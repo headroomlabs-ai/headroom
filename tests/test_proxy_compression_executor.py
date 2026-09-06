@@ -127,6 +127,62 @@ def test_in_flight_gauge_tracks_running_compressions() -> None:
         assert proxy._compression_in_flight == 0
 
 
+def test_contextvars_set_before_submission_are_visible_inside_the_worker() -> None:
+    """`run_in_executor` doesn't copy contextvars into the worker thread by
+    default (unlike `asyncio.to_thread`) -- without the fix, code reading
+    `get_registered_cwd()` there would silently see the default, not what
+    request middleware bound. Locks the fix with a generic ContextVar and
+    the real one astgrep.py's disk-verify depends on."""
+    import contextvars
+
+    from headroom.proxy.project_context import get_registered_cwd, set_registered_cwd
+
+    proxy = _make_proxy(compression_max_workers=2)
+    probe: contextvars.ContextVar[str | None] = contextvars.ContextVar("test_probe", default=None)
+    observed: dict[str, object] = {}
+
+    def _read_contextvars_on_worker_thread():
+        observed["probe"] = probe.get()
+        observed["registered_cwd"] = get_registered_cwd()
+        return "done"
+
+    async def _drive():
+        probe.set("set-on-calling-coroutine")
+        set_registered_cwd("/some/registered/project")
+        return await proxy._run_compression_in_executor(
+            _read_contextvars_on_worker_thread, timeout=5.0
+        )
+
+    result = asyncio.run(_drive())
+    assert result == "done"
+    assert observed["probe"] == "set-on-calling-coroutine"
+    assert observed["registered_cwd"] == "/some/registered/project"
+
+
+def test_contextvars_propagate_through_background_executor_too() -> None:
+    """Same fix, same bug class, but the *other* submission point --
+    `_run_compression_background` (no timeout, no leaked-thread accounting)
+    -- has its own `contextvars.copy_context()` call, not shared code with
+    `_run_compression_in_executor`. Covered separately since a fix at one
+    call site doesn't imply the other was fixed too."""
+    from headroom.proxy.project_context import get_registered_cwd, set_registered_cwd
+
+    proxy = _make_proxy(compression_max_workers=1)
+    observed: dict[str, object] = {}
+
+    def _read_registered_cwd_on_worker_thread():
+        observed["registered_cwd"] = get_registered_cwd()
+        return "done"
+
+    async def _drive():
+        set_registered_cwd("/some/other/registered/project")
+        return await proxy._run_compression_background(_read_registered_cwd_on_worker_thread)
+
+    result = asyncio.run(_drive())
+    assert result == "done"
+    assert observed["registered_cwd"] == "/some/other/registered/project"
+
+
 def test_high_water_mark_persists_after_completion() -> None:
     """``_compression_in_flight_max`` is monotonic — never decreases."""
     proxy = _make_proxy(compression_max_workers=8)

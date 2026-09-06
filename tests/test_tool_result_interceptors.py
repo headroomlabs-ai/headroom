@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import sys
 import textwrap
 
 import pytest
@@ -14,8 +17,14 @@ from headroom.proxy.interceptors import (
     interceptor_failure_counts,
     register,
 )
-from headroom.proxy.interceptors.astgrep import AstGrepReadOutline
+from headroom.proxy.interceptors.astgrep import (
+    AstGrepReadOutline,
+    ReadVerificationResult,
+    _open_regular_file_under_root,
+    _verify_read_against_disk,
+)
 from headroom.proxy.interceptors.base import reset_interceptor_failure_counts
+from headroom.proxy.project_context import get_registered_cwd, set_registered_cwd
 from headroom.tokenizer import Tokenizer
 
 
@@ -211,6 +220,536 @@ def test_astgrep_outlines_large_python_read(tokenizer):
     assert "def apply_promo" in new_content
     # Bodies should NOT leak through unchanged.
     assert "total += item.price * item.qty" not in new_content
+    # Complete-file control: no truncation banner in the input -> no truncation marker.
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_flags_truncated_read(tokenizer):
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 1-42 of 90 total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": truncated_source}],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+    # Still lists the definitions actually present in the visible portion.
+    assert "def process_payment" in new_content
+    assert "def apply_promo" in new_content
+
+
+def _read_result_messages(content: str, file_path: str = "/repo/payments.py"):
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": file_path},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": content}],
+        },
+    ]
+
+
+def test_astgrep_flags_truncated_read_wording_variants(tokenizer):
+    """The signature tolerates wording/casing/dash variation, but only inside
+    the recognized envelope — not as a synonym match over arbitrary prose."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[TRUNCATED:   PARTIAL VIEW — /repo/payments.py: "
+        "SHOWING  LINES 1–42  of 90  TOTAL. Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    assert "showing through line 42 of 90 total" in new_content
+
+
+def test_astgrep_ignores_truncation_phrase_in_comment(tokenizer):
+    """A count-shaped phrase in a plain comment, with no bracketed envelope,
+    must not be read as an upstream truncation claim."""
+    source_with_comment = (
+        _PY_FIXTURE + "\n\n# API pagination showing lines 10-20 of 30 total records\n"
+    )
+    messages = _read_result_messages(source_with_comment)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_ignores_bracketed_phrase_without_signature(tokenizer):
+    """Brackets plus a count-shaped phrase aren't enough on their own — the
+    exact recognized signature phrase must also be present."""
+    source_with_bracket = (
+        _PY_FIXTURE + "\n\n[Truncation happened; showing lines 1-42 of 90 total]\n"
+    )
+    messages = _read_result_messages(source_with_bracket)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+@pytest.mark.parametrize(
+    "banner_numbers",
+    [
+        pytest.param("50-90 of 90", id="end_equals_total"),
+        pytest.param("42-10 of 90", id="end_less_than_start"),
+        pytest.param("0-42 of 90", id="start_is_zero"),
+        pytest.param("1-5000 of 9000", id="end_exceeds_visible_payload"),
+    ],
+)
+def test_astgrep_ignores_malformed_truncation_counts(tokenizer, banner_numbers):
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        f"showing lines {banner_numbers} total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "outlined by ast-grep" in new_content
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_accepts_truncation_at_start_equals_end(tokenizer):
+    """`end >= start` is inclusive — a single-line visible window is valid."""
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 42-42 of 90 total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = _read_result_messages(truncated_source)
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+
+
+# -------- Disk verification: client-independent truncation fallback ----- #
+
+
+def test_set_get_registered_cwd_round_trips():
+    set_registered_cwd("/repo/project")
+    try:
+        assert get_registered_cwd() == "/repo/project"
+    finally:
+        set_registered_cwd(None)
+
+
+class TestVerifyReadAgainstDisk:
+    def test_missing_file_path_is_unknown(self):
+        verdict, info = _verify_read_against_disk(None, "abc", "/repo")
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_no_registered_cwd_is_unknown(self):
+        verdict, info = _verify_read_against_disk("payments.py", "abc", None)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_untrusted_request_never_touches_disk(self, tmp_path, monkeypatch):
+        """A valid file/content combo must short-circuit to UNKNOWN -- and
+        never call os.open -- when no root is registered."""
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        opened: list[object] = []
+        real_open = os.open
+
+        def _tracking_open(*args, **kwargs):
+            opened.append(args)
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _tracking_open)
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, None)
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+        assert opened == []
+
+    def test_missing_file_under_workspace_root_is_unknown(self, tmp_path):
+        verdict, info = _verify_read_against_disk(
+            str(tmp_path / "missing.py"), "abc", str(tmp_path)
+        )
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
+    def test_exact_match_is_complete(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path))
+        assert verdict is ReadVerificationResult.COMPLETE
+        assert info is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
+    def test_strict_prefix_is_truncated(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        partial = _PY_FIXTURE[:200]
+        verdict, info = _verify_read_against_disk(str(f), partial, str(tmp_path))
+        assert verdict is ReadVerificationResult.TRUNCATED
+        assert info == (len(partial.splitlines()), len(_PY_FIXTURE.splitlines()))
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+        " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+    )
+    def test_relative_path_resolves_against_registered_cwd(self, tmp_path):
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        partial = _PY_FIXTURE[:200]
+        verdict, info = _verify_read_against_disk("payments.py", partial, str(tmp_path))
+        assert verdict is ReadVerificationResult.TRUNCATED
+        assert info is not None
+
+    def test_content_mismatch_is_unknown_not_truncated(self, tmp_path):
+        # File diverged since the client read it -- not a clean prefix.
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE.replace("compute_subtotal", "compute_total"), encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_absolute_path_outside_workspace_root_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        sibling = tmp_path / "other"
+        sibling.mkdir()
+        f = sibling / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(root))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_relative_traversal_escapes_workspace_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        root.mkdir()
+        f = tmp_path / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk("../secret.py", _PY_FIXTURE, str(root))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_sibling_directory_sharing_string_prefix_is_not_inside_workspace(self, tmp_path):
+        """Containment is a path-segment check (relpath/segment split), not
+        a string-prefix check -- a target that merely starts with the
+        root's string must not be treated as inside it."""
+        root = tmp_path / "project"
+        root.mkdir()
+        other = tmp_path / "project-other"
+        other.mkdir()
+        f = other / "secret.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(root))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_directory_passed_as_file_path_is_unknown(self, tmp_path):
+        root = tmp_path / "project"
+        subdir = root / "subdir"
+        subdir.mkdir(parents=True)
+        verdict, info = _verify_read_against_disk("subdir", "abc", str(root))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+    def test_oversized_file_exceeding_byte_cap_is_unknown(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_MAX_BYTES", "10")
+        f = tmp_path / "payments.py"
+        f.write_text(_PY_FIXTURE, encoding="utf-8")
+        assert len(_PY_FIXTURE.encode("utf-8")) > 10
+        # Content matches exactly -- would be COMPLETE without the cap.
+        verdict, info = _verify_read_against_disk(str(f), _PY_FIXTURE, str(tmp_path))
+        assert verdict is ReadVerificationResult.UNKNOWN
+        assert info is None
+
+
+# -------- _open_regular_file_under_root: race-safety + off-loop (review round 2) --------- #
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need elevated privilege on Windows")
+def test_open_regular_file_under_root_rejects_symlinked_final_file(tmp_path):
+    """A symlinked leaf file must be rejected by O_NOFOLLOW, not followed.
+
+    A static symlink is sufficient race evidence here: O_NOFOLLOW rejects it
+    the same way whether it's always been there or appeared 2ms ago -- a
+    concurrent-race harness would prove nothing more and would be flaky.
+    """
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text(_PY_FIXTURE, encoding="utf-8")
+    link = root / "link.py"
+    link.symlink_to(outside)
+    assert _open_regular_file_under_root("link.py", root, 10_000) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need elevated privilege on Windows")
+def test_open_regular_file_under_root_rejects_symlinked_intermediate_directory(tmp_path):
+    """A symlinked directory component must be rejected at that hop, not
+    walked into."""
+    root = tmp_path / "project"
+    root.mkdir()
+    real_dir = tmp_path / "realdir"
+    real_dir.mkdir()
+    (real_dir / "secret.py").write_text(_PY_FIXTURE, encoding="utf-8")
+    link_dir = root / "linkdir"
+    link_dir.symlink_to(real_dir)
+    assert _open_regular_file_under_root("linkdir/secret.py", root, 10_000) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need elevated privilege on Windows")
+def test_open_regular_file_under_root_rejects_symlinked_root_anchor(tmp_path):
+    """The root anchor itself must be opened O_NOFOLLOW too, not just the
+    segments below it -- otherwise a symlink swapped in at the resolved root
+    path would be followed, the exact TOCTOU shape review round 2 flagged,
+    just moved from the leaf to the anchor."""
+    real_root = tmp_path / "real-project"
+    real_root.mkdir()
+    (real_root / "x.py").write_text("content", encoding="utf-8")
+    root_link = tmp_path / "project-link"
+    root_link.symlink_to(real_root)
+    assert _open_regular_file_under_root("x.py", root_link, 10_000) is None
+
+
+def test_open_regular_file_under_root_refuses_on_event_loop_thread(tmp_path):
+    """Calling from inside a running event loop must refuse immediately
+    rather than perform the read."""
+    f = tmp_path / "x.py"
+    f.write_text("content", encoding="utf-8")
+
+    async def _call_from_loop():
+        return _open_regular_file_under_root(str(f), tmp_path, 10_000)
+
+    assert asyncio.run(_call_from_loop()) is None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+    " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+)
+def test_open_regular_file_under_root_proceeds_from_plain_sync_context(tmp_path):
+    """Sanity check: with no running loop, the read must still succeed."""
+    f = tmp_path / "x.py"
+    f.write_text("content", encoding="utf-8")
+    assert _open_regular_file_under_root(str(f), tmp_path, 10_000) == "content"
+
+
+def test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported(
+    tmp_path, monkeypatch
+):
+    """Fails closed (None) rather than falling back to a less-safe pattern
+    when dir_fd-relative opens aren't supported (notably Windows)."""
+    import headroom.proxy.interceptors.astgrep as astgrep_module
+
+    f = tmp_path / "x.py"
+    f.write_text("content", encoding="utf-8")
+    monkeypatch.setattr(astgrep_module, "_dir_fd_walk_supported", lambda: False)
+    assert _open_regular_file_under_root(str(f), tmp_path, 10_000) is None
+
+
+def test_open_regular_file_under_root_directory_passed_as_target_is_unknown(tmp_path):
+    """A directory at the leaf position must be rejected -- the target must
+    be a file."""
+    (tmp_path / "subdir").mkdir()
+    assert _open_regular_file_under_root("subdir", tmp_path, 10_000) is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.mkfifo unavailable on Windows")
+def test_open_regular_file_under_root_rejects_fifo_without_hanging(tmp_path):
+    """A FIFO must be rejected by the S_ISREG check, and -- because the open
+    uses O_NONBLOCK -- must return promptly rather than blocking on a
+    writer that will never arrive. If this test hangs, O_NONBLOCK regressed."""
+    fifo_path = tmp_path / "pipe"
+    os.mkfifo(fifo_path)
+    assert _open_regular_file_under_root("pipe", tmp_path, 10_000) is None
+
+
+# -------- End-to-end: apply_to_messages, real registered_cwd --------- #
+
+
+def _disk_verification_messages(partial: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+        },
+    ]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+    " (see test_astgrep_disk_verification_stays_unknown_when_dir_fd_unsupported)",
+)
+def test_astgrep_disk_verification_flags_truncation_when_no_banner(
+    tokenizer, tmp_path, monkeypatch
+):
+    """Opted in, root registered, real on-disk prefix, no banner -- disk
+    verification alone qualifies the header."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]  # no banner text anywhere
+    assert "truncated" not in partial.lower()
+
+    set_registered_cwd(str(tmp_path))
+    try:
+        result = apply_to_messages(_disk_verification_messages(partial), tokenizer)
+    finally:
+        set_registered_cwd(None)
+
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" in new_content
+    visible_lines = len(partial.splitlines())
+    total_lines = len(_PY_FIXTURE.splitlines())
+    assert f"showing through line {visible_lines} of {total_lines} total" in new_content
+    assert "def compute_subtotal" in new_content
+    assert "def apply_promo" in new_content
+    assert "def format_receipt" not in new_content
+
+
+def test_astgrep_disk_verification_stays_unknown_when_dir_fd_unsupported(
+    tokenizer, tmp_path, monkeypatch
+):
+    """Fail-closed contract, simulated cross-platform: dir_fd unsupported ->
+    UNKNOWN -> no false "truncated upstream" claim. Stands in for the real
+    Windows behavior the skipif'd tests above can't exercise here."""
+    import headroom.proxy.interceptors.astgrep as astgrep_module
+
+    monkeypatch.setattr(astgrep_module, "_dir_fd_walk_supported", lambda: False)
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]  # no banner text anywhere
+    assert "truncated" not in partial.lower()
+
+    set_registered_cwd(str(tmp_path))
+    try:
+        result = apply_to_messages(_disk_verification_messages(partial), tokenizer)
+    finally:
+        set_registered_cwd(None)
+
+    # The outline rewrite is independent of the disk-verify verdict.
+    assert len(result.spans) == 1
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_disk_verification_skips_when_no_root_registered(tokenizer, tmp_path, monkeypatch):
+    """No registered root at all (the default) -- opted in, real on-disk
+    prefix, but never flags. Spoofed-header-doesn't-work is covered
+    end-to-end in test_proxy_workspace_registration_middleware.py."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    monkeypatch.setenv("HEADROOM_INTERCEPT_READ_MIN_CHARS", "50")
+    f = tmp_path / "payments.py"
+    f.write_text(_PY_FIXTURE, encoding="utf-8")
+    marker = "\n\ndef format_receipt"
+    partial = _PY_FIXTURE[: _PY_FIXTURE.index(marker)]
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": partial}],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "truncated upstream" not in new_content
+
+
+def test_astgrep_banner_detection_takes_priority_over_disk_verification(tokenizer, monkeypatch):
+    """When a banner is already present, disk verification must not run at
+    all (no cwd bound here -- if it ran, resolution would fail anyway), and
+    the banner's own numbers must be what the header reports."""
+    monkeypatch.setenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "1")
+    truncated_source = (
+        _PY_FIXTURE + "\n\n[Truncated: PARTIAL view — /repo/payments.py: "
+        "showing lines 1-42 of 90 total (26031 tokens, cap 25000). "
+        "Call Read with offset=43 to see more.]\n"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "abc",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "abc", "content": truncated_source}],
+        },
+    ]
+    result = apply_to_messages(messages, tokenizer)
+    new_content = result.messages[1]["content"][0]["content"]
+    assert "showing through line 42 of 90 total" in new_content
 
 
 def test_astgrep_skips_small_files(tokenizer):

@@ -565,6 +565,43 @@ jobs:
       - name: Run native installer wrapper tests
         run: pytest tests/test_install/test_native_installers.py -q
 
+  # Runtime coverage for pure-Python proxy logic on Windows, kept separate
+  # from windows-native-wrapper (above), which is deliberately
+  # dependency-minimal and gated on native-installer changes only. Installs
+  # the latest published wheel from PyPI (real precompiled _core.pyd, no
+  # cargo/maturin build needed) so this branch's local ./headroom source
+  # tree can shadow it -- same shadowing the Linux `test` job relies on,
+  # just without needing our own freshly-built wheel, since none of the
+  # covered test files import headroom._core.
+  #
+  # Covers the full disk-verify session-token path, not just the
+  # interceptor: OpenCode config/launch-env building, the wrap opencode
+  # CLI command, and workspace-root registration through the real HTTP
+  # middleware -- so this gate actually exercises the OpenCode path, not
+  # only its final consumer.
+  windows-tool-result-interceptors:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install headroom-ai[dev] (published wheel; local source shadows it)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "headroom-ai[dev]"
+      - name: Run disk-verify session-token path tests
+        shell: bash
+        run: |
+          pytest tests/test_tool_result_interceptors.py \
+            tests/test_providers_opencode_config.py \
+            tests/test_cli/test_wrap_opencode.py \
+            tests/test_proxy_workspace_registration_middleware.py -q
+
   macos-native-wrapper:
     needs: changes
     if: needs.changes.outputs.native == 'true'

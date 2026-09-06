@@ -25,6 +25,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -38,6 +39,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
+from headroom import proxy_client_liveness
 from headroom._subprocess import pid_alive, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
@@ -2933,6 +2935,24 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
 
 
+# Read by proxy's workspace_registry.resolve_registered_cwd() to look up
+# this session's registered cwd.
+_SESSION_TOKEN_HEADER_NAME = "X-Headroom-Session-Token"
+
+
+def _apply_session_token_header_env(env: dict[str, str], session_token: str) -> None:
+    """Inject X-Headroom-Session-Token into ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    Mirrors :func:`_apply_project_header_env`. No "user override wins" case
+    here -- the token is wrap-generated, not user-supplied.
+    """
+    if not session_token:
+        return
+    header_line = f"{_SESSION_TOKEN_HEADER_NAME}: {session_token}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}" if existing else header_line
+
+
 # Codex's own built-in providers plus Headroom's injected one — never treated
 # as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
 _CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
@@ -4475,50 +4495,44 @@ def _ensure_proxy(
 
 
 def _client_marker_path(port: int) -> Path:
-    """Path to this process's wrap-client marker for ``port``."""
+    """Path to this process's wrap-client marker for ``port``.
+
+    Mode 0700: markers carry ``cwd``/``session_token`` the proxy treats as
+    an authoritative binding, so only the invoking OS user may read them.
+    """
     from headroom import paths as _paths
 
     d = _paths.proxy_clients_dir(port)
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
     return d / f"{os.getpid()}.json"
 
 
-def _proc_identity(pid: int) -> tuple[str, float] | None:
-    """Best-effort ``(source, start_time)`` identity for a PID.
-
-    Used to defeat PID reuse: a marker is only trusted while the live PID is
-    *the same process* that wrote it. Returns ``None`` when start time can't be
-    determined (e.g. macOS without psutil), in which case callers fall back to
-    existence-only liveness — no regression, just no reuse protection there.
-
-    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
-    different units; we only compare like-for-like.
-    """
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
-
-        return ("psutil", psutil.Process(pid).create_time())
-    except Exception:
-        pass
-    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
-    # since boot — a stable per-process value. `comm` (field 2) may contain
-    # spaces/parens, so split after the final ')'.
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            fields = fh.read().rpartition(b")")[2].split()
-        return ("proc", float(fields[19]))
-    except (OSError, IndexError, ValueError):
-        return None
+_proc_identity = proxy_client_liveness.proc_identity
 
 
-def _register_proxy_client(port: int) -> None:
+def _register_proxy_client(port: int, *, session_token: str | None = None) -> None:
     """Register this wrap process as a live client of the shared proxy.
 
-    Best-effort: a failed write just means our marker is missing, and the
-    liveness pruning in :func:`_live_proxy_clients` is the real safety net.
+    Also records ``cwd`` (wrap is the coding-agent CLI's real blocking
+    parent, so this is authoritative) and, if given, ``session_token`` --
+    also injected into the wrapped CLI's headers so the proxy can resolve
+    which registered cwd a request belongs to.
+
+    Best-effort: a failed write just means our marker is missing, and
+    :func:`_live_proxy_clients`'s liveness pruning is the real safety net.
     """
     try:
-        payload: dict[str, Any] = {"pid": os.getpid(), "started_at": time.time()}
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "cwd": os.getcwd(),
+        }
+        if session_token:
+            payload["session_token"] = session_token
         ident = _proc_identity(os.getpid())
         if ident is not None:
             payload["start_src"], payload["start_time"] = ident
@@ -4544,33 +4558,8 @@ def _pid_alive(pid: int) -> bool:
     return pid_alive(pid)
 
 
-def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
-    """True only if ``pid``'s current identity *provably* differs from the
-    recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
-
-    Conservative by design: any uncertainty (unknown/legacy identity, unknown
-    start time, mismatched source) returns ``False`` — never claim a mismatch
-    without proof, since the caller uses this to decide whether to trust or
-    discard state tied to a live PID.
-    """
-    if not isinstance(src, str) or not isinstance(recorded, int | float):
-        return False  # legacy / identity-less record — can't tell
-    ident = _proc_identity(pid)
-    if ident is None or ident[0] != src:
-        return False  # can't compare like-for-like — don't claim mismatch
-    # Start times are stable per process; >1s apart means a different process.
-    return abs(ident[1] - float(recorded)) > 1.0
-
-
-def _marker_pid_reused(marker: Path, pid: int) -> bool:
-    """True only if the live ``pid`` is *provably* a different process than the
-    one that wrote ``marker`` (i.e. the PID was recycled after a crash).
-    """
-    try:
-        rec = json.loads(_read_text(marker))
-    except (OSError, ValueError):
-        return False
-    return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
+_identity_mismatch = proxy_client_liveness.identity_mismatch
+_marker_pid_reused = proxy_client_liveness.marker_pid_reused
 
 
 def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
@@ -5262,7 +5251,10 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
-        _register_proxy_client(port)
+        # One token for the whole session -- written into the marker below
+        # and, further down, into the header the wrapped CLI sends.
+        _session_token = secrets.token_urlsafe(32)
+        _register_proxy_client(port, session_token=_session_token)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -5278,7 +5270,7 @@ def claude(
         )
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
@@ -5401,6 +5393,8 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+        # Same token written into the marker above.
+        _apply_session_token_header_env(env, _session_token)
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
@@ -7815,7 +7809,11 @@ def opencode(
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
     # shared proxy during the startup gap.
-    _register_proxy_client(port)
+    #
+    # Mirrors claude()'s token minting; only reaches OpenCode when the
+    # plugin layer is loaded (see build_launch_env).
+    _session_token = secrets.token_urlsafe(32)
+    _register_proxy_client(port, session_token=_session_token)
 
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
@@ -7844,7 +7842,7 @@ def opencode(
         # cleanup tracking stays accurate and update MCP config.
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
             if not no_mcp:
                 from headroom.mcp_registry import OpencodeRegistrar
 
@@ -7854,7 +7852,11 @@ def opencode(
         if subscription_resolution is not None:
             _scrub_copilot_subscription_launch_env(launch_environ)
         env, env_vars_display = _build_opencode_launch_env(
-            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+            actual_port,
+            launch_environ,
+            project=_project_name_from_cwd(),
+            include_mcp=not no_mcp,
+            session_token=_session_token,
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.

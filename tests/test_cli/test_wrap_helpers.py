@@ -25,6 +25,7 @@ import pytest
 from click.testing import CliRunner
 
 from headroom import paths as paths_mod
+from headroom import proxy_client_liveness
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
 
@@ -677,7 +678,10 @@ class TestProxyClientRefCounting:
         live_pid = os.getppid()  # alive, but not the process that "registered"
         marker = self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
         # The process currently holding that PID started much later → reuse.
-        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: ("psutil", 9000.0))
+        # Patched on proxy_client_liveness, not wrap_mod: _identity_mismatch/
+        # _marker_pid_reused are now thin aliases to that module's
+        # implementation, which resolves proc_identity in its own globals.
+        monkeypatch.setattr(proxy_client_liveness, "proc_identity", lambda p: ("psutil", 9000.0))
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
@@ -690,7 +694,7 @@ class TestProxyClientRefCounting:
         """Same process (start time within tolerance) is a real client — kept."""
         live_pid = os.getppid()
         marker = self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
-        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: ("psutil", 1000.4))
+        monkeypatch.setattr(proxy_client_liveness, "proc_identity", lambda p: ("psutil", 1000.4))
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
@@ -704,7 +708,7 @@ class TestProxyClientRefCounting:
         live_pid = os.getppid()
         self._write_marker(clients_dir, live_pid, identity=("psutil", 1000.0))
         # Start time unknowable for the live PID → must not prune a real client.
-        monkeypatch.setattr(wrap_mod, "_proc_identity", lambda p: None)
+        monkeypatch.setattr(proxy_client_liveness, "proc_identity", lambda p: None)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 

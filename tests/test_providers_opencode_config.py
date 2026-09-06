@@ -513,10 +513,48 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert env["HEADROOM_PROJECT"] == "test-proj"
     # Plugin loaded → its proxy target is exported for self-configuration.
     assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8787"
-    assert str(plugin) in env["OPENCODE_CONFIG_CONTENT"]
+    # Parse and compare semantically -- json.dumps doubles Windows backslashes,
+    # so a raw str(plugin) substring search is a false negative there.
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["plugin"] == [str(plugin)]
     assert f"plugin={HEADROOM_OPENCODE_PLUGIN}" in display
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_build_launch_env_forwards_session_token_when_plugin_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Token reaches OpenCode only via the transport plugin -- the only
+    header-capable layer (native baseURL is header-blind, like Cursor)."""
+    from headroom.providers.opencode.runtime import build_launch_env
+
+    plugin = tmp_path / "entry.opencode.js"
+    plugin.write_text("export default () => {}", encoding="utf-8")
+    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
+
+    env, _display = build_launch_env(
+        port=8787,
+        include_mcp=False,
+        session_token="tok-abc",
+    )
+    assert env["HEADROOM_OPENCODE_SESSION_TOKEN"] == "tok-abc"
+
+
+def test_build_launch_env_omits_session_token_when_plugin_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No plugin -> no header surface -> token must not be forwarded,
+    same as Cursor's UNKNOWN."""
+    from headroom.providers.opencode.runtime import build_launch_env
+
+    monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(tmp_path / "missing.js"))
+
+    env, _display = build_launch_env(
+        port=8787,
+        include_mcp=False,
+        session_token="tok-abc",
+    )
+    assert "HEADROOM_OPENCODE_SESSION_TOKEN" not in env
 
 
 def test_build_launch_env_with_custom_environ() -> None:
