@@ -87,6 +87,37 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
     "enabled",
 )
 
+# When headroom_read is enabled, restrict file reads to the workspace
+# directory and the current working directory by default. This prevents
+# prompt-injected AI agents from exfiltrating secrets (e.g. ~/.ssh/id_rsa,
+# .env files, /etc/passwd) via the MCP tool. Operators who need
+# unrestricted reads can opt in with HEADROOM_MCP_READ_UNRESTRICTED=1.
+_READ_UNRESTRICTED = os.environ.get("HEADROOM_MCP_READ_UNRESTRICTED", "off").lower().strip() in (
+    "on",
+    "true",
+    "1",
+    "yes",
+    "enabled",
+)
+
+# Sensitive file patterns that are always blocked regardless of unrestricted
+# mode, to prevent accidental secret exfiltration even by trusted agents.
+_SENSITIVE_PATTERNS = (
+    ".ssh/",
+    ".env",
+    ".aws/credentials",
+    ".gnupg/",
+    ".kube/config",
+    ".docker/config",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "id_rsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".pem",
+)
+
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
 # How often the parent-death watchdog polls os.getppid() (seconds). When the
@@ -957,6 +988,55 @@ class HeadroomMCPServer:
             ]
 
         path = Path(file_path).expanduser().resolve()
+
+        # Security: sandbox file reads to the workspace and CWD by default.
+        # Without this check, an AI agent (potentially prompt-injected) could
+        # read arbitrary files like ~/.ssh/id_rsa, .env, /etc/passwd, etc.
+        # Operators can opt out with HEADROOM_MCP_READ_UNRESTRICTED=1.
+        if not _READ_UNRESTRICTED:
+            allowed_roots = [
+                Path.cwd().resolve(),
+                _paths.workspace_dir().resolve(),
+            ]
+            if not any(
+                path == root or root in path.parents for root in allowed_roots
+            ):
+                logger.warning(
+                    "headroom_read: rejected path %s outside allowed roots %s",
+                    path,
+                    [str(r) for r in allowed_roots],
+                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": (
+                                f"Access denied: {file_path} is outside the allowed "
+                                "workspace directory. Set HEADROOM_MCP_READ_UNRESTRICTED=1 "
+                                "to allow reads outside the workspace."
+                            ),
+                        }),
+                    )
+                ]
+
+            # Block sensitive file patterns even in restricted mode.
+            path_str = str(path)
+            if any(pattern in path_str for pattern in _SENSITIVE_PATTERNS):
+                logger.warning(
+                    "headroom_read: rejected sensitive path %s", path
+                )
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": (
+                                f"Access denied: {file_path} matches a sensitive "
+                                "file pattern (SSH keys, credentials, secrets)."
+                            ),
+                        }),
+                    )
+                ]
+
         if not path.exists():
             return [
                 TextContent(
