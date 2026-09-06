@@ -290,9 +290,16 @@ fn write_table(
     }
 }
 
+/// Bare token for an absent key, distinct from null's empty cell. Lets the
+/// decoder tell `missing key` (`\N`) from `null` (empty) from `""` (`""`).
+/// A literal string equal to this token is CSV-quoted so it never collides.
+const MISSING_SENTINEL: &str = "\\N";
+
 fn format_cell(c: &CellValue) -> String {
     match c {
-        CellValue::Missing => String::new(),
+        // Absent key → sentinel; null → empty cell. Previously both rendered
+        // empty, collapsing the missing/null/empty-string distinction (lossy).
+        CellValue::Missing => MISSING_SENTINEL.to_string(),
         CellValue::Scalar(v) => json_scalar_to_csv(v),
         CellValue::Nested(sub) => {
             // Render nested as compact JSON; CSV-quote because it
@@ -354,7 +361,15 @@ fn json_scalar_to_csv(v: &Value) -> String {
 }
 
 fn needs_csv_quote(s: &str) -> bool {
-    s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r')
+    // Quote the empty string so it renders `""` — distinct from a bare empty
+    // cell (null). Quote a literal `\N` so it can't be read back as the
+    // missing-key sentinel. Both are required for lossless round-tripping.
+    s.is_empty()
+        || s == MISSING_SENTINEL
+        || s.contains(',')
+        || s.contains('"')
+        || s.contains('\n')
+        || s.contains('\r')
 }
 
 fn csv_quote(s: &str) -> String {
