@@ -5626,6 +5626,11 @@ class OpenAIHandlerMixin:
 
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        # Messages-only count, preserved for the output shaper's turn/size
+        # classifier: the accounting pair below may widen original_tokens by
+        # the tools schema after compression, and shaper strata must not
+        # shift when it does.
+        message_input_tokens = original_tokens
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed
@@ -5847,6 +5852,10 @@ class OpenAIHandlerMixin:
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
         if self.config.optimize and not _bypass:
+            # Pre-compression tools reference: the compression pass is
+            # copy-on-write on the payload, so this still points at the
+            # original schemas after `body` is rebound below.
+            _tools_before = body.get("tools")
             try:
                 (
                     body,
@@ -5875,6 +5884,17 @@ class OpenAIHandlerMixin:
                 if _modified:
                     body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
+                    # tokens_saved includes tool schema/desc compaction, which
+                    # is measured against the tools array — content the
+                    # messages-only original_tokens count above never
+                    # included. Fold the tools schema into the pair so it
+                    # stays coherent (original - optimized == saved, savings
+                    # rate <= 100%); without this, schema-heavy turns clamp
+                    # optimized to 0 and record rates above 100%.
+                    if _tools_before:
+                        original_tokens += await asyncio.to_thread(
+                            tokenizer.count_text, _json_debug_dumps(_tools_before)
+                        )
                     optimized_tokens = max(0, original_tokens - tokens_saved)
                     logger.info(
                         "[%s] /v1/responses compressed %d→%d bytes "
@@ -5947,7 +5967,7 @@ class OpenAIHandlerMixin:
             _http_conversation_key = request.headers.get("x-headroom-session-id")
             _shape_result = _shape_openai_responses_for_output(
                 body,
-                input_tokens=original_tokens,
+                input_tokens=message_input_tokens,
                 model=str(model or ""),
                 conversation_key=(
                     f"header:x-headroom-session-id:{_http_conversation_key}"
