@@ -765,7 +765,7 @@
                     </div>
 
                     <div class="p-4">
-                        <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-5">
+                        <div class="grid grid-cols-1 md:grid-cols-5 gap-3 mb-5">
                             <div class="rounded-lg border border-border bg-card-alt p-3">
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Before</div>
                                 <div class="text-2xl font-light tabular-nums" x-text="formatNumber(stats.agent_usage?.totals?.before_tokens || 0)"></div>
@@ -781,6 +781,13 @@
                             <div class="rounded-lg border border-border bg-card-alt p-3">
                                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Savings</div>
                                 <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="(stats.agent_usage?.totals?.savings_percent || 0).toFixed(1) + '%'"></div>
+                            </div>
+                            <div class="rounded-lg border border-border bg-card-alt p-3"
+                                 :title="stats.co2?.methodology || 'EcoLogits energy model x IEA 2023 carbon intensity'">
+                                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">CO2 Saved</div>
+                                <div class="text-2xl font-light tabular-nums text-green-400"
+                                     x-text="formatCO2(stats.co2?.co2_saved_mg || 0)"></div>
+                                <div class="text-xs text-gray-600 mt-0.5">EcoLogits est.</div>
                             </div>
                         </div>
 
@@ -2272,6 +2279,14 @@
                     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                     if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                     return n.toString();
+                },
+
+                formatCO2(mg) {
+                    if (mg <= 0) return '0 mg';
+                    if (mg >= 1000000) return (mg / 1000000).toFixed(2) + ' kg';
+                    if (mg >= 1000) return (mg / 1000).toFixed(2) + ' g';
+                    if (mg >= 1) return mg.toFixed(1) + ' mg';
+                    return mg.toFixed(3) + ' mg';
                 },
 
                 formatCurrency(n) {
