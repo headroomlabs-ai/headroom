@@ -2350,6 +2350,15 @@ class HeadroomProxy(
 
                     # Retry other server errors (5xx)
                     if response.status_code >= 500:
+                        is_last = (
+                            not self.config.retry_enabled
+                            or attempt >= self.config.retry_max_attempts - 1
+                        )
+                        if is_last:
+                            # Out of retries — return the real upstream error so
+                            # the true status/body/retry-after reaches the client
+                            # instead of a fabricated 500/502.
+                            return response
                         raise httpx.HTTPStatusError(
                             f"Server error: {response.status_code}",
                             request=response.request,
@@ -4943,7 +4952,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         Response:
             {"hash": "...", "original_content": "...", ...}
         """
-        data = await request.json()
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid JSON body") from None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
         hash_key = data.get("hash")
 
         if not hash_key:
@@ -5124,7 +5138,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         Request body: Telemetry export data from /v1/telemetry/export
         """
         telemetry = get_telemetry_collector()
-        data = await request.json()
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid JSON body") from None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
         telemetry.import_stats(data)
         return {"status": "imported", "current_stats": telemetry.get_stats()}
 
@@ -5343,7 +5362,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "data": {...}  # Raw retrieval data
             }
         """
-        data = await request.json()
+        try:
+            data = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="invalid JSON body") from None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
         tool_call = data.get("tool_call", {})
         provider = data.get("provider", "anthropic")
 

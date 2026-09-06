@@ -1704,6 +1704,14 @@ class KompressCompressor(Transform):
                         if bool(mask_list[idx]):
                             kept_ids.add(wid + chunk_start)
 
+                # Truncation safety: if the chunk tokenized past max_length=512,
+                # its tail words have no word_id and were never scored. Keep them
+                # rather than silently dropping content ("same answers" guarantee).
+                covered = {wid for wid in word_ids if wid is not None}
+                for local_idx in range(len(chunk_words)):
+                    if local_idx not in covered:
+                        kept_ids.add(local_idx + chunk_start)
+
                 # Hard override: always keep must-keep tokens regardless of model score.
                 # Numbers, error names, paths, and flags carry meaning agents cannot
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.

@@ -5199,6 +5199,7 @@ class AnthropicHandlerMixin:
                 self.metrics.record_compression_failed(reason)
                 # Pass through unchanged on failure
                 compressed_requests.append(batch_req)
+                total_original_tokens += original_tokens  # keep denominator aligned
                 total_optimized_tokens += original_tokens
 
         # Update body with compressed requests

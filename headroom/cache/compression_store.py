@@ -411,18 +411,28 @@ class CompressionStore:
                 # rare with SHA256[:24]) collision; same content is a duplicate
                 # re-store. Either way we overwrite in place.
                 if existing.original_content != original:
+                    # True hash collision - different content, same hash.
+                    # Do NOT overwrite: the existing entry may already be
+                    # referenced by an emitted marker, and clobbering it would
+                    # make retrieve() return this new content for that marker
+                    # (silent wrong-data retrieval). Preserve the first entry
+                    # and skip caching the colliding content. (Realistically
+                    # only possible for short explicit_hash producers — default
+                    # SHA256[:24] keys won't collide at any real scale.)
                     logger.warning(
-                        "Hash collision detected: hash=%s tool=%s (existing_len=%d, new_len=%d)",
+                        "Hash collision detected: hash=%s tool=%s (existing_len=%d, new_len=%d) "
+                        "— keeping existing entry, not caching new content",
                         hash_key,
                         tool_name,
                         len(existing.original_content),
                         len(original),
                     )
-                else:
-                    logger.debug(
-                        "Duplicate store for hash=%s, updating entry",
-                        hash_key,
-                    )
+                    return hash_key
+                # Same content being stored again - this is fine, just update
+                logger.debug(
+                    "Duplicate store for hash=%s, updating entry",
+                    hash_key,
+                )
                 # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 
