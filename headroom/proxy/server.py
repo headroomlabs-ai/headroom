@@ -127,6 +127,7 @@ from headroom.proxy.cost import (
     build_prefix_cache_stats,  # noqa: F401
     build_session_summary,  # noqa: F401
     merge_cost_stats,  # noqa: F401
+    request_cost_usd,
 )
 from headroom.proxy.helpers import (
     COMPRESSION_CACHE_MAX_ENTRIES,
@@ -4112,6 +4113,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "total_latency_ms": _recent_request_optional_number(log, "total_latency_ms"),
                     "has_exact_tokens": token_accounting_status == "complete",
                     "token_accounting_status": token_accounting_status,
+                    # Best-effort list-price estimate; null means unavailable,
+                    # never fabricated zero.
+                    "cost_usd": request_cost_usd(proxy.cost_tracker, log),
                     "transforms_applied": log.get("transforms_applied", []),
                     "savings_breakdown": log.get("savings_breakdown", []),
                     "waste_signals": log.get("waste_signals"),

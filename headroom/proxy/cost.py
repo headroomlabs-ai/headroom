@@ -12,6 +12,7 @@ import importlib.util
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -481,6 +482,37 @@ def build_prefix_cache_stats(
     }
 
 
+def request_cost_usd(cost_tracker: CostTracker | None, log: Mapping[str, Any]) -> float | None:
+    """Best-effort actual-cost estimate (USD) for one logged request (issue #1079).
+
+    Prices the request the provider actually billed: the post-compression
+    ``input_tokens_optimized`` plus ``output_tokens``, via the existing
+    ``CostTracker.estimate_cost`` (LiteLLM list price). Best-effort: it does NOT
+    apply cache-read/cache-write discounts, because ``recent_requests`` does not
+    retain a per-request cache breakdown — treat the value as a list-price billed
+    estimate, not an exact bill.
+
+    Returns ``None`` — never a fabricated number — when cost tracking is
+    disabled, the entry lacks a model / input tokens, or pricing is unavailable,
+    so downstream tooling can distinguish "unknown" from "$0". Exception-isolated
+    so a single bad entry never breaks the ``/stats`` payload.
+    """
+    if cost_tracker is None:
+        return None
+    model = log.get("model")
+    input_tokens = log.get("input_tokens_optimized")
+    if not model or input_tokens is None:
+        return None
+    try:
+        return cost_tracker.estimate_cost(
+            model=model,
+            input_tokens=int(input_tokens),
+            output_tokens=int(log.get("output_tokens") or 0),
+        )
+    except Exception:  # noqa: BLE001 — never break /stats on a pricing error
+        return None
+
+
 def merge_cost_stats(
     cost_stats: dict | None,
     cache_stats: dict,
@@ -586,7 +618,7 @@ def build_session_summary(
     def _entry_has_number(entry: Any, attr: str) -> bool:
         value = getattr(entry, attr, None)
         return (
-            isinstance(value, (int, float))
+            isinstance(value, int | float)
             and not isinstance(value, bool)
             and math.isfinite(float(value))
         )
