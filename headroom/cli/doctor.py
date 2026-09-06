@@ -565,6 +565,48 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     return CheckResult(name=name, status=PASS, summary=f"{summary} ({source})")
 
 
+def check_kompress_health(health: dict[str, Any] | None) -> CheckResult:
+    """Report whether the optional Kompress model can actually run.
+
+    ``/livez`` only proves that the proxy process is alive, and ``/stats``
+    cannot distinguish a healthy zero-savings workload from a cold Kompress
+    model. The health payload has the component-level readiness state needed
+    to explain the "ML extras installed, but every request passes through"
+    failure mode.
+    """
+    name = "kompress"
+    if health is None:
+        return CheckResult(name=name, status=SKIP, summary="proxy health endpoint not reachable")
+
+    checks = health.get("checks")
+    component = checks.get(name) if isinstance(checks, dict) else None
+    if not isinstance(component, dict):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="proxy does not report Kompress readiness (older version?)",
+            hint="restart the proxy on the current version",
+        )
+
+    if not bool(component.get("enabled", True)):
+        return CheckResult(name=name, status=PASS, summary="disabled")
+
+    backend = component.get("backend")
+    backend_text = f" ({backend})" if backend else ""
+    if bool(component.get("ready")):
+        return CheckResult(name=name, status=PASS, summary=f"ready{backend_text}")
+
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary=f"not ready{backend_text} — content compression is passing through",
+        hint=(
+            "pre-download the Kompress model and retry; inspect /debug/warmup "
+            "for the resolved load state"
+        ),
+    )
+
+
 def check_budget(stats: dict[str, Any] | None) -> CheckResult:
     """Is a spend budget configured on the proxy?"""
     name = "budget"
@@ -704,6 +746,7 @@ def doctor(port: int, emit_json: bool) -> None:
     """
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
+    health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
 
@@ -720,6 +763,7 @@ def doctor(port: int, emit_json: bool) -> None:
         check_wrap_marker_staleness(project_local_claude_settings),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
+        check_kompress_health(health),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]

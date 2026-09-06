@@ -4,6 +4,7 @@ import json
 import logging
 from importlib import import_module
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
@@ -286,6 +287,35 @@ def test_compress_savings_profile_does_not_mutate_supplied_config(monkeypatch) -
     assert config.protect_analysis_context is False
     assert config.target_ratio is None
     assert config.min_tokens_to_compress == 999
+
+
+def test_force_kompress_falls_back_to_structural_compression_when_cold(monkeypatch):
+    """A cold forced-ML profile must not hide safe content routing."""
+    import headroom.transforms.content_router as router_mod
+
+    router = ContentRouter(ContentRouterConfig())
+    compressor = SimpleNamespace(is_ready=lambda: False, ensure_background_load=MagicMock())
+    log_compressor = SimpleNamespace(
+        compress=lambda content, bias=1.0: SimpleNamespace(compressed="ERROR: compacted")
+    )
+    router._get_kompress = lambda: compressor
+    router._get_log_compressor = lambda: log_compressor
+    router._runtime_force_kompress = True
+    router._runtime_skip_kompress = False
+    router._runtime_target_ratio = None
+    router.config.enable_log_compressor = True
+    monkeypatch.setattr(
+        router_mod,
+        "_detect_content",
+        lambda content: router_mod.DetectionResult(router_mod.ContentType.BUILD_OUTPUT, 1.0, {}),
+    )
+    monkeypatch.setattr(router_mod, "is_mixed_content", lambda content: False)
+
+    result = router.compress("ERROR: repeated output\\n" * 40)
+
+    assert result.compressed == "ERROR: compacted"
+    assert result.strategy_used == CompressionStrategy.LOG
+    compressor.ensure_background_load.assert_called_once()
 
 
 def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
