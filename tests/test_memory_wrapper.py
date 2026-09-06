@@ -224,3 +224,17 @@ def test_parse_response_with_memory_tolerates_non_object_memory_block() -> None:
     )
     assert parsed.memories == [{"content": "User likes Python"}]
     assert parsed.content == "text"
+
+
+def test_parse_response_with_memory_tolerates_none_content() -> None:
+    from headroom.memory.inline_extractor import parse_response_with_memory
+
+    # `chat.completions` returns `message.content == None` whenever the model
+    # answers with tool/function calls instead of text. The callers forward that
+    # `None` straight in, where `re.search(pattern, None)` used to raise
+    # `TypeError` and crash the whole request. It must degrade gracefully and
+    # preserve `None` (not coerce a tool-call turn to text).
+    parsed = parse_response_with_memory(None)
+    assert parsed.content is None
+    assert parsed.memories == []
+    assert parsed.raw is None
