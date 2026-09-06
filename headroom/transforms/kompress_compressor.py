@@ -18,6 +18,7 @@ import contextlib
 import gc
 import hashlib
 import logging
+import math
 import os
 import re
 import threading
@@ -87,6 +88,206 @@ def _add_kompress_must_keep_words(
             kept_ids.add(word_idx + chunk_start)
 
 
+# ── Diversity-aware sentence selection (MMR + centroid scoring) ──────
+#
+# When compressing with a target_ratio, the default top-k selection picks
+# individual words by score. This can retain redundant information: three
+# sentences saying similar things all survive because each has decent scores.
+#
+# Diversity-aware selection groups words into sentences, computes a centroid
+# embedding (mean of sentence feature vectors), ranks sentences by cosine
+# similarity to the centroid (relevance), and applies Maximal Marginal
+# Relevance (MMR) to penalize redundancy:
+#
+#   score = λ * relevance - (1-λ) * max_similarity_to_selected
+#
+# λ controls the diversity-vs-relevance tradeoff. Higher λ (toward 1.0)
+# favors relevance; lower λ favors diversity. Default 0.7. Override with
+# HEADROOM_DIVERSITY_LAMBDA env var.
+
+
+def _get_diversity_lambda() -> float:
+    """Read the MMR lambda parameter from HEADROOM_DIVERSITY_LAMBDA.
+
+    Returns a value in [0.0, 1.0]. Default 0.7 (favors relevance over
+    diversity). Values outside [0, 1] are clamped.
+    """
+    raw = os.environ.get(DIVERSITY_LAMBDA_ENV, "0.7").strip()
+    if not raw:
+        return 0.7
+    try:
+        lam = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using default 0.7",
+            DIVERSITY_LAMBDA_ENV,
+            raw,
+        )
+        return 0.7
+    return max(0.0, min(1.0, lam))
+
+
+def _group_words_into_sentences(words: list[str]) -> list[list[int]]:
+    """Group word indices into sentences based on sentence-ending punctuation.
+
+    A sentence boundary is detected when a word ends with '.', '!', or '?'.
+    Words between boundaries form a sentence. Returns a list of lists, where
+    each inner list contains the word indices belonging to one sentence.
+    """
+    sentences: list[list[int]] = []
+    current: list[int] = []
+    for i, word in enumerate(words):
+        current.append(i)
+        if word and word[-1] in ".!?":
+            sentences.append(current)
+            current = []
+    if current:
+        sentences.append(current)
+    return sentences
+
+
+def _cosine_similarity_vec(a: dict[str, float], b: dict[str, float]) -> float:
+    """Cosine similarity between two sparse vectors (word -> score).
+
+    Both vectors use the same key space (lowercased words). Returns 0.0 for
+    empty vectors or zero-norm vectors.
+    """
+    if not a or not b:
+        return 0.0
+    dot = 0.0
+    for k, v in b.items():
+        if k in a:
+            dot += a[k] * v
+    if dot == 0.0:
+        return 0.0
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _diversity_select_words(
+    word_scores: dict[int, float],
+    words: list[str],
+    chunk_start: int,
+    target_ratio: float,
+    lam: float | None = None,
+) -> set[int]:
+    """Select words using centroid-based scoring + MMR diversity penalty.
+
+    Replaces simple top-k selection with diversity-aware sentence selection:
+
+    1. Words are grouped into sentences by punctuation boundaries.
+    2. Each sentence gets a sparse feature vector (word -> importance score).
+    3. The centroid (mean) of all sentence vectors is computed.
+    4. Relevance = cosine similarity of each sentence to the centroid.
+    5. MMR selects sentences iteratively, balancing relevance and diversity:
+       score = λ * relevance - (1-λ) * max_similarity_to_selected
+
+    Args:
+        word_scores: ``{local_word_index: model_score}`` from the model.
+        words: Word list for this chunk.
+        chunk_start: Offset of this chunk in the full word list (for index
+            mapping). The returned indices are *local* to the chunk.
+        target_ratio: Target keep ratio (0.0–1.0).
+        lam: MMR λ parameter. ``None`` reads from env (default 0.7).
+
+    Returns:
+        Set of word indices (local to chunk) to keep.
+    """
+    if lam is None:
+        lam = _get_diversity_lambda()
+
+    # Group words into sentences
+    sentences = _group_words_into_sentences(words)
+    n_sents = len(sentences)
+
+    if n_sents <= 1:
+        # Only one sentence — no diversity to enforce; use simple top-k
+        sorted_wids = sorted(word_scores, key=lambda w: word_scores[w], reverse=True)
+        num_keep = max(1, int(len(sorted_wids) * target_ratio))
+        return set(sorted_wids[:num_keep])
+
+    # Build sentence feature vectors (lowercased word -> importance score)
+    sent_vectors: list[dict[str, float]] = []
+    sent_importance: list[float] = []
+
+    for sent_indices in sentences:
+        vec: dict[str, float] = {}
+        scores_list: list[float] = []
+        for wi in sent_indices:
+            score = word_scores.get(wi, 0.0)
+            word = words[wi].lower() if wi < len(words) else ""
+            if word:
+                vec[word] = max(vec.get(word, 0.0), score)
+                scores_list.append(score)
+        sent_vectors.append(vec)
+        sent_importance.append(sum(scores_list) / len(scores_list) if scores_list else 0.0)
+
+    # Compute centroid: mean of all sentence vectors
+    vocab: set[str] = set()
+    for vec in sent_vectors:
+        vocab.update(vec.keys())
+
+    centroid: dict[str, float] = {}
+    for word in vocab:
+        values = [v.get(word, 0.0) for v in sent_vectors]
+        centroid[word] = sum(values) / len(values)
+
+    # Relevance: cosine similarity to centroid
+    relevance = [_cosine_similarity_vec(vec, centroid) for vec in sent_vectors]
+
+    # MMR iterative selection
+    target_keep_words = max(1, int(len(words) * target_ratio))
+    selected_sents: list[int] = []
+    remaining = list(range(n_sents))
+    kept_indices: set[int] = set()
+    kept_word_count = 0
+
+    while remaining and kept_word_count < target_keep_words:
+        best_score = -float("inf")
+        best_idx = remaining[0]
+
+        for i in remaining:
+            # Max cosine similarity to any already-selected sentence
+            max_sim = 0.0
+            if selected_sents:
+                for sel_i in selected_sents:
+                    sim = _cosine_similarity_vec(sent_vectors[i], sent_vectors[sel_i])
+                    if sim > max_sim:
+                        max_sim = sim
+
+            # MMR score
+            mmr_score = lam * relevance[i] - (1.0 - lam) * max_sim
+
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = i
+
+        selected_sents.append(best_idx)
+        remaining.remove(best_idx)
+        for wi in sentences[best_idx]:
+            kept_indices.add(wi)
+        kept_word_count += len(sentences[best_idx])
+
+    logger.debug(
+        "Diversity select: %d sentences, %d selected, %d/%d words kept, "
+        "lambda=%.2f, avg_relevance=%.3f",
+        n_sents,
+        len(selected_sents),
+        len(kept_indices),
+        len(words),
+        lam,
+        sum(relevance) / len(relevance) if relevance else 0.0,
+    )
+
+    return kept_indices
+
+
+# ── End diversity-aware selection ─────────────────────────────────────
+
+
 # ONNX artifacts are resolved against the model repo in this order, falling
 # through on download miss OR session-load failure:
 #
@@ -131,6 +332,7 @@ KOMPRESS_REQUEST_DEADLINE_ENV = "HEADROOM_COMPRESSION_DEADLINE_MS"
 _DEFAULT_ACQUIRE_TIMEOUT_SECONDS = 5.0
 _DEFAULT_TIME_BUDGET_SECONDS = 20.0
 _DEFAULT_CANARY_THRESHOLD_SECONDS = 5.0
+DIVERSITY_LAMBDA_ENV = "HEADROOM_DIVERSITY_LAMBDA"
 
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
@@ -1364,6 +1566,17 @@ class KompressCompressor(Transform):
 
     Auto-downloads the model from HuggingFace on first use.
     Configure via KompressConfig to select model, chunk size, and threshold.
+
+    Model loading is deferred until first use (lazy loading). The ONNX model
+    load takes ~19.5s on cold start, so deferring it to the first compression
+    call keeps startup fast. The ``preload()`` method can force early loading
+    when background warmup is desired.
+
+    Production behavior:
+    - Model load failures are caught and logged; compression falls back to
+      passthrough (content returned unchanged) so the pipeline never crashes.
+    - ``is_model_loaded()`` returns True/False for health checks without I/O.
+    - ``is_ready()`` is the hot-path variant (no lock, no I/O).
     """
 
     name: str = "kompress_compressor"
@@ -1378,6 +1591,61 @@ class KompressCompressor(Transform):
         # Consecutive inference failures — reset by any success, so a transient
         # error can't accumulate toward the latch across a healthy run.
         self._inference_failures: int = 0
+
+    # -- Lazy model loading ------------------------------------------------
+    # The ONNX/PyTorch model is loaded on first use, not at __init__ time.
+    # _ensure_model_loaded() is the single choke-point for loading; callers
+    # that need the model (compress, compress_batch, preload) go through it.
+    # After the first successful load the result is served from the module-
+    # level _kompress_cache (shared across instances with the same model_id).
+
+    def _ensure_model_loaded(self, *, allow_download: bool = True) -> tuple[Any, Any, str]:
+        """Lazily load the Kompress model on first compression call.
+
+        Returns ``(model, tokenizer, backend)``.  If the model is already in
+        the module-level ``_kompress_cache`` this is a fast dict lookup (no
+        I/O).  On a cold cache the expensive ONNX/PyTorch load happens here,
+        *not* at ``__init__`` time, keeping startup non-blocking.
+
+        Args:
+            allow_download: When ``False`` the model is loaded from the local
+                cache only; a cache miss raises :class:`KompressModelNotCached`
+                instead of fetching from the network.
+
+        Raises:
+            KompressModelNotCached: When ``allow_download=False`` and the
+                model is not in the local cache.
+            ImportError: When neither onnxruntime nor torch is installed.
+        """
+        model_id = self.config.model_id
+        if model_id in _kompress_cache:
+            return _kompress_cache[model_id]
+        # Production: log load timing so cold-start latency is observable.
+        t0 = time.perf_counter()
+        logger.info(
+            "Kompress: lazy-loading model %s (allow_download=%s) ...",
+            model_id,
+            allow_download,
+        )
+        try:
+            result = _load_kompress(model_id, self.config.device, allow_download=allow_download)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info(
+                "Kompress: model %s loaded in %.0fms (backend=%s)",
+                model_id,
+                elapsed_ms,
+                result[2],
+            )
+            return result
+        except Exception:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.warning(
+                "Kompress: model load FAILED for %s after %.0fms; "
+                "compression will fall back to passthrough",
+                model_id,
+                elapsed_ms,
+            )
+            raise
 
     def preload(self, *, allow_download: bool = True) -> str:
         """Load the backing model/tokenizer and return the selected backend.
@@ -1481,6 +1749,14 @@ class KompressCompressor(Transform):
         entry = _kompress_cache.get(self.config.model_id)
         return entry[2] if entry is not None else None
 
+    def is_model_loaded(self) -> bool:
+        """Health-check: True if the Kompress model is in memory and ready.
+
+        Equivalent to :meth:`is_ready` but named for monitoring/health-check
+        APIs. Returns True without I/O — safe to call on every request.
+        """
+        return self.is_ready()
+
     def ensure_background_load(self) -> None:
         """Kick off a one-shot, non-blocking background download of the model.
 
@@ -1543,8 +1819,8 @@ class KompressCompressor(Transform):
             self._deadline_s = deadline_s
 
         try:
-            model, tokenizer, backend = _load_kompress(
-                self.config.model_id, self.config.device, allow_download=allow_download
+            model, tokenizer, backend = self._ensure_model_loaded(
+                allow_download=allow_download,
             )
             is_onnx = backend.startswith("onnx")
             device_type = _model_device_type(model, backend)
@@ -1691,11 +1967,23 @@ class KompressCompressor(Transform):
                         if wid not in word_scores or s > word_scores[wid]:
                             word_scores[wid] = s
                     if word_scores:
-                        sorted_wids = sorted(
-                            word_scores, key=lambda w: word_scores[w], reverse=True
-                        )
-                        num_keep = max(1, int(len(sorted_wids) * target_ratio))
-                        for wid in sorted_wids[:num_keep]:
+                        # Preserve the established top-k behavior unless an
+                        # operator explicitly opts into diversity-aware MMR.
+                        if DIVERSITY_LAMBDA_ENV in os.environ:
+                            local_keep = _diversity_select_words(
+                                word_scores,
+                                chunk_words,
+                                chunk_start,
+                                target_ratio,
+                            )
+                        else:
+                            ranked = sorted(
+                                word_scores, key=lambda wid: word_scores[wid], reverse=True
+                            )
+                            local_keep = set(
+                                ranked[: max(1, int(len(ranked) * target_ratio))]
+                            )
+                        for wid in local_keep:
                             kept_ids.add(wid + chunk_start)
                 else:
                     for idx, wid in enumerate(word_ids):
@@ -1949,7 +2237,7 @@ class KompressCompressor(Transform):
 
         # Load model once for the whole batch.
         try:
-            model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+            model, tokenizer, backend = self._ensure_model_loaded()
         except Exception as e:
             logger.warning("Kompress load failed for batch: %s — passthrough all", e)
             for i in range(n):
@@ -2076,12 +2364,14 @@ class KompressCompressor(Transform):
                         continue
 
                     if ratio is not None:
-                        # Top-k by score.
-                        sorted_wids = sorted(
-                            word_scores, key=lambda w: word_scores[w], reverse=True
+                        # Diversity-aware selection: centroid scoring + MMR
+                        local_keep = _diversity_select_words(
+                            word_scores,
+                            chunk_words,
+                            chunk_start,
+                            ratio,
                         )
-                        num_keep = max(1, int(len(sorted_wids) * ratio))
-                        for wid in sorted_wids[:num_keep]:
+                        for wid in local_keep:
                             kept_ids_per_text[text_idx].add(wid + chunk_start)
                     else:
                         # Threshold from config (default 0.5, matches ONNX get_keep_mask).
@@ -2185,17 +2475,21 @@ class KompressCompressor(Transform):
           - PyTorch CPU: typically similar (conservative fallback).
           - PyTorch + CUDA: 2.0-2.3x speedup at N>=3 — use batched path.
 
-        If the model isn't loaded yet, we trigger loading so the backend
-        is known. This is a no-op if the model is already in cache.
+        When the model isn't loaded yet, returns ``True`` (sequential) to avoid
+        an expensive eager load just to check the backend type. After the first
+        compression call the model is cached and the backend is known, so
+        subsequent batch calls correctly decide. This is the lazy-loading path
+        that keeps startup non-blocking.
         """
         model_id = self.config.model_id
+        # Fast path: if the model is already loaded, check the cached backend.
+        # This is the common case after the first compression call.
         if model_id not in _kompress_cache:
-            try:
-                _load_kompress(model_id, self.config.device)
-            except Exception:
-                return True
-
-        if model_id not in _kompress_cache:
+            # Model not loaded yet — default to sequential (conservative).
+            # Avoids an expensive eager load (ONNX ~19.5s) just to determine
+            # the backend type. The backend will be known after the first
+            # compress() call, at which point this check will take the fast
+            # path above.
             return True
 
         model, _tokenizer, backend = _kompress_cache[model_id]
