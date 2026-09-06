@@ -7,6 +7,7 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
     _openai_responses_context_budget,
+    _openai_responses_tool_results_for_learning,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -53,6 +54,129 @@ def test_openai_responses_context_budget_breaks_out_static_and_live_buckets() ->
         b"line one\nline two\n"
     )
     assert budget["input_breakdown"]["message"]["items"] == 1
+
+
+def test_openai_responses_tool_results_for_learning_pairs_calls_with_outputs() -> None:
+    input_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "Read",
+            "arguments": '{"file_path": "/tmp/example.py"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_read",
+            "output": "print('ok')",
+        },
+    ]
+
+    results = _openai_responses_tool_results_for_learning(input_items)
+
+    assert results == [
+        {
+            "tool_name": "Read",
+            "input": {"file_path": "/tmp/example.py"},
+            "output": "print('ok')",
+            "is_error": False,
+        }
+    ]
+
+
+def test_openai_responses_tool_results_for_learning_pairs_custom_tool_calls() -> None:
+    input_items: list[dict[str, Any]] = [
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_shell",
+            "name": "shell",
+            "input": '{"cmd": "python --version"}',
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_shell",
+            "output": "Python 3.12.13",
+        },
+    ]
+
+    results = _openai_responses_tool_results_for_learning(input_items)
+
+    assert results == [
+        {
+            "tool_name": "Bash",
+            "input": {"command": "python --version"},
+            "output": "Python 3.12.13",
+            "is_error": False,
+        }
+    ]
+
+
+def test_openai_responses_tool_results_for_learning_coerces_bash_command_lists() -> None:
+    input_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call",
+            "call_id": "call_exec",
+            "name": "exec_command",
+            "arguments": '{"cmd": ["bash", "-lc", "uv run pytest"]}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_exec",
+            "output": "passed",
+        },
+    ]
+
+    results = _openai_responses_tool_results_for_learning(input_items)
+
+    assert results == [
+        {
+            "tool_name": "Bash",
+            "input": {"command": "uv run pytest"},
+            "output": "passed",
+            "is_error": False,
+        }
+    ]
+
+
+def test_openai_responses_tool_results_for_learning_skips_unpaired_outputs() -> None:
+    input_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call_output",
+            "call_id": "missing_call",
+            "output": "No such file or directory",
+        },
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "another_missing_call",
+            "output": "done",
+        },
+    ]
+
+    assert _openai_responses_tool_results_for_learning(input_items) == []
+
+
+def test_openai_responses_tool_results_for_learning_handles_bad_args_and_errors() -> None:
+    input_items: list[dict[str, Any]] = [
+        {
+            "type": "function_call",
+            "call_id": "call_bash",
+            "name": "Bash",
+            "arguments": "{not json",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_bash",
+            "output": "No such file or directory",
+        },
+    ]
+
+    results = _openai_responses_tool_results_for_learning(input_items)
+
+    assert results[0] == {
+        "tool_name": "Bash",
+        "input": {"command": ""},
+        "output": "No such file or directory",
+        "is_error": True,
+    }
 
 
 def test_openai_tool_schema_compaction_preserves_invocation_shape() -> None:

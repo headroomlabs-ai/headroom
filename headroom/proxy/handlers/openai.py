@@ -55,6 +55,7 @@ from headroom.copilot_auth import (
     build_copilot_upstream_url,
     is_copilot_api_url,
 )
+from headroom.learn._shared import normalize_tool_name
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.providers.codex.responses import (
     codex_responses_http_url,
@@ -1076,6 +1077,113 @@ def _responses_input_to_waste_messages(instructions: Any, input_data: Any) -> li
     return messages
 
 
+def _responses_function_args(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments.strip():
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _responses_command_arg_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if not value:
+            return ""
+        parts = [str(part) for part in value if part is not None]
+        if len(parts) >= 3 and parts[-2] in {"-c", "-lc"}:
+            return parts[-1]
+        return " ".join(parts)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_responses_tool_for_learning(
+    name: Any,
+    input_args: Any,
+) -> tuple[str, dict[str, Any]]:
+    tool_name = name if isinstance(name, str) and name else "unknown"
+    normalized_name = normalize_tool_name(tool_name)
+    parsed = _responses_function_args(input_args)
+
+    if normalized_name == "Bash":
+        parsed = dict(parsed)
+        command = parsed.pop("cmd", None)
+        if "command" in parsed:
+            command = parsed["command"]
+        parsed["command"] = _responses_command_arg_text(command)
+
+    return normalized_name, parsed
+
+
+def _openai_responses_tool_results_for_learning(
+    input_data: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(input_data, list):
+        return []
+
+    try:
+        from headroom.memory.traffic_learner import _is_error as output_is_error
+    except Exception:
+        output_is_error = None
+
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type != "function_call" and (
+            not isinstance(item_type, str)
+            or f"{item_type}_output" not in _RESPONSES_OUTPUT_ITEM_TYPES
+        ):
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        name = item.get("name")
+        input_args = item.get("arguments") if item_type == "function_call" else item.get("input")
+        tool_name, tool_input = _normalize_responses_tool_for_learning(name, input_args)
+        calls_by_id[call_id] = {
+            "tool_name": tool_name,
+            "input": tool_input,
+        }
+
+    results: list[dict[str, Any]] = []
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in _RESPONSES_OUTPUT_ITEM_TYPES:
+            continue
+        call_id = item.get("call_id")
+        call = calls_by_id.get(call_id if isinstance(call_id, str) else "")
+        if call is None:
+            continue
+        output = _responses_part_text(item.get("output"))
+        if not output and item.get("output") is not None:
+            output = json.dumps(item.get("output"), ensure_ascii=False, default=str)
+        is_error = bool(item.get("is_error"))
+        if output_is_error is not None:
+            try:
+                is_error = is_error or output_is_error(output)
+            except Exception:
+                pass
+        results.append(
+            {
+                "tool_name": call["tool_name"],
+                "input": call["input"],
+                "output": output,
+                "is_error": is_error,
+            }
+        )
+    return results
+
+
 def _responses_input_to_learner_messages(
     instructions: Any,
     input_data: Any,
@@ -1776,19 +1884,21 @@ class OpenAIHandlerMixin:
             ):
                 traffic_learner.set_backend(memory_handler.backend)
 
-            learner_messages = _responses_input_to_learner_messages(
-                body.get("instructions"),
-                body.get("input", ""),
-            )
-            tool_results = traffic_learner.extract_tool_results_from_messages(learner_messages)
-            for tool_result in tool_results[-5:]:
+            input_data = body.get("input", "")
+            for tool_result in _openai_responses_tool_results_for_learning(input_data)[-5:]:
                 await traffic_learner.on_tool_result(
                     tool_name=tool_result["tool_name"],
                     tool_input=tool_result["input"],
                     tool_output=tool_result["output"],
                     is_error=tool_result["is_error"],
                 )
-            await traffic_learner.on_messages(learner_messages)
+
+            learner_messages = _responses_input_to_learner_messages(
+                body.get("instructions"),
+                input_data,
+            )
+            if learner_messages:
+                await traffic_learner.on_messages(learner_messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
 
@@ -7223,6 +7333,11 @@ class OpenAIHandlerMixin:
                 ):
                     first_msg_raw = json.dumps(body)
                     logger.info(f"[{request_id}] WS Responses: forced store=false for ChatGPT auth")
+                if isinstance(ws_response_body_for_store, dict):
+                    await self._observe_openai_responses_traffic(
+                        ws_response_body_for_store,
+                        request_id=request_id,
+                    )
             ws_input_tokens_total = 0
             ws_output_tokens_total = 0
             ws_cache_read_tokens_total = 0
@@ -8003,6 +8118,11 @@ class OpenAIHandlerMixin:
                             )
                         frame_compression_elapsed_ms = 0.0
                         try:
+                            await self._observe_openai_responses_traffic(
+                                inner_payload,
+                                request_id=request_id,
+                            )
+
                             model_for_frame = inner_payload.get("model") or ""
                             _frame_auth_mode = classify_auth_mode(ws_headers)
                             _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
