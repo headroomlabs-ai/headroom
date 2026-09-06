@@ -69,6 +69,21 @@ def _warn_pricing_once(model: str, message: str) -> None:
     logger.warning(message)
 
 
+def _is_passthrough_model(model: str) -> bool:
+    """True when ``model`` is an internal ``passthrough:<endpoint>`` label.
+
+    Passthrough handlers (e.g. Anthropic's ``/v1/messages/count_tokens`` or the
+    batch endpoint) tag their requests with a synthetic ``passthrough:`` model
+    name purely so dashboards can see the upstream call happened. These labels
+    are not billable model calls — there is no provider rate to look up, and
+    LiteLLM rejects them with ``LLM Provider NOT provided``. Pricing lookups
+    for them only produce a spurious WARNING per process (and a misleading
+    ``passthrough:*`` row on the dashboard), so they are skipped outright
+    (#2578).
+    """
+    return model.startswith("passthrough:")
+
+
 # A route whose responses never carry a usage breakdown hits the estimated-basis
 # fallback on *every* request, so the warning is deduped per model for the same
 # reason pricing warnings are (#2504): one line per model per process, not one
@@ -909,6 +924,15 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
+        # Internal passthrough labels are not billable model calls, so there is
+        # no rate to look up. Skip before even touching LiteLLM so these don't
+        # emit a spurious pricing WARNING on every /count_tokens-style call
+        # (#2578). Must precede the LiteLLM-availability check below, otherwise
+        # a LiteLLM-less deployment would warn "LiteLLM not available" for a
+        # label it never had any business pricing.
+        if _is_passthrough_model(model):
+            return None
+
         litellm = _get_litellm_module()
         if litellm is None:
             _warn_pricing_once(
