@@ -550,9 +550,22 @@ class SQLiteMemoryStore:
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering
+                # Use JSON extraction for metadata filtering.
+                #
+                # ``json_extract`` returns a NATIVE SQLite value (INTEGER / REAL /
+                # TEXT), so a scalar filter must bind the native Python value.
+                # Binding ``json.dumps(value)`` instead compared the numeric/boolean
+                # column against its text form ("5", "true") — and SQLite never
+                # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
+                # nothing. ``bool`` is a subclass of ``int``, so it is covered here
+                # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
+                # A non-scalar value (dict/list) is not a bindable SQLite type, so it
+                # keeps the JSON-text comparison rather than raising.
                 conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                params.append(json.dumps(value) if not isinstance(value, str) else value)
+                if isinstance(value, (str, int, float)):
+                    params.append(value)
+                else:
+                    params.append(json.dumps(value))
 
         return conditions, params
 
