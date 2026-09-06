@@ -2531,19 +2531,11 @@ class AnthropicHandlerMixin:
                 and self.config.ccr_proactive_expansion
                 and ccr_workspace_key
             ):
-                # Extract user query from messages
-                user_query = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            user_query = content
-                        elif isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    user_query = block.get("text", "")
-                                    break
-                        break
+                # Relevance query for this turn. Same helper the compression
+                # pipeline scores with, so both read the query the same way;
+                # `latest_user_turn_only` keeps the previous behaviour of not
+                # reaching back past the newest user turn.
+                user_query = extract_user_query(messages, latest_user_turn_only=True)
 
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(

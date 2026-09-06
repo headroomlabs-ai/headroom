@@ -43,12 +43,23 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
     return hashlib.md5(data).hexdigest()[:length]  # nosec B324
 
 
-def extract_user_query(messages: list[dict[str, Any]]) -> str:
+def extract_user_query(
+    messages: list[dict[str, Any]], *, latest_user_turn_only: bool = False
+) -> str:
     """Extract the most recent user question from messages.
 
     Used to pass context through the compression pipeline so transforms like
     SmartCrusher can score items by relevance to the user's actual question,
     not just by statistical properties (position, anomaly, boundary).
+
+    Args:
+        messages: Conversation messages, oldest first.
+        latest_user_turn_only: Stop at the newest user message instead of
+            walking back through earlier ones when it yields no text. Callers
+            that treat the query as "what this turn is about" want this: on a
+            tool_result continuation turn the newest user message carries no
+            text, and resurrecting an older turn's question would make them
+            act on a stale intent.
     """
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -61,6 +72,8 @@ def extract_user_query(messages: list[dict[str, Any]]) -> str:
                         text = str(block.get("text", "")).strip()
                         if text:
                             return text
+            if latest_user_turn_only:
+                return ""
     return ""
 
 
