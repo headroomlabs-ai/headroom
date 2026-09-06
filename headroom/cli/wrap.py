@@ -1670,24 +1670,37 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     with a SessionStart hook that runs the hidden ``wrap selfheal`` command.
     SessionStart ONLY (never PreToolUse): the self-heal must not run per Bash
     call mid-session, where a transient probe blip could clear a live session.
-    Idempotent — an existing entry carrying the marker is not duplicated.
+    Idempotent — an existing entry carrying the marker is not duplicated. If the
+    stored command has drifted from what ``_wrap_selfheal_hook_command()``
+    would generate today (e.g. it was hand-edited, or ``headroom`` moved on
+    PATH since it was installed), the stored command is overwritten in place
+    rather than left stale forever.
     """
     payload = _read_settings_for_write(settings_path)
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
     entries = (
         list(hooks.get("SessionStart") or []) if isinstance(hooks.get("SessionStart"), list) else []
     )
-    already = any(
-        isinstance(entry, dict)
-        and isinstance(entry.get("hooks"), list)
-        and any(
-            isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
-            for item in entry["hooks"]
-        )
-        for entry in entries
-    )
-    if already:
-        return
+    current_command = _wrap_selfheal_hook_command()
+    changed = False
+    for entry in entries:
+        if not (isinstance(entry, dict) and isinstance(entry.get("hooks"), list)):
+            continue
+        for item in entry["hooks"]:
+            if not (
+                isinstance(item, dict)
+                and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
+            ):
+                continue
+            if item.get("command") != current_command:
+                item["command"] = current_command
+                changed = True
+            hooks["SessionStart"] = entries
+            payload["hooks"] = hooks
+            if changed:
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_text(settings_path, json.dumps(payload, indent=2) + "\n")
+            return
     entries.append(
         {
             "matcher": "startup|resume",
