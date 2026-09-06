@@ -565,6 +565,23 @@ class ToolIntelligenceNetwork:
             model_family: Target model family (`claude-3-5`, `gpt-4o`, …).
                 Defaults to `DEFAULT_MODEL_FAMILY` when not provided.
         """
+        # The beacon's copy of this event is taken BEFORE the enabled check.
+        # TOIN's own store is gated on HEADROOM_TELEMETRY, which is opt-in and
+        # therefore off across almost the whole fleet -- so recording after the
+        # gate would mean the network in "Tool Output Intelligence Network"
+        # only ever sees the installs that least need it.
+        #
+        # Costs nothing extra: `tool_signature` was already built by the
+        # caller, and `record_tool_shape` reads a handful of its integer
+        # attributes and no hash at all. Off by default and never raises, like
+        # every other beacon entry point.
+        try:
+            from headroom.telemetry.session import record_tool_shape
+
+            record_tool_shape(tool_signature, original_tokens, compressed_tokens)
+        except Exception:  # pragma: no cover - telemetry must never break a request
+            logger.debug("beacon: tool shape recording failed", exc_info=True)
+
         # HIGH FIX: Check enabled FIRST to avoid computing structure_hash if disabled
         # This saves CPU when TOIN is turned off
         if not self._config.enabled:

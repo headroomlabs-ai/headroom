@@ -75,7 +75,11 @@ class TestFormatTelemetryNotice:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.delenv("HEADROOM_TELEMETRY_WARN", raising=False)
         notice = format_telemetry_notice()
-        assert "compression stats" in notice
+        # Substance, not the exact phrasing: what is sent (counters), what is
+        # not (prompts), and how to turn it off. The wording widened at schema
+        # v2 — "compression stats" stopped describing a payload that also
+        # carries cache behaviour, session shape and configuration.
+        assert "usage counters" in notice
         assert "HEADROOM_BEACON=off" in notice
 
     def test_beacon_notice_names_what_is_not_sent(self, monkeypatch):
@@ -233,7 +237,7 @@ class TestWrapCLITelemetryNotice:
 
         _print_telemetry_notice()
         captured = capsys.readouterr()
-        assert "compression stats" in captured.out
+        assert "usage counters" in captured.out
         assert "HEADROOM_BEACON=off" in captured.out
 
     def test_print_notice_silent_when_telemetry_off(self, monkeypatch, capsys):

@@ -12,13 +12,25 @@
           {
             "key": "service.version",
             "value": {
-              "stringValue": "0.34.0"
+              "stringValue": "0.37.0"
             }
           },
           {
             "key": "headroom.install_id",
             "value": {
               "stringValue": "00000000000000000000000000000000"
+            }
+          },
+          {
+            "key": "headroom.install_mode",
+            "value": {
+              "stringValue": "pip"
+            }
+          },
+          {
+            "key": "headroom.stack",
+            "value": {
+              "stringValue": "proxy"
             }
           },
           {
@@ -42,14 +54,14 @@
           },
           "logRecords": [
             {
-              "timeUnixNano": "1785731364402434048",
+              "timeUnixNano": "1787703693355874048",
               "body": {
                 "kvlistValue": {
                   "values": [
                     {
                       "key": "schema_version",
                       "value": {
-                        "intValue": "1"
+                        "intValue": "2"
                       }
                     },
                     {
@@ -60,7 +72,7 @@
                             {
                               "key": "id",
                               "value": {
-                                "stringValue": "sample0000000001"
+                                "stringValue": "4996e02d2b7cafe7"
                               }
                             },
                             {
@@ -72,25 +84,25 @@
                             {
                               "key": "duration_s",
                               "value": {
-                                "intValue": "4210"
+                                "intValue": "135"
                               }
                             },
                             {
                               "key": "turns",
                               "value": {
-                                "intValue": "47"
+                                "intValue": "4"
                               }
                             },
                             {
                               "key": "ended",
                               "value": {
-                                "stringValue": "active"
+                                "stringValue": "shutdown"
                               }
                             },
                             {
                               "key": "final",
                               "value": {
-                                "boolValue": false
+                                "boolValue": true
                               }
                             }
                           ]
@@ -105,55 +117,55 @@
                             {
                               "key": "original",
                               "value": {
-                                "intValue": "890000"
+                                "intValue": "480000"
                               }
                             },
                             {
                               "key": "attempted",
                               "value": {
-                                "intValue": "410000"
+                                "intValue": "160000"
                               }
                             },
                             {
                               "key": "input",
                               "value": {
-                                "intValue": "570000"
+                                "intValue": "360000"
                               }
                             },
                             {
                               "key": "output",
                               "value": {
-                                "intValue": "41000"
+                                "intValue": "4800"
                               }
                             },
                             {
                               "key": "saved",
                               "value": {
-                                "intValue": "320000"
+                                "intValue": "120000"
                               }
                             },
                             {
                               "key": "tool_saved",
                               "value": {
-                                "intValue": "48000"
+                                "intValue": "0"
                               }
                             },
                             {
                               "key": "cache_read",
                               "value": {
-                                "intValue": "210000"
+                                "intValue": "240000"
                               }
                             },
                             {
                               "key": "cache_write",
                               "value": {
-                                "intValue": "30000"
+                                "intValue": "32000"
                               }
                             },
                             {
                               "key": "uncached",
                               "value": {
-                                "intValue": "650000"
+                                "intValue": "88000"
                               }
                             }
                           ]
@@ -168,31 +180,43 @@
                             {
                               "key": "saved_pct",
                               "value": {
-                                "doubleValue": 35.96
+                                "doubleValue": 25.0
                               }
                             },
                             {
                               "key": "eligible_pct",
                               "value": {
-                                "doubleValue": 46.07
+                                "doubleValue": 33.33
                               }
                             },
                             {
                               "key": "yield_pct",
                               "value": {
-                                "doubleValue": 78.05
+                                "doubleValue": 75.0
+                              }
+                            },
+                            {
+                              "key": "all_layers_saved_pct",
+                              "value": {
+                                "doubleValue": 25.0
+                              }
+                            },
+                            {
+                              "key": "all_layers_yield_pct",
+                              "value": {
+                                "doubleValue": 75.0
                               }
                             },
                             {
                               "key": "cache_read_pct",
                               "value": {
-                                "doubleValue": 23.6
+                                "doubleValue": 50.0
                               }
                             },
                             {
                               "key": "overhead_pct",
                               "value": {
-                                "doubleValue": 1.96
+                                "doubleValue": 1.14
                               }
                             }
                           ]
@@ -212,7 +236,7 @@
                                     {
                                       "key": "crush",
                                       "value": {
-                                        "intValue": "47"
+                                        "intValue": "4"
                                       }
                                     }
                                   ]
@@ -220,15 +244,35 @@
                               }
                             },
                             {
+                              "key": "by_strategy",
+                              "value": {
+                                "arrayValue": {
+                                  "values": []
+                                }
+                              }
+                            },
+                            {
                               "key": "overhead_ms_total",
                               "value": {
-                                "intValue": "1840"
+                                "doubleValue": 192.0
                               }
                             },
                             {
                               "key": "latency_ms_total",
                               "value": {
-                                "intValue": "94000"
+                                "doubleValue": 16800.0
+                              }
+                            },
+                            {
+                              "key": "overhead_ms_per_turn",
+                              "value": {
+                                "doubleValue": 48.0
+                              }
+                            },
+                            {
+                              "key": "latency_ms_per_turn",
+                              "value": {
+                                "doubleValue": 4200.0
                               }
                             },
                             {
@@ -240,7 +284,7 @@
                             {
                               "key": "response_cache_hits",
                               "value": {
-                                "intValue": "3"
+                                "intValue": "0"
                               }
                             }
                           ]
@@ -252,6 +296,21 @@
                       "value": {
                         "kvlistValue": {
                           "values": []
+                        }
+                      }
+                    },
+                    {
+                      "key": "sources",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "proxy",
+                              "value": {
+                                "intValue": "4"
+                              }
+                            }
+                          ]
                         }
                       }
                     },
@@ -273,7 +332,7 @@
                         "arrayValue": {
                           "values": [
                             {
-                              "stringValue": "claude-sonnet-4-5-20250929"
+                              "stringValue": "claude-sonnet-5"
                             }
                           ]
                         }
@@ -282,21 +341,749 @@
                     {
                       "key": "failures",
                       "value": {
-                        "intValue": "2"
+                        "intValue": "0"
                       }
                     },
                     {
                       "key": "failure_statuses",
                       "value": {
                         "kvlistValue": {
+                          "values": []
+                        }
+                      }
+                    },
+                    {
+                      "key": "quality",
+                      "value": {
+                        "kvlistValue": {
                           "values": [
                             {
-                              "key": "529",
+                              "key": "reread_tokens",
                               "value": {
-                                "intValue": "2"
+                                "intValue": "3600"
+                              }
+                            },
+                            {
+                              "key": "reread_compressed_tokens",
+                              "value": {
+                                "intValue": "1600"
+                              }
+                            },
+                            {
+                              "key": "waste_turns",
+                              "value": {
+                                "intValue": "4"
+                              }
+                            },
+                            {
+                              "key": "waste",
+                              "value": {
+                                "arrayValue": {
+                                  "values": []
+                                }
                               }
                             }
                           ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "hist",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "msgs",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "edges",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "5"
+                                            },
+                                            {
+                                              "intValue": "20"
+                                            },
+                                            {
+                                              "intValue": "50"
+                                            },
+                                            {
+                                              "intValue": "100"
+                                            },
+                                            {
+                                              "intValue": "250"
+                                            },
+                                            {
+                                              "intValue": "500"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    {
+                                      "key": "counts",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "4"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "overhead_ms",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "edges",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "doubleValue": 1.0
+                                            },
+                                            {
+                                              "doubleValue": 5.0
+                                            },
+                                            {
+                                              "doubleValue": 25.0
+                                            },
+                                            {
+                                              "doubleValue": 100.0
+                                            },
+                                            {
+                                              "doubleValue": 500.0
+                                            },
+                                            {
+                                              "doubleValue": 2000.0
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    {
+                                      "key": "counts",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "4"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "saved_pct",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "edges",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "doubleValue": 0.5
+                                            },
+                                            {
+                                              "doubleValue": 5.0
+                                            },
+                                            {
+                                              "doubleValue": 10.0
+                                            },
+                                            {
+                                              "doubleValue": 20.0
+                                            },
+                                            {
+                                              "doubleValue": 40.0
+                                            },
+                                            {
+                                              "doubleValue": 60.0
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    {
+                                      "key": "counts",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "4"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "ttfb_ms",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "edges",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "doubleValue": 200.0
+                                            },
+                                            {
+                                              "doubleValue": 500.0
+                                            },
+                                            {
+                                              "doubleValue": 1000.0
+                                            },
+                                            {
+                                              "doubleValue": 2500.0
+                                            },
+                                            {
+                                              "doubleValue": 5000.0
+                                            },
+                                            {
+                                              "doubleValue": 15000.0
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    {
+                                      "key": "counts",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "4"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "turn_tokens",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": [
+                                    {
+                                      "key": "edges",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "1000"
+                                            },
+                                            {
+                                              "intValue": "4000"
+                                            },
+                                            {
+                                              "intValue": "16000"
+                                            },
+                                            {
+                                              "intValue": "64000"
+                                            },
+                                            {
+                                              "intValue": "128000"
+                                            },
+                                            {
+                                              "intValue": "256000"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    },
+                                    {
+                                      "key": "counts",
+                                      "value": {
+                                        "arrayValue": {
+                                          "values": [
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "4"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            },
+                                            {
+                                              "intValue": "0"
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "shapes",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "by_content",
+                              "value": {
+                                "arrayValue": {
+                                  "values": []
+                                }
+                              }
+                            },
+                            {
+                              "key": "by_tool",
+                              "value": {
+                                "arrayValue": {
+                                  "values": []
+                                }
+                              }
+                            },
+                            {
+                              "key": "truncated",
+                              "value": {
+                                "boolValue": false
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "cache",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "gap_edges_s",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "doubleValue": 30.0
+                                    },
+                                    {
+                                      "doubleValue": 60.0
+                                    },
+                                    {
+                                      "doubleValue": 120.0
+                                    },
+                                    {
+                                      "doubleValue": 300.0
+                                    },
+                                    {
+                                      "doubleValue": 600.0
+                                    },
+                                    {
+                                      "doubleValue": 1800.0
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "hits",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "3"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "misses",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "write_5m",
+                              "value": {
+                                "intValue": "24000"
+                              }
+                            },
+                            {
+                              "key": "write_1h",
+                              "value": {
+                                "intValue": "8000"
+                              }
+                            },
+                            {
+                              "key": "inferred_turns",
+                              "value": {
+                                "intValue": "0"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "trajectory",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "buckets",
+                              "value": {
+                                "intValue": "10"
+                              }
+                            },
+                            {
+                              "key": "turns",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "intValue": "1"
+                                    },
+                                    {
+                                      "intValue": "2"
+                                    },
+                                    {
+                                      "intValue": "1"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "tokens",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "intValue": "120000"
+                                    },
+                                    {
+                                      "intValue": "240000"
+                                    },
+                                    {
+                                      "intValue": "120000"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "saved",
+                              "value": {
+                                "arrayValue": {
+                                  "values": [
+                                    {
+                                      "intValue": "30000"
+                                    },
+                                    {
+                                      "intValue": "60000"
+                                    },
+                                    {
+                                      "intValue": "30000"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    },
+                                    {
+                                      "intValue": "0"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            {
+                              "key": "kinds",
+                              "value": {
+                                "stringValue": "s4"
+                              }
+                            },
+                            {
+                              "key": "kinds_truncated",
+                              "value": {
+                                "boolValue": false
+                              }
+                            },
+                            {
+                              "key": "msgs_max",
+                              "value": {
+                                "intValue": "140"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "clients",
+                      "value": {
+                        "arrayValue": {
+                          "values": [
+                            {
+                              "kvlistValue": {
+                                "values": [
+                                  {
+                                    "key": "client",
+                                    "value": {
+                                      "stringValue": "claude_code"
+                                    }
+                                  },
+                                  {
+                                    "key": "n",
+                                    "value": {
+                                      "intValue": "4"
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "errors",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "count",
+                              "value": {
+                                "intValue": "0"
+                              }
+                            },
+                            {
+                              "key": "by_status",
+                              "value": {
+                                "kvlistValue": {
+                                  "values": []
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "key": "strata",
+                      "value": {
+                        "arrayValue": {
+                          "values": []
+                        }
+                      }
+                    },
+                    {
+                      "key": "config",
+                      "value": {
+                        "arrayValue": {
+                          "values": []
                         }
                       }
                     }
