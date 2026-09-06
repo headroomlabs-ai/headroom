@@ -3545,12 +3545,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             logger.debug("record_inbound_response failed", exc_info=True)
         logger.info(
-            "event=proxy_inbound_response id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            "event=proxy_inbound_response id=%s method=%s path=%s status=%s "
+            "duration_ms=%.2f response_content_length=%s",
             inbound_id,
             method,
             path,
             response.status_code,
             (time.perf_counter() - started) * 1000.0,
+            response.headers.get("content-length", ""),
         )
         return response
 
