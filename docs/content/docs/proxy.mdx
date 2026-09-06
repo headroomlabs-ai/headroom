@@ -44,6 +44,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
+| `--uds` | None | Serve on a Unix domain socket at this path instead of `--host`/`--port`. POSIX only — Windows has no `AF_UNIX` support in Python or asyncio. See [Serving on a Unix socket](#serving-on-a-unix-socket) |
 | `--workers` | `1` | Number of Uvicorn worker processes |
 | `--limit-concurrency` | `1000` | Maximum concurrent connections before Uvicorn returns 503 |
 | `--max-connections` | `500` | Maximum upstream HTTP connections |
@@ -204,6 +205,65 @@ HEADROOM_SAVINGS_PROFILE=balanced HEADROOM_TARGET_RATIO=0.15 headroom proxy
 ### Custom profiles
 
 For permanent custom profiles, see the profile definitions in `headroom/agent_savings.py`. Each profile is an `AgentSavingsProfile` dataclass with fields for compression mode, target ratio, turn protection, and pipeline toggles.
+
+## Serving on a Unix socket
+
+`--uds` binds an `AF_UNIX` socket instead of a TCP port. Request handling is
+identical — only the transport changes.
+
+```bash
+headroom proxy --uds ~/.headroom/run/proxy.sock
+```
+
+Two reasons to prefer it over a loopback port:
+
+- **No port to collide with, and no port exposed.** Access is governed by
+  filesystem permissions rather than by anything listening on the network.
+- **Deployments where a port is awkward.** Containers and systemd units can share a
+  socket through a bind mount or a runtime directory without publishing a port.
+
+<Callout type="warning">
+  A socket does **not** re-enable Claude Code's Remote Control. Setting
+  `ANTHROPIC_UNIX_SOCKET` passes that feature's host check but makes Claude Code
+  treat the session as API-key auth, which fails a separate subscription-auth
+  requirement — see [Why the Unix socket route does not
+  help](/docs/troubleshooting#why-the-unix-socket-route-does-not-help).
+</Callout>
+
+Point any Unix-socket-capable client at the path. With curl:
+
+```bash
+curl --unix-socket ~/.headroom/run/proxy.sock http://localhost/health
+```
+
+### Permissions and lifecycle
+
+A Unix socket carries no credentials of its own, so **the mode of the directory
+holding it is the access-control boundary**.
+
+If the parent directory does not exist, Headroom creates it `0700`. If it already
+exists, Headroom does not touch its permissions — something else owns that
+directory's policy, and silently tightening it could lock out whatever put it
+there. Instead it refuses to start when an existing parent is writable by other
+users and not sticky, since anyone on the host could then replace the socket.
+(A sticky directory such as `/tmp` is accepted: others may create their own
+entries there but cannot unlink or rename yours.)
+
+On startup Headroom removes a stale socket left behind by a crashed process, but
+it refuses to start when:
+
+- something is still listening on the path (two proxies would silently split traffic),
+- the path exists and is not a socket (far more likely a typo'd argument pointing
+  at real data than a leftover), or
+- the path exceeds the platform's `sun_path` limit — 108 bytes on Linux, 104 on
+  macOS and the BSDs. Keep it short; a long path fails inside `bind()` with an
+  error that names nothing.
+
+<Callout type="warn">
+  `--uds` is POSIX-only. On Windows the command exits immediately with an error
+  telling you to use `--port`; Python exposes no `socket.AF_UNIX` there and
+  asyncio has no Windows UDS transport.
+</Callout>
 
 ## Configuration in depth
 
