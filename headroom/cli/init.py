@@ -55,13 +55,14 @@ _GLOBAL_PROFILE = "init-user"
 _CLAUDE_HOOK_MARKER = "headroom-init-claude"
 _COPILOT_HOOK_MARKER = "headroom-init-copilot"
 _CODEX_HOOK_MARKER = "headroom-init-codex"
+_AGY_HOOK_MARKER = "headroom-init-agy"
 _CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
 _CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
 _CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
 _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
-_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
+_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw", "agy")
 _LOCAL_TARGETS = {"claude", "codex"}
-_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw", "agy"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
@@ -131,6 +132,10 @@ def _copilot_config_path() -> Path:
 
 def _codex_hooks_path(global_scope: bool) -> Path:
     return (Path.home() if global_scope else Path.cwd()) / ".codex" / "hooks.json"
+
+
+def _agy_hooks_path() -> Path:
+    return Path.home() / ".gemini" / "config" / "hooks.json"
 
 
 def _claude_scope_path(global_scope: bool) -> Path:
@@ -248,6 +253,23 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
         retained.append({"type": "command", "command": command, "cwd": ".", "timeout": 15})
         hooks[event] = retained
     payload["hooks"] = hooks
+    _write_json(path, payload)
+
+
+def _ensure_agy_hooks(path: Path, profile: str) -> None:
+    """Register the Headroom keep-alive hook in Antigravity's hooks.json.
+
+    Antigravity keys hooks.json by hook name, so Headroom owns exactly one
+    entry and rewriting it in place is the whole update. Only PreInvocation
+    is installed: PreToolUse handlers must answer with a permission decision
+    and Headroom has no opinion on tool calls.
+    """
+    logger.debug("ensure agy hooks: %s (profile=%s)", path, profile)
+    payload = _json_file(path)
+    command = f"{_hook_command('--profile', profile)} --marker {_AGY_HOOK_MARKER}"
+    payload[_AGY_HOOK_MARKER] = {
+        "PreInvocation": [{"type": "command", "command": command, "timeout": 15}]
+    }
     _write_json(path, payload)
 
 
@@ -649,6 +671,12 @@ def _resolve_copilot_env(port: int, backend: str) -> dict[str, str]:
     }
 
 
+def _resolve_agy_env(port: int) -> dict[str, str]:
+    # The Antigravity CLI sends every Cloud Code Assist call to CLOUD_CODE_URL
+    # when it is set, which is what puts its traffic through Headroom.
+    return {"CLOUD_CODE_URL": f"http://127.0.0.1:{port}"}
+
+
 def _marketplace_source() -> str:
     override = os.environ.get("HEADROOM_MARKETPLACE_SOURCE")
     if override:
@@ -884,6 +912,24 @@ def _init_openclaw(*, global_scope: bool, port: int) -> None:
         raise SystemExit(result.returncode)
 
 
+def _init_agy(*, global_scope: bool, profile: str, port: int) -> None:
+    if not global_scope:
+        raise click.ClickException(
+            "Antigravity durable init currently requires -g (current-user scope)."
+        )
+    _ensure_agy_hooks(_agy_hooks_path(), profile)
+    _apply_user_env(_resolve_agy_env(port))
+    # agy runs its eligibility check against CLOUD_CODE_URL at startup, before
+    # the first model call and therefore before any hook can start the proxy:
+    # a proxy that is down makes `agy` refuse to boot. Start it here so the
+    # next launch works, and let the PreInvocation hook revive it later.
+    _ensure_profile_running(profile)
+    click.echo("Configured Antigravity CLI (user scope).")
+    click.echo(
+        "Open a new shell (CLOUD_CODE_URL is exported from your shell profile), then run agy."
+    )
+
+
 def _run_init_targets(
     *,
     targets: list[str],
@@ -923,6 +969,8 @@ def _run_init_targets(
             _init_codex(global_scope=global_scope, profile=profile, port=port)
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
+        elif target == "agy":
+            _init_agy(global_scope=global_scope, profile=profile, port=port)
 
     # Register the headroom MCP server with every targeted agent that has
     # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
@@ -1084,6 +1132,21 @@ def init_openclaw(ctx: click.Context) -> None:
     """Install the durable OpenClaw Headroom plugin."""
     _run_init_targets(
         targets=["openclaw"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("agy")
+@click.pass_context
+def init_agy(ctx: click.Context) -> None:
+    """Install Antigravity CLI durable hooks and provider routing."""
+    _run_init_targets(
+        targets=["agy"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),
