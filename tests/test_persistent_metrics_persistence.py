@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from headroom.proxy.savings_tracker import SavingsTracker
 
 
@@ -53,9 +55,12 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     assert lifetime["tokens"]["attempted_input"] == 100
     assert lifetime["tokens"]["saved"] == 20
     assert lifetime["prefix_cache"]["cache_read_tokens"] == 5
+    # Compression dollars are restated onto the realized basis on load: 20 saved
+    # tokens at the ledger's own $1.5/80-token realized input rate, not the list
+    # price they were written at. Everything else carries over untouched.
     assert lifetime["cost"] == {
         "input_usd": 1.5,
-        "compression_savings_usd": 0.5,
+        "compression_savings_usd": pytest.approx(20 * (1.5 / 80)),
         "cache_savings_usd": 0.2,
     }
     assert lifetime["by_model"]["other"]["input_tokens"] == 80
@@ -63,7 +68,10 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["schema_version"] == 5
-    assert saved["lifetime"] == legacy_state["lifetime"]
+    assert saved["lifetime"] == {
+        **legacy_state["lifetime"],
+        "compression_savings_usd": pytest.approx(20 * (1.5 / 80)),
+    }
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80

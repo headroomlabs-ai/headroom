@@ -35,6 +35,10 @@ HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
 SCHEMA_VERSION = 5
+# Pricing era of the persisted dollar figures. State written before compression
+# savings moved to the request's realized input rate carries no marker and is
+# repriced once on load (_reprice_state_to_realized_basis).
+PRICING_BASIS_REALIZED = "realized"
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
@@ -243,11 +247,56 @@ def _resolve_litellm_model(model: str) -> str:
     return model
 
 
-def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
-    """Estimate compression savings in USD from saved input tokens."""
-    litellm = _get_litellm_module()
-    if tokens_saved <= 0:
+def _estimate_compression_savings_usd(
+    model: str,
+    tokens_saved: int,
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+) -> float:
+    """Estimate compression savings in USD from saved input tokens.
+
+    When the caller supplies the request's cache read/write/uncached breakdown,
+    saved tokens price at that request's realized blended input rate — the same
+    split ``_estimate_input_cost_usd`` prices real spend with. Removed bytes
+    would have travelled in this request's mix: a removal on a cold request
+    would have billed near list (or the cache-write premium), while a removal
+    re-applied on a warm-prefix turn would have billed at the provider's
+    cache-read discount. Flat list pricing values every re-applied removal at
+    full rate every turn, which overstates cache-heavy traffic roughly 7x
+    (a 94%-cache-read mix bills near 10% of list). Lifetime twin of
+    ``cost.py``'s session-scoped ``cache_aware_savings_usd``.
+
+    The blended rate is an UPPER BOUND on what removals were worth, not the
+    exact realized rate for them. Removals are re-applied each turn to keep the
+    wire form byte-identical to the cached prefix, so they concentrate in the
+    cached region, whose marginal rate is cache-read rather than the blend.
+    On a 940k/40k/20k read/write/uncached mix that is $1.00/M against a $1.64/M
+    blend. Bounding it exactly needs per-removal cache-region attribution, which
+    the savings path does not carry; the blend is the tight, cheap over-estimate.
+
+    Without a breakdown (legacy checkpoints, callers that never learned the
+    split) the historical flat-list behavior is unchanged.
+    """
+    saved = _coerce_int(tokens_saved)
+    if saved <= 0:
         return 0.0
+    breakdown_tokens = (
+        max(_coerce_int(cache_read_tokens), 0)
+        + max(_coerce_int(cache_write_tokens), 0)
+        + max(_coerce_int(uncached_input_tokens), 0)
+    )
+    if breakdown_tokens > 0:
+        realized_input_cost = _estimate_input_cost_usd(
+            model,
+            0,
+            cache_read_tokens=max(_coerce_int(cache_read_tokens), 0),
+            cache_write_tokens=max(_coerce_int(cache_write_tokens), 0),
+            uncached_input_tokens=max(_coerce_int(uncached_input_tokens), 0),
+        )
+        return float(saved) * (realized_input_cost / float(breakdown_tokens))
+    litellm = _get_litellm_module()
     if litellm is None:
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
@@ -336,6 +385,8 @@ def estimate_request_savings_usd(
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
     cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_input_tokens: int = 0,
 ) -> dict[str, float]:
     """Price one request's distinct savings layers for external telemetry.
 
@@ -346,7 +397,11 @@ def estimate_request_savings_usd(
 
     return {
         "compression": _estimate_compression_savings_usd(
-            model, max(_coerce_int(compression_tokens_saved), 0)
+            model,
+            max(_coerce_int(compression_tokens_saved), 0),
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            uncached_input_tokens=uncached_input_tokens,
         ),
         "tool_schema": _estimate_compression_savings_usd(
             model, max(_coerce_int(tool_schema_tokens_saved), 0)
@@ -421,6 +476,81 @@ def _estimate_input_cost_usd(
         return float(total_input_tokens) * float(input_cost_per_token)
     except Exception:
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+
+
+def _normalize_pricing_basis(raw: Any) -> str:
+    """Anything but the realized marker means "legacy, needs restating"."""
+    return PRICING_BASIS_REALIZED if raw == PRICING_BASIS_REALIZED else "legacy"
+
+
+def _realized_input_rate(entry: Any) -> float | None:
+    """Realized $/input-token implied by a persisted aggregate, or None.
+
+    Every persisted aggregate (lifetime, history point, project, model, display
+    session) carries ``total_input_tokens`` and ``total_input_cost_usd``, and
+    that cost was already priced on the request's cache split. Their ratio is
+    the realized input rate for exactly the traffic that aggregate covers.
+    """
+    if not isinstance(entry, dict):
+        return None
+    tokens = _coerce_int(entry.get("total_input_tokens"))
+    cost = _coerce_float(entry.get("total_input_cost_usd"))
+    if tokens <= 0 or cost <= 0:
+        return None
+    return cost / float(tokens)
+
+
+def _reprice_entry_to_realized(entry: Any, tokens_key: str, fallback_rate: float) -> None:
+    """Restate one aggregate's compression dollars at the realized rate."""
+    if not isinstance(entry, dict):
+        return
+    rate = _realized_input_rate(entry)
+    if rate is None:
+        rate = fallback_rate
+    saved = max(_coerce_int(entry.get(tokens_key)), 0)
+    entry["compression_savings_usd"] = round(float(saved) * rate, 6)
+
+
+def _reprice_state_to_realized_basis(state: dict[str, Any]) -> bool:
+    """One-time restatement of a list-priced ledger onto the realized basis.
+
+    Without this the lifetime ledger holds list-priced dollars from before the
+    pricing fix and realized-rate dollars from after it, indistinguishable, with
+    the headline converging only as old entries age out - which leaves the
+    reported bug substantially unfixed for existing installs.
+
+    No new per-entry field is needed to tell the eras apart: ``tokens_saved``
+    and the realized rate are both already persisted on every aggregate, so the
+    dollars are simply recomputed from them. Each aggregate uses its own rate
+    where it has one (so a history point is restated at the rate that prevailed
+    up to that point and the derived day/provider/model deltas stay consistent),
+    falling back to the lifetime rate. Returns False when there is nothing to
+    reprice against yet, in which case the marker is not written and the
+    restatement is retried on the next load.
+    """
+    lifetime = state.get("lifetime")
+    rate = _realized_input_rate(lifetime)
+    if rate is None:
+        # Nothing priced yet: only stamp when there are no legacy dollars to
+        # restate, otherwise wait for a rate rather than freezing list prices in.
+        return _coerce_float((lifetime or {}).get("compression_savings_usd")) <= 0.0
+
+    _reprice_entry_to_realized(lifetime, "tokens_saved", rate)
+    _reprice_entry_to_realized(state.get("display_session"), "tokens_saved", rate)
+    for point in state.get("history") or []:
+        _reprice_entry_to_realized(point, "total_tokens_saved", rate)
+    for bucket in ("projects", "by_model"):
+        for entry in (state.get(bucket) or {}).values():
+            _reprice_entry_to_realized(entry, "tokens_saved", rate)
+
+    metrics = state.get("lifetime_metrics")
+    if isinstance(metrics, dict):
+        cost = metrics.get("cost")
+        tokens = metrics.get("tokens")
+        if isinstance(cost, dict) and isinstance(tokens, dict):
+            saved = max(_coerce_int(tokens.get("saved")), 0)
+            cost["compression_savings_usd"] = round(float(saved) * rate, 6)
+    return True
 
 
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
@@ -702,6 +832,8 @@ class SavingsTracker:
         if timestamp_dt is None:
             timestamp_dt = _utc_now()
 
+        # Checkpoint callers have no cache breakdown, so this path keeps the
+        # historical flat-list pricing (see _estimate_compression_savings_usd).
         delta_usd = _estimate_compression_savings_usd(model, delta_tokens)
 
         with self._lock:
@@ -810,7 +942,13 @@ class SavingsTracker:
         else:
             # No priced breakdown available: only message savings are known here,
             # so this path stays message-only exactly as before.
-            delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+            delta_savings_usd = _estimate_compression_savings_usd(
+                model,
+                delta_tokens_saved,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+            )
         delta_output_savings_usd = (
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
@@ -987,7 +1125,13 @@ class SavingsTracker:
         )
         metrics.setdefault(
             "compression_savings_usd",
-            _estimate_compression_savings_usd(model, _coerce_int(metrics.get("tokens_saved"))),
+            _estimate_compression_savings_usd(
+                model,
+                _coerce_int(metrics.get("tokens_saved")),
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+            ),
         )
         metrics.setdefault(
             "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
@@ -1269,6 +1413,7 @@ class SavingsTracker:
             history = [dict(item) for item in self._state["history"]]
             return {
                 "schema_version": SCHEMA_VERSION,
+                "pricing_basis": self._state.get("pricing_basis", PRICING_BASIS_REALIZED),
                 "storage_path": str(self._path),
                 "lifetime": dict(self._state["lifetime"]),
                 "display_session": self._display_session_snapshot_locked(),
@@ -1288,6 +1433,7 @@ class SavingsTracker:
     def _default_state(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
+            "pricing_basis": PRICING_BASIS_REALIZED,
             "lifetime": {
                 "requests": 0,
                 "tokens_saved": 0,
@@ -1407,6 +1553,12 @@ class SavingsTracker:
             state["lifetime_metrics"] = raw_lifetime_metrics
         else:
             state["lifetime_metrics"] = self._migrate_v4_lifetime_metrics(state)
+            self._needs_schema_save = True
+
+        state["pricing_basis"] = _normalize_pricing_basis(raw.get("pricing_basis"))
+        if state["pricing_basis"] != PRICING_BASIS_REALIZED:
+            if _reprice_state_to_realized_basis(state):
+                state["pricing_basis"] = PRICING_BASIS_REALIZED
             self._needs_schema_save = True
 
         if normalized_history:
@@ -1564,6 +1716,9 @@ class SavingsTracker:
             lifetime_metrics["persistence"]["last_saved_at"] = saved_at
             payload = {
                 "schema_version": SCHEMA_VERSION,
+                # Pricing era of the dollars below, so the one-time restatement
+                # onto the realized basis runs once per install and not again.
+                "pricing_basis": self._state.get("pricing_basis", PRICING_BASIS_REALIZED),
                 "lifetime": self._state["lifetime"],
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],

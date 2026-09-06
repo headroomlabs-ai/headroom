@@ -788,6 +788,8 @@ class PrometheusMetrics:
             tool_schema_tokens_saved=tool_search_saved,
             output_tokens_saved=output_tokens_saved,
             cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            uncached_input_tokens=uncached_input_tokens,
         )
         async with self._lock:
             self.requests_total += 1
