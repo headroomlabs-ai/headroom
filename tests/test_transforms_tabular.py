@@ -322,6 +322,29 @@ def test_router_respects_disable_flag() -> None:
 # Binary spreadsheet ingestion -----------------------------------------------
 
 
+def test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() -> None:
+    """Trailing all-empty rows are dropped and the output has no stray ``\\r``.
+
+    openpyxl's used-range routinely extends past the last data row, so a sheet
+    commonly ends in ``(None, None, ...)`` tuples. Those were emitted as blank
+    ``,`` rows, and ``csv.writer``'s default ``\\r\\n`` terminator combined with
+    ``.strip("\\n")`` left a dangling ``\\r`` — noise fed straight to the LLM.
+    """
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    rendered = _rows_to_csv(
+        [["Name", "Age"], ["Alice", "30"], [None, None], ["", "  "], [None, None]]
+    )
+    assert rendered == "Name,Age\nAlice,30"
+    assert "\r" not in rendered
+
+    # Interior empty rows are preserved (only the trailing run is dropped).
+    assert _rows_to_csv([["a", "b"], [None, None], ["c", "d"], [None, None]]) == "a,b\n,\nc,d"
+
+    # A fully empty sheet renders to the empty string.
+    assert _rows_to_csv([[None, None], ["", ""]]) == ""
+
+
 @pytest.mark.skipif(not _HAS_OPENPYXL, reason="openpyxl not installed")
 def test_load_and_compress_xlsx(tmp_path) -> None:
     import openpyxl
