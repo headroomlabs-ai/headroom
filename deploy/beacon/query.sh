@@ -20,6 +20,7 @@
 set -euo pipefail
 
 BUCKET="${R2_BUCKET:-headroom-telemetry}"
+[[ "$BUCKET" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid R2_BUCKET value — must contain only alphanumeric, hyphen, or underscore characters" >&2; exit 1; }
 _repo_env="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.env"
 ENV_FILE="${HEADROOM_ENV_FILE:-$HOME/env.txt}"
 [ -f "$ENV_FILE" ] || ENV_FILE="$_repo_env"
