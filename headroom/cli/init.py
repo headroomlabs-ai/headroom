@@ -26,7 +26,12 @@ except ModuleNotFoundError:  # Python < 3.11
 import click
 
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.paths import (
+    claude_settings_path,
+    codex_config_path,
+    unix_user_env_targets,
+    validate_profile_name,
+)
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
@@ -912,21 +917,36 @@ def _init_openclaw(*, global_scope: bool, port: int) -> None:
         raise SystemExit(result.returncode)
 
 
+def _ensure_agy_launcher(profile: str) -> None:
+    """Start the proxy before Antigravity's startup eligibility request."""
+    start = "# --- Headroom init agy launcher ---"
+    end = "# --- end Headroom init agy launcher ---"
+    command = _command_string(
+        [*resolve_headroom_command(), "init", "launch-agy", "--profile", profile, "--"]
+    )
+    block = f'{start}\nagy() {{\n  {command} "$@"\n}}\n{end}'
+    for path in unix_user_env_targets():
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_replace_marker_block(content, start, end, block), encoding="utf-8")
+
+
 def _init_agy(*, global_scope: bool, profile: str, port: int) -> None:
     if not global_scope:
         raise click.ClickException(
             "Antigravity durable init currently requires -g (current-user scope)."
         )
+    if os.name == "nt":
+        raise click.ClickException("Antigravity durable init currently requires a POSIX shell.")
     _ensure_agy_hooks(_agy_hooks_path(), profile)
     _apply_user_env(_resolve_agy_env(port))
-    # agy runs its eligibility check against CLOUD_CODE_URL at startup, before
-    # the first model call and therefore before any hook can start the proxy:
-    # a proxy that is down makes `agy` refuse to boot. Start it here so the
-    # next launch works, and let the PreInvocation hook revive it later.
+    _ensure_agy_launcher(profile)
+    # Warm the proxy now; the shell launcher also ensures readiness on every
+    # subsequent launch, before loadCodeAssist can run (unlike PreInvocation).
     _ensure_profile_running(profile)
     click.echo("Configured Antigravity CLI (user scope).")
     click.echo(
-        "Open a new shell (CLOUD_CODE_URL is exported from your shell profile), then run agy."
+        "Open a new bash/zsh shell, then run agy (the shell launcher ensures the proxy is ready)."
     )
 
 
@@ -1154,6 +1174,32 @@ def init_agy(ctx: click.Context) -> None:
         region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
     )
+
+
+@init.command("launch-agy", hidden=True)
+@click.option("--profile", required=True)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+def init_launch_agy(profile: str, args: tuple[str, ...]) -> None:
+    """Launch Antigravity only after its configured proxy is ready."""
+    binary = shutil.which("agy")
+    if not binary:
+        raise click.ClickException("'agy' not found in PATH. Install Antigravity CLI first.")
+    try:
+        manifest = load_manifest(validate_profile_name(profile))
+    except ManifestError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if manifest is None:
+        raise click.ClickException(f"Missing profile '{profile}'. Run headroom init -g agy.")
+    _ensure_profile_running(profile)
+    if not wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+        raise click.ClickException(
+            f"Headroom proxy for '{profile}' is not ready; agy was not started."
+        )
+    env = {**os.environ, **_resolve_agy_env(manifest.port)}
+    try:
+        os.execvpe(binary, [binary, *args], env)
+    except OSError as exc:
+        raise click.ClickException(f"Could not launch agy: {exc}") from exc
 
 
 @init.group("hook", hidden=True)
