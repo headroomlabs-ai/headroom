@@ -175,6 +175,24 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path in {"/responses", "/v1/responses"}:
+            self._write_json(
+                200,
+                {
+                    "id": "resp-e2e",
+                    "object": "response",
+                    "model": payload.get("model"),
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "mock response"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                },
+            )
+            return
         if self.path == "/v1/messages":
             self._write_json(
                 200,
@@ -741,7 +759,9 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         stop_process(proc)
 
 
-def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+def verify_vscode_wrap(
+    base_env: dict[str, str], project_dir: Path, mock_server: MockOpenAIServer
+) -> None:
     """Exercise the Linux settings lifecycle without real Copilot credentials."""
     port = VSCODE_PORT
     settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
@@ -813,6 +833,31 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             health.get("config", {}).get("openai_api_url")
             == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             "VS Code proxy should use the mocked Copilot upstream",
+        )
+        models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+        start = len(mock_server.requests)
+        for model in models:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}{project_prefix}/v1/responses",
+                json={"model": model, "input": "model swap probe", "stream": False},
+                timeout=10.0,
+            )
+            assert_true(
+                response.status_code == 200,
+                f"VS Code route failed for {model}: {response.status_code} {response.text}",
+            )
+            assert_true(
+                response.json().get("model") == model,
+                f"VS Code response did not reflect selected model {model}",
+            )
+        forwarded = [
+            item["body"].get("model")
+            for item in mock_server.requests[start:]
+            if item["path"].endswith("/responses") and isinstance(item["body"], dict)
+        ]
+        assert_true(
+            forwarded == models,
+            f"VS Code outbound model sequence changed: {forwarded!r}",
         )
     finally:
         stop_process(proc)
@@ -1067,7 +1112,7 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
-            verify_vscode_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir, mock_server)
             verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)

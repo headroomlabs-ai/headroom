@@ -56,8 +56,30 @@ def get_python_forwarder_mode() -> PythonForwarderMode:
 
 
 def serialize_body_canonical(body: dict[str, Any]) -> bytes:
-    """Re-serialize a request body deterministically with cache-stable formatting."""
-    return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    """Re-serialize a request body deterministically with cache-stable formatting.
+
+    ``ensure_ascii=False`` keeps the bytes compact and cache-stable, but it also
+    means a lone surrogate anywhere in the body raises here. That is reachable
+    input, not a hypothetical: ``"\\ud800"`` is valid JSON, ``json.loads``
+    accepts it happily, and a tool result carrying truncated UTF-16 or sliced
+    binary produces one. Both forwarders resolve outbound bytes *outside* their
+    connection-retry loop, so the exception escapes as a 500 with no retry.
+
+    #3124 made that newly load-bearing: mutated thinking-bearing bodies used to
+    return the client's bytes verbatim and never reached this function at all,
+    so the largest, most tool-result-heavy population in Claude Code traffic now
+    depends on it not raising.
+
+    The escaped form is the right degradation -- it encodes the identical parsed
+    values, so upstream reconstructs exactly the same request, and every mutation
+    still reaches the wire (important: the caller's ``stream`` flip rides on
+    these bytes). Only the byte-level encoding differs, costing one cache miss on
+    a request that would otherwise have failed outright.
+    """
+    try:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(body, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def has_signed_thinking_blocks(body: dict[str, Any]) -> bool:
@@ -135,21 +157,30 @@ def _original_body_has_signed_thinking_blocks(original_body_bytes: bytes | None)
 #: thinking block is provably unchanged. **Default ON**; set this to ``0`` (or
 #: ``false``/``no``/``off``) to restore the previous blanket lock.
 #:
-#: Risk note, recorded deliberately. The lock this relaxes was added by #2254
-#: after real upstream 400s ("`thinking` blocks ... cannot be modified"). That
-#: report attributed the failure to a plain canonical re-encode, which cannot
-#: alter parsed values and therefore cannot by itself invalidate a signature --
-#: and the report's own log shows a transform (`tool_search_deferral`) firing on
-#: the failing turn. So the stated cause does not hold up, but the failure was
-#: real and its true trigger was never isolated. This relaxation is narrower
-#: than what broke: it forwards edits ONLY when every thinking block is
-#: byte-identical to the client's, which is exactly the property #2254's blanket
-#: rule was a crude proxy for.
+#: The lock this relaxes was added by #2254 after real upstream 400s
+#: ("`thinking` blocks ... cannot be modified").
 #:
-#: It is on by default at the maintainer's direction, to recover the savings the
-#: lock was discarding. If Anthropic starts rejecting thinking-bearing turns,
-#: set the env var to ``0`` -- that is a single-variable, no-deploy rollback to
-#: the previous behaviour, and the 400s stop immediately.
+#: What the signature actually covers is now measured, not assumed --
+#: ``tests/test_thinking_signature_scope_live.py`` pins it against the live API
+#: on sonnet-4-5, opus-4-5, sonnet-4-6, sonnet-5 and opus-5, with identical
+#: results on all five. Anthropic accepts a replayed turn whose signed thinking
+#: block is intact while we compress a ``tool_result``, rewrite sibling
+#: ``text``/``tool_use`` blocks *inside the same assistant message*, rewrite
+#: top-level ``system``/``tools``, or re-serialize the whole body with reordered
+#: keys. It rejects exactly one thing: a forged ``signature`` ("Invalid
+#: `signature` in `thinking` block"), which is the negative control proving the
+#: endpoint validates signatures on this shape at all -- without it every
+#: acceptance above would be vacuous.
+#:
+#: So the seal binds the block, not the request, and #2254's stated cause (a
+#: plain canonical re-encode) is disproven directly: variant F changes the bytes
+#: and is accepted. The 400s were real but were never traced to their true
+#: trigger. This relaxation stays narrower than the evidence permits anyway --
+#: it forwards edits ONLY when every thinking block is byte-identical to the
+#: client's -- so the measurements above are headroom, not the safety margin.
+#:
+#: If Anthropic ever changes this, that live test fails loudly, and setting the
+#: env var to ``0`` is a single-variable, no-deploy rollback to the blanket lock.
 THINKING_PRESERVING_MUTATIONS_ENV = "HEADROOM_THINKING_PRESERVING_MUTATIONS"
 
 
@@ -215,6 +246,10 @@ def thinking_blocks_survived_mutation(
     Treating the presence of a sealed block as a reason to freeze the entire
     body is a category error -- it protects bytes the signature says nothing
     about, and on Claude Code traffic that is nearly the whole request.
+
+    That scope claim is measured against the live API, not inferred -- see
+    ``tests/test_thinking_signature_scope_live.py``, which also pins the one
+    thing Anthropic does reject (a forged ``signature``).
 
     Conservative by construction: any parse failure, or any detectable
     difference at all, returns False and the caller keeps today's passthrough.

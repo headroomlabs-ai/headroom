@@ -50,6 +50,12 @@ def _clear_warn_memo():
     reset_warning_state()
 
 
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstreams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit reserved test hosts while credential trust is tested separately."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "attacker.example,corp-gw.internal")
+
+
 class _Capturing(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.headers: dict[str, str] | None = None

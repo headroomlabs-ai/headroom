@@ -2,6 +2,9 @@
 	"name": "headroom-docs",
 	"version": "0.0.0",
 	"private": true,
+	"engines": {
+		"node": ">=22"
+	},
 	"scripts": {
 		"build": "next build",
 		"dev": "next dev",
@@ -34,7 +37,7 @@
 		"@types/node": "^26.1.1",
 		"@types/react": "^19.2.17",
 		"@types/react-dom": "^19.2.3",
-		"ai": "^6.0.149",
+		"ai": "7.0.59",
 		"openai": "^6.47.0",
 		"postcss": "^8.5.26",
 		"tailwindcss": "^4.2.2",

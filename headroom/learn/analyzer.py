@@ -56,7 +56,7 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
-    ("codex", "codex-cli", ["codex", "exec"]),
+    ("codex", "codex-cli", ["codex", "exec", "--skip-git-repo-check"]),
 ]
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.
@@ -202,7 +202,9 @@ class SessionAnalyzer:
             result.recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
         except Exception as e:
             logger.warning("LLM analysis failed: %s", e)
-            # Return result with stats but no recommendations
+            # Preserve the stats so multi-project runs can continue, but retain
+            # the failure so the CLI cannot report an empty result as success.
+            result.analysis_error = str(e) or type(e).__name__
 
         return result
 

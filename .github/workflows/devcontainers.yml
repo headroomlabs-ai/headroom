@@ -54,7 +54,7 @@ jobs:
           swap-storage: false
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -102,7 +102,7 @@ jobs:
         run: git worktree add "$RUNNER_TEMP/headroom-worktree" HEAD
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 

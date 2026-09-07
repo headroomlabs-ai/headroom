@@ -158,13 +158,19 @@ def test_build_tool_name_map_anthropic_wrapped() -> None:
 
 
 def test_build_tool_name_map_wrapped_not_excluded_before_unwrap() -> None:
-    """Sanity: without unwrapping, a wrapped read_file is NOT excluded.
+    """Sanity: without unwrapping, a wrapped tool is NOT excluded.
 
     This documents the failure mode the fix addresses: `tool_call` is not in
     DEFAULT_EXCLUDE_TOOLS, so a whitelist match would never fire.
+
+    The inner name is `codebase_search` rather than `read_file` purely because
+    the second assertion needs a tool that is genuinely absent from the
+    defaults, and `read_file` (Cursor's `Read`) has since been added to them on
+    purpose. The property under test is the WRAPPER's name not matching, which
+    is the first assertion; the inner name is only an example.
     """
     assert is_tool_excluded("tool_call", DEFAULT_EXCLUDE_TOOLS) is False
-    assert is_tool_excluded("read_file", DEFAULT_EXCLUDE_TOOLS) is False
+    assert is_tool_excluded("codebase_search", DEFAULT_EXCLUDE_TOOLS) is False
 
 
 def test_build_tool_name_map_exclusion_after_unwrap() -> None:

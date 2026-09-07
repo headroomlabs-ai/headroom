@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +20,7 @@ from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.token_counting import gemini_output_tokens
 
@@ -342,10 +342,7 @@ class GeminiHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             # Per-project memory routing (GH #462). Gemini's
             # ``systemInstruction`` field carries the system prompt;
             # ``extract_system_prompt`` doesn't know that shape, so we

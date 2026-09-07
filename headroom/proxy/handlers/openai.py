@@ -30,8 +30,10 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
     sanitize_forwarded_response_headers,
 )
+from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -81,6 +83,7 @@ from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
@@ -89,6 +92,7 @@ from headroom.proxy.project_context import (
     get_current_project,
     set_current_project,
 )
+from headroom.proxy.thinking_tokens import ThinkingTokens, extract_from_usage
 from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
@@ -102,6 +106,12 @@ _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR_LOCK = threading.RLock()
 _OPENAI_RESPONSES_UNIT_EXECUTOR: ThreadPoolExecutor | None = None
 _CODEX_WS_COMPRESSION_TIMEOUT_SECONDS = 5.0
+# The WS->HTTP fallback streams SSE, so `read` is the gap BETWEEN events, not a
+# cap on the whole response: 120s of silence from a live Codex turn means the
+# upstream is gone, not thinking. That is this path's own bound and is
+# deliberately tighter than the generic request timeout. The other three phases
+# are not this path's business and come from ProxyConfig.
+_WS_HTTP_FALLBACK_READ_TIMEOUT_SECONDS = 120.0
 _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
 )
@@ -381,6 +391,13 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
         normalized = f"{normalized}{path}"
 
     if urlparse(normalized).scheme not in {"http", "https"}:
+        return None
+    if not is_safe_upstream_url(normalized):
+        # Client-supplied upstream resolves to a private/loopback/link-local or
+        # cloud-metadata address (SSRF). Ignore the override and fall back to the
+        # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
+        # internal endpoints.
+        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
         return None
     return normalized
 
@@ -767,6 +784,182 @@ def _compact_openai_responses_tools(
     from headroom.proxy.tool_schema_compaction import compact_tools
 
     return compact_tools(payload)
+
+
+def _codex_additional_tools_lift_enabled() -> bool:
+    from headroom.proxy import runtime_env
+
+    return (
+        runtime_env.getenv("HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT", "1") or "1"
+    ).strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _lift_codex_additional_tools(
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+    restore_plan: list[dict[str, Any]] | None = None,
+) -> int:
+    """Lift Codex ``additional_tools`` input items into top-level ``tools``.
+
+    Codex CLI 0.149.0 stopped sending a top-level ``tools`` array on
+    ``/v1/responses`` for models its capability cache flags (``gpt-5.6-sol``,
+    its current default): tool definitions ride inside ``input`` as items of
+    type ``additional_tools``. Every tools consumer downstream -- schema
+    compaction, the output-shaper stratum, tools token accounting -- reads
+    only ``payload["tools"]``, so those requests classified "notools" and
+    recorded zero tool-schema savings while forwarding normally (#3185).
+
+    Mutates *payload* in place: concatenates the items' ``tools`` arrays into
+    ``payload["tools"]`` and drops the carrier items from ``input``. Returns
+    the number of lifted tool definitions (0 = no-op).
+
+    This is an *internal* normalization only. The forwarded payload must keep
+    the shape the client sent, so callers pass ``restore_plan`` and hand it to
+    :func:`_restore_codex_additional_tools` before forwarding -- forwarding the
+    lifted shape costs a stateful session its whole tool surface (the 0.36.3
+    regression from #3186). No-op when the payload
+    already carries top-level tools, so classic-encoding clients are
+    untouched and a future Codex reverting the change costs nothing. The
+    classic top-level encoding is accepted upstream for these models --
+    Codex <= 0.148 still sends it for ``gpt-5.6-sol`` -- verified against the
+    live ChatGPT Codex backend with executed tool calls. Disable with
+    ``HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0``.
+    """
+    if not isinstance(payload, dict) or payload.get("tools"):
+        return 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return 0
+    if not any(isinstance(item, dict) and item.get("type") == "additional_tools" for item in items):
+        return 0
+    if not _codex_additional_tools_lift_enabled():
+        return 0
+    lifted: list[Any] = []
+    kept: list[Any] = []
+    plan: list[dict[str, Any]] = []
+    for item in items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "additional_tools"
+            and isinstance(item.get("tools"), list)
+            and item["tools"]
+        ):
+            # `kept_index` is the carrier's position among the items that
+            # survive the lift, so the restore re-inserts it in the same
+            # relative slot even when compression rewrites the transcript.
+            plan.append(
+                {
+                    "kept_index": len(kept),
+                    "item": {k: v for k, v in item.items() if k != "tools"},
+                    "tools": list(item["tools"]),
+                }
+            )
+            lifted.extend(item["tools"])
+        else:
+            kept.append(item)
+    if not lifted:
+        return 0
+    payload["tools"] = lifted
+    payload["input"] = kept
+    if restore_plan is not None:
+        restore_plan.extend(plan)
+    logger.info(
+        "[%s] Lifted %d Codex additional_tools definitions to top-level tools",
+        request_id or "-",
+        len(lifted),
+    )
+    return len(lifted)
+
+
+def _restore_codex_additional_tools(
+    payload: dict[str, Any],
+    restore_plan: list[dict[str, Any]],
+    *,
+    request_id: str | None = None,
+) -> int:
+    """Undo :func:`_lift_codex_additional_tools`, keeping compaction's work.
+
+    The lift exists so Headroom's tools consumers engage; it must not change
+    what Codex sees on the wire. ``tools`` is a per-request parameter, while
+    ``additional_tools`` is an ``input`` item and therefore part of the
+    conversation transcript. A stateful session (Codex TUI/app-server over
+    WebSocket) declares its tools once and relies on the transcript for every
+    later turn, so forwarding the lifted shape leaves that transcript
+    tool-less: turn one works, then shell/filesystem access vanishes for the
+    rest of the session -- the 0.36.3 regression from #3186. Stateless HTTP
+    hid it in review: every request re-sends the carrier, so the lift refires
+    each turn and nothing is ever lost.
+
+    Rewrites *payload* in place -- moves ``payload["tools"]`` (post-compaction)
+    back into ``additional_tools`` carriers at their original positions and
+    drops the top-level array. Returns the number of definitions restored.
+    """
+    if not isinstance(payload, dict) or not restore_plan:
+        return 0
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return 0
+    if any(
+        isinstance(item, dict) and item.get("type") == "additional_tools" and item.get("tools")
+        for item in items
+    ):
+        # Already in carrier form -- restoring again would duplicate the
+        # definitions. Keeps the restore idempotent.
+        return 0
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+
+    original_total = sum(len(entry.get("tools") or []) for entry in restore_plan)
+    if not tools:
+        # A consumer emptied the array. Restoring the definitions as Codex
+        # sent them is strictly safer than forwarding a tool-less payload.
+        slices = [list(entry.get("tools") or []) for entry in restore_plan]
+    elif len(tools) == original_total:
+        slices = []
+        offset = 0
+        for entry in restore_plan:
+            width = len(entry.get("tools") or [])
+            slices.append(tools[offset : offset + width])
+            offset += width
+    else:
+        # The definition count changed (deferral, injection), so the original
+        # per-carrier split no longer maps. The whole set rides the first
+        # carrier rather than being distributed on a stale boundary.
+        slices = [list(tools)] + [[] for _ in restore_plan[1:]]
+
+    restored_items = list(items)
+    restored = 0
+    shift = 0
+    for entry, tool_slice in zip(restore_plan, slices):
+        if not tool_slice:
+            continue
+        carrier = dict(entry.get("item") or {})
+        carrier["type"] = "additional_tools"
+        carrier["tools"] = tool_slice
+        position = entry.get("kept_index")
+        if not isinstance(position, int) or position < 0:
+            position = len(restored_items)
+        restored_items.insert(min(position + shift, len(restored_items)), carrier)
+        shift += 1
+        restored += len(tool_slice)
+
+    if not restored:
+        return 0
+    payload["input"] = restored_items
+    payload.pop("tools", None)
+    logger.debug(
+        "[%s] Restored %d Codex tool definitions to additional_tools",
+        request_id or "-",
+        restored,
+    )
+    return restored
 
 
 def _allow_responses_memory_tools(is_chatgpt_auth: bool) -> bool:
@@ -1408,6 +1601,14 @@ WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 # "lossless" would otherwise look like it worked).
 COMPRESS_MODES = ("ccr", "lossy_inline", "lossless_then_lossy")
 
+# Max wait for a sidecar session's turn lock, on the executor. MUST stay
+# well below COMPRESSION_TIMEOUT_SECONDS: with an untimed acquire, a slow
+# turn's 503-driven retries would park executor workers blocked on the lock
+# doing no work, each recording timeout debt toward the compression
+# quarantine. Failing the acquire raises TimeoutError, which maps to the
+# session-mode 503 retry path.
+_SESSION_TURN_LOCK_TIMEOUT_SECONDS = 10.0
+
 
 def _extract_codex_handshake_headers(upstream: Any) -> list[tuple[str, str]]:
     """Return the ``x-codex-*`` headers from an upstream WS handshake response.
@@ -1911,6 +2112,7 @@ class OpenAIHandlerMixin:
         # original and lowercased name variants (see _parse_exclude_tools), but
         # we also test the lowercased name defensively for case-insensitivity.
         from headroom.config import (
+            DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
             DEFAULT_EXCLUDE_TOOLS,
             DEFAULT_VERBATIM_EXCLUDE_TOOLS,
             is_tool_excluded,
@@ -1930,6 +2132,55 @@ class OpenAIHandlerMixin:
             for call_id, fn_name in function_name_by_call_id.items()
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
+        # A file read is protected from the lossless FOLD only — its bytes come
+        # back as the model's `Edit(old_string=…)` anchor, so a rewrite costs a
+        # missed edit. Deliberately NOT folded into verbatim_excluded_call_ids:
+        # that set also gates the Responses cross-turn dedup below, and dedup
+        # leaves the true bytes in context (see DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS).
+        byte_exact_call_ids: set[str] = {
+            call_id
+            for call_id, fn_name in function_name_by_call_id.items()
+            if is_tool_excluded(fn_name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS)
+        }
+
+        # Read protection (HEADROOM_PROTECT_READS) — parity with the
+        # chat/Anthropic path (ContentRouter.apply). Output of a file-READ
+        # command (cat/nl/sed -n/head/tail/…) must stay verbatim: the agent
+        # byte-patches against it, and lossy reads caused re-reads /
+        # turn-inflation + resolve loss on SWE-bench. The Responses wire carries
+        # the producing command in two shapes, both normalized by the shared
+        # _tool_call_command_text helper:
+        #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
+        #   - local_shell_call.action  (native Responses shell; argv or string)
+        # Content is gated per-output by _read_output_should_be_protected so
+        # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
+        # compressible, exactly like the chat path.
+        from headroom.transforms.content_router import (
+            _is_read_command,
+            _read_output_should_be_protected,
+            _tool_call_command_text,
+            read_protection_enabled,
+        )
+
+        read_command_by_call_id: dict[str, str] = {}
+        if read_protection_enabled():
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "function_call":
+                    command = _tool_call_command_text(item.get("arguments"))
+                elif item_type == "local_shell_call":
+                    command = _tool_call_command_text(item.get("action"))
+                else:
+                    continue
+                call_id = item.get("call_id")
+                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                    read_command_by_call_id[call_id] = command
+        # Outputs protected by read-command detection. Also unioned into the
+        # cross-turn dedup protection set below: a [↑…] fold of a read would
+        # break the exact-bytes contract just like lossy compression would.
+        read_protected_call_ids: set[str] = set()
 
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
@@ -1974,6 +2225,24 @@ class OpenAIHandlerMixin:
                             }
                         )
                     continue
+                if isinstance(call_id, str) and call_id in read_command_by_call_id:
+                    # Finalize by CONTENT (same gate as ContentRouter.apply):
+                    # protect unless the output is confidently non-code DATA.
+                    if _read_output_should_be_protected(_responses_part_text(item.get("output"))):
+                        read_protected_call_ids.add(call_id)
+                        if debug_enabled:
+                            extraction_debug.append(
+                                {
+                                    "index": idx,
+                                    "eligible": False,
+                                    "reason": "read_command_protected",
+                                    "item_type": item_type,
+                                    "call_id": call_id,
+                                    "command": read_command_by_call_id[call_id],
+                                    "item": item,
+                                }
+                            )
+                        continue
                 if isinstance(call_id, str) and call_id in excluded_call_ids:
                     if call_id in verbatim_excluded_call_ids:
                         if debug_enabled:
@@ -1995,8 +2264,14 @@ class OpenAIHandlerMixin:
                     # Note: when output is a content-part array, fold each text part
                     # individually using ("output_part", index) slots to preserve the
                     # array structure (non-text parts like images are left untouched).
+                    # A file read skips the fold entirely: this is the Codex wire,
+                    # where `read` really does return raw file bytes, so a fold here
+                    # is exactly what breaks the next `Edit(old_string=…)`.
+                    excluded_folded = False
                     raw_output = item.get("output")
-                    if isinstance(raw_output, list):
+                    if call_id in byte_exact_call_ids:
+                        pass  # byte-exact: no fold, fall through to the debug record
+                    elif isinstance(raw_output, list):
                         for pidx, part in enumerate(raw_output):
                             if (
                                 isinstance(part, dict)
@@ -2006,6 +2281,7 @@ class OpenAIHandlerMixin:
                                 part_text = part["text"]
                                 pf = router._lossless_compact_excluded(part_text)
                                 if pf is not None:
+                                    excluded_folded = True
                                     lossless_excluded.append(
                                         (idx, ("output_part", pidx), pf[0], part_text)
                                     )
@@ -2013,6 +2289,7 @@ class OpenAIHandlerMixin:
                         excl_out = _responses_part_text(raw_output)
                         fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                         if fold is not None:
+                            excluded_folded = True
                             lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
                         extraction_debug.append(
@@ -2021,7 +2298,7 @@ class OpenAIHandlerMixin:
                                 "eligible": False,
                                 "reason": (
                                     "exclude_tools_lossless_fold"
-                                    if fold is not None
+                                    if excluded_folded
                                     else "exclude_tools_protected"
                                 ),
                                 "item_type": item_type,
@@ -2437,7 +2714,7 @@ class OpenAIHandlerMixin:
                 updated_items,
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
-                protected_call_ids=verbatim_excluded_call_ids,
+                protected_call_ids=verbatim_excluded_call_ids | read_protected_call_ids,
             )
             if dd_folded:
                 modified = True
@@ -2861,6 +3138,27 @@ class OpenAIHandlerMixin:
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
+        # Codex >= 0.149.0 nests tool definitions in `input` items of type
+        # additional_tools; normalize to the classic top-level array before
+        # shaping/compression so every downstream tools consumer engages.
+        # Runs once per pass, ahead of the executor closure, and never breaks
+        # forwarding.
+        _restore_plan: list[dict[str, Any]] = []
+        try:
+            _lift_codex_additional_tools(
+                payload,
+                request_id=request_id,
+                restore_plan=_restore_plan,
+            )
+        except Exception:  # pragma: no cover - defensive; never break forwarding
+            # The plan is deliberately kept: if the lift raised after mutating
+            # the payload, the restore is what undoes it.
+            logger.warning(
+                "[%s] additional_tools lift failed; continuing unlifted",
+                request_id,
+                exc_info=True,
+            )
+
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
             # compression so the turn classifier sees the client's input as
@@ -2873,13 +3171,7 @@ class OpenAIHandlerMixin:
                 payload,
                 model=model,
                 request_id=request_id,
-                output_shaper_enabled=(
-                    getattr(getattr(self, "config", None), "rollout", None).is_enabled(
-                        "proxy_output_shaper"
-                    )
-                    if getattr(getattr(self, "config", None), "rollout", None) is not None
-                    else None
-                ),
+                output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
             )
             compression_kwargs: dict[str, Any] = {
                 "model": model,
@@ -2928,6 +3220,33 @@ class OpenAIHandlerMixin:
             _compress,
             timeout=timeout,
         )
+
+        # Restore the carrier Codex sent the definitions in. The lift is an
+        # internal normalization for the tools consumers; the forwarded shape
+        # must match what the client sent, or a stateful session loses its
+        # tool surface after the first turn (0.36.3 regression from #3186).
+        if _restore_plan and result and isinstance(result[0], dict):
+            try:
+                if not _restore_codex_additional_tools(
+                    result[0],
+                    _restore_plan,
+                    request_id=request_id,
+                ):
+                    # The lifted shape is about to go out: a stateful client
+                    # will lose its tools after this turn. Never silent.
+                    logger.warning(
+                        "[%s] additional_tools carrier could not be restored; "
+                        "forwarding lifted shape (set "
+                        "HEADROOM_CODEX_ADDITIONAL_TOOLS_LIFT=0 to opt out)",
+                        request_id,
+                    )
+            except Exception:  # pragma: no cover - defensive
+                logger.warning(
+                    "[%s] additional_tools restore failed",
+                    request_id,
+                    exc_info=True,
+                )
+
         if len(result) == 8:
             return (*result, timing)
         return result
@@ -3160,10 +3479,7 @@ class OpenAIHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             # Per-project memory routing (GH #462). Built once per request
             # so every save/search/inject resolves to the same workspace.
             from headroom.memory.storage_router import (
@@ -3422,8 +3738,33 @@ class OpenAIHandlerMixin:
                 )
                 openai_frozen_count = 0
 
+        # Provider-confirmed floor for the cross-turn overlay at the end of this
+        # function. This is the count derived from OpenAI's own
+        # `prompt_tokens_details.cached_tokens` (via the shared tracker),
+        # snapshotted HERE rather than read at the call site: the token path's
+        # `prepare_turn` below runs FREEZE_POLICY_REPLAYABLE, whose count is
+        # `max(cache_count, explicit)` over the LOCAL byte-replay cache and can
+        # therefore exceed what the provider actually confirmed. Replaying past
+        # the confirmed point unconditionally would pin content the provider
+        # never cached. A cold prefix zeroes this above, which collapses the
+        # floor and lets every accumulated improvement land - same as Anthropic.
+        _openai_confirmed_frozen = max(int(openai_frozen_count or 0), 0)
+
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
+        # Cross-turn dedup rewrites repeated tool-output spans to bare
+        # `[↑NL same as msg M]` in-context pointers. Those are recoverable only
+        # where the model can resolve the reference; on the streaming chat path
+        # the CCR retrieval tool cannot be injected (this path cannot intercept
+        # tool calls) and OpenAI-compatible clients never show the model
+        # numbered messages, so a folded pointer reads as deleted content and
+        # models retry-loop on the "missing" output. Gate the fold on the same
+        # recoverability predicate that gates CCR tool injection: the buffered
+        # (non-streaming) chat path keeps dedup, the streaming path skips it.
+        _dedup_pointers_recoverable = _should_inject_openai_chat_ccr_tool(
+            ccr_inject_tool=self.config.ccr_inject_tool,
+            stream=stream,
+        )
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
@@ -3450,17 +3791,45 @@ class OpenAIHandlerMixin:
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
-                    # Zone 1: Swap cached compressed versions
-                    working_messages = comp_cache.apply_cached(messages)
-
-                    # Re-freeze boundary. Token mode can use the compression
-                    # cache's positional frozen count. Cache mode must keep the
-                    # latest observation mutable even when the compression
-                    # cache has no compressible entry for it yet; otherwise
-                    # OpenAI-compatible tool-call clients freeze the entire
-                    # conversation and report near-zero savings.
                     if not is_cache_mode(self.config.mode):
-                        openai_frozen_count = comp_cache.compute_frozen_count(messages)
+                        # Token mode: shared engine, REPLAYABLE policy — its
+                        # formula with no explicit pin is exactly this path's
+                        # historical freeze (compute_frozen_count alone; the
+                        # tracker count feeds cache mode below, never token
+                        # mode). The engine also runs
+                        # mark_stable_from_messages, which this path skipped:
+                        # that marks tool_results INSIDE the frozen prefix as
+                        # stable — redundant in the common case (an in-prefix
+                        # tool_result is already stable via its cache entry)
+                        # but it keeps `_stable_hashes` bookkeeping identical
+                        # across all three paths, e.g. preserving stability
+                        # across cache-entry LRU turnover. Note it can never
+                        # mark the BOUNDARY tool_result that stopped the
+                        # count (it sits outside messages[:frozen]) — the
+                        # protection against re-compressing a passthrough
+                        # boundary tool_result under rising context pressure
+                        # is the router-level `_frozen_verdicts` pin, on every
+                        # path, unchanged by this migration.
+                        from headroom.proxy.session_engine import (
+                            FREEZE_POLICY_REPLAYABLE,
+                            prepare_turn,
+                        )
+
+                        _prep = prepare_turn(
+                            comp_cache,
+                            messages,
+                            policy=FREEZE_POLICY_REPLAYABLE,
+                        )
+                        working_messages = _prep.pipeline_input
+                        openai_frozen_count = _prep.frozen_message_count
+                    else:
+                        # Cache mode: Zone-1 swap only. The latest observation
+                        # must stay mutable even when the compression cache
+                        # has no entry for it yet (otherwise OpenAI-compatible
+                        # tool-call clients freeze the entire conversation and
+                        # report near-zero savings), so the freeze comes from
+                        # the tracker (set above), never from the cache count.
+                        working_messages = comp_cache.apply_cached(messages)
 
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
@@ -3478,6 +3847,7 @@ class OpenAIHandlerMixin:
                             ),
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
                             # chat-completions path, matching handlers/
@@ -3518,6 +3888,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
+                            cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
                             # the configured profile too (#1534).
@@ -3549,21 +3920,42 @@ class OpenAIHandlerMixin:
         # Cache-safety (ALL modes): forward the previously-cached (compressed)
         # prefix byte-identical, so freezing can't bust the prompt cache. See the
         # matching guard in the Anthropic handler for the full rationale. Append-
-        # only-guarded and idempotent (cache mode already replays).
-        from headroom.cache.prefix_tracker import overlay_cached_prefix
+        # only-guarded and idempotent (cache mode already replays). Shared
+        # implementation: session_engine.finalize_turn.
+        from headroom.proxy.session_engine import finalize_turn
 
-        _ov = overlay_cached_prefix(
+        _final = finalize_turn(
             optimized_messages,
             original_client_messages,
             openai_prefix_tracker.get_last_original_messages(),
             openai_prefix_tracker.get_last_forwarded_messages(),
+            count_tokens=tokenizer.count_messages,
+            # Same reasoning as the Anthropic call site: inside the
+            # provider-confirmed prefix the replay source IS what OpenAI
+            # hashed, so declining a byte-larger replay there re-forwards
+            # recompressed history and busts the prompt cache from the first
+            # changed byte. Beyond the floor the size bound still arbitrates.
+            # Exposure here is narrower than Anthropic's - the token path's
+            # REPLAYABLE freeze already stops most recompression of
+            # already-forwarded messages - but it is not zero: an entry
+            # evicted from the local byte-replay cache falls out of that
+            # freeze and can be recompressed, and cache mode freezes from the
+            # tracker only.
+            confirmed_frozen_count=_openai_confirmed_frozen,
         )
-        if _ov != optimized_messages:
-            optimized_messages = _ov
-            optimized_tokens = tokenizer.count_messages(optimized_messages)
+        if _final.replayed:
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
-        # Guard: if "optimization" inflated tokens, revert to originals
-        if optimized_tokens > original_tokens:
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # NEVER after the overlay replayed (same exemption as the Anthropic
+        # handler): the replayed prefix is the exact bytes the provider
+        # cached, and reverting to raw originals re-forwards the uncompressed
+        # prefix — trading a 90% read discount for a full cache re-write. The
+        # nominal "inflation" there is an artifact of comparing the cached
+        # (compressed) forwarding against the raw original count.
+        if optimized_tokens > original_tokens and not _final.replayed:
             logger.warning(
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -4109,11 +4501,8 @@ class OpenAIHandlerMixin:
             )
 
             _shaper_settings = OutputShaperSettings.from_env(
-                enabled=(
-                    self.config.rollout.is_enabled("proxy_output_shaper")
-                    if getattr(self.config, "rollout", None) is not None
-                    else None
-                )
+                enabled=(shaper_enabled_for(getattr(self, "config", None))),
+                steering_enabled=steering_allowed_for(getattr(self, "config", None)),
             )
             if _shaper_settings.enabled:
                 # Conversation-stable holdout: a whole conversation is treatment
@@ -4362,6 +4751,7 @@ class OpenAIHandlerMixin:
                     # matching the streaming path and the guarded cache keys below
                     # (same class as the gemini fix in #2347).
                     output_tokens = _usage_int(usage.get("completion_tokens"))
+                    _thinking = extract_from_usage(usage)
                     total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
 
                     # Cache stats: prefer the Anthropic/Bedrock top-level
@@ -4436,6 +4826,8 @@ class OpenAIHandlerMixin:
                             optimized_tokens=optimized_tokens,
                             provider_input_tokens=total_input_tokens,
                             output_tokens=output_tokens,
+                            thinking_tokens=_thinking.tokens,
+                            thinking_inferred=_thinking.inferred,
                             tokens_saved=tokens_saved,
                             attempted_input_tokens=optimized_tokens + tokens_saved,
                             cache_read_tokens=cache_read_tokens,
@@ -4722,6 +5114,10 @@ class OpenAIHandlerMixin:
                         except Exception as dump_err:
                             logger.error(f"[{request_id}] Failed to write debug dump: {dump_err}")
 
+                # Bound here so the RequestOutcome emit below can never hit an
+                # unbound name on an except or early-exit path — an accounting
+                # field must not be able to 500 a live request.
+                _thinking = ThinkingTokens()
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = optimized_tokens  # fallback
@@ -4738,6 +5134,7 @@ class OpenAIHandlerMixin:
                     # request (same class as the gemini fix in #2347).
                     total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
                     output_tokens = _usage_int(usage.get("completion_tokens"))
+                    _thinking = extract_from_usage(usage)
                     # OpenAI returns cached_tokens in prompt_tokens_details
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details") or {}
@@ -4899,6 +5296,8 @@ class OpenAIHandlerMixin:
                         optimized_tokens=optimized_tokens,
                         provider_input_tokens=total_input_tokens,
                         output_tokens=output_tokens,
+                        thinking_tokens=_thinking.tokens,
+                        thinking_inferred=_thinking.inferred,
                         tokens_saved=tokens_saved,
                         attempted_input_tokens=optimized_tokens + tokens_saved,
                         cache_read_tokens=cache_read_tokens,
@@ -5197,10 +5596,7 @@ class OpenAIHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             from headroom.memory.storage_router import (
                 RequestContext as _MemRequestContext,
             )
@@ -5558,11 +5954,7 @@ class OpenAIHandlerMixin:
                     if _http_conversation_key
                     else None
                 ),
-                output_shaper_enabled=(
-                    self.config.rollout.is_enabled("proxy_output_shaper")
-                    if getattr(self.config, "rollout", None) is not None
-                    else None
-                ),
+                output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
             )
             _append_unique_transforms(transforms_applied, _shape_result.labels)
             if _shape_result.changed:
@@ -5845,6 +6237,10 @@ class OpenAIHandlerMixin:
                             headers={**adapted_headers, "content-type": "application/json"},
                         )
 
+                    # Bound here so the RequestOutcome emit below can never hit an
+                    # unbound name on an except or early-exit path — an accounting
+                    # field must not be able to 500 a live request.
+                    _thinking = ThinkingTokens()
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
@@ -5864,6 +6260,7 @@ class OpenAIHandlerMixin:
                             original_tokens,
                         )
                         output_tokens = _usage_int(usage.get("output_tokens"))
+                        _thinking = extract_from_usage(usage)
                         details = usage.get("input_tokens_details")
                         if isinstance(details, dict):
                             cache_read_tokens = _usage_int(details.get("cached_tokens"))
@@ -6111,6 +6508,8 @@ class OpenAIHandlerMixin:
                             optimized_tokens=effective_optimized_tokens,
                             provider_input_tokens=total_input_tokens,
                             output_tokens=output_tokens,
+                            thinking_tokens=_thinking.tokens,
+                            thinking_inferred=_thinking.inferred,
                             tokens_saved=tokens_saved,
                             attempted_input_tokens=attempted_input_tokens,
                             cache_read_tokens=cache_read_tokens,
@@ -6979,12 +7378,7 @@ class OpenAIHandlerMixin:
                 nonlocal memory_user_id, memory_request_ctx
 
                 memory_user_id_candidate = (
-                    ws_headers.get(
-                        "x-headroom-user-id",
-                        os.environ.get("USER", os.environ.get("USERNAME", "default")),
-                    )
-                    if self.memory_handler
-                    else None
+                    resolve_memory_identity(websocket) if self.memory_handler else None
                 )
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,
@@ -7440,11 +7834,7 @@ class OpenAIHandlerMixin:
                         self.openai_provider,
                     ),
                     conversation_key=f"ws:{session_id}",
-                    output_shaper_enabled=(
-                        self.config.rollout.is_enabled("proxy_output_shaper")
-                        if getattr(self.config, "rollout", None) is not None
-                        else None
-                    ),
+                    output_shaper_enabled=(shaper_enabled_for(getattr(self, "config", None))),
                 )
                 _append_unique_transforms(transforms_applied, _shape_labels)
                 if _shape_modified:
@@ -7895,9 +8285,7 @@ class OpenAIHandlerMixin:
                                         ),
                                         conversation_key=f"ws:{session_id}",
                                         output_shaper_enabled=(
-                                            self.config.rollout.is_enabled("proxy_output_shaper")
-                                            if getattr(self.config, "rollout", None) is not None
-                                            else None
+                                            shaper_enabled_for(getattr(self, "config", None))
                                         ),
                                     )
                                     _append_unique_transforms(
@@ -8864,6 +9252,22 @@ class OpenAIHandlerMixin:
                 metrics=getattr(self, "metrics", None),
             )
 
+    def _ws_http_fallback_timeout(self) -> httpx.Timeout:
+        """Timeout for the WS->HTTP fallback POST.
+
+        This used to be a bare ``timeout=120.0``. httpx expands a float across
+        all four phases, so connecting and pooling silently got 120s instead of
+        the configured 10s, and the send ignored ``write_timeout_seconds``
+        entirely — an operator tightening either knob had no effect on this
+        path. Only ``read`` was ever meant to be 120s here (#3259 follow-up).
+        """
+        return httpx.Timeout(
+            connect=self.config.connect_timeout_seconds,
+            read=_WS_HTTP_FALLBACK_READ_TIMEOUT_SECONDS,
+            write=self.config.write_timeout_seconds,
+            pool=self.config.connect_timeout_seconds,
+        )
+
     async def _ws_http_fallback(
         self,
         websocket: WebSocket,
@@ -8977,7 +9381,7 @@ class OpenAIHandlerMixin:
                         http_url,
                         headers=http_headers,
                         content=outbound_bytes,
-                        timeout=120.0,
+                        timeout=self._ws_http_fallback_timeout(),
                     ) as response:
                         if response.status_code != 200:
                             error_body = b""
@@ -9294,6 +9698,9 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers)
         tags = extract_tags(headers)
         client = classify_client(headers)
+        # Initialized before the try so the TimeoutError handler can branch on
+        # it even if the failure happened before session parsing.
+        session_id = None
 
         try:
             # Use OpenAI pipeline (messages are in OpenAI format from TS SDK)
@@ -9358,6 +9765,64 @@ class OpenAIHandlerMixin:
                         }
                     },
                 )
+            # Session-aware sidecar mode (opt-in): with a session id the
+            # endpoint keeps the byte-replay state ITSELF — the same
+            # per-session machinery the proxy path uses (compression cache +
+            # prefix tracker, with the registry's TTL/LRU lifecycle) — so a
+            # gateway that owns routing (e.g. Kong) can resend the RAW
+            # conversation every turn and still get a byte-identical prefix
+            # back. Contract: the caller forwards the returned messages
+            # verbatim, and may relay provider usage via POST /v1/usage for
+            # telemetry/attribution. Without a session id, behaviour is the
+            # stateless contract, unchanged.
+            session_id = compress_config.get("session_id")
+            # The x-headroom-session-id header is honored only behind an
+            # explicit env opt-in: deployments whose gateways already stamp
+            # that header on ALL traffic (it is the documented proxy-path
+            # session key) would otherwise silently flip stateless callers
+            # into session mode on upgrade — and a header value shared across
+            # conversations (Claude Code subagents do exactly this) would
+            # blend unrelated conversations into one replay state.
+            if session_id is None and os.environ.get(
+                "HEADROOM_COMPRESS_SESSION_FROM_HEADER", ""
+            ).lower() in ("1", "true"):
+                session_id = request.headers.get("x-headroom-session-id")
+            if session_id is not None and (
+                not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 256
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                f"Invalid config.session_id: {session_id!r}. "
+                                "Expected a non-empty string of at most 256 characters."
+                            ),
+                        }
+                    },
+                )
+            if session_id is not None and compress_user_messages:
+                # User/assistant rewrites are not content-addressed (the
+                # session cache replays tool_result content only), so once the
+                # tracker's overlay snapshots expire a rewritten user message
+                # would come back in RAW form — a guaranteed prefix bust inside
+                # the tracker-TTL/cache-TTL window. Refuse the combination
+                # rather than bust later.
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "invalid_request",
+                            "message": (
+                                "config.compress_user_messages is not supported with "
+                                "config.session_id: user-message rewrites cannot be "
+                                "byte-replayed across turns, which would bust the "
+                                "provider prompt cache."
+                            ),
+                        }
+                    },
+                )
             # Mode selection. Default is marker-free (see _no_ccr_pipeline):
             # no caller of this route can resolve a CCR marker unless it opts in
             # with mode="ccr", which restores the full marker + store behaviour.
@@ -9404,23 +9869,160 @@ class OpenAIHandlerMixin:
             if frozen_message_count is not None:
                 pipeline_kwargs["frozen_message_count"] = frozen_message_count
 
-            # Offload the CPU-bound pipeline to the bounded compression executor
-            # (mirrors the request handlers above). Running apply() inline blocked
-            # the single event loop on a large payload, so even GET /health stalled
-            # until it finished (#718). The executor also enforces a timeout so a
-            # too-large body fails fast instead of hanging forever.
-            result = await self._run_compression_in_executor(
-                lambda: pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    **pipeline_kwargs,
-                ),
+            # Sidecar session pre-work: swap in previously-computed compressed
+            # bytes (Zone 1), then freeze the ENTIRE locally-replayable prefix
+            # (`compute_frozen_count`). This deliberately differs from the
+            # proxy path's `min(tracker, cache)` posture: in sidecar mode,
+            # whatever this endpoint previously RETURNED is the provider's
+            # cache contract, so every already-returned message must come back
+            # byte-identical — recompressing it (even "better") is a bust.
+            # Over-freezing relative to the provider's actual cache only
+            # forgoes tail compression; it can never bust. The tracker's
+            # /v1/usage-fed freeze count is deliberately NOT a freeze floor —
+            # freezing a message whose cache entry was evicted would forward
+            # raw original bytes. An explicit config.frozen_message_count
+            # still wins when larger: the caller may know more about the
+            # provider cache than local state does.
+            comp_cache = None
+            session_tracker = None
+            if session_id:
+                # Namespaced with a NUL separator so sidecar sessions can
+                # never collide with proxy-path session ids: NUL cannot
+                # appear in an HTTP header value, so no client-supplied
+                # x-headroom-session-id on the proxy path can spoof its way
+                # into a sidecar session's tracker or replay cache (the same
+                # trick SessionTrackerStore uses for its synthetic lineage
+                # keys). A plain "compress:" string prefix was spoofable.
+                _session_key = f"compress\x00{session_id}"
+                _tracker_provider = (
+                    "anthropic"
+                    if ("claude" in model_name.lower() or "anthropic" in model_name.lower())
+                    else "openai"
+                )
+                comp_cache = self._get_compression_cache(_session_key)
+                session_tracker = self.session_tracker_store.get_or_create(
+                    _session_key, _tracker_provider
+                )
+
+            def _run_stateless():
+                result = pipeline.apply(messages=messages, model=model, **pipeline_kwargs)
+                return (
+                    result,
+                    result.messages,
+                    result.tokens_before,
+                    result.tokens_after,
+                    None,
+                )
+
+            def _run_session_turn():
+                # One sidecar turn as a single executor-side block: every step
+                # here is CPU-bound (content hashing, deep compares, token
+                # counts, full-transcript deepcopies) and must stay off the
+                # event loop for the same reason pipeline.apply does (#718).
+                # The per-session lock serializes contract-violating
+                # concurrent turns so an older in-flight turn cannot tear or
+                # overwrite a newer turn's tracker snapshots mid-flight.
+                # Cache management (freeze + swap + overlay) lives in the
+                # shared session engine — one brain for this path and the
+                # proxy request paths.
+                from headroom.proxy.session_engine import (
+                    FREEZE_POLICY_REPLAYABLE,
+                    finalize_turn,
+                    prepare_turn,
+                )
+
+                # TIMED acquire, strictly shorter than the executor timeout:
+                # an untimed `with lock:` here lets one slow session's
+                # 503-driven retries park executor workers doing no work —
+                # each blocked worker records timeout debt and can arm the
+                # compression quarantine for ALL traffic. Failing fast maps
+                # to the same TimeoutError → session-mode 503 → retry path.
+                if not comp_cache.session_turn_lock.acquire(
+                    timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS
+                ):
+                    raise TimeoutError(
+                        f"session turn lock busy for {session_id!r} "
+                        "(a previous turn for this session is still running)"
+                    )
+                try:
+                    prev_original = session_tracker.get_last_original_messages()
+                    prev_returned = session_tracker.get_last_forwarded_messages()
+                    prep = prepare_turn(
+                        comp_cache,
+                        messages,
+                        policy=FREEZE_POLICY_REPLAYABLE,
+                        explicit_frozen=frozen_message_count,
+                    )
+                    session_frozen = prep.frozen_message_count
+                    pipeline_kwargs["frozen_message_count"] = session_frozen
+                    result = pipeline.apply(
+                        messages=prep.pipeline_input, model=model, **pipeline_kwargs
+                    )
+                    # Replay last turn's exact returned prefix over any drift
+                    # the pipeline introduced — byte-identical is the contract
+                    # the caller forwards on.
+                    turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
+                    final = turn.messages
+                    # Savings are reported against the caller's RAW payload,
+                    # not the cache-swapped pipeline input: on a warm turn the
+                    # swap has already shrunk the input before the pipeline
+                    # counts it, which made every warm turn report ~0 saved.
+                    try:
+                        from headroom.tokenizers import get_tokenizer
+
+                        _tok = get_tokenizer(model_name)
+                        raw_tokens_before = _tok.count_messages(messages)
+                        final_tokens_after = _tok.count_messages(final)
+                    except Exception as e:
+                        # Fail-open, but LOUD: this fallback reverts to the
+                        # pipeline's counts of the cache-swapped input, which
+                        # silently resurrects the ~0-saved warm-turn bug the
+                        # raw recount exists to fix — per-model, so it can
+                        # hide indefinitely without this log.
+                        logger.warning(
+                            "[compress:%s] raw-payload token recount failed for "
+                            "model %s (%s: %s); savings for this turn are "
+                            "reported against the cache-swapped input",
+                            session_id,
+                            model_name,
+                            type(e).__name__,
+                            e,
+                        )
+                        raw_tokens_before = result.tokens_before
+                        final_tokens_after = result.tokens_after
+                    comp_cache.update_from_result(messages, final)
+                    # Record this turn's result as the new "last returned" —
+                    # the sidecar equivalent of "last forwarded", captured at
+                    # return time because whatever we hand back IS what the
+                    # caller sends upstream.
+                    session_tracker.record_returned(messages, final)
+                    info = {
+                        "id": session_id,
+                        "frozen_message_count": session_frozen,
+                        "cached_prefix_replayed": turn.replayed,
+                    }
+                    return result, final, raw_tokens_before, final_tokens_after, info
+                finally:
+                    comp_cache.session_turn_lock.release()
+
+            # Offload the CPU-bound work to the bounded compression executor
+            # (mirrors the request handlers above). Running it inline blocked
+            # the single event loop on a large payload, so even GET /health
+            # stalled until it finished (#718). The executor also enforces a
+            # timeout so a too-large body fails fast instead of hanging.
+            (
+                result,
+                final_messages,
+                tokens_before,
+                tokens_after,
+                session_info,
+            ) = await self._run_compression_in_executor(
+                _run_session_turn if session_id else _run_stateless,
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
-            ccr_hashes = _response_ccr_hashes(result.messages, result.markers_inserted)
 
-            tokens_before = result.tokens_before
-            tokens_after = result.tokens_after
+            ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
+
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
             await self._record_request_outcome(
@@ -9452,28 +10054,82 @@ class OpenAIHandlerMixin:
                 )
             )
 
-            return JSONResponse(
-                {
-                    "messages": result.messages,
-                    "tokens_before": result.tokens_before,
-                    "tokens_after": result.tokens_after,
-                    "tokens_saved": result.tokens_before - result.tokens_after,
-                    "compression_ratio": (
-                        result.tokens_after / result.tokens_before
-                        if result.tokens_before > 0
-                        else 1.0
-                    ),
-                    "transforms_applied": result.transforms_applied,
-                    "transforms_summary": result.transforms_summary,
-                    "ccr_hashes": ccr_hashes,
-                }
-            )
+            _payload = {
+                "messages": final_messages,
+                "tokens_before": tokens_before,
+                "tokens_after": tokens_after,
+                # Clamped like the telemetry above: the overlay's byte-replay
+                # can legitimately return a slightly larger prefix than the
+                # pipeline's best effort, and a negative "saved" here while
+                # telemetry records 0 would be two answers for one number.
+                "tokens_saved": tokens_saved,
+                "compression_ratio": (tokens_after / tokens_before if tokens_before > 0 else 1.0),
+                "transforms_applied": result.transforms_applied,
+                "transforms_summary": result.transforms_summary,
+                "ccr_hashes": ccr_hashes,
+            }
+            if session_info is not None:
+                _payload["session"] = session_info
+            return JSONResponse(_payload)
         except TimeoutError:
+            self.metrics.record_compression_failed("timeout")
+            if session_id:
+                # Fail-open-with-originals is WRONG for a session call: the
+                # timed-out worker cannot be cancelled and may still finish
+                # and record its compressed result as "last returned" — while
+                # the caller, handed the originals, forwards those instead.
+                # The desynced snapshot then busts the next turn. A 503 tells
+                # the gateway to retry; the retry lands on whatever state the
+                # straggler recorded and replays it consistently.
+                logger.warning(
+                    "Compression timed out after %.0fs for session %r; "
+                    "returning 503 (session mode cannot fail open without "
+                    "desyncing replay state)",
+                    COMPRESSION_TIMEOUT_SECONDS,
+                    session_id,
+                )
+                # Same outcome recording as the stateless timeout path below:
+                # session timeouts hit the largest transcripts, and skipping
+                # the RequestOutcome here under-counts exactly those requests
+                # when dashboards reconcile failure counters against outcomes.
+                _timeout_latency_ms = (time.time() - start_time) * 1000
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=(
+                            await self._next_request_id()
+                            if hasattr(self, "_next_request_id")
+                            else f"compress_{int(time.time())}"
+                        ),
+                        provider="compress",
+                        model=model if isinstance(model, str) else str(model),
+                        original_tokens=0,
+                        optimized_tokens=0,
+                        output_tokens=0,
+                        tokens_saved=0,
+                        attempted_input_tokens=0,
+                        total_latency_ms=_timeout_latency_ms,
+                        overhead_ms=_timeout_latency_ms,
+                        num_messages=len(messages) if isinstance(messages, list) else 0,
+                        tags=tags,
+                        client=client,
+                    )
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "type": "compression_timeout",
+                            "message": (
+                                "Compression timed out; retry this turn. "
+                                "Session replay state remains consistent."
+                            ),
+                        }
+                    },
+                )
             logger.warning(
                 "Compression timed out after %.0fs; failing open with original messages",
                 COMPRESSION_TIMEOUT_SECONDS,
             )
-            self.metrics.record_compression_failed("timeout")
             latency_ms = (time.time() - start_time) * 1000
             await self._record_request_outcome(
                 RequestOutcome(
@@ -9522,6 +10178,186 @@ class OpenAIHandlerMixin:
                     }
                 },
             )
+
+    async def handle_compress_usage(self, request: Request) -> JSONResponse:
+        """Relay of the provider's usage block for a sidecar compress session.
+
+        POST /v1/usage
+        Body: {"session_id": "...",
+               "usage": {"cache_read_input_tokens": N,
+                         "cache_creation_input_tokens": N}}
+
+        The session-aware ``/v1/compress`` never sees the provider's response
+        (the caller owns routing). This relay feeds the provider-confirmed
+        numbers into the session's tracker — the same signal the proxy path
+        reads from the response itself — powering cache-hit/miss attribution,
+        idle-vs-prefix-change classification, and savings accounting for
+        sidecar sessions.
+
+        Deliberately NOT a freeze input: the compress path freezes exactly the
+        locally-replayable prefix (``compute_frozen_count``), and raising that
+        to a provider-confirmed count could freeze a message whose cache entry
+        was evicted — which would forward raw original bytes and bust the very
+        prefix the count vouched for. Optional: skipping this call costs
+        telemetry fidelity, never correctness.
+        """
+        from fastapi.responses import JSONResponse
+
+        from headroom.proxy.helpers import _read_request_json
+
+        def _invalid(message: str) -> JSONResponse:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"type": "invalid_request", "message": message}},
+            )
+
+        try:
+            body = await _read_request_json(request)
+        except Exception:
+            return _invalid("Invalid JSON in request body.")
+
+        session_id = body.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 256:
+            return _invalid(
+                "Missing or invalid session_id: expected a non-empty string "
+                "of at most 256 characters."
+            )
+        usage = body.get("usage")
+        if not isinstance(usage, dict):
+            return _invalid("Missing or invalid usage: expected an object.")
+        # A usage block carrying NEITHER cache field is a no-signal relay (an
+        # OpenAI-style {"prompt_tokens": N} forwarded verbatim, for example).
+        # Defaulting the absent fields to 0 would make update_from_response
+        # treat it as a provider-confirmed fully-cold turn and wipe the
+        # tracker's cached-prefix state — so absence of both is a 400, not 0.
+        if "cache_read_input_tokens" not in usage and "cache_creation_input_tokens" not in usage:
+            return _invalid(
+                "usage must carry cache_read_input_tokens and/or "
+                "cache_creation_input_tokens; a block with neither carries no "
+                "cache signal and is not accepted."
+            )
+
+        def _token_field(name: str) -> int | None:
+            value = usage.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return None
+            return value
+
+        cache_read = _token_field("cache_read_input_tokens")
+        cache_write = _token_field("cache_creation_input_tokens")
+        if cache_read is None or cache_write is None:
+            return _invalid(
+                "usage.cache_read_input_tokens and usage.cache_creation_input_tokens "
+                "must be non-negative integers when present."
+            )
+
+        # Same NUL-separated namespace as handle_compress: unspoofable from
+        # any HTTP header. peek() (never get_or_create) so a flood of novel
+        # session ids cannot grow the tracker store — an unknown or expired
+        # session is answered without leaving a footprint, and the session
+        # keeps the provider its compress call inferred rather than a default
+        # from here.
+        _session_key = f"compress\x00{session_id}"
+        tracker = self.session_tracker_store.peek(_session_key)
+        if tracker is None:
+            return self._compress_usage_unknown_session(session_id)
+        # No create, no LRU bump: the cache is only needed for its turn lock.
+        comp_cache = self._peek_compression_cache(_session_key)
+
+        # A relay whose only present field is zero carries no positive cache
+        # signal (an OpenAI-mapped gateway naturally sends
+        # {"cache_read_input_tokens": 0} with no write field — OpenAI has no
+        # write signal). Applying it would hit update_from_response's
+        # total_cached == 0 branch and wipe the tracker's cached-prefix
+        # state — a "provider-confirmed fully cold" reset the relay never
+        # actually asserted. Only a relay with BOTH fields present may claim
+        # a genuine fully-cold turn.
+        _both_present = (
+            "cache_read_input_tokens" in usage and "cache_creation_input_tokens" in usage
+        )
+        if cache_read + cache_write == 0 and not _both_present:
+            return JSONResponse(
+                {
+                    "session_id": session_id,
+                    "frozen_message_count": tracker.get_frozen_message_count(),
+                    "applied": False,
+                    "reason": "no_cache_signal",
+                }
+            )
+
+        def _apply_usage():
+            # Off the event loop (full-transcript deepcopies + per-message
+            # token estimation live in update_from_response), and under the
+            # session turn lock: an unlocked update here races the
+            # executor-side compress turn — record_returned installs turn
+            # N+1's snapshots, then this write would roll them back to turn
+            # N's copies and the next overlay would refuse to replay.
+            lock = comp_cache.session_turn_lock if comp_cache is not None else None
+            if lock is not None and not lock.acquire(timeout=_SESSION_TURN_LOCK_TIMEOUT_SECONDS):
+                raise TimeoutError(f"session turn lock busy for {session_id!r}")
+            try:
+                last_returned = tracker.get_last_forwarded_messages()
+                if not last_returned:
+                    return None
+                tracker.update_from_response(
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
+                    messages=last_returned,
+                    original_messages=tracker.get_last_original_messages(),
+                )
+                return tracker.get_frozen_message_count()
+            finally:
+                if lock is not None:
+                    lock.release()
+
+        try:
+            frozen_count = await self._run_compression_in_executor(
+                _apply_usage, timeout=COMPRESSION_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "type": "session_busy",
+                        "message": (
+                            "A compress turn for this session is in flight; retry the usage relay."
+                        ),
+                    }
+                },
+            )
+        if frozen_count is None:
+            return self._compress_usage_unknown_session(session_id)
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "frozen_message_count": frozen_count,
+                "applied": True,
+            }
+        )
+
+    @staticmethod
+    def _compress_usage_unknown_session(session_id: str):
+        from fastapi.responses import JSONResponse
+
+        # No compress state for this session: never seen, or the tracker's
+        # session TTL reclaimed it. Note the byte-replay cache lives longer
+        # than the tracker, so a 404 here does NOT mean the next /v1/compress
+        # loses replay — only this telemetry relay landed nowhere.
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "type": "unknown_session",
+                    "message": (
+                        f"No usage-tracking state for session {session_id!r} "
+                        "(never seen, or expired). Compression replay for the "
+                        "session may still be active; only this telemetry "
+                        "relay landed nowhere."
+                    ),
+                }
+            },
+        )
 
     async def _maybe_compress_passthrough_responses(
         self, body: bytes, *, client: str | None = None

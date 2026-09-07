@@ -38,6 +38,13 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
+
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the reserved override used by the end-to-end isolation test."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "override.example")
+
+
 # ---------------------------------------------------------------------------
 # Pure helper unit tests
 # ---------------------------------------------------------------------------

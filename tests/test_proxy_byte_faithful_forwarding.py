@@ -711,7 +711,7 @@ def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
     """
     monkeypatch.delenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", raising=False)
     config = ProxyConfig(
-        optimize=False,
+        optimize=True,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,
@@ -1009,7 +1009,15 @@ def test_anthropic_tools_unsorted_order_preserves_byte_faithful_request() -> Non
     assert [tool["name"] for tool in forwarded["tools"]] == ["zeta", "alpha"]
 
 
-def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized() -> None:
+def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This asserts an exact upstream body to pin *tool* canonicalization, so
+    # isolate it from output shaping, which is on by default for an optimized
+    # proxy and appends a steering block to the system tail. Shaping is
+    # covered by its own suites; folding its text into this expectation would
+    # make a tool-ordering test fail every time the steering copy is edited.
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
     client, transport = _make_anthropic_app(optimize=True)
     proxy = client.app.state.proxy
     proxy.config.mode = "token"
@@ -1893,3 +1901,52 @@ def test_unparseable_original_cannot_prove_preservation(
     monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
     assert thinking_blocks_survived_mutation(_tb_body(), b"{not json") is False
     assert thinking_blocks_survived_mutation(_tb_body(), None) is False
+
+
+def test_lone_surrogate_in_thinking_body_serializes_instead_of_raising():
+    """A lone surrogate must not turn a mutated thinking body into a 500.
+
+    ``"\\ud800"`` is valid JSON, so ``json.loads`` accepts it and a tool result
+    carrying truncated UTF-16 produces one. Before #3124 a mutated
+    thinking-bearing body returned the client's bytes verbatim and never reached
+    canonical serialization; now it does, and both forwarders resolve outbound
+    bytes outside their retry loop, so a raise here escapes as an unretried 500.
+    """
+    import json
+
+    from headroom.proxy.body_forwarding import select_outbound_body
+
+    lone_surrogate = chr(0xD800)
+    original = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": f"reasoning {lone_surrogate}",
+                        "signature": "sig",
+                    }
+                ],
+            }
+        ]
+    }
+    original_bytes = json.dumps(original, ensure_ascii=True).encode("utf-8")
+    mutated = json.loads(original_bytes)
+    mutated["messages"].append({"role": "user", "content": "compressed"})
+
+    outbound = select_outbound_body(
+        body=mutated,
+        original_body_bytes=original_bytes,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    # The relaxation still applies (the thinking block is untouched) and the
+    # mutation reaches the wire rather than being discarded or crashing.
+    assert outbound.source == "canonical"
+    assert not outbound.dropped_mutations
+    reparsed = json.loads(outbound.content)
+    assert reparsed == mutated
+    # The signed block round-trips to exactly the values the client sent.
+    assert reparsed["messages"][0] == original["messages"][0]

@@ -500,7 +500,16 @@ def _empty_display_session() -> dict[str, Any]:
 def _empty_by_model_entry() -> dict[str, Any]:
     return {
         "requests": 0,
+        # Message-level compression only. Kept as its own bucket rather than
+        # widened in place, so the persisted meaning of an existing field never
+        # changes under a reader that predates this.
         "tokens_saved": 0,
+        # Tool-schema deferral, attributed to the model that benefited. This was
+        # dropped on the floor: `record_request` was handed it and passed only
+        # the message figure down, so a tool-heavy model read "0 tokens saved"
+        # while the headline counted its deferral. Deferral is routinely the
+        # larger half -- 589,206 of 625,277 in the report that prompted this.
+        "tool_tokens_saved": 0,
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
@@ -562,6 +571,8 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         normalized = _empty_by_model_entry()
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
+        # Absent in state files written before this field existed -> 0.
+        normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
         normalized["compression_savings_usd"] = round(
             _coerce_float(entry.get("compression_savings_usd")), 6
         )
@@ -741,6 +752,12 @@ class SavingsTracker:
         model: str,
         input_tokens: int,
         tokens_saved: int,
+        # Tool-schema deferral for this request, DISJOINT from ``tokens_saved``
+        # (which is the bare message figure). The caller has always had this
+        # number and already folds it into the priced dollars below; it simply
+        # had no parameter to arrive through, so per-model tokens stayed
+        # message-only while per-model dollars did not.
+        tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
         provider: str | None = None,
         project: str | None = None,
@@ -764,6 +781,7 @@ class SavingsTracker:
             timestamp_dt = _utc_now()
 
         delta_tokens_saved = _coerce_int(tokens_saved)
+        delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
@@ -902,6 +920,7 @@ class SavingsTracker:
                 model,
                 requests_delta=1,
                 tokens_saved_delta=delta_tokens_saved,
+                tool_tokens_saved_delta=delta_tool_tokens_saved,
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
@@ -1060,6 +1079,7 @@ class SavingsTracker:
         *,
         requests_delta: int = 0,
         tokens_saved_delta: int = 0,
+        tool_tokens_saved_delta: int = 0,
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
@@ -1074,6 +1094,7 @@ class SavingsTracker:
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
+        entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
             entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
         )
@@ -1106,15 +1127,26 @@ class SavingsTracker:
         by_model = self._state.get("by_model", {})
         ranked = sorted(
             by_model.items(),
-            key=lambda item: item[1]["tokens_saved"],
+            key=lambda item: item[1]["tokens_saved"] + item[1].get("tool_tokens_saved", 0),
             reverse=True,
         )
         result: dict[str, dict[str, Any]] = {}
         for model, entry in ranked:
             view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            tool_saved = _coerce_int(entry.get("tool_tokens_saved"))
+            # Deferred tool schemas never reached the model, so they were never in
+            # ``total_input_tokens`` — the pre-Headroom denominator is the input we
+            # sent plus what we withheld. Same construction the PERF headline and
+            # perf/analyzer use, so a row and the total printed above it share one
+            # definition of "saved".
+            headline_saved = entry["tokens_saved"] + tool_saved
+            total_before = headline_saved + entry["total_input_tokens"]
+            # Named "headline" rather than "total" because this module already uses
+            # ``total_tokens_saved`` for the cumulative lifetime figure on history
+            # points; reusing it here would mean two different things in one file.
+            view["headline_tokens_saved"] = headline_saved
             view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                (headline_saved / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[model] = view
