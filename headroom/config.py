@@ -387,12 +387,12 @@ _HERMES_TOOL_CALL_WRAPPER = "tool_call"
 
 
 def unwrap_tool_call_name(name: str, arguments: Any) -> str:
-    """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
+    """Extract the real tool name from a Hermes or Pi wrapper.
 
     Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
     fail open and return the wrapper name (caller decides what that means).
     """
-    if name != _HERMES_TOOL_CALL_WRAPPER:
+    if name not in {_HERMES_TOOL_CALL_WRAPPER, "mcp_daemon"}:
         return name
     raw = arguments
     if isinstance(raw, str):
@@ -401,6 +401,13 @@ def unwrap_tool_call_name(name: str, arguments: Any) -> str:
         except (ValueError, TypeError):
             return name
     if isinstance(raw, dict):
+        if name == "mcp_daemon":
+            selector = raw.get("selector")
+            if raw.get("action") == "call" and isinstance(selector, str):
+                parts = selector.split(".")
+                if len(parts) == 2 and all(parts):
+                    return f"mcp__{parts[0]}__{parts[1]}"
+            return name
         inner = raw.get("name")
         if isinstance(inner, str) and inner.strip():
             return inner.strip()
