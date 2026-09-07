@@ -764,6 +764,11 @@ class CompressionStore:
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
         """
+        purge_expired = getattr(self._backend, "purge_expired", None)
+        if callable(purge_expired):
+            self._stale_heap_entries += purge_expired()
+            return
+
         expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
         for key in expired_keys:
             self._backend.delete(key)
