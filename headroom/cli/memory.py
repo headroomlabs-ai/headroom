@@ -1212,14 +1212,30 @@ def reindex_memories(ctx: click.Context, db_path: str) -> None:
             print_error(f"Failed to clear FTS5 index: {exc}")
             sys.exit(1)
 
+        # Index a page at a time. One transaction per page instead of per record
+        # is ~100x faster, while still bounding how much the journal grows and
+        # how much a single failure can take with it. On a failed page, retry
+        # that page record by record so valid records still land and the broken
+        # one is still named -- the index was already cleared above, so a page
+        # that only rolled back would leave a silent hole in search coverage.
         fts_indexed = 0
-        for mem in memories:
+        for start in range(0, len(memories), _REINDEX_PAGE_SIZE):
+            page = memories[start : start + _REINDEX_PAGE_SIZE]
             try:
-                asyncio.run(fts.index_memory(mem))
-                fts_indexed += 1
+                fts_indexed += asyncio.run(fts.index_batch_memories(page))
+                continue
             except Exception as exc:
-                print_warning(f"FTS5: failed to index {mem.id[:8]}: {exc}")
-                ok = False
+                # Not a failure on its own: exit status stays tied to whether
+                # records actually got indexed, exactly as before.
+                print_warning(f"FTS5: batch failed ({exc}); retrying page record by record")
+
+            for mem in page:
+                try:
+                    asyncio.run(fts.index_memory(mem))
+                    fts_indexed += 1
+                except Exception as exc:
+                    print_warning(f"FTS5: failed to index {mem.id[:8]}: {exc}")
+                    ok = False
 
         # --- Vector: remove orphaned entries (requires sqlite-vec) ---
         vector_db = db.parent / f"{db.stem}_vectors.db"
