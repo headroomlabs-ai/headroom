@@ -370,6 +370,35 @@ def test_learn_handles_empty_sessions_and_no_pattern_outputs(
     assert "No actionable patterns found." in result.output
 
 
+def test_learn_surfaces_analysis_failure_and_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    project = SimpleNamespace(name="broken", project_path=tmp_path / "broken")
+    plugin = FakePlugin("codex", "Codex", [project])
+
+    class FailingAnalyzer(FakeAnalyzer):
+        def analyze(self, project, sessions):  # noqa: ANN001, ANN201
+            self.calls.append((project, sessions))
+            return SimpleNamespace(
+                total_sessions=1,
+                total_calls=3,
+                total_failures=1,
+                failure_rate=1 / 3,
+                recommendations=[],
+                analysis_error="codex CLI failed (exit 1): Not inside a trusted directory",
+            )
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "codex-cli")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", FailingAnalyzer)
+
+    result = runner.invoke(main, ["learn", "--agent", "codex", "--all"])
+
+    assert result.exit_code == 1
+    assert "Analysis failed: codex CLI failed (exit 1)" in result.output
+    assert "No actionable patterns found." not in result.output
+
+
 def test_learn_main_only_flag_threads_to_scanner(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
 ) -> None:

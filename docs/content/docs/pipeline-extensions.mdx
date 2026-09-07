@@ -18,6 +18,7 @@ Extensions receive a `PipelineEvent` for each stage in `headroom.pipeline.Pipeli
 | `INPUT_CACHED`, `INPUT_ROUTED`, `INPUT_COMPRESSED`, `INPUT_REMEMBERED` | Cache, routing, compression, memory stages |
 | `PRE_SEND` | Last hook before the request is forwarded upstream |
 | `POST_SEND`, `RESPONSE_RECEIVED` | After forwarding / on response |
+| `OUTCOME_OBSERVED` | Emits a read-only `OutcomeSnapshot` (tokens, stop reason, transforms applied) once the response is fully processed |
 
 `PRE_SEND` is the right stage for normalizing requests to fit a quirky upstream: compression and caching are done, and whatever you write into `event.messages` is exactly what the provider receives.
 

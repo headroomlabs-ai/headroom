@@ -226,6 +226,8 @@ def _mirror_url(url: str) -> str:
     mirror = os.environ.get("HEADROOM_BINARIES_MIRROR")
     if not mirror:
         return url
+    if not mirror.startswith("https://"):
+        raise BinaryFetchError(f"HEADROOM_BINARIES_MIRROR must use https:// (got {mirror!r})")
     # Only substitute the github.com host so that paths remain intact.
     for prefix in ("https://github.com", "https://objects.githubusercontent.com"):
         if url.startswith(prefix):
@@ -245,6 +247,8 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if not _is_writable_dir(dest.parent):
         raise OSError(f"binary cache directory is not writable: {dest.parent}")
     final_url = _mirror_url(url)
+    if not final_url.startswith("https://"):
+        raise BinaryFetchError(f"refusing non-https download URL: {final_url!r}")
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
     attempts = 3
     for attempt in range(1, attempts + 1):
@@ -307,16 +311,56 @@ def _sha256_file(path: Path) -> str:
 
 
 def _verify_sha256(path: Path, expected: str | None) -> None:
+    if os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+        logger.warning(
+            "skipping sha256 verification for %s (HEADROOM_BINARIES_ALLOW_UNVERIFIED=1)",
+            path.name,
+        )
+        return
     if not expected:
-        # Upstream release not SHA-pinned in registry. HTTPS + the GitHub CDN
-        # is the only integrity check. Log at INFO so verbose runs can see
-        # this state; `doctor` surfaces the same fact via `sha_pinned=False`.
+        # No pin in the registry (e.g. an off-registry version override). All
+        # shipped assets ARE pinned — enforced by the tools-hash-refresh CI gate —
+        # so a missing pin means an off-registry fetch; fall back to HTTPS trust.
         logger.info("binary %s downloaded without sha256 pin (HTTPS trust only)", path.name)
         return
     got = _sha256_file(path)
     if got.lower() != expected.lower():
         path.unlink(missing_ok=True)
         raise Sha256Mismatch(f"sha256 mismatch for {path.name}: expected {expected}, got {got}")
+
+
+def sha256_for_url(url: str) -> str | None:
+    """Return the registry's pinned sha256 for a download URL, if present."""
+    for tool in _registry().get("tools", {}).values():
+        for asset in tool.get("assets", {}).values():
+            if asset.get("url") == url:
+                pin = asset.get("sha256")
+                return pin if isinstance(pin, str) else None
+    return None
+
+
+def verify_download_bytes(data: bytes, *, url: str, name: str) -> None:
+    """Fail-closed integrity check for an in-memory downloaded archive.
+
+    Used by installers (rtk, lean-ctx, codebase-memory-mcp) that download and
+    extract on their own instead of going through the fetch path above. Verifies
+    the bytes against the tools.json pin for ``url`` and refuses an unpinned URL
+    unless HEADROOM_BINARIES_ALLOW_UNVERIFIED=1.
+    """
+    if os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+        logger.warning(
+            "skipping sha256 verification for %s (HEADROOM_BINARIES_ALLOW_UNVERIFIED=1)", name
+        )
+        return
+    expected = sha256_for_url(url)
+    if not expected:
+        # Off-registry URL (e.g. a version override); shipped assets are all
+        # pinned via the CI gate, so fall back to HTTPS trust here.
+        logger.info("%s downloaded without sha256 pin (HTTPS trust only)", name)
+        return
+    got = hashlib.sha256(data).hexdigest()
+    if got.lower() != expected.lower():
+        raise Sha256Mismatch(f"sha256 mismatch for {name}: expected {expected}, got {got}")
 
 
 # ---------- Archive extraction ------------------------------------------- #

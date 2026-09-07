@@ -473,6 +473,7 @@ class TestSessionAnalyzer:
         assert result.total_calls == 1
         assert result.total_failures == 1
         assert result.recommendations == []
+        assert result.analysis_error == "API key not set"
 
     @patch("headroom.learn.analyzer._call_llm")
     def test_passes_events_to_digest(self, mock_call_llm: MagicMock):
@@ -865,7 +866,7 @@ class TestCallCliLlm:
         result = _call_cli_llm("test digest", "codex-cli")
         assert result == {"context_file_rules": [], "memory_file_rules": []}
         cmd = mock_run.call_args[0][0]
-        assert cmd == ["codex", "exec"]
+        assert cmd == ["codex", "exec", "--skip-git-repo-check"]
 
     @patch("headroom.learn.analyzer.subprocess.run")
     def test_gemini_cli_uses_p_flag(self, mock_run: MagicMock):

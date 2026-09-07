@@ -100,7 +100,7 @@ class TestMustKeepCompression:
         _install_fake_kompress(monkeypatch)
         monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
 
-        compressor = KompressCompressor(KompressConfig(enable_ccr=False))
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
         monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
 
         result = compressor.compress(
@@ -113,7 +113,7 @@ class TestMustKeepCompression:
         _install_fake_kompress(monkeypatch)
         monkeypatch.setenv(_KOMPRESS_MUST_KEEP_ENV, "0")
 
-        compressor = KompressCompressor(KompressConfig(enable_ccr=False))
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
         monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
 
         result = compressor.compress(
@@ -126,7 +126,7 @@ class TestMustKeepCompression:
         _install_fake_kompress(monkeypatch)
         monkeypatch.delenv(_KOMPRESS_MUST_KEEP_ENV, raising=False)
 
-        compressor = KompressCompressor(KompressConfig(enable_ccr=False))
+        compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
         monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
 
         [result] = compressor.compress_batch(

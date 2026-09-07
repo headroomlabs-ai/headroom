@@ -1,0 +1,29 @@
+name: tools-hash-refresh
+
+# Enforce that headroom/tools.json SHA-256 pins match the published assets for
+# the currently pinned tool versions. Fails if a version was bumped without
+# refreshing pins (run scripts/refresh_tool_hashes.py locally). See WEB-03.
+
+on:
+  pull_request:
+    paths:
+      - "headroom/tools.json"
+      - "scripts/refresh_tool_hashes.py"
+      - ".github/workflows/tools-hash-refresh.yml"
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  verify-pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Verify tool SHA-256 pins
+        run: python scripts/refresh_tool_hashes.py --check

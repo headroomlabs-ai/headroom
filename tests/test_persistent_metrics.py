@@ -153,3 +153,48 @@ def test_state_normalizes_invalid_values_and_unknown_dimension_labels() -> None:
     assert snapshot["requests"]["by_stack"] == {"other": 1}
     assert snapshot["by_model"]["other"]["input_tokens"] == 7
     assert snapshot["waste_signals"] == {"other": 9}
+
+
+def test_json_bloat_waste_signal_is_a_named_bucket() -> None:
+    """The parser emits ``json_bloat`` (WasteSignals.to_dict); it must not fall to ``other``."""
+    state = _new_state()
+    state.record_request(
+        provider="anthropic",
+        stack="claude",
+        model="claude-sonnet-5",
+        waste_signals={"json_bloat": 500, "html_noise": 20},
+    )
+
+    snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
+
+    assert snapshot["waste_signals"] == {"json_bloat": 500, "html_noise": 20}
+
+
+def test_waste_signal_other_bucket_survives_reload() -> None:
+    """Reloading persisted state must keep ``other`` as ``other``, not relabel it ``unknown``.
+
+    Before this fix, unrecognised names went to ``other`` at record time but to
+    ``unknown`` at load time, so every restart moved the whole ``other`` bucket
+    into a new ``unknown`` bucket and the two grew side by side.
+    """
+    state = PersistentMetricsState(
+        {
+            "waste_signals": {"other": 40, "unknown": 60, "html_noise": 5, "bogus": 3},
+        },
+        now=lambda: FIXED_NOW,
+    )
+
+    snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
+
+    assert snapshot["waste_signals"] == {"other": 103, "html_noise": 5}
+
+
+def test_miss_reasons_still_fall_back_to_unknown_on_reload() -> None:
+    state = PersistentMetricsState(
+        {"prefix_cache": {"misses_by_reason": {"ttl_expiry": 2, "bogus": 1}}},
+        now=lambda: FIXED_NOW,
+    )
+
+    snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
+
+    assert snapshot["prefix_cache"]["misses_by_reason"] == {"ttl_expiry": 2, "unknown": 1}

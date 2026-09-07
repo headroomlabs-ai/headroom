@@ -152,6 +152,14 @@ class PrometheusMetrics:
         # whether the compression budget is too tight vs. a real bug.
         self.compression_failed_by_reason: dict[str, int] = defaultdict(int)
 
+        # Upstream transport failures on the streaming path, keyed by provider.
+        # Raised when every connect retry is exhausted and the proxy synthesizes
+        # its own error response instead of forwarding an upstream status. That
+        # path emits no upstream status code to attribute the failure to, so
+        # without this counter it is invisible in metrics and survives only as a
+        # log line.
+        self.upstream_connection_errors_by_provider: dict[str, int] = defaultdict(int)
+
         # Kompress size-gate outcomes, keyed by outcome ("within",
         # "exceeded"). The gate routes oversized blocks away from ML
         # compression (ContentRouter._kompress_max_tokens, #1171). This
@@ -355,6 +363,7 @@ class PrometheusMetrics:
             self.savings_by_source.clear()
             with self._obs_counter_lock:
                 self.compression_failed_by_reason.clear()
+                self.upstream_connection_errors_by_provider.clear()
                 self.kompress_size_gate_by_outcome.clear()
                 self.compression_quarantine_by_event.clear()
 
@@ -567,6 +576,18 @@ class PrometheusMetrics:
         """
         with self._obs_counter_lock:
             self.compression_failed_by_reason[reason or "error"] += 1
+
+    def record_upstream_connection_error(self, provider: str) -> None:
+        """Record one exhausted-retries upstream transport failure.
+
+        Called from the streaming handler's ``httpx.TransportError`` fallback
+        (handlers/streaming.py), where the proxy synthesizes its own 502
+        because no upstream response ever arrived. Guarded by
+        ``_obs_counter_lock`` for the same reason as
+        ``record_compression_failed``.
+        """
+        with self._obs_counter_lock:
+            self.upstream_connection_errors_by_provider[provider or "unknown"] += 1
 
     def record_kompress_size_gate(self, outcome: str) -> None:
         """Record one kompress size-gate decision, bucketed by ``outcome``.
@@ -914,6 +935,14 @@ class PrometheusMetrics:
                 model=model,
                 input_tokens=input_tokens,
                 tokens_saved=tokens_saved,
+                # ``tokens_saved`` is message-only; deferral rides separately and
+                # the two are disjoint. This argument was the missing link: the
+                # value arrives at this method (see the parameter above) and is
+                # already folded into ``savings_usd`` below, but it stopped here,
+                # so per-model tokens under-reported by exactly the deferral while
+                # per-model dollars did not — a tool-heavy model showed real money
+                # saved next to "0 tokens saved".
+                tool_search_saved=tool_search_saved,
                 provider=provider,
                 project=project,
                 cache_read_tokens=cache_read_tokens,
@@ -1404,8 +1433,22 @@ class PrometheusMetrics:
             # then format outside it (see _obs_counter_lock).
             with self._obs_counter_lock:
                 compression_failed = dict(self.compression_failed_by_reason)
+                upstream_conn_errors = dict(self.upstream_connection_errors_by_provider)
                 kompress_size_gate = dict(self.kompress_size_gate_by_outcome)
                 compression_quarantine = dict(self.compression_quarantine_by_event)
+
+            if upstream_conn_errors:
+                lines.extend(
+                    [
+                        "# HELP headroom_upstream_connection_errors_total Exhausted-retries upstream transport failures by provider; the proxy answered 502 itself because no upstream response arrived",
+                        "# TYPE headroom_upstream_connection_errors_total counter",
+                    ]
+                )
+                for prov, count in upstream_conn_errors.items():
+                    lines.append(
+                        f'headroom_upstream_connection_errors_total{{provider="{_escape_label_value(prov)}"}} {count}'
+                    )
+                lines.append("")
 
             if compression_failed:
                 lines.extend(

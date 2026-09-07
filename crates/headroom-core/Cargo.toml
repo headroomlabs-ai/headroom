@@ -13,11 +13,11 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tiktoken-rs = "0.11"
+tiktoken-rs = "0.12"
 # `tokenizers` is the HuggingFace pure-Rust tokenizer crate. Default features
 # pull in `onig` for the BPE pre-tokenizer regex; that vendors oniguruma so it
 # builds without a system dep on macOS/Linux.
-tokenizers = "0.22"
+tokenizers = "0.23"
 # `hf-hub` is the HuggingFace Hub client. We use the blocking `ureq` transport
 # with `rustls` (no system OpenSSL dep — keeps the binary static-linkable for
 # AWS deploys). `from_pretrained` is called once at startup, so blocking is
@@ -25,7 +25,7 @@ tokenizers = "0.22"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 # `md5` for the CCR cache_key. Python's compression_store hashes the original
 # diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
-md-5 = "0.10"
+md-5 = "0.11"
 # `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
 # hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
 sha2 = "0.11"

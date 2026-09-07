@@ -154,7 +154,7 @@ class MemoryConfig:
     qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
     # Memory Bridge (bidirectional markdown <-> Headroom sync)
     bridge_enabled: bool = False
     bridge_md_paths: list[str] = field(default_factory=list)

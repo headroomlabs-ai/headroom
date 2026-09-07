@@ -27,7 +27,7 @@ repos:
         # unconditionally, so installing hooks is not required for enforcement.
         args: [--assume-in-merge]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.2
+    rev: v0.16.3
     hooks:
       - id: ruff
         args: [--fix]

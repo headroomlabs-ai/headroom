@@ -120,6 +120,51 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
 
 
+def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
+    """`:latest` must have exactly one writer (#3150).
+
+    The sibling test above proves the *promotion step* is owned by the root
+    cell. That was never the whole contract: it checked the intended writer
+    and not the absence of unintended ones.
+
+    ``docker/metadata-action`` defaults to ``latest=auto``, which appends a
+    bare ``latest`` for any semver release. Its own log line reads
+    ``suffixLatest=false`` — the per-tag ``suffix=`` that keeps every other
+    tag variant-scoped does not reach it. So all eight variant cells emitted
+    ``ghcr.io/.../headroom:latest`` and the last to finish won the tag. At
+    0.36.0 that was ``code-slim``: ``:latest`` resolved to the distroless
+    build, whose ``import onnxruntime`` segfaults on arm64, and
+    ``headroom deploy`` crash-looped on Apple Silicon with SIGSEGV.
+
+    Two things hold the line, and both are asserted here: ``latest=false``
+    stops the tag being generated at all, and a runtime guard refuses to
+    publish if a suffixed variant ever carries one anyway.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    manifest = workflow["jobs"]["docker-manifest"]
+
+    meta = next(step for step in manifest["steps"] if step.get("id") == "meta")
+    flavor = meta["with"].get("flavor", "")
+    assert "latest=false" in flavor, (
+        "docker/metadata-action defaults to latest=auto; without latest=false "
+        "every variant cell publishes a bare :latest and the last one wins"
+    )
+
+    # No tag rule may reintroduce it explicitly either.
+    assert "value=latest" not in meta["with"]["tags"]
+
+    create = next(
+        step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
+    )
+    script = create["run"]
+    # The guard reads the variant name from env, never spliced inline.
+    assert create["env"].get("VARIANT_NAME") == "${{ matrix.variant.name }}"
+    assert 'endswith(":latest")' in script
+    assert script.index('endswith(":latest")') < script.index("docker buildx imagetools create"), (
+        "the bare-latest guard must run before anything is pushed"
+    )
+
+
 def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
     """Each manifest cell must download exactly its two architecture digests.
 
@@ -294,23 +339,35 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     import subprocess
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        # Same environment gates as the openssl-sys dual above: a cargo
+        # failure that is not "package did not match" means the Linux wheel
+        # target is unavailable here, not that native-tls came back.
         not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
+        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
+            result.stderr + result.stdout
+        ):
+            pytest.skip(
+                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+            )
         assert not_in_tree, (
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
@@ -874,7 +931,7 @@ def test_glibc_compat_shim_present_in_headroom_py() -> None:
     """STRUCTURAL INVARIANT: the headroom-py crate ships a glibc-2.38
     compatibility shim that defines weak `__isoc23_*` aliases.
 
-    Issue #355 (https://github.com/chopratejas/headroom/issues/355) —
+    Issue #355 (https://github.com/headroomlabs-ai/headroom/issues/355) —
     the published wheel's `_core.so` references `__isoc23_strtoll`
     (glibc 2.38+) because we statically link prebuilt ONNX Runtime
     artifacts compiled with gcc 14. Users with libc < 2.38 (Ubuntu

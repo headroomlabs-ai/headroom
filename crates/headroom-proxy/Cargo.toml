@@ -92,7 +92,7 @@ async-trait = "0.1"
 # ordering — never persisted, never compared cross-host. Same crate
 # the core uses for the CCR cache_key, so no additional hash backend
 # enters the dep tree.
-md-5 = "0.10"
+md-5 = "0.11"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

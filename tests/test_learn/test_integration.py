@@ -294,9 +294,20 @@ class TestCodexIntegration:
 
         assert len(sessions) > 0
 
-        # Codex has only Bash tool (shell)
+        # This runs against whatever Codex sessions the machine actually has,
+        # so it must not pin one release's tool vocabulary. Codex has renamed
+        # its shell tool across versions (`Bash` -> `shell` -> `exec`) and
+        # 0.149.0 added agent tools alongside it, which is what the pipeline
+        # has to keep parsing.
         all_tools = {tc.name for s in sessions for tc in s.tool_calls}
-        assert "Bash" in all_tools
+        assert all_tools, "pipeline extracted no tool calls from real Codex sessions"
+
+        shell_tool_aliases = {"Bash", "shell", "exec", "local_shell", "container.exec"}
+        assert all_tools & shell_tool_aliases, (
+            "no shell-execution tool recognised in real Codex sessions; "
+            f"saw {sorted(all_tools)} -- if Codex renamed it again, add the "
+            "new name to shell_tool_aliases"
+        )
 
     def test_codex_writer_targets_agents_md(self, tmp_path):
         """Codex writer should target AGENTS.md, not CLAUDE.md."""

@@ -174,6 +174,7 @@ class AnalysisResult:
     total_calls: int = 0
     total_failures: int = 0
     recommendations: list[Recommendation] = field(default_factory=list)
+    analysis_error: str | None = None
 
     @property
     def failure_rate(self) -> float:
