@@ -392,7 +392,7 @@ def unwrap_tool_call_name(name: str, arguments: Any) -> str:
     Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
     fail open and return the wrapper name (caller decides what that means).
     """
-    if name not in {_HERMES_TOOL_CALL_WRAPPER, "mcp_daemon"}:
+    if name not in (_HERMES_TOOL_CALL_WRAPPER, "mcp_daemon"):
         return name
     raw = arguments
     if isinstance(raw, str):
