@@ -16,6 +16,8 @@ surfaced, were ranked no higher than a one-off rule. These tests pin:
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from headroom.learn.analyzer import SessionAnalyzer, _build_digest
 from headroom.learn.fixtures import (
     error_loop_session,
@@ -31,6 +33,8 @@ from headroom.learn.models import (
     ProjectInfo,
     Recommendation,
     RecommendationTarget,
+    SessionData,
+    ToolCall,
 )
 
 
@@ -48,6 +52,46 @@ def _project() -> ProjectInfo:
 
 
 class TestDetectLoops:
+    @pytest.mark.parametrize(
+        ("name", "pattern"),
+        [("Grep", "TimeoutError"), ("Glob", "**/*.py")],
+    )
+    def test_search_signatures_include_path(self, name: str, pattern: str):
+        def call(path: str, index: int):
+            return ToolCall(
+                name=name,
+                tool_call_id=f"{name}-{index}",
+                input_data={"pattern": pattern, "path": path},
+                output="x" * 40000,
+                is_error=False,
+                output_bytes=40000,
+                msg_index=index,
+            )
+
+        distinct_paths = [
+            call("/srv/ingest", 0),
+            call("/srv/billing", 1),
+            call("/srv/web", 2),
+        ]
+        assert len({_canonical_signature(call) for call in distinct_paths}) == 3
+        assert detect_loops([SessionData(session_id=name, tool_calls=distinct_paths)]) == []
+
+        same_path = [call("/srv/ingest", index) for index in range(3)]
+        loop = detect_loops([SessionData(session_id=name, tool_calls=same_path)])[0]
+        assert loop.count == 3
+        assert loop.sample_input == f"{pattern} in /srv/ingest"
+
+    def test_unknown_tool_summary_still_uses_generic_input(self):
+        input_data = {"query": "TimeoutError", "path": "/srv/ingest"}
+        tool_call = ToolCall(
+            name="Search",
+            tool_call_id="search-1",
+            input_data=input_data,
+            output="",
+            is_error=False,
+        )
+        assert tool_call.input_summary == str(input_data)[:80]
+
     def test_refetch_loop_detected_despite_no_errors(self):
         loops = detect_loops([refetch_loop_session(repetitions=5)])
         assert len(loops) == 1
