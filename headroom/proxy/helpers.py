@@ -2672,12 +2672,41 @@ async def _read_request_body_bytes(request: Request) -> bytes:
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure, and the
-    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
-    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    Raises the :class:`RequestBodyTooLarge` ``ValueError`` subclass if the
+    wire-size body itself exceeds :data:`MAX_REQUEST_BODY_SIZE` (checked while
+    streaming, before the full body is buffered) or if the *decompressed*
+    body would exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`. Raises plain
+    ``ValueError`` on any other decompression failure.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
-    raw = await request.body()
+
+    # Content-Length is an optimization only, not the enforcement boundary: it
+    # can be absent, understated, or belong to a chunked transfer. The
+    # streaming loop below is what actually bounds every case (#3479).
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB "
+                f"(Content-Length: {declared})"
+            )
+
+    chunks = bytearray()
+    async for chunk in request.stream():
+        chunks.extend(chunk)
+        if len(chunks) > MAX_REQUEST_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Request body exceeds {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    raw: bytes = bytes(chunks)
+    # Cache like Starlette's own body() would, so any other .body() caller on
+    # this request (there is none today, but future callers get the same
+    # semantics) sees the bytes already read rather than a consumed stream.
+    request._body = raw
 
     # Every branch below decompresses incrementally against
     # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
