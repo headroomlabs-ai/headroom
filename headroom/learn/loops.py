@@ -97,12 +97,20 @@ class LoopPattern:
 # and renders any tool missing from this table as ``str(input_data)[:80]``. Two
 # distinct calls sharing a long prefix survive that truncation as equal strings,
 # so identity is taken from the untruncated input here instead.
+#
+# Because identity no longer reads ``input_summary``, a field that distinguishes
+# two calls has to be named here to count — adding one to the summary alone
+# changes the display and leaves the grouping merged.
 _IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "bash": ("command",),
     "shell": ("command",),
     "read": ("file_path",),
-    "grep": ("pattern",),
-    "glob": ("pattern",),
+    # A search is identified by pattern *and* path: the same pattern swept
+    # across three service directories is three searches, not a loop. #3455
+    # pins this on the display side; identity has to agree or one undoes the
+    # other depending on merge order.
+    "grep": ("pattern", "path"),
+    "glob": ("pattern", "path"),
     "edit": ("file_path",),
     "write": ("file_path",),
 }

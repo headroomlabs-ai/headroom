@@ -425,3 +425,50 @@ class TestIdentityFallsBackWhenTheSchemaIsUnknown:
         call = _call("Bash", "call_0", payload, msg_index=0)
 
         assert _canonical_signature(call).startswith("bash::")
+
+
+class TestSearchIdentityIncludesPath:
+    """The same pattern in different trees is three searches, not a loop.
+
+    Identity now comes from the input fields rather than ``input_summary``, so
+    every field that distinguishes a search has to be named here — a pattern
+    alone would merge a sweep across three service directories into one loop
+    worth 20,000 tokens of phantom waste. Pins the same behavior #3455 pins on
+    the display side, on the path identity actually reads.
+    """
+
+    def _search(self, name: str, pattern: str, path: str, index: int) -> ToolCall:
+        return _call(name, f"{name}-{index}", {"pattern": pattern, "path": path}, msg_index=index)
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_distinct_paths_are_distinct_signatures(self, name: str, pattern: str):
+        calls = [
+            self._search(name, pattern, path, i)
+            for i, path in enumerate(("/srv/ingest", "/srv/billing", "/srv/web"))
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 3
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_the_same_pattern_in_three_trees_is_not_a_loop(self, name: str, pattern: str):
+        calls = [
+            self._search(name, pattern, path, i)
+            for i, path in enumerate(("/srv/ingest", "/srv/billing", "/srv/web"))
+        ]
+
+        assert detect_loops([SessionData(session_id=name, tool_calls=calls)]) == []
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_repeating_one_search_is_still_a_loop(self, name: str, pattern: str):
+        # Adding path to identity must not stop a real re-search loop counting.
+        calls = [self._search(name, pattern, "/srv/ingest", i) for i in range(3)]
+
+        assert detect_loops([SessionData(session_id=name, tool_calls=calls)])[0].count == 3
+
+    def test_a_search_without_a_path_still_has_identity(self, name: str = "Grep"):
+        # Claude Code omits path when searching the cwd; identity must not
+        # collapse to the empty fallback, nor split from a differing path.
+        rooted = _call(name, "g-1", {"pattern": "TimeoutError", "path": "/srv"}, msg_index=1)
+        bare = _call(name, "g-0", {"pattern": "TimeoutError"}, msg_index=0)
+
+        assert _canonical_signature(bare) != _canonical_signature(rooted)
