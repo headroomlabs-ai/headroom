@@ -634,10 +634,10 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         class_body_node_types=frozenset({"declaration_list"}),
     ),
     CodeLanguage.ELIXIR: LangConfig(
-        # Every entry below is a `_CALL_ROLE_*` sentinel, not a grammar node
-        # type: tree-sitter-elixir emits `call` for `def`, `defmodule`,
-        # `alias` and friends alike, so dispatch runs on the macro name via
-        # `call_*_targets` (see LangConfig).
+        # Every entry below is a `_CALL_ROLE_*` sentinel rather than a real
+        # grammar node type. tree-sitter-elixir emits `call` for `def`,
+        # `defmodule`, `alias` and friends alike, so dispatch runs on the macro
+        # name via `call_*_targets` (see LangConfig).
         import_nodes=frozenset({_CALL_ROLE_IMPORT}),
         function_nodes=frozenset({_CALL_ROLE_FUNCTION}),
         class_nodes=frozenset({_CALL_ROLE_CLASS}),
@@ -2722,11 +2722,12 @@ def _effective_type(node: Any, lang_config: LangConfig) -> str:
     in `Repo.all(query)` — is never a definition and keeps its own type, so
     ordinary remote calls fall through untouched.
     """
-    if lang_config.call_node_type is None or node.type != lang_config.call_node_type:
-        return node.type
+    node_type: str = node.type
+    if lang_config.call_node_type is None or node_type != lang_config.call_node_type:
+        return node_type
     target = node.children[0] if node.child_count else None
     if target is None or target.type != "identifier":
-        return node.type
+        return node_type
     name = _node_identifier_text(target)
     if name in lang_config.call_function_targets:
         return _CALL_ROLE_FUNCTION
@@ -2736,7 +2737,7 @@ def _effective_type(node: Any, lang_config: LangConfig) -> str:
         return _CALL_ROLE_IMPORT
     if name in lang_config.call_type_targets:
         return _CALL_ROLE_TYPE
-    return node.type
+    return node_type
 
 
 # Depth cap for the leftmost-head walk below: real Elixir heads are two or
