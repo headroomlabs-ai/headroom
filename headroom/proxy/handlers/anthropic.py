@@ -1457,6 +1457,21 @@ class AnthropicHandlerMixin:
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
+
+            # Circuit breaker check for runaway tool repetition loops
+            _cb = getattr(self, "tool_loop_circuit_breaker", None)
+            if _cb is not None and getattr(self.config, "circuit_breaker", "warn") != "off":
+                from headroom.proxy.circuit_breaker import execute_circuit_breaker_policy
+
+                await execute_circuit_breaker_policy(
+                    circuit_breaker=_cb,
+                    mode=self.config.circuit_breaker,
+                    session_id=session_id,
+                    messages=original_client_messages,
+                    request_id=request_id,
+                    metrics=getattr(self, "metrics", None),
+                    on_enforce_abort=_finalize_pre_upstream,
+                )
             # Prefix trackers must follow the provider's cache key, not just
             # message history.  Anthropic renders tools before system/messages;
             # parallel sub-calls commonly share model+system+history while
