@@ -31,6 +31,7 @@ from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -41,7 +42,6 @@ from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     buffered_ccr_asgi_call,
 )
-from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
