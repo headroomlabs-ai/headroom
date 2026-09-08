@@ -1805,3 +1805,128 @@ def test_datetime_prefixed_user_prompt_survives_router() -> None:
     result = ContentRouter().compress(prompt)
     assert result.strategy_used is not CompressionStrategy.SEARCH
     assert "Please update the PR desc" in result.compressed
+
+
+class _CountingTokenizer:
+    def count_text(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+
+def _rows(n: int = 200, tag: str = "row") -> str:
+    return json.dumps(
+        [{"id": i, "name": f"{tag}-{i}", "status": "ok", "value": i * 3} for i in range(n)]
+    )
+
+
+def _tool_result_messages(payload: str) -> list[dict[str, object]]:
+    return [
+        {"role": "user", "content": "go"},
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}],
+        },
+    ]
+
+
+def test_concurrent_apply_keeps_per_request_options_isolated() -> None:
+    """Two requests sharing one router must not see each other's options.
+
+    The proxy builds ONE ContentRouter and compresses on a multi-threaded
+    executor, so ``apply()`` runs concurrently on the same instance (#3486).
+    Request A is held inside ``compress`` until request B has finished its own
+    ``apply()``; A must still observe the options it was called with.
+    """
+    router = ContentRouter(ContentRouterConfig(lossless=True, enable_kompress=False))
+
+    a_entered = threading.Event()
+    b_done = threading.Event()
+    observed: dict[str, tuple[object, object]] = {}
+    orig_compress = router.compress
+
+    def probe(*args: object, **kwargs: object) -> object:
+        if threading.current_thread().name == "req-a" and "a" not in observed:
+            a_entered.set()
+            assert b_done.wait(30), "request B never finished"
+            observed["a"] = (router._runtime_target_ratio, router._runtime_force_kompress)
+        return orig_compress(*args, **kwargs)
+
+    router.compress = probe  # type: ignore[method-assign]
+
+    def request_a() -> None:
+        router.apply(
+            _tool_result_messages(_rows(tag="a")),
+            _CountingTokenizer(),
+            target_ratio=0.10,
+            force_kompress=False,
+        )
+
+    def request_b() -> None:
+        assert a_entered.wait(30), "request A never reached compress()"
+        router.apply(
+            _tool_result_messages(_rows(tag="b")),
+            _CountingTokenizer(),
+            target_ratio=0.90,
+            force_kompress=True,
+        )
+        b_done.set()
+
+    threads = [
+        threading.Thread(target=request_a, name="req-a"),
+        threading.Thread(target=request_b, name="req-b"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+        assert not t.is_alive(), "worker thread did not finish"
+
+    assert observed["a"] == (0.10, False), (
+        f"request A compressed with request B's options: {observed['a']}"
+    )
+
+
+def test_compression_fanout_inherits_per_request_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``apply``'s own worker threads must inherit the request's options.
+
+    Context-scoping the options is only correct if the threads ``apply``
+    spawns for parallel compression start from the calling request's context
+    rather than the defaults (#3486).
+    """
+    monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
+    router = ContentRouter(ContentRouterConfig(lossless=True, enable_kompress=False))
+
+    seen: list[tuple[object, object]] = []
+    seen_lock = threading.Lock()
+    orig_compress = router.compress
+
+    def probe(*args: object, **kwargs: object) -> object:
+        with seen_lock:
+            seen.append((router._runtime_target_ratio, router._runtime_kompress_model))
+        return orig_compress(*args, **kwargs)
+
+    router.compress = probe  # type: ignore[method-assign]
+
+    messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
+    for i in range(4):
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}", "content": _rows(tag=f"t{i}")}
+                ],
+            }
+        )
+
+    router.apply(
+        messages,
+        _CountingTokenizer(),
+        target_ratio=0.25,
+        kompress_model="test-model",
+    )
+
+    assert seen, "no content reached compress()"
+    assert all(entry == (0.25, "test-model") for entry in seen), (
+        f"fan-out workers lost the request's options: {seen}"
+    )
