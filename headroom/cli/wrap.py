@@ -2794,6 +2794,26 @@ def _strip_existing_codex_headroom_provider_table(content: str) -> str:
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
+def _strip_existing_codex_memory_mcp_table(content: str) -> str:
+    """Remove a pre-existing, unmarked ``[mcp_servers.headroom_memory]`` table.
+
+    Guards ``_inject_memory_mcp_config`` against duplicate TOML tables when
+    the section exists without the ``_MEMORY_MCP_MARKER``/``_MEMORY_MCP_END``
+    comments that make the marker-based idempotency check work (e.g. hand-
+    added from the usage example in ``headroom/memory/mcp_server.py``).
+    """
+    if "[mcp_servers.headroom_memory]" not in content:
+        return content
+
+    import re  # local import to match surrounding helper convention
+
+    memory_table = re.compile(
+        r"(?ms)^[ \t]*\[mcp_servers\.headroom_memory\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
+    )
+    content = memory_table.sub("", content)
+    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+
 def _redirect_existing_top_level_keys(content: str, port: int) -> str:
     """Rewrite user-defined top-level keys so wrap does not create duplicates.
 
@@ -3408,6 +3428,15 @@ def _inject_memory_mcp_config(user_id: str) -> None:
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
                 content = content[:start].rstrip("\n") + mcp_section + content[end:].lstrip("\n")
             else:
+                # No marker yet. A `[mcp_servers.headroom_memory]` table can
+                # still exist unmarked — e.g. a user copied the snippet from
+                # this module's docstring by hand, or the table survived
+                # from before markers guarded this injection. Strip it first
+                # so we don't end up with two `[mcp_servers.headroom_memory]`
+                # tables, which is invalid TOML and silently breaks Codex's
+                # MCP config parsing (last-table-wins or hard failure
+                # depending on the TOML parser).
+                content = _strip_existing_codex_memory_mcp_table(content)
                 content = content.rstrip() + "\n" + mcp_section
         else:
             content = mcp_section

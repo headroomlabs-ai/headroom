@@ -263,6 +263,45 @@ class TestCodexMemoryMcpConfig:
         assert "--db" not in content
         assert 'model = "gpt-4o"' in content
 
+    def test_inject_replaces_unmarked_memory_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A `[mcp_servers.headroom_memory]` table without the injection
+        markers (e.g. hand-copied from the `mcp_server.py` docstring, or left
+        over from before this table was marker-guarded) must be replaced in
+        place, not duplicated alongside a second, marked table.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--user", "old-user"]\n'
+            "startup_timeout_sec = 30\n"
+            "tool_timeout_sec = 30\n\n"
+            "[mcp_servers.other]\n"
+            'command = "other-tool"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count("[mcp_servers.headroom_memory]") == 1
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert '"--user", "codex-user"' in content
+        assert "old-user" not in content
+        assert 'model = "gpt-4o"' in content
+        assert "[mcp_servers.other]" in content
+        assert 'command = "other-tool"' in content
+
+        # The result must also be valid, parseable TOML — the original bug
+        # produced two `[mcp_servers.headroom_memory]` tables, which is
+        # invalid TOML (duplicate key) and breaks Codex startup.
+        parsed = tomllib.loads(content)
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
 
 class TestInjectAndRestoreRoundTrip:
     """End-to-end wrap → unwrap cycle operating directly on a temp $HOME."""
