@@ -18,7 +18,23 @@ Naive truncation breaks code. Cutting a function in half leaves invalid syntax t
 | Tier | Languages | Support Level |
 |---|---|---|
 | Tier 1 | Python, JavaScript, TypeScript | Full AST analysis |
-| Tier 2 | Go, Rust, Java, C, C++, C#, PHP | Function body compression |
+| Tier 2 | Go, Rust, Java, C, C++, C#, PHP, Elixir | Function body compression |
+
+### Elixir
+
+Elixir has no dedicated definition nodes -- `def`, `defmodule` and `alias` are
+macros, so every one of them parses as a generic `call`. Headroom dispatches on
+the macro name instead of the node type, which means:
+
+- `defmodule`, `defprotocol`, `defimpl` and ExUnit `describe` blocks are
+  containers: their members compress individually.
+- `def`, `defp`, `defmacro`, `defguard`, `defdelegate`, and ExUnit
+  `test`/`setup` bodies are compressed; heads (including `when` guards) are kept.
+- `alias`, `import`, `require`, `use` are treated as imports and preserved.
+- `defstruct`, `defexception`, and Ecto `schema`/`embedded_schema` blocks are
+  preserved verbatim -- they declare the module's shape, not its behaviour.
+- One-line `def foo(x), do: expr` clauses have no block to compress and pass
+  through unchanged, as do `~H`/`~s` heredoc sigils, which are single statements.
 
 ## What Gets Preserved vs Compressed
 

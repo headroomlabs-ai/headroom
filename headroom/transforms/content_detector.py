@@ -111,6 +111,17 @@ _CODE_PATTERNS = {
         ),
         re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
     ],
+    "elixir": [
+        # Elixir-only definition macros: bare `def` is shared with Python, so
+        # it is deliberately not matched here.
+        re.compile(
+            r"^\s*def(module|p|macro|macrop|guard|guardp|delegate|struct|exception"
+            r"|impl|protocol|n|np)\b"
+        ),
+        re.compile(r"^\s*@(moduledoc|doc|spec|type|typep|opaque|behaviour|impl|callback)\b"),
+        re.compile(r"\|>\s*\w"),  # pipe operator
+        re.compile(r"^\s*(alias|require|use)\s+[A-Z][\w.]*"),
+    ],
     "php": [
         re.compile(r"<\?php\b"),
         re.compile(r"^\s*namespace\s+[\w\\]+\s*;"),
