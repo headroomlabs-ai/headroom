@@ -117,14 +117,16 @@ def detect_repetition_cycle(
     return None
 
 
-def extract_tool_calls_from_messages(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+def extract_tool_calls_from_messages(
+    messages: Sequence[Mapping[str, Any]] | None,
+) -> list[tuple[str, str]]:
     """Extract tool calls from OpenAI or Anthropic shaped message arrays."""
     calls: list[tuple[str, str]] = []
-    if not isinstance(messages, list):
+    if not messages:
         return calls
 
     for msg in messages:
-        if not isinstance(msg, dict):
+        if not isinstance(msg, Mapping):
             continue
         role = msg.get("role")
         if role != "assistant":
@@ -193,7 +195,7 @@ class ToolLoopCircuitBreaker:
     def check_messages(
         self,
         session_id: str,
-        messages: list[dict[str, Any]],
+        messages: Sequence[Mapping[str, Any]] | None,
     ) -> ToolLoopDetection | None:
         """Update session state from request messages and check for repetition loops."""
         extracted = extract_tool_calls_from_messages(messages)
@@ -247,7 +249,7 @@ async def execute_circuit_breaker_policy(
     if not messages:
         return None
 
-    detection = circuit_breaker.check_messages(session_id, list(messages))
+    detection = circuit_breaker.check_messages(session_id, messages)
     if detection is None:
         return None
 
