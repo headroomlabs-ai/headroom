@@ -509,3 +509,160 @@ def test_resolve_circuit_breaker_mode() -> None:
     assert resolve_circuit_breaker_mode("disabled") == "off"
     assert resolve_circuit_breaker_mode("0") == "off"
     assert resolve_circuit_breaker_mode("false") == "off"
+
+
+def test_hash_tool_call_edge_cases() -> None:
+    """Verifies hash_tool_call with None, non-dict/non-string, and invalid JSON string."""
+    name, h = hash_tool_call("test", None)
+    assert name == "test"
+    assert len(h) == 16
+
+    name, h = hash_tool_call("test", 12345)
+    assert name == "test"
+    assert len(h) == 16
+
+    # Invalid JSON string falls back to raw string hashing
+    name, h = hash_tool_call("test", "{invalid json")
+    assert name == "test"
+    assert len(h) == 16
+
+
+def test_extract_tool_calls_edge_cases() -> None:
+    """Verifies extraction handles legacy function_call, non-dict items, and missing keys."""
+    msgs = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "function_call": {"name": "legacy_fn", "arguments": '{"x": 1}'}},
+        {"role": "assistant", "function_call": {"name": "no_args"}},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        "string_msg",
+    ]
+    calls = extract_tool_calls_from_messages(msgs)  # type: ignore[arg-type]
+    assert len(calls) == 2
+    assert calls[0][0] == "legacy_fn"
+    assert calls[1][0] == "no_args"
+
+    assert extract_tool_calls_from_messages(None) == []
+    assert extract_tool_calls_from_messages([]) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_circuit_breaker_policy_abort_hook_and_period2_enforce() -> None:
+    """Verifies on_enforce_abort hook is called and period > 1 detail string."""
+    from fastapi import HTTPException
+
+    from headroom.proxy.circuit_breaker import execute_circuit_breaker_policy
+
+    cb = ToolLoopCircuitBreaker()
+    # Repeating period 2 cycle: [A, B, A, B, A, B]
+    msgs = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "2",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "3",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "4",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "5",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "6",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": '{"f": 1}'},
+                }
+            ],
+        },
+    ]
+    abort_called = False
+
+    async def _on_abort() -> None:
+        nonlocal abort_called
+        abort_called = True
+
+    with pytest.raises(HTTPException) as exc_info:
+        await execute_circuit_breaker_policy(
+            circuit_breaker=cb,
+            mode="enforce",
+            session_id="s_abort",
+            messages=msgs,
+            on_enforce_abort=_on_abort,
+        )
+
+    assert abort_called is True
+    assert exc_info.value.status_code == 429
+    assert "repeating sequence of 2 tool calls" in exc_info.value.detail
+
+    # Test clear_session
+    cb.clear_session("s_abort")
+    assert cb.check_session("s_abort") is None
+
+
+def test_circuit_breaker_session_eviction_and_unserializable_dict() -> None:
+    """Verifies FIFO session eviction at capacity and un-serializable dict arguments."""
+    from collections import deque
+
+    from headroom.proxy.circuit_breaker import MAX_TRACKED_SESSIONS
+
+    cb = ToolLoopCircuitBreaker()
+    # Pre-populate up to MAX_TRACKED_SESSIONS
+    for i in range(MAX_TRACKED_SESSIONS):
+        cb._sessions[f"s_{i}"] = deque()
+    assert len(cb._sessions) == MAX_TRACKED_SESSIONS
+
+    # Adding one more triggers eviction of oldest
+    cb.record_tool_call("s_new", "tool", {"arg": 1})
+    assert len(cb._sessions) == MAX_TRACKED_SESSIONS
+    assert "s_0" not in cb._sessions
+    assert "s_new" in cb._sessions
+
+    # Dict with non-JSON-serializable value falls back to str()
+    class Unserializable:
+        def __str__(self) -> str:
+            return "unserializable_val"
+
+    name, h = hash_tool_call("fn", {"obj": Unserializable()})
+    assert name == "fn"
+    assert len(h) == 16
