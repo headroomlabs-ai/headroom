@@ -983,6 +983,52 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert "[profiles.default]" in content
         assert 'model = "gpt-5"' in content
 
+    def test_inject_replaces_legacy_nested_subtable_format(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Legacy ``wrap`` output used a nested
+        ``[model_providers.headroom.env_http_headers]`` sub-table instead of
+        today's inline table. The strip must consume the sub-table as well:
+        leaving it behind makes the re-injected inline ``env_http_headers``
+        key a duplicate TOML key and invalidates the whole config (seen in
+        the wild as ``TOMLDecodeError: Cannot declare ('model_providers',
+        'headroom') twice``).
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'model = "gpt-5"\n'
+            "\n"
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n'
+            'name = "OpenAI via Headroom proxy"\n'
+            "requires_openai_auth = true\n"
+            "supports_websockets = true\n"
+            "\n"
+            "[model_providers.headroom.env_http_headers]\n"
+            'X-Headroom-Project = "HEADROOM_PROJECT"\n'
+            "\n"
+            "[notice]\n"
+            "hide_rate_limit_model_nudge = true\n"
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        content = config_file.read_text()
+
+        parsed = tomllib.loads(content)  # must not raise: the original bug did
+        assert content.count("[model_providers.headroom]") == 1
+        assert "[model_providers.headroom.env_http_headers]" not in content
+        assert content.count("env_http_headers") == 1  # inline form from the injection
+        assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
+        assert parsed["model_providers"]["headroom"]["env_http_headers"] == {
+            "X-Headroom-Project": "HEADROOM_PROJECT"
+        }
+        assert parsed["profiles"]["default"]["model"] == "gpt-5"
+        assert parsed["notice"] == {"hide_rate_limit_model_nudge": True}
+
     def test_unwrap_restores_prior_headroom_provider_table(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

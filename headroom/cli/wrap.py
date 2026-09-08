@@ -2761,11 +2761,20 @@ def _strip_codex_headroom_blocks(
     # Strip any orphaned `[model_providers.headroom]` table with the fields we
     # write.  We only remove it if the table is recognisably ours (base_url
     # mentions localhost and a Headroom proxy port).  This protects users who
-    # happen to have a differently configured `headroom` provider.
+    # happen to have a differently configured `headroom` provider.  Nested
+    # `[model_providers.headroom.<sub>]` sub-tables must be consumed as well —
+    # legacy `wrap` output used one for `env_http_headers`, and an orphaned
+    # sub-table collides with the re-injected inline key (duplicate TOML key).
+    if not content.endswith("\n"):
+        content += "\n"
     orphan_headroom_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
-        r"(?=^\[|\Z)"
+        r"(?m)^\[model_providers\.headroom\][^\n]*\n"
+        r"(?:[^\[\n][^\n]*\n|\n)*?"
+        r'[ \t]*base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\n]*\n'
+        + _TOML_TABLE_BODY
+        + r"(?:^\[model_providers\.headroom\.[^\]\n]+\][^\n]*\n"
+        + _TOML_TABLE_BODY
+        + r")*"
     )
     content = orphan_headroom_table.sub("", content)
 
@@ -2780,17 +2789,43 @@ def _strip_codex_headroom_blocks(
 _REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
 
 
+# Consecutive TOML lines that do not start a new table header. Each iteration
+# consumes exactly one full line, and the two alternatives are disjoint on the
+# first character, so matching is linear (no catastrophic backtracking).
+_TOML_TABLE_BODY = r"(?:[^\[\n][^\n]*\n|\n)*"
+# A ``[model_providers.headroom]`` table plus any nested
+# ``[model_providers.headroom.<sub>]`` sub-tables that follow it. Matching the
+# sub-tables too is essential: legacy ``wrap`` output wrote ``env_http_headers``
+# as a nested sub-table, and leaving one behind turns the re-injected inline
+# ``env_http_headers`` key into a duplicate TOML key that invalidates the whole
+# config (``TOMLDecodeError: Cannot overwrite a value``).
+_TOML_HEADROOM_PROVIDER_TABLE = (
+    r"(?m)^[ \t]*\[model_providers\.headroom\][^\n]*\n"
+    + _TOML_TABLE_BODY
+    + r"(?:^[ \t]*\[model_providers\.headroom\.[^\]\n]+\][^\n]*\n" + _TOML_TABLE_BODY + r")*"
+)
+
+
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
-    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap."""
+    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap.
+
+    Also consumes nested ``[model_providers.headroom.<sub>]`` sub-tables.
+    Legacy ``wrap`` output wrote ``env_http_headers`` as a nested sub-table
+    instead of today's inline table; leaving such a sub-table behind makes
+    the re-injected inline ``env_http_headers`` key a duplicate TOML key,
+    which silently invalidates the whole config (observed in the wild as
+    ``TOMLDecodeError: Cannot declare ('model_providers', 'headroom')
+    twice``).
+    """
     if "[model_providers.headroom]" not in content:
         return content
 
     import re  # local import to match surrounding helper convention
 
-    provider_table = re.compile(
-        r"(?ms)^[ \t]*\[model_providers\.headroom\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
-    )
-    content = provider_table.sub("", content)
+    # Line-aligned patterns below require the content to end with a newline.
+    if not content.endswith("\n"):
+        content += "\n"
+    content = re.compile(_TOML_HEADROOM_PROVIDER_TABLE).sub("", content)
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
