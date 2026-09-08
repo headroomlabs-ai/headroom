@@ -228,6 +228,37 @@ class TestDefaultArgs:
         assert wr.wrap_targets_overlay_status().outcomes[0].action == "skipped"
 
 
+class TestToolLabel:
+    """Multi-word targets need a label the name can't spell ("IBM BOB")."""
+
+    @staticmethod
+    def _launch_label(config_dir, monkeypatch, cli_args):
+        import headroom.cli.wrap as wrap_mod
+
+        monkeypatch.delenv("HEADROOM_MODE", raising=False)
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+        captured: dict[str, str] = {}
+        monkeypatch.setattr(
+            wrap_mod, "_launch_tool", lambda **kw: captured.update(label=kw["tool_label"])
+        )
+        result = CliRunner().invoke(wrap, cli_args)
+        assert result.exit_code == 0, result.output
+        return captured["label"]
+
+    def test_tool_label_is_a_configurable_field(self, config_dir):
+        # Regression: dropping it from _TARGET_FIELDS skipped the whole target.
+        write_config(config_dir, {"version": 1, "targets": {"bob": {"tool_label": "IBM BOB"}}})
+        assert wr.wrap_targets_overlay_status().outcomes[0].action == "overridden"
+        assert wr.get_wrap_target("bob").tool_label == "IBM BOB"
+
+    def test_configured_label_reaches_the_launch_banner(self, config_dir, monkeypatch):
+        write_config(config_dir, {"version": 1, "targets": {"bob": {"tool_label": "IBM BOB"}}})
+        assert self._launch_label(config_dir, monkeypatch, ["bob"]) == "IBM BOB"
+
+    def test_unset_label_falls_back_to_the_name(self, config_dir, monkeypatch):
+        assert self._launch_label(config_dir, monkeypatch, ["bob"]) == "BOB"
+
+
 class TestOriginIndexUsesOverlay:
     def test_overridden_strip_keys_apply(self, config_dir):
         write_config(
