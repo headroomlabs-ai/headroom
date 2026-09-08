@@ -25,7 +25,10 @@ from headroom.learn.fixtures import (
     refetch_loop_session,
 )
 from headroom.learn.loops import (
+    _IDENTITY_FIELDS,
     _canonical_signature,
+    _identity_input,
+    _signature_tokens,
     apply_loop_weighting,
     detect_loops,
 )
@@ -472,3 +475,85 @@ class TestSearchIdentityIncludesPath:
         bare = _call(name, "g-0", {"pattern": "TimeoutError"}, msg_index=0)
 
         assert _canonical_signature(bare) != _canonical_signature(rooted)
+
+
+class TestIdentityPreservesFieldBoundaries:
+    """Two identity fields must not run together into one flat string.
+
+    ``pattern`` and ``path`` joined on a space lose the boundary between them:
+    ``("error in src", "logs")`` and ``("error", "in src logs")`` are different
+    searches that render the same text, and merged into one loop they report
+    20,000 tokens of waste nobody spent. Only tools with more than one identity
+    field need the structured form, so Bash keeps the bare command its
+    pagination normalization is written against.
+    """
+
+    def _search(self, pattern: str, path: str, index: int) -> ToolCall:
+        return _call("Grep", f"g-{index}", {"pattern": pattern, "path": path}, msg_index=index)
+
+    # Same characters in the same order, split between the fields three ways.
+    _AMBIGUOUS = (("error in src", "logs"), ("error in", "src logs"), ("error", "in src logs"))
+
+    def test_field_splits_of_one_string_are_distinct_signatures(self):
+        calls = [
+            self._search(pattern, path, i) for i, (pattern, path) in enumerate(self._AMBIGUOUS)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 3
+
+    def test_field_splits_of_one_string_are_not_a_loop(self):
+        calls = [
+            self._search(pattern, path, i) for i, (pattern, path) in enumerate(self._AMBIGUOUS)
+        ]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_a_path_containing_spaces_still_loops_when_repeated(self):
+        # Spaces are not themselves a reason to split a group.
+        calls = [self._search("error in src", "/srv/my logs", i) for i in range(3)]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)])[0].count == 3
+
+    @pytest.mark.parametrize(
+        ("pattern", "path"),
+        [('a", "b', "c"), ("a", '", "b", "c'), ("a\\", '"b'), ('["a"]', "b")],
+    )
+    def test_a_pattern_that_mimics_the_encoding_stays_distinct(self, pattern: str, path: str):
+        # Whatever the encoding is, a search cannot forge another search's
+        # identity by embedding the separator in its own pattern.
+        mimic = self._search(pattern, path, 0)
+        plain = self._search("a", "b", 1)
+
+        assert _canonical_signature(mimic) != _canonical_signature(plain)
+
+    def test_pagination_variants_of_one_command_still_collapse(self):
+        # The structured form must not reach single-field tools: Bash identity
+        # stays the bare command, so _PAGINATION_RE keeps matching it.
+        base = 'rg --no-heading "TimeoutError" /srv/app/services/ingest/pipeline/handlers.py'
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base} | head -{50 * (i + 1)}"}, msg_index=i)
+            for i in range(4)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 1
+
+    def test_a_non_ascii_pattern_does_not_leak_escape_tokens(self):
+        # apply_loop_weighting requires a *majority* of a signature's tokens to
+        # appear in a recommendation. An escape artifact is a token no
+        # recommendation can ever contain, so it only raises that bar and costs
+        # a real loop its measured-waste boost.
+        call = self._search("café latte", "/srv/menu", 0)
+
+        assert "u00e9" not in _signature_tokens(_canonical_signature(call))
+
+    @pytest.mark.parametrize(
+        ("name", "field"),
+        [(n, f[0]) for n, f in sorted(_IDENTITY_FIELDS.items()) if len(f) == 1],
+    )
+    def test_a_single_field_tool_keeps_its_bare_value(self, name: str, field: str):
+        # Guards the carve-out above: give one of these tools a second identity
+        # field and it silently moves to the structured form, where
+        # _PAGINATION_RE no longer matches the command it was written for.
+        call = _call(name, "c-0", {field: "a b c"}, msg_index=0)
+
+        assert _identity_input(call) == "a b c"

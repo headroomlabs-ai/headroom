@@ -101,6 +101,11 @@ class LoopPattern:
 # Because identity no longer reads ``input_summary``, a field that distinguishes
 # two calls has to be named here to count — adding one to the summary alone
 # changes the display and leaves the grouping merged.
+#
+# Adding a *second* field to a tool listed here also moves it to the structured
+# identity form in ``_identity_input``, which ``_PAGINATION_RE`` below is not
+# written against — so a second field on ``bash``/``shell`` would stop
+# re-fetch variants of one command collapsing.
 _IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "bash": ("command",),
     "shell": ("command",),
@@ -131,9 +136,17 @@ def _identity_input(tc: ToolCall) -> str:
     if fields is not None:
         parts = [str(data.get(field, "")) for field in fields]
         if any(parts):
-            return " ".join(parts)
+            # A lone field is already unambiguous, and leaving it bare is what
+            # the shell pagination normalization below matches against. Two or
+            # more have to carry their own boundaries: joined on a space,
+            # ("error in src", "logs") and ("error", "in src logs") are two
+            # different searches rendering one string — and so one phantom loop.
+            # Escaping stays off: ``\u00e9`` would reach _signature_tokens as a
+            # token no recommendation can contain, diluting the majority overlap
+            # apply_loop_weighting needs to credit the loop.
+            return parts[0] if len(parts) == 1 else json.dumps(parts, ensure_ascii=False)
     try:
-        return json.dumps(tc.input_data, sort_keys=True, default=repr)
+        return json.dumps(tc.input_data, sort_keys=True, default=repr, ensure_ascii=False)
     except TypeError:
         # Unorderable keys — not reachable from parsed JSON, but identity is
         # derived from files the user did not write, so it must not raise.
