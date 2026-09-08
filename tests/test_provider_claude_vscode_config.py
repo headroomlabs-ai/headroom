@@ -143,6 +143,10 @@ def test_configure_1m_uses_fallback_and_disable_restores_missing_model(
     configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
     assert json.loads(path.read_text(encoding="utf-8"))["model"] == "claude-opus-9[1m]"
 
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-10")
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "claude-opus-10[1m]"
+
     assert configure_vscode_claude_settings(path, "http://127.0.0.1:9999") == "updated"
     configured = json.loads(path.read_text(encoding="utf-8"))
     state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))

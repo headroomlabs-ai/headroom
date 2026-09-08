@@ -226,7 +226,9 @@ def configure_vscode_claude_settings(
                 "managed": resolved_model,
             }
         else:
-            resolved_model = resolve_1m_model(current_model)
+            previous_model = model_state["previous"]
+            prior_value = previous_model["value"] if previous_model["present"] else None
+            resolved_model = resolve_1m_model(prior_value)
             model_state["managed"] = resolved_model
             state["model"] = model_state
         payload["model"] = resolved_model
