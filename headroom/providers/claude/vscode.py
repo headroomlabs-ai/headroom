@@ -12,6 +12,7 @@ from typing import Any
 import click
 
 from headroom import fsutil
+from headroom.providers.claude.runtime import resolve_1m_model
 from headroom.proxy.project_context import with_project_prefix
 
 _BASE_URL_KEY = "ANTHROPIC_BASE_URL"
@@ -79,12 +80,104 @@ def _env_map(payload: dict[str, Any], path: Path) -> dict[str, Any]:
     return dict(env)
 
 
+def _model_value(payload: dict[str, Any], path: Path) -> str | None:
+    if "model" not in payload:
+        return None
+    model = payload["model"]
+    if not isinstance(model, str):
+        raise click.ClickException(
+            f"Claude settings {path} has a non-string top-level 'model' value; "
+            "refusing to overwrite it."
+        )
+    return model
+
+
+def resolve_vscode_claude_model(path: Path) -> str:
+    """Resolve the 1M model from settings without writing settings or state."""
+    payload = _read_settings(path)
+    return resolve_1m_model(_model_value(payload, path))
+
+
+def resolve_vscode_claude_model_for_instructions(path: Path) -> str:
+    """Resolve a model for manual setup instructions, tolerating bad settings."""
+    try:
+        return resolve_vscode_claude_model(path)
+    except click.ClickException:
+        return resolve_1m_model(None)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fsutil.write_text(path, json.dumps(payload, indent=2) + "\n")
 
 
-def configure_vscode_claude_settings(path: Path, proxy_url: str) -> str:
+def _validate_previous(previous: dict[str, Any], state_path: Path) -> None:
+    for key in _MANAGED_KEYS:
+        saved = previous.get(key)
+        if (
+            not isinstance(saved, dict)
+            or not isinstance(saved.get("present"), bool)
+            or "value" not in saved
+        ):
+            raise click.ClickException(
+                f"Headroom state {state_path} is incomplete; refusing to edit."
+            )
+
+
+def _validate_model_record(state: dict[str, Any], state_path: Path) -> dict[str, Any] | None:
+    if "model" not in state:
+        return None
+    model_state = state["model"]
+    if not isinstance(model_state, dict):
+        raise click.ClickException(
+            f"Headroom state {state_path} has an incomplete model record; refusing to edit."
+        )
+    previous = model_state.get("previous")
+    managed = model_state.get("managed")
+    if (
+        not isinstance(previous, dict)
+        or not isinstance(previous.get("present"), bool)
+        or "value" not in previous
+        or not isinstance(managed, str)
+        or (not previous["present"] and previous.get("value") is not None)
+        or (previous["present"] and not isinstance(previous.get("value"), str))
+    ):
+        raise click.ClickException(
+            f"Headroom state {state_path} has an incomplete model record; refusing to edit."
+        )
+    return model_state
+
+
+def _validate_state(state: dict[str, Any], state_path: Path) -> dict[str, Any] | None:
+    if state.get("version") != _STATE_VERSION or not isinstance(state.get("previous"), dict):
+        raise click.ClickException(
+            f"Headroom state {state_path} is unsupported or incomplete; refusing to edit."
+        )
+    previous = state["previous"]
+    _validate_previous(previous, state_path)
+    managed = state.get("managed")
+    if not isinstance(managed, dict):
+        raise click.ClickException(f"Headroom state {state_path} has no managed values.")
+    if any(key not in managed or not isinstance(managed[key], str) for key in _MANAGED_KEYS):
+        raise click.ClickException(f"Headroom state {state_path} is incomplete; refusing to edit.")
+    return _validate_model_record(state, state_path)
+
+
+def _model_is_managed(payload: dict[str, Any], managed: str) -> bool:
+    return "model" in payload and payload["model"] == managed
+
+
+def _restore_model(payload: dict[str, Any], model_state: dict[str, Any]) -> None:
+    previous = model_state["previous"]
+    if previous["present"]:
+        payload["model"] = previous["value"]
+    else:
+        payload.pop("model", None)
+
+
+def configure_vscode_claude_settings(
+    path: Path, proxy_url: str, *, context_1m: bool = False
+) -> str:
     """Route Claude Code's VS Code process through Headroom, reversibly."""
     payload = _read_settings(path)
     env = _env_map(payload, path)
@@ -97,20 +190,21 @@ def configure_vscode_claude_settings(path: Path, proxy_url: str) -> str:
 
     if state_path.exists():
         state = _read_object(state_path, label="Headroom state")
-        if state.get("version") != _STATE_VERSION or not isinstance(state.get("previous"), dict):
-            raise click.ClickException(
-                f"Headroom state {state_path} is unsupported or incomplete; refusing to edit."
-            )
-        old_managed = state.get("managed")
-        if not isinstance(old_managed, dict) or any(
-            env.get(key) != old_managed.get(key) for key in _MANAGED_KEYS
-        ):
+        model_state = _validate_state(state, state_path)
+        old_managed = state["managed"]
+        if any(env.get(key) != old_managed[key] for key in _MANAGED_KEYS):
             raise click.ClickException(
                 "Claude settings changed one of Headroom's managed values. Run "
                 "`headroom unwrap vscode-claude` or resolve the conflict before retrying."
             )
+        if model_state is not None and not _model_is_managed(payload, model_state["managed"]):
+            raise click.ClickException(
+                "Claude settings changed Headroom's managed model. Run "
+                "`headroom unwrap vscode-claude` or resolve the conflict before retrying."
+            )
         action = "updated"
     else:
+        model_state = None
         state = {
             "version": _STATE_VERSION,
             "settings_existed": path.exists(),
@@ -119,6 +213,26 @@ def configure_vscode_claude_settings(path: Path, proxy_url: str) -> str:
             },
         }
         action = "added"
+
+    if context_1m:
+        current_model = _model_value(payload, path)
+        if model_state is None:
+            resolved_model = resolve_1m_model(current_model)
+            state["model"] = {
+                "previous": {
+                    "present": "model" in payload,
+                    "value": current_model,
+                },
+                "managed": resolved_model,
+            }
+        else:
+            resolved_model = resolve_1m_model(current_model)
+            model_state["managed"] = resolved_model
+            state["model"] = model_state
+        payload["model"] = resolved_model
+    elif model_state is not None:
+        _restore_model(payload, model_state)
+        state.pop("model", None)
 
     env.update(managed)
     payload["env"] = env
@@ -134,29 +248,25 @@ def remove_vscode_claude_settings(path: Path) -> bool:
     if not state_path.exists():
         return False
     state = _read_object(state_path, label="Headroom state")
-    previous = state.get("previous")
-    managed = state.get("managed")
-    if state.get("version") != _STATE_VERSION or not isinstance(previous, dict):
-        raise click.ClickException(
-            f"Headroom state {state_path} is unsupported or incomplete; refusing to edit."
-        )
-    if not isinstance(managed, dict):
-        raise click.ClickException(f"Headroom state {state_path} has no managed values.")
+    previous = state["previous"]
+    managed = state["managed"]
+    model_state = _validate_state(state, state_path)
 
     payload = _read_settings(path)
     env = _env_map(payload, path)
-    if any(env.get(key) != managed.get(key) for key in _MANAGED_KEYS):
+    if any(env.get(key) != managed[key] for key in _MANAGED_KEYS):
         raise click.ClickException(
             "Claude settings changed one of Headroom's managed values; refusing to overwrite "
             f"the user's change. Resolve the conflict in {path}, then retry."
         )
+    if model_state is not None and not _model_is_managed(payload, model_state["managed"]):
+        raise click.ClickException(
+            "Claude settings changed Headroom's managed model; refusing to overwrite the user's "
+            f"change. Resolve the conflict in {path}, then retry."
+        )
 
     for key in _MANAGED_KEYS:
         saved = previous.get(key)
-        if not isinstance(saved, dict) or not isinstance(saved.get("present"), bool):
-            raise click.ClickException(
-                f"Headroom state {state_path} is incomplete; refusing to edit."
-            )
         if saved["present"]:
             env[key] = saved.get("value")
         else:
@@ -165,6 +275,9 @@ def remove_vscode_claude_settings(path: Path) -> bool:
         payload["env"] = env
     else:
         payload.pop("env", None)
+
+    if model_state is not None:
+        _restore_model(payload, model_state)
 
     if payload or state.get("settings_existed"):
         _write_json(path, payload)

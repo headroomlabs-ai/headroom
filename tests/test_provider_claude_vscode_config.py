@@ -13,6 +13,8 @@ from headroom.providers.claude.vscode import (
     claude_user_settings_path,
     configure_vscode_claude_settings,
     remove_vscode_claude_settings,
+    resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 
@@ -82,6 +84,161 @@ def test_reconfigure_updates_port_without_losing_original_values(tmp_path: Path)
     }
 
 
+def test_configure_1m_snapshots_selected_model_and_restores_exact_value(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    original = {
+        "model": " claude-sonnet-5 ",
+        "permissions": {"allow": ["Read"]},
+        "env": {"KEEP": "yes"},
+    }
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))
+    assert configured["model"] == "claude-sonnet-5[1m]"
+    assert state["model"] == {
+        "previous": {"present": True, "value": " claude-sonnet-5 "},
+        "managed": "claude-sonnet-5[1m]",
+    }
+
+    assert remove_vscode_claude_settings(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
+def test_configure_1m_is_idempotent_and_does_not_double_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"model":"claude-opus-5[1m]"}', encoding="utf-8")
+
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+    configure_vscode_claude_settings(path, "http://127.0.0.1:9999", context_1m=True)
+
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))
+    assert configured["model"] == "claude-opus-5[1m]"
+    assert state["model"]["previous"] == {"present": True, "value": "claude-opus-5[1m]"}
+    assert remove_vscode_claude_settings(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "claude-opus-5[1m]"
+
+
+def test_configure_1m_preserves_present_empty_model(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"model":""}', encoding="utf-8")
+
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+    state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))
+    assert state["model"]["previous"] == {"present": True, "value": ""}
+    assert remove_vscode_claude_settings(path)
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == ""
+
+
+def test_configure_1m_uses_fallback_and_disable_restores_missing_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "settings.json"
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "claude-opus-9[1m]"
+
+    assert configure_vscode_claude_settings(path, "http://127.0.0.1:9999") == "updated"
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))
+    assert "model" not in configured
+    assert "model" not in state
+    assert configured["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9999"
+
+    assert remove_vscode_claude_settings(path)
+    assert not path.exists()
+
+
+def test_legacy_v1_sidecar_can_add_and_restore_model_state(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787")
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+
+    state = json.loads((tmp_path / ".headroom-vscode-claude.json").read_text(encoding="utf-8"))
+    assert state["version"] == 1
+    assert state["model"]["previous"] == {"present": False, "value": None}
+    assert remove_vscode_claude_settings(path)
+    assert not path.exists()
+
+
+def test_configure_1m_rejects_non_string_model_without_writes(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = {"model": {"name": "opus"}, "env": {"KEEP": "yes"}}
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="non-string"):
+        configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+    assert not (tmp_path / ".headroom-vscode-claude.json").exists()
+
+
+def test_configure_without_1m_preserves_unmanaged_model_and_nested_values(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    original = {
+        "model": "claude-sonnet-5",
+        "permissions": {"allow": ["Read"]},
+        "custom": {"nested": {"value": True}},
+    }
+    path.write_text(json.dumps(original), encoding="utf-8")
+
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787")
+    configured = json.loads(path.read_text(encoding="utf-8"))
+    assert configured["model"] == original["model"]
+    assert configured["permissions"] == original["permissions"]
+    assert configured["custom"] == original["custom"]
+
+
+def test_model_conflicts_fail_closed_on_configure_and_remove(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"model":"claude-sonnet-5"}', encoding="utf-8")
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["model"] = "user-selected-model"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    state_path = tmp_path / ".headroom-vscode-claude.json"
+    state_before = state_path.read_text(encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="managed model"):
+        configure_vscode_claude_settings(path, "http://127.0.0.1:9999", context_1m=True)
+    with pytest.raises(click.ClickException, match="managed model"):
+        remove_vscode_claude_settings(path)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["model"] == "user-selected-model"
+    assert state_path.read_text(encoding="utf-8") == state_before
+
+
+def test_resolve_vscode_claude_model_is_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"model":"claude-opus-5"}', encoding="utf-8")
+
+    assert resolve_vscode_claude_model(path) == "claude-opus-5[1m]"
+    assert path.read_text(encoding="utf-8") == '{"model":"claude-opus-5"}'
+    assert not (tmp_path / ".headroom-vscode-claude.json").exists()
+
+
+def test_resolve_vscode_claude_model_for_instructions_falls_back_for_non_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "settings.json"
+    original = '{"model":{"name":"opus"}}'
+    path.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+
+    with pytest.raises(click.ClickException, match="non-string"):
+        resolve_vscode_claude_model(path)
+
+    assert resolve_vscode_claude_model_for_instructions(path) == "claude-opus-9[1m]"
+    assert path.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".headroom-vscode-claude.json").exists()
+
+
 def test_remove_deletes_settings_created_only_for_headroom(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     configure_vscode_claude_settings(path, "http://127.0.0.1:8787/p/demo")
@@ -94,7 +251,7 @@ def test_configure_refuses_malformed_settings(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text("{broken", encoding="utf-8")
     with pytest.raises(click.ClickException, match="not valid JSON"):
-        configure_vscode_claude_settings(path, "http://127.0.0.1:8787")
+        configure_vscode_claude_settings(path, "http://127.0.0.1:8787", context_1m=True)
     assert path.read_text(encoding="utf-8") == "{broken"
 
 
@@ -135,6 +292,47 @@ def test_remove_without_headroom_state_is_noop(tmp_path: Path) -> None:
         ({"version": 2}, "unsupported or incomplete"),
         ({"managed": None}, "has no managed values"),
         ({"previous": {"ANTHROPIC_BASE_URL": None}}, "is incomplete"),
+        ({"model": None}, "incomplete model record"),
+        (
+            {"model": {"previous": None, "managed": "claude-opus-5[1m]"}},
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": True},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": False, "value": "unexpected"},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": True, "value": 5},
+                    "managed": "claude-opus-5[1m]",
+                }
+            },
+            "incomplete model record",
+        ),
+        (
+            {
+                "model": {
+                    "previous": {"present": False, "value": None},
+                    "managed": None,
+                }
+            },
+            "incomplete model record",
+        ),
     ],
 )
 def test_remove_refuses_incomplete_state(

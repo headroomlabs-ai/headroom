@@ -6,6 +6,8 @@ description: Route the official Claude Code extension through Headroom's local c
 The official Claude Code extension for VS Code embeds Claude Code. Headroom can
 route its Anthropic API requests through the same local compression proxy used by
 `headroom wrap claude`, without changing your Anthropic sign-in or selected model.
+Pass `--1m` when you want Headroom to persist Claude Code's client-owned 1M model
+selector.
 
 <Callout type="info" title="Using Claude Code in a terminal instead?">
 Use `headroom wrap claude`. This page is specifically for Anthropic's official
@@ -50,6 +52,26 @@ uses a custom endpoint. Existing settings and prior values for both variables ar
 preserved for restoration. Headroom does not store or replace your Anthropic
 credentials.
 
+To opt into Claude Code's 1M context selector, run:
+
+```bash
+headroom wrap vscode-claude --1m
+```
+
+The command writes a top-level setting alongside `env`:
+
+```json
+{
+  "model": "claude-opus-5[1m]"
+}
+```
+
+The selected model is trimmed and receives one `[1m]` suffix. When no model is
+selected, `HEADROOM_1M_MODEL` is used, followed by the built-in fallback. Headroom
+stores the exact prior model presence and value in its sidecar, preserves that
+snapshot across repeated runs, and restores it when you omit `--1m` or run
+`headroom unwrap vscode-claude`.
+
 3. After the first configuration, run **Developer: Reload Window** from the VS
 Code Command Palette.
 4. Keep the wrapper terminal running and use the Claude Code panel normally.
@@ -78,7 +100,9 @@ respected when set. To target another profile explicitly:
 headroom wrap vscode-claude --settings-file /path/to/.claude/settings.json
 ```
 
-Use `--no-configure` to print the settings without editing a file.
+Use `--no-configure` to print the settings without editing a file. With
+`--no-configure --1m`, the resolved top-level `model` is printed too and neither
+the settings file nor the sidecar is written.
 
 The proxy URL includes the current directory as the project attribution name.
 Run the wrapper from the intended project directory. If you select another port,
@@ -96,9 +120,10 @@ Restore the values that existed before Headroom configured the extension:
 headroom unwrap vscode-claude
 ```
 
-Headroom records only the two values it owns in a sidecar next to the Claude
-settings file. It refuses malformed settings or conflicting edits rather than
-overwriting them. Unrelated Claude settings are preserved.
+Headroom records the two environment values it owns and, when `--1m` is active,
+the model snapshot in a sidecar next to the Claude settings file. It refuses
+malformed settings or conflicting edits rather than overwriting them. Unrelated
+Claude settings are preserved.
 
 If you used `--settings-file` during setup, pass the same option when undoing it:
 
@@ -125,3 +150,8 @@ automatic discovery does not match it.
 - If you use `CLAUDE_CONFIG_DIR`, launch Headroom from an environment where it is
   set to the same value used by Claude Code.
 - This integration is for the Claude Code extension, not the Claude desktop app.
+
+Claude Code and Anthropic decide whether the selected model and account can use
+the 1M tier. Local settings tests prove persistence and restoration only; they do
+not prove a live entitled VS Code session, extension behavior, or a 1M context
+window.

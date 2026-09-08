@@ -74,6 +74,9 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
+    CONTEXT_1M_SUFFIX,
+    DEFAULT_1M_MODEL,
+    HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
@@ -87,6 +90,9 @@ from headroom.providers.claude import (
     remote_control_gate_message,
     remote_control_sibling_gate_note,
     remove_vscode_claude_settings,
+    resolve_1m_model,
+    resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 from headroom.providers.claude import (
@@ -320,28 +326,15 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
-_CONTEXT_1M_SUFFIX = "[1m]"
-_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
-# Fallback model for `--1m` when nothing else selects one (no ANTHROPIC_MODEL,
-# no explicit --model). Overridable via HEADROOM_1M_MODEL so it can track new
-# Opus releases without a code change and without pinning ANTHROPIC_MODEL
-# globally (which would also change non-`--1m` sessions and override Claude
-# Code's /model picker). #2937.
-_DEFAULT_1M_MODEL = "claude-opus-5"
+# Private aliases preserve the standalone wrapper's existing test and import
+# surface while the provider runtime owns the 1M selection contract.
+_CONTEXT_1M_SUFFIX = CONTEXT_1M_SUFFIX
+_1M_MODEL_ENV = HEADROOM_1M_MODEL_ENV
+_DEFAULT_1M_MODEL = DEFAULT_1M_MODEL
 _OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
-def _resolve_1m_model(current: str | None) -> str:
-    """Return the model id that makes Claude Code request the 1M window (#1158).
-
-    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
-    appending the ``[1m]`` suffix when missing). When none is set it falls back
-    to ``HEADROOM_1M_MODEL`` if defined, else the built-in default Opus (#2937).
-    Idempotent — a value already ending in ``[1m]`` is returned unchanged.
-    """
-    fallback = (os.environ.get(_1M_MODEL_ENV) or "").strip() or _DEFAULT_1M_MODEL
-    base = (current or "").strip() or fallback
-    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+_resolve_1m_model = resolve_1m_model
 
 
 def _apply_1m_to_claude_args(args: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
@@ -6056,34 +6049,61 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
     default=True,
     help="Safely add/update Claude Code's proxy environment settings",
 )
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Persist Claude Code's [1m] model selector in settings for the 1M "
+        "context window (issue #3360)."
+    ),
+)
 def vscode_claude(
     port: int,
     memory: bool,
     settings_file: Path | None,
     configure: bool,
+    context_1m: bool,
 ) -> None:
     """Route VS Code's official Claude Code extension through Headroom.
 
     Run this from your project, reload VS Code after first setup, and keep this
     command running while using Claude Code. Authentication and model selection
-    remain unchanged. Run `headroom unwrap vscode-claude` to restore settings.
+    remain unchanged. Use --1m to opt into Claude Code's client-owned 1M model
+    selector. Run `headroom unwrap vscode-claude` to restore settings.
     """
     target_settings = settings_file or claude_user_settings_path()
 
     def _print_setup(actual_port: int) -> None:
         proxy_url = vscode_claude_proxy_url(actual_port, _project_name_from_cwd())
         if configure:
-            action = configure_vscode_claude_settings(target_settings, proxy_url)
+            action = configure_vscode_claude_settings(
+                target_settings, proxy_url, context_1m=context_1m
+            )
             click.echo(f"  VS Code Claude Code proxy settings {action}: {target_settings}")
+            if context_1m:
+                click.echo(
+                    f"  1M context model persisted: {resolve_vscode_claude_model(target_settings)}"
+                )
             click.echo("  Next: Reload VS Code, then use the Claude Code panel.")
             click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
-            click.echo("  Authentication and the selected Claude model are preserved.")
+            if context_1m:
+                click.echo("  Authentication is preserved; the 1M model selector is enabled.")
+            else:
+                click.echo("  Authentication and the selected Claude model are preserved.")
             click.echo("  Undo later with: headroom unwrap vscode-claude")
             click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
-        click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
+        if context_1m:
+            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
+            click.echo(f"  Add this top-level setting to {target_settings}:")
+            click.echo(
+                f'  "model": "{resolve_vscode_claude_model_for_instructions(target_settings)}"'
+            )
+        else:
+            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
 
     _run_proxy_only_watcher(
         agent_label="VS CODE CLAUDE",
