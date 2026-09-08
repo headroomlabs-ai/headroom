@@ -28,8 +28,26 @@ import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
+from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 
 logger = logging.getLogger("headroom.proxy")
+
+
+def _thinking_for_stream(payload: object) -> ThinkingTokens:
+    """Thinking-token split for a reassembled streaming response.
+
+    Shares the estimator with the non-streaming path so a streamed and an
+    unstreamed response of the same shape produce the same number — otherwise
+    the stratum would mix two different rulers.
+
+    Never raises: accounting must not cost a caller their response.
+    """
+    try:
+        from headroom.proxy.handlers.anthropic import _thinking_estimator
+
+        return extract_thinking_tokens(payload, estimator=_thinking_estimator())
+    except Exception:  # noqa: BLE001 - accounting must never break a response
+        return ThinkingTokens()
 
 
 def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
@@ -1055,7 +1073,22 @@ class StreamingMixin:
         # live-zone tracking is a follow-up. Without this fallback the
         # dashboard headline collapses to 0% even when compression is
         # happening (issue #455).
+        # Thinking split and stop_reason for the streaming path. Streaming is
+        # where the agentic traffic is, so without this the split — and the one
+        # feedback signal an adaptive ceiling can learn from — would exist only
+        # for non-streaming requests, which is close to nowhere in practice.
+        #
+        # ``parsed_response`` is the reassembled SSE body: it carries the content
+        # blocks (thinking among them) and stop_reason, which the raw usage chunk
+        # does not.
+        _stream_thinking = _thinking_for_stream(parsed_response)
+        _stream_stop_reason = (
+            parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
+        )
         outcome = RequestOutcome.from_stream(
+            thinking_tokens=_stream_thinking.tokens,
+            thinking_inferred=_stream_thinking.inferred,
+            stop_reason=_stream_stop_reason,
             body=body,
             provider=outcome_provider,
             model=model,

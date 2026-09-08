@@ -14,6 +14,7 @@ crates/
   headroom-proxy/                # binary: axum /healthz (Phase 2 grows this)
   headroom-py/                   # PyO3 cdylib exposing `headroom._core`
   headroom-parity/               # lib + `parity-run` CLI for Python parity tests
+  headroom-simulators/           # binary: deterministic local upstream stub for proxy tests
 tests/parity/
   fixtures/<transform>/*.json    # recorded Python outputs (Phase 1 ports match)
   recorder.py                    # Python-side fixture recorder
@@ -36,7 +37,7 @@ exposes the same targets:
 | `make test-parity` | Builds `headroom-py` via maturin, runs `parity-run run` |
 | `make bench` | `cargo bench --workspace` |
 | `make build-proxy` | Release-builds `headroom-proxy`, strips, prints size |
-| `make build-wheel` | `maturin build --release -m crates/headroom-py/pyproject.toml` |
+| `make build-wheel` | `maturin build --release -m crates/headroom-py/Cargo.toml` |
 | `make fmt` | `cargo fmt --all` |
 | `make lint` | `cargo fmt --check` + `cargo clippy --workspace -- -D warnings` |
 
@@ -282,9 +283,10 @@ doesn't rediscover them.
   `plugins/headroom-agent-hooks/**/plugin.json` on every commit. Those
   changes are harmless but each commit in Phase 0 picks them up. Phase 1
   does not need to do anything special — just let the hook run.
-- **`rust-toolchain.toml`** pins `channel = "stable"` rather than a specific
-  version so CI picks up the same toolchain the local box uses. Tighten to a
-  pinned version (e.g. `1.78`) once the port stabilizes.
+- **`rust-toolchain.toml`** now pins `channel = "1.95.0"` (previously tracked
+  `"stable"`, which let CI drift ahead of local dev boxes — see the file's own
+  comment for the 2026-04-27 incident this fixed). Resolved; kept here for
+  history.
 
 ## Multi-worker deployment — CCR fragmentation
 
@@ -331,10 +333,14 @@ in-memory.
 Each uvicorn worker is a separate Python process. The following state is
 fragmented across workers:
 
-1. **Python `CompressionStore`** — defaults to `InMemoryBackend` (per-process)
-   when `HEADROOM_CCR_BACKEND` is unset. Each worker has its own singleton; CCR
-   markers written on worker A are invisible to worker B. Set
-   `HEADROOM_CCR_BACKEND=sqlite` to use a shared cross-worker store.
+1. **Python `CompressionStore`** — defaults to `SQLiteBackend` at
+   `workspace_dir()/ccr_store.db` (restart-safe, shared across workers) when
+   `HEADROOM_CCR_BACKEND` is unset or `"sqlite"` (`_create_default_ccr_backend`
+   in `headroom/cache/compression_store.py`). Set `HEADROOM_CCR_BACKEND=memory`
+   to opt into the per-process `InMemoryBackend` instead — that is the setting
+   this section's fragmentation risk actually applies to; the log messages in
+   `headroom/proxy/server.py` (see below) still assume in-memory-by-default and
+   are stale on this point.
 2. **`HeadroomProxy._compression_caches`** (`headroom/proxy/server.py`)
    — per-session `CompressionCache` dict (instance var, always per-worker).
 3. **`HeadroomProxy.session_tracker_store`** — per-session prefix-tracker

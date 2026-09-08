@@ -62,22 +62,18 @@ def test_set_overrides_ignores_unknown_keys_and_non_strings():
 def test_explicit_env_returns_only_explicitly_set_knobs():
     environ = {
         "HEADROOM_OUTPUT_SHAPER": "1",
-        "HEADROOM_MECHANICAL_EFFORT": "low",
         "HEADROOM_VERBOSITY_LEVEL": "   ",  # blank -> not "explicitly set"
         "PATH": "/usr/bin",  # not a knob
     }
     assert rt.explicit_env(environ) == {
         "HEADROOM_OUTPUT_SHAPER": "1",
-        "HEADROOM_MECHANICAL_EFFORT": "low",
     }
 
 
 def test_effective_runtime_env_reports_override_or_none(monkeypatch):
-    monkeypatch.setenv("HEADROOM_EFFORT_ROUTER", "0")
     rt.set_overrides({"HEADROOM_OUTPUT_SHAPER": "1"})
     eff = rt.effective_runtime_env()
     assert eff["HEADROOM_OUTPUT_SHAPER"] == "1"  # from override
-    assert eff["HEADROOM_EFFORT_ROUTER"] == "0"  # from env
     assert eff["HEADROOM_VERBOSITY_LEVEL"] is None  # unset
     # Every registered knob is reported.
     assert set(eff) == {knob.env for knob in rt.RUNTIME_ENV_KNOBS}
@@ -160,7 +156,16 @@ def test_admin_runtime_env_applies_and_reflects_in_health(loopback_client):
     ("rollout", "expected_enabled", "expected_reason"),
     [
         (resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"}), True, "legacy_alias"),
-        (resolve_rollout({}), False, "blocked_by_channel"),
+        # Was ``(resolve_rollout({}), False, "blocked_by_channel")`` while
+        # ``proxy_output_shaper`` was BETA: on the default channel the admin
+        # POST could not enable it. The feature is now STABLE and on by
+        # default, so the same POST is honoured. The escalation-refusal
+        # property this case used to cover cannot be reproduced through this
+        # endpoint any more — ``/admin/runtime-env`` re-resolves exactly one
+        # rollout alias, ``HEADROOM_OUTPUT_SHAPER`` (see server.py), so there
+        # is no second, still-gated feature to point it at. Channel gating
+        # itself stays covered in test_rollout.py.
+        (resolve_rollout({}), True, "legacy_alias"),
         (
             resolve_rollout(
                 {

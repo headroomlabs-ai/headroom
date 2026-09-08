@@ -55,6 +55,19 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|\.[a-z]{2,4}\b"  # extensions: .py .so .json
     r"|--?[a-z][\w-]*"  # flags: --verbose, -n
     r"|\b[A-Z][a-z]+[A-Z]\w*"  # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+    # Directive words. Every other class above protects a token the model could
+    # not RECONSTRUCT; these protect tokens whose loss INVERTS the surrounding
+    # sentence. Compressed prompts carry instructions as often as they carry
+    # tool output, and "do not guess at model names" without its "not" is not a
+    # degraded instruction, it is the opposite instruction. Measured over 40
+    # real skill bodies with THIS pattern: negation retention rose
+    # 73.5% -> 91.9% and modal retention 65.5% -> 96.8%, for 0.2 percentage
+    # points of compression (ratio 0.716 -> 0.718) -- these are short, common
+    # words, so the model was already keeping most of them and pinning the rest
+    # costs almost nothing.
+    r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
+    r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
+    r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"

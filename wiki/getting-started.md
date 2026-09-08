@@ -39,13 +39,13 @@ npm install headroom-ai
 **Docker-native:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
 ```
 
 PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.ps1 | iex
 ```
 
 See [Docker-native install](docker-install.md) for wrapper behavior, compose usage, and host-integrated `wrap` flows.
@@ -140,7 +140,7 @@ plan = client.chat.completions.simulate(
     messages=[...],
 )
 print(f"Would save {plan.tokens_saved} tokens")
-print(f"Transforms: {plan.transforms_applied}")
+print(f"Transforms: {plan.transforms}")
 ```
 
 ## Next Steps
