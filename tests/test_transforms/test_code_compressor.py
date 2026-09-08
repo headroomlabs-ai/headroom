@@ -2549,6 +2549,59 @@ class TestElixirSupport:
         # `Enum.map/2` is an ordinary remote call, never a definition.
         assert roles.count("call") == 1
 
+    def test_definition_macro_roles_match_the_grammars_own_list(self):
+        """The role table is the grammar's classification, not a guess: the
+        function role is `queries/highlights.scm`'s function-definition subset
+        verbatim, and every one of the 15 definition macros that file lists is
+        assigned a role. Pins the table so a grammar bump surfaces here."""
+        config = cc._LANG_CONFIGS[CodeLanguage.ELIXIR]
+        upstream_function_definitions = {
+            "def",
+            "defdelegate",
+            "defguard",
+            "defguardp",
+            "defmacro",
+            "defmacrop",
+            "defn",
+            "defnp",
+            "defp",
+        }
+        # ExUnit block macros are ours, not the grammar's; strip them to compare.
+        exunit_blocks = {"test", "setup", "setup_all"}
+        assert config.call_function_targets - exunit_blocks == upstream_function_definitions
+
+        upstream_definition_keywords = upstream_function_definitions | {
+            "defexception",
+            "defimpl",
+            "defmodule",
+            "defoverridable",
+            "defprotocol",
+            "defstruct",
+        }
+        assigned = (
+            config.call_function_targets | config.call_class_targets | config.call_type_targets
+        )
+        assert upstream_definition_keywords <= assigned
+
+    def test_defoverridable_declaration_is_preserved(self):
+        code = textwrap.dedent("""\
+            defmodule MyApp.Base do
+              def handle(x) do
+                a = x + 1
+                b = a + 2
+                c = b + 3
+                c
+              end
+
+              defoverridable handle: 1
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "defoverridable handle: 1" in result.compressed
+        assert "lines omitted" in result.compressed
+
     def test_declarations_inside_a_macro_wrapper_are_not_duplicated(self):
         """Elixir wraps declarations in ordinary macros. Capturing the inner
         `defimpl` while the uncaptured `for`/`if` wrapper is re-emitted verbatim

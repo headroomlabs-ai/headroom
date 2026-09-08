@@ -650,6 +650,13 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         uses_colon_after_signature=False,
         detection_hints=("defmodule ", "defp ", "@moduledoc", "|>", " do\n"),
         call_node_type="call",
+        # The three target sets below partition the 15 definition macros the
+        # grammar itself recognises — `queries/highlights.scm` in
+        # elixir-lang/tree-sitter-elixir, `#any-of? @keyword "def" ...`. The
+        # function set is that file's own function-definition subset verbatim;
+        # the rest are split by whether the macro owns a member list
+        # (container) or declares shape (verbatim). Re-check against upstream
+        # when the pinned grammar version moves.
         call_function_targets=frozenset(
             {
                 "def",
@@ -677,7 +684,17 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         # Structure declarations, kept verbatim: they are the module's shape,
         # not its behaviour, and `schema`/`embedded_schema` field lists are
         # exactly what a reader of compressed Ecto code needs.
-        call_type_targets=frozenset({"defstruct", "defexception", "schema", "embedded_schema"}),
+        call_type_targets=frozenset(
+            {
+                "defstruct",
+                "defexception",
+                # Declares which generated functions may be replaced; carries no
+                # body of its own.
+                "defoverridable",
+                "schema",
+                "embedded_schema",
+            }
+        ),
         # Anything at the top level that is not itself a definition is opaque:
         # emitted verbatim, never recursed into. Elixir wraps declarations in
         # ordinary macros (`for encoder <- [...] do defimpl ... end end`), and
