@@ -6096,14 +6096,12 @@ def vscode_claude(
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
+        click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
         if context_1m:
-            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
             click.echo(f"  Add this top-level setting to {target_settings}:")
             click.echo(
                 f'  "model": "{resolve_vscode_claude_model_for_instructions(target_settings)}"'
             )
-        else:
-            click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
 
     _run_proxy_only_watcher(
         agent_label="VS CODE CLAUDE",

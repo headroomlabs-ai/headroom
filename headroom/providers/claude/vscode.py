@@ -248,9 +248,9 @@ def remove_vscode_claude_settings(path: Path) -> bool:
     if not state_path.exists():
         return False
     state = _read_object(state_path, label="Headroom state")
+    model_state = _validate_state(state, state_path)
     previous = state["previous"]
     managed = state["managed"]
-    model_state = _validate_state(state, state_path)
 
     payload = _read_settings(path)
     env = _env_map(payload, path)

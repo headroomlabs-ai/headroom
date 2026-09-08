@@ -366,6 +366,16 @@ def test_reconfigure_refuses_incomplete_or_conflicting_state(tmp_path: Path) -> 
         configure_vscode_claude_settings(path, proxy_url)
 
 
+def test_remove_refuses_missing_state_keys(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    configure_vscode_claude_settings(path, "http://127.0.0.1:8787")
+    state_path = tmp_path / ".headroom-vscode-claude.json"
+    state_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="unsupported or incomplete"):
+        remove_vscode_claude_settings(path)
+
+
 def test_remove_refuses_to_overwrite_changed_managed_value(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     configure_vscode_claude_settings(path, "http://127.0.0.1:8787/p/demo")
