@@ -2091,10 +2091,26 @@ class OpenAIHandlerMixin:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") != "function_call":
+            if item.get("type") not in {"function_call", "custom_tool_call"}:
                 continue
             name = item.get("name")
             call_id = item.get("call_id")
+            # Codex code-mode nests MCP calls in JavaScript. Its output belongs
+            # to exec, not the nested retrieval, but has the same verbatim
+            # contract. Conservatively protect the entire matching result.
+            script = item.get("input") or item.get("arguments")
+            if (
+                isinstance(name, str)
+                and name in {"exec", "functions.exec"}
+                and isinstance(script, str)
+                and re.search(
+                    r"\b(?:headroom_retrieve|[A-Za-z0-9_]+__headroom_retrieve)\s*\(",
+                    script,
+                )
+                and isinstance(call_id, str)
+                and call_id
+            ):
+                headroom_retrieve_call_ids.add(call_id)
             if name:
                 # Hermes deferred tools arrive wrapped as `tool_call` with
                 # the real name inside the arguments/input payload.
@@ -2714,7 +2730,11 @@ class OpenAIHandlerMixin:
                 updated_items,
                 self.OPENAI_RESPONSES_OUTPUT_TYPES,
                 tokenizer.count_text,
-                protected_call_ids=verbatim_excluded_call_ids | read_protected_call_ids,
+                protected_call_ids=(
+                    verbatim_excluded_call_ids
+                    | read_protected_call_ids
+                    | headroom_retrieve_call_ids
+                ),
             )
             if dd_folded:
                 modified = True
