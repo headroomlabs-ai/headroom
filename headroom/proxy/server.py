@@ -1215,6 +1215,11 @@ class HeadroomProxy(
         # Set by startup() when HEADROOM_PREFIX_STATE_FILE opts in.
         self._prefix_state_file: str | None = None
 
+        # Circuit breaker for runaway tool repetition loops
+        from headroom.proxy.circuit_breaker import ToolLoopCircuitBreaker
+
+        self.tool_loop_circuit_breaker = ToolLoopCircuitBreaker()
+
         # Compression cache store for token mode (session-scoped). The dict
         # itself is mutated under `_compression_caches_lock`; the per-session
         # `CompressionCache` instances have their own internal lock guarding

@@ -157,6 +157,7 @@ class PrometheusMetrics:
         # healthy proxies. "unknown" is a real bucket -- record_failed uses it
         # when no provider is attributed -- so seeding it invents no provider.
         self.requests_failed_by_provider: dict[str, int] = defaultdict(int, {_PROVIDER_UNKNOWN: 0})
+        self.tool_loops_detected = 0
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -511,6 +512,7 @@ class PrometheusMetrics:
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
             self._net_tokens_negative = False
+            self.tool_loops_detected = 0
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
@@ -1311,6 +1313,16 @@ class PrometheusMetrics:
             self._net_tokens_negative = False
         return None
 
+    async def record_tool_loop_detected(
+        self,
+        tool: str | None = None,
+        period: int = 1,
+    ) -> None:
+        """Record a detected runaway tool repetition loop."""
+        async with self._lock:
+            self.tool_loops_detected += 1
+        self._get_otel_metrics().record_tool_loop_detected(tool=tool, period=period)
+
     async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
         """Record why a turn that expected a prompt-cache hit missed instead.
 
@@ -1461,6 +1473,13 @@ class PrometheusMetrics:
                     f'{_escape_label_value(str(_provider))}"}} {_count}'
                 )
             lines.append("")
+            _append_metric(
+                lines,
+                name="headroom_tool_loop_detected_total",
+                metric_type="counter",
+                help_text="Runaway tool repetition loops detected",
+                value=self.tool_loops_detected,
+            )
             _append_metric(
                 lines,
                 name="headroom_inbound_requests_total",
