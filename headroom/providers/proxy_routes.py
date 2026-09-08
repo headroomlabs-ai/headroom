@@ -6,10 +6,18 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import Response
 
 from headroom.providers.cloudcode import normalize_cloudcode_passthrough_path
+from headroom.providers.codex.endpoints import codex_backend_url
+from headroom.providers.codex.headers import drop_header
+from headroom.providers.codex.live import (
+    CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_websocket,
+)
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
+from headroom.providers.codex.runtime import resolve_codex_routing
 from headroom.providers.model_metadata import (
     MODEL_METADATA_LIST_ENDPOINT,
     handle_model_metadata_endpoint,
@@ -59,8 +67,35 @@ from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
 from headroom.proxy.request_scope import normalize_request_path
+from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
+
+
+async def _handle_chatgpt_codex_alpha_search(request: Request, proxy: Any) -> Response | None:
+    upstream_headers = dict(request.headers.items())
+    drop_header(upstream_headers, "host")
+    drop_header(upstream_headers, "accept-encoding")
+    from headroom.proxy.helpers import _strip_internal_headers
+
+    decision = resolve_codex_routing(_strip_internal_headers(upstream_headers))
+    if not decision.is_chatgpt_auth:
+        return None
+
+    body = await request.body()
+    assert proxy.http_client is not None
+    resp = await proxy.http_client.request(
+        request.method,
+        codex_backend_url("/alpha/search", request.url.query),
+        headers=decision.headers,
+        content=body,
+        timeout=120.0,
+    )
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=dict(resp.headers),
+    )
 
 
 def _register_provider_passthrough_route(
@@ -175,6 +210,26 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
         _register_openai_responses_subpath_route(app, proxy, spec)
 
 
+def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
+    for path in CODEX_LIVE_ROUTE_PATHS:
+
+        def register_websocket_route(route_path: str) -> None:
+            async def codex_live_websocket(websocket: WebSocket):
+                await handle_codex_live_websocket(
+                    websocket,
+                    proxy,
+                    _api_target(proxy, "openai"),
+                    route_path,
+                )
+
+            codex_live_websocket.__name__ = (
+                route_path.strip("/").replace("/", "_") + "_live_websocket"
+            )
+            app.websocket(route_path)(codex_live_websocket)
+
+        register_websocket_route(path)
+
+
 def _register_openai_image_route(app: FastAPI, proxy: Any, endpoint: OpenAIImageEndpoint) -> None:
     async def openai_image_endpoint(request: Request):
         return await handle_openai_image_endpoint(
@@ -212,6 +267,9 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         # OpenAI-compatible and generic passthrough routes.
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             return await proxy.handle_anthropic_messages(
                 request, upstream_base_url=custom_base.rstrip("/")
             )
@@ -432,7 +490,27 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             provider_name=provider_name,
         )
 
+    @app.post("/v1/alpha/search")
+    async def codex_alpha_search(request: Request):
+        chatgpt_response = await _handle_chatgpt_codex_alpha_search(request, proxy)
+        if chatgpt_response is not None:
+            return chatgpt_response
+        # This route resolves a caller-named upstream like the catch-all does,
+        # so it needs the same rejection. Without it a client could point the
+        # proxy at loopback/RFC1918/cloud-metadata and read the response back
+        # (CVE-2026-77775).
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+        return await proxy.handle_passthrough(
+            request,
+            _select_passthrough_base_url(proxy, dict(request.headers)),
+        )
+
     _register_openai_image_routes(app, proxy)
+
+    _register_codex_live_routes(app, proxy)
 
     _register_provider_passthrough_routes(app, proxy)
 
@@ -440,6 +518,9 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             base_url = custom_base.rstrip("/")
             endpoint_name, provider_name = _custom_base_passthrough_telemetry(
                 request.method,
@@ -464,5 +545,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
         return await proxy.handle_passthrough(
             request,
-            _select_passthrough_base_url(proxy, dict(request.headers)),
+            # The path matters here: this is where unrouted paths land, and
+            # Copilot's inline completions are one of them (#3076).
+            _select_passthrough_base_url(proxy, dict(request.headers), request.url.path),
         )

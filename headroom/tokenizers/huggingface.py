@@ -325,11 +325,22 @@ class HuggingFaceTokenizer(BaseTokenizer):
         # Try to use chat template for accurate counting
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
-                # Apply chat template and count
+                # ``return_dict=False`` is load-bearing. transformers >= 5 defaults
+                # ``apply_chat_template(tokenize=True)`` to ``return_dict=True``,
+                # which hands back a BatchEncoding — so ``len(formatted)`` counted
+                # DICT KEYS (2: input_ids, attention_mask) instead of tokens.
+                # Measured on Qwen2.5-72B, a 6,000-char message: count_messages
+                # returned 2 and count_message returned -1 (base subtracts a
+                # 3-token reply overhead), against a true 1,003 tokens. That is a
+                # ~99.8% undercount on every HF-routed family whose resolved
+                # tokenizer carries a chat template — llama, qwen, deepseek, phi,
+                # yi, falcon, starcoder. pyproject pins transformers>=5.5.0,<6.0,
+                # so the affected version is the only installable one.
                 formatted = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=True,
                     add_generation_prompt=True,
+                    return_dict=False,
                 )
                 return len(formatted)
             except Exception:

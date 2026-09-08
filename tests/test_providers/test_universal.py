@@ -200,7 +200,18 @@ class TestOpenAICompatibleProvider:
         assert tokens == 55
         assert total == 34
 
-    def test_openai_compatible_token_counter_ignores_unhandled_content_shapes(self, monkeypatch):
+    def test_openai_compatible_token_counter_prices_declared_media(self, monkeypatch):
+        """An image block costs tokens; a non dict/str part still contributes none.
+
+        This previously asserted that BOTH contribute 0 — i.e. it pinned the
+        defect. The counter handled only ``type == "text"``, so every other block
+        priced at ~0: measured on a 6,800-char block, tool_result / thinking /
+        document / mcp_tool_result all returned 8 tokens, overhead only. Counters
+        now delegate to the shared walker, which prices a declared image with the
+        pixel-based estimate (1600, the max after provider auto-resize) rather
+        than either ignoring it or serializing its base64 as text.
+        """
+
         class DummyTokenizer:
             def count_text(self, text: str) -> int:
                 return len(text)
@@ -211,8 +222,12 @@ class TestOpenAICompatibleProvider:
         )
         counter = OpenAICompatibleProvider().get_token_counter("demo-model")
 
+        # Non-list, non-str content is still ignored.
         assert counter.count_message({"role": "user", "content": {}}) == 8
-        assert counter.count_message({"role": "user", "content": [{"type": "image"}, 123]}) == 8
+        # A bare int is not a block and still contributes nothing.
+        assert counter.count_message({"role": "user", "content": [123]}) == 8
+        # A declared image is now priced instead of silently free.
+        assert counter.count_message({"role": "user", "content": [{"type": "image"}, 123]}) == 1608
 
     def test_get_context_limit_prefix_output_buffer_and_partial_pricing(self):
         provider = OpenAICompatibleProvider(
@@ -428,22 +443,13 @@ class TestLiteLLMProvider:
                 "output-model": {"max_output_tokens": 6000},
             }[model],
         )
+        # Cost now resolves through the shared pricing helper rather than a
+        # direct `litellm.completion_cost` call, so patch that seam. The helper
+        # returns None (not an exception) for a model LiteLLM can't price.
         monkeypatch.setattr(
             litellm_module,
-            "litellm",
-            type(
-                "LiteLLM",
-                (),
-                {
-                    "completion_cost": staticmethod(
-                        lambda **kwargs: (
-                            1.23
-                            if kwargs["model"] == "priced-model"
-                            else (_ for _ in ()).throw(RuntimeError("missing price"))
-                        )
-                    )
-                },
-            )(),
+            "estimate_cost_from_tokens",
+            lambda model, **kwargs: 1.23 if model == "priced-model" else None,
         )
 
         provider = litellm_module.LiteLLMProvider()

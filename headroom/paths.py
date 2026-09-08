@@ -342,6 +342,12 @@ def beacon_lock_path(port: int) -> Path:
     return workspace_dir() / f".beacon_lock_{int(port)}"
 
 
+def proxy_start_lock_path(port: int) -> Path:
+    """Return the per-port lock used to serialize wrap proxy startup."""
+
+    return workspace_dir() / f".proxy_start_{int(port)}.lock"
+
+
 # ---------------------------------------------------------------------------
 # Per-resource helpers -- config bucket
 # ---------------------------------------------------------------------------
@@ -432,6 +438,7 @@ __all__ = [
     "proxy_clients_dir",
     "deploy_root",
     "beacon_lock_path",
+    "proxy_start_lock_path",
     "models_config_path",
     "plugin_config_dir",
     "plugin_workspace_dir",

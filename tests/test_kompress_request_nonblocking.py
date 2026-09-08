@@ -15,7 +15,7 @@ import threading
 
 from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
-from headroom.transforms.kompress_compressor import KompressCompressor
+from headroom.transforms.kompress_compressor import KompressCompressor, KompressConfig
 
 
 def test_compress_cache_only_passes_through_without_network(monkeypatch):
@@ -32,7 +32,9 @@ def test_compress_cache_only_passes_through_without_network(monkeypatch):
     monkeypatch.setattr(kc, "hf_hub_download_local_first", fake_local_first)
 
     text = " ".join(["token"] * 50)  # >= 10 words: not the short-content passthrough
-    result = KompressCompressor().compress(text, allow_download=False)
+    result = KompressCompressor(KompressConfig(min_input_words=10)).compress(
+        text, allow_download=False
+    )
 
     assert result.compressed == text
     assert result.compression_ratio == 1.0
@@ -175,7 +177,9 @@ def test_saturation_fail_open_does_not_hang_request(monkeypatch):
     result_holder: dict[str, object] = {}
 
     def _run() -> None:
-        result_holder["result"] = KompressCompressor().compress(text, allow_download=False)
+        result_holder["result"] = KompressCompressor(KompressConfig(min_input_words=10)).compress(
+            text, allow_download=False
+        )
 
     worker = threading.Thread(target=_run)
     worker.start()
@@ -231,7 +235,9 @@ def test_capacity_available_still_compresses(monkeypatch):
         lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), "onnx"),
     )
 
-    result = KompressCompressor().compress(" ".join(["word"] * 20), allow_download=False)
+    result = KompressCompressor(KompressConfig(min_input_words=10)).compress(
+        " ".join(["word"] * 20), allow_download=False
+    )
     assert 0 < result.compression_ratio < 1.0
     assert result.compressed != " ".join(["word"] * 20)
 

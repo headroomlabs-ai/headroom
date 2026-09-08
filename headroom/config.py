@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -10,6 +11,7 @@ from enum import Enum
 from typing import Any, Literal
 
 from headroom.models.config import ML_MODEL_DEFAULTS
+from headroom.rollout import RolloutSnapshot, resolve_rollout
 
 
 class HeadroomMode(str, Enum):
@@ -213,6 +215,9 @@ class AnchorConfig:
 # Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
 # To protect Bash or other non-excluded tools from lossy compression, use
 # HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
+# headroom_retrieve: its entire contract is returning already-retrieved, original
+# CCR content verbatim. Recompressing it writes a new <<ccr:hash>> marker the
+# agent can never redeem (#1077).
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -222,10 +227,35 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Edit",
         "WebSearch",
         "WebFetch",
+        "headroom_retrieve",
+        # Copilot CLI's file-read tool (its `Read` equivalent): raw file bytes
+        # the model byte-patches against.
+        "view",
+        # Cursor's file-read tool, the same category as `Read` and `view`. Its
+        # absence here was not a decision: without it Cursor's raw source took
+        # the LOSSY path, which is strictly worse than the fold that
+        # DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS protects it from. Protecting a read
+        # tool needs both halves -- excluded here so it is never lossily
+        # compressed, and named below so it is never folded either -- and a
+        # plugin that supplies only the first half cannot be relied on to be
+        # installed.
+        "read_file",
+        # Skill bodies (Claude Code's `Skill` tool) are INSTRUCTIONS, not tool
+        # output, and lossy compression on a directive does not degrade it --
+        # it inverts it. "do not guess at model names" losing its "not" is a
+        # correctness failure, not a quality tradeoff. Measured across 40 real
+        # SKILL.md bodies on the lossy path: only 73.5% of negations (not,
+        # never, avoid, unless, without) and 65.5% of modals (must, always,
+        # only, required) survived; two skills kept 0/2 and 1/6 of theirs.
+        # Bodies load on demand and are read once, so the tokens at stake are
+        # small and the downside is unbounded. Named below as well, because
+        # protecting a tool needs both halves.
+        "Skill",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
+        "skill",
         "write",
         "edit",
         "web_search",
@@ -235,18 +265,98 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 
 # These excluded web-tool results must remain byte-faithful. Even the
 # excluded-tool lossless fold rewrites formatted JSON.
+# Five consumers key off this frozenset, across two modules -- a name added here
+# is protected on every wire shape, not just the one you happened to test:
+# transforms/content_router.py has ContentRouter's two per-block excluded-tool
+# guards (OpenAI chat + Anthropic blocks) and _cross_turn_dedup_messages's
+# verbatim_tool_ids; proxy/handlers/openai.py builds verbatim_excluded_call_ids
+# for the Responses excluded-tool guard and for the Responses dedup's
+# protected_call_ids. The dedup consumers have no dedicated guard of their own,
+# so removing headroom_retrieve from here would silently reopen the retrieval
+# loop for those paths with cross-turn dedup on.
 DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "WebSearch",
         "WebFetch",
         "web_search",
         "web_fetch",
+        "headroom_retrieve",
+        # `view` (Copilot CLI file read) must stay BYTE-EXACT: the model produces
+        # line/byte-precise edits against it, and even "lossless" JSON rewrites
+        # or cross-turn dedup folds break old_str matching and force re-reads.
+        "view",
+    }
+)
+
+# File-READ tools whose output the excluded-tool lossless fold must never
+# REWRITE. A strictly weaker protection than DEFAULT_VERBATIM_EXCLUDE_TOOLS
+# above, and that gap is the whole reason there are two sets: this one gates only
+# the fold, so these tools keep cross-turn dedup and the age-based fall-through.
+#
+# The failure being fixed: a read tool that returns raw file bytes (Codex-style
+# `read`, custom agents, /v1/compress callers naming their own tools) hands
+# `_lossless_compact_excluded` a pretty-printed JSON file, which json-min's it.
+# That fold is data-lossless and the proxy can invert it -- but the inverse runs
+# on OUR side, while the copy that has to match on disk is typed by the MODEL out
+# of the bytes it was SHOWN. It builds `Edit(old_string=...)` from minified JSON,
+# the file on disk is still pretty-printed, the edit misses, and the retry turn
+# costs far more than the fold saved. The log fold (repeats rewritten to
+# `... (repeated N times)`) and the search fold (path hoisted into a heading)
+# destroy an Edit anchor the same way, so this gates the fold as a whole rather
+# than the JSON branch alone. DEFAULT_EXCLUDE_TOOLS has claimed since forever
+# that Read "Returns exact file content needed for Edit tool's old_string
+# matching"; this is what makes that true instead of aspirational.
+#
+# Why NOT just add these to DEFAULT_VERBATIM_EXCLUDE_TOOLS, which would have been
+# the one-line fix: that set also gates cross-turn dedup and the age-based lossy
+# fall-through, and neither shares the failure mode. Dedup replaces a repeat with
+# an in-context pointer to an EARLIER copy that is never rewritten (the
+# keep-earliest invariant in transforms/cross_turn_dedup.py), so the true bytes
+# stay physically in the window for the model to copy from; the fold leaves them
+# nowhere at all. Measured on one file read three times, dedup is worth ~66% of
+# those tokens -- the largest Read-side saving there is, and the one that still
+# fires on Claude Code's `cat -n`-shaped Read output, where the fold never fires
+# in the first place. Buying byte-exactness with dedup would be paying the large
+# bill to plug the small leak. `view` stays in the stricter set above: that was a
+# deliberate, documented call for Copilot and loosening it is not this change's
+# business.
+DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "read",
+        # Cursor's `Read` equivalent. Named here for a reason worth stating,
+        # because it is counter-intuitive: adding a read tool to the proxy's
+        # EXCLUDE set to keep it away from lossy compression makes things WORSE
+        # on its own. Exclusion is exactly what routes a tool INTO the
+        # excluded-tool fold, and the pluggable provider on that path is handed
+        # content with no tool name, so it cannot tell a file read from a grep
+        # and will happily rewrite raw source. Protecting a read tool takes
+        # both halves: excluded from the lossy path, and named here to stay out
+        # of the fold. Caught by scripts/verify-lossless-coverage.py in the
+        # partner-trial repo, which reported `read_file` reaching the provider
+        # seam once the plugin started excluding it.
+        "read_file",
+        # Skill bodies. The other half of the protection added above: excluding
+        # `Skill` from the lossy path routes it INTO the excluded-tool fold, and
+        # the fold rewrites what the model is SHOWN. On tool output that is a
+        # fair trade; on a directive it is not, because the folds that collapse
+        # repeated lines or hoist paths into headings can merge two distinct
+        # instructions into one. Skill bodies are prose and fold poorly anyway,
+        # so this costs close to nothing and removes the whole class.
+        "Skill",
+        "skill",
     }
 )
 
 
 def _tool_name_aliases(name: str) -> tuple[str, ...]:
     """Return equivalent spellings for tool exclusion matching."""
+    if not isinstance(name, str):
+        # Pre-existing fragility (not introduced here): a malformed message can
+        # put a non-string value in the tool-name map (see _build_tool_name_map's
+        # truthy-only `if tc_id and name:` filter). Fail safe -- no aliases means
+        # is_tool_excluded() returns False -- rather than crashing the pipeline.
+        return ()
     aliases = [name]
     lname = name.lower()
 
@@ -264,6 +374,37 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
             aliases.append(parts[2])
 
     return tuple(dict.fromkeys(aliases))
+
+
+# Hermes Agent's deferred-tool bridge. Hermes loads on-demand tools via a
+# `tool_search`/`tool_describe`/`tool_call` indirection; on the wire the
+# emitted tool call is named `tool_call` and the REAL tool name lives in the
+# arguments payload (`{"name": "...", "arguments": {...}}`). Tool exclusion /
+# protect lists match on the real name, so we must unwrap this bridge before
+# building the tool_call_id -> name map, or whitelists silently no-op for all
+# deferred tools.
+_HERMES_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def unwrap_tool_call_name(name: str, arguments: Any) -> str:
+    """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
+
+    Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
+    fail open and return the wrapper name (caller decides what that means).
+    """
+    if name != _HERMES_TOOL_CALL_WRAPPER:
+        return name
+    raw = arguments
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return name
+    if isinstance(raw, dict):
+        inner = raw.get("name")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return name
 
 
 def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
@@ -624,8 +765,13 @@ class HeadroomConfig:
     content_router_enabled: InitVar[bool | None] = None
 
     # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
-    # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).
+    # The legacy env alias and this typed request still obey the canary rollout gate.
     intercept_tool_results: bool = False
+
+    # Immutable runtime rollout state. ``None`` is resolved once here so every
+    # pipeline built from this config observes the same decisions even if the
+    # process environment later changes.
+    rollout: RolloutSnapshot | None = None
 
     # Debugging - opt-in diff artifact generation
     generate_diff_artifact: bool = False  # Enable to get detailed transform diffs
@@ -633,6 +779,11 @@ class HeadroomConfig:
     # Canonical pipeline lifecycle extensions
     pipeline_extensions: list[Any] = field(default_factory=list)
     discover_pipeline_extensions: bool = True
+
+    def __post_init__(self, content_router_enabled: bool | None = None) -> None:
+        if self.rollout is None:
+            requested = ("tool_result_interceptors",) if self.intercept_tool_results else ()
+            self.rollout = resolve_rollout(requested=requested)
 
     def get_context_limit(self, model: str) -> int | None:
         """

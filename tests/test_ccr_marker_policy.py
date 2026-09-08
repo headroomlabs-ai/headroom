@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from headroom.ccr.tool_injection import CCRToolInjector
-from headroom.proxy.ccr_marker_policy import has_new_ccr_markers, should_inject_ccr_tool
+from headroom.proxy.ccr_marker_policy import has_new_ccr_markers
 
 
 def _hashes(*contents: str) -> list[str]:
@@ -70,27 +70,3 @@ def test_has_new_ccr_markers_returns_false_without_current_hashes() -> None:
         )
         is False
     )
-
-
-def test_should_inject_ccr_tool_overrides_frozen_prefix_deferral_for_markers() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=3,
-        has_compressed_content=True,
-    ) == (True, True)
-
-
-def test_should_inject_ccr_tool_defers_frozen_prefix_without_markers() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=3,
-        has_compressed_content=False,
-    ) == (False, False)
-
-
-def test_should_inject_ccr_tool_injects_configured_tool_without_frozen_prefix() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=0,
-        has_compressed_content=False,
-    ) == (True, False)

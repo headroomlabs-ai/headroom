@@ -15,8 +15,8 @@ from __future__ import annotations
 import errno
 import json
 import os
-import subprocess
-import sys
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +108,35 @@ def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> Non
     )
 
     assert result.exit_code == 0, result.output
+
+
+# ---------------------------------------------------------------------------
+# _apply_1m_to_claude_args — add the [1m] suffix to an explicit pass-through
+# --model so it survives Claude Code's CLI-over-env precedence (#2915).
+# ---------------------------------------------------------------------------
+def test_apply_1m_rewrites_model_flag_value() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_rewrites_equals_model_flag() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model=opusplan",))
+    assert args == ("--model=opusplan[1m]",)
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_is_idempotent_on_already_suffixed_model() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan[1m]"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
+
+
+def test_apply_1m_noop_without_model_flag() -> None:
+    original = ("--permission-mode", "auto", "--resume")
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(original)
+    assert args == original
+    assert rewritten is None
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +238,57 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
     inv = runner.invoke(_cmd)
     assert inv.exit_code == 0, inv.output
     assert "Shutting down..." in inv.output
+
+
+def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows console stop handlers must use the clean shutdown path."""
+
+    handlers: dict[int, Any] = {}
+    cleanup_calls = {"n": 0}
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+    def capture_handler(sig: int, handler: Any) -> None:
+        handlers[sig] = handler
+
+    def trigger_sigint(_seconds: float) -> None:
+        handlers[signal.SIGINT](signal.SIGINT, None)
+
+    def cleanup(*_args: Any) -> None:
+        cleanup_calls["n"] += 1
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (_FakeProc(), 8787))
+    monkeypatch.setattr(wrap_mod.time, "sleep", trigger_sigint)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: cleanup)
+    monkeypatch.setattr(wrap_mod.signal, "signal", capture_handler)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    sigbreak = 999
+    monkeypatch.setattr(wrap_mod.signal, "SIGBREAK", sigbreak, raising=False)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._run_proxy_only_watcher(
+            agent_label="vscode copilot",
+            port=8787,
+            no_proxy=False,
+            learn=False,
+            memory=False,
+            agent_type="copilot",
+            print_setup_lines=lambda _port: None,
+        )
+
+    inv = runner.invoke(_cmd)
+    assert inv.exit_code == 0, inv.output
+    assert "Shutting down..." in inv.output
+    assert "Proxy process exited unexpectedly" not in inv.output
+    assert sigbreak in handlers
+    assert cleanup_calls["n"] >= 2  # signal handler plus finally (idempotent)
 
 
 def test_run_proxy_only_watcher_unexpected_exception_returns_exit_1(
@@ -492,6 +572,73 @@ class TestProxyClientRefCounting:
         # Our own marker is removed before we count.
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
 
+    def test_cleanup_stops_detached_windows_serving_child(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl+C must stop the listener even when its launcher already exited."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        proc.poll = lambda: 0  # type: ignore[method-assign]
+        stopped: list[int] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 123})
+        monkeypatch.setattr(
+            wrap_mod,
+            "_stop_local_proxy_for_unwrap",
+            lambda port: stopped.append(port) or "stopped",
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert not proc.terminated
+        assert stopped == [self.PORT]
+
+    def test_kill_proxy_uses_taskkill_tree_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows cleanup must terminate the native launcher's whole tree."""
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        checks = iter([True, False])
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: next(checks))
+        monkeypatch.setattr(
+            wrap_mod.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        assert wrap_mod._kill_proxy_by_pid(456, self.PORT)
+        assert calls == [
+            (
+                ["taskkill", "/F", "/T", "/PID", "456"],
+                {"capture_output": True, "timeout": 10, "check": False},
+            )
+        ]
+
+    def test_cleanup_uses_pre_shutdown_pid_when_health_probe_races(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transient post-terminate /health miss must not orphan the listener."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 456})
+        monkeypatch.setattr(wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "unidentified")
+        monkeypatch.setattr(
+            wrap_mod,
+            "_kill_proxy_by_pid",
+            lambda pid, port: killed.append((pid, port)) or True,
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert proc.terminated
+        assert killed == [(456, self.PORT)]
+
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
         wrap_mod._register_proxy_client(self.PORT)
@@ -505,13 +652,13 @@ class TestProxyClientRefCounting:
 
         assert proc.terminated is False
 
-    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+    def test_dead_client_marker_is_pruned_and_not_counted(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A marker for a dead PID is pruned from disk and never counted."""
-        # Spawn and reap a child so its PID is reliably dead (not a zombie).
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        dead_pid = child.pid
+        dead_pid = 358784
         marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
@@ -651,10 +798,57 @@ def test_resolve_1m_model_is_idempotent() -> None:
     assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
 
-def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
-    """With no model selected, fall back to the default Opus carrying [1m]."""
-    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
-    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
+def test_resolve_1m_model_falls_back_to_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no model selected, fall back to the built-in default carrying [1m]."""
+    monkeypatch.delenv("HEADROOM_1M_MODEL", raising=False)
+    expected = f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+    assert wrap_mod._resolve_1m_model(None) == expected
+    assert wrap_mod._resolve_1m_model("  ") == expected
+
+
+def test_resolve_1m_model_env_overrides_builtin_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_1M_MODEL overrides the built-in fallback so --1m can track new
+    Opus releases without a code change or pinning ANTHROPIC_MODEL (#2937)."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_current_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit ANTHROPIC_MODEL still wins; HEADROOM_1M_MODEL is only the
+    fallback default when nothing else is selected."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model("claude-sonnet-5") == "claude-sonnet-5[1m]"
+
+
+def test_resolve_1m_model_env_idempotent_on_suffixed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HEADROOM_1M_MODEL that already carries [1m] is not double-suffixed."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9[1m]")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_blank_env_falls_back_to_builtin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank/whitespace HEADROOM_1M_MODEL falls back to the built-in default."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "   ")
+    assert wrap_mod._resolve_1m_model(None) == f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+
+
+def test_headroom_1m_model_is_documented_and_default_matches_code() -> None:
+    """The HEADROOM_1M_MODEL knob must stay documented, and the documented
+    default must track the code, so the supported configuration surface cannot
+    silently drift or disappear (#2937).
+    """
+    docs = Path(__file__).resolve().parents[2] / "docs" / "content" / "docs" / "configuration.mdx"
+    text = docs.read_text(encoding="utf-8")
+    assert wrap_mod._1M_MODEL_ENV in text, f"{wrap_mod._1M_MODEL_ENV} is not documented"
+    # The env-var catalog row must advertise the current built-in default.
+    assert f"`{wrap_mod._DEFAULT_1M_MODEL}`" in text, (
+        "documented HEADROOM_1M_MODEL default is out of sync with "
+        f"_DEFAULT_1M_MODEL={wrap_mod._DEFAULT_1M_MODEL!r}"
+    )
 
 
 class TestFindAvailablePort:
@@ -717,3 +911,43 @@ class TestFindAvailablePort:
         )
         with pytest.raises(RuntimeError, match="No available port found"):
             wrap_mod._find_available_port(8787, max_attempts=3)
+
+
+def test_ensure_proxy_serializes_startup_per_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal wrap must enter the per-port startup critical section."""
+    events: list[object] = []
+
+    @contextmanager
+    def fake_lock(port: int):
+        events.append(("lock-enter", port))
+        try:
+            yield
+        finally:
+            events.append(("lock-exit", port))
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fake_lock)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_ensure_proxy_unlocked",
+        lambda port, no_proxy, **kwargs: events.append(("ensure", port, no_proxy)) or (None, port),
+    )
+
+    assert wrap_mod._ensure_proxy(8787, False) == (None, 8787)
+    assert events == [("lock-enter", 8787), ("ensure", 8787, False), ("lock-exit", 8787)]
+
+
+def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit --no-proxy reuses an existing service without taking the lock."""
+    entered = False
+
+    @contextmanager
+    def fail_lock(port: int):
+        nonlocal entered
+        entered = True
+        yield
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fail_lock)
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy_unlocked", lambda *args, **kwargs: (None, 8787))
+
+    assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
+    assert entered is False

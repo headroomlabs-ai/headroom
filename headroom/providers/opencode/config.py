@@ -31,24 +31,18 @@ _MCP_BLOCK_RE = re.compile(
 )
 HEADROOM_OPENCODE_PLUGIN = "headroom-opencode"
 
-# Models exposed by the injected `headroom` provider. OpenCode only resolves
-# `headroom/<id>` for ids listed in the provider's `models` map, so an empty
-# map means every documented `headroom/*` model fails with "Model not found".
-# Keep in sync with DEFAULT_MODELS in plugins/opencode/src/provider.ts and the
-# table in plugins/opencode/README.md.
+# Models exposed by the injected `headroom` provider. This provider uses
+# ``@ai-sdk/openai-compatible`` and the proxy's ``/v1/chat/completions`` path,
+# which is routed to the configured OpenAI upstream. Do not advertise Claude
+# models here: OpenCode would send them through the OpenAI endpoint and report
+# an ``invalid_api_key`` error instead of reaching Anthropic. Claude models are
+# available through OpenCode's native ``anthropic`` provider, whose base URL is
+# also redirected to Headroom by ``build_opencode_config_content``.
+#
+# OpenCode only resolves ``headroom/<id>`` for ids listed in this map, so an
+# empty map means every documented ``headroom/*`` model fails with "Model not
+# found".
 HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
-    "claude-sonnet-4-6": {
-        "name": "Claude Sonnet 4.6",
-        "limit": {"context": 200000, "output": 16384},
-    },
-    "claude-opus-4-6": {
-        "name": "Claude Opus 4.6",
-        "limit": {"context": 200000, "output": 16384},
-    },
-    "claude-haiku-4-5-20251001": {
-        "name": "Claude Haiku 4.5",
-        "limit": {"context": 200000, "output": 8192},
-    },
     "gpt-4o": {
         "name": "GPT-4o",
         "limit": {"context": 128000, "output": 16384},

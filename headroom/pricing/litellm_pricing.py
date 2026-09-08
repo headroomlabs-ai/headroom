@@ -160,6 +160,13 @@ class LiteLLMModelPricing:
     max_output_tokens: int | None = None
     supports_vision: bool = False
     supports_function_calling: bool = False
+    # Prompt-cache traffic, where LiteLLM knows it. ``None`` means "not published
+    # for this model", which is distinct from 0.0 ("free"): the 1h write rate in
+    # particular is absent for most models, and a caller that needs it must either
+    # derive it (see :mod:`headroom.pricing.cache_ttl`) or report that it could not.
+    cache_read_per_1m: float | None = None
+    cache_write_5m_per_1m: float | None = None
+    cache_write_1h_per_1m: float | None = None
 
 
 def get_litellm_model_cost() -> dict[str, Any]:
@@ -209,7 +216,46 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         max_output_tokens=info.get("max_output_tokens"),
         supports_vision=info.get("supports_vision", False),
         supports_function_calling=info.get("supports_function_calling", False),
+        cache_read_per_1m=_per_1m(info.get("cache_read_input_token_cost")),
+        cache_write_5m_per_1m=_per_1m(info.get("cache_creation_input_token_cost")),
+        cache_write_1h_per_1m=_per_1m(info.get("cache_creation_input_token_cost_above_1hr")),
     )
+
+
+def _per_1m(cost_per_token: object) -> float | None:
+    """Scale a LiteLLM per-token cost to per-1M, preserving "not published".
+
+    ``None`` in, ``None`` out — the absence of a rate is information and must not
+    collapse into 0.0, which would read as free.
+    """
+    if not isinstance(cost_per_token, (int, float, str)):
+        return None
+    try:
+        return float(cost_per_token) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+def pricing_per_1m(model: str) -> tuple[float, float] | None:
+    """``(input, output)`` USD per 1M tokens from LiteLLM, or ``None``.
+
+    The tuple shape providers already use for their own tables, so a provider can
+    prefer this over a hand-maintained copy with a single call. ``None`` means
+    "LiteLLM can't answer" — either it isn't installed (the dependency is gated
+    ``python_version < '3.14'``) or it doesn't know the model — which is the
+    provider's cue to fall back.
+
+    A found-but-zero price is returned as ``0.0`` rather than treated as missing:
+    some models genuinely are free, and ``savings_ledger`` already made this call
+    (see its note on "a legitimate 0.0 for genuinely free (0-priced) models").
+    """
+    pricing = get_model_pricing(model)
+    if pricing is None:
+        return None
+    # LiteLLM stores cost per token, so the x1e6 conversion leaves float noise
+    # ($0.4/1M arrives as 0.39999999999999997). Round at this boundary: 6 places
+    # is finer than any published rate and keeps the value printable.
+    return (round(pricing.input_cost_per_1m, 6), round(pricing.output_cost_per_1m, 6))
 
 
 def estimate_cost(
@@ -234,6 +280,47 @@ def estimate_cost(
     input_cost = (input_tokens / 1_000_000) * pricing.input_cost_per_1m
     output_cost = (output_tokens / 1_000_000) * pricing.output_cost_per_1m
     return input_cost + output_cost
+
+
+def estimate_cost_from_tokens(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_tokens: int = 0,
+) -> float | None:
+    """Cost for one request from token counts, using LiteLLM's own cost model.
+
+    Prefer this over :func:`estimate_cost` whenever a request may carry cached
+    tokens or exceed a model's long-context threshold. Flat per-1M rates cannot
+    express either: cache reads bill at their own rate, and on Anthropic's
+    Sonnet 4 / 4.5 family a prompt over 200K re-prices the *whole* request --
+    input, output and cache alike. ``litellm.cost_per_token`` applies both.
+
+    ``input_tokens`` is the TOTAL prompt, ``cached_tokens`` included. LiteLLM
+    subtracts the cached portion itself and tests the long-context threshold
+    against the total, so passing a cache-exclusive count would both
+    double-discount the cached tokens and understate the threshold.
+
+    Returns ``None`` when LiteLLM is unavailable (the dependency is gated
+    ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
+    to fall back to its own table.
+    """
+    if not LITELLM_AVAILABLE:
+        return None
+    candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
+    if candidate is None:
+        return None
+    try:
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=candidate,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            cache_read_input_tokens=cached_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - depends on litellm internals
+        logger.debug("litellm.cost_per_token failed for %s: %s", candidate, exc)
+        return None
+    return float(prompt_cost) + float(completion_cost)
 
 
 def list_available_models() -> list[str]:

@@ -360,6 +360,7 @@ def test_read_maturation_knobs_from_env(monkeypatch):
     monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
 
     monkeypatch.setenv("HEADROOM_READ_MATURATION", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_QUIESCE_TURNS", "3")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", "10")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", "4096")
@@ -370,3 +371,18 @@ def test_read_maturation_knobs_from_env(monkeypatch):
     assert cfg.read_maturation_quiesce_turns == 3
     assert cfg.read_maturation_max_hold_turns == 10
     assert cfg.read_maturation_min_size_bytes == 4096
+
+
+def test_read_maturation_env_cannot_bypass_stable_rollout(monkeypatch):
+    """Every env-driven server composition root must enforce the beta gate."""
+    from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, _proxy_config_from_env
+
+    monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
+    monkeypatch.setenv("HEADROOM_READ_MATURATION", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "stable")
+
+    cfg = _proxy_config_from_env()
+
+    assert cfg.read_maturation is False
+    assert cfg.rollout is not None
+    assert cfg.rollout.decision("read_maturation").reason.value == "blocked_by_channel"

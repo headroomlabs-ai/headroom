@@ -241,6 +241,14 @@ fn sqlite_get_refreshes_idle_ttl() {
 
 #[test]
 fn sqlite_max_lifetime_caps_sliding_window() {
+    // Timing note: the backend stores unix-SECONDS (`as_secs()` truncates)
+    // and purges on `last_accessed + ttl <= now`, so apparent elapsed time
+    // is `floor(t0 + s) - floor(t0)` — it rounds UP by nearly a second
+    // depending on where t0 lands within its second. Every margin here is
+    // therefore kept a full second clear of the boundary in both
+    // directions; a sub-second margin makes this test phase-dependent
+    // (the previous 1.5s-against-a-2s-window "still alive" assertion
+    // failed ~70% of runs whenever `frac(t0) >= 0.5`).
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("ccr.sqlite");
     // Idle 2s with a 3s ceiling: constant access must not outlive t+3s.
@@ -248,14 +256,24 @@ fn sqlite_max_lifetime_caps_sliding_window() {
         SqliteCcrStore::open_with_ttls(&path, 2, 3).expect("open sqlite store with ceiling");
     let hash = compute_key(b"capped sqlite");
     store.put(&hash, "capped sqlite");
-    std::thread::sleep(Duration::from_millis(1_500));
+    // 0.5s: apparent elapsed is 0s or 1s — always under the 2s window.
+    std::thread::sleep(Duration::from_millis(500));
     assert_eq!(
         store.get(&hash).as_deref(),
         Some("capped sqlite"),
         "entry inside idle window and ceiling must hit"
     );
-    // Keep touching, but cross the 3s ceiling.
-    std::thread::sleep(Duration::from_millis(2_600));
+    // Keep touching, but cross the 3s ceiling. The touches must stay INSIDE
+    // the idle window or the entry dies of idleness and the assertion below
+    // passes without ever exercising the ceiling — the thing under test.
+    // 0.7s gaps read as at most 1s apparent, comfortably under the 2s idle
+    // window. Five gaps carry total age to at least 4s, which is strictly
+    // beyond the 3s ceiling even after unix-second truncation. Four gaps
+    // only reach 3.3s and can land exactly on the now-valid 3s boundary.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = store.get(&hash);
+    }
     assert_eq!(
         store.get(&hash),
         None,

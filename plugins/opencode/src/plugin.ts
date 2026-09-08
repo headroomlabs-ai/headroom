@@ -28,9 +28,14 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
 export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project =
+    pluginOptions.project ??
+    (input.project as { id?: string } | undefined)?.id ??
+    input.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
+    project,
     debug: pluginOptions.debug,
   });
 
@@ -54,10 +59,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     "shell.env": async (_input, output) => {
       output.env.HEADROOM_ACTIVE = "1";
       output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT =
-        pluginOptions.project ??
-        (input.project as { id?: string }).id ??
-        input.directory;
+      output.env.HEADROOM_PROJECT = project;
       if (pluginOptions.backend) {
         output.env.HEADROOM_BACKEND = pluginOptions.backend;
       }

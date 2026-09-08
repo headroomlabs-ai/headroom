@@ -16,7 +16,7 @@ import threading
 from functools import lru_cache
 from typing import Any
 
-from .base import BaseTokenizer
+from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +164,14 @@ def get_encoding_for_model(model: str) -> str:
     Returns:
         Encoding name (e.g., 'o200k_base', 'cl100k_base').
     """
+    # Case-insensitive: TokenizerRegistry lowercases only its *cache key*, then
+    # constructs the counter from the caller's original string. An uppercase
+    # deployment name ("GPT-4o", routine on Azure) therefore arrived here
+    # verbatim, matched no prefix, and silently took DEFAULT_ENCODING -- so the
+    # encoding a model got depended on the casing of whichever request warmed
+    # the cache first, and flipped across restarts.
+    model = model.lower()
+
     # Direct lookup
     if model in MODEL_TO_ENCODING:
         return MODEL_TO_ENCODING[model]
@@ -180,6 +188,9 @@ def get_encoding_for_model(model: str) -> str:
         # which they would otherwise match and be mis-encoded as cl100k_base.
         ("gpt-4.1", "o200k_base"),
         ("gpt-4.5", "o200k_base"),
+        # gpt-5 uses o200k_base. Without this it fell through to the
+        # cl100k_base default, over-counting CJK by ~33%.
+        ("gpt-5", "o200k_base"),
         ("gpt-4-turbo", "cl100k_base"),
         ("gpt-4", "cl100k_base"),
         ("gpt-3.5", "cl100k_base"),
@@ -226,6 +237,7 @@ class TiktokenCounter(BaseTokenizer):
         self.model = model
         self.encoding_name = encoding or get_encoding_for_model(model)
         self._encoding = None  # Lazy load
+        self._count_cache = TokenCountCache()
 
     @property
     def encoding(self):
@@ -245,6 +257,14 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self.encoding.encode(text))
         except ValueError:
@@ -305,24 +325,25 @@ class TiktokenCounter(BaseTokenizer):
                             elif isinstance(part, str):
                                 total += self.count_text(part)
                 elif key == "role":
-                    total += self.count_text(value)
+                    total += self.count_text(coerce_countable_text(value))
                 elif key == "name":
-                    total += self.count_text(value)
+                    total += self.count_text(coerce_countable_text(value))
                     total += 1  # Name adds 1 token
                 elif key == "tool_calls":
-                    for tool_call in value:
+                    for tool_call in value or []:
                         total += 3  # Tool call overhead
                         if "function" in tool_call:
-                            func = tool_call["function"]
-                            total += self.count_text(func.get("name", ""))
-                            total += self.count_text(func.get("arguments", ""))
+                            func = tool_call["function"] or {}
+                            total += self.count_text(coerce_countable_text(func.get("name")))
+                            total += self.count_text(coerce_countable_text(func.get("arguments")))
                         if "id" in tool_call:
-                            total += self.count_text(tool_call["id"])
+                            total += self.count_text(coerce_countable_text(tool_call["id"]))
                 elif key == "tool_call_id":
-                    total += self.count_text(value)
+                    total += self.count_text(coerce_countable_text(value))
                 elif key == "function_call":
-                    total += self.count_text(value.get("name", ""))
-                    total += self.count_text(value.get("arguments", ""))
+                    value = value or {}
+                    total += self.count_text(coerce_countable_text(value.get("name")))
+                    total += self.count_text(coerce_countable_text(value.get("arguments")))
 
         # Every reply is primed with assistant
         total += self.REPLY_OVERHEAD

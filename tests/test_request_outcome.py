@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -296,6 +297,16 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         "cache_write_1h_tokens": 20,
         "uncached_tokens": 0,
         "output_tokens": 50,
+        # Tells cost whether cache_write_tokens was REPORTED by the provider or
+        # derived from the uncached portion. An inferred value is the same tokens
+        # as uncached_tokens, so counting it in the billed prompt total would
+        # double it. Defaults False for providers with disjoint buckets.
+        "cache_inferred": False,
+        # Tool-schema deferral, disjoint from the positional ``tokens_saved``.
+        # The funnel already computed it for metrics.record_request; forwarding
+        # it here is what lets the dashboard's per-model table count the layer
+        # its own headline counts. Zero for this outcome (no deferral tags).
+        "tool_schema_saved": 0,
     }
 
 
@@ -318,6 +329,22 @@ async def test_funnel_logs_request_with_derived_cache_hit() -> None:
     assert len(h.logger.logs) == 1
     log_entry = h.logger.logs[0]
     assert log_entry.cache_hit is True
+
+
+@pytest.mark.asyncio
+async def test_funnel_logs_request_timestamp_with_utc_offset() -> None:
+    """Recent-request timestamps must identify an absolute instant.
+
+    A naive ISO timestamp is interpreted in the browser's local timezone,
+    which makes the dashboard show negative ages when the proxy and browser
+    use different timezone settings.
+    """
+    h = _FunnelHarness()
+    await h._record_request_outcome(_outcome())
+
+    timestamp = datetime.fromisoformat(h.logger.logs[0].timestamp)
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset() == timezone.utc.utcoffset(timestamp)
 
 
 @pytest.mark.asyncio
@@ -431,6 +458,7 @@ async def test_funnel_emits_perf_log_with_canonical_shape(
     assert "tok_before=1000" in line
     assert "tok_after=300" in line
     assert "tok_saved=700" in line
+    assert "tok_inflated=0" in line
     assert "cache_read=200" in line
     assert "cache_write=100" in line
     assert "cache_hit_pct=67" in line  # 200/(200+100) * 100 = 67
@@ -651,3 +679,44 @@ def test_from_stream_threads_waste_signals_for_openai_via_backend_site() -> None
         waste_signals={"skipped_units": 3, "applied_units": 7},
     )
     assert o.waste_signals == {"skipped_units": 3, "applied_units": 7}
+
+
+# ── tokens_inflated: distinguishing "could not compress" from "grew" ──
+
+
+def test_tokens_inflated_is_zero_when_request_shrank() -> None:
+    """A normally-compressed request reports no inflation."""
+    o = _outcome(original_tokens=1000, optimized_tokens=300, tokens_saved=700)
+    assert o.tokens_inflated == 0
+
+
+def test_tokens_inflated_is_zero_when_compression_was_a_no_op() -> None:
+    """Nothing compressible is not the same as growth — both keep tok_saved=0."""
+    o = _outcome(original_tokens=1000, optimized_tokens=1000, tokens_saved=0)
+    assert o.tokens_inflated == 0
+    assert o.tokens_saved == 0
+
+
+def test_tokens_inflated_reports_growth_the_clamp_swallows() -> None:
+    """A request forwarded larger than it arrived is no longer indistinguishable.
+
+    tokens_saved stays clamped at 0 (its consumers treat it as a size, and
+    injection paths book their own cost separately), so the grown amount has
+    to surface as its own number or the regression is invisible.
+    """
+    o = _outcome(original_tokens=55161, optimized_tokens=57845, tokens_saved=0)
+    assert o.tokens_saved == 0
+    assert o.tokens_inflated == 2684
+
+
+def test_tokens_inflated_does_not_disturb_derived_sizes() -> None:
+    """attempted_input_tokens and savings_pct keep their unsigned semantics."""
+    o = _outcome(
+        original_tokens=55161,
+        optimized_tokens=57845,
+        tokens_saved=0,
+        attempted_input_tokens=57845,
+    )
+    assert o.attempted_input_tokens == 57845
+    assert o.savings_pct == 0.0
+    assert o.tokens_inflated == 2684

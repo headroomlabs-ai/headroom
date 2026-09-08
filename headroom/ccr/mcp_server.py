@@ -36,6 +36,7 @@ from typing import Any
 from headroom import paths as _paths
 from headroom import savings_ledger
 from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.telemetry import session as telemetry_session
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -775,7 +776,7 @@ class HeadroomMCPServer:
             result["proxy"] = proxy_status
             result["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -794,6 +795,16 @@ class HeadroomMCPServer:
             model=os.environ.get("HEADROOM_MCP_MODEL"),
             client=self._current_client(),
             source="mcp",
+        )
+        # Anonymous beacon (opt-out; no-op unless enabled). Without this the MCP
+        # path is invisible to aggregate stats even though it is a first-class
+        # way to use Headroom — and subagents make that worse, since each runs
+        # its own MCP server. Swallows its own errors; the caller's try/except
+        # is a second net, not the first.
+        telemetry_session.record_mcp_compression(
+            original_tokens=before,
+            compressed_tokens=after,
+            model=os.environ.get("HEADROOM_MCP_MODEL"),
         )
 
     def _current_client(self) -> str:
@@ -830,7 +841,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -895,7 +906,7 @@ class HeadroomMCPServer:
                     stats["proxy"] = proxy_status
                     stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=json.dumps(stats, indent=2, ensure_ascii=False))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""

@@ -15,8 +15,10 @@ DEFAULT_API_URL = "https://api.anthropic.com"
 # single source of truth shared by `wrap`, `init`, and `install`.
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 TOOL_SEARCH_DEFAULT = "true"
+TOOL_SEARCH_FOUNDRY_DEFAULT = "false"
 REMOTE_CONTROL_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 REMOTE_CONTROL_FEATURE = "Remote Control"
+CLAUDE_AUTH_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 # GH #1779: Claude Code v2.1.196 added a client-side eligibility check that
 # DISABLES first-party Remote Control (`/remote-control` / `/rc`, which mirrors a
@@ -182,6 +184,46 @@ def remote_control_applies_to_auth(environ: Mapping[str, object]) -> bool:
     """
     return not any(
         str(environ.get(key) or "").strip() for key in REMOTE_CONTROL_NON_SUBSCRIPTION_ENV
+    )
+
+
+def claude_auth_conflict_sources(
+    *layers: tuple[str, Mapping[str, object]],
+) -> dict[str, str] | None:
+    """Return source labels when both mutually exclusive Claude auth keys are effective.
+
+    Layers are ordered from lowest to highest precedence. Empty values clear an
+    inherited value, matching environment overlay semantics. Credential values
+    are deliberately never returned so callers cannot leak them in diagnostics.
+    """
+    effective: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for source, values in layers:
+        for key in CLAUDE_AUTH_KEYS:
+            if key not in values:
+                continue
+            value = str(values.get(key) or "").strip()
+            if value:
+                effective[key] = value
+                sources[key] = source
+            else:
+                effective.pop(key, None)
+                sources.pop(key, None)
+    if all(key in effective for key in CLAUDE_AUTH_KEYS):
+        return {key: sources[key] for key in CLAUDE_AUTH_KEYS}
+    return None
+
+
+def claude_auth_conflict_message(sources: Mapping[str, str]) -> str:
+    """Format a value-free remediation for contradictory Claude credentials."""
+    api_source = sources.get("ANTHROPIC_API_KEY", "effective configuration")
+    token_source = sources.get("ANTHROPIC_AUTH_TOKEN", "effective configuration")
+    return (
+        "Claude Code has both ANTHROPIC_API_KEY "
+        f"({api_source}) and ANTHROPIC_AUTH_TOKEN ({token_source}) set. "
+        "Claude rejects this ambiguous auth state before Headroom can proxy a request. "
+        "Keep ANTHROPIC_API_KEY for API-key billing, or keep ANTHROPIC_AUTH_TOKEN "
+        "for token/gateway auth; remove the other key from the named source and retry."
     )
 
 

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 
 use super::classifier::{classify_cell, CellClass};
-use super::compactor::{compact, CompactConfig};
+use super::compactor::{compact_with_store, CompactConfig};
 use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
 use crate::ccr::CcrStore;
@@ -116,8 +116,12 @@ fn walk_array(items: Vec<Value>, ctx: &DocumentCompactor) -> Value {
     // becomes a rendered string before the outer table sees it.
     let inner: Vec<Value> = items.into_iter().map(|i| walk(i, ctx)).collect();
 
-    // Then try the array as a whole.
-    let c = compact(&inner, &ctx.config);
+    // Then try the array as a whole. `compact_with_store` (not the
+    // store-less `compact`) is required: the table compactor substitutes
+    // opaque cells with `<<ccr:HASH,…>>` markers, and without the store
+    // those markers point at a key nothing ever wrote — `headroom_retrieve`
+    // 404s and the cell's bytes are gone for good (#2694).
+    let c = compact_with_store(&inner, &ctx.config, ctx.ccr_store.as_ref());
     if c.was_compacted() {
         Value::String(ctx.formatter.format(&c))
     } else {

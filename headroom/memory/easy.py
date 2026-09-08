@@ -33,6 +33,7 @@ Backends:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -115,7 +116,7 @@ class Memory:
         qdrant_api_key: str | None = None,
         neo4j_uri: str = "neo4j://localhost:7687",
         neo4j_user: str = "neo4j",
-        neo4j_password: str = "password",
+        neo4j_password: str | None = None,
     ) -> None:
         from headroom.memory import qdrant_env
 
@@ -145,7 +146,9 @@ class Memory:
         )
         self._neo4j_uri = neo4j_uri
         self._neo4j_user = neo4j_user
-        self._neo4j_password = neo4j_password
+        self._neo4j_password = (
+            neo4j_password if neo4j_password is not None else os.environ.get("NEO4J_PASSWORD", "")
+        )
 
     async def _ensure_initialized(self) -> None:
         """Initialize the backend on first use."""

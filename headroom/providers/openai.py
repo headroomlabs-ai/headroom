@@ -16,25 +16,24 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
+from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider, TokenCounter
 
 logger = logging.getLogger(__name__)
 
 # Pricing metadata for transparency
-_PRICING_LAST_UPDATED = date(2025, 1, 14)
+_PRICING_LAST_UPDATED = date(2026, 8, 4)  # every _PRICING entry verified vs litellm
 _PRICING_STALE_DAYS = 60  # Warn if pricing data is older than this
 
 # Warning tracking
 _PRICING_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
+# Models whose price came from the built-in table rather than LiteLLM.
+_PRICING_FALLBACK_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -63,6 +62,10 @@ _MODEL_ENCODINGS: dict[str, str] = {
     "o1-mini": "o200k_base",
     "o3": "o200k_base",
     "o3-mini": "o200k_base",
+    "o4": "o200k_base",
+    "o4-mini": "o200k_base",
+    "gpt-4.1": "o200k_base",
+    "gpt-5": "o200k_base",
     # GPT-4 and GPT-3.5 use cl100k_base
     "gpt-4": "cl100k_base",
     "gpt-4-turbo": "cl100k_base",
@@ -77,6 +80,18 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-11-20": 128000,
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
+    # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
+    # get_context_limit; these are the manual fallback for installs without it
+    # (the litellm dep is gated python_version < '3.14').
+    "gpt-4.1": 1_047_576,
+    "gpt-4.1-mini": 1_047_576,
+    "gpt-4.1-nano": 1_047_576,
+    # GPT-5 series. This table is an INPUT budget (get_context_limit returns
+    # litellm's max_input_tokens when available), so these are 272K input --
+    # not the 400K total window, which is 272K in + 128K out.
+    "gpt-5": 272000,
+    "gpt-5-mini": 272000,
+    "gpt-5-nano": 272000,
     # GPT-4 Turbo
     "gpt-4-turbo": 128000,
     "gpt-4-turbo-preview": 128000,
@@ -93,6 +108,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o1-mini": 128000,
     "o3": 200000,
     "o3-mini": 200000,
+    "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
     # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
     # aliases). LiteLLM lookup is still attempted first in get_context_limit;
@@ -111,21 +127,35 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "deepseek-coder-v2": 128_000,
 }
 
-# Fallback pricing - LiteLLM is preferred source
-# OpenAI pricing per 1M tokens (input, output)
-# NOTE: These are ESTIMATES. Always verify against actual OpenAI billing.
-# Last updated: 2025-01-14
+# USD per 1M tokens, (input, output). NOTE: these are ESTIMATES -- always verify
+# against actual OpenAI billing.
+#
+# Unlike get_context_limit, _get_pricing has NO litellm lookup in front of it, so
+# this table is authoritative for every consumer (client.py cost_before /
+# cost_after, reporting, evals). Every entry below was checked against litellm's
+# model_cost; keep the newer families explicit, because these are matched by
+# prefix and "gpt-4.1" would otherwise fall into "gpt-4" and be priced at the
+# legacy $30/$60 -- 15x its real rate, and 300x for gpt-4.1-nano.
 _PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
     "gpt-4-turbo": (10.00, 30.00),
     "gpt-4": (30.00, 60.00),
     "gpt-3.5-turbo": (0.50, 1.50),
     "o1": (15.00, 60.00),
     "o1-preview": (15.00, 60.00),
     "o1-mini": (3.00, 12.00),
-    "o3": (10.00, 40.00),
+    # o3 was cut from $10/$40 to $2/$8 in June 2025; the old rate
+    # overstated every o3 cost estimate by 5x.
+    "o3": (2.00, 8.00),
     "o3-mini": (1.10, 4.40),
+    "o4-mini": (1.10, 4.40),
 }
 
 # Pattern-based defaults for unknown models
@@ -135,7 +165,7 @@ _PATTERN_DEFAULTS = {
     "gpt-4": {"context": 8192, "encoding": "cl100k_base", "pricing": (30.00, 60.00)},
     "gpt-3.5": {"context": 16385, "encoding": "cl100k_base", "pricing": (0.50, 1.50)},
     "o1": {"context": 200000, "encoding": "o200k_base", "pricing": (15.00, 60.00)},
-    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (10.00, 40.00)},
+    "o3": {"context": 200000, "encoding": "o200k_base", "pricing": (2.00, 8.00)},
 }
 
 # Default for completely unknown OpenAI models
@@ -170,6 +200,11 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
@@ -179,7 +214,10 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -193,6 +231,9 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
+
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
 
             openai_config = loaded.get("openai", {})
             if "context_limits" in openai_config:
@@ -209,7 +250,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -251,16 +292,30 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routes through the bounded loader so a stalled vocab download raises
+    :class:`~headroom.tokenizers.tiktoken_counter.TiktokenLoadError` after a
+    timeout instead of hanging the caller indefinitely — ``tiktoken`` fetches
+    vocabularies with no network timeout, and this runs on whatever thread
+    first counts tokens for a model, including proxy startup (GH #956).
+    """
     if not TIKTOKEN_AVAILABLE:
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from ..tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
 
 
-def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
-    """Get the encoding name for a model with fallback support."""
+def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = None) -> str | None:
+    """Resolve the tiktoken encoding for ``model``, or ``None`` if none claims it.
+
+    ``None`` is the "not an OpenAI model" signal: it means no explicit mapping,
+    no known prefix, and no OpenAI family pattern matched. Callers that can
+    reach a better tokenizer should use it rather than guess an encoding.
+    """
     # Check custom encodings first
     if custom_encodings and model in custom_encodings:
         return custom_encodings[model]
@@ -269,18 +324,26 @@ def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | 
     if model in _MODEL_ENCODINGS:
         return _MODEL_ENCODINGS[model]
 
-    # Prefix match for versioned models
-    for prefix, encoding in _MODEL_ENCODINGS.items():
+    # Prefix match for versioned models, longest prefix first. Plain dict order
+    # let a shorter family shadow a longer one: "gpt-4.1" hit the "gpt-4" entry
+    # and got cl100k_base instead of o200k_base, which over-counts CJK by ~33%.
+    for prefix in sorted(_MODEL_ENCODINGS, key=len, reverse=True):
         if model.startswith(prefix):
-            return encoding
+            return _MODEL_ENCODINGS[prefix]
 
     # Pattern-based inference
     family = _infer_model_family(model)
     if family and family in _PATTERN_DEFAULTS:
         return cast(str, _PATTERN_DEFAULTS[family]["encoding"])
 
-    # Default for unknown models
-    return cast(str, _UNKNOWN_OPENAI_DEFAULT["encoding"])
+    return None
+
+
+def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
+    """Get the encoding name for a model with fallback support."""
+    return _lookup_encoding_name(model, custom_encodings) or cast(
+        str, _UNKNOWN_OPENAI_DEFAULT["encoding"]
+    )
 
 
 class OpenAITokenCounter:
@@ -296,6 +359,8 @@ class OpenAITokenCounter:
 
         Raises:
             RuntimeError: If tiktoken is not installed.
+            TiktokenLoadError: If the encoding's vocabulary can't be loaded
+                within the bounded timeout (e.g. stalled download).
         """
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
@@ -320,8 +385,13 @@ class OpenAITokenCounter:
 
         Accounts for ChatML format overhead.
         """
-        # Base overhead per message (role + delimiters)
-        tokens = 4
+        # Base overhead per message (role + delimiters). OpenAI's counting
+        # guide uses 3 for every model since gpt-3.5-turbo-0613; only the
+        # retired gpt-3.5-turbo-0301 used 4. Staying on 4 over-counted every
+        # message by one token and disagreed with the tokenizer registry, which
+        # already uses 3 — so the same request measured differently depending on
+        # whether the pipeline or the handler counted it.
+        tokens = 3
 
         role = message.get("role", "")
         tokens += self.count_text(role)
@@ -331,14 +401,16 @@ class OpenAITokenCounter:
             if isinstance(content, str):
                 tokens += self.count_text(content)
             elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            tokens += self.count_text(part.get("text", ""))
-                        elif part.get("type") == "image_url":
-                            tokens += 85  # Low detail image estimate
-                    elif isinstance(part, str):
-                        tokens += self.count_text(part)
+                # Delegate to the audited shared walker instead of a partial
+                # per-provider one. Each provider counter had grown its own
+                # shortened branch list, so every modern block priced at ~0:
+                # measured on a 6,800-char block this returned 8 tokens for
+                # tool_result, thinking, document, mcp_tool_result — and for
+                # output_text / refusal, which are OpenAI's OWN Responses shapes.
+                # The shared walker is also image-safe: a 200KB base64 image gets
+                # a pixel-based 1600, not the ~50K phantom text tokens a naive
+                # str(block) catch-all would produce.
+                tokens += count_content_blocks(content, self.count_text)
 
         # Name field
         name = message.get("name")
@@ -349,10 +421,10 @@ class OpenAITokenCounter:
         tool_calls = message.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
-                func = tc.get("function", {})
-                tokens += self.count_text(func.get("name", ""))
-                tokens += self.count_text(func.get("arguments", ""))
-                tokens += self.count_text(tc.get("id", ""))
+                func = tc.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
+                tokens += self.count_text(coerce_countable_text(tc.get("id")))
                 tokens += 10  # Structural overhead
 
         # Tool call ID for tool responses
@@ -407,16 +479,22 @@ class OpenAIProvider(Provider):
         self._context_limits.update(custom_config["context_limits"])
         self._encodings.update(custom_config["encodings"])
 
-        # Handle pricing (can be tuple or list from JSON)
+        # Handle pricing (can be tuple or list from JSON). Tracked separately as
+        # well: an explicitly configured price is a user decision and must beat
+        # the LiteLLM lookup, whereas the built-in table is only a fallback.
+        self._pricing_overrides: dict[str, tuple[float, float]] = {}
         for model, pricing in custom_config["pricing"].items():
             if isinstance(pricing, list | tuple) and len(pricing) >= 2:
                 self._pricing[model] = (float(pricing[0]), float(pricing[1]))
+                self._pricing_overrides[model] = self._pricing[model]
 
         # Explicit overrides take precedence
         if context_limits:
             self._context_limits.update(context_limits)
 
-        self._token_counters: dict[str, OpenAITokenCounter] = {}
+        # Holds OpenAITokenCounter for models with a real tiktoken encoding and
+        # registry tokenizers for everything else (see get_token_counter).
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -439,11 +517,37 @@ class OpenAIProvider(Provider):
         )
 
     def get_token_counter(self, model: str) -> TokenCounter:
-        """Get token counter for an OpenAI model."""
+        """Get token counter for ``model``, deferring non-OpenAI models.
+
+        ``/v1/chat/completions`` is a multi-provider passthrough, so Kimi,
+        Gemini, Mistral and Cohere models all reach this provider. Handing them
+        a guessed tiktoken encoding mis-counts by up to ~19% (Kimi), and since
+        the proxy pipeline resolves its tokenizer through this provider while
+        handlers resolve through the tokenizer registry, the two disagree about
+        the same request — savings become a difference of two rulers. Defer to
+        the registry so each model has exactly one tokenizer. For OpenAI models,
+        fall back to estimation when a vocabulary cannot load within the bounded
+        timeout; the cached fallback prevents subsequent requests from blocking.
+        """
         if model not in self._token_counters:
-            self._token_counters[model] = OpenAITokenCounter(
-                model=model, custom_encodings=self._encodings
-            )
+            if _lookup_encoding_name(model, self._encodings) is None:
+                from headroom.tokenizers import get_tokenizer
+
+                self._token_counters[model] = cast(Any, get_tokenizer(model))
+            else:
+                from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+                try:
+                    self._token_counters[model] = OpenAITokenCounter(
+                        model=model, custom_encodings=self._encodings
+                    )
+                except TiktokenLoadError as exc:
+                    logger.warning(
+                        "tiktoken unavailable for %s (%s); using estimation.", model, exc
+                    )
+                    from ..tokenizers.estimator import EstimatingTokenCounter
+
+                    self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
@@ -490,10 +594,12 @@ class OpenAIProvider(Provider):
         if model in self._context_limits:
             return self._context_limits[model]
 
-        # Prefix match
-        for prefix, limit in self._context_limits.items():
+        # Prefix match, longest prefix first. Plain dict order let a shorter
+        # family shadow a longer one: "gpt-4.1" hit the "gpt-4" entry and got
+        # 8192 instead of ~1M, and "gpt-4-32k-0613" got 8192 instead of 32768.
+        for prefix in sorted(self._context_limits, key=len, reverse=True):
             if model.startswith(prefix):
-                return limit
+                return self._context_limits[prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)
@@ -543,20 +649,16 @@ class OpenAIProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        # Try LiteLLM first (most up-to-date pricing)
-        litellm = _get_litellm_module()
-        if litellm is not None:
-            try:
-                # LiteLLM uses per-token pricing, returns total cost
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt_tokens=input_tokens,
-                    completion_tokens=output_tokens,
-                )
-                if cost is not None and cost > 0:
-                    return float(cost)
-            except Exception:
-                pass  # Fall through to manual pricing
+        # Try LiteLLM first (most up-to-date pricing, and it knows each model's
+        # real cached-input rate rather than the manual path's flat estimate)
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None and cost > 0:
+            return float(cost)
 
         # Fall back to hardcoded pricing
         return self._estimate_cost_manual(input_tokens, output_tokens, model, cached_tokens)
@@ -590,23 +692,65 @@ class OpenAIProvider(Provider):
         return cached_cost + regular_cost + output_cost
 
     def _get_pricing(self, model: str) -> tuple[float, float] | None:
-        """Get pricing for a model with fallback logic."""
-        # Direct match
+        """Get pricing for a model, preferring LiteLLM over the built-in table.
+
+        Resolution order, mirroring ``get_context_limit`` so the two agree:
+
+        1. **Explicit user config** (``HEADROOM_MODEL_LIMITS`` / ``models.json``)
+           — a configured price is a decision, not a guess.
+        2. **LiteLLM** — the live source of truth. It also resolves gateway forms
+           the built-in table never covered (``azure/``, ``bedrock/``,
+           ``vertex_ai/``, ``groq/``).
+        3. **Built-in table**, then family pattern, then the unknown default.
+
+        The table used to be authoritative, which is how it went ~18 months stale
+        and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
+        a fallback means that drift only reaches installs with no LiteLLM — the
+        dependency is gated ``python_version < '3.14'``.
+        """
+        # 1. Explicit configuration wins.
+        override = self._pricing_overrides.get(model)
+        if override is not None:
+            return override
+
+        # 2. LiteLLM.
+        from headroom.pricing.litellm_pricing import pricing_per_1m
+
+        live = pricing_per_1m(model)
+        if live is not None:
+            return live
+
+        # 3. Built-in fallback. Only here does the staleness of this table
+        #    matter, so this is the only path that should warn about it.
+        self._warn_pricing_fallback(model)
+
         if model in self._pricing:
             return self._pricing[model]
 
-        # Prefix match
-        for model_prefix, pricing in self._pricing.items():
+        # Longest prefix first -- same shadowing hazard the context-limit and
+        # encoding lookups had: in plain dict order the shorter "gpt-4" entry
+        # claimed "gpt-4.1" and priced it at $30/$60.
+        for model_prefix in sorted(self._pricing, key=len, reverse=True):
             if model.startswith(model_prefix):
-                return pricing
+                return self._pricing[model_prefix]
 
-        # Pattern-based inference
         family = _infer_model_family(model)
         if family and family in _PATTERN_DEFAULTS:
             return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"])
 
-        # Default for unknown models
         return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+
+    def _warn_pricing_fallback(self, model: str) -> None:
+        """Warn once per model that pricing came from the built-in table."""
+        if model in _PRICING_FALLBACK_WARNINGS:
+            return
+        _PRICING_FALLBACK_WARNINGS.add(model)
+        stale = _check_pricing_staleness()
+        logger.debug(
+            "No LiteLLM pricing for '%s'; using built-in estimate.%s",
+            model,
+            f" {stale}" if stale else "",
+        )
 
     def get_output_buffer(self, model: str, default: int = 4000) -> int:
         """Get recommended output buffer."""

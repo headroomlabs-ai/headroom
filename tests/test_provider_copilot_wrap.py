@@ -93,6 +93,7 @@ def test_validate_configuration_rejects_invalid_combinations() -> None:
     [
         ("gpt-5.5", True),
         ("gpt-5-codex", True),
+        ("gpt-5.4", True),
         ("openai/gpt-5.4", True),
         ("o1", True),
         ("o3-mini", True),

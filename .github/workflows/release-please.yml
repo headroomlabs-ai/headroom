@@ -42,16 +42,31 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # Prefer a short-lived, repo-scoped GitHub App installation token. A
+      # personal PAT carries the maintainer's whole account — with a classic
+      # `repo` scope that reaches every other repository they can access — and
+      # this credential can tag past branch protection and reaches PyPI, npm and
+      # GHCR through the `release: published` publishes. An installation token is
+      # scoped to this repository and expires in an hour. Gated on the repo
+      # variable so an unconfigured app falls through instead of blocking a
+      # release. See #2955.
+      - name: Mint installation token
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v5
         with:
-          # PAT (not GITHUB_TOKEN): a release/tag created by GITHUB_TOKEN does
-          # NOT emit events that trigger other workflows, so release.yml
-          # (PyPI/npm) and docker.yml — which fire on `release: published` —
-          # never ran, and releases had to be cut by hand. A PAT is treated as a
-          # real user, so the release it creates DOES trigger those publishes; it
-          # also lets the bot tag past branch/tag protection. Falls back to
-          # GITHUB_TOKEN when the secret is unset (the release PR still opens; it
-          # just won't trigger the downstream publishes).
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          # Neither an app token nor a PAT is GITHUB_TOKEN, and that matters: a
+          # release/tag created by GITHUB_TOKEN does NOT emit events that trigger
+          # other workflows, so release.yml (PyPI/npm) and docker.yml — which fire
+          # on `release: published` — never ran, and releases had to be cut by
+          # hand. Falls back to GITHUB_TOKEN when nothing else is set (the release
+          # PR still opens; it just won't trigger the downstream publishes).
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: .release-please-config.json
           manifest-file: .release-please-manifest.json

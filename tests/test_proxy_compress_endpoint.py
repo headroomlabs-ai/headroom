@@ -134,6 +134,45 @@ class TestCompressEndpointBasic:
         assert data["tokens_saved"] >= 0
         assert data["compression_ratio"] > 0
 
+    def test_response_ccr_hashes_extracts_only_retrievable_hashes(self):
+        """Embedded CCR markers are reported without unrelated transform metadata."""
+        from headroom.proxy.handlers.openai import _response_ccr_hashes
+
+        messages = [
+            {
+                "role": "tool",
+                "content": ("[100 rows compressed. Retrieve more: hash=abc123def4567890abc123de]"),
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<<ccr:feedface00112233 10_rows_offloaded>>",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Retrieve original: hash=ABC123DEF4567890ABC123DE",
+                    },
+                ],
+            },
+        ]
+
+        hashes = _response_ccr_hashes(
+            messages,
+            [
+                "deadbeef0000000000000000",
+                "<headroom:tool_digest sha256=1234567890abcdef>",
+                "stable_prefix_hash:feedface00112233",
+            ],
+        )
+
+        assert hashes == [
+            "deadbeef0000000000000000",
+            "abc123def4567890abc123de",
+            "feedface00112233",
+        ]
+
     def test_bypass_header_returns_uncompressed(self, client):
         """X-Headroom-Bypass header should skip compression."""
         messages = [
@@ -264,7 +303,12 @@ class TestCompressEndpointCompression:
             transforms_summary={"test_transform": 1},
             markers_inserted=[],
         )
-        run_compression = AsyncMock(return_value=result)
+        # The executor callable returns the 5-tuple contract of
+        # _run_stateless/_run_session_turn:
+        # (result, final_messages, tokens_before, tokens_after, session_info).
+        run_compression = AsyncMock(
+            return_value=(result, result.messages, result.tokens_before, result.tokens_after, None)
+        )
         record_outcome = AsyncMock()
         monkeypatch.setattr(proxy, "_run_compression_in_executor", run_compression)
         monkeypatch.setattr(proxy, "_record_request_outcome", record_outcome)
@@ -289,6 +333,47 @@ class TestCompressEndpointCompression:
         assert outcome.num_messages == 1
         assert outcome.transforms_applied == ("test_transform",)
         assert outcome.total_latency_ms >= 0
+
+    def test_response_reports_embedded_ccr_hashes(self, client, monkeypatch):
+        """The endpoint reports a CCR marker even when the transform omitted its registry."""
+        proxy = client.app.state.proxy
+        ccr_hash = "abc123def4567890abc123de"
+        result = SimpleNamespace(
+            messages=[
+                {
+                    "role": "tool",
+                    "content": f"<<ccr:{ccr_hash} 10_rows_offloaded>>",
+                }
+            ],
+            tokens_before=12,
+            tokens_after=7,
+            transforms_applied=["test_transform"],
+            transforms_summary={"test_transform": 1},
+            markers_inserted=["<headroom:tool_digest sha256=1234567890abcdef>"],
+        )
+        monkeypatch.setattr(
+            proxy,
+            "_run_compression_in_executor",
+            # Same 5-tuple contract as _run_stateless (see above).
+            AsyncMock(
+                return_value=(
+                    result,
+                    result.messages,
+                    result.tokens_before,
+                    result.tokens_after,
+                    None,
+                )
+            ),
+        )
+        monkeypatch.setattr(proxy, "_record_request_outcome", AsyncMock())
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": [{"role": "user", "content": "compress me"}], "model": "gpt-4"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ccr_hashes"] == [ccr_hash]
 
     def test_compression_error_records_failed_request(self, client, monkeypatch):
         """A hard compression failure should increment failed metrics."""
@@ -671,7 +756,7 @@ class TestCompressEndpointDoesNotBlockLoop:
                 markers_inserted=[],
             )
 
-        monkeypatch.setattr(proxy.openai_pipeline, "apply", blocking_apply)
+        monkeypatch.setattr(proxy._ccr_pipeline(), "apply", blocking_apply)
 
         # /v1/compress is loopback-gated (#1227) — present as 127.0.0.1.
         transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
@@ -682,8 +767,9 @@ class TestCompressEndpointDoesNotBlockLoop:
                     json={
                         "messages": [{"role": "user", "content": "hello world"}],
                         "model": "gpt-4",
-                        # mode="ccr" routes to `openai_pipeline` (the default is a
-                        # derived marker-free pipeline); this test patches that one.
+                        # Every mode now runs a DERIVED pipeline so the tokenizer
+                        # comes from the per-model registry; mode="ccr" is the
+                        # marker-on one, patched above.
                         "config": {"mode": "ccr"},
                     },
                 )
@@ -706,3 +792,107 @@ class TestCompressEndpointDoesNotBlockLoop:
             resp = await asyncio.wait_for(compress, timeout=5)
             assert resp.status_code == 200
             assert resp.json()["tokens_saved"] == 5
+
+
+class TestCompressEndpointFrozenMessageCount:
+    """``config.frozen_message_count`` pins a prefix the provider has already cached.
+
+    Callers that resend a growing conversation every turn (agent loops, the Strands
+    plugin) need the leading messages to come back byte-for-byte identical. Without
+    this the router compresses old messages harder as the conversation grows, their
+    bytes change, and the provider's prompt cache misses from that point on — turning
+    compression into a net cost. ``protect_recent`` guards the other end of the list
+    and cannot express it.
+    """
+
+    @staticmethod
+    def _conversation(turns: int) -> list[dict]:
+        log = "\n".join(
+            f"2026-07-31 12:00:{n:02d} INFO worker={n} req=r{n} took {n}ms" for n in range(60)
+        )
+        messages: list[dict] = []
+        for i in range(turns):
+            messages += [
+                {"role": "user", "content": f"step {i}"},
+                {"role": "assistant", "content": f"reading log {i}\n{log}"},
+            ]
+        return messages
+
+    def test_pinned_prefix_is_returned_byte_for_byte(self, client):
+        messages = self._conversation(12)
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": messages,
+                "model": "gpt-4",
+                "config": {"compress_user_messages": True, "frozen_message_count": 8},
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["messages"][:8] == messages[:8]
+
+    def test_the_unpinned_tail_is_still_compressed(self, client):
+        messages = self._conversation(12)
+        body = {"messages": messages, "model": "gpt-4", "config": {"compress_user_messages": True}}
+        full = client.post("/v1/compress", json=body).json()
+        pinned = client.post(
+            "/v1/compress",
+            json={**body, "config": {**body["config"], "frozen_message_count": 8}},
+        ).json()
+
+        # Pinning must not disable compression outright — only exempt the prefix.
+        assert pinned["messages"][8:] != messages[8:], "tail was left uncompressed"
+        assert pinned["tokens_after"] >= full["tokens_after"], "pinning should compress no harder"
+
+    def test_a_pinned_prefix_does_not_drift_as_the_conversation_grows(self, client):
+        """The regression this field exists to prevent."""
+        short, long = self._conversation(6), self._conversation(24)
+        config = {"compress_user_messages": True, "frozen_message_count": 12}
+
+        a = client.post(
+            "/v1/compress", json={"messages": short, "model": "gpt-4", "config": config}
+        ).json()
+        b = client.post(
+            "/v1/compress", json={"messages": long, "model": "gpt-4", "config": config}
+        ).json()
+
+        assert a["messages"][:12] == b["messages"][:12], (
+            "prefix was re-rendered as the conversation grew"
+        )
+
+    @pytest.mark.parametrize("value", ["8", -1, 3.5, True, [8], {"n": 8}])
+    def test_invalid_values_return_400(self, client, value):
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"frozen_message_count": value},
+            },
+        )
+        assert response.status_code == 400
+        data = response.json()
+        assert data["error"]["type"] == "invalid_request"
+        assert "frozen_message_count" in data["error"]["message"]
+
+    @pytest.mark.parametrize("value", [0, 1, 10_000], ids=["zero", "one", "beyond-the-list"])
+    def test_valid_values_are_accepted(self, client, value):
+        """0 means "pin nothing"; a count past the end simply pins everything."""
+        response = client.post(
+            "/v1/compress",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "model": "gpt-4",
+                "config": {"frozen_message_count": value},
+            },
+        )
+        assert response.status_code == 200
+
+    def test_unset_is_unchanged_behaviour(self, client):
+        messages = self._conversation(4)
+        body = {"messages": messages, "model": "gpt-4", "config": {"compress_user_messages": True}}
+        without = client.post("/v1/compress", json=body).json()
+        explicit_zero = client.post(
+            "/v1/compress", json={**body, "config": {**body["config"], "frozen_message_count": 0}}
+        ).json()
+        assert without["messages"] == explicit_zero["messages"]

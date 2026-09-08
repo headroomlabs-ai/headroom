@@ -523,7 +523,11 @@ impl SmartCrusher {
                                 rows.extend(arr.iter().cloned());
                             }
 
-                            let result = self.crush_array(&rows, query_context, bias);
+                            // `arr` (not `rows`) is what the CCR marker must
+                            // resolve to: `rows` may already be prose-
+                            // compressed / marker-substituted by the hook.
+                            let result =
+                                self.crush_array_with_source(&rows, arr, query_context, bias);
                             // Lossless path won → substitute the array
                             // with the compacted string in place. This
                             // makes the lossless win visible to the
@@ -759,6 +763,27 @@ impl SmartCrusher {
     /// 7. `execute_plan(plan, items)` → result.
     /// 8. Strategy info = `analysis.recommended_strategy.as_str()`.
     pub fn crush_array(&self, items: &[Value], query_context: &str, bias: f64) -> CrushArrayResult {
+        self.crush_array_with_source(items, items, query_context, bias)
+    }
+
+    /// [`crush_array`](Self::crush_array), but hashing and stashing
+    /// `ccr_source` — not `items` — behind the row-drop marker.
+    ///
+    /// The two differ on the prose-hook path: there, `items` are rows whose
+    /// leaves have ALREADY been rewritten (prose extractively compressed,
+    /// opaque blobs swapped for `<<ccr:…>>` markers). Storing those as the
+    /// entry's "original" hands a retrieving caller compressed output rather
+    /// than the dropped rows — the data the marker promises is simply not in
+    /// the store (#2694, same defect class as #1209). `ccr_source` is the
+    /// pre-processing array, so the marker's hash and the stored bytes both
+    /// describe what the model actually lost.
+    fn crush_array_with_source(
+        &self,
+        items: &[Value],
+        ccr_source: &[Value],
+        query_context: &str,
+        bias: f64,
+    ) -> CrushArrayResult {
         let item_strings: Vec<String> = items
             .iter()
             .map(|i| serde_json::to_string(i).unwrap_or_default())
@@ -908,7 +933,9 @@ impl SmartCrusher {
             // same bytes get stored — eliminating a redundant tree clone
             // (`items.to_vec()`) and a redundant `serde_json::to_string`
             // pass that the previous version did per dropped array.
-            let canonical = canonical_array_json(items);
+            // `ccr_source` == `items` except on the prose-hook path, where
+            // it is the pre-processing array — see `crush_array_with_source`.
+            let canonical = canonical_array_json(ccr_source);
             let h = hash_canonical(&canonical);
             let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
             if let Some(store) = &self.ccr_store {

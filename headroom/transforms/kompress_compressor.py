@@ -29,6 +29,7 @@ from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
+    hf_entry_known_absent,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -54,6 +55,19 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|\.[a-z]{2,4}\b"  # extensions: .py .so .json
     r"|--?[a-z][\w-]*"  # flags: --verbose, -n
     r"|\b[A-Z][a-z]+[A-Z]\w*"  # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+    # Directive words. Every other class above protects a token the model could
+    # not RECONSTRUCT; these protect tokens whose loss INVERTS the surrounding
+    # sentence. Compressed prompts carry instructions as often as they carry
+    # tool output, and "do not guess at model names" without its "not" is not a
+    # degraded instruction, it is the opposite instruction. Measured over 40
+    # real skill bodies with THIS pattern: negation retention rose
+    # 73.5% -> 91.9% and modal retention 65.5% -> 96.8%, for 0.2 percentage
+    # points of compression (ratio 0.716 -> 0.718) -- these are short, common
+    # words, so the model was already keeping most of them and pinning the rest
+    # costs almost nothing.
+    r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
+    r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
+    r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
@@ -95,6 +109,12 @@ KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
 KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
+# Consecutive inference failures before Kompress latches to passthrough for the
+# rest of the process. 3 rides out a transient error while still catching a model
+# that is broken for this install on the first few requests rather than the 200th.
+# ponytail: fixed count, not a rate window — a broken artifact fails every call,
+# so there is nothing a window would tell us that three strikes doesn't.
+_INFERENCE_FAILURE_LATCH = 3
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_ENV = "HEADROOM_KOMPRESS_EXECUTION_TIMEOUT_MS"
 KOMPRESS_EXECUTION_SEMAPHORE_WAIT_MS_DEFAULT = 3000
 KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
@@ -599,15 +619,42 @@ def _onnx_filename_candidates() -> tuple[str, ...]:
     return _DEFAULT_ONNX_FILENAMES
 
 
+def _smoke_run(session: Any) -> None:
+    """Run one tiny forward pass so a broken artifact fails HERE, not per request.
+
+    Some ONNX Runtime builds accept a session and then reject it at execution.
+    The int8 weight-only artifact carries ``MatMulNBits`` with ``bits=8``; ORT's
+    CPU kernel only handles 8-bit through the prepacked MLAS path, so a build or
+    ISA without an 8-bit ``SQNBitGemm`` kernel falls into ``ComputeBUnpacked``,
+    which hard-asserts ``nbits_ == 4``. That raises on ``session.run()`` — after
+    construction succeeded — so a load-only check never sees it and the fp32
+    fallback below is unreachable. Observed in the wild as 207 consecutive
+    per-request failures over three days with ML compression silently dead.
+
+    Two tokens through the real graph, so it costs milliseconds rather than the
+    seconds the timed canary takes (kernel dispatch is what fails, not compute).
+    """
+    import numpy as np
+
+    session.run(
+        ["final_scores"],
+        {
+            "input_ids": np.zeros((1, 2), dtype=np.int64),
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+        },
+    )
+
+
 def _create_onnx_session(
     model_id: str, providers: list[Any], *, allow_download: bool = True
 ) -> Any:
     """Resolve and load the model's ONNX artifact, trying candidates in order.
 
-    A candidate is skipped on download miss (file not in the repo) or on
-    session-load failure (e.g. the weight-only int8 artifact uses the
-    MatMulNBits contrib op, which old onnxruntime builds can't run — those
-    installs fall through to the fp32 artifact instead of losing Kompress).
+    A candidate is skipped on download miss (file not in the repo), on
+    session-load failure, or on smoke-run failure (e.g. the weight-only int8
+    artifact uses the MatMulNBits contrib op, which some onnxruntime builds
+    accept at load and then reject at execution — those installs fall through to
+    the fp32 artifact instead of losing Kompress). See :func:`_smoke_run`.
 
     When ``allow_download`` is ``False`` candidates are resolved from the local
     cache only; if none is cached, :class:`KompressModelNotCached` is raised
@@ -632,15 +679,17 @@ def _create_onnx_session(
 
             ort = onnxruntime
         try:
-            return ort.InferenceSession(
+            session = ort.InferenceSession(
                 onnx_path,
                 _onnx_session_options(ort),
                 providers=providers,
             )
+            _smoke_run(session)
+            return session
         except Exception as exc:
             last_err = exc
             logger.warning(
-                "ONNX artifact %r from %s failed to load (%s); trying next candidate",
+                "ONNX artifact %r from %s is unusable (%s); trying next candidate",
                 filename,
                 model_id,
                 exc,
@@ -710,15 +759,125 @@ def _load_kompress_onnx(
 
 
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
-    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False."""
+    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
+
+    Always tries the local cache FIRST, even when downloading is allowed. With
+    ``local_files_only=False`` transformers re-validates against the Hub on every
+    load — a tree listing plus a HEAD per tokenizer file — even when the repo is
+    fully cached. MEASURED ~900ms warm-cache versus ~150ms local-only, i.e. ~750ms
+    of pure network round-trip on every process start, and it is also what makes
+    a cold start slow on a bad network rather than merely offline.
+
+    Same files, same tokenizer, so the loaded object is identical; this only
+    changes whether the Hub is consulted to confirm what is already on disk.
+    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
+    this loader already uses.
+    """
     try:
-        return auto_tokenizer.from_pretrained(
-            "answerdotai/ModernBERT-base", local_files_only=not allow_download
-        )
+        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
+    # Genuine cache miss and downloading is permitted: fetch it.
+    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
+
+
+# Sub-state-dict keys inside a merged v2-style checkpoint (see
+# scripts/export_kompress_v2_onnx.py, which this mirrors).
+_MERGED_CHECKPOINT_KEYS = ("encoder_state_dict", "token_head_state_dict", "span_conv_state_dict")
+
+
+def _load_merged_state_dict(model: Any, ckpt_path: str, model_id: str) -> None:
+    """Load a merged v2-style checkpoint (LoRA already folded into the encoder).
+
+    The checkpoint is a dict of per-submodule state-dicts
+    (``encoder_state_dict`` / ``token_head_state_dict`` / ``span_conv_state_dict``)
+    rather than a single flat state-dict, so each piece is loaded into its
+    matching submodule directly instead of via a single ``load_state_dict``
+    call on the whole model.
+    """
+    import torch
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    missing_sections = [k for k in _MERGED_CHECKPOINT_KEYS if k not in ckpt]
+    if missing_sections:
+        raise RuntimeError(
+            f"merged.pt for {model_id} is missing {missing_sections}; found keys: "
+            f"{sorted(ckpt)}. This checkpoint format is not what the loader expects."
+        )
+
+    for section, submodule in (
+        ("encoder_state_dict", model.encoder),
+        ("token_head_state_dict", model.token_head),
+        ("span_conv_state_dict", model.span_conv),
+    ):
+        missing, unexpected = submodule.load_state_dict(ckpt[section], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"{model_id} {section}: state_dict mismatch against {type(submodule).__name__} "
+                f"(missing={list(missing)[:5]}, unexpected={list(unexpected)[:5]}). "
+                "The checkpoint no longer matches HeadroomCompressorModel's architecture."
+            )
+
+
+def _load_plain_state_dict(model: Any, weights_path: str, model_id: str) -> None:
+    """Load a plain, already-merged full state-dict (the pre-v2 / non-PEFT format)."""
+    from safetensors.torch import load_file
+
+    state_dict = load_file(weights_path)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{model_id} model.safetensors: state_dict mismatch against "
+            f"HeadroomCompressorModel (missing={list(missing)[:5]}, "
+            f"unexpected={list(unexpected)[:5]}). Refusing to run with unloaded weights."
+        )
+
+
+def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) -> None:
+    """Load PyTorch weights into ``model``, preferring the merged v2 checkpoint.
+
+    ``merged.pt`` (when the repo ships one) holds LoRA-merged sub-state-dicts
+    keyed by submodule name. In a PEFT-trained repo, ``model.safetensors`` is
+    the *unmerged* adapter checkpoint (encoder keys prefixed
+    ``encoder.base_model.model...``) and does not map onto this module tree at
+    all, so it is only used as a fallback for repos that never shipped a
+    merged checkpoint (e.g. the original non-LoRA kompress-base).
+
+    In cache-only mode (``allow_download=False``) a ``merged.pt`` cache miss is
+    ambiguous: it could mean the repo has no merged checkpoint (safe to use the
+    plain fallback), or it could mean the repo has one but it just is not
+    downloaded yet (in which case a *stale* cached ``model.safetensors`` from a
+    prior run must not be used, since for a PEFT repo it is the wrong format).
+    ``hf_entry_known_absent`` disambiguates without a network call, using
+    HuggingFace Hub's own cache of confirmed-404 lookups.
+    """
+    try:
+        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+    except _NOT_CACHED_ERRORS as exc:
+        if not allow_download:
+            if not hf_entry_known_absent(model_id, "merged.pt"):
+                raise KompressModelNotCached(model_id) from exc
+            try:
+                weights_path = hf_hub_download_local_first(
+                    model_id, "model.safetensors", allow_network=False
+                )
+            except _NOT_CACHED_ERRORS:
+                raise KompressModelNotCached(model_id) from exc
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
+        if isinstance(exc, EntryNotFoundError):
+            # merged.pt genuinely does not exist in this repo (confirmed by a
+            # real network lookup, not just a cache miss) - fall back to the
+            # plain format instead of treating it as a download failure.
+            weights_path = hf_hub_download_local_first(
+                model_id, "model.safetensors", allow_network=allow_download
+            )
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
         raise
+    else:
+        _load_merged_state_dict(model, ckpt_path, model_id)
 
 
 def _load_kompress_pytorch(
@@ -738,22 +897,10 @@ def _load_kompress_pytorch(
 
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
-        try:
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
-        except _NOT_CACHED_ERRORS as exc:
-            if not allow_download:
-                raise KompressModelNotCached(model_id) from exc
-            raise
-
         HeadroomCompressorModel = _get_model_class()
         model = HeadroomCompressorModel()
 
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+        _load_pytorch_weights(model, model_id, allow_download=allow_download)
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -917,6 +1064,45 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
 _download_threads: dict[str, threading.Thread] = {}
 _download_threads_lock = threading.Lock()
 
+#: Retry backoff for a FAILED background download, in seconds. A finished-or-failed
+#: thread is replaced on the next call so a transient network blip recovers, but
+#: without a floor an unreachable Hub means every request spawns a fresh download
+#: thread for the life of the process — each one importing transformers and
+#: resolving the Hub, all holding the GIL against the event loop. The window grows
+#: per consecutive failure and resets on success, so the happy path and the
+#: transient-failure path are both unchanged; only the permanently-broken case is
+#: bounded.
+_DOWNLOAD_RETRY_BASE_SECONDS = 5.0
+_DOWNLOAD_RETRY_MAX_SECONDS = 300.0
+_download_failures: dict[str, tuple[int, float]] = {}
+
+
+def _record_download_failure(model_id: str) -> None:
+    with _download_threads_lock:
+        failures, _ = _download_failures.get(model_id, (0, 0.0))
+        _download_failures[model_id] = (failures + 1, time.monotonic())
+
+
+def _clear_download_failures(model_id: str) -> None:
+    with _download_threads_lock:
+        _download_failures.pop(model_id, None)
+
+
+def _download_retry_blocked(model_id: str) -> bool:
+    """True when the last attempt failed and the backoff window has not elapsed.
+
+    Caller must hold ``_download_threads_lock``.
+    """
+    entry = _download_failures.get(model_id)
+    if entry is None:
+        return False
+    failures, last_attempt = entry
+    window = min(
+        _DOWNLOAD_RETRY_MAX_SECONDS,
+        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+    )
+    return bool((time.monotonic() - last_attempt) < window)
+
 
 def _background_download(model_id: str, device: str) -> None:
     try:
@@ -924,7 +1110,10 @@ def _background_download(model_id: str, device: str) -> None:
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
     except Exception as exc:
+        _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+    else:
+        _clear_download_failures(model_id)
 
 
 def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
@@ -932,7 +1121,9 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
 
     Idempotent and non-blocking: at most one download thread runs per model_id,
     and a finished or failed thread is replaced on the next call so a transient
-    network failure can be retried by a later request. Once the download
+    network failure can be retried by a later request — subject to a growing
+    backoff after consecutive failures, so an unreachable Hub cannot turn every
+    request into another download thread. Once the download
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
@@ -944,6 +1135,8 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         existing = _download_threads.get(model_id)
         if existing is not None and existing.is_alive():
             return
+        if _download_retry_blocked(model_id):
+            return
         thread = threading.Thread(
             target=_background_download,
             args=(model_id, device),
@@ -952,6 +1145,70 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
         )
         _download_threads[model_id] = thread
         thread.start()
+
+
+def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
+    """Download the model's ONNX artifact to the local cache. No native init.
+
+    Deliberately weaker than :func:`warm_kompress_model`: it resolves files over
+    plain huggingface_hub HTTP and never constructs an ``InferenceSession`` or
+    imports ``transformers``. That distinction is the whole point — entering
+    Kompress *native* init on the proxy's startup path segfaults in
+    libarrow/jemalloc on RHEL/CentOS 7-family hosts (#1908, fixed by #2001), so
+    startup may prefetch bytes but must not build the model.
+
+    Stops at the first candidate that resolves: the loader tries them in the same
+    order, so fetching the rest would be wasted bandwidth.
+
+    Returns ``True`` if an artifact is now cached locally.
+    """
+    if model_id in _kompress_cache:
+        return True
+    for filename in _onnx_filename_candidates():
+        try:
+            hf_hub_download_local_first(model_id, filename, allow_network=True)
+            return True
+        except Exception as exc:
+            logger.debug("Kompress prefetch: %r unavailable for %s: %s", filename, model_id, exc)
+    return False
+
+
+def ensure_background_prefetch(model_id: str = HF_MODEL_ID) -> bool:
+    """Start a one-shot background artifact prefetch. Non-blocking, idempotent.
+
+    Returns ``True`` when a prefetch is running or was started, ``False`` when the
+    model is already cached (nothing to do) or Kompress isn't installed. Shares the
+    per-model thread registry with :func:`ensure_background_download` so the two
+    can't race to fetch the same files.
+    """
+    if not is_kompress_available() or model_id in _kompress_cache:
+        return False
+    with _download_threads_lock:
+        if model_id in _kompress_cache:
+            return False
+        existing = _download_threads.get(model_id)
+        if existing is not None and existing.is_alive():
+            return True
+
+        def _run() -> None:
+            logger.info("Kompress: prefetching model artifacts for %s ...", model_id)
+            if prefetch_kompress_artifacts(model_id):
+                logger.info(
+                    "Kompress: artifact prefetch complete for %s; the model loads on "
+                    "first use without a download stall.",
+                    model_id,
+                )
+            else:
+                logger.warning("Kompress: artifact prefetch found no usable file for %s", model_id)
+
+        thread = threading.Thread(
+            target=_run,
+            name=f"kompress-prefetch-{model_id.replace('/', '-')}",
+            daemon=True,
+        )
+        _download_threads[model_id] = thread
+        thread.start()
+        return True
 
 
 def warm_kompress_model(
@@ -1006,6 +1263,12 @@ class KompressConfig:
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
+    # Lossy word-dropping below this size is a net loss: the CCR retrieval
+    # marker alone is ~20 words, and short blocks are disproportionately
+    # instruction-like (sanitizer banners, section headers) where dropped
+    # words read as garbling rather than compression. Values below the
+    # historical floor of 10 are clamped up to it.
+    min_input_words: int = 64
 
 
 @dataclass
@@ -1031,6 +1294,26 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+def ccr_retrieval_marker(
+    n_words: int, compressed_count: int, ccr_source: str, cache_key: str
+) -> str:
+    """The retrieval marker appended after a lossy Kompress pass.
+
+    Says "words" — Kompress drops words from prose; the counts are word
+    counts. The old wording said "items", which models (and humans) read
+    as an item-structured payload that compression mangled. The source
+    line span is reported so a reader can tell content was compressed
+    away rather than absent (#2586).
+    """
+    source_lines = ccr_source.count("\n") + 1
+    line_word = "line" if source_lines == 1 else "lines"
+    return (
+        f"\n[{n_words} words compressed to {compressed_count}"
+        f" (from {source_lines} source {line_word})."
+        f" Retrieve more: hash={cache_key}]"
+    )
+
+
 def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
     """Store an original->compressed mapping in the proxy-local CCR store and
     return its retrieval hash (or None on any failure).
@@ -1051,8 +1334,12 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
             compressed,
             original_tokens=original_tokens,
             compressed_tokens=compressed_tokens,
-            original_item_count=original_tokens,
-            compressed_item_count=compressed_tokens,
+            # No item counts: kompress compresses prose, not item lists.
+            # These fields used to carry the word counts, so a retrieval
+            # of a 33-word banner reported "original_item_count: 33" — a
+            # model (and a debugging human) reads that as a 33-item data
+            # structure that compression mangled. Token counts already
+            # carry the size story in their own fields above.
             tool_signature_hash=signature.structure_hash,
             compression_strategy="kompress",
         )
@@ -1083,10 +1370,14 @@ class KompressCompressor(Transform):
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
-        # Set by the preload canary when inference is too slow to be useful;
-        # compress()/compress_batch() then pass content through untouched.
+        # Set by the preload canary when inference is too slow to be useful, or by
+        # the failure latch when inference raises repeatedly; compress()/
+        # compress_batch() then pass content through untouched.
         self._degraded_reason: str | None = None
         self._canary_thread: threading.Thread | None = None
+        # Consecutive inference failures — reset by any success, so a transient
+        # error can't accumulate toward the latch across a healthy run.
+        self._inference_failures: int = 0
 
     def preload(self, *, allow_download: bool = True) -> str:
         """Load the backing model/tokenizer and return the selected backend.
@@ -1236,7 +1527,7 @@ class KompressCompressor(Transform):
         words = content.split()
         n_words = len(words)
 
-        if n_words < 10 or self._degraded_reason is not None:
+        if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
@@ -1455,12 +1746,8 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
 
             if inference_ms >= 1000.0:
@@ -1476,6 +1763,9 @@ class KompressCompressor(Transform):
                     result.tokens_saved,
                 )
 
+            # A real inference landed — clear the strike count so only CONSECUTIVE
+            # failures can reach the latch.
+            self._inference_failures = 0
             return result
 
         except KompressModelNotCached:
@@ -1485,8 +1775,40 @@ class KompressCompressor(Transform):
             )
             return self._passthrough(content, n_words)
         except Exception as e:
-            logger.warning("Kompress compression failed: %s", e)
+            self._record_inference_failure(e)
             return self._passthrough(content, n_words)
+
+    def _record_inference_failure(self, exc: BaseException) -> None:
+        """Log a failed inference, and latch to degraded after repeated failures.
+
+        A model that fails once may be transient; one that fails every call is
+        broken for this process and will never recover on its own. Without a latch
+        that state is a per-request WARNING forever — the reported case logged 207
+        identical lines across three days while every request silently went
+        uncompressed, which read as noise rather than "ML compression is dead".
+        Latching converts it into one actionable line plus a `/debug/warmup`
+        signal, and stops paying for a call that cannot succeed.
+        """
+        self._inference_failures += 1
+        if self._degraded_reason is not None:
+            return
+        if self._inference_failures < _INFERENCE_FAILURE_LATCH:
+            logger.warning(
+                "Kompress compression failed (%d/%d before disabling): %s",
+                self._inference_failures,
+                _INFERENCE_FAILURE_LATCH,
+                exc,
+            )
+            return
+        self._degraded_reason = f"{self._inference_failures} consecutive inference failures: {exc}"
+        logger.error(
+            "Kompress inference failed %d times consecutively (%s) — ML compression "
+            "DISABLED for this run; content passes through uncompressed. Pin a working "
+            "ONNX artifact via %s=onnx/kompress-fp32.onnx, or report the error above.",
+            self._inference_failures,
+            exc,
+            KOMPRESS_ONNX_FILENAME_ENV,
+        )
 
     def compress_batch(
         self,
@@ -1611,9 +1933,10 @@ class KompressCompressor(Transform):
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
+        _floor = max(10, self.config.min_input_words)
         chunk_queue: list[tuple[int, int, list[str], float | None]] = []
         for i, (words, ratio) in enumerate(zip(word_lists, ratios, strict=True)):
-            if len(words) < 10:
+            if len(words) < _floor:
                 results[i] = self._passthrough(contents[i], len(words))
                 continue
             for chunk_start in range(0, len(words), max_chunk_words):
@@ -1818,12 +2141,8 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    result.compressed += ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
 
             results[text_idx] = result
@@ -1920,7 +2239,9 @@ class KompressCompressor(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
 
-            if not isinstance(content, str) or len(content.split()) < 10:
+            if not isinstance(content, str) or len(content.split()) < max(
+                10, self.config.min_input_words
+            ):
                 transformed.append(message)
                 continue
 

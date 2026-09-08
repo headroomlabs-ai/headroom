@@ -8,7 +8,104 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
+
+#: Cap on the serialized form of a non-string tool-call field. A malformed
+#: upstream can put an arbitrarily large object where a JSON string belongs;
+#: serializing it unbounded would turn a token *estimate* into a multi-megabyte
+#: encode. Truncating keeps the estimate finite and the request alive.
+_MAX_COERCED_FIELD_CHARS = 200_000
+
+#: Admission policy for :class:`TokenCountCache`. These bound memory only — they
+#: never change a returned count, so they are not a behavioural threshold.
+#: Strings below the floor encode in microseconds, so caching them would only
+#: evict the large entries that the cache exists for.
+_COUNT_CACHE_MIN_CHARS = 256
+_COUNT_CACHE_MAX_ENTRIES = 4096
+_COUNT_CACHE_MAX_CHARS = 8_000_000
+
+
+class TokenCountCache:
+    """Exact memo for ``count_text``.
+
+    ``count_text`` is a pure function of its text, so replaying a stored count is
+    value-identical. That is the whole safety argument: the result is the same
+    integer, which is why this is safe even at the call sites whose count feeds a
+    routing decision (``context_pressure`` -> ``min_ratio``) rather than a log line.
+
+    Keyed on the text itself rather than a hash. A hash collision here would hand
+    back the wrong count for real content and silently change what gets
+    compressed; the counts are too load-bearing to trade correctness for a
+    smaller key. The price is holding the strings, so entries *and* total
+    characters are capped.
+
+    No lock: ``dict`` get/set/clear are atomic under the GIL, and the pipeline
+    runs on a thread pool. An LRU would need ``move_to_end``, which is not
+    atomic — hence clear-on-full rather than eviction. A cleared cache costs one
+    re-encode, never a wrong answer.
+    """
+
+    __slots__ = ("_chars", "_counts", "_max_chars", "_max_entries", "_min_chars")
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = _COUNT_CACHE_MIN_CHARS,
+        max_entries: int = _COUNT_CACHE_MAX_ENTRIES,
+        max_chars: int = _COUNT_CACHE_MAX_CHARS,
+    ) -> None:
+        self._counts: dict[str, int] = {}
+        self._chars = 0
+        self._min_chars = min_chars
+        self._max_entries = max_entries
+        self._max_chars = max_chars
+
+    def get(self, text: str) -> int | None:
+        """Return the stored count for *text*, or None."""
+        return self._counts.get(text)
+
+    def put(self, text: str, count: int) -> None:
+        """Store *count* for *text* if it is worth caching."""
+        if len(text) < self._min_chars:
+            return
+        if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:
+            self._counts.clear()
+            self._chars = 0
+        self._counts[text] = count
+        self._chars += len(text)
+
+    def clear(self) -> None:
+        self._counts.clear()
+        self._chars = 0
+
+
+def coerce_countable_text(value: Any) -> str:
+    """Return *value* as text safe to pass to ``count_text``.
+
+    Tool-call fields (``function.name``, ``function.arguments``, ``id``) are
+    strings per the OpenAI spec, but OpenAI-compatible upstreams do emit
+    ``None`` or a raw object there. Passing those straight to
+    ``tiktoken.encode()`` raises ``TypeError: expected string or buffer``, which
+    failed the whole compression with a 503 — and kept failing on every later
+    request, because the malformed message stays in conversation history.
+
+    ``None`` counts as nothing; dicts/lists are JSON-serialized so an object
+    ``arguments`` is priced roughly like the JSON string it should have been;
+    anything else falls back to ``str()``.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, dict | list | tuple):
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+    else:
+        text = str(value)
+    return text[:_MAX_COERCED_FIELD_CHARS]
 
 
 @runtime_checkable
@@ -310,20 +407,20 @@ class BaseTokenizer(ABC):
             total += 4  # Tool call overhead
 
             if "function" in call:
-                func = call["function"]
-                total += self.count_text(func.get("name", ""))
-                total += self.count_text(func.get("arguments", ""))
+                func = call["function"] or {}
+                total += self.count_text(coerce_countable_text(func.get("name")))
+                total += self.count_text(coerce_countable_text(func.get("arguments")))
 
             if "id" in call:
-                total += self.count_text(call["id"])
+                total += self.count_text(coerce_countable_text(call["id"]))
 
         return total
 
     def _count_function_call(self, function_call: dict[str, Any]) -> int:
         """Count tokens in legacy function call."""
         total = 4  # Function call overhead
-        total += self.count_text(function_call.get("name", ""))
-        total += self.count_text(function_call.get("arguments", ""))
+        total += self.count_text(coerce_countable_text(function_call.get("name")))
+        total += self.count_text(coerce_countable_text(function_call.get("arguments")))
         return total
 
     def encode(self, text: str) -> list[int]:
@@ -359,3 +456,39 @@ class BaseTokenizer(ABC):
             NotImplementedError: If decoding is not supported.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support decoding")
+
+
+class _DelegatingBlockCounter(BaseTokenizer):
+    """Adapter exposing :meth:`BaseTokenizer._count_content_parts` to non-subclasses.
+
+    The provider token counters in ``headroom/providers/`` are not
+    ``BaseTokenizer`` subclasses, and each grew its own shortened content-block
+    walker that handled only the shapes its provider was expected to send. The
+    result was that every one of them priced most modern blocks at ~0: measured
+    on a 6,800-char block, ``OpenAITokenCounter`` returned 8 tokens for
+    ``tool_result``/``thinking``/``document``/``mcp_tool_result`` and — its own
+    Responses shapes — ``output_text``/``refusal``; ``AnthropicTokenCounter``
+    returned 7 for ``thinking``/``document``, which are Anthropic's own.
+
+    Rather than add a fifth partial walker, this lets them borrow the audited one.
+    It is image-safe (base64 blobs get a pixel-based estimate instead of being
+    serialized and priced as text) and bounds oversized blobs, which a naive
+    ``count_text(str(block))`` catch-all does not.
+    """
+
+    __slots__ = ("_count_text_fn",)
+
+    def __init__(self, count_text_fn: Callable[[str], int]) -> None:
+        self._count_text_fn = count_text_fn
+
+    def count_text(self, text: str) -> int:
+        return self._count_text_fn(text)
+
+
+def count_content_blocks(parts: list[Any], count_text_fn: Callable[[str], int]) -> int:
+    """Count a multi-part content list using *count_text_fn* for text.
+
+    Shared entry point for provider counters. See
+    :class:`_DelegatingBlockCounter` for why this exists.
+    """
+    return _DelegatingBlockCounter(count_text_fn)._count_content_parts(parts)

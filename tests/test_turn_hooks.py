@@ -102,6 +102,41 @@ def test_on_request_may_mutate_ctx():
     assert ctx.tools == [{"name": "keep"}]
 
 
+def test_request_runner_attributes_savings_with_handler_counters():
+    class Shrink:
+        name = "internal-hook-name"
+        savings_source = "tool_search"
+
+        def on_request(self, ctx: TurnContext) -> None:
+            ctx.tools = (ctx.tools or [])[:1]
+            ctx.messages[0]["content"] = "short"
+
+    register_turn_hook(Shrink())
+    tags = {}
+    ctx = _ctx(
+        messages=[{"role": "user", "content": "a much longer value"}],
+        tools=[{"name": "keep"}, {"name": "drop"}],
+        tags=tags,
+        count_messages=lambda messages: len(messages[0]["content"]),
+        count_tools=lambda tools: len(tools or []),
+    )
+
+    run_request_hooks(ctx)
+
+    from headroom.proxy.savings_attribution import from_tags
+
+    assert from_tags(tags) == [
+        {
+            "source": "tool_search",
+            "realized": True,
+            "estimated": False,
+            "tokens": 15,
+            "usd": 0.0,
+            "details": {"message_tokens_saved": 14, "tool_tokens_saved": 1},
+        }
+    ]
+
+
 # --- on_response replacement + re-drive loop ---------------------------------
 
 

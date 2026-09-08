@@ -52,6 +52,10 @@ DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_S
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
+# Previews carry verbatim tool-result content (post-redaction), which makes
+# proxy.log too sensitive for users to share in bug reports. Set to
+# 0/false/no/off to log byte counts only.
+PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
     r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
@@ -108,7 +112,21 @@ def _redact_retrieval_log_payload(payload: str) -> str:
     return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
 
 
+def _payload_preview_enabled() -> bool:
+    raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
+    if not _payload_preview_enabled():
+        return {
+            "payload_chars": len(payload),
+            "payload_preview_chars": 0,
+            "payload_truncated": len(payload) > 0,
+            "payload_preview": "",
+        }
     redacted = _redact_retrieval_log_payload(payload)
     preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
     truncated = len(redacted) > len(preview)
@@ -323,6 +341,36 @@ class CompressionStore:
             # persistence-side effect — the same content always hashes
             # deterministically under whichever function is in use.
             hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
+
+        # Refuse to persist a bare CCR marker as an entry's "original"
+        # (#2694). A marker is a *pointer* to content, never content: an
+        # entry like `hash=abc123 -> "<<ccr:abc123,base64,2.0KB>>"` answers a
+        # retrieve with the very placeholder the caller is trying to resolve,
+        # and (worse) can overwrite a good entry with a useless one. Any
+        # producer that gets here has lost the source bytes upstream, so fail
+        # loudly rather than silently converting "retrievable" into "gone".
+        # Narrow by design: only a *bare* marker is rejected. Legitimate
+        # originals may legally CONTAIN markers (nested offloads, a tool that
+        # echoed one), and refusing those would drop recoverable data.
+        #
+        # The rejected value is never echoed into the log. It is provably a
+        # bare marker here, but `original` is the store's credential-bearing
+        # payload in the general case (this issue was reported against an
+        # OAuth token), and an error path is exactly where that sort of leak
+        # survives review. `hash_key` already identifies the entry.
+        stripped = original.strip()
+        if stripped.startswith("<<ccr:") and stripped.endswith(">>") and "\n" not in stripped:
+            logger.error(
+                "CCR store: refusing to persist a bare retrieval marker as "
+                "original_content (hash=%s tool=%s strategy=%s len=%d) — the "
+                "producer lost the source bytes; retrieval for this hash will "
+                "miss instead of returning a placeholder",
+                hash_key,
+                tool_name,
+                compression_strategy,
+                len(stripped),
+            )
+            return hash_key
 
         entry = CompressionEntry(
             hash=hash_key,

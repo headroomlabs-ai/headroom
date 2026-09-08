@@ -2,10 +2,12 @@ import asyncio
 import base64
 import json
 import sys
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import anyio
+import httpx
 import pytest
 from fastapi import Request
 
@@ -14,6 +16,7 @@ from headroom.proxy.handlers.openai import (
     _is_allowed_websocket_origin,
     _openai_responses_unit_cache_key,
     _resolve_codex_routing_headers,
+    _responses_stateless_output_items,
 )
 
 
@@ -133,6 +136,30 @@ def test_openai_responses_unit_cache_key_includes_target_ratio() -> None:
 
     assert aggressive_key != default_key
     assert aggressive_key != balanced_key
+
+
+def test_responses_stateless_output_items_drop_unencrypted_reasoning() -> None:
+    assert _responses_stateless_output_items(None) == []
+    assert _responses_stateless_output_items(
+        [
+            {"type": "reasoning", "id": "rs-unusable", "summary": []},
+            {
+                "type": "reasoning",
+                "id": "rs-reusable",
+                "summary": [],
+                "encrypted_content": "encrypted",
+            },
+            {"type": "function_call", "call_id": "call-1"},
+        ]
+    ) == [
+        {
+            "type": "reasoning",
+            "id": "rs-reusable",
+            "summary": [],
+            "encrypted_content": "encrypted",
+        },
+        {"type": "function_call", "call_id": "call-1"},
+    ]
 
 
 class _DummyMetrics:
@@ -272,6 +299,106 @@ class _MemoryToolsOnlyHandler:
 
     def has_memory_tool_calls(self, response: dict, provider: str) -> bool:
         return False
+
+
+class _MemoryContinuationHandler(_MemoryToolsOnlyHandler):
+    async def _ensure_initialized(self) -> None:
+        self._backend = True
+
+    async def _execute_memory_tool(
+        self,
+        name: str,
+        args: dict,
+        user_id: str,
+        provider: str,
+    ) -> str:
+        assert (name, args, user_id, provider) == (
+            "memory_search",
+            {},
+            "user-1",
+            "openai",
+        )
+        return '{"memories": []}'
+
+    def has_memory_tool_calls(self, response: dict, provider: str) -> bool:
+        assert provider == "openai"
+        return any(
+            item.get("name") == "memory_search"
+            for item in response.get("output", [])
+            if isinstance(item, dict)
+        )
+
+
+class _ZdrResponsesHandler(_DummyOpenAIHandler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.memory_handler = _MemoryContinuationHandler()
+        self.requests: list[dict] = []
+
+    async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):
+        assert (method, url) == ("POST", "https://api.openai.com/v1/responses")
+        self.requests.append(deepcopy(body))
+        request = httpx.Request(method, url)
+        if len(self.requests) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp-initial",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "reasoning-1",
+                            "summary": [],
+                            "encrypted_content": "encrypted-1",
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc-1",
+                            "call_id": "call-1",
+                            "name": "memory_search",
+                            "arguments": "{}",
+                        },
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 2},
+                },
+                request=request,
+            )
+        if any(
+            isinstance(item, dict)
+            and item.get("type") == "reasoning"
+            and not item.get("encrypted_content")
+            for item in body.get("input", [])
+            if isinstance(body.get("input"), list)
+        ):
+            return httpx.Response(
+                400,
+                json={
+                    "error": {"message": "Reasoning item is not reusable without encrypted_content"}
+                },
+                request=request,
+            )
+        if "previous_response_id" in body:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unknown parameter: 'previous_response_id'.",
+                        "type": "invalid_request_error",
+                        "param": "previous_response_id",
+                        "code": "unsupported_parameter",
+                    }
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-final",
+                "output": [{"type": "message", "id": "message-1"}],
+                "usage": {"input_tokens": 8, "output_tokens": 3},
+            },
+            request=request,
+        )
 
 
 def _build_request(body: dict, headers: dict[str, str]) -> Request:
@@ -423,7 +550,7 @@ def test_handle_openai_responses_chatgpt_codex_timeout_fails_open(monkeypatch):
     assert body["store"] is False
 
 
-def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeypatch):
+def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_tools(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello", "store": False},
         {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
@@ -444,8 +571,111 @@ def test_handle_openai_responses_api_auth_store_false_skips_memory_tools(monkeyp
     _, url, _, body = handler.captured_request
     assert url == "https://api.openai.com/v1/responses"
     assert body["store"] is False
-    assert "tools" not in body
+    assert [tool["name"] for tool in body["tools"]] == ["memory_search"]
+    assert body["include"] == ["reasoning.encrypted_content"]
     assert memory_handler.compute_calls == 1
+
+
+@pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])
+@pytest.mark.parametrize(
+    "include",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param(["response.output_text.done"], id="missing-marker"),
+        pytest.param(
+            ["response.output_text.done", "reasoning.encrypted_content"],
+            id="existing-marker",
+        ),
+        pytest.param("not-a-list", id="non-list"),
+    ],
+)
+def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkeypatch):
+    body = {
+        "model": "gpt-5.4",
+        "previous_response_id": "resp-inherited",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+            {
+                "type": "reasoning",
+                "id": "prior-reasoning",
+                "summary": [],
+                "encrypted_content": "prior-encrypted",
+            },
+            {
+                "type": "reasoning",
+                "id": "prior-unencrypted-reasoning",
+                "summary": [],
+            },
+        ],
+    }
+    if include is not None:
+        body["include"] = include
+    if store is not None:
+        body["store"] = store
+    request = _build_request(
+        body,
+        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+    )
+    handler = _ZdrResponsesHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert len(handler.requests) == 2
+    first_body, continuation_body = handler.requests
+    expected_include = (
+        ["reasoning.encrypted_content"]
+        if include is None
+        else (
+            include
+            if not isinstance(include, list)
+            else (
+                include
+                if "reasoning.encrypted_content" in include
+                else [*include, "reasoning.encrypted_content"]
+            )
+        )
+    )
+    assert first_body["include"] == expected_include
+    assert continuation_body["include"] == expected_include
+    assert first_body["previous_response_id"] == "resp-inherited"
+    assert ("store" in first_body) is (store is not None)
+    if store is not None:
+        assert first_body["store"] is store
+    else:
+        assert "store" not in first_body
+    assert continuation_body["input"] == [
+        body["input"][0],
+        body["input"][1],
+        {
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "summary": [],
+            "encrypted_content": "encrypted-1",
+        },
+        {
+            "type": "function_call",
+            "id": "fc-1",
+            "call_id": "call-1",
+            "name": "memory_search",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"memories": []}',
+        },
+    ]
+    assert "previous_response_id" not in continuation_body
+    assert ("store" in continuation_body) is (store is not None)
+    if store is not None:
+        assert continuation_body["store"] is store
 
 
 def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):
@@ -466,6 +696,74 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_non_stream_adapts_sse_upstream(monkeypatch):
+    """A ``stream: false`` request whose upstream replies ``200
+    text/event-stream`` must be adapted to the terminal response JSON, not
+    converted into a 502 proxy_error (#2613)."""
+    import httpx
+
+    sse = (
+        b"event: response.completed\n"
+        b'data: {"type":"response.completed","response":{"id":"resp_sse_repro",'
+        b'"output":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+    )
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    payload = json.loads(response.body)
+    assert payload["id"] == "resp_sse_repro"
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_handle_openai_responses_non_stream_passes_through_unparseable_sse(monkeypatch):
+    """A 200 SSE upstream body with no recognizable terminal response event
+    must be forwarded as-is — never converted into a 502 (#2613)."""
+    import httpx
+
+    sse = b"event: response.weird\ndata: not-json\n\n"
+
+    class _SSEUpstreamHandler(_DummyOpenAIHandler):
+        async def _retry_request(self, method, url, headers, body, **kwargs):
+            self.captured_request = (method, url, headers, body)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse,
+            )
+
+    request = _build_request(
+        {"model": "gpt-5.4", "stream": False, "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _SSEUpstreamHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200, response.body
+    assert response.body == sse
+    assert response.headers["content-type"] == "text/event-stream"
 
 
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):

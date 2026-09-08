@@ -104,7 +104,7 @@ async fn bedrock_classified_as_oauth() {
         auth_mode.as_str().to_string()
     }
     let app = Router::new()
-        .route("/model/:model_id/invoke", post(probe))
+        .route("/model/{model_id}/invoke", post(probe))
         .route_layer(axum::middleware::from_fn(classify_and_attach_auth_mode));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

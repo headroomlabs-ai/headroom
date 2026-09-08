@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from headroom.dashboard import get_dashboard_html
+from headroom.dashboard import STATIC_DIR, get_dashboard_html
 
 playwright = pytest.importorskip("playwright.sync_api")
 Page = playwright.Page
@@ -153,9 +153,29 @@ def _sample_history() -> dict:
     }
 
 
+def _fulfill_static_asset(route, path: str) -> bool:  # type: ignore[no-untyped-def]
+    """Serve the vendored dashboard JS from disk; True when it handled the route.
+
+    The harnesses in this file and its siblings intercept every request, so the
+    dashboard's relative asset URLs would otherwise fall through to a real fetch
+    against a fake origin with nothing listening. Alpine has to load: every
+    section of <main> lives inside a `<template x-if>`, which renders nothing at
+    all without it, so an empty <main> is the symptom to look for here.
+    """
+    if not path.startswith("/dashboard/static/"):
+        return False
+    route.fulfill(
+        status=200,
+        content_type="text/javascript",
+        body=(STATIC_DIR / Path(path).name).read_bytes(),
+    )
+    return True
+
+
 def _install_dashboard_routes(page: Page) -> None:
     stats = _sample_stats()
     history = _sample_history()
+    lifetime = {"projects": {}}
     health = {"status": "healthy", "version": "0.3.0"}
     dashboard_html = get_dashboard_html()
 
@@ -167,12 +187,17 @@ def _install_dashboard_routes(page: Page) -> None:
         if path in ("/dashboard", "/"):
             route.fulfill(status=200, content_type="text/html", body=dashboard_html)
             return
+        if _fulfill_static_asset(route, path):
+            return
         if "/stats-history" in path:
             route.fulfill(
                 status=200,
                 content_type="application/json",
                 body=json.dumps(history),
             )
+            return
+        if path.endswith("/stats-lifetime"):
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(lifetime))
             return
         if path.endswith("/stats"):
             route.fulfill(status=200, content_type="application/json", body=json.dumps(stats))
@@ -192,6 +217,7 @@ def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
         _install_dashboard_routes(page)
 
         page.goto("http://127.0.0.1:8788/dashboard", wait_until="load")
+        page.get_by_role("button", name="Lifetime", exact=True).click()
         expect(
             page.get_by_text(
                 "ANTHROPIC_BASE_URL: http://127.0.0.1:8788/p/<project-name>", exact=True
@@ -204,6 +230,7 @@ def test_dashboard_per_project_setup_url_uses_current_origin() -> None:
         ).to_have_count(0)
 
         page.goto("http://headroom.local:9393/dashboard", wait_until="load")
+        page.get_by_role("button", name="Lifetime", exact=True).click()
         expect(
             page.get_by_text(
                 "ANTHROPIC_BASE_URL: http://headroom.local:9393/p/<project-name>", exact=True

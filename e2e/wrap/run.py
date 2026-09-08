@@ -35,6 +35,10 @@ CONTINUE_PORT = 28893
 GOOSE_PORT = 28894
 OPENHANDS_PORT = 28895
 OPENCODE_PORT = 28896
+CLAUDE_PORT = 28897
+VSCODE_PORT = 28898
+VSCODE_CLAUDE_PORT = 28899
+MOCK_UPSTREAM_PORT = 19001
 
 
 def log(message: str) -> None:
@@ -116,6 +120,13 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         self._record()
+        if self.path == "/copilot_internal/user":
+            port = self.server.server_address[1]
+            self._write_json(
+                200,
+                {"endpoints": {"api": f"http://127.0.0.1:{port}/v1"}},
+            )
+            return
         if self.path == "/v1/models":
             self._write_json(
                 200,
@@ -161,6 +172,38 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                         "completion_tokens": 5,
                         "total_tokens": 17,
                     },
+                },
+            )
+            return
+        if self.path in {"/responses", "/v1/responses"}:
+            self._write_json(
+                200,
+                {
+                    "id": "resp-e2e",
+                    "object": "response",
+                    "model": payload.get("model"),
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "mock response"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                },
+            )
+            return
+        if self.path == "/v1/messages":
+            self._write_json(
+                200,
+                {
+                    "id": "msg_e2e",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": payload.get("model", "claude-sonnet-4-6"),
+                    "content": [{"type": "text", "text": "mock Claude response"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 12, "output_tokens": 4},
                 },
             )
             return
@@ -634,7 +677,7 @@ def verify_codex_wrap(
 
 
 def verify_claude_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
-    port = PROXY_PORT + 10
+    port = CLAUDE_PORT
     run(
         ["headroom", "wrap", "claude", "--port", str(port), "--", "--help"],
         env=base_env,
@@ -714,6 +757,178 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
     finally:
         stop_process(proc)
+
+
+def verify_vscode_wrap(
+    base_env: dict[str, str], project_dir: Path, mock_server: MockOpenAIServer
+) -> None:
+    """Exercise the Linux settings lifecycle without real Copilot credentials."""
+    port = VSCODE_PORT
+    settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    original = b'{\n  // existing user setting\n  "editor.fontSize": 15\n}\n'
+    settings_path.write_bytes(original)
+
+    env = base_env.copy()
+    for name in (
+        "COPILOT_GITHUB_TOKEN",
+        "COPILOT_PROVIDER_BEARER_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "GITHUB_COPILOT_API_TOKEN": "synthetic-e2e-token",
+            "GITHUB_COPILOT_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "GITHUB_COPILOT_USER_INFO_URL": (
+                f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/copilot_internal/user"
+            ),
+            "HEADROOM_COPILOT_AUTH_FILE": str(Path(base_env["HOME"]) / "copilot-auth.json"),
+        }
+    )
+
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = settings_path.read_text(encoding="utf-8")
+        assert_true(
+            f'"github.copilot.advanced.debug.overrideProxyUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should configure the project-scoped proxy URL",
+        )
+        assert_true(
+            f'"github.copilot.advanced.debug.overrideCapiUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should route Copilot Chat generation through Headroom",
+        )
+        assert_true(
+            "overrideAuthType" not in configured,
+            "VS Code wrap must not write overrideAuthType: no such setting exists in "
+            "the modern Copilot Chat extension, so VS Code flags it as unknown (#3076)",
+        )
+        assert_true(
+            "synthetic-e2e-token" not in configured, "Settings must not contain credentials"
+        )
+        assert_true("model" not in configured.lower(), "Settings must not override model selection")
+        assert_true(
+            str(settings_path) in output, "Wrap output should identify the Linux settings path"
+        )
+
+        health = wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15).json()
+        assert_true(
+            health.get("config", {}).get("openai_api_url")
+            == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
+            "VS Code proxy should use the mocked Copilot upstream",
+        )
+        models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+        start = len(mock_server.requests)
+        for model in models:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}{project_prefix}/v1/responses",
+                json={"model": model, "input": "model swap probe", "stream": False},
+                timeout=10.0,
+            )
+            assert_true(
+                response.status_code == 200,
+                f"VS Code route failed for {model}: {response.status_code} {response.text}",
+            )
+            assert_true(
+                response.json().get("model") == model,
+                f"VS Code response did not reflect selected model {model}",
+            )
+        forwarded = [
+            item["body"].get("model")
+            for item in mock_server.requests[start:]
+            if item["path"].endswith("/responses") and isinstance(item["body"], dict)
+        ]
+        assert_true(
+            forwarded == models,
+            f"VS Code outbound model sequence changed: {forwarded!r}",
+        )
+    finally:
+        stop_process(proc)
+
+    assert_true(settings_path.read_bytes() != original, "Ctrl+C should leave managed settings")
+    run(["headroom", "unwrap", "vscode"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        settings_path.read_bytes() == original,
+        "VS Code unwrap should restore the original settings byte-for-byte",
+    )
+
+
+def verify_vscode_claude_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Exercise Claude Code's settings, proxy request, and restore lifecycle."""
+    port = VSCODE_CLAUDE_PORT
+    settings_path = Path(base_env["HOME"]) / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    original = {"env": {"KEEP": "yes"}, "permissions": {"allow": ["Read"]}}
+    settings_path.write_text(json.dumps(original), encoding="utf-8")
+
+    env = base_env.copy()
+    env["ANTHROPIC_TARGET_API_URL"] = f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}"
+    proc = subprocess.Popen(
+        ["headroom", "wrap", "vscode-claude", "--port", str(port)],
+        env=env,
+        cwd=str(project_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        output = wait_for_output(proc, "Press Ctrl+C to stop the proxy.", timeout=30)
+        project_prefix = f"/p/{quote(project_dir.name, safe='')}"
+        configured = json.loads(settings_path.read_text(encoding="utf-8"))
+        proxy_url = configured["env"]["ANTHROPIC_BASE_URL"]
+        assert_true(
+            proxy_url == f"http://127.0.0.1:{port}{project_prefix}",
+            "VS Code Claude wrap should configure the project-scoped Anthropic URL",
+        )
+        assert_true(
+            configured["env"]["ENABLE_TOOL_SEARCH"] == "false",
+            "VS Code Claude wrap should disable tool deferral for webview compatibility",
+        )
+        assert_true(configured["env"]["KEEP"] == "yes", "Existing Claude env must remain")
+        assert_true(str(settings_path) in output, "Wrap output should identify Claude settings")
+
+        response = httpx.post(
+            f"{proxy_url}/v1/messages",
+            headers={"x-api-key": "synthetic-anthropic-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply briefly"}],
+            },
+            timeout=30,
+        )
+        assert_true(response.status_code == 200, "Claude request should traverse Headroom")
+        assert_true(
+            response.json()["content"][0]["text"] == "mock Claude response",
+            "Claude response should return through Headroom",
+        )
+    finally:
+        stop_process(proc)
+
+    run(["headroom", "unwrap", "vscode-claude"], env=env, cwd=project_dir, timeout=60)
+    assert_true(
+        json.loads(settings_path.read_text(encoding="utf-8")) == original,
+        "VS Code Claude unwrap should restore existing Claude settings",
+    )
 
 
 def verify_cline_wrap(base_env: dict[str, str], project_dir: Path) -> None:
@@ -880,14 +1095,14 @@ def main() -> None:
             path.mkdir(parents=True, exist_ok=True)
         create_shims(shim_dir)
 
-        mock_server, mock_thread = start_mock_server(19001)
+        mock_server, mock_thread = start_mock_server(MOCK_UPSTREAM_PORT)
         base_env = os.environ.copy()
         base_env.update(
             {
                 "HOME": str(home_dir),
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
-                "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
+                "OPENAI_TARGET_API_URL": f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             }
         )
 
@@ -897,6 +1112,8 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir, mock_server)
+            verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)
             verify_goose_wrap(base_env, project_dir)

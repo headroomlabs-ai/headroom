@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult
+from ..config import CCRConfig, TransformResult, is_tool_excluded
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
@@ -653,11 +653,12 @@ class SmartCrusher(Transform):
         kept, lost = self._splice_missing_protected(protected, kept)
         if len(kept) != before_count:
             # Only reserialize when something was actually spliced in —
-            # an unmodified `kept` stays byte-identical to Rust's output
-            # (Python's `json.dumps` and serde_json don't necessarily
-            # agree on e.g. non-ASCII escaping).
+            # an unmodified `kept` stays byte-identical to Rust's output.
+            # ensure_ascii=False matches serde_json (which never escapes
+            # non-ASCII), so a splice doesn't turn readable unicode into
+            # model-visible \uXXXX soup.
             result = dict(result)
-            result["items"] = json.dumps(kept)
+            result["items"] = json.dumps(kept, ensure_ascii=False)
         if not lost:
             return result
 
@@ -712,7 +713,9 @@ class SmartCrusher(Transform):
             kept, lost = self._splice_missing_protected(protected, parsed)
             # Only reserialize when something was actually spliced in —
             # see the matching comment in `_apply_audit_safe_protection`.
-            candidate = json.dumps(kept) if len(kept) != len(parsed) else crushed
+            candidate = (
+                json.dumps(kept, ensure_ascii=False) if len(kept) != len(parsed) else crushed
+            )
         else:
             lost = sum(
                 max(0, len(p.findall(original_content)) - len(p.findall(crushed)))
@@ -1202,7 +1205,12 @@ class SmartCrusher(Transform):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg.get("tool_calls", []):
                     if isinstance(tc, dict):
-                        func = tc.get("function", {})
+                        # `tc.get("function", {})` returns None for an explicit
+                        # {"function": null} (the default only applies to a
+                        # missing key), and `.get` on None raises AttributeError,
+                        # crashing apply(). Use the null-safe form the sibling
+                        # `_build_tool_name_index` already uses (line ~118).
+                        func = tc.get("function") or {}
                         args = func.get("arguments", "")
                         if isinstance(args, str) and args:
                             context_parts.append(args)
@@ -1280,7 +1288,10 @@ class SmartCrusher(Transform):
                 # unresolvable retrieval loop.
                 # ponytail: ceiling is tool_call_id lookup; if the id is missing we
                 # compress (conservative: unknown tool names don't get a free pass).
-                if tool_names_by_id.get(msg.get("tool_call_id") or "") == CCR_TOOL_NAME:
+                if is_tool_excluded(
+                    tool_names_by_id.get(msg.get("tool_call_id") or "") or "",
+                    (CCR_TOOL_NAME,),
+                ):
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
@@ -1310,7 +1321,10 @@ class SmartCrusher(Transform):
                     # would produce a new <<ccr:hash>> marker the agent cannot
                     # redeem (infinite retrieval loop).
                     # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
-                    if tool_names_by_id.get(block.get("tool_use_id") or "") == CCR_TOOL_NAME:
+                    if is_tool_excluded(
+                        tool_names_by_id.get(block.get("tool_use_id") or "") or "",
+                        (CCR_TOOL_NAME,),
+                    ):
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):

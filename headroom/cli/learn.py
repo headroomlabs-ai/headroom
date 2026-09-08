@@ -225,6 +225,7 @@ def learn(
     total_projects = 0
     total_failures = 0
     total_recommendations = 0
+    total_analysis_failures = 0
     matched_projects = 0
     available_projects: list[tuple[str, Path]] = []
 
@@ -299,6 +300,12 @@ def learn(
                 f"Failures: {result_data.total_failures} ({result_data.failure_rate:.1%})"
             )
 
+            analysis_error = getattr(result_data, "analysis_error", None)
+            if analysis_error:
+                total_analysis_failures += 1
+                click.echo(f"  Analysis failed: {analysis_error}", err=True)
+                continue
+
             if result_data.failure_rate == 0 and not result_data.recommendations:
                 click.echo("  No failures or patterns found.")
                 continue
@@ -350,6 +357,9 @@ def learn(
             f"{total_recommendations} recommendations"
         )
 
+    if total_analysis_failures:
+        raise SystemExit(1)
+
 
 def _make_llm_judge(model: str) -> Any:
     """Build an LLM judge callable for verbosity, or None if unavailable.
@@ -400,8 +410,9 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     When a proxy is already running locally we hot-enable it via
     ``/admin/runtime-env`` (no restart, the same channel ``wrap`` uses), so
     ``--apply`` actually takes effect. Returns ``(status, port)`` where status is
-    ``"live"`` (enabled on a running proxy), ``"absent"`` (no reachable proxy),
-    or ``"error"``.
+    ``"live"`` (enabled on a running proxy), ``"blocked"`` (the proxy's
+    rollout channel rejected it), ``"absent"`` (no reachable proxy), or
+    ``"error"``.
     """
     import json as _json
     import os as _os
@@ -417,7 +428,22 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     )
     try:
         with urllib.request.urlopen(request, timeout=2) as response:
-            response.read()
+            raw_response = response.read()
+        payload = _json.loads(raw_response) if raw_response else {}
+        rollout = payload.get("rollout") if isinstance(payload, dict) else None
+        if isinstance(rollout, dict):
+            decisions = rollout.get("features")
+            if isinstance(decisions, list):
+                output_shaper = next(
+                    (
+                        item
+                        for item in decisions
+                        if isinstance(item, dict) and item.get("name") == "proxy_output_shaper"
+                    ),
+                    None,
+                )
+                if isinstance(output_shaper, dict) and not output_shaper.get("enabled", False):
+                    return "blocked", resolved_port
         return "live", resolved_port
     except (urllib.error.URLError, OSError):
         # ConnectionRefused (no proxy) or 404 (proxy predates the endpoint).
@@ -555,8 +581,17 @@ def _run_verbosity(
                 f"level {best_profile.level} is live now (while HEADROOM_VERBOSITY_LEVEL is unset)."
             )
             click.echo(
-                "    To keep it on across restarts: export HEADROOM_OUTPUT_SHAPER=1 "
-                "before `headroom wrap ...` (wrap pushes it to the proxy)."
+                "    To keep it on across restarts: export HEADROOM_ROLLOUT_CHANNEL=beta "
+                "and HEADROOM_OUTPUT_SHAPER=1 before `headroom wrap ...`."
+            )
+        elif status == "blocked":
+            click.echo(
+                "\n  ⚠ Level written, but the running proxy's rollout channel blocks the "
+                "beta output shaper."
+            )
+            click.echo(
+                "    Restart it with HEADROOM_ROLLOUT_CHANNEL=beta and "
+                "HEADROOM_OUTPUT_SHAPER=1; the learned level will be used automatically."
             )
         else:
             click.echo(
@@ -564,9 +599,10 @@ def _run_verbosity(
                 "NOT shaping output yet."
             )
             click.echo(
-                "    Enable it: export HEADROOM_OUTPUT_SHAPER=1 then `headroom wrap ...` "
-                "(or start `headroom proxy` with it set). The learned level is then used "
-                "automatically while HEADROOM_VERBOSITY_LEVEL is unset."
+                "    Enable it: export HEADROOM_ROLLOUT_CHANNEL=beta and "
+                "HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` (or restart "
+                "`headroom proxy`). The learned level is then used automatically while "
+                "HEADROOM_VERBOSITY_LEVEL is unset."
             )
     else:
         click.echo("\n  Dry run — use --apply to persist the level and baseline.")

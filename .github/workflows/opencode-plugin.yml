@@ -11,12 +11,14 @@ on:
     paths:
       - "plugins/opencode/**"
       - "headroom/providers/opencode/_dist/**"
+      - "headroom/providers/opencode/hook-shim/**"
       - ".github/workflows/opencode-plugin.yml"
   push:
     branches: [main]
     paths:
       - "plugins/opencode/**"
       - "headroom/providers/opencode/_dist/**"
+      - "headroom/providers/opencode/hook-shim/**"
       - ".github/workflows/opencode-plugin.yml"
 
 permissions:
@@ -32,7 +34,7 @@ jobs:
         working-directory: plugins/opencode
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -51,3 +53,6 @@ jobs:
           cmp dist-standalone/entry.opencode.js \
             ../../headroom/providers/opencode/_dist/entry.opencode.js \
             || { echo "::error::headroom/providers/opencode/_dist/entry.opencode.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }
+          cmp dist-standalone/hook-shim/handler.js \
+            ../../headroom/providers/opencode/hook-shim/handler.js \
+            || { echo "::error::headroom/providers/opencode/hook-shim/handler.js is stale - run 'npm run build:standalone' in plugins/opencode and commit the result"; exit 1; }

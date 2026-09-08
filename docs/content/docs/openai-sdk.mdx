@@ -42,9 +42,11 @@ That's it. Every call to `client.chat.completions.create()` compresses the messa
 `withHeadroom()` returns a proxy around your OpenAI client that intercepts `chat.completions.create()`:
 
 1. Extracts `messages` from the request params
-2. Sends them to the Headroom proxy's `/v1/compress` endpoint
+2. Sends them to the Headroom proxy's [`POST /v1/compress`](/docs/proxy#post-v1compress) endpoint
 3. Replaces the original messages with the compressed result
 4. Forwards the request to OpenAI as normal
+
+The SDK talks to a **local** proxy, which is why no extra configuration is needed: `/v1/compress` is loopback-only by default. If you move the proxy to another host, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` on it or requests come back `404`.
 
 All other client methods are untouched:
 

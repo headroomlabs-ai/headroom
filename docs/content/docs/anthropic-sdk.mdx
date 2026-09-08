@@ -41,7 +41,7 @@ Every call to `client.messages.create()` compresses messages first. The response
 
 `withHeadroom()` returns a proxy around your Anthropic client that intercepts `messages.create()`:
 
-1. Converts Anthropic-format messages to OpenAI format (the compression engine's native format)
+1. Converts Anthropic-format messages to OpenAI format
 2. Sends them to the Headroom proxy's `/v1/compress` endpoint
 3. Converts the compressed messages back to Anthropic format
 4. Forwards the request to Anthropic as normal
@@ -57,6 +57,10 @@ The adapter handles the full Anthropic message format including content blocks:
 | `{ type: "tool_result", tool_use_id, content }` | `{ role: "tool", tool_call_id, content }` |
 
 This conversion is lossless. Your request and response behave identically to an unwrapped client.
+
+<Callout type="info" title="The conversion is an SDK choice, not an API requirement">
+`POST /v1/compress` does no format conversion and compresses Anthropic content blocks natively — see [Message format](/docs/proxy#message-format). If you are calling the endpoint directly (from a gateway, or LiteLLM's `headroom` guardrail), send Anthropic-shaped messages as-is; you get the same shape back. Only this TypeScript adapter converts, because it normalises on OpenAI types internally.
+</Callout>
 
 ## Options
 

@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import click
+from click.core import ParameterSource
 
 from headroom._subprocess import run
 from headroom.install.health import probe_json, probe_ready
@@ -36,6 +37,7 @@ from headroom.install.runtime import (
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    list_manifests,
     load_manifest,
     save_manifest,
 )
@@ -65,14 +67,82 @@ def install() -> None:
     """Install and manage persistent Headroom deployments."""
 
 
+def _profile_selection_was_explicit() -> bool:
+    """True when the current command received an explicit ``--profile``.
+
+    An explicit selection must be honored verbatim or rejected, never redirected
+    to ``HEADROOM_DEPLOYMENT_PROFILE`` or a lone installed deployment: silently
+    operating ``stop``/``restart``/``remove`` on a different profile than the one
+    the user typed is dangerous. Only a defaulted (omitted) ``--profile`` is
+    eligible for the recovery fallback. Outside a Click command context (direct
+    calls / unit tests) there is no explicit selection to protect.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    return bool(ctx.get_parameter_source("profile") == ParameterSource.COMMANDLINE)
+
+
+def _missing_profile_error(
+    name: str,
+    installed: list[DeploymentManifest],
+    *,
+    source: str | None = None,
+) -> click.ClickException:
+    if installed:
+        names = ", ".join(sorted(m.profile for m in installed))
+        hint = f" Installed: {names}. Select one with --profile <name>."
+    else:
+        hint = " No deployments are installed; run `headroom init` or `headroom install apply`."
+    origin = f" (from {source})" if source else ""
+    return click.ClickException(f"No deployment profile named '{name}'{origin} is installed.{hint}")
+
+
 def _require_manifest(profile: str) -> DeploymentManifest:
     try:
         manifest = load_manifest(profile)
     except ManifestError as e:
         raise click.ClickException(str(e)) from None
-    if manifest is None:
-        raise click.ClickException(f"No deployment profile named '{profile}' is installed.")
-    return manifest
+    if manifest is not None:
+        return manifest
+
+    # The requested profile isn't installed. `headroom init` installs under a
+    # non-"default" profile name (e.g. init-user), while every lifecycle command
+    # defaults --profile to "default" -- so on an init'd machine the documented
+    # bare commands (`headroom install status`, etc.) would all dead-end (#2811).
+    installed = list_manifests()
+
+    # An EXPLICIT --profile is honored or rejected verbatim, never redirected: a
+    # typo must not silently act on the env/lone profile (#2832 review).
+    if _profile_selection_was_explicit():
+        raise _missing_profile_error(profile, installed)
+
+    # --profile was defaulted. A non-empty HEADROOM_DEPLOYMENT_PROFILE (which the
+    # runtime exports) is itself an explicit selection: honor it when installed,
+    # otherwise fail naming it. It must never fall through to the lone-manifest
+    # fallback and silently operate on a different deployment (#2832 review).
+    env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
+    if env_profile:
+        if env_profile != profile:
+            try:
+                resolved = load_manifest(env_profile)
+            except ManifestError:
+                resolved = None
+            if resolved is not None:
+                return resolved
+        raise _missing_profile_error(env_profile, installed, source="HEADROOM_DEPLOYMENT_PROFILE")
+
+    # Neither CLI nor environment named a profile. A single installed deployment
+    # is unambiguous, so use it; otherwise report what is available.
+    if len(installed) == 1:
+        return installed[0]
+    raise _missing_profile_error(profile, installed)
+
+
+def _is_windows() -> bool:
+    """Return whether this command is running on Windows."""
+
+    return sys.platform.startswith("win")
 
 
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
@@ -435,9 +505,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--port",
     "-p",
     default=8787,
+    envvar="HEADROOM_PORT",
     type=click.IntRange(1, 65535),
     show_default=True,
-    help="Persistent proxy port.",
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",
@@ -495,7 +566,8 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.) in the "
-        "persistent runtime. Off by default while this feature ships."
+        "persistent runtime. This also selects the required canary rollout channel "
+        "unless --env HEADROOM_ROLLOUT_CHANNEL=... is supplied."
     ),
 )
 @click.option(
@@ -593,6 +665,16 @@ def install_apply(
         bedrock_profile=bedrock_profile,
         extra_env=combined_env,
     )
+    if (
+        preset == InstallPreset.PERSISTENT_SERVICE.value
+        and manifest.preset == InstallPreset.PERSISTENT_TASK.value
+        and _is_windows()
+    ):
+        click.echo(
+            "Warning: persistent-service is not supported on Windows because the "
+            "Python runner cannot act as a Windows service. Falling back to "
+            "persistent-task with Task Scheduler."
+        )
 
     _apply_manifest(manifest)
     _echo_installed(manifest)
@@ -601,7 +683,13 @@ def install_apply(
 @main.command("deploy")
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    envvar="HEADROOM_PORT",
+    type=int,
+    show_default=True,
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",

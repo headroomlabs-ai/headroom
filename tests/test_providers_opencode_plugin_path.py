@@ -31,6 +31,23 @@ def test_packaged_bundle_is_committed_and_self_contained() -> None:
     assert 'from "@opencode-ai/plugin"' not in text
 
 
+def test_hook_shim_is_committed_next_to_the_entry_bundle() -> None:
+    # transport.ts resolves `../hook-shim/handler.js` next to the loaded entry,
+    # so the shim must ship as a sibling of _dist/. Without it, Node children
+    # spawned under `headroom wrap opencode` lose fetch/http routing (the
+    # existsSync guard skips injection), and before that guard they crashed with
+    # ERR_MODULE_NOT_FOUND on every Node MCP (#2850, #2806).
+    shim = _PACKAGED.resolve().parent.parent / "hook-shim" / "handler.js"
+    assert shim.is_file(), "committed wheel hook-shim missing - run npm run build:standalone"
+    text = shim.read_text(encoding="utf-8")
+    assert len(text) > 5_000, "hook-shim suspiciously small - not the standalone build?"
+    # Self-contained standalone build, not the checkout dev shim (which imports
+    # the non-bundled ../dist/index.js that site-packages has no node_modules for).
+    assert 'from "../dist/index.js"' not in text
+    assert "installHeadroomTransport" in text
+    assert "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL" in text
+
+
 def test_plugin_path_env_override_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     override = tmp_path / "custom.js"
     override.write_text("// plugin")

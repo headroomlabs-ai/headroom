@@ -761,7 +761,9 @@ def test_recovery_keeps_newest_divergent_rollout_and_backs_up_both(
     sys.platform == "win32" or not hasattr(socket, "AF_UNIX"),
     reason="requires POSIX Unix domain sockets",
 )
-def test_recovery_records_sockets_and_secures_both_backups(tmp_path: Path) -> None:
+def test_recovery_records_sockets_and_secures_both_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     target = tmp_path / "codex"
     source = tmp_path / "headroom-codex-home-broken"
     target.mkdir(mode=0o755)
@@ -773,8 +775,11 @@ def test_recovery_records_sockets_and_secures_both_backups(tmp_path: Path) -> No
     fifo_path = source / "codex.pipe"
     os.mkfifo(fifo_path)
 
+    # AF_UNIX sun_path is capped (~104 bytes on macOS) and pytest's tmp_path can
+    # exceed it, so bind a short RELATIVE name from inside source.
+    monkeypatch.chdir(source)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as codex_socket:
-        codex_socket.bind(str(socket_path))
+        codex_socket.bind(socket_path.name)
         report = recover_codex_home(source=source, target=target)
 
     pinned = report.backup_dir / "source-pinned"

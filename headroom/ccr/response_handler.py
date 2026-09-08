@@ -58,6 +58,7 @@ class CCRToolResult:
     content: str
     success: bool
     items_retrieved: int = 0
+    tool_name: str | None = None
 
 
 @dataclass
@@ -211,6 +212,7 @@ class CCRResponseHandler:
                     tool_call_id=ccr_call.tool_call_id,
                     content=content,
                     success=False,
+                    tool_name=ccr_call.tool_name,
                 )
 
             # Retrieval is by hash: always return the full original content.
@@ -229,6 +231,7 @@ class CCRResponseHandler:
                     content=content,
                     success=True,
                     items_retrieved=entry.original_item_count,
+                    tool_name=ccr_call.tool_name,
                 )
 
             miss_status = (
@@ -249,6 +252,7 @@ class CCRResponseHandler:
                 tool_call_id=ccr_call.tool_call_id,
                 content=content,
                 success=False,
+                tool_name=ccr_call.tool_name,
             )
 
         except Exception as e:
@@ -264,6 +268,7 @@ class CCRResponseHandler:
                 tool_call_id=ccr_call.tool_call_id,
                 content=content,
                 success=False,
+                tool_name=ccr_call.tool_name,
             )
 
     def _create_tool_result_message(
@@ -337,14 +342,13 @@ class CCRResponseHandler:
                     response_data = json.loads(result.content)
                 except json.JSONDecodeError:
                     response_data = {"content": result.content}
-                parts.append(
-                    {
-                        "functionResponse": {
-                            "name": result.tool_call_id,  # tool_call_id contains the function name for Google
-                            "response": response_data,
-                        }
-                    }
-                )
+                function_response = {
+                    "name": result.tool_name or result.tool_call_id,
+                    "response": response_data,
+                }
+                if result.tool_name and result.tool_call_id != result.tool_name:
+                    function_response["id"] = result.tool_call_id
+                parts.append({"functionResponse": function_response})
             return {
                 "role": "user",
                 "parts": parts,
@@ -399,7 +403,16 @@ class CCRResponseHandler:
             # echoed back verbatim as `input[]` items — not a single
             # role/content dict like chat completions. Sentinel key mirrors
             # `_openai_tool_results`; handle_response() extends on it.
-            return {"_openai_responses_output_items": response.get("output", [])}
+            # `.get("output", [])` only falls back when the key is absent, so a
+            # present-but-null `output` would return None and make the
+            # `current_messages.extend(...)` in handle_response raise TypeError;
+            # coerce to a list like the choices branch above.
+            output_items = response.get("output")
+            return {
+                "_openai_responses_output_items": output_items
+                if isinstance(output_items, list)
+                else []
+            }
         elif provider == "google":
             # Google/Gemini format: role is "model", content is in candidates[0].content.parts
             candidates = response.get("candidates", [])
@@ -558,10 +571,22 @@ class StreamingCCRBuffer:
     chunks: list[bytes] = field(default_factory=list)
     detected_ccr: bool = False
     complete_response: dict[str, Any] | None = None
+    provider: str = "anthropic"
 
-    # Patterns to detect tool_use in stream
+    # Wire markers for the start of a tool call. Anthropic streams
+    # `"type":"tool_use"` content blocks; OpenAI-compatible streams carry a
+    # `"tool_calls"` array inside `choices[].delta` and never emit the
+    # Anthropic marker, so scanning only for the latter meant CCR was never
+    # detected on an OpenAI stream.
     _tool_use_start: bytes = b'"type":"tool_use"'
+    _openai_tool_use_start: bytes = b'"tool_calls"'
     _ccr_tool_pattern: bytes = f'"{CCR_TOOL_NAME}"'.encode()
+
+    def _tool_call_marker(self) -> bytes:
+        """The provider's on-the-wire marker for the start of a tool call."""
+        if self.provider == "anthropic":
+            return self._tool_use_start
+        return self._openai_tool_use_start
 
     def add_chunk(self, chunk: bytes) -> bool:
         """Add a chunk and check for CCR tool calls.
@@ -574,7 +599,7 @@ class StreamingCCRBuffer:
         # Quick check: does accumulated content contain CCR tool?
         accumulated = b"".join(self.chunks)
 
-        if self._tool_use_start in accumulated and self._ccr_tool_pattern in accumulated:
+        if self._tool_call_marker() in accumulated and self._ccr_tool_pattern in accumulated:
             self.detected_ccr = True
             return True
 
@@ -609,7 +634,7 @@ class StreamingCCRHandler:
     ) -> None:
         self.response_handler = response_handler
         self.provider = provider
-        self.buffer = StreamingCCRBuffer()
+        self.buffer = StreamingCCRBuffer(provider=provider)
 
     async def process_stream(
         self,
@@ -635,8 +660,12 @@ class StreamingCCRHandler:
             Response chunks (possibly from continuation response).
         """
         # Phase 1: Initial detection
-        # Buffer chunks until we can determine if there's a CCR call
-        detection_complete = False
+        # Buffer chunks until we can determine if there's a CCR call.
+        #
+        # The end-of-stream marker is provider-specific. Anthropic signals the
+        # terminal state with `stop_reason` in `message_delta`; OpenAI-compatible
+        # streams have no such field and terminate with the `[DONE]` sentinel.
+        end_marker = b'"stop_reason"' if self.provider == "anthropic" else b"data: [DONE]"
 
         async for chunk in stream_iterator:
             self.buffer.add_chunk(chunk)
@@ -647,9 +676,7 @@ class StreamingCCRHandler:
             accumulated = self.buffer.get_accumulated()
 
             # Look for stream end markers
-            if b'"stop_reason"' in accumulated:
-                detection_complete = True
-
+            if end_marker in accumulated:
                 if self.buffer.detected_ccr:
                     # CCR detected - need to handle
                     break
@@ -666,13 +693,15 @@ class StreamingCCRHandler:
                     yield buffered_chunk
                 self.buffer.clear()
 
-        # Continue streaming rest of response
-        if not detection_complete and not self.buffer.detected_ccr:
-            async for chunk in stream_iterator:
-                if self.buffer.detected_ccr:
-                    self.buffer.add_chunk(chunk)
-                else:
-                    yield chunk
+        # The end marker is not guaranteed to arrive: upstream can truncate, a
+        # provider can omit the sentinel, or the stream can be a shape this
+        # detector does not recognise. Anything still buffered once the source
+        # iterator is exhausted is real response data the client has never
+        # seen, so flush it instead of dropping it.
+        if not self.buffer.detected_ccr and self.buffer.chunks:
+            for buffered_chunk in self.buffer.chunks:
+                yield buffered_chunk
+            self.buffer.clear()
 
         # Phase 2: Handle CCR if detected
         if self.buffer.detected_ccr:
@@ -890,19 +919,53 @@ class StreamingCCRHandler:
         }
 
         tool_calls_map: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        envelope: dict[str, Any] = {}
+        usage: Any = None
 
         for event in events:
-            choices = event.get("choices", [])
-            if not choices:
+            # Carry the chunk envelope through. Dropping it left the
+            # reconstructed body without `id`, `model`, `created` or `usage`,
+            # which downstream middleware reads for routing and metering.
+            for key in ("id", "created", "model", "system_fingerprint"):
+                value = event.get(key)
+                if value is not None:
+                    envelope[key] = value
+            if event.get("usage") is not None:
+                usage = event["usage"]
+
+            choices = event.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict):
                 continue
 
-            delta = choices[0].get("delta", {})
+            # `finish_reason` is null on every chunk but the last, so keep the
+            # most recent non-null value rather than the first one seen.
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+
+            # Some OpenAI-compatible providers send `"delta": null` on the
+            # terminal chunk instead of an empty object.
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
 
             if "content" in delta and delta["content"]:
                 message["content"] = (message.get("content") or "") + delta["content"]
 
-            if "tool_calls" in delta:
-                for tc_delta in delta["tool_calls"]:
+            # Guard the value, not just the key: some OpenAI-compatible
+            # providers include ``"tool_calls": null`` (and ``"function": null``)
+            # in a delta rather than omitting the key, which would make the
+            # iteration below raise ``TypeError: 'NoneType' object is not
+            # iterable`` and abort the whole reconstruction. Mirrors the
+            # ``and delta["content"]`` value-guard above.
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc_delta in tool_calls:
+                    if not isinstance(tc_delta, dict):
+                        continue
                     idx = tc_delta.get("index", 0)
                     if idx not in tool_calls_map:
                         tool_calls_map[idx] = {
@@ -914,22 +977,102 @@ class StreamingCCRHandler:
                     tc = tool_calls_map[idx]
                     if "id" in tc_delta:
                         tc["id"] = tc_delta["id"]
-                    if "function" in tc_delta:
-                        fn = tc_delta["function"]
+                    fn = tc_delta.get("function")
+                    if isinstance(fn, dict):
                         if "name" in fn:
                             tc["function"]["name"] = fn["name"]
                         if "arguments" in fn:
                             tc["function"]["arguments"] += fn["arguments"]
 
         message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())]
-        if not message["tool_calls"]:
+        has_tool_calls = bool(message["tool_calls"])
+        if not has_tool_calls:
             del message["tool_calls"]
         if not message["content"]:
             message["content"] = None
 
-        return {
-            "choices": [{"message": message, "finish_reason": "stop"}],
+        # OpenAI requires `finish_reason: "tool_calls"` whenever the message
+        # carries tool calls. This was hardcoded to "stop", which tells any
+        # client that drives its agent loop off `finish_reason` that the turn
+        # is over, so the reconstructed tool calls were never executed.
+        if has_tool_calls:
+            finish_reason = "tool_calls"
+        elif finish_reason is None:
+            finish_reason = "stop"
+
+        response: dict[str, Any] = {
+            "object": "chat.completion",
+            **envelope,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }
+        if usage is not None:
+            response["usage"] = usage
+        return response
+
+    def _openai_response_to_chunks(self, response: dict[str, Any]) -> list[bytes]:
+        """Split a non-streaming ``chat.completion`` body into SSE chunk frames.
+
+        A streaming client reads ``choices[].delta``, not ``choices[].message``.
+        Serialising the reconstructed non-streaming body into a single SSE frame
+        produced a stream in which both the text and the tool calls were
+        invisible to the client.
+        """
+        choices = response.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        if not isinstance(choice, dict):
+            choice = {}
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            message = {}
+        finish_reason = choice.get("finish_reason") or "stop"
+
+        base: dict[str, Any] = {"object": "chat.completion.chunk"}
+        for key in ("id", "created", "model", "system_fingerprint"):
+            if response.get(key) is not None:
+                base[key] = response[key]
+
+        def frame(delta: dict[str, Any], reason: str | None) -> bytes:
+            payload = {
+                **base,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": reason}],
+            }
+            return f"data: {json.dumps(payload)}\n\n".encode()
+
+        frames = [frame({"role": message.get("role") or "assistant"}, None)]
+
+        content = message.get("content")
+        if content:
+            frames.append(frame({"content": content}, None))
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for index, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    function = {}
+                frames.append(
+                    frame(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": tool_call.get("id", ""),
+                                    "type": tool_call.get("type", "function"),
+                                    "function": {
+                                        "name": function.get("name", ""),
+                                        "arguments": function.get("arguments", ""),
+                                    },
+                                }
+                            ]
+                        },
+                        None,
+                    )
+                )
+
+        frames.append(frame({}, finish_reason))
+        return frames
 
     async def _response_to_sse(
         self,
@@ -946,6 +1089,7 @@ class StreamingCCRHandler:
             for chunk in StreamingMixin()._response_to_sse(response, "anthropic"):
                 yield chunk
         else:
-            # OpenAI SSE format
-            yield f"data: {json.dumps(response)}\n\n".encode()
+            # OpenAI SSE format: `chat.completion.chunk` frames, then [DONE].
+            for chunk in self._openai_response_to_chunks(response):
+                yield chunk
             yield b"data: [DONE]\n\n"

@@ -11,8 +11,22 @@ import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
 
+/** Race a promise against a timeout and always release the timer. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<never>((_, reject) => {
+    timerId = setTimeout(() => reject(new Error(`headroom compress() timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timer]).finally(() => {
+    if (timerId !== undefined) clearTimeout(timerId);
+  });
+}
+
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
+  requestTimeoutMs?: number;
+  circuitBreakerThreshold?: number;
+  circuitBreakerCooldownMs?: number;
 }
 
 export class HeadroomContextEngine {
@@ -36,6 +50,7 @@ export class HeadroomContextEngine {
     totalTokensBefore: 0,
     compactions: 0,
   };
+  private circuit = { errors: 0, openUntilMs: 0 };
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -97,19 +112,28 @@ export class HeadroomContextEngine {
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
 
+    if (this.isCircuitOpen()) {
+      this.logger.warn("[headroom] Circuit open — using uncompressed messages");
+      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+    }
+
     try {
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
 
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
-      const result = await compress(openaiMessages, {
-        model: params.model ?? "claude-sonnet-4-5",
-        baseUrl: this.proxyUrl,
-        fallback: true,
-        tokenBudget: params.tokenBudget,
-      } as any);
+      const result = await withTimeout(
+        compress(openaiMessages, {
+          model: params.model ?? "claude-sonnet-4-5",
+          baseUrl: this.proxyUrl,
+          fallback: true,
+          tokenBudget: params.tokenBudget,
+        } as any),
+        this.config.requestTimeoutMs ?? 30_000,
+      );
 
       if (!result.compressed || result.tokensSaved === 0) {
+        this.resetCircuit();
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
@@ -118,6 +142,7 @@ export class HeadroomContextEngine {
 
       // Convert back to AgentMessage format
       const compressedAgentMessages = openAIToAgent(result.messages);
+      this.resetCircuit();
 
       // Track stats
       this.stats.totalCompressions++;
@@ -138,6 +163,7 @@ export class HeadroomContextEngine {
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
+      this.tripCircuit(error);
       // Graceful fallback: return original messages
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
@@ -238,6 +264,30 @@ export class HeadroomContextEngine {
 
   getProxyStartupError(): unknown {
     return this.proxyStartupError;
+  }
+
+  private isCircuitOpen(): boolean {
+    const threshold = this.config.circuitBreakerThreshold ?? 3;
+    if (this.circuit.errors < threshold) return false;
+    if (Date.now() < this.circuit.openUntilMs) return true;
+    this.circuit = { errors: 0, openUntilMs: 0 };
+    return false;
+  }
+
+  private tripCircuit(error: unknown): void {
+    this.circuit.errors += 1;
+    const threshold = this.config.circuitBreakerThreshold ?? 3;
+    if (this.circuit.errors < threshold) return;
+    const cooldownMs = this.config.circuitBreakerCooldownMs ?? 60_000;
+    this.circuit.openUntilMs = Date.now() + cooldownMs;
+    this.logger.warn(
+      `[headroom] Circuit breaker opened after ${this.circuit.errors} errors ` +
+        `(last: ${String(error)}); bypassing compression for ${cooldownMs}ms`,
+    );
+  }
+
+  private resetCircuit(): void {
+    this.circuit = { errors: 0, openUntilMs: 0 };
   }
 
   ensureProxyStarted(): void {

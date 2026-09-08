@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
+from headroom.proxy import upstream_guard
+from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
@@ -29,6 +31,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []
@@ -273,6 +278,133 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
     assert len(anthropic_calls) >= 2
 
 
+def test_codex_alpha_search_route_from_headroom_issue_2525() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, str], bytes]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(
+                (
+                    method,
+                    url,
+                    dict(kwargs.get("headers", {})),
+                    kwargs.get("content", b""),
+                )
+            )
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.post(
+            "/v1/alpha/search?query=weather",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(fake_http_client.calls) == 1
+    method, url, headers, body = fake_http_client.calls[0]
+    assert method == "POST"
+    assert url == "https://chatgpt.com/backend-api/codex/alpha/search?query=weather"
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert headers["chatgpt-account-id"] == "acct_123"
+    assert headers["content-length"] == "19"
+    assert headers["content-type"] == "application/json"
+    assert body == b'{"query":"weather"}'
+
+
+def test_non_chatgpt_alpha_search_falls_through_to_openai_upstream(monkeypatch) -> None:
+    calls: list[tuple[str, str, str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.method, request.url.path, base_url, sub_path, provider_name))
+        return JSONResponse(
+            {
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.openai.test",
+        "sub_path": "",
+        "provider": "",
+    }
+    assert calls == [
+        (
+            "POST",
+            "/v1/alpha/search",
+            "https://api.openai.test",
+            "",
+            "",
+        )
+    ]
+
+
+def test_codex_alpha_search_route_matrix(monkeypatch) -> None:
+    fallback_calls: list[tuple[str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        fallback_calls.append((request.url.path, base_url))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.urls.append(url)
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+
+        oauth_response = client.post(
+            "/v1/alpha/search",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+        api_key_response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert oauth_response.status_code == 200
+    assert api_key_response.status_code == 200
+    assert fake_http_client.urls == ["https://chatgpt.com/backend-api/codex/alpha/search"]
+    assert fallback_calls == [("/v1/alpha/search", "https://api.openai.test")]
+
+
 def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> None:
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     proxy = type(
@@ -299,12 +431,21 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    assert (
-        proxy_routes._select_passthrough_base_url(
-            proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+    # The azure branch honours the override, but only after the SSRF guard
+    # clears the destination (CVE-2026-77775). `azure.example` does not
+    # resolve, and the guard fails closed on resolution failure, so pin a
+    # public answer to keep this assertion about target *precedence*.
+    with patch.object(
+        upstream_guard.socket,
+        "getaddrinfo",
+        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
+    ):
+        assert (
+            proxy_routes._select_passthrough_base_url(
+                proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+            )
+            == "https://azure.example/base"
         )
-        == "https://azure.example/base"
-    )
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )
@@ -368,7 +509,9 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
+        assert client.post("/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/v1/codex/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/codex/responses").json()["handler"] == (
@@ -479,6 +622,31 @@ def test_openai_response_websocket_aliases_delegate_to_openai_ws_handler(monkeyp
         "/backend-api/responses",
         "/backend-api/codex/responses",
     ]
+
+
+def test_project_prefixed_openai_response_websocket_delegates_to_openai_ws_handler(
+    monkeypatch,
+) -> None:
+    seen_paths: list[str] = []
+    seen_projects: list[str | None] = []
+
+    async def fake_ws(self, websocket):  # type: ignore[no-untyped-def]
+        seen_paths.append(websocket.url.path)
+        seen_projects.append(get_current_project())
+        await websocket.accept()
+        await websocket.send_json({"path": websocket.url.path})
+        await websocket.close()
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_responses_ws", fake_ws)
+
+    with TestClient(_app()) as client:
+        with client.websocket_connect("/p/test-project/v1/responses") as websocket:
+            assert websocket.receive_json() == {"path": "/v1/responses"}
+
+    assert seen_paths == ["/v1/responses"]
+    # The /p/<name> prefix is bound as the project even without a header, so a
+    # prefix-only Codex WS client is still attributed (not just routed).
+    assert seen_projects == ["test-project"]
 
 
 def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> None:

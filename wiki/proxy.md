@@ -2,7 +2,7 @@
 
 The Headroom proxy server is a production-ready HTTP server that applies context optimization to all requests passing through it.
 
-> **New:** The proxy now supports the [TypeScript SDK](typescript-sdk.md) via the `POST /v1/compress` endpoint, enabling compression-as-a-service for any HTTP client without calling an LLM.
+> The proxy exposes compression-as-a-service via the `POST /v1/compress` endpoint — used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars. It is loopback-only by default; see the endpoint section below.
 
 ## Starting the Proxy
 
@@ -68,7 +68,7 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
-| `--mode` | `token` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
+| `--mode` | `cache` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
 | `--no-optimize` | `false` | Disable optimization (passthrough mode) |
 | `--no-cache` | `false` | Disable semantic caching |
 | `--no-rate-limit` | `false` | Disable rate limiting |
@@ -266,13 +266,30 @@ POST /v1/chat/completions
 
 ### `POST /v1/compress`
 
-Compression-only endpoint. Compresses messages without calling any LLM. Used by the [TypeScript SDK](typescript-sdk.md) and any HTTP client that wants compression as a service.
+Compression-only endpoint. Compresses messages without ever making a **completion request to an LLM provider** — no generation, no provider API key. Used by the [TypeScript SDK](typescript-sdk.md), LiteLLM's `headroom` guardrail, and gateway sidecars.
+
+**It does run local ML models.** Compression is ML-backed: Kompress is a ModernBERT encoder scoring tokens for retention (classification, not generation) and Magika classifies content types, both in-process by default. If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTTP to that model server — real egress from the sidecar. Only inference goes remote; the CCR store and markers stay proxy-local. `HEADROOM_DISABLE_KOMPRESS=1` gives structural compression only.
+
+**Loopback-only by default.** Non-loopback callers get **404** (not 403 — the route stays invisible to scanners). Set `HEADROOM_COMPRESS_ALLOW_REMOTE=1` to allow remote callers.
+
+**No format conversion.** `messages` may be OpenAI-shaped (`role: "tool"` + `tool_call_id`) or Anthropic-shaped (`tool_use` / `tool_result` content blocks); the same shape comes back. `model` selects the tokenizer and context limit — send the real name, including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet`.
+
+**`system` and `tools` are ignored.** Anthropic sends both out of band. This endpoint accepts them without complaint (200, no warning) and returns neither, so neither is compressed — keep carrying them yourself. That means the Anthropic system prompt is not compressed here, and tool-schema compaction / tool-search deferral are not reachable through this route; run Headroom as the proxy if you need those.
 
 **Request:**
 ```json
 {
-  "messages": [...],     // OpenAI chat format
-  "model": "gpt-4o"     // model name (for token counting)
+  "messages": [...],          // either wire format
+  "model": "gpt-4o",          // tokenizer + context limit
+  "token_budget": 8000,       // optional: override the context limit
+  "config": {                 // optional
+    "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy
+    "frozen_message_count": 12,   // pin an already-cached prefix
+    "compress_user_messages": false,
+    "target_ratio": 0.5,
+    "protect_recent": 2,
+    "protect_analysis_context": true
+  }
 }
 ```
 
@@ -283,16 +300,45 @@ Compression-only endpoint. Compresses messages without calling any LLM. Used by 
   "tokens_before": 15000,
   "tokens_after": 3500,
   "tokens_saved": 11500,
-  "compression_ratio": 0.23,
+  "compression_ratio": 0.23,    // tokens_after / tokens_before — LOWER is better
   "transforms_applied": ["router:smart_crusher:0.35"],
-  "ccr_hashes": ["a1b2c3"]
+  "transforms_summary": {"router:smart_crusher:0.35": 1},
+  "ccr_hashes": []              // non-empty only with mode="ccr"
 }
 ```
 
 **Headers:**
-- `x-headroom-bypass: true` — skip compression, return messages as-is
+- `x-headroom-bypass: true` — skip compression, return messages as-is with zeroed metrics
 
-**Error responses:** 400 (missing fields), 401 (bad API key), 503 (compression failed)
+**Error responses:** 400 (missing/invalid fields, bad `config.mode` or `config.frozen_message_count`), 401 (bad `HEADROOM_PROXY_TOKEN`), 404 (non-loopback without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`), 503 (compression failed)
+
+**Fail-open:** on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`.
+
+**Multi-turn callers — don't lose the prefix cache.** This endpoint is stateless: unlike the proxy's own request path (which runs a CacheAligner and tracks provider cache hits across turns), it has no idea what the provider already cached.
+
+The provider caches the bytes you *forwarded*, which compression already changed — so your originals and the cached prefix are no longer the same thing, and it is the forwarded version you must keep reproducing. Compression also varies with position: an older tool result can fall outside the recent-read protection window as the conversation grows and be compressed harder than last turn, so re-compression is not guaranteed to reproduce earlier output either. Two rules:
+
+1. Pass `config.frozen_message_count` = the number of leading messages already cached upstream.
+2. Send back the messages you **previously forwarded**, not the pristine originals. `frozen_message_count` returns leading messages exactly as passed in, so feeding it originals hands the provider different bytes than last turn and busts the cache anyway.
+
+```python
+forwarded = []
+
+
+def next_turn(new_messages):
+    r = requests.post(
+        f"{proxy}/v1/compress",
+        json={
+            "messages": forwarded + new_messages,
+            "model": "claude-sonnet-4-6",
+            "config": {"frozen_message_count": len(forwarded)},
+        },
+    ).json()
+    forwarded[:] = r["messages"]  # next turn's frozen prefix
+    return forwarded
+```
+
+Note `protect_recent` is not a substitute — it guards the newest messages, while `frozen_message_count` guards the oldest, which is the cached end.
 
 ## Using with Claude Code
 
@@ -390,11 +436,13 @@ For production deployments:
 # Use a process manager
 pip install gunicorn
 
-# Run with gunicorn
-gunicorn headroom.proxy.server:app \
+# Run with gunicorn — server.py has no module-level `app`; FastAPI is built
+# by the create_app() factory, so gunicorn needs --factory
+gunicorn headroom.proxy.server:create_app \
   --workers 4 \
   --bind 0.0.0.0:8787 \
-  --worker-class uvicorn.workers.UvicornWorker
+  --worker-class uvicorn.workers.UvicornWorker \
+  --factory
 ```
 
 Or with Docker:

@@ -7,7 +7,6 @@ from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
     _openai_responses_context_budget,
-    _responses_request_allows_memory_tool_continuation,
 )
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -436,30 +435,6 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     assert compressed_tokens == 2
     # The fallback chain must record both strategies it tried.
     assert strategy_chain == ["smart_crusher", "kompress"]
-
-
-def test_responses_memory_tools_skip_explicit_store_false() -> None:
-    """Regression: explicit store=false must block Responses memory-tool injection."""
-
-    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
-
-    assert _responses_request_allows_memory_tool_continuation(payload) is False
-    assert payload["store"] is False
-
-
-def test_responses_memory_tools_allow_default_and_stored_requests() -> None:
-    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
-    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
-    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
-
-    assert _responses_request_allows_memory_tool_continuation(no_memory_payload) is False
-    assert no_memory_payload["store"] is False
-
-    assert _responses_request_allows_memory_tool_continuation(already_stored_payload) is True
-    assert already_stored_payload["store"] is True
-
-    assert _responses_request_allows_memory_tool_continuation(default_store_payload) is True
-    assert "store" not in default_store_payload
 
 
 def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:

@@ -12,6 +12,7 @@ env:
   NPM_REGISTRY_URL: https://registry.npmjs.org
   NPM_SDK_PACKAGE: headroom-ai
   NPM_OPENCLAW_PACKAGE: headroom-openclaw
+  NPM_OPENCODE_PACKAGE: headroom-opencode
 
   # GitHub Package Registry
   GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
@@ -133,12 +134,12 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -268,7 +269,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -523,7 +524,7 @@ jobs:
       # is on PATH as `python` for the smoke step below.
       - name: Set up Python (Windows host)
         if: matrix.image == '' && runner.os == 'Windows'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -804,7 +805,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
@@ -852,10 +853,30 @@ jobs:
           npm publish --access public
         continue-on-error: true
 
-      - name: npm publish notice
-        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure'
+      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
+        id: npm-opencode-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip both npm publishes if tokens are not configured."
+          version="${{ needs.detect-version.outputs.npm_version }}"
+          cd plugins/opencode
+          npm ci
+          npm run build
+          npm version "$version" --no-git-tag-version --allow-same-version
+          HEADROOM_NPM_VERSION="$version" node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.dependencies = pkg.dependencies || {};
+          pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          npm publish --access public
+        continue-on-error: true
+
+      - name: npm publish notice
+        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure' || steps.npm-opencode-publish.outcome == 'failure'
+        run: |
+          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip npm publishes if tokens are not configured."
 
   publish-github-packages:
     needs: [detect-version, build]
@@ -876,7 +897,7 @@ jobs:
           printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js for GitHub Package Registry
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}

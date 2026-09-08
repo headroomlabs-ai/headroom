@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.tokenizers import get_tokenizer
+from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider
 
@@ -159,12 +160,16 @@ class OpenAICompatibleTokenCounter:
             if isinstance(content, str):
                 tokens += self.count_text(content)
             elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            tokens += self.count_text(part.get("text", ""))
-                    elif isinstance(part, str):
-                        tokens += self.count_text(part)
+                # Delegate to the audited shared walker instead of a partial
+                # per-provider one. Each provider counter had grown its own
+                # shortened branch list, so every modern block priced at ~0:
+                # measured on a 6,800-char block this returned 8 tokens for
+                # tool_result, thinking, document, mcp_tool_result — and for
+                # output_text / refusal, which are OpenAI's OWN Responses shapes.
+                # The shared walker is also image-safe: a 200KB base64 image gets
+                # a pixel-based 1600, not the ~50K phantom text tokens a naive
+                # str(block) catch-all would produce.
+                tokens += count_content_blocks(content, self.count_text)
 
         name = message.get("name")
         if name:
@@ -173,9 +178,9 @@ class OpenAICompatibleTokenCounter:
         tool_calls = message.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
-                func = tc.get("function", {})
-                tokens += self.count_text(func.get("name", ""))
-                tokens += self.count_text(func.get("arguments", ""))
+                func = tc.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
                 tokens += 10
 
         tool_call_id = message.get("tool_call_id")

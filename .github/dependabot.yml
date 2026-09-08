@@ -35,6 +35,11 @@ updates:
       prefix: "deps"
     # Only open PRs for security updates to avoid noise
     open-pull-requests-limit: 5
+    # MCP SDK 2.x removes the low-level Server API used by the shipping
+    # proxy and mcp extras. Keep 1.x until the port tracked in GH #2658 lands.
+    ignore:
+      - dependency-name: "mcp"
+        versions: [">=2.0.0"]
     groups:
       pip-minor-patch:
         update-types:

@@ -28,7 +28,10 @@ def output_savings() -> None:
     if not path.exists():
         click.echo("No output-savings data yet.")
         click.echo("Run `headroom learn --verbosity --apply` to seed the baseline,")
-        click.echo("then enable the shaper (HEADROOM_OUTPUT_SHAPER=1) and send traffic.")
+        click.echo(
+            "then enable the beta shaper (HEADROOM_ROLLOUT_CHANNEL=beta "
+            "HEADROOM_OUTPUT_SHAPER=1) and send traffic."
+        )
         return
 
     ledger = SavingsLedger.load(path)
