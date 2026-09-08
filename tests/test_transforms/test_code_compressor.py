@@ -2525,6 +2525,29 @@ class TestElixirSupport:
         assert "def" not in result.symbol_scores
         assert "defp" not in result.symbol_scores
 
+    def test_block_macro_without_arguments_has_no_name(self):
+        """`setup do` is a definition-role call with no `arguments` child at
+        all. The name lookup must return None (falling back to the default body
+        budget) rather than raising."""
+        parser = cc._get_parser("elixir")
+        config = cc._LANG_CONFIGS[CodeLanguage.ELIXIR]
+        node = parser.parse(b"setup do\n  :ok\nend\n").root_node.children[0]
+
+        assert cc._effective_type(node, config) == cc._CALL_ROLE_FUNCTION
+        assert [c.type for c in node.children] == ["identifier", "do_block"]
+        assert cc._get_call_definition_name(node) is None
+
+    def test_definition_name_walk_is_depth_capped(self):
+        """The leftmost-head walk stops after `_CALL_HEAD_MAX_DEPTH` levels.
+        Real heads are two or three deep; a pathological operator chain must
+        give up and return None instead of walking an arbitrary tree."""
+        parser = cc._get_parser("elixir")
+        source = b"def " + b"!" * (cc._CALL_HEAD_MAX_DEPTH + 2) + b"x do\n  1\nend\n"
+        node = parser.parse(source).root_node.children[0]
+
+        assert node.type == "call"
+        assert cc._get_call_definition_name(node) is None
+
     def test_effective_type_resolves_macro_calls(self):
         """Unit-level pin on the dispatch helper itself."""
         parser = cc._get_parser("elixir")

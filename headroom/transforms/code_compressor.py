@@ -2724,10 +2724,8 @@ def _effective_type(node: Any, lang_config: LangConfig) -> str:
     """
     if lang_config.call_node_type is None or node.type != lang_config.call_node_type:
         return node.type
-    if not node.child_count:
-        return node.type
-    target = node.children[0]
-    if target.type != "identifier":
+    target = node.children[0] if node.child_count else None
+    if target is None or target.type != "identifier":
         return node.type
     name = _node_identifier_text(target)
     if name in lang_config.call_function_targets:
