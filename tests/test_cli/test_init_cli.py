@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import sys
 import types
 from contextlib import contextmanager
@@ -280,6 +281,48 @@ def test_init_hook_ensure_prefers_local_profile(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert ensured == ["init-repo-12345678"]
+
+
+def test_local_profile_strips_non_ascii_letters(monkeypatch, tmp_path: Path) -> None:
+    """Regression test for #3467.
+
+    ``str.isalnum()`` is Unicode-aware and keeps non-ASCII letters (Cyrillic,
+    CJK, etc.), so a working-directory name containing them used to produce a
+    slug that ``validate_profile_name()`` then rejected with "Invalid profile
+    name". The slug must only ever contain characters the validator accepts.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    root = tmp_path / "Мастеринг в HW"
+    root.mkdir()
+
+    profile = init_cli._local_profile(cwd=root)
+
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", profile)
+    assert profile.startswith("init-hw-")
+
+
+def test_local_profile_keeps_ascii_slug_unchanged(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    root = tmp_path / "My-Repo_2"
+    root.mkdir()
+
+    profile = init_cli._local_profile(cwd=root)
+
+    assert profile.startswith("init-my-repo_2-")
+
+
+def test_local_profile_falls_back_to_repo_when_slug_is_empty(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    root = tmp_path / "мастеринг"
+    root.mkdir()
+
+    profile = init_cli._local_profile(cwd=root)
+
+    assert profile.startswith("init-repo-")
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", profile)
 
 
 def test_init_openclaw_requires_global(monkeypatch) -> None:

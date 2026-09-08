@@ -114,9 +114,14 @@ def _enable_verbose_logging() -> None:
 
 def _local_profile(cwd: Path | None = None) -> str:
     root = (cwd or Path.cwd()).resolve()
-    slug = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in root.name.lower()).strip(
-        "-"
-    )
+    # str.isalnum() is Unicode-aware and keeps non-ASCII letters (e.g. Cyrillic,
+    # CJK), but validate_profile_name() only accepts [A-Za-z0-9._-]. Restrict to
+    # ASCII alnum here so a non-ASCII directory name doesn't produce a slug that
+    # fails validation downstream (#3467); the sha1 digest keeps the profile
+    # name unique even when the slug collapses to 'repo'.
+    slug = "".join(
+        ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
+    ).strip("-")
     digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
