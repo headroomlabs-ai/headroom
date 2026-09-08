@@ -383,3 +383,41 @@ class TestFixturesSatisfyTheDedupContract:
         tuesday = {c.tool_call_id for c in refetch_loop_session("session-tuesday").tool_calls}
 
         assert monday.isdisjoint(tuesday)
+
+
+class TestSubThresholdSessionsDoNotCombine:
+    """A session that only looped in replays must not contribute at all.
+
+    ``min_occurrences`` is screened against the *pre-dedup* per-session group, so
+    a session whose repetitions are all replays of one call still qualifies and
+    hands its single real call to the global view. Three such sessions then clear
+    the bar together, reporting a loop no conversation actually ran.
+    """
+
+    def _replay_padded_session(self, session_id: str, call_id: str) -> SessionData:
+        # One real Read, written into this transcript three times.
+        return SessionData(
+            session_id=session_id,
+            tool_calls=[
+                _call("Read", call_id, {"file_path": "/repo/design.md"}, msg_index=i)
+                for i in range(3)
+            ],
+        )
+
+    def test_each_session_alone_is_not_a_loop(self):
+        sessions = [
+            self._replay_padded_session("s1", "toolu_s1"),
+            self._replay_padded_session("s2", "toolu_s2"),
+            self._replay_padded_session("s3", "toolu_s3"),
+        ]
+
+        assert [detect_loops([s]) for s in sessions] == [[], [], []]
+
+    def test_sub_threshold_sessions_do_not_combine_into_a_loop(self):
+        sessions = [
+            self._replay_padded_session("s1", "toolu_s1"),
+            self._replay_padded_session("s2", "toolu_s2"),
+            self._replay_padded_session("s3", "toolu_s3"),
+        ]
+
+        assert detect_loops(sessions) == []
