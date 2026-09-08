@@ -3800,7 +3800,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         multi-worker proxies reject the update because overrides are process-local.
         """
         try:
-            body = await request.json()
+            body = await _read_request_json(request)
         except (ValueError, UnicodeDecodeError):
             body = None
         if not isinstance(body, dict):
