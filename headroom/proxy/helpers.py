@@ -1568,6 +1568,9 @@ def _setup_file_logging() -> None:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
     """
+    if _paths.process_is_stateless():
+        return
+
     from logging.handlers import RotatingFileHandler
 
     try:

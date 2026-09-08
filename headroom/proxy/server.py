@@ -2732,6 +2732,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from headroom.proxy.forwarded_headers import load_trusted_dashboard_client_cidrs
 
+    config = config or ProxyConfig()
+
+    # Record stateless mode before initializing any optional filesystem writer.
+    # HeadroomProxy repeats this defensively for non-create_app entrypoints.
+    from headroom import paths as _hr_paths
+
+    _hr_paths.set_process_stateless(config.stateless)
+
     # Parse once at startup so invalid operator configuration fails loudly.
     trusted_dashboard_client_cidrs = load_trusted_dashboard_client_cidrs()
 
@@ -2742,8 +2750,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy.log.
     _setup_file_logging()
-
-    config = config or ProxyConfig()
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint

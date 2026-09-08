@@ -459,6 +459,8 @@ class SubscriptionTracker(QuotaTracker):
     # ------------------------------------------------------------------
 
     def _persist_state(self) -> None:
+        if _paths.process_is_stateless():
+            return
         try:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
@@ -477,6 +479,8 @@ class SubscriptionTracker(QuotaTracker):
             logger.debug("Failed to persist subscription state: %s", exc)
 
     def _load_persisted_state(self) -> None:
+        if _paths.process_is_stateless():
+            return
         try:
             with open(self._persist_path, encoding="utf-8") as fh:
                 raw = json.load(fh)

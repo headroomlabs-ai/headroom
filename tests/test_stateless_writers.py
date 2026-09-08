@@ -7,11 +7,18 @@ TOIN are covered in their own test modules.)
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("fastapi")
 
 from headroom import paths
+from headroom.cache.compression_store import (
+    _create_default_ccr_backend,
+    reset_compression_store,
+)
+from headroom.proxy.helpers import _setup_file_logging
 from headroom.proxy.output_savings import SavingsRecorder
 from headroom.relevance.embedding import (
     _DEFAULT_MODEL_PINNED_REVISION,
@@ -24,6 +31,7 @@ from headroom.relevance.embedding import (
 def _reset_stateless_globals():
     """The stateless flag and TOIN singleton are process-global — never leak."""
     yield
+    reset_compression_store()
     paths.set_process_stateless(False)
     try:
         from headroom.telemetry.toin import reset_toin
@@ -74,6 +82,68 @@ def test_output_savings_flush_persists_when_not_stateless(tmp_path, monkeypatch)
     assert path.exists()
 
 
+# ---- default CCR backend --------------------------------------------------
+
+
+def test_default_ccr_backend_is_memory_only_when_stateless(tmp_path, monkeypatch):
+    workspace = tmp_path / ".headroom"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "sqlite")
+    paths.set_process_stateless(True)
+
+    backend = _create_default_ccr_backend()
+
+    assert backend is None
+    assert not workspace.exists()
+
+
+def test_explicit_memory_ccr_backend_remains_memory_only(tmp_path, monkeypatch):
+    workspace = tmp_path / ".headroom"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    paths.set_process_stateless(False)
+
+    backend = _create_default_ccr_backend()
+
+    assert backend is None
+    assert not workspace.exists()
+
+
+# ---- proxy file logging ---------------------------------------------------
+
+
+def test_file_logging_writes_nothing_when_stateless(tmp_path, monkeypatch):
+    workspace = tmp_path / ".headroom"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    paths.set_process_stateless(True)
+
+    _setup_file_logging()
+
+    assert not workspace.exists()
+
+
+# ---- subscription tracker -------------------------------------------------
+
+
+def test_subscription_tracker_does_not_read_or_write_when_stateless(tmp_path):
+    from headroom.subscription.tracker import SubscriptionTracker
+
+    persist_path = tmp_path / ".headroom" / "subscription_state.json"
+    persist_path.parent.mkdir(parents=True)
+    persist_path.write_text(
+        '{"poll_count": 41, "contribution": {"tokens_submitted": 99}}',
+        encoding="utf-8",
+    )
+    before = persist_path.read_bytes()
+    paths.set_process_stateless(True)
+
+    tracker = SubscriptionTracker(enabled=False, persist_path=persist_path)
+    asyncio.run(tracker.stop())
+
+    assert tracker.state["poll_count"] == 0
+    assert persist_path.read_bytes() == before
+
+
 # ---- persistent memory ----------------------------------------------------
 
 
@@ -86,7 +156,7 @@ def test_memory_disabled_under_stateless(tmp_path, monkeypatch):
     app = create_app(ProxyConfig(memory_enabled=True, stateless=True))
     proxy = app.state.proxy
     assert proxy.memory_handler is None
-    assert not (tmp_path / ".headroom" / "memory.db").exists()
+    assert not (tmp_path / ".headroom").exists()
 
 
 # ---- fastembed model pinning ----------------------------------------------
