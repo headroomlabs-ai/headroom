@@ -804,6 +804,16 @@ def _try_detect_code(content: str) -> DetectionResult | None:
     if not language_scores:
         return None
 
+    # Disambiguation: Elixir's `def foo(...)` heads also match the Python
+    # pattern, so a module with more public functions than attributes would be
+    # tagged `python` and handed to a parser that cannot read it — the file
+    # then fails validation and compresses by nothing. The Elixir patterns are
+    # deliberately exclusive (`defmodule`, `defp`, `@moduledoc`, `|>` have no
+    # Python spelling), so two of them settle the language; the Python score is
+    # folded in rather than dropped because those are Elixir `def` lines.
+    if language_scores.get("elixir", 0) >= 2 and "python" in language_scores:
+        language_scores["elixir"] += language_scores.pop("python")
+
     # Find best matching language
     best_lang = max(language_scores, key=lambda k: language_scores[k])
     best_score = language_scores[best_lang]
