@@ -8244,7 +8244,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             env=env,
             port=port,
             no_proxy=no_proxy,
-            tool_label=run_target.name.upper(),
+            tool_label=run_target.tool_label or run_target.name.upper(),
             env_vars_display=env_vars_display,
             learn=learn,
             memory=memory,

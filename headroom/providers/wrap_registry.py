@@ -144,6 +144,9 @@ class WrapTarget:
     # invocation args (`headroom wrap bob -- ...`). Prepended, not appended,
     # so per-invocation args win under the usual last-flag-wins CLI rule.
     default_args: tuple[str, ...] = ()
+    # Banner label for the launch box. Empty means derive it from the name,
+    # which is right for one-word targets and wrong for the rest ("IBM-BOB").
+    tool_label: str = ""
 
 
 def build_launch_env(
@@ -413,6 +416,7 @@ _TARGET_FIELDS: dict[str, Callable[[object], object]] = {
     "origin_passthrough_strip_json_keys": _coerce_strip_keys,
     "default_mode": _coerce_mode,
     "default_args": _coerce_args_tuple,
+    "tool_label": _coerce_str,
 }
 
 _NEW_TARGET_REQUIRED = ("binaries", "install_hint", "env_vars")
