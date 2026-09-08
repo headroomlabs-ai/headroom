@@ -1554,3 +1554,22 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+def test_local_profile_ascii_only_for_non_ascii_dir(monkeypatch, tmp_path: Path) -> None:
+    """Non-ASCII working directory names must still yield a valid profile (#3467)."""
+    import re
+
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    non_ascii = tmp_path / "Мастеринг в HW"
+    non_ascii.mkdir(parents=True, exist_ok=True)
+    profile = init_cli._local_profile(cwd=non_ascii)
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", profile), f"non-ASCII slug leaked: {profile!r}"
+    assert "hw" in profile
+
+    all_non_ascii = tmp_path / "日本語テスト"
+    all_non_ascii.mkdir(parents=True, exist_ok=True)
+    fallback = init_cli._local_profile(cwd=all_non_ascii)
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", fallback), f"fallback invalid: {fallback!r}"
+    assert fallback.startswith("init-repo-")
