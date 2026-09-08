@@ -64,11 +64,13 @@ jobs:
       - name: Validate compose model
         env:
           ANTHROPIC_API_KEY: dummy
+          HEADROOM_PROXY_TOKEN: capture-proof
         run: docker compose -f docker/differential-network-capture/docker-compose.yml --profile run config
 
       - name: Build Claude Code runner image
         env:
           ANTHROPIC_API_KEY: dummy
+          HEADROOM_PROXY_TOKEN: capture-proof
         run: docker compose -f docker/differential-network-capture/docker-compose.yml --profile run build claude-direct
 
       - name: Smoke Claude Code runner image
@@ -117,6 +119,8 @@ jobs:
         working-directory: docker/differential-network-capture
         run: |
           set -euo pipefail
+          HEADROOM_PROXY_TOKEN="$(openssl rand -hex 32)"
+          export HEADROOM_PROXY_TOKEN
           mkdir -p captures
           docker compose up -d --build mitm-direct mitm-headroom-upstream headroom-proxy mitm-headroom-client
           trap 'docker compose --profile run down -v' EXIT

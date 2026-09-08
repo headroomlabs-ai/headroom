@@ -257,7 +257,7 @@ function Start-ProxyContainer {
 
     $containerName = "headroom-proxy-$Port-$PID"
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
     $dockerArgs.AddRange((Get-SharedDockerArgs))
     $dockerArgs.Add($HeadroomImage)
     $dockerArgs.Add('--host')
@@ -1727,7 +1727,7 @@ switch ($args[0]) {
     'proxy' {
         $port = 8787
         $forwardArgs = New-Object System.Collections.Generic.List[string]
-        foreach ($arg in $args) { $forwardArgs.Add($arg) }
+        for ($i = 1; $i -lt $args.Count; $i++) { $forwardArgs.Add($args[$i]) }
         for ($i = 1; $i -lt $args.Count; $i++) {
             if ($args[$i] -eq '--port' -or $args[$i] -eq '-p') {
                 Require-OptionValue -Arguments $args -Index $i -Option $args[$i]
@@ -1743,11 +1743,16 @@ switch ($args[0]) {
         $dockerArgs = New-Object System.Collections.Generic.List[string]
         $dockerArgs.AddRange([string[]]@('run','--rm'))
         Add-TtyArgs -ArgsList $dockerArgs
-        $dockerArgs.AddRange([string[]]@('-p',"$port`:$port"))
+        $dockerArgs.AddRange([string[]]@('-p',"127.0.0.1`:$port`:$port"))
         $dockerArgs.AddRange((Get-SharedDockerArgs))
         $dockerArgs.Add('--entrypoint')
         $dockerArgs.Add('headroom')
         $dockerArgs.Add($HeadroomImage)
+        $dockerArgs.Add('proxy')
+        $dockerArgs.Add('--host')
+        $dockerArgs.Add('0.0.0.0')
+        $dockerArgs.Add('--port')
+        $dockerArgs.Add("$port")
         foreach ($arg in $forwardArgs) {
             $dockerArgs.Add($arg)
         }

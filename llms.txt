@@ -19,7 +19,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 - Python: `pip install headroom-ai` (add `[all]` for every optional extra)
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
-- Docker: `docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest`
+- Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
 - Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
 

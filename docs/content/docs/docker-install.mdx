@@ -59,15 +59,27 @@ headroom mcp install
 headroom memory list
 ```
 
-For `proxy`, the wrapper publishes the selected port back to the host:
+For `proxy`, the maintained wrapper always publishes the selected host port on
+loopback. It passes `--host 0.0.0.0` inside the container so that the loopback
+publication can reach the container, and it has no public-publication override.
+For local-only use, no token is required:
 
 ```bash
 docker run --rm -it \
-  -p 8787:8787 \
+  -p 127.0.0.1:8787:8787 \
   -v "$PWD:/workspace" \
   -w /workspace \
   ghcr.io/headroomlabs-ai/headroom:latest \
-  headroom proxy --host 0.0.0.0 --port 8787
+  --host 0.0.0.0 --port 8787
+```
+
+For deliberate public access, publish on an explicit public address and set
+`HEADROOM_PROXY_TOKEN`:
+
+```bash
+docker run --rm -p 0.0.0.0:8787:8787 \
+  -e HEADROOM_PROXY_TOKEN='replace-with-a-secret' \
+  ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0 --port 8787
 ```
 
 ### `wrap` commands

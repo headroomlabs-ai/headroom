@@ -371,6 +371,39 @@ def _bash_supports_4_3() -> bool:
     return (major, minor) >= (4, 3)
 
 
+def _assert_loopback_publication(call: list[str]) -> None:
+    publication = call[call.index("-p") + 1].split(":")
+    assert len(publication) == 3
+    assert publication[0] == "127.0.0.1"
+    assert publication[1] == publication[2]
+
+
+def _assert_generated_proxy_argv(
+    call: list[str], expected_port: int, forwarded_tail: list[str] | None = None
+) -> None:
+    _assert_loopback_publication(call)
+    entrypoint = call.index("--entrypoint")
+    image = entrypoint + 2
+    assert call[entrypoint + 1] == "headroom"
+    assert call[image + 1 : image + 6] == [
+        "proxy",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(expected_port),
+    ]
+    if forwarded_tail is not None:
+        assert call[image + 6 :] == forwarded_tail
+
+
+def test_generated_wrappers_explicitly_override_image_host_for_container_access() -> None:
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert 'args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")' in bash_source
+    assert "dockerArgs.Add('0.0.0.0')" in powershell_source
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
     reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
@@ -394,6 +427,7 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         wrap_help = _run([str(wrapper), "wrap", "--help"], env=env)
         assert "Supported commands:" in wrap_help.stdout
         assert "copilot" not in wrap_help.stdout
+        _run([str(wrapper), "proxy", "--help"], env=env)
         unsupported_wrap = _run(
             [str(wrapper), "wrap", "copilot", "--help"],
             env=env,
@@ -504,8 +538,33 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
             if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "--help" in call
         )
         assert "-it" not in help_call
+        proxy_help_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
+        )
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [str(wrapper), "proxy", "--port", str(explicit_port), "--host", "192.0.2.1"],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call
@@ -925,8 +984,40 @@ def test_powershell_native_installer_supports_persistent_docker_lifecycle(tmp_pa
             if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
         )
         assert "-it" not in proxy_help_call
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "proxy",
+                "--port",
+                str(explicit_port),
+                "--host",
+                "192.0.2.1",
+            ],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call

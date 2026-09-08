@@ -185,7 +185,7 @@ RUN mkdir -p /home/nonroot /data && \
 USER ${RUNTIME_USER}
 WORKDIR ${RUNTIME_HOME}
 
-ENV HEADROOM_HOST=0.0.0.0 \
+ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
@@ -202,7 +202,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["curl", "--fail", "--silent", "http://127.0.0.1:8787/readyz"]
 
 ENTRYPOINT ["headroom", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+CMD ["--port", "8787"]
 
 FROM ${DISTROLESS_IMAGE} AS runtime-slim
 
@@ -216,7 +216,7 @@ COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
 USER ${RUNTIME_USER}
 WORKDIR /app
 
-ENV HEADROOM_HOST=0.0.0.0 \
+ENV HEADROOM_HOST=127.0.0.1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=${PYTHON_SITE_PACKAGES}
@@ -227,7 +227,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=5)"]
 
 ENTRYPOINT ["python3", "-m", "headroom.cli", "proxy"]
-CMD ["--host", "0.0.0.0", "--port", "8787"]
+CMD ["--port", "8787"]
 
 # Default published image remains python-slim runtime
 FROM runtime-slim-base AS runtime

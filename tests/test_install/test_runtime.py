@@ -63,6 +63,56 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in command
 
 
+def test_build_runtime_command_preserves_non_ascii_ambient_token(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    token = "tökén-安全-🔐"
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", token)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    token_env_index = command.index("HEADROOM_PROXY_TOKEN")
+    assert command[token_env_index - 1] == "--env"
+    assert token not in command
+
+    captured: dict[str, list[str] | dict[str, str]] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> None:
+        captured["command"] = command
+        container_env: dict[str, str] = {}
+        for index, arg in enumerate(command):
+            if arg != "--env":
+                continue
+            value = command[index + 1]
+            if "=" in value:
+                name, resolved = value.split("=", 1)
+                container_env[name] = resolved
+            else:
+                container_env[value] = os.environ[value]
+        captured["container_env"] = container_env
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.run", fake_run)
+    start_persistent_docker(manifest)
+    assert captured["container_env"]["HEADROOM_PROXY_TOKEN"] == token
+    assert token not in captured["command"]
+
+
 def test_build_runtime_command_for_docker_includes_gpu_passthrough(
     monkeypatch, tmp_path: Path
 ) -> None:
