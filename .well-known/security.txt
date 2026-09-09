@@ -1,0 +1,14 @@
+# Headroom security contact — https://headroomlabs.ai/.well-known/security.txt
+# Format: RFC 9116 (https://www.rfc-editor.org/rfc/rfc9116)
+# NOTE: for this file to be authoritative it must be served at
+#       https://headroomlabs.ai/.well-known/security.txt (and ideally
+#       https://headroomlabs.ai/security.txt as a redirect). Keep this copy and
+#       the deployed copy in sync, and refresh Expires before it lapses.
+
+Contact: https://github.com/headroomlabs-ai/headroom/security/advisories/new
+Contact: mailto:security@headroomlabs.ai
+Expires: 2027-09-01T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://headroomlabs.ai/.well-known/security.txt
+Policy: https://github.com/headroomlabs-ai/headroom/blob/main/SECURITY.md
+# Encryption: https://headroomlabs.ai/.well-known/pgp-key.txt   # add once a key is published
