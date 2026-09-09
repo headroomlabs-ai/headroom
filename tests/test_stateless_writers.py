@@ -79,14 +79,15 @@ def test_output_savings_flush_persists_when_not_stateless(tmp_path, monkeypatch)
 
 def test_memory_disabled_under_stateless(tmp_path, monkeypatch):
     """A stateless proxy with --memory must not initialize memory or write a DB."""
+    workspace = tmp_path / "state"
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     from headroom.proxy.server import ProxyConfig, create_app
 
     app = create_app(ProxyConfig(memory_enabled=True, stateless=True))
     proxy = app.state.proxy
     assert proxy.memory_handler is None
-    assert not (tmp_path / ".headroom" / "memory.db").exists()
+    assert not workspace.exists()
 
 
 # ---- fastembed model pinning ----------------------------------------------
