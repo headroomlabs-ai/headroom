@@ -67,7 +67,7 @@ curl http://localhost:8787/metrics
 
 ```
 # HELP headroom_requests_total Total requests processed
-headroom_requests_total{mode="optimize"} 1234
+headroom_requests_total 1234
 
 # HELP headroom_tokens_saved_total Total tokens saved
 headroom_tokens_saved_total 5678900
@@ -75,18 +75,18 @@ headroom_tokens_saved_total 5678900
 # HELP headroom_persistent_savings_tokens_saved_total Durable lifetime input tokens saved by proxy compression
 headroom_persistent_savings_tokens_saved_total 5678900
 
-# HELP headroom_compression_ratio Compression ratio histogram
-headroom_compression_ratio_bucket{le="0.5"} 890
-headroom_compression_ratio_bucket{le="0.7"} 1100
-headroom_compression_ratio_bucket{le="0.9"} 1200
+# HELP headroom_latency_ms_sum Sum of request latency in milliseconds
+headroom_latency_ms_sum 152300
+# HELP headroom_latency_ms_count Count of latency samples
+headroom_latency_ms_count 1234
 
-# HELP headroom_latency_seconds Request latency histogram
-headroom_latency_seconds_bucket{le="0.01"} 800
-headroom_latency_seconds_bucket{le="0.1"} 1150
-
-# HELP headroom_cache_hits_total Cache hit counter
-headroom_cache_hits_total 456
+# HELP headroom_provider_cache_hit_requests_total Requests that read from the provider's prompt cache
+headroom_provider_cache_hit_requests_total{provider="anthropic"} 456
 ```
+
+<Callout type="warn" title="No percentile buckets on /metrics">
+There are no Prometheus histogram buckets for compression ratio or latency — build percentiles or averages from `_sum` / `_count` pairs (`headroom_latency_ms_sum`, `headroom_latency_ms_count`, and so on), or use the `headroom perf` CLI for real p95/p99.
+</Callout>
 
 ### OpenTelemetry (OTLP) Export
 
@@ -154,7 +154,7 @@ curl http://localhost:8787/health
 ```json
 {
   "status": "healthy",
-  "version": "0.1.0",
+  "version": "0.37.0",
   "uptime_seconds": 3600
 }
 ```
@@ -176,7 +176,7 @@ const client = new HeadroomClient();
 // Get proxy stats
 const stats = await client.proxyStats();
 console.log(`Tokens saved: ${stats.tokens.saved}`);
-console.log(`Savings: ${stats.tokens.savings_percent}%`);
+console.log(`Savings: ${stats.tokens.savingsPercent}%`);
 ```
 
 ### Compression Result Metrics
@@ -203,7 +203,7 @@ Quick stats for the current session (no database query):
 stats = client.get_stats()
 print(f"Mode: {stats['config']['mode']}")
 print(f"Tokens saved: {stats['session']['tokens_saved_total']}")
-print(f"Avg compression: {stats['session']['compression_ratio_avg']:.1%}")
+print(f"Requests optimized: {stats['session']['requests_optimized']}")
 ```
 
 Returns:
@@ -212,23 +212,20 @@ Returns:
 {
     "session": {
         "requests_total": 10,
-        "tokens_input_before": 50000,
-        "tokens_input_after": 35000,
+        "requests_optimized": 8,
+        "requests_audit": 2,
         "tokens_saved_total": 15000,
-        "tokens_output_total": 8000,
         "cache_hits": 3,
-        "compression_ratio_avg": 0.70,
     },
     "config": {
         "mode": "optimize",
         "provider": "openai",
-        "cache_optimizer_enabled": True,
-        "semantic_cache_enabled": False,
+        "cache_optimizer": "openai-prefix-stabilizer",
+        "semantic_cache": False,
     },
     "transforms": {
         "smart_crusher_enabled": True,
         "cache_aligner_enabled": True,
-        "rolling_window_enabled": True,
     },
 }
 ```
@@ -257,8 +254,7 @@ Aggregate statistics across all stored metrics:
 summary = client.get_summary()
 print(f"Total requests: {summary['total_requests']}")
 print(f"Total tokens saved: {summary['total_tokens_saved']}")
-print(f"Average compression: {summary['avg_compression_ratio']:.1%}")
-print(f"Total cost savings: ${summary['total_cost_saved_usd']:.2f}")
+print(f"Avg tokens saved per request: {summary['avg_tokens_saved']:.0f}")
 ```
 
 </Tab>
@@ -291,8 +287,8 @@ DEBUG:headroom.transforms.smart_crusher:Kept items: [0,1,2,42,77,97,98,99] (erro
 # Log to file
 headroom proxy --log-file headroom.jsonl
 
-# Increase verbosity
-headroom proxy --log-level debug
+# Increase verbosity (no --log-level flag; use the env var)
+HEADROOM_LOG_LEVEL=debug headroom proxy
 ```
 </Tab>
 </Tabs>
@@ -353,19 +349,19 @@ Env: `HEADROOM_BUDGET_ESTIMATED_BASIS`. `headroom doctor` reports the estimated 
 |--------|-------------------|--------|
 | `headroom_tokens_saved_total` | Runtime tokens saved since this proxy process started | Higher is better |
 | `headroom_persistent_savings_tokens_saved_total` | Durable lifetime tokens saved from `/stats.persistent_savings` | Higher is better |
-| `compression_ratio_avg` | Efficiency | 0.7--0.9 typical |
-| `cache_hit_rate` | Cache effectiveness | >20% is good |
-| `latency_p99` | Performance impact | &lt;10ms |
-| `failed_requests` | Reliability | 0 |
+| `headroom_overhead_ms_sum` / `headroom_overhead_ms_count` | Mean latency Headroom itself adds (there are no percentile buckets — see the callout above) | Low is better |
+| `headroom_provider_cache_hit_requests_total` / `headroom_provider_cache_requests_total` | Cache effectiveness, by provider | >20% is good |
+| `headroom_requests_failed_total` | Reliability (upstream 5xx errors) | 0 |
 
 ## Grafana Dashboard
 
-A ready-to-import dashboard ships in
+A dashboard template ships in
 [`examples/grafana/headroom-dashboard.json`](https://github.com/headroomlabs-ai/headroom/blob/main/examples/grafana/headroom-dashboard.json).
-Import it in Grafana (**Dashboards → New → Import → Upload**) and pick your Prometheus
-datasource — it renders tokens saved, request throughput, and processing overhead
-(`headroom_overhead_ms_sum` / `headroom_overhead_ms_count`) straight from the metrics
-the `/metrics` endpoint exposes.
+Its metric names match `/metrics`, but every panel query filters on a `pool` label
+(e.g. `headroom_tokens_saved_total{pool=~"..."}`) that no metric in
+`headroom/proxy/prometheus_metrics.py` actually emits, so the panel dropdowns come up
+empty on import. Edit the queries to drop the `pool=~"..."` filter, or use the ad-hoc
+queries below instead.
 
 Example ad-hoc queries against the same metric family:
 
@@ -373,6 +369,5 @@ Example ad-hoc queries against the same metric family:
 |-------|--------|
 | Runtime Tokens Saved | `headroom_tokens_saved_total` |
 | Lifetime Tokens Saved | `headroom_persistent_savings_tokens_saved_total` |
-| Compression Ratio (median) | `histogram_quantile(0.5, headroom_compression_ratio_bucket)` |
-| Request Latency (p99) | `histogram_quantile(0.99, headroom_latency_seconds_bucket)` |
-| Cache Hit Rate | `headroom_cache_hits_total / (headroom_cache_hits_total + headroom_cache_misses_total)` |
+| Mean Headroom Overhead | `rate(headroom_overhead_ms_sum[5m]) / rate(headroom_overhead_ms_count[5m])` |
+| Cache Hit Rate (by provider) | `sum by (provider) (rate(headroom_provider_cache_hit_requests_total[5m])) / sum by (provider) (rate(headroom_provider_cache_requests_total[5m]))` |

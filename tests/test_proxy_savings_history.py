@@ -1070,7 +1070,10 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
     monkeypatch.setattr(
         "headroom.proxy.server.CostTracker._get_cache_prices",
-        lambda self, model: (0.001, 0.0015, 0.002),
+        # **kwargs so the stub keeps standing in for the real method as its
+        # signature grows: it takes a keyword-only `long_context` tier selector,
+        # which a positional-only stub turns into a TypeError inside /stats.
+        lambda self, model, **kwargs: (0.001, 0.0015, 0.002),
     )
 
     config = ProxyConfig(
@@ -1270,7 +1273,10 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
     monkeypatch.setattr(
         "headroom.proxy.server.CostTracker._get_cache_prices",
-        lambda self, model: (0.001, 0.0015, 0.002),
+        # **kwargs so the stub keeps standing in for the real method as its
+        # signature grows: it takes a keyword-only `long_context` tier selector,
+        # which a positional-only stub turns into a TypeError inside /stats.
+        lambda self, model, **kwargs: (0.001, 0.0015, 0.002),
     )
 
     config = ProxyConfig(

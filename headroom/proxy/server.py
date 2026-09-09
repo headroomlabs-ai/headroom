@@ -476,6 +476,16 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _code_syntax_breaker_status() -> dict[str, Any]:
+    """Per-language AST-compression breaker state, or {} if unavailable."""
+    try:
+        from headroom.transforms.code_compressor import syntax_breaker_status
+
+        return syntax_breaker_status()
+    except Exception:  # pragma: no cover - defensive; stats must not fail
+        return {}
+
+
 class _SuppressCancelledErrorFilter(logging.Filter):
     """Hide expected uvicorn CancelledError tracebacks during shutdown."""
 
@@ -2614,11 +2624,18 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     expected to be lowercase (Starlette's ``Headers`` is case-insensitive; the
     WebSocket middleware lowercases the raw ASGI pairs itself).
     """
+    raw = headers.get("x-headroom-proxy-token")
+    if raw is not None:
+        return str(raw) or None
+
+    # A provider credential can legitimately occupy Authorization (for example,
+    # an OAuth/subscription client). Prefer the explicit proxy header whenever
+    # it is present so that the upstream credential is not mistaken for the
+    # proxy credential.
     auth = str(headers.get("authorization") or "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip() or None
-    raw = headers.get("x-headroom-proxy-token")
-    return str(raw) if raw else None
+    return None
 
 
 class WebSocketAuthMiddleware:
@@ -3627,7 +3644,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # only names listed in config.proxy_extensions (CLI: --proxy-extension,
     # env: HEADROOM_PROXY_EXTENSIONS) actually get installed. Discovery alone
     # never runs third-party code. An extension that raises from its install()
-    # is a deliberate fail-closed signal and aborts startup.
+    # disables *itself*: `install_all` logs it, prints a SKIPPED line to stderr
+    # and the proxy keeps serving without that extension (extensions.py:169-183).
+    # One bad plugin must not brick the proxy. Note the consequence: a plugin
+    # whose licence gate raises is absent, not fatal — the feature fails closed,
+    # the process does not.
     from headroom.proxy.extensions import install_all as _install_extensions
 
     _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
@@ -4295,12 +4316,34 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         output_reduction: dict[str, Any] = {"available": False}
         try:
             from headroom.proxy.output_savings import get_recorder
+            from headroom.proxy.output_shaper import (
+                OutputShaperSettings,
+                resolve_verbosity_level,
+                shaper_enabled_for,
+            )
 
-            _oest = get_recorder().estimate()
+            # The active steering level enables the modelled fallback, which is
+            # what a deployment with no holdout and no learned baseline has --
+            # i.e. every fresh install, since `learn --verbosity` needs history
+            # that predates the shaper.
+            _olevel: int | None = None
+            try:
+                _osettings = OutputShaperSettings.from_env(
+                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
+                )
+                if _osettings.enabled:
+                    _olevel = resolve_verbosity_level(_osettings)[0]
+            except Exception:  # pragma: no cover - defensive
+                _olevel = None
+
+            _oest = get_recorder().estimate(_olevel)
             if _oest.n_requests > 0:
                 output_reduction = {
                     "available": True,
-                    "method": _oest.kind,  # "measured" | "estimated"
+                    "method": _oest.kind,  # "measured" | "estimated" | "modelled"
+                    # A modelled band is the spread between the two benchmarked
+                    # models, not a sampling CI. The UI must not call it one.
+                    "band_is_ci": _oest.kind != "modelled",
                     "tokens_saved": round(_oest.tokens_saved),
                     "baseline_tokens": round(_oest.baseline_tokens),
                     "reduction_percent": round(_oest.pct, 1),
@@ -4311,9 +4354,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # pragma: no cover - defensive
             pass
 
+        # Model-routing section: populated only when an extension registered a
+        # routing-stats provider (headroom.proxy.routing_stats); None otherwise.
+        from headroom.proxy.routing_stats import get_routing_stats
+
         return {
             "summary": summary,
             "agent_usage": agent_usage,
+            "routing": get_routing_stats(),
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
@@ -4342,9 +4390,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         **output_reduction,
                         "description": (
                             "OUTPUT tokens the model didn't emit because the shaper "
-                            "steered verbosity / routed effort down. Counterfactual — "
-                            "shown as an estimate (vs a learned baseline) or measured "
-                            "(A/B holdout), always with a confidence band."
+                            "steered verbosity down. Counterfactual — measured "
+                            "(A/B holdout), estimated (vs a learned baseline), or "
+                            "modelled (a benchmark factor, when this deployment has "
+                            "produced neither). Always labelled with which."
                         ),
                     },
                     "tool_search": {
@@ -4571,6 +4620,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
             "compression_cache": compression_cache_stats,
+            # Per-language AST compression pauses. Empty on a healthy install;
+            # non-empty is the explanation for a savings drop in one language.
+            "code_syntax_breaker": _code_syntax_breaker_status(),
             # Always False: the anonymous telemetry beacon was removed, so no
             # telemetry is ever shipped externally (local collection only).
             "anon_telemetry_shipping": False,

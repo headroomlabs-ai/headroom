@@ -206,6 +206,7 @@ temp/
 .benchmarks/
 benchmark_results.json
 benchmark_results/
+examples/vertex_gemini_benchmark/results.json
 
 # DeepEval cache
 .deepeval/

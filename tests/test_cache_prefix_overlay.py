@@ -145,6 +145,91 @@ def test_block_append_overlay_never_inflates_forwarded_payload():
     assert overlay_cached_prefix(optimized, current, previous, forwarded) == optimized
 
 
+def test_confirmed_floor_replays_recompressed_confirmed_prefix():
+    # Background recompression produced a SMALLER form of already-forwarded,
+    # provider-CONFIRMED history. The floor replays the confirmed bytes
+    # unconditionally; without a floor the size bound declines the replay and
+    # the cache busts the moment compression improves.
+    recompressed = [
+        M("user", "READ foo.py:\n<tiny>"),
+        M("assistant", "ok"),
+        M("user", "grep result:\n<compressed>"),
+    ]
+    out = overlay_cached_prefix(
+        recompressed, CUR_ORIG, PREV_ORIG, PREV_FWD, confirmed_frozen_count=2
+    )
+    assert out[:2] == PREV_FWD  # confirmed bytes win over the smaller fresh form
+    assert out[2] == recompressed[2]  # this turn's tail is preserved
+    # No floor: the same replay is declined as inflating (sidecar posture).
+    assert overlay_cached_prefix(recompressed, CUR_ORIG, PREV_ORIG, PREV_FWD) == recompressed
+
+
+def test_confirmed_floor_keeps_alignment_guards():
+    # The floor relaxes ONLY the size bound; every alignment guard still bails.
+    changed = [M("user", "TOTALLY DIFFERENT"), PREV_ORIG[1], M("user", "x")]
+    assert (
+        overlay_cached_prefix(
+            OPTIMIZED_BUGGY, changed, PREV_ORIG, PREV_FWD, confirmed_frozen_count=2
+        )
+        == OPTIMIZED_BUGGY
+    )
+    assert (
+        overlay_cached_prefix(
+            OPTIMIZED_BUGGY, CUR_ORIG, PREV_ORIG, PREV_FWD[:1], confirmed_frozen_count=2
+        )
+        == OPTIMIZED_BUGGY
+    )
+
+
+def test_improvement_beyond_floor_lands_while_confirmed_region_replays():
+    # Three previously-forwarded messages; only the first is provider-confirmed.
+    prev_orig = [
+        M("user", "old tool output " * 20),
+        M("user", "newer output"),
+        M("assistant", "ok"),
+    ]
+    prev_fwd = [M("user", "[fwd-old-form-larger]"), M("user", "[fwd-newer]"), M("assistant", "ok")]
+    current = prev_orig + [M("user", "next")]
+    # Fresh compression improved BOTH forwarded forms. Only the beyond-floor
+    # improvement may land; the confirmed one would change provider bytes.
+    optimized = [
+        M("user", "[t0]"),
+        M("user", "[t1]"),
+        M("assistant", "ok"),
+        M("user", "next"),
+    ]
+    out = overlay_cached_prefix(optimized, current, prev_orig, prev_fwd, confirmed_frozen_count=1)
+    assert out[0] == prev_fwd[0]  # confirmed region: replayed unconditionally
+    assert out[1] == optimized[1]  # improvement beyond the floor reaches the wire
+    assert out[3] == optimized[3]
+
+
+def test_originals_drift_beyond_floor_still_repaired_when_replay_shrinks():
+    # The pipeline emitted the agent's ORIGINAL bytes beyond the floor (the
+    # #1850 freeze-drift case). The replay shrinks, the size bound passes, and
+    # the repair still covers the WHOLE prefix - the floor only decides the
+    # split when the bound would otherwise decline.
+    out = overlay_cached_prefix(
+        OPTIMIZED_BUGGY, CUR_ORIG, PREV_ORIG, PREV_FWD, confirmed_frozen_count=1
+    )
+    assert out[:2] == PREV_FWD
+
+
+def test_block_append_within_confirmed_floor_replays_forwarded_blocks():
+    previous = [{"role": "user", "content": [{"type": "text", "text": "stable"}]}]
+    forwarded = [{"role": "user", "content": [{"type": "text", "text": "x" * 500}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "stable"}, {"type": "text", "text": "new"}],
+        }
+    ]
+    optimized = copy.deepcopy(current)
+    out = overlay_cached_prefix(optimized, current, previous, forwarded, confirmed_frozen_count=1)
+    assert out[0]["content"][0]["text"] == "x" * 500
+    assert out[0]["content"][1]["text"] == "new"
+
+
 def test_cache_hit_property_prefix_matches_last_forward():
     # The invariant that guarantees a cache hit: forwarded[:n] this turn ==
     # forwarded[:n] last turn (== what the provider cached).
