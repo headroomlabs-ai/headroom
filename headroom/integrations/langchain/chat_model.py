@@ -345,6 +345,7 @@ class HeadroomChatModel(BaseChatModel):
             messages=openai_messages,
             model=model_str,
             model_limit=model_limit,
+            compress_user_messages=True,
         )
 
         # Create metrics
