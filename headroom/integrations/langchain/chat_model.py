@@ -571,6 +571,18 @@ class HeadroomChatModel(BaseChatModel):
             "total_tokens_after": sum(m.tokens_after for m in self._metrics_history),
         }
 
+    def get_metrics(self) -> dict[str, Any]:
+        """Return aggregated optimization metrics.
+
+        Alias for :meth:`get_savings_summary` kept for backwards
+        compatibility with docs/examples calling ``get_metrics()``
+        (see wiki/langchain.md). Includes both ``total_tokens_saved``
+        and a ``tokens_saved`` alias key.
+        """
+        summary = self.get_savings_summary()
+        summary.setdefault("tokens_saved", summary.get("total_tokens_saved", 0))
+        return summary
+
 
 class HeadroomCallbackHandler(BaseCallbackHandler):
     """LangChain callback handler for Headroom metrics and observability.

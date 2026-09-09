@@ -293,6 +293,43 @@ class TestHeadroomChatModel:
         assert summary["total_tokens_saved"] == 70
         assert summary["average_savings_percent"] == 22.5
 
+    def test_get_metrics_alias_empty(self, mock_chat_model):
+        """Regression test for #3446: get_metrics exists with no history."""
+        from headroom.integrations import HeadroomChatModel
+
+        model = HeadroomChatModel(mock_chat_model)
+        metrics = model.get_metrics()
+
+        assert metrics["total_requests"] == 0
+        assert metrics["tokens_saved"] == 0
+        assert metrics["total_tokens_saved"] == 0
+
+    def test_get_metrics_alias_with_data(self, mock_chat_model):
+        """Regression test for #3446: get_metrics matches savings summary."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.integrations.langchain import OptimizationMetrics
+
+        model = HeadroomChatModel(mock_chat_model)
+        model._metrics_history = [
+            OptimizationMetrics(
+                request_id="1",
+                timestamp=datetime.now(),
+                tokens_before=100,
+                tokens_after=80,
+                tokens_saved=20,
+                savings_percent=20.0,
+                transforms_applied=["smart_crusher"],
+                model="gpt-4o",
+            ),
+        ]
+        model._total_tokens_saved = 20
+
+        metrics = model.get_metrics()
+
+        assert metrics["total_requests"] == 1
+        assert metrics["total_tokens_saved"] == 20
+        assert metrics["tokens_saved"] == 20
+
 
 class TestHeadroomCallbackHandler:
     """Tests for HeadroomCallbackHandler."""
