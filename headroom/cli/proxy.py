@@ -199,21 +199,40 @@ def _get_env_float_optional(name: str) -> float | None:
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
-    help="Proxy port (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port. Defaults to auto-detecting the most recently started live "
+        "wrap session (falls back to 8787). Env: HEADROOM_PORT."
+    ),
 )
 @click.option("--no-open", is_flag=True, help="Print the URL instead of opening a browser")
-def dashboard(port: int, no_open: bool) -> None:
+def dashboard(port: int | None, no_open: bool) -> None:
     """Open the Headroom savings dashboard in your browser.
 
     Requires a running proxy (start one with `headroom proxy` or `headroom wrap ...`).
+
+    With no ``--port``/``HEADROOM_PORT``, the port is auto-detected from live wrap
+    sessions (e.g. a session bumped to 8788 because 8787 was taken) so the dashboard
+    URL matches whatever proxy is actually running.
     """
     import webbrowser
 
-    url = f"http://127.0.0.1:{port}/dashboard"
+    from headroom.cli._utils.proxy_discovery import proxy_is_healthy, resolve_proxy_port
+
+    resolved_port, origin = resolve_proxy_port(port)
+    url = f"http://127.0.0.1:{resolved_port}/dashboard"
+    if origin == "discovered":
+        click.echo(f"  Detected live proxy on port {resolved_port}")
     click.echo(f"  Dashboard: {url}")
+    if not proxy_is_healthy(resolved_port):
+        click.secho(
+            f"  Warning: no proxy responding on port {resolved_port}. "
+            "Start one with `headroom proxy` or `headroom wrap ...`, "
+            "or pass --port explicitly.",
+            fg="yellow",
+            err=True,
+        )
     if not no_open:
         try:
             webbrowser.open(url)

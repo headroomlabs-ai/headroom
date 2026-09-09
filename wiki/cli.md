@@ -382,7 +382,7 @@ headroom inspect --format json   # raw feed for piping into another tool
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--port` / `-p` | `8787` | Proxy port to query (env: `HEADROOM_PORT`) |
+| `--port` / `-p` | auto-detected, else `8787` | Proxy port to query. Defaults to the most recently started live wrap session (env: `HEADROOM_PORT`) |
 | `--last` | `1` | Number of most-recent requests to show |
 | `--format` | `text` | `text` renders a highlighted diff; `json` emits the raw feed |
 | `--full` | off | Include messages the compressor left unchanged |

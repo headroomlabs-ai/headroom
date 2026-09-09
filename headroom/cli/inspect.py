@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import difflib
 import json
-import os
 from typing import Any
 
 import click
@@ -117,8 +116,10 @@ def _render_request(transformation: dict[str, Any], *, full: bool) -> None:
     "-p",
     default=None,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
-    help="Proxy port to query (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port to query. Defaults to auto-detecting the most recently "
+        "started live wrap session (falls back to 8787). Env: HEADROOM_PORT."
+    ),
 )
 @click.option(
     "--last",
@@ -152,9 +153,10 @@ def inspect_cmd(port: int | None, last: int, output_format: str, full: bool) -> 
         headroom inspect --full          Include unchanged messages
         headroom inspect --format json   Raw feed for piping into another tool
     """
+    from headroom.cli._utils.proxy_discovery import resolve_proxy_port
     from headroom.install.health import probe_json
 
-    resolved_port = port if port is not None else int(os.environ.get("HEADROOM_PORT", "8787"))
+    resolved_port, _origin = resolve_proxy_port(port)
     base_url = f"http://127.0.0.1:{resolved_port}"
     payload = probe_json(f"{base_url}/transformations/feed?limit={last}", timeout=5.0)
 
