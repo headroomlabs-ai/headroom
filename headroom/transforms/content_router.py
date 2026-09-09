@@ -50,6 +50,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from ..cache.compression_store import cached_references_available
 from ..config import (
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
@@ -1280,7 +1281,9 @@ class CompressionCache:
             entry = self._results.get(key)
             if entry is not None:
                 compressed, ratio, strategy, created_at = entry
-                if (time.monotonic() - created_at) < self._ttl_seconds:
+                if (
+                    time.monotonic() - created_at
+                ) < self._ttl_seconds and cached_references_available(compressed):
                     self._hits += 1
                     self._total_lookup_ns += time.perf_counter_ns() - t0
                     self._lookup_count += 1

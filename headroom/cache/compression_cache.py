@@ -15,6 +15,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .compression_store import cached_references_available
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,6 +155,10 @@ class CompressionCache:
         """Retrieve compressed content by hash, refreshing LRU position on hit."""
         with self._lock:
             entry = self._cache.get(hash)
+            if entry is not None and not cached_references_available(entry.compressed):
+                self._total_tokens_saved -= entry.tokens_saved
+                del self._cache[hash]
+                entry = None
             if entry is None:
                 self._misses += 1
                 return None
@@ -317,7 +323,7 @@ class CompressionCache:
                     content = _extract_tool_result_content(msg)
                     if content is not None:
                         h = self.content_hash(content)
-                        if h not in self._cache and h not in self._stable_hashes:
+                        if self.get_compressed(h) is None and h not in self._stable_hashes:
                             break
                     else:
                         # tool_result with non-string content; treat as unstable
