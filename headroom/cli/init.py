@@ -1,11 +1,10 @@
-"""Durable agent initialization commands."""
+"""Durable agent initialization commands (Claude Code only)."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -16,19 +15,12 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
-from headroom._subprocess import run
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    import tomli as tomllib  # type: ignore[no-redef]
-
 import click
 
+from headroom._subprocess import run
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.paths import claude_settings_path, validate_profile_name
 from headroom.install.planner import build_manifest
-from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
@@ -42,8 +34,6 @@ from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
-from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
 
@@ -53,26 +43,10 @@ _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
 _GLOBAL_PROFILE = "init-user"
 _CLAUDE_HOOK_MARKER = "headroom-init-claude"
-_COPILOT_HOOK_MARKER = "headroom-init-copilot"
-_CODEX_HOOK_MARKER = "headroom-init-codex"
-_CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
-_CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
-_CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
-_CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
-_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
-_LOCAL_TARGETS = {"claude", "codex"}
-_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_SUPPORTED_TARGETS = ("claude",)
+_LOCAL_TARGETS = {"claude"}
+_GLOBAL_TARGETS = {"claude"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
-_TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
-_TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
-_TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
-_CODEX_FEATURES_TABLE_RE = re.compile(
-    rf"^[ \t]*\[[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\][ \t]*(?:#.*)?$"
-)
-_CODEX_FEATURES_DOTTED_LEGACY_RE = re.compile(
-    rf"^[ \t]*{_TOML_FEATURES_NAME_RE}[ \t]*\.[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*="
-)
-_CODEX_FEATURES_LEGACY_KEY_RE = re.compile(rf"^[ \t]*{_TOML_CODEX_HOOKS_NAME_RE}[ \t]*=")
 
 
 def _command_string(parts: list[str]) -> str:
@@ -125,24 +99,10 @@ def _runtime_profile(global_scope: bool, cwd: Path | None = None) -> str:
     return _GLOBAL_PROFILE if global_scope else _local_profile(cwd)
 
 
-def _copilot_config_path() -> Path:
-    return Path.home() / ".copilot" / "config.json"
-
-
-def _codex_hooks_path(global_scope: bool) -> Path:
-    return (Path.home() if global_scope else Path.cwd()) / ".codex" / "hooks.json"
-
-
 def _claude_scope_path(global_scope: bool) -> Path:
     if global_scope:
         return claude_settings_path()
     return Path.cwd() / ".claude" / "settings.local.json"
-
-
-def _codex_scope_path(global_scope: bool) -> Path:
-    if global_scope:
-        return codex_config_path()
-    return Path.cwd() / ".codex" / "config.toml"
 
 
 def _json_file(path: Path) -> dict[str, Any]:
@@ -154,12 +114,12 @@ def _json_file(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(content)
     except json.JSONDecodeError as e:
-        # This is a user-owned file (e.g. ~/.claude/settings.json or Codex's
-        # hooks.json) that the callers read-merge-write. Returning {} would make
-        # the following _write_json overwrite it, silently discarding the user's
-        # settings; letting the raw JSONDecodeError propagate crashes `headroom
-        # init` with a traceback. Abort with an actionable message so the user
-        # can fix the JSON (or move it aside) without losing it.
+        # This is a user-owned file (e.g. ~/.claude/settings.json) that the
+        # callers read-merge-write. Returning {} would make the following
+        # _write_json overwrite it, silently discarding the user's settings;
+        # letting the raw JSONDecodeError propagate crashes `headroom init`
+        # with a traceback. Abort with an actionable message so the user can
+        # fix the JSON (or move it aside) without losing it.
         raise click.ClickException(
             f"{path} contains invalid JSON ({e}); fix it and re-run, or move it aside."
         ) from e
@@ -231,322 +191,10 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     _write_json(path, payload)
 
 
-def _ensure_copilot_hooks(path: Path, profile: str) -> None:
-    logger.debug("ensure copilot hooks: %s (profile=%s)", path, profile)
-    payload = _json_file(path)
-    hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
-    command = f"{_hook_command('--profile', profile)} --marker {_COPILOT_HOOK_MARKER}"
-    for event in ("SessionStart", "PreToolUse"):
-        entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
-        retained = [
-            entry
-            for entry in entries
-            if not (
-                isinstance(entry, dict) and _COPILOT_HOOK_MARKER in str(entry.get("command", ""))
-            )
-        ]
-        retained.append({"type": "command", "command": command, "cwd": ".", "timeout": 15})
-        hooks[event] = retained
-    payload["hooks"] = hooks
-    _write_json(path, payload)
-
-
-def _replace_marker_block(
-    content: str, marker_start: str, marker_end: str, block: str, *, at_root: bool = False
-) -> str:
-    content = _remove_marker_block(content, marker_start, marker_end)
-    block = block.strip()
-    if at_root:
-        # The block carries top-level keys, so it must sit above the first table
-        # header; appended after a table (e.g. [features]) TOML scopes those keys
-        # into that table and Codex rejects the config (#260).
-        lines = content.splitlines()
-        for index, line in enumerate(lines):
-            if _TOML_TABLE_HEADER_RE.search(line):
-                head = "\n".join(lines[:index]).rstrip()
-                tail = "\n".join(lines[index:]).lstrip("\n")
-                prefix = f"{head}\n\n" if head else ""
-                return (f"{prefix}{block}\n\n{tail}").rstrip() + "\n"
-    return (content.rstrip() + "\n\n" + block + "\n").lstrip()
-
-
-def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> str:
-    if marker_start not in content or marker_end not in content:
-        return content
-    start = content.index(marker_start)
-    end = content.index(marker_end) + len(marker_end)
-    return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
-
-
-def _strip_codex_init_block(content: str) -> str:
-    """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
-    import re
-
-    # Remove any provider marker → end marker span, possibly repeated.
-    while _CODEX_PROVIDER_MARKER_START in content and _CODEX_PROVIDER_MARKER_END in content:
-        start = content.index(_CODEX_PROVIDER_MARKER_START)
-        end_idx = content.index(_CODEX_PROVIDER_MARKER_END, start)
-        if end_idx < start:
-            break
-        end = end_idx + len(_CODEX_PROVIDER_MARKER_END)
-        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
-
-    # Remove stale unpaired markers.
-    content = content.replace(_CODEX_PROVIDER_MARKER_START + "\n", "")
-    content = content.replace(_CODEX_PROVIDER_MARKER_END + "\n", "")
-
-    # Strip any orphan top-level keys that a crashed or partial write may have
-    # left outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
-
-    # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
-    orphan_headroom_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
-        r"(?=^\[|\Z)"
-    )
-    content = orphan_headroom_table.sub("", content)
-
-    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
-
-
-def _ensure_codex_provider(path: Path, port: int) -> None:
-    import re
-
-    logger.debug("ensure codex provider block: %s (port=%s)", path, port)
-    # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
-    # account menu); omitting it for API-key users avoids forcing an OAuth
-    # login (#406).
-    requires_openai_auth = (
-        "requires_openai_auth = true\n"
-        if codex_uses_chatgpt_auth(path.parent / "auth.json")
-        else ""
-    )
-    block = (
-        f"{_CODEX_PROVIDER_MARKER_START}\n"
-        'model_provider = "headroom"\n'
-        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
-        "[model_providers.headroom]\n"
-        'name = "Headroom init proxy"\n'
-        f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        "supports_websockets = true\n"
-        f"{requires_openai_auth}"
-        f"{_CODEX_PROVIDER_MARKER_END}"
-    )
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    # init owns the ROOT-level model_provider/openai_base_url: drop any prior
-    # root assignment so we replace it instead of emitting a duplicate top-level
-    # key (#260). Scope the strip to the document root (everything before the
-    # first table header) -- these keys also appear legitimately inside
-    # [profiles.*] tables as per-profile overrides, and stripping them there
-    # silently reroutes the user's profiles to the injected "headroom" default.
-    _first_table = re.search(r"(?m)^[ \t]*\[", content)
-    _split = _first_table.start() if _first_table else len(content)
-    root, rest = content[:_split], content[_split:]
-    root = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", root)
-    root = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", root)
-    content = root + rest
-    # The provider block carries top-level keys (model_provider, openai_base_url),
-    # so it must land at the document root rather than after a trailing table (#260).
-    content = _replace_marker_block(
-        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    # Codex filters its history menu by the active model_provider, so existing
-    # native threads vanish once we switch to "headroom". Retag them to match the
-    # active provider so the history stays whole (#961), mirroring the install
-    # (providers.codex.install) and wrap (cli.wrap) paths. The revert direction is
-    # handled by `headroom unwrap codex`.
-    retag_to_headroom(path.parent)
-
-
-def _codex_feature_block() -> str:
-    return f"{_CODEX_FEATURE_MARKER_START}\nhooks = true\n{_CODEX_FEATURE_MARKER_END}"
-
-
-def _codex_dotted_feature_block() -> str:
-    return f"{_CODEX_FEATURE_MARKER_START}\nfeatures.hooks = true\n{_CODEX_FEATURE_MARKER_END}"
-
-
-def _codex_features_table_index(lines: list[str]) -> int | None:
-    return next(
-        (index for index, line in enumerate(lines) if _CODEX_FEATURES_TABLE_RE.search(line)),
-        None,
-    )
-
-
-def _codex_features(content: str) -> dict[str, Any] | None:
-    if not content.strip():
-        return None
-    try:
-        parsed = tomllib.loads(content)
-    except tomllib.TOMLDecodeError:
-        return None
-    features = parsed.get("features")
-    return features if isinstance(features, dict) else None
-
-
-def _codex_features_has_hooks(content: str) -> bool:
-    features = _codex_features(content)
-    if features is None:
-        # Keep init resilient for already-invalid user configs; this fallback
-        # only needs to avoid adding a second obvious hooks line.
-        lines = content.splitlines()
-        features_index = _codex_features_table_index(lines)
-        if features_index is None:
-            return False
-        for line in lines[features_index + 1 :]:
-            if _TOML_TABLE_HEADER_RE.search(line):
-                break
-            if re.search(r"^[ \t]*hooks[ \t]*=", line):
-                return True
-        return False
-
-    return "hooks" in features
-
-
-def _strip_codex_legacy_feature_flag(content: str) -> str:
-    lines = content.splitlines(keepends=True)
-    retained: list[str] = []
-    in_features = False
-    in_root = True
-
-    for line in lines:
-        if _TOML_TABLE_HEADER_RE.search(line):
-            in_root = False
-            in_features = bool(_CODEX_FEATURES_TABLE_RE.search(line))
-            retained.append(line)
-            continue
-        if (in_root and _CODEX_FEATURES_DOTTED_LEGACY_RE.search(line)) or (
-            in_features and _CODEX_FEATURES_LEGACY_KEY_RE.search(line)
-        ):
-            continue
-        retained.append(line)
-
-    return "".join(retained)
-
-
-def _ensure_codex_feature_flag(path: Path) -> None:
-    """Ensure Codex's ``[features].hooks`` flag is enabled in config.toml.
-
-    ``hooks`` is the canonical key. ``codex_hooks`` was the original key name and
-    still resolves as a deprecated alias, but Codex >= 0.129 emits a deprecation
-    warning for it (renamed in openai/codex#20522). Any legacy
-    ``[features].codex_hooks`` line is removed, whether inside or outside our
-    marker block, so a migrated config drops the deprecated key and never
-    collides with a duplicate ``hooks`` key. A user-managed ``hooks`` value
-    outside our marker block is left untouched.
-    """
-    content = path.read_text(encoding="utf-8") if path.exists() else ""
-    # Drop the deprecated alias key from [features]. Mirrors the top-level key
-    # cleanup in _ensure_codex_provider (#260) so re-running init migrates a
-    # legacy config rather than producing a duplicate `hooks` key, while leaving
-    # unrelated user tables untouched.
-    content = _strip_codex_legacy_feature_flag(content)
-    if _CODEX_FEATURE_MARKER_START in content and _CODEX_FEATURE_MARKER_END in content:
-        # init owns its marker block; remove it first, then reinsert under the
-        # correct TOML scope below.
-        content = _remove_marker_block(
-            content, _CODEX_FEATURE_MARKER_START, _CODEX_FEATURE_MARKER_END
-        )
-
-    if _codex_features_has_hooks(content):
-        # A user-managed `[features].hooks` key already exists outside our
-        # marker block; respect their value. Clearing the legacy key above was
-        # the only work.
-        pass
-    else:
-        lines = content.splitlines()
-        features_index = _codex_features_table_index(lines)
-        if features_index is not None:
-            # Leading blank line matches the normalisation _replace_marker_block
-            # applies on later runs, so re-running init is byte-idempotent.
-            lines[features_index + 1 : features_index + 1] = [
-                "",
-                *_codex_feature_block().splitlines(),
-            ]
-            content = "\n".join(lines).rstrip() + "\n"
-        elif _codex_features(content) is not None:
-            # The user expressed [features] via dotted keys, so adding a new
-            # table would duplicate it. Keep this key at the document root.
-            content = _replace_marker_block(
-                content,
-                _CODEX_FEATURE_MARKER_START,
-                _CODEX_FEATURE_MARKER_END,
-                _codex_dotted_feature_block(),
-                at_root=True,
-            )
-        else:
-            content = (
-                content.rstrip() + "\n\n[features]\n\n" + _codex_feature_block() + "\n"
-            ).lstrip()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
-def _ensure_codex_hooks(path: Path, profile: str) -> None:
-    logger.debug("ensure codex hooks: %s (profile=%s)", path, profile)
-    command = f"{_hook_command('--profile', profile)} --marker {_CODEX_HOOK_MARKER}"
-    # Read-merge-write rather than overwrite: the previous version wrote a fresh
-    # payload wholesale, destroying any user-managed hooks (and other top-level
-    # keys) in codex hooks.json. Merge per event and dedup on the Headroom
-    # marker, matching _ensure_claude_hooks / _ensure_copilot_hooks.
-    payload = _json_file(path)
-    hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
-    for event, matcher in (
-        ("SessionStart", "startup|resume"),
-        ("PreToolUse", "Bash"),
-    ):
-        entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
-        retained: list[dict[str, Any]] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                retained.append(entry)
-                continue
-            hook_items = entry.get("hooks")
-            if not isinstance(hook_items, list):
-                retained.append(entry)
-                continue
-            has_headroom = any(
-                isinstance(item, dict)
-                and item.get("command")
-                and _CODEX_HOOK_MARKER in str(item.get("command"))
-                for item in hook_items
-            )
-            if not has_headroom:
-                retained.append(entry)
-        retained.append(
-            {
-                "matcher": matcher,
-                "hooks": [{"type": "command", "command": command, "timeout": 15}],
-            }
-        )
-        hooks[event] = retained
-    payload["hooks"] = hooks
-    _write_json(path, payload)
-
-
-def _manifest_changed(
-    existing: Any,
-    *,
-    port: int,
-    backend: str,
-    anyllm_provider: str | None,
-    region: str | None,
-    memory: bool,
-) -> bool:
+def _manifest_changed(existing: Any, *, port: int, memory: bool) -> bool:
     return any(
         [
             getattr(existing, "port", port) != port,
-            getattr(existing, "backend", backend) != backend,
-            getattr(existing, "anyllm_provider", anyllm_provider) != anyllm_provider,
-            getattr(existing, "region", region) != region,
             getattr(existing, "memory_enabled", memory) != memory,
         ]
     )
@@ -557,9 +205,6 @@ def _ensure_runtime_manifest(
     global_scope: bool,
     targets: list[str],
     port: int,
-    backend: str,
-    anyllm_provider: str | None,
-    region: str | None,
     memory: bool,
 ) -> str:
     profile = _runtime_profile(global_scope)
@@ -578,75 +223,24 @@ def _ensure_runtime_manifest(
         provider_mode="manual",
         targets=merged_targets,
         port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
         proxy_mode="token",
         memory_enabled=memory,
-        telemetry_enabled=True,
-        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        telemetry_enabled=False,
+        image="",
     )
     manifest.supervisor_kind = SupervisorKind.NONE.value
     manifest.artifacts = []
     manifest.mutations = existing.mutations if existing else []
-    if existing is not None and _manifest_changed(
-        existing,
-        port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-        memory=memory,
-    ):
+    if existing is not None and _manifest_changed(existing, port=port, memory=memory):
         try:
             stop_runtime(existing)
         except Exception:
             pass
     save_manifest(manifest)
     return profile
-
-
-def _env_manifest(values: dict[str, str]) -> Any:
-    return build_manifest(
-        profile="init-env",
-        preset=InstallPreset.PERSISTENT_TASK.value,
-        runtime_kind=RuntimeKind.PYTHON.value,
-        scope=ConfigScope.USER.value,
-        provider_mode="manual",
-        targets=["copilot"],
-        port=8787,
-        backend="anthropic",
-        anyllm_provider=None,
-        region=None,
-        proxy_mode="token",
-        memory_enabled=False,
-        telemetry_enabled=True,
-        image="ghcr.io/headroomlabs-ai/headroom:latest",
-    )
-
-
-def _apply_user_env(values: dict[str, str]) -> None:
-    manifest = _env_manifest(values)
-    manifest.base_env = {}
-    manifest.tool_envs = {"copilot": values}
-    scope = "windows" if os.name == "nt" else "unix"
-    logger.debug("apply user env scope=%s keys=%s", scope, sorted(values.keys()))
-    if os.name == "nt":
-        _apply_windows_env_scope(manifest)
-    else:
-        _apply_unix_env_scope(manifest)
-
-
-def _resolve_copilot_env(port: int, backend: str) -> dict[str, str]:
-    if backend == "anthropic":
-        return {
-            "COPILOT_PROVIDER_TYPE": "anthropic",
-            "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}",
-        }
-    return {
-        "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_BASE_URL": f"http://127.0.0.1:{port}/v1",
-        "COPILOT_PROVIDER_WIRE_API": "completions",
-    }
 
 
 def _marketplace_source() -> str:
@@ -695,21 +289,6 @@ def _install_claude_marketplace(scope: str) -> None:
     _run_checked(
         [claude_bin, "plugin", "install", "headroom@headroom-marketplace", "--scope", scope],
         action="claude plugin install",
-    )
-
-
-def _install_copilot_marketplace() -> None:
-    copilot_bin = shutil.which("copilot")
-    if not copilot_bin:
-        raise click.ClickException("'copilot' not found in PATH. Install GitHub Copilot CLI first.")
-    source = _marketplace_source()
-    _run_checked(
-        [copilot_bin, "plugin", "marketplace", "add", source],
-        action="copilot marketplace add",
-    )
-    _run_checked(
-        [copilot_bin, "plugin", "install", "headroom@headroom-marketplace"],
-        action="copilot plugin install",
     )
 
 
@@ -799,12 +378,7 @@ def detect_init_targets(global_scope: bool) -> list[str]:
 
 
 def _format_empty_detection_error(global_scope: bool) -> str:
-    """Build the error message shown when no in-scope targets were detected.
-
-    Lists every agent that was probed, what ``shutil.which`` returned, and
-    confirms how to proceed explicitly — including that the ``-g`` / ``--global``
-    flag the user tried is still valid.
-    """
+    """Build the error message shown when no in-scope targets were detected."""
 
     probes = _probe_init_targets(global_scope)
     scope_flag = "-g" if global_scope else ""
@@ -848,68 +422,24 @@ def _init_claude(*, global_scope: bool, profile: str, port: int) -> None:
     click.echo("Restart Claude Code to activate Headroom hooks and provider routing.")
 
 
-def _init_copilot(*, global_scope: bool, profile: str, port: int, backend: str) -> None:
-    if not global_scope:
-        raise click.ClickException(
-            "Copilot durable init currently requires -g (current-user scope)."
-        )
-    _ensure_copilot_hooks(_copilot_config_path(), profile)
-    _apply_user_env(_resolve_copilot_env(port, backend))
-    _install_copilot_marketplace()
-    click.echo("Configured GitHub Copilot CLI (user scope).")
-    click.echo("Restart Copilot CLI to activate Headroom hooks and provider routing.")
-
-
-def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
-    config_path = _codex_scope_path(global_scope)
-    _ensure_codex_provider(config_path, port)
-    _ensure_codex_feature_flag(config_path)
-    _ensure_codex_hooks(_codex_hooks_path(global_scope), profile)
-    click.echo(f"Configured Codex ({'user' if global_scope else 'local'} scope).")
-    if os.name == "nt":
-        click.echo(
-            "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
-        )
-    click.echo("Restart Codex to activate Headroom configuration.")
-
-
-def _init_openclaw(*, global_scope: bool, port: int) -> None:
-    if not global_scope:
-        raise click.ClickException(
-            "OpenClaw durable init currently requires -g (current-user scope)."
-        )
-    command = [*resolve_headroom_command(), "wrap", "openclaw", "--proxy-port", str(port)]
-    result = subprocess.run(command)
-    if result.returncode != 0:
-        raise SystemExit(result.returncode)
-
-
 def _run_init_targets(
     *,
     targets: list[str],
     global_scope: bool,
     port: int,
-    backend: str,
-    anyllm_provider: str | None,
-    region: str | None,
     memory: bool,
 ) -> None:
     logger.debug(
-        "run_init_targets: targets=%s global_scope=%s port=%s backend=%s memory=%s",
+        "run_init_targets: targets=%s global_scope=%s port=%s memory=%s",
         targets,
         global_scope,
         port,
-        backend,
         memory,
     )
-    runtime_targets = [target for target in targets if target != "openclaw"]
     profile = _ensure_runtime_manifest(
         global_scope=global_scope,
-        targets=runtime_targets,
+        targets=targets,
         port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
         memory=memory,
     )
     logger.debug("run_init_targets: using profile=%s", profile)
@@ -917,17 +447,7 @@ def _run_init_targets(
         logger.debug("run_init_targets: dispatching -> %s", target)
         if target == "claude":
             _init_claude(global_scope=global_scope, profile=profile, port=port)
-        elif target == "copilot":
-            _init_copilot(global_scope=global_scope, profile=profile, port=port, backend=backend)
-        elif target == "codex":
-            _init_codex(global_scope=global_scope, profile=profile, port=port)
-        elif target == "openclaw":
-            _init_openclaw(global_scope=global_scope, port=port)
 
-    # Register the headroom MCP server with every targeted agent that has
-    # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
-    # add Cursor / Codex / Continue / Cline / Windsurf / Goose without
-    # touching the call sites.
     _install_headroom_mcp_for_targets(targets=targets, port=port)
 
 
@@ -960,9 +480,6 @@ def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
     show_default=True,
     help="Headroom proxy port.",
 )
-@click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
-@click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
 @click.option(
     "-v",
@@ -976,38 +493,23 @@ def init(
     ctx: click.Context,
     global_scope: bool,
     port: int,
-    backend: str,
-    anyllm_provider: str | None,
-    region: str | None,
     memory: bool,
     verbose: bool,
 ) -> None:
-    """Install durable Headroom integrations for supported agents."""
+    """Install durable Headroom integration for Claude Code."""
     if verbose:
         _enable_verbose_logging()
     logger.debug(
-        "init: global_scope=%s port=%s backend=%s anyllm_provider=%s region=%s memory=%s "
-        "invoked_subcommand=%s",
+        "init: global_scope=%s port=%s memory=%s invoked_subcommand=%s",
         global_scope,
         port,
-        backend,
-        anyllm_provider,
-        region,
         memory,
         ctx.invoked_subcommand,
     )
-    if anyllm_provider and backend != "anyllm":
-        click.echo(
-            f"Warning: --anyllm-provider is ignored unless --backend anyllm "
-            f"(got --backend {backend})."
-        )
     if ctx.invoked_subcommand is not None:
         ctx.obj = {
             "global_scope": global_scope,
             "port": port,
-            "backend": backend,
-            "anyllm_provider": anyllm_provider,
-            "region": region,
             "memory": memory,
             "verbose": verbose,
         }
@@ -1022,9 +524,6 @@ def init(
         targets=targets,
         global_scope=global_scope,
         port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
         memory=memory,
     )
 
@@ -1041,54 +540,6 @@ def init_claude(ctx: click.Context) -> None:
         targets=["claude"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
-        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
-        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
-        region=_ctx_value(ctx, "region"),
-        memory=bool(_ctx_value(ctx, "memory")),
-    )
-
-
-@init.command("copilot")
-@click.pass_context
-def init_copilot(ctx: click.Context) -> None:
-    """Install GitHub Copilot CLI durable hooks and provider routing."""
-    _run_init_targets(
-        targets=["copilot"],
-        global_scope=bool(_ctx_value(ctx, "global_scope")),
-        port=int(_ctx_value(ctx, "port") or 8787),
-        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
-        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
-        region=_ctx_value(ctx, "region"),
-        memory=bool(_ctx_value(ctx, "memory")),
-    )
-
-
-@init.command("codex")
-@click.pass_context
-def init_codex(ctx: click.Context) -> None:
-    """Install Codex durable hooks and provider routing."""
-    _run_init_targets(
-        targets=["codex"],
-        global_scope=bool(_ctx_value(ctx, "global_scope")),
-        port=int(_ctx_value(ctx, "port") or 8787),
-        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
-        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
-        region=_ctx_value(ctx, "region"),
-        memory=bool(_ctx_value(ctx, "memory")),
-    )
-
-
-@init.command("openclaw")
-@click.pass_context
-def init_openclaw(ctx: click.Context) -> None:
-    """Install the durable OpenClaw Headroom plugin."""
-    _run_init_targets(
-        targets=["openclaw"],
-        global_scope=bool(_ctx_value(ctx, "global_scope")),
-        port=int(_ctx_value(ctx, "port") or 8787),
-        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
-        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
-        region=_ctx_value(ctx, "region"),
         memory=bool(_ctx_value(ctx, "memory")),
     )
 

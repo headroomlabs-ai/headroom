@@ -246,21 +246,3 @@ def test_bypass_request_is_never_model_rewritten() -> None:
     # Byte-faithful passthrough must keep the client's original model.
     assert _forwarded_model(http) == "claude-sonnet-4-6"
 
-
-def test_vertex_raw_predict_model_is_not_rewritten_in_body() -> None:
-    # When the model comes from the provider URL (Vertex rawPredict), the upstream
-    # model is set by the path, so routing must not rewrite body["model"].
-    app = create_app(_messages_config())
-    with TestClient(app) as client:
-        http = _install_fake_client(client.app.state.proxy)
-        resp = client.post(
-            "/v1/projects/p/locations/us-central1/publishers/anthropic/models/"
-            "claude-sonnet-4-6:rawPredict",
-            json={
-                "anthropic_version": "vertex-2023-10-16",
-                "max_tokens": 16,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-        )
-    assert resp.status_code == 200
-    assert "model" not in _forwarded_body(http)

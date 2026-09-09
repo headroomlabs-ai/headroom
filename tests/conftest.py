@@ -46,19 +46,15 @@ def _scrub_developer_headroom_env(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
 
 
-# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
-# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
-# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
-# to the real production endpoint. Every test that reaches the outcome funnel
-# then POSTs a session event for real: observed writing into the live corpus
-# during a local run, and CI would do the same on every push.
-#
-# Depends on the scrub fixture so it is guaranteed to run after it rather than
-# relying on declaration order. A test that wants the beacon on just sets the
-# var itself — monkeypatch inside the test wins over this.
+# Hermetic defaults, applied after the scrub above: the proxy must never probe
+# the real upstream from a test (pytest-socket blocks it anyway — this keeps
+# /health reporting "healthy" instead of failing the probe), and every optional
+# network fetch stays off. A test that wants different values sets them itself.
 @pytest.fixture(autouse=True)
-def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
-    monkeypatch.setenv("HEADROOM_BEACON", "off")
+def _hermetic_env(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("HEADROOM_BINARIES_OFFLINE", "1")
 
 
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
@@ -83,28 +79,6 @@ def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
 
     ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
     monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
-
-
-# The Copilot "routed to Copilot" flag is a module-global ContextVar that
-# build_copilot_upstream_url() sets as a side effect. Unit tests that call that
-# builder directly (or otherwise run in the shared root context) would leave it
-# set and mislabel a later test's request outcome as "copilot". Reset it around
-# every test so build-time side effects can't leak between tests.
-@pytest.fixture(autouse=True)
-def _reset_copilot_routing_flag():
-    # The macos/windows-native-wrapper CI jobs run the installer tests with only
-    # pytest installed (no headroom): they drive the installer shell scripts via
-    # subprocess, so headroom isn't importable and there's no routing flag to
-    # reset. Skip the reset there instead of erroring at setup.
-    try:
-        from headroom.copilot_auth import reset_request_routed_to_copilot
-    except ModuleNotFoundError:
-        yield
-        return
-
-    reset_request_routed_to_copilot()
-    yield
-    reset_request_routed_to_copilot()
 
 
 # `savings_tracker._resolve_litellm_model` is an `lru_cache`d, module-global,

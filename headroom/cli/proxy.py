@@ -1244,9 +1244,6 @@ def proxy(
     provider_api_overrides = resolve_api_overrides(
         anthropic_api_url=anthropic_api_url,
         openai_api_url=openai_api_url,
-        gemini_api_url=gemini_api_url,
-        cloudcode_api_url=cloudcode_api_url,
-        vertex_api_url=vertex_api_url,
         environ=os.environ,
     )
 
@@ -1316,9 +1313,6 @@ def proxy(
         openai_extra_headers=resolved_openai_extra_headers,
         openai_api_url=provider_api_overrides.openai,
         provider_name=provider_name,
-        gemini_api_url=provider_api_overrides.gemini,
-        cloudcode_api_url=provider_api_overrides.cloudcode,
-        vertex_api_url=provider_api_overrides.vertex,
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
@@ -1494,8 +1488,6 @@ def proxy(
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
     openai_url = provider_api_targets.openai
-    cloudcode_url = provider_api_targets.cloudcode
-    vertex_url = provider_api_targets.vertex
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -1505,25 +1497,10 @@ def proxy(
   Providers: https://mozilla-ai.github.io/any-llm/providers/
 """
     elif config.backend != "anthropic":
-        # LiteLLM backend
-        from headroom.backends.litellm import get_provider_config
-
-        provider = config.backend.replace("litellm-", "")
-        provider_config = get_provider_config(provider)
-
-        # Build usage instructions from provider config
-        env_vars_str = (
-            ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
+        backend_section = (
+            f"\n  NOTE: backend {config.backend!r} is not available in this build; "
+            "requests go directly to Anthropic.\n"
         )
-        backend_section = f"""
-IMPORTANT for {provider_config.display_name} users:
-  1. Set credentials: {env_vars_str}
-  2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
-     (Headroom ignores this - it uses your {provider_config.display_name} credentials)
-  3. Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"""
-        if provider_config.model_format_hint:
-            backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
-        backend_section += "\n"
 
     # Build memory section if enabled
     memory_section = ""
@@ -1649,15 +1626,12 @@ Starting proxy server...
 {backend_section}{tuning_section}
 
 Routing:
-  /v1/messages                    → {anthropic_url}
-  /v1/chat/completions            → {openai_url}
-  /v1/responses                   → {openai_url}  (HTTP + WebSocket)
-  /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
+  /v1/messages                    → {anthropic_url}  (compressed)
+  other paths                     → passthrough ({anthropic_url} / {openai_url})
 
 Usage:
   Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+  (or: headroom wrap claude)
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness
@@ -1669,17 +1643,6 @@ Endpoints:
 
 Press Ctrl+C to stop.
 """)
-
-    # Surface an "update available" notice (reads cache only; no network here).
-    # Best-effort: a broken update check must never block proxy startup.
-    try:
-        from headroom.update_check import format_update_notice
-
-        _update_notice = format_update_notice()
-        if _update_notice:
-            click.echo(f"\n{_update_notice}\n")
-    except Exception:  # noqa: BLE001 — banner must never crash startup
-        pass
 
     # -----------------------------------------------------------------------
     # Option E: start embedding server sidecar if requested

@@ -1,23 +1,16 @@
-"""Generic MCP server registration across coding agents.
+"""MCP server registration for Claude Code.
 
 The MCP protocol is universal but each agent's *registration* mechanism is
-not — Claude Code uses its own CLI + ``~/.claude/.claude.json``, Cursor
-writes ``~/.cursor/mcp.json``, Codex patches a TOML file, and so on. This
-module provides a uniform interface so headroom can install its MCP server
-(``headroom mcp serve``) into every detected agent.
-
-Wave 1 ships :class:`ClaudeRegistrar`. Other registrars (Cursor, Codex,
-Continue, Cline, Windsurf, Goose, OpenHands) are added in subsequent waves
-without changing the calling code.
+not — Claude Code uses its own CLI + ``~/.claude/.claude.json``. This module
+provides the registrar that installs headroom's MCP server
+(``headroom mcp serve``) into Claude Code.
 """
 
 from __future__ import annotations
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeConfigMutationError, ClaudeRegistrar
-from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
-from .grok import GrokRegistrar
 from .install import (
     CLAUDE_SERENA_CONTEXT,
     DEFAULT_PROXY_URL,
@@ -26,7 +19,6 @@ from .install import (
     get_all_registrars,
     install_everywhere,
 )
-from .opencode import OpencodeRegistrar
 from .server_json import build_server_json, render_server_json
 
 __all__ = [
@@ -34,10 +26,7 @@ __all__ = [
     "CLAUDE_SERENA_CONTEXT",
     "ClaudeConfigMutationError",
     "ClaudeRegistrar",
-    "CodexRegistrar",
-    "GrokRegistrar",
     "MCPRegistrar",
-    "OpencodeRegistrar",
     "RegisterResult",
     "RegisterStatus",
     "ServerSpec",

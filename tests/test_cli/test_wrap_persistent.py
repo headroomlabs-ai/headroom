@@ -374,126 +374,6 @@ def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monke
     assert calls[1][2]["openai_api_url"] == "https://api.individual.githubcopilot.com"
 
 
-def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_seed(
-    monkeypatch,
-) -> None:
-    calls: list[object] = []
-
-    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
-    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
-    monkeypatch.setattr(
-        wrap_cli,
-        "_find_available_port",
-        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_kill_proxy_by_pid",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("subscription-seeded session should not restart the shared proxy")
-        ),
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_start_proxy",
-        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
-    )
-
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        copilot_api_token="tid-session-token",
-        copilot_refresh_oauth_token="gho-refresh",
-        copilot_api_token_expires_at=456.5,
-    )
-
-    assert proc is None
-    assert actual_port == 8788
-    assert calls[0] == ("find_port", 8788)
-    assert calls[1][0] == "start"
-    assert calls[1][1][0] == 8788
-    assert calls[1][2]["copilot_api_token"] == "tid-session-token"
-    assert calls[1][2]["copilot_refresh_oauth_token"] == "gho-refresh"
-    assert calls[1][2]["copilot_api_token_expires_at"] == 456.5
-
-
-def test_ensure_proxy_isolates_copilot_subscription_seed_with_api_token_only(monkeypatch) -> None:
-    calls: list[object] = []
-
-    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
-    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
-    monkeypatch.setattr(
-        wrap_cli,
-        "_find_available_port",
-        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_start_proxy",
-        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
-    )
-
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        copilot_api_token="direct-token-only",
-    )
-
-    assert proc is None
-    assert actual_port == 8788
-    assert calls[0] == ("find_port", 8788)
-    assert calls[1][0] == "start"
-    assert calls[1][2]["copilot_api_token"] == "direct-token-only"
-
-
-def test_ensure_proxy_starts_isolated_ephemeral_proxy_when_subscription_seed_targets_persistent_port(
-    monkeypatch,
-) -> None:
-    calls: list[object] = []
-
-    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
-    monkeypatch.setattr(
-        "headroom.install.health.probe_ready",
-        lambda url: (_ for _ in ()).throw(
-            AssertionError("subscription-seeded session should skip persistent probing")
-        ),
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_restart_persistent_proxy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("subscription-seeded session should not restart the persistent proxy")
-        ),
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_find_available_port",
-        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_start_proxy",
-        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
-    )
-
-    proc, actual_port = wrap_cli._ensure_proxy(
-        8787,
-        False,
-        copilot_api_token="tid-session-token",
-        copilot_refresh_oauth_token="gho-refresh",
-        copilot_api_token_expires_at=456.5,
-    )
-
-    assert proc is None
-    assert actual_port == 8788
-    assert calls[0] == ("find_port", 8788)
-    assert calls[1][0] == "start"
-    assert calls[1][1][0] == 8788
-    assert calls[1][2]["copilot_api_token"] == "tid-session-token"
-    assert calls[1][2]["copilot_refresh_oauth_token"] == "gho-refresh"
-    assert calls[1][2]["copilot_api_token_expires_at"] == 456.5
-
-
 def test_ensure_proxy_reuses_agent_proxy_without_savings_profile(monkeypatch) -> None:
     health = {
         "version": wrap_cli._HEADROOM_VERSION,
@@ -520,7 +400,7 @@ def test_ensure_proxy_reuses_agent_proxy_without_savings_profile(monkeypatch) ->
         ),
     )
 
-    proc, actual_port = wrap_cli._ensure_proxy(8787, False, agent_type="codex")
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, agent_type="claude")
 
     assert proc is None
     assert actual_port == 8787
@@ -550,7 +430,7 @@ def test_ensure_proxy_restarts_for_explicit_agent_savings_profile(monkeypatch) -
         lambda *args, **kwargs: calls.append(("start", args, kwargs)),
     )
 
-    proc, actual_port = wrap_cli._ensure_proxy(8787, False, agent_type="codex")
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, agent_type="claude")
 
     assert proc is None
     assert actual_port == 8787

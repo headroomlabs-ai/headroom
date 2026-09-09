@@ -8,7 +8,6 @@ from typing import Any, cast
 from fastapi import Request
 from fastapi.responses import Response
 
-from headroom.providers.codex.model_metadata import handle_chatgpt_model_metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,16 +38,8 @@ async def handle_model_metadata_endpoint(
     provider_api_base_url: str,
     provider_name: str,
 ) -> Response:
-    """Handle OpenAI-compatible model metadata with Codex ChatGPT-auth support."""
+    """Handle OpenAI-compatible model metadata by passing through to the provider."""
     assert proxy.http_client is not None
-    chatgpt_response = await handle_chatgpt_model_metadata(
-        proxy.http_client,
-        request,
-        endpoint.upstream_path,
-    )
-    if chatgpt_response is not None:
-        return chatgpt_response
-
     return cast(
         Response,
         await proxy.handle_passthrough(

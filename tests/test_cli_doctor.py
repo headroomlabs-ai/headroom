@@ -18,7 +18,6 @@ from headroom.cli.doctor import (
     check_claude_desktop,
     check_claude_remote_control_gate,
     check_claude_routing,
-    check_codex_routing,
     check_deployments,
     check_proxy_liveness,
     check_savings,
@@ -454,91 +453,6 @@ class TestClaudeRoutingScope:
         assert check_claude_routing(user, 8787).status == PASS
 
 
-class TestCodexRouting:
-    def test_missing_file_warns(self, tmp_path):
-        assert check_codex_routing(tmp_path / "config.toml", 8787).status == WARN
-
-    def test_marker_block_right_port_passes(self, tmp_path):
-        path = tmp_path / "config.toml"
-        path.write_text(
-            'model_provider = "headroom"\n'
-            "[model_providers.headroom]\n"
-            'base_url = "http://127.0.0.1:8787/v1"\n',
-            encoding="utf-8",
-        )
-        assert check_codex_routing(path, 8787).status == PASS
-
-    def test_port_mismatch_warns(self, tmp_path):
-        path = tmp_path / "config.toml"
-        path.write_text(
-            '[model_providers.headroom]\nbase_url = "http://127.0.0.1:9999/v1"\n',
-            encoding="utf-8",
-        )
-        result = check_codex_routing(path, 8787)
-        assert result.status == WARN
-        assert "9999" in result.summary
-
-    def test_no_marker_warns(self, tmp_path):
-        path = tmp_path / "config.toml"
-        path.write_text('model = "gpt-5"\n', encoding="utf-8")
-        assert check_codex_routing(path, 8787).status == WARN
-
-    def test_garbage_bytes_warn_not_crash(self, tmp_path):
-        path = tmp_path / "config.toml"
-        path.write_bytes(b"\xff\xfe garbage \x00")
-        assert check_codex_routing(path, 8787).status == WARN
-
-    # -- requires_openai_auth (#3206) ------------------------------------
-    # Codex attaches no Authorization header to a custom provider unless the
-    # block carries requires_openai_auth. A ChatGPT-OAuth user then 401s on
-    # every request with "Missing bearer" while doctor reported green -- the
-    # reason one report went 15h before anyone could see the cause.
-
-    @staticmethod
-    def _routed(tmp_path, *, requires_auth: bool):
-        path = tmp_path / "config.toml"
-        block = (
-            "[model_providers.headroom]\n"
-            'base_url = "http://127.0.0.1:8787/v1"\n'
-            "supports_websockets = true\n"
-        )
-        if requires_auth:
-            block += "requires_openai_auth = true\n"
-        path.write_text(block, encoding="utf-8")
-        return path
-
-    @staticmethod
-    def _chatgpt_auth(tmp_path):
-        (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
-
-    def test_chatgpt_auth_without_requires_openai_auth_warns(self, tmp_path):
-        path = self._routed(tmp_path, requires_auth=False)
-        self._chatgpt_auth(tmp_path)
-
-        result = check_codex_routing(path, 8787)
-
-        assert result.status == WARN
-        assert "Authorization" in result.summary
-
-    def test_chatgpt_auth_with_requires_openai_auth_passes(self, tmp_path):
-        path = self._routed(tmp_path, requires_auth=True)
-        self._chatgpt_auth(tmp_path)
-
-        assert check_codex_routing(path, 8787).status == PASS
-
-    def test_api_key_user_without_requires_openai_auth_still_passes(self, tmp_path):
-        """API-key users must not be nagged -- the flag would break them (#406)."""
-        path = self._routed(tmp_path, requires_auth=False)
-        (tmp_path / "auth.json").write_text('{"OPENAI_API_KEY": "sk-test"}', encoding="utf-8")
-
-        assert check_codex_routing(path, 8787).status == PASS
-
-    def test_no_auth_json_does_not_warn(self, tmp_path):
-        path = self._routed(tmp_path, requires_auth=False)
-
-        assert check_codex_routing(path, 8787).status == PASS
-
-
 class TestShellEnv:
     def test_unset_warns(self):
         result = check_shell_env({}, 8787)
@@ -710,7 +624,6 @@ class TestDoctorCommand:
     def isolated(self, tmp_path, monkeypatch):
         """Point all filesystem/network surfaces at controlled fakes."""
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: tmp_path / "settings.json")
-        monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
         for var in (

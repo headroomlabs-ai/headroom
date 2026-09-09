@@ -15,8 +15,6 @@ survives that kind of sys.modules mutation.
 from . import (  # noqa: F401
     audit,
     capture,
-    copilot_auth,
-    evals,
     init,
     inspect,
     install,
@@ -24,10 +22,8 @@ from . import (  # noqa: F401
     mcp,
     perf,
     proxy,
-    recover,
     rollout,
     tools,
-    update,
     wrap,
 )
 from .main import main

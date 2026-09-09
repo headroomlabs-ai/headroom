@@ -276,7 +276,7 @@ def _docker_supports_nvidia_gpus() -> bool:
     return "nvidia" in result.stdout.lower()
 
 
-def _select_turnkey_plan(*, prefer_docker: bool = True) -> TurnkeyPlan:
+def _select_turnkey_plan(*, prefer_docker: bool = False) -> TurnkeyPlan:
     """Choose the most portable available deployment strategy for this host."""
 
     gpu_names = _detect_nvidia_gpu_names()
@@ -542,8 +542,8 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 )
 @click.option(
     "--image",
-    default="ghcr.io/headroomlabs-ai/headroom:latest",
-    show_default=True,
+    default="",
+    show_default=False,
     help="Docker image to use when runtime=docker or preset=persistent-docker.",
 )
 @click.option(
@@ -745,14 +745,14 @@ def install_apply(
 )
 @click.option(
     "--image",
-    default="ghcr.io/headroomlabs-ai/headroom:latest",
-    show_default=True,
+    default="",
+    show_default=False,
     help="Docker image to use when Docker is selected.",
 )
 @click.option(
     "--no-docker",
     is_flag=True,
-    help="Use the native Python runtime even when Docker is installed.",
+    help="Never use Docker (the native Python runtime is already the default unless --image is set).",
 )
 @click.option(
     "--no-http2",
@@ -778,7 +778,10 @@ def deploy(
 ) -> None:
     """Deploy a turnkey local Headroom proxy and configure detected tools."""
 
-    plan = _select_turnkey_plan(prefer_docker=not no_docker)
+    # Docker is only considered when the user names an image explicitly: this
+    # fork ships no image, and the upstream ghcr.io image carries code paths
+    # (telemetry beacon, other agents) that were removed here.
+    plan = _select_turnkey_plan(prefer_docker=bool(image) and not no_docker)
     click.echo(f"Selected {plan.preset} ({plan.runtime}): {plan.reason}")
     manifest = _build_deployment_manifest(
         profile=profile,

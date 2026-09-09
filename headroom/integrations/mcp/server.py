@@ -56,7 +56,6 @@ from typing import Any
 
 from headroom.config import HeadroomConfig, SmartCrusherConfig
 from headroom.providers.openai import OpenAIProvider
-from headroom.telemetry.session import BeaconCompressionObserver
 from headroom.transforms.smart_crusher import SmartCrusher
 
 
@@ -274,7 +273,6 @@ class HeadroomMCPCompressor:
             # because that is where mypy reports a multi-line call's arg-type.
             config=smart_config,  # type: ignore[arg-type]
             with_compaction=False,
-            observer=BeaconCompressionObserver(),
         )
 
         # Build messages for SmartCrusher (it expects conversation format)

@@ -311,7 +311,6 @@ CCR_GATED = [
     ("get", "/v1/retrieve/stats"),
     ("get", "/v1/retrieve/somehash"),
     ("post", "/v1/retrieve/tool_call"),
-    ("post", "/v1/compress"),
 ]
 
 

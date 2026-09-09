@@ -680,7 +680,7 @@ def test_install_apply_rejects_provider_scope_targets_without_support() -> None:
     )
 
     assert result.exit_code != 0
-    assert "Provider scope supports only claude, codex, openclaw, and opencode" in result.output
+    assert "Provider scope supports only claude" in result.output
 
 
 def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
@@ -946,7 +946,8 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
         "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
     )
 
-    result = runner.invoke(main, ["deploy"])
+    # Docker is only considered when an image is named explicitly.
+    result = runner.invoke(main, ["deploy", "--image", "example.test/headroom:local"])
 
     assert result.exit_code == 0, result.output
     assert "Selected persistent-docker" in result.output
@@ -1004,7 +1005,7 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
         "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
     )
 
-    result = runner.invoke(main, ["deploy"])
+    result = runner.invoke(main, ["deploy", "--image", "example.test/headroom:local"])
 
     assert result.exit_code == 0, result.output
     assert "RTX 4090" in result.output

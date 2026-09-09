@@ -606,6 +606,9 @@ class TestGlobalTelemetryCollector:
         user to have turned it on."""
         reset_telemetry_collector()
         monkeypatch.delenv("HEADROOM_TELEMETRY_DISABLED", raising=False)
+        # The hermetic test env sets HEADROOM_OFFLINE=1, which also switches
+        # local telemetry off; this test is specifically about the opt-in path.
+        monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
         monkeypatch.setenv("HEADROOM_TELEMETRY", "on")
 
         collector = get_telemetry_collector()

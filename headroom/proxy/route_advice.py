@@ -152,18 +152,14 @@ class BackendResolver:
         if not _known_provider(provider):
             log.warning("route advice: %r is not a litellm provider; ignoring", provider)
             return None
-        try:
-            from headroom.backends.litellm import LiteLLMBackend
-
-            return LiteLLMBackend(provider=provider)
-        except Exception as exc:  # noqa: BLE001 - never fail a request for this
-            log.warning(
-                "route advice: cannot build a backend for %r (%s); "
-                "falling back to the configured backend",
-                provider,
-                exc,
-            )
-            return None
+        # Translated (LiteLLM) backends were removed from this build; route
+        # advice can only ever select the configured direct-Anthropic path.
+        log.warning(
+            "route advice: alternate backend %r is unavailable in this build; "
+            "falling back to the configured backend",
+            provider,
+        )
+        return None
 
 
 def resolver_for(handler: Any) -> BackendResolver:

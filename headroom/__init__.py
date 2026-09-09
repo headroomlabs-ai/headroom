@@ -70,11 +70,16 @@ For more examples, see https://github.com/headroom-sdk/headroom/tree/main/exampl
 
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from typing import Any
 
-from ._ort import ensure_ort_dylib_pinned
-from ._version import __version__  # noqa: F401
+# litellm is used only for its bundled price tables. Without this it fetches
+# its model-cost map from GitHub on import; this fork never wants that.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+from ._ort import ensure_ort_dylib_pinned  # noqa: E402
+from ._version import __version__  # noqa: E402, F401
 
 # Must run before anything can import `headroom._core`: on Windows the
 # Rust core resolves onnxruntime.dll at runtime (ort load-dynamic), and

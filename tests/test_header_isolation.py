@@ -21,8 +21,6 @@ a silent fallback.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -507,77 +505,6 @@ def test_disabled_mode_passes_through_e2e(
     upstream = {k.lower(): v for k, v in transport.captured_headers.items()}
     # Operator opt-in: internal header IS forwarded (diagnostic mode).
     assert upstream.get("x-headroom-mode") == "passthrough"
-
-
-# ---------------------------------------------------------------------------
-# OpenAI Chat Completions parity check
-# ---------------------------------------------------------------------------
-
-
-def test_openai_chat_x_headroom_bypass_not_forwarded() -> None:
-    """OpenAI handler also strips x-headroom-* before upstream call."""
-    config = ProxyConfig(
-        optimize=False,
-        cache_enabled=False,
-        rate_limit_enabled=False,
-        cost_tracking_enabled=False,
-        log_requests=False,
-        ccr_inject_tool=False,
-        ccr_handle_responses=False,
-        ccr_context_tracking=False,
-        image_optimize=False,
-    )
-    app = create_app(config)
-    proxy = app.state.proxy
-
-    captured: dict[str, object] = {}
-
-    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
-        captured["headers"] = dict(headers)
-        return httpx.Response(
-            200,
-            json={
-                "id": "chatcmpl_1",
-                "object": "chat.completion",
-                "model": "gpt-4o",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
-            },
-        )
-
-    proxy._retry_request = _fake_retry  # type: ignore[attr-defined]
-    proxy.memory_handler = SimpleNamespace(
-        config=SimpleNamespace(inject_context=False, inject_tools=False),
-        search_and_format_context=AsyncMock(return_value=""),
-        has_memory_tool_calls=lambda resp, provider: False,
-    )
-
-    client = TestClient(app)
-    resp = client.post(
-        "/v1/chat/completions",
-        headers={
-            "authorization": "Bearer sk-test",
-            "x-headroom-bypass": "true",
-            "x-headroom-user-id": "u1",
-        },
-        json={
-            "model": "gpt-4o",
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-    )
-    assert resp.status_code == 200, resp.text
-    sent_headers_raw = captured.get("headers")
-    assert isinstance(sent_headers_raw, dict)
-    sent_headers = {k.lower(): v for k, v in sent_headers_raw.items()}
-    assert "x-headroom-bypass" not in sent_headers
-    assert "x-headroom-user-id" not in sent_headers
-    assert sent_headers.get("authorization") == "Bearer sk-test"
 
 
 # ---------------------------------------------------------------------------

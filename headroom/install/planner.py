@@ -9,7 +9,6 @@ from collections.abc import Iterable
 import click
 
 from headroom import paths as _paths
-from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
 from headroom.rollout import RolloutChannel
 
@@ -26,26 +25,13 @@ from .paths import validate_profile_name
 
 SUPPORTED_TARGETS = [
     ToolTarget.CLAUDE,
-    ToolTarget.COPILOT,
-    ToolTarget.CODEX,
-    ToolTarget.AIDER,
-    ToolTarget.CURSOR,
-    ToolTarget.GROK_BUILD,
-    ToolTarget.GROK,
-    ToolTarget.OPENCLAW,
-    ToolTarget.OPENCODE,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
-    ToolTarget.CODEX,
-    ToolTarget.OPENCLAW,
-    ToolTarget.OPENCODE,
 ]
 
 
 def _binary_name(target: ToolTarget) -> str | None:
-    if target == ToolTarget.CURSOR:
-        return None
     return str(target.value)
 
 
@@ -56,12 +42,6 @@ def detect_targets() -> list[str]:
     for target in SUPPORTED_TARGETS:
         binary = _binary_name(target)
         if binary and shutil.which(binary):
-            detected.append(target.value)
-            continue
-        if target == ToolTarget.CURSOR and shutil.which("cursor"):
-            detected.append(target.value)
-            continue
-        if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
             detected.append(target.value)
     return detected
 
@@ -83,11 +63,7 @@ def resolve_targets(
 
     if provider_mode == ProviderSelectionMode.AUTO.value:
         detected = [target for target in detect_targets() if target in valid]
-        return detected or [
-            ToolTarget.CLAUDE.value,
-            ToolTarget.CODEX.value,
-            *([] if scope == ConfigScope.PROVIDER.value else [ToolTarget.COPILOT.value]),
-        ]
+        return detected or [ToolTarget.CLAUDE.value]
 
     # Manual selection is the only mode that consults `requested`, so the
     # provider-scope validation belongs here. Running it earlier rejected
@@ -99,7 +75,7 @@ def resolve_targets(
         if unsupported:
             unsupported_list = ", ".join(sorted(set(unsupported)))
             raise click.ClickException(
-                "Provider scope supports only claude, codex, openclaw, and opencode; "
+                "Provider scope supports only claude; "
                 f"unsupported targets: {unsupported_list}"
             )
 
@@ -178,19 +154,6 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
-    # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
-    # OpenAI-compatible tools share this proxy (those may need api.openai.com /
-    # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
-    _openai_native = {
-        ToolTarget.CODEX.value,
-        ToolTarget.COPILOT.value,
-        ToolTarget.AIDER.value,
-        ToolTarget.OPENCODE.value,
-    }
-    _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
-    target_set = set(resolved_targets)
-    if target_set & _grok_targets and not (target_set & _openai_native):
-        base_env.setdefault("OPENAI_TARGET_API_URL", _GROK_DEFAULT_API_URL)
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:

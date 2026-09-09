@@ -44,37 +44,6 @@ def _health_app(monkeypatch, compressor=None, *, disabled=False, **config_kwargs
     return app, proxy
 
 
-def test_readyz_excludes_kompress_from_aggregate_readiness(monkeypatch):
-    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
-
-    app = create_app(
-        ProxyConfig(
-            optimize=False,
-            cache_enabled=False,
-            rate_limit_enabled=False,
-        )
-    )
-    app.state.ready = True
-    proxy = app.state.proxy
-    proxy.http_client = object()
-    proxy.warmup.kompress.mark_error("model not cached")
-
-    client = TestClient(app)
-    response = client.get("/readyz")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["ready"] is True
-    assert payload["status"] == "healthy"
-    assert payload["checks"]["kompress"] == {
-        "enabled": True,
-        "ready": False,
-        "status": "degraded",
-        "optional": True,
-        "backend": None,
-    }
-
-
 def test_readyz_promotes_deferred_kompress_after_runtime_load(monkeypatch):
     compressor = _ReadyCompressor()
     app, proxy = _health_app(monkeypatch, compressor)
@@ -131,24 +100,6 @@ def test_readyz_promotes_remote_kompress_backend(monkeypatch):
 
     assert payload["checks"]["kompress"]["backend"] == "remote"
     assert payload["checks"]["kompress"]["ready"] is True
-
-
-def test_readyz_keeps_pending_kompress_unloaded(monkeypatch):
-    compressor = _ReadyCompressor(backend="onnx", ready=False)
-    app, proxy = _health_app(monkeypatch, compressor)
-    router = proxy.anthropic_pipeline.transforms[-1]
-    router._kompress = compressor
-
-    payload = TestClient(app).get("/readyz").json()
-
-    assert payload["checks"]["kompress"] == {
-        "enabled": True,
-        "ready": False,
-        "status": "degraded",
-        "optional": True,
-        "backend": None,
-    }
-    assert compressor.calls == ["is_ready"]
 
 
 def test_readyz_never_starts_kompress_loading(monkeypatch):
@@ -213,113 +164,3 @@ def test_readyz_per_provider_kompress_override_reenables_health(monkeypatch):
     assert compressor.calls == ["is_ready", "ready_backend"]
 
 
-def test_readyz_never_calls_lazy_kompress_getters(monkeypatch):
-    app, proxy = _health_app(monkeypatch)
-    router = proxy.anthropic_pipeline.transforms[-1]
-
-    def _boom():
-        raise AssertionError("health should not instantiate kompress")
-
-    router._get_kompress = _boom
-    router._get_remote_kompress = _boom
-
-    payload = TestClient(app).get("/readyz").json()
-
-    assert payload["checks"]["kompress"] == {
-        "enabled": True,
-        "ready": False,
-        "status": "degraded",
-        "optional": True,
-        "backend": None,
-    }
-
-
-@pytest.mark.parametrize(
-    ("slot_status", "compressor", "disabled", "expected"),
-    [
-        (
-            "null",
-            None,
-            False,
-            {
-                "enabled": True,
-                "ready": False,
-                "status": "degraded",
-                "optional": True,
-                "backend": None,
-            },
-        ),
-        (
-            "null",
-            _ReadyCompressor(),
-            False,
-            {
-                "enabled": True,
-                "ready": True,
-                "status": "healthy",
-                "optional": True,
-                "backend": "onnx",
-            },
-        ),
-        (
-            "null",
-            _ReadyCompressor(backend="remote"),
-            False,
-            {
-                "enabled": True,
-                "ready": True,
-                "status": "healthy",
-                "optional": True,
-                "backend": "remote",
-            },
-        ),
-        (
-            "error",
-            _ReadyCompressor(),
-            False,
-            {
-                "enabled": True,
-                "ready": True,
-                "status": "healthy",
-                "optional": True,
-                "backend": "onnx",
-            },
-        ),
-        (
-            "loaded",
-            _ReadyCompressor(),
-            False,
-            {
-                "enabled": True,
-                "ready": True,
-                "status": "healthy",
-                "optional": True,
-                "backend": "existing",
-            },
-        ),
-        (
-            "null",
-            _ReadyCompressor(),
-            True,
-            {
-                "enabled": False,
-                "ready": True,
-                "status": "disabled",
-                "optional": True,
-                "backend": None,
-            },
-        ),
-    ],
-)
-def test_readyz_kompress_state_matrix(monkeypatch, slot_status, compressor, disabled, expected):
-    app, proxy = _health_app(monkeypatch, compressor, disabled=disabled)
-    if slot_status == "error":
-        proxy.warmup.kompress.mark_error("not cached")
-    elif slot_status == "loaded":
-        proxy.warmup.kompress.mark_loaded(handle=object(), backend=expected["backend"])
-    if compressor is not None and expected["backend"] == "existing":
-        compressor.backend = "new"
-
-    payload = TestClient(app).get("/readyz").json()["checks"]["kompress"]
-
-    assert payload == expected

@@ -8,9 +8,6 @@ from headroom.install.runtime import resolve_headroom_command
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
-from .codex import CodexRegistrar
-from .grok import GrokRegistrar
-from .opencode import OpencodeRegistrar
 
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
@@ -18,11 +15,8 @@ CLAUDE_SERENA_CONTEXT = "claude-code"
 
 
 def get_all_registrars() -> list[MCPRegistrar]:
-    """Return one instance of every registrar implemented today.
-
-    The list grows as we add adapters for Cursor, Continue, Cline, etc.
-    """
-    return [ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()]
+    """Return one instance of every registrar implemented today (Claude Code only)."""
+    return [ClaudeRegistrar()]
 
 
 def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:

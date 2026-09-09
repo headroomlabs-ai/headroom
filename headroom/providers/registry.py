@@ -1,4 +1,4 @@
-"""Provider runtime registry and transport helpers."""
+"""Provider runtime registry and transport helpers (Anthropic-focused build)."""
 
 from __future__ import annotations
 
@@ -7,22 +7,17 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
-from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
-from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 
-DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
-DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
+#: Upstream used for OpenAI-format pipeline provider objects (tokenizer choice,
+#: /v1/models metadata). Claude Code never sends traffic here.
+DEFAULT_OPENAI_API_URL = "https://api.openai.com"
 
 if TYPE_CHECKING:
-    from headroom.backends.base import Backend
     from headroom.providers.base import Provider
-
-AnyLLMBackendType: Any = None
-LiteLLMBackendType: Any = None
 
 
 @dataclass(frozen=True)
@@ -31,9 +26,6 @@ class ProviderApiOverrides:
 
     anthropic: str | None = None
     openai: str | None = None
-    gemini: str | None = None
-    cloudcode: str | None = None
-    vertex: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,9 +34,6 @@ class ProviderApiTargets:
 
     anthropic: str = DEFAULT_ANTHROPIC_API_URL
     openai: str = DEFAULT_OPENAI_API_URL
-    gemini: str = DEFAULT_GEMINI_API_URL
-    cloudcode: str = DEFAULT_CLOUDCODE_API_URL
-    vertex: str = DEFAULT_VERTEX_API_URL
 
 
 @dataclass(frozen=True)
@@ -59,9 +48,6 @@ class ProxyProviderRuntime:
         return {
             "anthropic": self.api_targets.anthropic,
             "openai": self.api_targets.openai,
-            "gemini": self.api_targets.gemini,
-            "cloudcode": self.api_targets.cloudcode,
-            "vertex": self.api_targets.vertex,
         }[provider_name]
 
     def pipeline_provider(self, provider_name: str) -> Provider:
@@ -76,8 +62,6 @@ class ProxyProviderRuntime:
         """Resolve the upstream base URL for catch-all passthrough requests."""
         if _is_anthropic_auth(headers):
             return self.api_targets.anthropic
-        if headers.get("x-goog-api-key"):
-            return self.api_targets.gemini
         if headers.get("api-key"):
             azure_base = headers.get("x-headroom-base-url", "")
             # Same SSRF guard as `proxy_targets.select_passthrough_base_url`;
@@ -97,40 +81,17 @@ def _normalize_api_url(url: str | None, *, default: str) -> str:
     return normalized
 
 
-def _log_backend_init_failure(
-    logger: logging.Logger,
-    *,
-    backend: str,
-    provider: str,
-    exc: Exception,
-) -> None:
-    logger.error(
-        "backend initialization failed: backend=%s provider=%s error=%s",
-        backend,
-        provider,
-        exc,
-    )
-
-
 def resolve_api_overrides(
     *,
     anthropic_api_url: str | None,
-    openai_api_url: str | None,
-    gemini_api_url: str | None,
-    cloudcode_api_url: str | None,
-    vertex_api_url: str | None = None,
+    openai_api_url: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ProviderApiOverrides:
     """Resolve provider API URL overrides from CLI/config inputs and environment."""
     env = environ or os.environ
     return ProviderApiOverrides(
-        anthropic=anthropic_api_url
-        or env.get("ANTHROPIC_TARGET_API_URL")
-        or env.get("ANTHROPIC_FOUNDRY_BASE_URL"),
+        anthropic=anthropic_api_url or env.get("ANTHROPIC_TARGET_API_URL"),
         openai=openai_api_url or env.get("OPENAI_TARGET_API_URL"),
-        gemini=gemini_api_url or env.get("GEMINI_TARGET_API_URL"),
-        cloudcode=cloudcode_api_url or env.get("CLOUDCODE_TARGET_API_URL"),
-        vertex=vertex_api_url or env.get("VERTEX_TARGET_API_URL"),
     )
 
 
@@ -162,30 +123,9 @@ def resolve_extra_headers(
 
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     """Resolve normalized upstream provider targets from configured overrides."""
-    from headroom.copilot_auth import is_copilot_upstream_url
-
-    openai = _normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL)
-
-    # GitHub Copilot serves BOTH its OpenAI surface (``/chat/completions``,
-    # ``/responses``) and its Anthropic surface (``/v1/messages``, for Claude
-    # models) from the same host. When the OpenAI target is a Copilot host
-    # (``wrap copilot --subscription`` / ``wrap vscode`` both point it there so
-    # GPT models work) but no Anthropic target was set, Claude-model requests
-    # fell back to ``DEFAULT_ANTHROPIC_API_URL`` (api.anthropic.com) and 401'd
-    # with the Copilot bearer — "Invalid bearer token" (#3247). Default the
-    # Anthropic target to the same Copilot host so those requests reach the
-    # surface that actually serves them. An explicit ``ANTHROPIC_TARGET_API_URL``
-    # still wins (only a ``None`` override is filled in here).
-    anthropic_override = overrides.anthropic
-    if anthropic_override is None and is_copilot_upstream_url(openai):
-        anthropic_override = openai
-
     return ProviderApiTargets(
-        anthropic=_normalize_api_url(anthropic_override, default=DEFAULT_ANTHROPIC_API_URL),
-        openai=openai,
-        gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
-        cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
-        vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
+        anthropic=_normalize_api_url(overrides.anthropic, default=DEFAULT_ANTHROPIC_API_URL),
+        openai=_normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL),
     )
 
 
@@ -209,81 +149,27 @@ def build_proxy_provider_runtime(config: Any) -> ProxyProviderRuntime:
 def create_proxy_backend(
     *,
     backend: str,
-    anyllm_provider: str,
-    bedrock_region: str | None,
-    bedrock_profile: str | None = None,
     logger: logging.Logger,
-    openai_api_url: str | None = None,
-    anyllm_backend_cls: Any | None = None,
-    litellm_backend_cls: Any | None = None,
-) -> Backend | None:
-    """Create the optional translated backend for Anthropic proxy requests."""
-    if backend == "anthropic":
-        return None
+    **_ignored: Any,
+) -> None:
+    """Translated backends (LiteLLM / any-llm / Bedrock) were removed from this build.
 
-    if backend == "anyllm" or backend.startswith("anyllm-"):
-        provider = anyllm_provider
-        backend_name = "anyllm" if backend == "anyllm" else backend
-        try:
-            backend_cls = anyllm_backend_cls or _load_anyllm_backend()
-            instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
-            logger.info("any-llm backend enabled (provider=%s)", provider)
-            return instance
-        except ImportError as exc:
-            logger.warning("any-llm backend not available: %s", exc)
-            return None
-        except Exception as exc:  # pragma: no cover - defensive logging
-            _log_backend_init_failure(
-                logger,
-                backend=backend_name,
-                provider=provider,
-                exc=exc,
-            )
-            return None
-
-    normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
-    provider = normalized_backend.replace("litellm-", "")
-    # `litellm-vertex` is the name in our docs/help, but LiteLLM (and our
-    # provider registry) keys Google Vertex on `vertex_ai`. Without this alias
-    # the provider falls through to a generic pass-through: wrong model prefix
-    # (`vertex/…` instead of `vertex_ai/…`), region dropped, auth mishandled.
-    if provider in ("vertex", "google-vertex", "googlevertex"):
-        provider = "vertex_ai"
-    try:
-        backend_cls = litellm_backend_cls or _load_litellm_backend()
-        instance = cast(
-            "Backend",
-            backend_cls(provider=provider, region=bedrock_region, profile_name=bedrock_profile),
+    Only the direct Anthropic upstream is supported. Any other ``backend`` value
+    logs a warning and falls back to direct Anthropic.
+    """
+    if backend != "anthropic":
+        logger.warning(
+            "backend %r is not available in this build; using direct Anthropic upstream",
+            backend,
         )
-        logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
-        return instance
-    except ImportError as exc:
-        logger.warning("LiteLLM backend not available: %s", exc)
-        return None
-    except Exception as exc:  # pragma: no cover - defensive logging
-        _log_backend_init_failure(
-            logger,
-            backend=normalized_backend,
-            provider=provider,
-            exc=exc,
-        )
-        return None
+    return None
 
 
-def format_backend_status(*, backend: str, anyllm_provider: str, bedrock_region: str | None) -> str:
+def format_backend_status(*, backend: str, **_ignored: Any) -> str:
     """Build the human-readable backend status string shown in CLI/server output."""
     if backend == "anthropic":
         return "ANTHROPIC (direct API)"
-    if backend == "anyllm" or backend.startswith("anyllm-"):
-        return f"{anyllm_provider.title()} via any-llm"
-
-    from headroom.backends.litellm import get_provider_config
-
-    provider = backend.replace("litellm-", "")
-    provider_config = get_provider_config(provider)
-    if provider_config.uses_region:
-        return f"{provider_config.display_name} via LiteLLM (region={bedrock_region})"
-    return f"{provider_config.display_name} via LiteLLM"
+    return f"{backend} (unavailable in this build — direct Anthropic used)"
 
 
 def call_client_transport(
@@ -310,24 +196,6 @@ def call_client_transport(
         metrics=metrics,
         **kwargs,
     )
-
-
-def _load_anyllm_backend() -> Any:
-    global AnyLLMBackendType
-    if AnyLLMBackendType is None:
-        from headroom.backends.anyllm import AnyLLMBackend
-
-        AnyLLMBackendType = AnyLLMBackend
-    return AnyLLMBackendType
-
-
-def _load_litellm_backend() -> Any:
-    global LiteLLMBackendType
-    if LiteLLMBackendType is None:
-        from headroom.backends.litellm import LiteLLMBackend
-
-        LiteLLMBackendType = LiteLLMBackend
-    return LiteLLMBackendType
 
 
 def _call_openai_transport(

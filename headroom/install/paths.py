@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -107,41 +106,3 @@ def claude_settings_path() -> Path:
     """Return the Claude user settings path."""
 
     return Path.home() / ".claude" / "settings.json"
-
-
-def codex_config_path() -> Path:
-    """Return the Codex config path."""
-
-    return Path.home() / ".codex" / "config.toml"
-
-
-def openclaw_config_path() -> Path:
-    """Return the OpenClaw config path."""
-
-    return Path.home() / ".openclaw" / "openclaw.json"
-
-
-def opencode_config_path() -> Path:
-    """Return the OpenCode config path.
-
-    Resolves ``~/.config/opencode/opencode.json`` when ``OPENCODE_CONFIG``
-    is unset; otherwise the value of that environment variable. Checks for
-    ``opencode.jsonc`` as well.
-    """
-
-    env_path = os.environ.get("OPENCODE_CONFIG", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    base_dir = Path.home() / ".config" / "opencode"
-    jsonc_path = base_dir / "opencode.jsonc"
-
-    if jsonc_path.exists():
-        return jsonc_path
-
-    return base_dir / "opencode.json"
-
-
-def zcode_config_dir() -> Path:
-    """Return the ZCode user configuration directory."""
-
-    return Path.home() / ".zcode"

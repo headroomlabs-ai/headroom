@@ -5,9 +5,7 @@ from unittest.mock import patch
 from headroom.providers.proxy_targets import (
     api_target,
     select_passthrough_base_url,
-    vertex_target_for_location,
 )
-from headroom.providers.registry import DEFAULT_VERTEX_API_URL
 from headroom.proxy import upstream_guard
 
 
@@ -31,34 +29,12 @@ def test_api_target_prefers_legacy_proxy_attrs() -> None:
     assert api_target(proxy, "openai") == "https://runtime.openai.test"
 
 
-def test_vertex_target_for_location_derives_region_when_default_configured() -> None:
-    proxy = _proxy(VERTEX_API_URL=DEFAULT_VERTEX_API_URL)
-
-    assert vertex_target_for_location(proxy, "europe-west1") == (
-        "https://europe-west1-aiplatform.googleapis.com"
-    )
-    assert vertex_target_for_location(proxy, "global") == "https://aiplatform.googleapis.com"
-
-
-def test_vertex_target_for_location_honors_explicit_gateway() -> None:
-    proxy = _proxy(VERTEX_API_URL="https://vertex-gateway.example")
-
-    assert vertex_target_for_location(proxy, "europe-west1") == "https://vertex-gateway.example"
-
-
 def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
     proxy = _proxy(
         ANTHROPIC_API_URL="https://legacy.anthropic.test",
         OPENAI_API_URL="https://legacy.openai.test",
-        GEMINI_API_URL="https://legacy.gemini.test",
     )
 
-    assert select_passthrough_base_url(proxy, {"chatgpt-account-id": "acct"}) == (
-        "https://chatgpt.com"
-    )
-    assert select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
-        "https://legacy.gemini.test"
-    )
     # The Azure branch honours the override only after the SSRF guard clears
     # the destination (CVE-2026-77775), and `azure.example` does not resolve.
     # Pin a public answer so this stays a test of target *precedence*.

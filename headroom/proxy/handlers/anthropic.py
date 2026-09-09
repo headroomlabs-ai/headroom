@@ -29,7 +29,6 @@ import httpx
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
-from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
@@ -3584,22 +3583,12 @@ class AnthropicHandlerMixin:
                         },
                     )
 
-            # Direct Anthropic API, or a provider-compatible Anthropic
-            # Messages endpoint such as Vertex AI publisher rawPredict.
-            # Both arms build through `build_copilot_upstream_url` because that
-            # is the only place `mark_request_routed_to_copilot` fires, and the
-            # outcome funnel relabels `provider` to "copilot" off that flag (see
-            # proxy/outcome.py). The resolved target reaches Copilot without any
-            # per-request `upstream_base_url` — `wrap vscode` points the
-            # Anthropic target at the Copilot host — so this else arm carries the
-            # Claude-on-Copilot traffic, and building it by f-string attributed
-            # every one of those turns to "anthropic" on the dashboard.
-            # For a non-Copilot base the builder only joins base + path, so the
-            # URL itself is unchanged.
+            # Direct Anthropic API, or an Anthropic-compatible Messages
+            # endpoint supplied per request via ``upstream_base_url``.
             url = (
-                build_copilot_upstream_url(upstream_base_url, request.url.path)
+                f"{upstream_base_url.rstrip('/')}{request.url.path}"
                 if upstream_base_url
-                else build_copilot_upstream_url(self.ANTHROPIC_API_URL, "/v1/messages")
+                else f"{self.ANTHROPIC_API_URL.rstrip('/')}/v1/messages"
             )
             if upstream_base_url and request.url.query:
                 url = f"{url}?{request.url.query}"
@@ -3856,27 +3845,6 @@ class AnthropicHandlerMixin:
                         for _accept_key in [k for k in headers if k.lower() == "accept"]:
                             headers.pop(_accept_key, None)
                         headers["accept"] = "application/json"
-
-                    # Copilot auth is applied per-URL, and until now only the
-                    # streaming forwarder did it (``_stream_response``). This
-                    # buffered arm sends via ``_retry_request``, which forwards
-                    # headers untouched — so a Claude turn routed to Copilot
-                    # arrived with whatever the client happened to send and none
-                    # of Headroom's own credential handling: no minted or
-                    # refreshed token (the one ``wrap vscode`` hands the proxy),
-                    # no ``Copilot-Integration-Id`` default. A client token that
-                    # went stale mid-session therefore 401'd here while the
-                    # streaming path recovered.
-                    #
-                    # A non-Copilot URL returns the headers unchanged, so this is
-                    # a no-op everywhere else.
-                    #
-                    # Mutated in place for the same reason as the accept header
-                    # above: the closures below capture ``headers``, and the CCR
-                    # continuation rebuilds its own header set from it.
-                    _copilot_authed_headers = await apply_copilot_api_auth(dict(headers), url=url)
-                    headers.clear()
-                    headers.update(_copilot_authed_headers)
 
                     # Populated once the upstream answers 200 with parseable
                     # JSON, so the guard below can fall back to it (#3088).

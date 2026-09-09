@@ -25,7 +25,7 @@ import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
-from headroom.install.paths import claude_settings_path, codex_config_path
+from headroom.install.paths import claude_settings_path
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
 from headroom.providers.claude import (
@@ -49,7 +49,6 @@ FAIL = "fail"
 SKIP = "skip"
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -399,73 +398,6 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
     )
 
 
-def check_codex_routing(config_path: Path, port: int) -> CheckResult:
-    """Is Codex configured to route through the proxy?
-
-    Detection keys on the ``[model_providers.headroom]`` section, which both
-    writers emit (install's persistent block and wrap's auto-injected block).
-    Substring matching keeps malformed TOML a WARN instead of a crash.
-    """
-    name = "codex"
-    if not config_path.exists():
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary="not routed (no ~/.codex/config.toml)",
-            hint="wrap it: headroom wrap codex",
-        )
-    try:
-        text = config_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return CheckResult(name=name, status=WARN, summary=f"could not read {config_path}: {exc}")
-    if "[model_providers.headroom]" not in text:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary="not routed (no Headroom provider in config.toml)",
-            hint="wrap it: headroom wrap codex",
-        )
-    match = _CODEX_BASE_URL_RE.search(text)
-    if match and int(match.group(1)) != port:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
-            hint=f"re-run with: headroom doctor --port {match.group(1)}",
-        )
-    # Routed, but Codex may still attach no credentials. A ChatGPT-OAuth user
-    # needs `requires_openai_auth = true` in the provider block or Codex sends
-    # no Authorization header at all and every request 401s with "Missing
-    # bearer" (#3206). That failure is invisible from here -- the proxy is up,
-    # the block is present -- so this check is the only place it can surface.
-    if _codex_block_missing_openai_auth(text, config_path):
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary="routed, but Codex will send no Authorization (missing requires_openai_auth)",
-            hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
-        )
-    return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
-
-
-def _codex_block_missing_openai_auth(text: str, config_path: Path) -> bool:
-    """ChatGPT-OAuth Codex routed without ``requires_openai_auth`` (#3206)."""
-    start = text.find("[model_providers.headroom]")
-    if start == -1:
-        return False
-    rest = text[start + len("[model_providers.headroom]") :]
-    end = rest.find("\n[")
-    block = rest if end == -1 else rest[:end]
-    if "requires_openai_auth" in block:
-        return False
-    try:
-        from headroom.providers.codex.install import codex_uses_chatgpt_auth
-
-        return codex_uses_chatgpt_auth(config_path.parent / "auth.json")
-    except Exception:  # pragma: no cover - never let a doctor check crash
-        return False
-
-
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
     """Is the *current shell* pointed at the proxy for ad-hoc runs?"""
     name = "shell env"
@@ -718,7 +650,6 @@ def doctor(port: int, emit_json: bool) -> None:
             [project_local_claude_settings, project_claude_settings],
         ),
         check_wrap_marker_staleness(project_local_claude_settings),
-        check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
         check_savings(stats, savings_path()),
         check_budget(stats),

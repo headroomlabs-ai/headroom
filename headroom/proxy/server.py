@@ -101,10 +101,7 @@ from headroom.pipeline import PipelineExtensionManager, PipelineStage
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
     DEFAULT_ANTHROPIC_API_URL,
-    DEFAULT_CLOUDCODE_API_URL,
-    DEFAULT_GEMINI_API_URL,
     DEFAULT_OPENAI_API_URL,
-    DEFAULT_VERTEX_API_URL,
     build_proxy_provider_runtime,
     create_proxy_backend,
     format_backend_status,
@@ -112,7 +109,6 @@ from headroom.providers.registry import (
 )
 from headroom.proxy import runtime_env
 from headroom.proxy.audit import is_auditable_path, record_admin_action
-from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
 from headroom.proxy.budget_basis_policy import resolve_estimated_basis_policy
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -176,8 +172,6 @@ from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tag
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
-from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
-from headroom.subscription.copilot_quota import get_copilot_quota_tracker
 from headroom.subscription.tracker import (
     configure_subscription_tracker,
     get_subscription_tracker,
@@ -615,10 +609,7 @@ def _check_rust_core() -> tuple[str, str | None]:
 
 from headroom.proxy.handlers import (  # noqa: E402
     AnthropicHandlerMixin,
-    BatchHandlerMixin,
-    BedrockHandlerMixin,
-    GeminiHandlerMixin,
-    OpenAIHandlerMixin,
+    PassthroughHandlerMixin,
     StreamingMixin,
 )
 
@@ -770,18 +761,12 @@ def _external_compressor_selection(compressors: set[str] | None) -> list[str] | 
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
-    OpenAIHandlerMixin,
-    GeminiHandlerMixin,
-    BatchHandlerMixin,
-    BedrockHandlerMixin,
+    PassthroughHandlerMixin,
 ):
     """Production-ready Headroom optimization proxy."""
 
     ANTHROPIC_API_URL = DEFAULT_ANTHROPIC_API_URL
     OPENAI_API_URL = DEFAULT_OPENAI_API_URL
-    GEMINI_API_URL = DEFAULT_GEMINI_API_URL
-    CLOUDCODE_API_URL = DEFAULT_CLOUDCODE_API_URL
-    VERTEX_API_URL = DEFAULT_VERTEX_API_URL
 
     def __init__(self, config: ProxyConfig):
         self.config = config
@@ -810,9 +795,6 @@ class HeadroomProxy(
         # provider_runtime as the source of truth for resolved upstream targets.
         HeadroomProxy.ANTHROPIC_API_URL = api_targets.anthropic
         HeadroomProxy.OPENAI_API_URL = api_targets.openai
-        HeadroomProxy.GEMINI_API_URL = api_targets.gemini
-        HeadroomProxy.CLOUDCODE_API_URL = api_targets.cloudcode
-        HeadroomProxy.VERTEX_API_URL = api_targets.vertex
         self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
         self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
@@ -987,22 +969,6 @@ class HeadroomProxy(
             transforms=[*_intercept_prefix, cache_aligner, openai_router],
             provider=self.openai_provider,
         )
-        # Build the DEFAULT /v1/compress pipeline now, not on first request.
-        # It is a ContentRouter derived from `openai_router` (marker-free), so
-        # a lazy build would land inside the bounded compression executor on a
-        # cold pod's very first gateway request — paying router construction
-        # and, when the ML model runs in-process, model load against the 30 s
-        # compression budget. Building it here also lets startup warmup see it
-        # (`_eager_preload_transforms`). Never fatal: on failure the handler
-        # falls back to the original lazy path.
-        try:
-            self._no_ccr_pipeline()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug(
-                "Eager /v1/compress pipeline build failed (%s); deferring to first request",
-                exc,
-            )
-
         # Initialize components
         self.cache = (
             SemanticCache(
@@ -1348,18 +1314,9 @@ class HeadroomProxy(
                     "hint=bridge_syncs_only_the_legacy_DB_today_per-project_bridge_follow-up_planned"
                 )
 
-        # Usage Reporter (license validation + phone-home for managed/enterprise).
-        # Suppressed entirely in offline mode — the air-gap switch must stop all
-        # egress, including license phone-home, even when a key is configured.
-        self.usage_reporter: UsageReporter | None = None
-        if config.license_key and not (config.offline or is_offline()):
-            from headroom.telemetry.reporter import UsageReporter
-
-            self.usage_reporter = UsageReporter(
-                license_key=config.license_key,
-                cloud_url=config.license_cloud_url,
-                report_interval=config.license_report_interval,
-            )
+        # The upstream license usage reporter (phone-home) was removed from
+        # this build; kept as an always-None attribute for compatibility.
+        self.usage_reporter: Any = None
 
         # Traffic Learner (live pattern extraction from proxy traffic)
         # Only activates with --learn flag; requires --memory for backend
@@ -2045,8 +2002,6 @@ class HeadroomProxy(
             enabled=self.config.subscription_tracking_enabled,
         )
         registry.register(tracker)
-        registry.register(get_codex_rate_limit_state())
-        registry.register(get_copilot_quota_tracker())
         await registry.start_all()
 
         if self.config.subscription_tracking_enabled:
@@ -2057,15 +2012,6 @@ class HeadroomProxy(
             )
         else:
             logger.info("Subscription tracking: DISABLED")
-
-        copilot_tracker = get_copilot_quota_tracker()
-        if copilot_tracker.is_available():
-            logger.info("GitHub Copilot quota tracking: ENABLED")
-        else:
-            logger.info(
-                "GitHub Copilot quota tracking: DISABLED "
-                "(set GITHUB_TOKEN or GITHUB_COPILOT_GITHUB_TOKEN to enable)"
-            )
 
         # Log local telemetry status so operators can see it in the log stream.
         # Nothing is sent externally — telemetry is collected locally only (the
@@ -2884,8 +2830,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     app.state.periodic_malloc_trim_task = asyncio.create_task(
                         trim_periodically(config.malloc_trim_interval_seconds)
                     )
-                if proxy.usage_reporter:
-                    await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
                     await proxy.traffic_learner.start()
                 if proxy._background_compression_enabled:
@@ -2957,8 +2901,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
             if _beacon_is_owner[0]:
                 _release_beacon_lock()
-            if proxy.usage_reporter:
-                await _timed(proxy.usage_reporter.stop(), label="usage_reporter.stop", timeout=3.0)
             if proxy.traffic_learner:
                 await _timed(
                     proxy.traffic_learner.stop(), label="traffic_learner.stop", timeout=3.0
@@ -3465,15 +3407,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
-        # Path-based Codex identification: stamp X-Client: codex on the
-        # Responses endpoint for callers that don't otherwise classify (e.g.
-        # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
-        # the backend refuses oversized
-        # requests with a 413 on a compression timeout, which Codex treats as a
-        # hard connection failure. Mutating scope["headers"] before call_next
-        # makes every downstream classify_client(headers) read "codex".
-        if should_stamp_codex_client(path, headers):
-            request.scope["headers"].append((b"x-client", b"codex"))
         client = getattr(request, "client", None)
         client_addr = ""
         if client is not None:
@@ -5415,30 +5348,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "data": retrieval_data,
         }
 
-    # Compression-only endpoint (for TypeScript SDK and other HTTP clients).
-    # Loopback-only by default (guard added in #1537). An operator can opt in to
-    # network access for an authorized in-network sidecar/gateway (e.g. Kong,
-    # LiteLLM) on a trusted network by setting HEADROOM_COMPRESS_ALLOW_REMOTE=1,
-    # which drops ONLY this route's loopback dependency. Inbound auth
-    # (HEADROOM_PROXY_TOKEN via _security_gate) and network scoping still apply;
-    # all other _require_loopback routes are unaffected. Unset/false preserves
-    # today's loopback-only behavior.
-    _compress_dependencies = (
-        []
-        if _get_env_bool("HEADROOM_COMPRESS_ALLOW_REMOTE", False)
-        else [Depends(_require_loopback)]
-    )
-
-    @app.post("/v1/compress", dependencies=_compress_dependencies)
-    async def compress_messages(request: Request):
-        return await proxy.handle_compress(request)
-
-    # Sidecar-mode usage relay: same exposure policy as /v1/compress — the two
-    # form one contract (compress returns the bytes, usage reports what the
-    # provider said about them), so they must be reachable from the same place.
-    @app.post("/v1/usage", dependencies=_compress_dependencies)
-    async def compress_usage(request: Request):
-        return await proxy.handle_compress_usage(request)
+    # The upstream `/v1/compress` + `/v1/usage` sidecar endpoints (for the
+    # TypeScript SDK / gateway plugins) were removed with the OpenAI handler.
 
     register_provider_routes(app, proxy)
 
@@ -5665,9 +5576,6 @@ def run_server(
 ║  UPSTREAM TARGETS:                                                   ║
 ║    Anthropic:  {api_targets.anthropic:<57}║
 ║    OpenAI:     {api_targets.openai:<57}║
-║    Gemini:     {api_targets.gemini:<57}║
-║    Cloud Code: {api_targets.cloudcode:<57}║
-║    Vertex AI:  {api_targets.vertex:<57}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  FEATURES:                                                           ║
 ║    Optimization:    {"ENABLED " if config.optimize else "DISABLED"}                                       ║
@@ -5948,11 +5856,6 @@ if __name__ == "__main__":
             "message and batch paths (default: 600)"
         ),
     )
-    parser.add_argument(
-        "--vertex-api-url",
-        help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
-    )
-
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
         "--backend",

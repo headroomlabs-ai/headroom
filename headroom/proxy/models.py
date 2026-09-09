@@ -573,7 +573,4 @@ class ProxyConfig:
         return ProviderApiOverrides(
             anthropic=self.anthropic_api_url,
             openai=self.openai_api_url,
-            gemini=self.gemini_api_url,
-            cloudcode=self.cloudcode_api_url,
-            vertex=self.vertex_api_url,
         )

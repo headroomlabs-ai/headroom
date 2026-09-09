@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 import httpx
 
-from headroom.copilot_auth import apply_copilot_api_auth
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 
@@ -1235,7 +1234,6 @@ class StreamingMixin:
         # of being swallowed. (#1608)
         if supports_mid_turn_coalescing(client):
             self._active_streams.add(session_key)
-        headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
         # Byte-faithful forwarding (PR-A3, fixes P0-2). Resolve outbound
@@ -1423,22 +1421,6 @@ class StreamingMixin:
                 status_code=502,
                 media_type="text/event-stream",
             )
-
-        # Capture Codex rate-limit window data from the upstream response
-        # headers, for *every* status. Codex (gpt-5.x) almost always streams, so
-        # without this the session/weekly windows surfaced in ``/stats`` and the
-        # dashboard would only refresh on the rare non-streaming reply. We do this
-        # *before* the error early-return below so a streaming 429/5xx — the moment
-        # usage is most relevant — still refreshes the windows, matching the
-        # non-streaming HTTP handlers which capture on all statuses.
-        # ``update_from_headers`` is a no-op when the response carries no
-        # ``x-codex-*`` headers (e.g. the Anthropic streaming path), so this is
-        # safe to call unconditionally.
-        from headroom.subscription.codex_rate_limits import (
-            get_codex_rate_limit_state,
-        )
-
-        get_codex_rate_limit_state().update_from_headers(dict(upstream_response.headers))
 
         if upstream_response.status_code >= 400:
             logger.warning(
@@ -2111,8 +2093,12 @@ class StreamingMixin:
         """
         from fastapi.responses import StreamingResponse
 
-        from headroom.proxy.handlers.openai import _infer_openai_cache_write_tokens
         from headroom.proxy.outcome import RequestOutcome
+
+        def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) -> int:
+            # OpenAI exposes cache reads but no write counter; the uncached
+            # portion of the input is the best available write-volume proxy.
+            return max(input_tokens - cache_read_tokens, 0)
 
         # ``backend`` lets the caller serve this one request from somewhere
         # other than the configured backend (see proxy/route_advice.py). None

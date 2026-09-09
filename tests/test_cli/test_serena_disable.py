@@ -10,13 +10,11 @@ removes Serena.
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from headroom.cli import wrap as wrap_cli
-from headroom.cli.main import main
 from headroom.mcp_registry import build_serena_spec
 from headroom.mcp_registry.base import ServerSpec
 from headroom.mcp_registry.ledger import record_install
@@ -100,26 +98,3 @@ def test_disable_noop_when_agent_not_detected(
     wrap_cli._disable_serena_mcp(registrar, verbose=True)
 
     assert registrar.unregistered == []  # not detected → leave everything alone
-
-
-def test_unwrap_codex_removes_headroom_installed_serena(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
-    spec = build_serena_spec("codex")
-    record_install("codex", spec)
-    registrar = _FakeRegistrar("codex", server=spec)
-
-    with (
-        patch("headroom.mcp_registry.CodexRegistrar", return_value=registrar),
-        patch(
-            "headroom.cli.wrap._restore_codex_provider_config",
-            return_value=("noop", tmp_path / "config.toml"),
-        ),
-        patch("headroom.cli.wrap._stop_local_proxy_for_unwrap"),
-    ):
-        result = runner.invoke(main, ["unwrap", "codex"])
-
-    assert result.exit_code == 0, result.output
-    assert registrar.unregistered == ["serena"]
-    assert "Removed Headroom-installed Serena MCP server from Codex" in result.output

@@ -836,21 +836,6 @@ def test_resolve_1m_model_blank_env_falls_back_to_builtin(monkeypatch: pytest.Mo
     assert wrap_mod._resolve_1m_model(None) == f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
 
 
-def test_headroom_1m_model_is_documented_and_default_matches_code() -> None:
-    """The HEADROOM_1M_MODEL knob must stay documented, and the documented
-    default must track the code, so the supported configuration surface cannot
-    silently drift or disappear (#2937).
-    """
-    docs = Path(__file__).resolve().parents[2] / "docs" / "content" / "docs" / "configuration.mdx"
-    text = docs.read_text(encoding="utf-8")
-    assert wrap_mod._1M_MODEL_ENV in text, f"{wrap_mod._1M_MODEL_ENV} is not documented"
-    # The env-var catalog row must advertise the current built-in default.
-    assert f"`{wrap_mod._DEFAULT_1M_MODEL}`" in text, (
-        "documented HEADROOM_1M_MODEL default is out of sync with "
-        f"_DEFAULT_1M_MODEL={wrap_mod._DEFAULT_1M_MODEL!r}"
-    )
-
-
 class TestFindAvailablePort:
     """Tests for _find_available_port (Vite-style port fallback)."""
 

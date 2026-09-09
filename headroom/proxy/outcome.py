@@ -451,7 +451,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     and is awaitable-compatible. We could lift this to a typing.Protocol
     if/when another contract surface emerges, but YAGNI.
     """
-    from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -461,36 +460,6 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         public_tags,
         timings_from_tags,
     )
-    from headroom.telemetry.session import record_outcome
-
-    # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
-    # Anthropic wire, so the handlers stamp the wire provider. Relabel to
-    # "copilot" here — the single outcome funnel — so the dashboard shows the
-    # real upstream instead of "openai"/"anthropic". Keyed on the per-request
-    # flag set in build_copilot_upstream_url; never touches non-Copilot traffic.
-    # Done before the 5xx guard so a failed Copilot request is attributed too.
-    # consume_* reads AND clears the flag (called unconditionally via short-circuit
-    # order) so it cannot leak onto a later outcome in the same execution context.
-    if consume_request_routed_to_copilot() and outcome.provider in ("openai", "anthropic"):
-        import dataclasses
-
-        outcome = dataclasses.replace(outcome, provider="copilot")
-
-    # 0. Anonymous session beacon. Opt-in and a no-op unless HEADROOM_TELEMETRY
-    #    is explicitly on, in which case it folds this outcome into an in-memory
-    #    per-session aggregate and POSTs one content-free event when the session
-    #    goes idle (off-thread — see telemetry.session.post_session_event).
-    #
-    #    Placed before the 5xx short-circuit, for the same reason the Copilot
-    #    relabel above is: a session's failure count has to see upstream
-    #    failures, and per-session error rate is exactly the signal that shows a
-    #    provider going flaky for real users. Everything below this point is
-    #    success-only bookkeeping.
-    #
-    #    Synchronous but allocation-light, and swallows its own exceptions — the
-    #    beacon must never add latency to, or take down, the request path.
-    record_outcome(outcome)
-
     # Upstream failure (>= 500, e.g. a 529 Overloaded surfaced after retry
     # exhaustion) must not feed the savings/cost/log success stats; that would
     # let a failed request inflate the save-rate. Record it as failed and stop,
