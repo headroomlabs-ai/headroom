@@ -1,8 +1,8 @@
 name: Validate Docs
 
 # There is ONE documentation site: the Next.js/Fumadocs app in `docs/`, published
-# at https://headroom-docs.vercel.app by Vercel's own Git integration. That URL is
-# what README and `pyproject.toml` (Homepage, Documentation) point at.
+# at https://docs.headroomlabs.ai by Vercel's own Git integration. That URL is
+# what README and `pyproject.toml` (Homepage, Documentation) should point at.
 #
 # This workflow therefore only *validates* — it deploys nothing. Vercel owns
 # deployment; duplicating it here is what produced a `deploy-vercel` job that

@@ -32,9 +32,9 @@ dev = ["pytest>=7", "ruff"]
 test = ["pytest>=7"]
 
 [project.urls]
-Homepage = "https://github.com/chopratejas/headroom"
-Repository = "https://github.com/chopratejas/headroom"
-Issues = "https://github.com/chopratejas/headroom/issues"
+Homepage = "https://github.com/headroomlabs-ai/headroom"
+Repository = "https://github.com/headroomlabs-ai/headroom"
+Issues = "https://github.com/headroomlabs-ai/headroom/issues"
 
 # Registers with Headroom's opt-in proxy-extension seam (headroom/proxy/extensions.py).
 # Enable at runtime with `--proxy-extension oauth2` or HEADROOM_PROXY_EXTENSIONS=oauth2.

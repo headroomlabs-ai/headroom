@@ -55,7 +55,6 @@ class AgentSavingsProfile:
     lossless_then_lossy: bool = False
     protect_reads: bool = False
     code_aware: bool = True
-    effort_router: bool = True
     lossless: bool = False
     min_chars_for_block: int | None = None
 
@@ -87,7 +86,6 @@ class AgentSavingsProfile:
             "HEADROOM_LOSSLESS_THEN_LOSSY": "1" if self.lossless_then_lossy else "0",
             "HEADROOM_PROTECT_READS": "1" if self.protect_reads else "0",
             "HEADROOM_CODE_AWARE_ENABLED": "1" if self.code_aware else "0",
-            "HEADROOM_EFFORT_ROUTER": "1" if self.effort_router else "0",
             "HEADROOM_LOSSLESS": "1" if self.lossless else "0",
         }
         # Only pin a keep-ratio when the profile sets one; workload personas
@@ -182,7 +180,6 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         lossless_then_lossy=True,
         protect_reads=True,
         code_aware=True,
-        effort_router=False,
         lossless=False,
         min_chars_for_block=25,
     ),
@@ -327,7 +324,7 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         #
         # NOTE: this does not make the profile fully config-deliverable. The
         # profile's ``cross_turn_dedup`` / ``tool_search`` / ``lossless_then_lossy``
-        # / ``protect_reads`` / ``code_aware`` / ``effort_router`` / ``lossless``
+        # / ``protect_reads`` / ``code_aware`` / ``lossless``
         # fields are still env-only, but by a different mechanism: their consumers
         # read ``os.environ`` directly (ContentRouter.__init__ for HEADROOM_DEDUPE,
         # the Anthropic handler for HEADROOM_TOOL_SEARCH) and never pass through
