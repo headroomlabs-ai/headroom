@@ -84,6 +84,11 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
+# OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
+# tested npm version so both wrap-e2e callers use the same working installer.
+RUN npm install -g --no-fund --no-audit npm@11.16.0
+
 WORKDIR /workspace
 
 # Bring in the prebuilt manylinux wheel from stage 1.
