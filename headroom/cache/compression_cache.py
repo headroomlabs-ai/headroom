@@ -15,6 +15,9 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from headroom.ccr.retrieval_content import is_retrieval_result
+from headroom.config import DEFAULT_VERBATIM_EXCLUDE_TOOLS, is_tool_excluded, unwrap_tool_call_name
+
 from .compression_store import cached_references_available
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,54 @@ def _is_tool_result_message(msg: dict) -> bool:
     return False
 
 
+def _verbatim_tool_call_ids(messages: list[dict]) -> set[str]:
+    protected = set()
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            calls = []
+        content = message.get("content")
+        if isinstance(content, list):
+            calls = [
+                *calls,
+                *(
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_use"
+                ),
+            ]
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or call
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if not isinstance(name, str):
+                continue
+            name = unwrap_tool_call_name(name, function.get("arguments", call.get("input")))
+            if isinstance(call.get("id"), str) and is_tool_excluded(
+                name, DEFAULT_VERBATIM_EXCLUDE_TOOLS
+            ):
+                protected.add(call["id"])
+    return protected
+
+
+def _is_verbatim_result(message: dict, protected: set[str]) -> bool:
+    name = message.get("name")
+    if isinstance(name, str) and is_tool_excluded(name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
+        return True
+    if message.get("tool_call_id") in protected:
+        return True
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id") in protected
+        for block in content
+    )
+
+
 def _extract_text_from_blocks(blocks: list) -> str | None:
     """Extract joined text from a list-of-blocks content (e.g. Anthropic list-of-text-blocks).
 
@@ -50,6 +101,8 @@ def _extract_text_from_blocks(blocks: list) -> str | None:
     string.  This helper extracts text from ``type == "text"`` blocks and
     joins them.
     """
+    if any(not isinstance(block, dict) or block.get("type") != "text" for block in blocks):
+        return None
     texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
     return "\n".join(t for t in texts if t != "") or None
 
@@ -346,10 +399,11 @@ class CompressionCache:
         # `_cache` mid-iteration.
         with self._lock:
             result: list[dict] = []
+            protected = _verbatim_tool_call_ids(messages)
             for msg in messages:
-                if _is_tool_result_message(msg):
+                if _is_tool_result_message(msg) and not _is_verbatim_result(msg, protected):
                     content = _extract_tool_result_content(msg)
-                    if content is not None:
+                    if content is not None and not is_retrieval_result(content):
                         h = self.content_hash(content)
                         compressed = self.get_compressed(h)
                         if compressed is not None:

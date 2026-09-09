@@ -50,6 +50,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from headroom.ccr.retrieval_content import is_retrieval_result
+
 from ..cache.compression_store import cached_references_available
 from ..config import (
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
@@ -2204,6 +2206,12 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
         """
+        if is_retrieval_result(content):
+            return RouterCompressionResult(
+                compressed=content,
+                original=content,
+                strategy_used=CompressionStrategy.PASSTHROUGH,
+            )
         context = context or ""
         debug_enabled = logger.isEnabledFor(logging.DEBUG)
         request_debug = (
@@ -2585,6 +2593,23 @@ class ContentRouter(Transform):
         compressed = "\n\n".join(compressed_sections)
         if protected:
             compressed = restore_tags(compressed, protected)
+
+        if compressed != content and self.config.ccr_inject_marker and not self.config.lossless:
+            from headroom.cache.compression_store import get_compression_store
+
+            try:
+                store = get_compression_store()
+                key = store.store(content, compressed, compression_strategy="mixed")
+                if store.get_entry_status(key, clean_expired=False).get("status") != "available":
+                    raise ValueError("Mixed-content recovery storage is unavailable")
+            except Exception:
+                logger.warning("Mixed-content recovery storage failed; preserving original")
+                return RouterCompressionResult(
+                    compressed=content,
+                    original=content,
+                    strategy_used=CompressionStrategy.PASSTHROUGH,
+                )
+            compressed += f"\n[Retrieve original: hash={key}]"
 
         return RouterCompressionResult(
             compressed=compressed,
