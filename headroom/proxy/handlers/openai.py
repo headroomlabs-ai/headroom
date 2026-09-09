@@ -5429,7 +5429,10 @@ class OpenAIHandlerMixin:
                 circuit_breaker=_cb,
                 mode=self.config.circuit_breaker,
                 session_id=_responses_session_id,
-                messages=messages if isinstance(messages, list) else None,
+                messages=_responses_input_to_learner_messages(
+                    body.get("instructions"),
+                    input_data,
+                ),
                 request_id=request_id,
                 metrics=getattr(self, "metrics", None),
             )
