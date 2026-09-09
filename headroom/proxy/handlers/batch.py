@@ -1104,7 +1104,18 @@ class BatchHandlerMixin:
 
             try:
                 request_obj = json.loads(line)
+                # A JSONL line can be valid JSON that isn't a request object
+                # (e.g. a stray array, string, or null). `.get` on it would raise
+                # AttributeError, which the outer `except json.JSONDecodeError`
+                # below does not catch — crashing the whole batch. Pass such lines
+                # through unchanged, like the other non-compressible cases.
+                if not isinstance(request_obj, dict):
+                    compressed_lines.append(line)
+                    total_requests += 1
+                    continue
                 body = request_obj.get("body", {})
+                if not isinstance(body, dict):
+                    body = {}
                 messages = body.get("messages", [])
                 model = body.get("model", "gpt-4")
 

@@ -48,6 +48,10 @@ _MODEL_DEFAULTS: list[tuple[str, str]] = [
 ]
 
 _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + output)
+# Smallest digest budget worth retrying with after a context overflow. The
+# budget halves on each "prompt is too long" failure; below this the digest
+# carries too little signal to produce useful recommendations.
+_MIN_DIGEST_TOKENS = 10_000
 
 # CLI tools to try when no API key is set (checked in order).
 # Each entry: (binary_name, model_identifier, command_prefix). The claude-cli
@@ -56,7 +60,7 @@ _MAX_DIGEST_TOKENS = 80_000  # Budget for the digest (leave room for prompt + ou
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     ("claude", "claude-cli", ["claude", "-p", "--output-format", "stream-json", "--verbose"]),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
-    ("codex", "codex-cli", ["codex", "exec"]),
+    ("codex", "codex-cli", ["codex", "exec", "--skip-git-repo-check"]),
 ]
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.
@@ -187,24 +191,38 @@ class SessionAnalyzer:
         if not failed_calls and not loops and not any(s.events for s in sessions):
             return result
 
-        # Build compact digest of all sessions, leading with detected loops.
-        digest = _build_digest(project, sessions, loops=loops)
-
         # Resolve model (auto-detect if not specified)
         model = self.model or _detect_default_model()
 
-        # Call LLM for analysis
-        try:
-            raw = _call_llm(digest, model)
-            result.recommendations = _parse_llm_response(raw)
-            # Weight loop guardrails above one-off rules using MEASURED waste.
-            apply_loop_weighting(result.recommendations, loops)
-            result.recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
-        except Exception as e:
-            logger.warning("LLM analysis failed: %s", e)
-            # Return result with stats but no recommendations
-
-        return result
+        # Call LLM for analysis. The digest budget only bounds our side of the
+        # prompt: CLI backends (claude -p) load the user's own context on top
+        # (CLAUDE.md, MCP tool definitions), so a full-budget digest can still
+        # overflow the model's window. On a context-overflow error, rebuild the
+        # digest at half the budget and retry.
+        budget = _MAX_DIGEST_TOKENS
+        while True:
+            # Build compact digest of all sessions, leading with detected loops.
+            digest = _build_digest(project, sessions, loops=loops, max_tokens=budget)
+            try:
+                raw = _call_llm(digest, model)
+                result.recommendations = _parse_llm_response(raw)
+                # Weight loop guardrails above one-off rules using MEASURED waste.
+                apply_loop_weighting(result.recommendations, loops)
+                result.recommendations.sort(key=lambda r: r.estimated_tokens_saved, reverse=True)
+            except Exception as e:
+                if _is_prompt_too_long(e) and budget > _MIN_DIGEST_TOKENS:
+                    budget //= 2
+                    logger.info(
+                        "Prompt too long for %s; retrying with a %d-token digest budget",
+                        model,
+                        budget,
+                    )
+                    continue
+                logger.warning("LLM analysis failed: %s", e)
+                # Preserve the stats so multi-project runs can continue, but retain
+                # the failure so the CLI cannot report an empty result as success.
+                result.analysis_error = str(e) or type(e).__name__
+            return result
 
 
 # =============================================================================
@@ -251,10 +269,32 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
     return "\n".join(lines)
 
 
+def _is_prompt_too_long(exc: Exception) -> bool:
+    """True when *exc* signals the prompt overflowed the model's context window.
+
+    Matches the known phrasings across backends: claude CLI ("Prompt is too
+    long"), Anthropic via LiteLLM ("prompt is too long: N tokens > M maximum"),
+    OpenAI ("context_length_exceeded" / "maximum context length"), and Gemini
+    ("input token count exceeds the maximum").
+    """
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "prompt is too long",
+            "context_length_exceeded",
+            "maximum context length",
+            "context window",
+            "token count exceeds",
+        )
+    )
+
+
 def _build_digest(
     project: ProjectInfo,
     sessions: list[SessionData],
     loops: list[LoopPattern] | None = None,
+    max_tokens: int = _MAX_DIGEST_TOKENS,
 ) -> str:
     """Build a token-efficient text digest of all session events.
 
@@ -304,7 +344,7 @@ def _build_digest(
 
     # Budget tracking — stop adding events when we approach the limit
     # Rough estimate: 4 chars per token
-    char_budget = _MAX_DIGEST_TOKENS * 4
+    char_budget = max_tokens * 4
     chars_used = sum(len(ln) for ln in lines)
 
     for session in sessions:
@@ -539,6 +579,40 @@ def _strip_fenced_json(raw: str) -> dict:
     return result
 
 
+def _failure_detail(
+    stderr: str | None, stdout: str | None, *, result_text: str | None = None
+) -> str:
+    """Build the operator-facing reason for a non-zero CLI exit.
+
+    stderr alone is not enough. `claude -p --output-format stream-json` writes
+    *nothing* to stderr and reports API failures only in its final ``result``
+    event on stdout, so a stderr-only message renders as a bare
+    ``failed (exit 1):`` with no reason at all -- the user (and we) cannot tell a
+    usage limit from an unreachable proxy from an expired login.
+
+    Both streams are included when both have content, and stdout is tailed rather
+    than headed because CLI backends emit the error last (a streaming backend's
+    whole event log precedes it).
+
+    Args:
+        stderr: Captured stderr, if any.
+        stdout: Captured stdout, if any.
+        result_text: Pre-extracted reason (claude-cli's final ``result`` field),
+            used in place of the raw stdout tail when available.
+
+    Returns:
+        A non-empty snippet, or ``"(no output captured)"`` when both streams were
+        empty, so the message is never a dangling colon.
+    """
+    parts: list[str] = []
+    if stderr and stderr.strip():
+        parts.append(stderr.strip()[:_MAX_SNIPPET_LEN])
+    tail = result_text if result_text and result_text.strip() else stdout
+    if tail and tail.strip():
+        parts.append(tail.strip()[-_MAX_SNIPPET_LEN:])
+    return "\n".join(parts) if parts else "(no output captured)"
+
+
 def _call_cli_llm(digest: str, model: str) -> dict:
     """Call a locally installed CLI tool as the LLM backend.
 
@@ -611,10 +685,8 @@ def _call_cli_llm(digest: str, model: str) -> dict:
         ) from None
 
     if result.returncode != 0:
-        stderr_snippet = (result.stderr or "")[:_MAX_SNIPPET_LEN]
-        raise RuntimeError(
-            f"`{' '.join(cmd)}` failed (exit {result.returncode}):\n{stderr_snippet}"
-        )
+        detail = _failure_detail(result.stderr, result.stdout)
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {result.returncode}):\n{detail}")
 
     # Log stderr warnings even on success (auth refreshes, deprecation notices).
     if result.stderr and result.stderr.strip():
@@ -757,8 +829,14 @@ def _call_claude_cli_streaming(
     proc.wait()
 
     if proc.returncode != 0:
-        stderr_blob = "".join(stderr_lines)[:_MAX_SNIPPET_LEN]
-        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{stderr_blob}")
+        # `final_result` is preferred over the raw stdout tail: claude emits a
+        # final `result` event even when the run fails, and its `result` field is
+        # the human-readable reason ("API Error: ...", "Not logged in", usage
+        # limits).
+        detail = _failure_detail(
+            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result
+        )
+        raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
 
     stderr_blob = "".join(stderr_lines)
     if stderr_blob.strip():

@@ -46,6 +46,57 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
     assert manifest.tool_envs["copilot"]["COPILOT_PROVIDER_TYPE"] == "anthropic"
     assert "--memory" in manifest.proxy_args
+    # A container runtime must NOT carry the host memory DB path: it does not
+    # exist inside the container and would keep /readyz at 503 (#2803). The proxy
+    # resolves the DB under its own cwd, which is the bind-mounted ~/.headroom.
+    assert "--memory-db-path" not in manifest.proxy_args
+
+
+def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_SERVICE.value,
+        runtime_kind="python",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=True,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+
+    # On the host the resolved path is correct, so it is still passed explicitly.
+    assert "--memory" in manifest.proxy_args
+    assert "--memory-db-path" in manifest.proxy_args
+
+
+def test_build_manifest_falls_back_from_windows_service_to_task(monkeypatch) -> None:
+    monkeypatch.setattr("headroom.install.planner.sys.platform", "win32")
+
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_SERVICE.value,
+        runtime_kind="python",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+
+    assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
+    assert manifest.supervisor_kind == "task"
 
 
 def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targets() -> None:
@@ -238,6 +289,17 @@ def test_build_manifest_persists_intercept_tool_results() -> None:
     manifest = build_manifest(**_base_manifest_kwargs(intercept_tool_results=True))
 
     assert "--intercept-tool-results" in manifest.proxy_args
+    assert manifest.base_env["HEADROOM_ROLLOUT_CHANNEL"] == "canary"
+
+
+def test_build_manifest_rejects_interceptor_below_required_rollout_channel() -> None:
+    with pytest.raises(click.ClickException, match="requires HEADROOM_ROLLOUT_CHANNEL=canary"):
+        build_manifest(
+            **_base_manifest_kwargs(
+                intercept_tool_results=True,
+                extra_env={"HEADROOM_ROLLOUT_CHANNEL": "stable"},
+            )
+        )
 
 
 def test_build_manifest_persists_protect_tool_results() -> None:
@@ -268,3 +330,38 @@ def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
     # telemetry_enabled=False in _base_manifest_kwargs would normally set "off";
     # an explicit --env must win.
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"
+
+
+def test_build_manifest_grok_build_only_sets_xai_upstream() -> None:
+    """Persistent install for Grok Build alone must route proxy upstream to xAI."""
+    from headroom.providers.grok import DEFAULT_API_URL
+
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["grok_build"], backend="openai"))
+
+    assert manifest.base_env.get("OPENAI_TARGET_API_URL") == DEFAULT_API_URL
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == DEFAULT_API_URL
+
+
+def test_build_manifest_grok_with_codex_does_not_force_xai() -> None:
+    """Do not override OpenAI upstream when OpenAI-native tools share the proxy."""
+    manifest = build_manifest(
+        **_base_manifest_kwargs(targets=["grok_build", "codex"], backend="openai")
+    )
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_build_manifest_extra_env_wins_over_grok_xai_default() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            targets=["grok_build"],
+            backend="openai",
+            extra_env={"OPENAI_TARGET_API_URL": "https://gateway.example/v1"},
+        )
+    )
+
+    assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"

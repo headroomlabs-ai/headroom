@@ -68,7 +68,7 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
-| `--mode` | `token` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
+| `--mode` | `cache` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
 | `--no-optimize` | `false` | Disable optimization (passthrough mode) |
 | `--no-cache` | `false` | Disable semantic caching |
 | `--no-rate-limit` | `false` | Disable rate limiting |
@@ -323,13 +323,18 @@ The provider caches the bytes you *forwarded*, which compression already changed
 
 ```python
 forwarded = []
+
+
 def next_turn(new_messages):
-    r = requests.post(f"{proxy}/v1/compress", json={
-        "messages": forwarded + new_messages,
-        "model": "claude-sonnet-4-6",
-        "config": {"frozen_message_count": len(forwarded)},
-    }).json()
-    forwarded[:] = r["messages"]   # next turn's frozen prefix
+    r = requests.post(
+        f"{proxy}/v1/compress",
+        json={
+            "messages": forwarded + new_messages,
+            "model": "claude-sonnet-4-6",
+            "config": {"frozen_message_count": len(forwarded)},
+        },
+    ).json()
+    forwarded[:] = r["messages"]  # next turn's frozen prefix
     return forwarded
 ```
 
@@ -431,11 +436,13 @@ For production deployments:
 # Use a process manager
 pip install gunicorn
 
-# Run with gunicorn
-gunicorn headroom.proxy.server:app \
+# Run with gunicorn — server.py has no module-level `app`; FastAPI is built
+# by the create_app() factory, so gunicorn needs --factory
+gunicorn headroom.proxy.server:create_app \
   --workers 4 \
   --bind 0.0.0.0:8787 \
-  --worker-class uvicorn.workers.UvicornWorker
+  --worker-class uvicorn.workers.UvicornWorker \
+  --factory
 ```
 
 Or with Docker:

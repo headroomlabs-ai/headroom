@@ -58,7 +58,15 @@ class GrokPlugin(LearnPlugin, ConversationScanner):
                 continue
 
             decoded = unquote(workspace_dir.name)
-            project_path = Path(decoded) if decoded.startswith("/") else Path.cwd()
+            # The workspace dir name is a URL-encoded absolute cwd. Use
+            # Path.is_absolute() rather than a `startswith("/")` check so a
+            # Windows drive-letter path (e.g. `C:\Users\...`) is recognised as
+            # absolute instead of silently falling back to cwd (which would
+            # attribute the learnings to the wrong project and miss its
+            # GROK.md/AGENTS.md). Mirrors the Windows-aware path handling in
+            # memory/traffic_learner.py.
+            decoded_path = Path(decoded)
+            project_path = decoded_path if decoded_path.is_absolute() else Path.cwd()
             agents_md = project_path / "AGENTS.md"
             grok_md = project_path / "GROK.md"
 

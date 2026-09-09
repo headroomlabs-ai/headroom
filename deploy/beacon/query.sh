@@ -74,6 +74,15 @@ case "${1:-summary}" in
                  / nullif(sum(tokens.attempted), 0), 2)                AS yield_pct,
            round(sum(tokens.saved) * 100.0
                  / nullif(sum(tokens.original), 0), 2)                 AS saved_pct,
+           -- saved_pct/yield_pct above are context-compression only, because
+           -- tool_saved never lands in original/attempted. This is the
+           -- dashboard headline (server.py `savings_percent`): tool-schema
+           -- savings on BOTH sides, since deferred schemas were attempted work
+           -- that succeeded whole. On a tool-heavy fleet the two differ several-
+           -- fold, so say which one you are quoting.
+           round(sum(tokens.saved + tokens.tool_saved) * 100.0
+                 / nullif(sum(tokens.original + tokens.tool_saved), 0), 2)
+                                                                       AS all_layers_pct,
            sum(failures)                                               AS failures
     FROM sessions;"
     ;;

@@ -399,3 +399,76 @@ def test_dedup_folds_role_function_output():
     ]
     out = _dedup_only(msgs)
     assert "[↑" in out[2]["content"]
+
+
+# --------------------------------------------------------------------------
+# Recoverability gate (unresolvable-pointer paths). The fold rewrites a
+# repeated span to a bare `[↑NL same as msg M]` pointer naming Headroom's
+# internal message index. On the OpenAI chat-completions streaming path
+# (wrap copilot) no CCR retrieval tool can be injected and the client never
+# shows the model numbered messages, so the pointer is unresolvable: the
+# model reads it as deleted content and retry-loops. `apply()` therefore
+# accepts `cross_turn_dedup_recoverable=False` — the same recoverability
+# posture as the lossy `lossy_unrecoverable_skipped` guard — and keeps the
+# repeated bytes verbatim. Default True preserves every other path.
+# --------------------------------------------------------------------------
+def _apply_with_recoverable(messages, recoverable):
+    import copy
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    r = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
+    return r.apply(
+        copy.deepcopy(messages), _mk_tok(), cross_turn_dedup_recoverable=recoverable
+    ).messages
+
+
+def test_apply_unrecoverable_path_keeps_verbatim_bytes():
+    # The OpenAI chat streaming shape (role:tool strings): with dedup ENABLED
+    # but the path flagged unrecoverable, the re-read must NOT fold — the
+    # request keeps the verbatim bytes, no bare pointer.
+    span = _readspan()
+    msgs = [
+        {"role": "tool", "tool_call_id": "c1", "content": f"$ cat f.py\n{span}"},
+        {"role": "assistant", "content": "again"},
+        {"role": "tool", "tool_call_id": "c2", "content": f"$ cat f.py\n{span}"},
+    ]
+    out = _apply_with_recoverable(msgs, recoverable=False)
+    assert out[2]["content"] == f"$ cat f.py\n{span}"  # verbatim, no pointer
+    assert "[↑" not in out[2]["content"]
+
+
+def test_apply_unrecoverable_gate_also_covers_tool_result_blocks():
+    # Anthropic tool_result block shape, same gate: nothing folds when the
+    # caller reports the pointer is unresolvable on this path.
+    span = _readspan()
+    msgs = [_toolmsg(f"a\n{span}", "t1"), _toolmsg(f"b\n{span}", "t2")]
+    out = _apply_with_recoverable(msgs, recoverable=False)
+    joined = "".join(b["content"] for m in out for b in m["content"] if isinstance(b, dict))
+    assert "[↑" not in joined
+    assert out[-1]["content"][0]["content"] == f"b\n{span}"  # verbatim bytes kept
+
+
+def test_apply_recoverable_default_and_true_still_fold():
+    # The recoverable paths (Anthropic, buffered/non-streaming chat — anywhere
+    # the reference resolves) keep folding: default kwarg-absent behavior is
+    # unchanged, and an explicit True folds too.
+    span = _readspan()
+    msgs = [
+        {"role": "tool", "tool_call_id": "c1", "content": f"$ cat f.py\n{span}"},
+        {"role": "assistant", "content": "again"},
+        {"role": "tool", "tool_call_id": "c2", "content": f"$ cat f.py\n{span}"},
+    ]
+    import copy
+
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    default_out = (
+        ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
+        .apply(copy.deepcopy(msgs), _mk_tok())
+        .messages
+    )
+    assert "[↑" in default_out[2]["content"]  # no kwarg -> still folds
+
+    true_out = _apply_with_recoverable(msgs, recoverable=True)
+    assert "[↑" in true_out[2]["content"]  # explicit recoverable -> folds

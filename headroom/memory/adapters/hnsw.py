@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..models import Memory, ScopeLevel
+from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
 # hnswlib is optional - may not compile on all platforms
@@ -139,7 +139,9 @@ class IndexedMemoryMetadata:
             valid_until=(
                 datetime.fromisoformat(data["valid_until"]) if data.get("valid_until") else None
             ),
-            entity_refs=data.get("entity_refs", []),
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(data.get("entity_refs")),
             content=data["content"],
             created_at=datetime.fromisoformat(data["created_at"]),
             importance=data.get("importance", 0.5),

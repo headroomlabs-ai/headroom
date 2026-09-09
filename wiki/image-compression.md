@@ -55,19 +55,22 @@ Images are automatically compressed based on your queries.
 ### With HeadroomClient
 
 ```python
-from headroom import HeadroomClient
+from headroom import HeadroomClient, OpenAIProvider
+from openai import OpenAI
 
-client = HeadroomClient(provider="openai")
+client = HeadroomClient(original_client=OpenAI(), provider=OpenAIProvider())
 
 response = client.chat.completions.create(
     model="gpt-4o",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "What animal is this?"},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
-        ]
-    }]
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What animal is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+            ],
+        }
+    ],
 )
 # Image automatically compressed with detail="low" (87% savings)
 ```
@@ -92,11 +95,10 @@ print(f"Technique: {compressor.last_result.technique.value}")
 ### Proxy Configuration
 
 ```bash
-# Enable image compression (default: true)
-headroom proxy --image-optimize
-
-# Disable image compression
-headroom proxy --no-image-optimize
+# Image compression runs as part of the `image` built-in compressor and is
+# enabled by default. There is no dedicated --image-optimize toggle; select
+# compressors explicitly to disable it (flag is singular: --compressor):
+headroom proxy --compressor smart_crusher,kompress,code_aware,search,log,tabular,config,html
 ```
 
 ### Programmatic Configuration
@@ -106,8 +108,8 @@ from headroom.image import ImageCompressor
 
 compressor = ImageCompressor(
     model_id="chopratejas/technique-router",  # HuggingFace model
-    use_siglip=True,   # Enable image analysis
-    device="cuda",     # Use GPU if available
+    use_siglip=True,  # Enable image analysis
+    device="cuda",  # Use GPU if available
 )
 ```
 
@@ -181,7 +183,7 @@ For text extraction (converts image to text):
 - "What does it say?"
 - "Transcribe the document"
 
-*Note: Requires vision model call. Currently falls back to preserve.*
+*Note: Runs OCR and replaces the image with the extracted text. If OCR fails or returns low confidence, it falls back to `full_low` (not `preserve`).*
 
 ## The Trained Router
 
@@ -229,9 +231,11 @@ The HuggingFace model downloads on first use:
 ```python
 # Force a specific cache directory
 import os
+
 os.environ["HF_HOME"] = "/path/to/cache"
 
 from headroom.image import ImageCompressor
+
 compressor = ImageCompressor()
 ```
 
@@ -245,10 +249,12 @@ compressor = ImageCompressor(device="cpu")
 
 ### Disable Image Compression
 
-```python
-# Proxy
-headroom proxy --no-image-optimize
+```bash
+# Proxy (flag is singular: --compressor)
+headroom proxy --compressor smart_crusher,kompress,code_aware,search,log,tabular,config,html
+```
 
+```python
 # Direct
 # Simply don't call compress()
 ```
@@ -261,7 +267,7 @@ headroom proxy --no-image-optimize
 class ImageCompressor:
     def __init__(
         self,
-        model_id: str = "chopratejas/technique-router",
+        model_id: str | None = None,  # resolves to "chopratejas/technique-router" if unset
         use_siglip: bool = True,
         device: str | None = None,
     ): ...
@@ -290,10 +296,10 @@ class ImageCompressor:
 ```python
 @dataclass
 class CompressionResult:
-    technique: Technique      # full_low, preserve, crop, transcode
-    original_tokens: int      # Estimated tokens before
-    compressed_tokens: int    # Estimated tokens after
-    confidence: float         # Router confidence (0-1)
+    technique: Technique  # full_low, preserve, crop, transcode
+    original_tokens: int  # Estimated tokens before
+    compressed_tokens: int  # Estimated tokens after
+    confidence: float  # Router confidence (0-1)
 
     @property
     def savings_percent(self) -> float:
@@ -304,10 +310,10 @@ class CompressionResult:
 
 ```python
 class Technique(Enum):
-    FULL_LOW = "full_low"     # 87% savings
-    PRESERVE = "preserve"     # 0% savings
-    CROP = "crop"             # 50-90% savings
-    TRANSCODE = "transcode"   # 99% savings
+    FULL_LOW = "full_low"  # 87% savings
+    PRESERVE = "preserve"  # 0% savings
+    CROP = "crop"  # 50-90% savings
+    TRANSCODE = "transcode"  # 99% savings
 ```
 
 ## See Also

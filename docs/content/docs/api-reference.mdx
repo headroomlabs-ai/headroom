@@ -44,21 +44,24 @@ const client = new HeadroomClient({
   provider: { type: 'Provider', description: 'Token counting provider', default: 'Auto-detected' },
   default_mode: { type: '"audit" | "optimize"', description: 'Default compression mode', default: '"audit"' },
   store_url: { type: 'str | None', description: 'Storage URL for metrics database', default: 'None' },
-  smart_crusher_config: { type: 'SmartCrusherConfig', description: 'Compression settings', default: 'Default config' },
-  cache_aligner_config: { type: 'CacheAlignerConfig', description: 'Cache alignment settings', default: 'Default config' },
+  config: { type: 'HeadroomConfig | None', description: 'Compression and cache alignment settings (set config.smart_crusher / config.cache_aligner)', default: 'Default config' },
   enable_cache_optimizer: { type: 'bool', description: 'Enable provider-specific cache optimization', default: 'True' },
   enable_semantic_cache: { type: 'bool', description: 'Enable query-level semantic caching', default: 'False' },
   model_context_limits: { type: 'dict[str, int]', description: 'Override context limits per model', default: '{}' },
 }} />
 
 ```python
-from headroom import HeadroomClient, OpenAIProvider
+from headroom import HeadroomClient, OpenAIProvider, HeadroomConfig, SmartCrusherConfig, CacheAlignerConfig
 from openai import OpenAI
 
 client = HeadroomClient(
     original_client=OpenAI(),
     provider=OpenAIProvider(),
     default_mode="optimize",
+    config=HeadroomConfig(
+        smart_crusher=SmartCrusherConfig(min_tokens_to_crush=100),
+        cache_aligner=CacheAlignerConfig(enabled=True),
+    ),
 )
 ```
 
@@ -95,7 +98,6 @@ Accepts all standard OpenAI/Anthropic parameters plus Headroom-specific override
   headroom_query: { type: 'str', description: 'Query for relevance scoring', default: 'None' },
   headroom_output_buffer_tokens: { type: 'int', description: 'Reserve tokens for output', default: '4000' },
   headroom_keep_turns: { type: 'int', description: 'Keep last N turns uncompressed', default: '2' },
-  headroom_tool_profiles: { type: 'dict', description: 'Per-tool compression overrides', default: '{}' },
 }} />
 
 ```python
@@ -104,11 +106,17 @@ response = client.chat.completions.create(
     messages=[...],
     headroom_mode="optimize",
     headroom_keep_turns=5,
-    headroom_tool_profiles={
-        "important_tool": {"skip_compression": True},
-    },
 )
 ```
+
+<Callout type="warning" title="headroom_tool_profiles has no effect in 0.37.0">
+  `headroom_tool_profiles` is accepted but not currently wired through
+  `TransformPipeline.apply()`, so passing it changes nothing. To keep
+  specific tool outputs from being compressed as aggressively, use
+  `config.smart_crusher.max_items_after_crush` or
+  `config.smart_crusher.enabled = False` instead — see
+  [Compression Too Aggressive](/docs/troubleshooting#compression-too-aggressive).
+</Callout>
 
 </Tab>
 </Tabs>
@@ -124,8 +132,8 @@ plan = client.chat.completions.simulate(
 )
 
 print(f"Tokens: {plan.tokens_before} -> {plan.tokens_after}")
-print(f"Savings: {plan.savings_percent:.1f}%")
-print(f"Transforms: {plan.transforms_applied}")
+print(f"Savings: {plan.tokens_saved/plan.tokens_before*100:.1f}%")
+print(f"Transforms: {plan.transforms}")
 ```
 
 **Returns:** `SimulationResult`
@@ -187,8 +195,9 @@ Aggregate statistics across all stored metrics.
 
 ```python
 summary = client.get_summary()
-# Returns dict with total_requests, total_tokens_saved,
-# avg_compression_ratio, total_cost_saved_usd
+# Returns dict with total_requests, total_tokens_before, total_tokens_after,
+# total_tokens_saved, avg_tokens_saved, avg_cache_alignment,
+# audit_count, optimize_count
 ```
 
 ### validate_setup()
@@ -197,9 +206,12 @@ Validate that the client is configured correctly.
 
 ```python
 result = client.validate_setup()
+# Returns {"valid": bool, "provider": {...}, "storage": {...},
+#          "config": {...}, "cache_optimizer": {...}}, each with "ok"/"error"
 if not result["valid"]:
-    for issue in result["issues"]:
-        print(f"  - {issue}")
+    for key in ("provider", "storage", "config", "cache_optimizer"):
+        if not result[key]["ok"]:
+            print(f"  - {key}: {result[key]['error']}")
 ```
 
 ---
@@ -282,10 +294,14 @@ config = SmartCrusherConfig(
 
 <TypeTable type={{
   enabled: { type: 'bool', description: 'Enable/disable cache alignment (off by default)', default: 'False' },
-  extract_dates: { type: 'bool', description: 'Extract date patterns from system prompt', default: 'True' },
+  use_dynamic_detector: { type: 'bool', description: 'Use the dynamic content detector', default: 'True' },
+  detection_tiers: { type: "list[Literal['regex', 'ner', 'semantic']]", description: 'Detection tiers to apply', default: "['regex']" },
+  extra_dynamic_labels: { type: 'list[str]', description: 'Additional labels for dynamic content detection', default: '[]' },
+  entropy_threshold: { type: 'float', description: 'Entropy threshold for dynamic detection', default: '0.7' },
+  date_patterns: { type: 'list[str]', description: 'Regex patterns for date extraction', default: '[...]' },
   normalize_whitespace: { type: 'bool', description: 'Normalize whitespace for stable prefix', default: 'True' },
-  stable_prefix_min_tokens: { type: 'int', description: 'Minimum prefix tokens for caching', default: '100' },
-  dynamic_patterns: { type: 'list[str]', description: 'Regex patterns to extract as dynamic content', default: '[]' },
+  collapse_blank_lines: { type: 'bool', description: 'Collapse consecutive blank lines', default: 'True' },
+  dynamic_tail_separator: { type: 'str', description: 'Separator between static and dynamic content', default: "'\\n\\n---\\n[Dynamic Context]\\n'" },
 }} />
 
 ```python
@@ -293,9 +309,9 @@ from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
     enabled=True,
-    extract_dates=True,
+    use_dynamic_detector=True,
     normalize_whitespace=True,
-    stable_prefix_min_tokens=100,
+    entropy_threshold=0.7,
 )
 ```
 
@@ -304,7 +320,7 @@ config = CacheAlignerConfig(
 
 ### Context management
 
-Context management is now handled automatically inside the pipeline (live-zone-only compression). Headroom never drops messages from the conversation history; it compresses only the newest content blocks (latest user message, latest tool result) and keeps the cache hot zone — system prompt, tools, and older turns — untouched. Use the `headroom_keep_turns` / `headroom_output_buffer_tokens` per-request overrides to tune behavior. The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes are no longer part of Headroom.
+Context management is now handled automatically inside the pipeline (live-zone-only compression). Headroom never drops messages from the conversation history; it compresses only the newest content blocks (latest user message, latest tool result) and keeps the cache hot zone — system prompt, tools, and older turns — untouched. Use the `headroom_keep_turns` / `headroom_output_buffer_tokens` per-request overrides to tune behavior. The `RollingWindowConfig`, `IntelligentContextConfig`, and `ScoringWeights` classes have been retired from the Python package (`from headroom import RollingWindowConfig` fails) and from the compression pipeline itself; the TypeScript SDK's `HeadroomConfig` type still exports the equivalent field names as unused legacy type surface, wired to nothing.
 
 ### HeadroomConfig
 
@@ -360,9 +376,13 @@ config.cache_aligner.enabled = True
 <Tab value="Python">
 
 <TypeTable type={{
-  scorer_type: { type: '"bm25" | "embedding" | "hybrid"', description: 'Scoring method', default: '"bm25"' },
-  embedding_model: { type: 'str | None', description: 'Model name for embedding scorer', default: 'None' },
+  tier: { type: '"bm25" | "embedding" | "hybrid"', description: 'Scoring method', default: '"hybrid"' },
+  bm25_k1: { type: 'float', description: 'BM25 k1 parameter (term frequency saturation)', default: '1.5' },
+  bm25_b: { type: 'float', description: 'BM25 b parameter (length normalization)', default: '0.75' },
+  embedding_model: { type: 'str', description: 'Model name for embedding scorer', default: "'all-MiniLM-L6-v2'" },
   hybrid_alpha: { type: 'float', description: 'Weight for hybrid scoring (0=embedding, 1=bm25)', default: '0.5' },
+  adaptive_alpha: { type: 'bool', description: 'Automatically adapt alpha based on query type', default: 'True' },
+  relevance_threshold: { type: 'float', description: 'Minimum relevance score to keep', default: '0.25' },
 }} />
 
 </Tab>
@@ -391,19 +411,23 @@ config.cache_aligner.enabled = True
   tokens_before: { type: 'int', description: 'Token count before compression' },
   tokens_after: { type: 'int', description: 'Token count after compression' },
   tokens_saved: { type: 'int', description: 'Tokens removed by compression' },
-  savings_percent: { type: 'float', description: 'Percentage of tokens saved' },
-  transforms_applied: { type: 'list[str]', description: 'Names of transforms that were applied' },
-  waste_signals: { type: 'WasteSignals', description: 'Detected waste in the request' },
+  transforms: { type: 'list[str]', description: 'Names of transforms that were applied' },
+  waste_signals: { type: 'dict[str, int]', description: 'Detected waste in the request (see WasteSignals below)' },
 }} />
 
 ### WasteSignals (Python)
 
+`plan.waste_signals` is a plain `dict[str, int]`, not a class instance:
+
 <TypeTable type={{
-  json_bloat_tokens: { type: 'int', description: 'Tokens from JSON formatting waste' },
-  html_noise_tokens: { type: 'int', description: 'Tokens from HTML tags and noise' },
-  whitespace_tokens: { type: 'int', description: 'Tokens from excessive whitespace' },
-  dynamic_date_tokens: { type: 'int', description: 'Tokens from dynamic date strings' },
-  repetition_tokens: { type: 'int', description: 'Tokens from repeated content' },
+  json_bloat: { type: 'int', description: 'Tokens from JSON blocks over 500 tokens' },
+  html_noise: { type: 'int', description: 'Tokens from HTML tags and comments' },
+  base64: { type: 'int', description: 'Tokens from base64-encoded blobs' },
+  whitespace: { type: 'int', description: 'Tokens from repeated whitespace' },
+  dynamic_date: { type: 'int', description: 'Tokens from dynamic dates in the system prompt' },
+  repetition: { type: 'int', description: 'Tokens from repeated content' },
+  reread: { type: 'int', description: 'Tokens from tool results re-served after already appearing earlier' },
+  reread_compressed: { type: 'int', description: 'Subset of reread whose first serve was already compressed away' },
 }} />
 
 ### RequestMetrics (Python)
@@ -415,10 +439,10 @@ config.cache_aligner.enabled = True
   tokens_input_before: { type: 'int', description: 'Input tokens before compression' },
   tokens_input_after: { type: 'int', description: 'Input tokens after compression' },
   tokens_output: { type: 'int', description: 'Output tokens from the model' },
-  cost_before: { type: 'float', description: 'Cost before compression (USD)' },
-  cost_after: { type: 'float', description: 'Cost after compression (USD)' },
   transforms_applied: { type: 'list[str]', description: 'Transforms that were applied' },
 }} />
+
+Cost estimates are computed on demand inside `HeadroomClient` (`estimate_cost()` on the provider) rather than stored on `RequestMetrics`.
 
 ---
 
@@ -429,9 +453,7 @@ config.cache_aligner.enabled = True
 ```python
 from headroom import OpenAIProvider
 
-provider = OpenAIProvider(
-    enable_prefix_caching=True,
-)
+provider = OpenAIProvider()
 
 counter = provider.get_token_counter("gpt-4o")
 tokens = counter.count_text("Hello, world!")
@@ -447,7 +469,6 @@ from anthropic import Anthropic
 
 provider = AnthropicProvider(
     client=Anthropic(),
-    enable_cache_control=True,
 )
 
 counter = provider.get_token_counter("claude-3-5-sonnet-latest")
@@ -459,9 +480,7 @@ tokens = counter.count_messages(messages)  # Accurate count via API
 ```python
 from headroom.providers import GoogleProvider
 
-provider = GoogleProvider(
-    enable_context_caching=True,
-)
+provider = GoogleProvider()
 ```
 
 ---
@@ -479,7 +498,7 @@ from headroom import create_scorer
 scorer = create_scorer()
 
 # Explicitly choose type
-scorer = create_scorer(scorer_type="hybrid", alpha=0.7)
+scorer = create_scorer(tier="hybrid", alpha=0.7)
 ```
 
 ### BM25Scorer
@@ -490,7 +509,7 @@ Fast keyword-based scoring (zero dependencies):
 from headroom import BM25Scorer
 
 scorer = BM25Scorer()
-scores = scorer.score_items(items=["item 1", "item 2"], query="search query")
+scores = scorer.score_batch(["item 1", "item 2"], "search query")
 ```
 
 ### EmbeddingScorer
@@ -502,7 +521,7 @@ from headroom import EmbeddingScorer, embedding_available
 
 if embedding_available():
     scorer = EmbeddingScorer(model_name="BAAI/bge-small-en-v1.5")
-    scores = scorer.score_items(items, query)
+    scores = scorer.score_batch(items, query)
 ```
 
 ### HybridScorer
@@ -513,7 +532,7 @@ Combines BM25 and embeddings:
 from headroom import HybridScorer
 
 scorer = HybridScorer(alpha=0.5)  # 50% BM25, 50% embedding
-scores = scorer.score_items(items, query)
+scores = scorer.score_batch(items, query)
 ```
 
 ---
@@ -524,31 +543,37 @@ scores = scorer.score_items(items, query)
 
 ```python
 from headroom import SmartCrusher
+import json
 
 crusher = SmartCrusher()
-result = crusher.crush(data={"results": [...]}, query="user query")
+result = crusher.crush(content=json.dumps({"results": [...]}), query="user query")
 ```
 
 ### CacheAligner
 
 ```python
-from headroom import CacheAligner
+from headroom import CacheAligner, Tokenizer, OpenAIProvider
+
+provider = OpenAIProvider()
+tokenizer = Tokenizer(provider.get_token_counter("gpt-4o"), "gpt-4o")
 
 aligner = CacheAligner()
-result = aligner.align(messages)
+result = aligner.apply(messages, tokenizer)
 ```
 
 ### TransformPipeline
 
 ```python
-from headroom import TransformPipeline
+from headroom import TransformPipeline, SmartCrusher, CacheAligner
 
-pipeline = TransformPipeline([
+pipeline = TransformPipeline(transforms=[
     SmartCrusher(),
     CacheAligner(),
 ])
 
-result = pipeline.transform(messages)
+# model_limit is required for direct pipeline use — HeadroomClient
+# supplies it automatically from the provider's context limits
+result = pipeline.apply(messages, "gpt-4o", model_limit=128_000)
 ```
 
 ---
@@ -598,13 +623,16 @@ All exceptions include a `details` dict with additional context.
 ### Tokenizer
 
 ```python
-from headroom import Tokenizer, count_tokens_text, count_tokens_messages
+from headroom import Tokenizer, count_tokens_text, count_tokens_messages, OpenAIProvider
+
+provider = OpenAIProvider()
+token_counter = provider.get_token_counter("gpt-4o")
 
 # Quick counting
-tokens = count_tokens_text("Hello, world!", model="gpt-4o")
+tokens = count_tokens_text("Hello, world!", token_counter)
 
 # With tokenizer instance
-tokenizer = Tokenizer(model="gpt-4o")
+tokenizer = Tokenizer(token_counter, "gpt-4o")
 tokens = tokenizer.count_text("Hello")
 tokens = tokenizer.count_messages(messages)
 ```

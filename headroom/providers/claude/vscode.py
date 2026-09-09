@@ -89,7 +89,11 @@ def configure_vscode_claude_settings(path: Path, proxy_url: str) -> str:
     payload = _read_settings(path)
     env = _env_map(payload, path)
     state_path = _state_path(path)
-    managed = {_BASE_URL_KEY: proxy_url, _TOOL_SEARCH_KEY: "true"}
+    # Claude Code's VS Code webview cannot render the server_tool_use /
+    # tool_search_tool_result blocks emitted by deferred tool search (#2028).
+    # Keep it disabled for this surface; the standalone CLI retains its own
+    # configurable/default-on policy.
+    managed = {_BASE_URL_KEY: proxy_url, _TOOL_SEARCH_KEY: "false"}
 
     if state_path.exists():
         state = _read_object(state_path, label="Headroom state")

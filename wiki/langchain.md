@@ -35,8 +35,9 @@ Headroom automatically:
 
 ```python
 # After some usage
-print(llm.get_metrics())
-# {'tokens_saved': 12500, 'savings_percent': 45.2, 'requests': 50}
+print(llm.get_savings_summary())
+# {'total_requests': 50, 'total_tokens_saved': 12500, 'average_savings_percent': 45.2,
+#  'total_tokens_before': ..., 'total_tokens_after': ...}
 ```
 
 ---
@@ -61,13 +62,10 @@ llm = HeadroomChatModel(ChatAnthropic(model="claude-3-5-sonnet-20241022"))
 # Custom configuration
 from headroom import HeadroomConfig, HeadroomMode
 
-config = HeadroomConfig(
-    default_mode=HeadroomMode.OPTIMIZE,
-    smart_crusher_target_ratio=0.3,  # Target 70% compression
-)
+config = HeadroomConfig(default_mode=HeadroomMode.OPTIMIZE)
 llm = HeadroomChatModel(
     ChatOpenAI(model="gpt-4o"),
-    headroom_config=config,
+    config=config,
 )
 ```
 
@@ -91,10 +89,12 @@ Works seamlessly with LangChain tool calling:
 ```python
 from langchain_core.tools import tool
 
+
 @tool
 def search(query: str) -> str:
     """Search the web."""
     return {"results": [...]}  # Large JSON response
+
 
 llm_with_tools = llm.bind_tools([search])
 response = llm_with_tools.invoke("Search for Python tutorials")
@@ -117,7 +117,7 @@ base_history = ChatMessageHistory()
 compressed_history = HeadroomChatMessageHistory(
     base_history,
     compress_threshold_tokens=4000,  # Compress when over 4K tokens
-    keep_recent_turns=5,             # Always keep last 5 turns
+    keep_recent_turns=5,  # Always keep last 5 turns
 )
 
 # Use with any memory class
@@ -152,9 +152,9 @@ base_retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
 
 # Wrap with Headroom compression (keep best for precision)
 compressor = HeadroomDocumentCompressor(
-    max_documents=10,      # Keep top 10
-    min_relevance=0.3,     # Minimum relevance score
-    prefer_diverse=True,   # MMR-style diversity
+    max_documents=10,  # Keep top 10
+    min_relevance=0.3,  # Minimum relevance score
+    prefer_diverse=True,  # MMR-style diversity
 )
 
 retriever = ContextualCompressionRetriever(
@@ -179,17 +179,20 @@ from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.tools import tool
 from headroom.integrations import wrap_tools_with_headroom
 
+
 @tool
 def search_database(query: str) -> str:
     """Search the database."""
     # Returns 1000 results as JSON
     return json.dumps({"results": [...], "total": 1000})
 
+
 @tool
 def fetch_logs(service: str) -> str:
     """Fetch service logs."""
     # Returns 500 log entries
     return json.dumps({"logs": [...]})
+
 
 # Wrap tools with compression
 tools = [search_database, fetch_logs]
@@ -296,26 +299,33 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from headroom.integrations import HeadroomChatModel, wrap_tools_with_headroom
 
+
 # Define tools that return large outputs
 @tool
 def search_web(query: str) -> str:
     """Search the web for information."""
     # Simulating large search results
-    return json.dumps({
-        "results": [
-            {"title": f"Result {i}", "snippet": "..." * 100, "url": f"https://..."}
-            for i in range(100)
-        ],
-        "total": 1000,
-    })
+    return json.dumps(
+        {
+            "results": [
+                {"title": f"Result {i}", "snippet": "..." * 100, "url": f"https://..."}
+                for i in range(100)
+            ],
+            "total": 1000,
+        }
+    )
+
 
 @tool
 def query_database(sql: str) -> str:
     """Execute SQL query."""
-    return json.dumps({
-        "rows": [{"id": i, "data": "..." * 50} for i in range(500)],
-        "total": 500,
-    })
+    return json.dumps(
+        {
+            "rows": [{"id": i, "data": "..." * 50} for i in range(500)],
+            "total": 500,
+        }
+    )
+
 
 # Wrap model with Headroom
 llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
@@ -327,9 +337,9 @@ tools = wrap_tools_with_headroom([search_web, query_database])
 agent = create_react_agent(llm, tools)
 
 # Run - tool outputs are automatically compressed between iterations
-result = agent.invoke({
-    "messages": [("user", "Find all users who signed up last week and their activity")]
-})
+result = agent.invoke(
+    {"messages": [("user", "Find all users who signed up last week and their activity")]}
+)
 
 # Check savings
 print(f"Tokens saved: {llm.get_metrics()['tokens_saved']}")
@@ -352,23 +362,29 @@ from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, MessagesState, START, END
 from headroom.integrations.langchain import create_compress_tool_messages_node
 
+
 # Define your agent and tools nodes
 def agent_node(state: MessagesState):
     llm = ChatOpenAI(model="gpt-4o")
     response = llm.invoke(state["messages"])
     return {"messages": [response]}
 
+
 def tools_node(state: MessagesState):
     # Your tool execution logic here
     ...
+
 
 # Build the graph with a compression step
 graph = StateGraph(MessagesState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", tools_node)
-graph.add_node("compress", create_compress_tool_messages_node(
-    min_tokens_to_compress=100,  # Only compress outputs > ~100 tokens
-))
+graph.add_node(
+    "compress",
+    create_compress_tool_messages_node(
+        min_tokens_to_compress=100,  # Only compress outputs > ~100 tokens
+    ),
+)
 
 # Wire: tools -> compress -> agent (instead of tools -> agent directly)
 graph.add_edge(START, "agent")
@@ -411,9 +427,9 @@ base_retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
 
 # Headroom compressor for precision
 compressor = HeadroomDocumentCompressor(
-    max_documents=5,       # Keep only top 5
-    min_relevance=0.4,     # Must be 40%+ relevant
-    prefer_diverse=True,   # Avoid redundant docs
+    max_documents=5,  # Keep only top 5
+    min_relevance=0.4,  # Must be 40%+ relevant
+    prefer_diverse=True,  # Avoid redundant docs
 )
 
 # Combine into compression retriever
@@ -461,7 +477,7 @@ base_history = ChatMessageHistory()
 compressed_history = HeadroomChatMessageHistory(
     base_history,
     compress_threshold_tokens=8000,  # Compress when over 8K
-    keep_recent_turns=10,            # Always keep last 10 turns
+    keep_recent_turns=10,  # Always keep last 10 turns
 )
 
 memory = ConversationBufferMemory(
@@ -500,30 +516,45 @@ from headroom.integrations import (
     reset_tool_metrics,
 )
 
+
 @tool
 def search_arxiv(query: str) -> str:
     """Search arXiv for papers."""
-    return json.dumps({"papers": [{"title": f"Paper {i}", "abstract": "..." * 200} for i in range(50)]})
+    return json.dumps(
+        {"papers": [{"title": f"Paper {i}", "abstract": "..." * 200} for i in range(50)]}
+    )
+
 
 @tool
 def search_github(query: str) -> str:
     """Search GitHub repositories."""
-    return json.dumps({"repos": [{"name": f"repo-{i}", "description": "..." * 100, "stars": i * 100} for i in range(100)]})
+    return json.dumps(
+        {
+            "repos": [
+                {"name": f"repo-{i}", "description": "..." * 100, "stars": i * 100}
+                for i in range(100)
+            ]
+        }
+    )
+
 
 @tool
 def fetch_documentation(url: str) -> str:
     """Fetch documentation from URL."""
     return "..." * 5000  # Large doc content
 
+
 # Wrap everything
 llm = HeadroomChatModel(ChatOpenAI(model="gpt-4o"))
 tools = wrap_tools_with_headroom([search_arxiv, search_github, fetch_documentation])
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a research assistant. Use tools to gather information."),
-    ("human", "{input}"),
-    ("placeholder", "{agent_scratchpad}"),
-])
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a research assistant. Use tools to gather information."),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ]
+)
 
 agent = create_openai_tools_agent(llm, tools, prompt)
 executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
@@ -532,9 +563,11 @@ executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 reset_tool_metrics()
 
 # Run complex research task
-result = executor.invoke({
-    "input": "Research the latest advances in LLM context compression and find relevant GitHub projects"
-})
+result = executor.invoke(
+    {
+        "input": "Research the latest advances in LLM context compression and find relevant GitHub projects"
+    }
+)
 
 # Check per-tool metrics
 metrics = get_tool_metrics().get_summary()
@@ -550,9 +583,9 @@ print(f"Per-tool breakdown: {metrics['by_tool']}")
 
 ```python
 HeadroomChatModel(
-    wrapped_model,                     # Any LangChain BaseChatModel
+    wrapped_model,  # Any LangChain BaseChatModel
     headroom_config=HeadroomConfig(),  # Headroom configuration
-    auto_detect_provider=True,         # Auto-detect from wrapped model
+    auto_detect_provider=True,  # Auto-detect from wrapped model
 )
 ```
 
@@ -560,10 +593,10 @@ HeadroomChatModel(
 
 ```python
 HeadroomChatMessageHistory(
-    base_history,                      # Any BaseChatMessageHistory
-    compress_threshold_tokens=4000,    # Token threshold for compression
-    keep_recent_turns=5,               # Minimum turns to preserve
-    model="gpt-4o",                    # Model for token counting
+    base_history,  # Any BaseChatMessageHistory
+    compress_threshold_tokens=4000,  # Token threshold for compression
+    keep_recent_turns=5,  # Minimum turns to preserve
+    model="gpt-4o",  # Model for token counting
 )
 ```
 
@@ -571,9 +604,9 @@ HeadroomChatMessageHistory(
 
 ```python
 HeadroomDocumentCompressor(
-    max_documents=10,                  # Maximum docs to return
-    min_relevance=0.0,                 # Minimum relevance score (0-1)
-    prefer_diverse=False,              # Use MMR for diversity
+    max_documents=10,  # Maximum docs to return
+    min_relevance=0.0,  # Minimum relevance score (0-1)
+    prefer_diverse=False,  # Use MMR for diversity
 )
 ```
 
@@ -581,9 +614,9 @@ HeadroomDocumentCompressor(
 
 ```python
 wrap_tools_with_headroom(
-    tools,                             # List of LangChain tools
-    min_chars_to_compress=1000,        # Minimum output size
-    smart_crusher_config=None,         # SmartCrusher configuration
+    tools,  # List of LangChain tools
+    min_chars_to_compress=1000,  # Minimum output size
+    smart_crusher_config=None,  # SmartCrusher configuration
 )
 ```
 
@@ -595,27 +628,21 @@ wrap_tools_with_headroom(
 from headroom.integrations import (
     # Chat Model
     HeadroomChatModel,
-
     # Memory
     HeadroomChatMessageHistory,
-
     # Retrievers
     HeadroomDocumentCompressor,
-
     # Agents
     HeadroomToolWrapper,
     wrap_tools_with_headroom,
     get_tool_metrics,
     reset_tool_metrics,
-
     # Streaming
     StreamingMetricsTracker,
     StreamingMetricsCallback,
     track_streaming_response,
-
     # LangSmith
     HeadroomLangSmithCallbackHandler,
-
     # Provider Detection
     detect_provider,
     get_headroom_provider,
@@ -660,7 +687,7 @@ Check that your message count exceeds the threshold:
 history = HeadroomChatMessageHistory(
     base_history,
     compress_threshold_tokens=1000,  # Lower threshold
-    keep_recent_turns=2,             # Fewer preserved turns
+    keep_recent_turns=2,  # Fewer preserved turns
 )
 ```
 

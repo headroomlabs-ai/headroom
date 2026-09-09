@@ -163,6 +163,26 @@ class TestLosslessOnlyMode:
         assert json.loads(out.compressed) == rows
 
 
+def test_extract_context_survives_null_function_tool_call() -> None:
+    # A tool_call with an explicit {"function": null} must not crash context
+    # extraction: `dict.get("function", {})` returns None for a present-but-null
+    # key, and `.get` on None raises AttributeError inside apply().
+    crusher = _make_crusher()
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": None},
+                {"id": "2", "type": "function", "function": {"arguments": "keep-me"}},
+            ],
+        },
+    ]
+
+    ctx = crusher._extract_context_from_messages(messages)
+
+    assert "keep-me" in ctx
+
+
 # Stage 3c.1 lockstep bug-fix tests previously lived here; they probed
 # Python helpers (`_percentile_linear`, `_detect_sequential_pattern`,
 # `_detect_rare_status_values`, `_compute_k_split`) that were removed

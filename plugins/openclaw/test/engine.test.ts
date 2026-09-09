@@ -24,8 +24,10 @@ vi.mock("../src/proxy-manager.js", () => ({
 }));
 
 import { HeadroomContextEngine } from "../src/engine.js";
+import { compress } from "headroom-ai";
 
 afterEach(() => {
+  vi.mocked(compress).mockReset();
   mocked.start.mockReset();
   mocked.start.mockResolvedValue("http://127.0.0.1:8787");
   mocked.stop.mockClear();
@@ -195,5 +197,57 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
       estimatedTokens: 0,
     });
     expect(mocked.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the request timeout after successful compression", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(compress).mockResolvedValue({
+        compressed: false,
+        messages: [{ role: "user", content: "hello" }],
+        tokensBefore: 5,
+        tokensAfter: 5,
+        tokensSaved: 0,
+      });
+
+      const engine = new HeadroomContextEngine({ requestTimeoutMs: 30_000 });
+      (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+      await expect(
+        engine.assemble({
+          sessionId: "session-1",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      ).resolves.toEqual({
+        messages: [{ role: "user", content: "hello" }],
+        estimatedTokens: 5,
+      });
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens the circuit after consecutive compression failures", async () => {
+    vi.mocked(compress).mockRejectedValue(new Error("proxy stalled"));
+    const messages = [{ role: "user", content: "hello" }];
+    const engine = new HeadroomContextEngine({
+      circuitBreakerThreshold: 2,
+      circuitBreakerCooldownMs: 60_000,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages });
+    await engine.assemble({ sessionId: "session-1", messages });
+    await expect(engine.assemble({ sessionId: "session-1", messages })).resolves.toEqual({
+      messages,
+      estimatedTokens: 0,
+    });
+
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
   });
 });

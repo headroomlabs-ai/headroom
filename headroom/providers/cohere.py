@@ -21,6 +21,7 @@ import warnings
 from datetime import date
 from typing import Any
 
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -326,18 +327,13 @@ class CohereProvider(Provider):
         # Try LiteLLM first
         if LITELLM_AVAILABLE:
             for model_variant in [f"cohere/{model}", model]:
-                try:
-                    cost = litellm.completion_cost(
-                        model=model_variant,
-                        prompt="",
-                        completion="",
-                        prompt_tokens=input_tokens,
-                        completion_tokens=output_tokens,
-                    )
-                    if cost is not None:
-                        return float(cost)
-                except Exception:
-                    pass
+                cost = estimate_cost_from_tokens(
+                    model_variant,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                if cost is not None:
+                    return float(cost)
 
         # Fallback to built-in pricing
         model_lower = model.lower()

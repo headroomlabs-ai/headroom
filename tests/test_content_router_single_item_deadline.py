@@ -58,7 +58,7 @@ def _messages() -> list[dict[str, str]]:
 def test_single_cache_miss_fails_open_at_deadline(monkeypatch, caplog):
     router = _router()
 
-    def slow_compress(content, *, context="", bias=1.0):
+    def slow_compress(content, *, context="", bias=1.0, precomputed_detection=None):
         time.sleep(0.2)
         return _compression_result(content, "compressed output")
 
@@ -83,7 +83,9 @@ def test_single_cache_miss_preserves_under_deadline_output(monkeypatch):
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, *, context="", bias=1.0: _compression_result(content, "compressed output"),
+        lambda content, *, context="", bias=1.0, precomputed_detection=None: _compression_result(
+            content, "compressed output"
+        ),
     )
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "1000")
 
@@ -102,7 +104,9 @@ def test_single_cache_miss_preserves_disabled_deadline(monkeypatch):
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, *, context="", bias=1.0: _compression_result(content, "compressed output"),
+        lambda content, *, context="", bias=1.0, precomputed_detection=None: _compression_result(
+            content, "compressed output"
+        ),
     )
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "0")
 
@@ -147,7 +151,7 @@ def test_single_cache_miss_deadline_starts_before_kompress_load(monkeypatch, cap
             return [[i % 2 == 0 for i in range(len(row))] for row in input_ids]
 
     model = _Model()
-    compressor = KompressCompressor(config=KompressConfig(enable_ccr=False))
+    compressor = KompressCompressor(config=KompressConfig(enable_ccr=False, min_input_words=10))
     monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
     load_state = {"calls": 0}
 
@@ -160,7 +164,7 @@ def test_single_cache_miss_deadline_starts_before_kompress_load(monkeypatch, cap
     monkeypatch.setattr(
         router,
         "compress",
-        lambda content, *, context="", bias=1.0: _compression_result(
+        lambda content, *, context="", bias=1.0, precomputed_detection=None: _compression_result(
             content,
             compressor.compress(content).compressed,
         ),

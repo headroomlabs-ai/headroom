@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Override for the CPU memory-arena default below: "1"/"true" forces the
 # arena ON, "0"/"false" forces it OFF, unset/"auto" uses the platform default.
 ONNX_CPU_ARENA_ENV = "HEADROOM_ONNX_CPU_ARENA"
+ONNX_ALLOW_SPINNING_ENV = "HEADROOM_ONNX_ALLOW_SPINNING"
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
@@ -44,6 +45,22 @@ def cpu_arena_enabled() -> bool:
     if override is not None:
         return override
     return sys.platform == "win32"
+
+
+def onnx_thread_spinning_enabled() -> bool:
+    """Whether ONNX Runtime intra/inter-op thread pools may spin-wait when idle.
+
+    ORT's thread pools spin-wait on every core between inferences by default, so
+    a long-lived proxy that keeps compression/embedding models loaded pegs all
+    cores even while completely idle — the machine slows to a crawl after a
+    while (#2495). Default to blocking idle threads (spinning off). Set
+    ``HEADROOM_ONNX_ALLOW_SPINNING=1`` to restore ORT's spinning for peak
+    throughput on a dedicated/batch box.
+    """
+    override = _env_flag(ONNX_ALLOW_SPINNING_ENV)
+    if override is not None:
+        return override
+    return False
 
 
 # Pin model artifacts to immutable commit SHAs so a changed or compromised
@@ -158,6 +175,20 @@ def create_cpu_session_options(
         sess_options.intra_op_num_threads = intra_op_num_threads
     if inter_op_num_threads is not None:
         sess_options.inter_op_num_threads = inter_op_num_threads
+
+    if not onnx_thread_spinning_enabled():
+        # ORT's thread pools spin-wait on all cores between inferences by
+        # default, so idle-but-loaded models peg every core in a long-lived
+        # proxy (#2495). Make idle threads block instead. Best-effort: older ORT
+        # builds may not recognize a key.
+        for spin_key in (
+            "session.intra_op.allow_spinning",
+            "session.inter_op.allow_spinning",
+        ):
+            try:
+                sess_options.add_session_config_entry(spin_key, "0")
+            except Exception:
+                pass
 
     if not cpu_arena_enabled():
         if hasattr(sess_options, "enable_cpu_mem_arena"):

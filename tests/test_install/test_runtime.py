@@ -281,6 +281,9 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
     monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: 1000, raising=False)
     monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: 1001, raising=False)
+    # Force the Docker path deterministically regardless of the test host's
+    # `docker` binary (it might resolve to a podman shim).
+    monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "docker")
     docker_manifest = DeploymentManifest(
         profile="default",
         preset="persistent-docker",
@@ -299,6 +302,37 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     command = build_runtime_command(docker_manifest)
     assert "--user" in command
     assert "1000:1001" in command
+    assert "--userns=keep-id" not in command
+
+
+def test_build_runtime_command_podman_uses_keep_id_not_user(monkeypatch, tmp_path: Path) -> None:
+    """Under rootless Podman, --user <host-uid>:<host-gid> selects a subordinate
+    UID that owns none of the bind mounts, so writes into ~/.headroom fail. The
+    command must use --userns=keep-id and drop --user instead (#2804)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+    monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: 1001, raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "podman")
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+    command = build_runtime_command(manifest)
+    assert "--userns=keep-id" in command
+    assert "--user" not in command
+    assert "1000:1001" not in command
 
 
 def test_read_pid_handles_invalid_content(monkeypatch, tmp_path: Path) -> None:

@@ -175,6 +175,24 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if self.path in {"/responses", "/v1/responses"}:
+            self._write_json(
+                200,
+                {
+                    "id": "resp-e2e",
+                    "object": "response",
+                    "model": payload.get("model"),
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "mock response"}],
+                        }
+                    ],
+                    "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+                },
+            )
+            return
         if self.path == "/v1/messages":
             self._write_json(
                 200,
@@ -741,7 +759,9 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         stop_process(proc)
 
 
-def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+def verify_vscode_wrap(
+    base_env: dict[str, str], project_dir: Path, mock_server: MockOpenAIServer
+) -> None:
     """Exercise the Linux settings lifecycle without real Copilot credentials."""
     port = VSCODE_PORT
     settings_path = Path(base_env["HOME"]) / ".config" / "Code" / "User" / "settings.json"
@@ -791,8 +811,14 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             "VS Code wrap should configure the project-scoped proxy URL",
         )
         assert_true(
-            '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured,
-            "VS Code wrap should configure token auth",
+            f'"github.copilot.advanced.debug.overrideCapiUrl": '
+            f'"http://127.0.0.1:{port}{project_prefix}"' in configured,
+            "VS Code wrap should route Copilot Chat generation through Headroom",
+        )
+        assert_true(
+            "overrideAuthType" not in configured,
+            "VS Code wrap must not write overrideAuthType: no such setting exists in "
+            "the modern Copilot Chat extension, so VS Code flags it as unknown (#3076)",
         )
         assert_true(
             "synthetic-e2e-token" not in configured, "Settings must not contain credentials"
@@ -807,6 +833,31 @@ def verify_vscode_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             health.get("config", {}).get("openai_api_url")
             == f"http://127.0.0.1:{MOCK_UPSTREAM_PORT}/v1",
             "VS Code proxy should use the mocked Copilot upstream",
+        )
+        models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+        start = len(mock_server.requests)
+        for model in models:
+            response = httpx.post(
+                f"http://127.0.0.1:{port}{project_prefix}/v1/responses",
+                json={"model": model, "input": "model swap probe", "stream": False},
+                timeout=10.0,
+            )
+            assert_true(
+                response.status_code == 200,
+                f"VS Code route failed for {model}: {response.status_code} {response.text}",
+            )
+            assert_true(
+                response.json().get("model") == model,
+                f"VS Code response did not reflect selected model {model}",
+            )
+        forwarded = [
+            item["body"].get("model")
+            for item in mock_server.requests[start:]
+            if item["path"].endswith("/responses") and isinstance(item["body"], dict)
+        ]
+        assert_true(
+            forwarded == models,
+            f"VS Code outbound model sequence changed: {forwarded!r}",
         )
     finally:
         stop_process(proc)
@@ -849,8 +900,8 @@ def verify_vscode_claude_wrap(base_env: dict[str, str], project_dir: Path) -> No
             "VS Code Claude wrap should configure the project-scoped Anthropic URL",
         )
         assert_true(
-            configured["env"]["ENABLE_TOOL_SEARCH"] == "true",
-            "VS Code Claude wrap should retain Claude Code tool deferral",
+            configured["env"]["ENABLE_TOOL_SEARCH"] == "false",
+            "VS Code Claude wrap should disable tool deferral for webview compatibility",
         )
         assert_true(configured["env"]["KEEP"] == "yes", "Existing Claude env must remain")
         assert_true(str(settings_path) in output, "Wrap output should identify Claude settings")
@@ -1061,7 +1112,7 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
-            verify_vscode_wrap(base_env, project_dir)
+            verify_vscode_wrap(base_env, project_dir, mock_server)
             verify_vscode_claude_wrap(base_env, project_dir)
             verify_cline_wrap(base_env, project_dir)
             verify_continue_wrap(base_env, project_dir)

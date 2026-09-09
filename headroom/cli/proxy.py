@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 import warnings
+from importlib import import_module
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import click
@@ -17,6 +19,38 @@ from headroom.providers.registry import (
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
+
+
+def ensure_proxy_dependencies() -> None:
+    """Verify optional proxy extras are installed before starting or wrapping."""
+    required_modules: list[str] = [
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "openai",
+        "mcp",
+        "magika",
+        "zstandard",
+        "websockets",
+        "onnxruntime",
+        "transformers",
+        "watchdog",
+    ]
+    if sys.implementation.name != "pypy":
+        required_modules.append("orjson")
+
+    try:
+        for module in required_modules:
+            import_module(module)
+    except ImportError as e:
+        click.secho(
+            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
+            fg="red",
+            err=True,
+        )
+        click.secho(f"Details: {e}", fg="red", err=True)
+        raise SystemExit(1) from None
+
 
 # ---------------------------------------------------------------------------
 # Startup log suppression.
@@ -78,6 +112,55 @@ def _get_env_bool_optional(name: str) -> bool | None:
     if name not in os.environ:
         return None
     return _get_env_bool(name, False)
+
+
+# libmalloc reads these before main() runs, so they cannot be set from inside
+# the current process — the proxy re-execs itself once to apply them. Without
+# them, freed pages from large concurrent request bodies stay resident
+# (``vmmap`` shows whole "MALLOC_LARGE (empty)" regions) and long-lived proxy
+# RSS only ratchets upward (#2820). Vars the operator already set are left
+# untouched; HEADROOM_MALLOC_TUNING=0 disables the re-exec entirely.
+_MALLOC_TUNING = {
+    "MallocAggressiveMadvise": "1",  # madvise freed pages back to the OS eagerly
+    "MallocLargeCache": "0",  # no death-row cache for freed large allocations
+}
+
+
+def _process_is_headroom_cli_entrypoint() -> bool:
+    """Is this process the Headroom CLI itself, rather than an embedder?
+
+    ``_reexec_with_malloc_tuning`` rebuilds the command line as
+    ``python -m headroom.cli <argv[1:]>``. That is only a faithful
+    reconstruction when the process really was started as the Headroom CLI. If
+    something else invoked the ``proxy`` command in-process — pytest's
+    ``CliRunner``, an embedding application, ``runpy`` — then ``argv[1:]``
+    belongs to *that* program, and ``os.execv`` would replace it with a Headroom
+    process parsing arguments that were never meant for us.
+    """
+    argv0 = Path(sys.argv[0] or "")
+    if argv0.name in {"headroom", "headroom.exe"}:
+        return True
+    # `python -m headroom.cli` sets argv[0] to .../headroom/cli/__main__.py.
+    return argv0.parts[-3:] == ("headroom", "cli", "__main__.py")
+
+
+def _reexec_with_malloc_tuning() -> None:
+    if sys.platform != "darwin":
+        return
+    if not _get_env_bool("HEADROOM_MALLOC_TUNING", True):
+        return
+    if os.environ.get("_HEADROOM_MALLOC_TUNED") == "1":
+        return
+    if not _process_is_headroom_cli_entrypoint():
+        return
+    missing = {k: v for k, v in _MALLOC_TUNING.items() if k not in os.environ}
+    # Set the loop guard before the re-exec so the replacement process (which
+    # inherits this environment) skips this path instead of re-execing forever.
+    os.environ["_HEADROOM_MALLOC_TUNED"] = "1"
+    if not missing:
+        return
+    os.environ.update(missing)
+    os.execv(sys.executable, [sys.executable, "-m", "headroom.cli", *sys.argv[1:]])
 
 
 def _get_env_int_optional(name: str) -> int | None:
@@ -258,7 +341,7 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
-        "Off by default while this feature ships."
+        "Requires HEADROOM_ROLLOUT_CHANNEL=canary (or dev)."
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
@@ -311,6 +394,19 @@ def dashboard(port: int, no_open: bool) -> None:
         "No-CCR lossless mode: compress tool outputs with format-native lossless "
         "compaction (and marker-free SmartCrusher) without emitting any CCR "
         "retrieval marker, so no MCP retrieve tool is needed. Env: HEADROOM_LOSSLESS=1."
+    ),
+)
+@click.option(
+    "--ccr-inline-resolve",
+    is_flag=True,
+    envvar="HEADROOM_CCR_INLINE_RESOLVE",
+    help=(
+        "Resolve <<ccr:...>> markers inline on the response path instead of "
+        "relying on the model to call headroom_retrieve. For callers with no "
+        "tool-call round-trip to redeem a marker (e.g. Headroom running as a "
+        "LiteLLM guardrail/proxy hop, see issue #2509). Applies to non-streaming "
+        "responses only. Off by default. "
+        "Env: HEADROOM_CCR_INLINE_RESOLVE."
     ),
 )
 @click.option(
@@ -416,6 +512,19 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Upstream connection timeout in seconds (1–300, default: 10). "
         "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--write-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_WRITE_TIMEOUT_SECONDS",
+    help=(
+        "Seconds the upstream send may take before it is abandoned (default: 150). "
+        "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+        "large bodies over a slow link. Lower it to fail over a dead pooled "
+        "connection faster; --connect-timeout-seconds only guards a fresh connect. "
+        "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
     ),
 )
 @click.option(
@@ -628,7 +737,8 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
         "out of the provider prefix cache and compress them once their "
-        "file quiesces (env: HEADROOM_READ_MATURATION=1)"
+        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
+        "env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -934,6 +1044,7 @@ def proxy(
     tpm: int | None,
     no_ccr: bool,
     lossless: bool,
+    ccr_inline_resolve: bool,
     no_ccr_proactive_expansion: bool,
     proxy_extension: tuple[str, ...],
     compressor: tuple[str, ...],
@@ -944,6 +1055,7 @@ def proxy(
     retry_max_delay_ms: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    write_timeout_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1017,23 +1129,17 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    _reexec_with_malloc_tuning()
+    ensure_proxy_dependencies()
+
     # Import here to avoid slow startup
-    try:
-        from headroom.proxy.server import (
-            ProxyConfig,
-            _parse_csv_tools,
-            _parse_exclude_tools,
-            _parse_tool_profiles,
-            run_server,
-        )
-    except ImportError as e:
-        click.secho(
-            "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
-            fg="red",
-            err=True,
-        )
-        click.secho(f"Details: {e}", fg="red", err=True)
-        raise SystemExit(1) from None
+    from headroom.proxy.server import (
+        ProxyConfig,
+        _parse_csv_tools,
+        _parse_exclude_tools,
+        _parse_tool_profiles,
+        run_server,
+    )
 
     # Warn if --learn and --no-learn are both set (--no-learn wins, per docstring)
     if learn and no_learn:
@@ -1066,12 +1172,46 @@ def proxy(
             err=True,
         )
 
+    # Resolve rollout inputs once before constructing any rollout-managed
+    # behavior. The immutable snapshot is injected into ProxyConfig and is also
+    # what /stats later exposes.
+    from headroom.rollout import resolve_rollout
+
+    rollout_requests = []
+    if intercept_tool_results:
+        rollout_requests.append("tool_result_interceptors")
+    if read_maturation:
+        rollout_requests.append("read_maturation")
+    rollout_snapshot = resolve_rollout(os.environ, requested=rollout_requests)
+
+    if read_maturation and not rollout_snapshot.is_enabled("read_maturation"):
+        click.secho(
+            "error: --read-maturation is not available in the current rollout channel "
+            f"({rollout_snapshot.channel.value}). Set HEADROOM_ROLLOUT_CHANNEL=beta "
+            "(or dev), or use HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for an "
+            "emergency override.",
+            fg="red",
+            err=True,
+        )
+        sys.exit(1)
+
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
     # Only fetch the bundled CLI tool binaries when the feature is enabled —
     # otherwise we'd pay a network round-trip and risk a readonly-FS failure
     # for capabilities the user hasn't asked for. The TransformPipeline reads
-    # this env var at construction time.
+    # the resolved snapshot says it is active.
     if intercept_tool_results:
+        if not rollout_snapshot.is_enabled("tool_result_interceptors"):
+            click.secho(
+                "error: --intercept-tool-results is not available in the current "
+                f"rollout channel ({rollout_snapshot.channel.value}). Set "
+                "HEADROOM_ROLLOUT_CHANNEL=canary to dogfood it, or use "
+                "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1 for emergency override.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+
         from headroom.binaries import ensure_tools
 
         resolved_tools = ensure_tools()
@@ -1089,7 +1229,6 @@ def proxy(
                 err=True,
             )
             sys.exit(1)
-        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
     try:
         resolved_anthropic_extra_headers = resolve_extra_headers(
@@ -1171,6 +1310,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,
@@ -1186,6 +1326,10 @@ def proxy(
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        periodic_malloc_trim_enabled=_get_env_bool(
+            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+        ),
+        malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
         max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", 50),
         exclude_tools=_parse_exclude_tools(None) or None,
@@ -1200,12 +1344,23 @@ def proxy(
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-out: --no-ccr disables both halves at once (markers in content
-        # AND the injected retrieve tool). Markers without a tool — or a tool
-        # without markers — are useless, so it is a single switch. Default keeps
-        # CCR fully on.
+        # CCR opt-out: --no-ccr disables every half at once — markers in
+        # content, the injected retrieve tool, AND server-side response
+        # handling. Markers without a tool, or a tool without markers, are
+        # useless, so it is a single switch. Default keeps CCR fully on.
+        #
+        # Response handling has to be part of it. The buffered stream:false
+        # path keys off ``headroom_retrieve`` being present in the *request's*
+        # tools, and a client can advertise that tool on its own — the bundled
+        # OpenCode plugin registers it unconditionally. So with response
+        # handling left on, `--no-ccr` silently kept flipping streaming turns
+        # to buffered whenever history still held a redeemable marker, and the
+        # documented escape hatch for the CCR buffered-stream bugs did nothing
+        # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
+        ccr_handle_responses=not no_ccr,
+        ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
         # Flatten repeat-flag tuple AND any comma-separated values inside it.
@@ -1235,6 +1390,7 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
@@ -1276,7 +1432,7 @@ def proxy(
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Read maturation (Mechanism B): experimental, OFF by default
-        read_maturation=read_maturation,
+        read_maturation=rollout_snapshot.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=read_maturation_quiesce_turns,
         read_maturation_max_hold_turns=read_maturation_max_hold_turns,
         read_maturation_min_size_bytes=read_maturation_min_size_bytes,

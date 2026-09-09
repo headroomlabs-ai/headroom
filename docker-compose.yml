@@ -10,13 +10,26 @@
 #   3. point your LLM client at http://localhost:8787  (proxy)
 #
 # Just want the proxy without the memory features? You can run the proxy image
-# on its own (`docker run -p 8787:8787 ghcr.io/chopratejas/headroom`); the two
+# on its own (`docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom`); the two
 # database services below are only required for the memory/relevance features.
 #
-# Ports exposed on the host:
+# Ports published on the host — all bound to 127.0.0.1 (this machine only):
 #   8787  proxy (OpenAI-compatible endpoint)
 #   6333  Qdrant REST   6334  Qdrant gRPC
 #   7474  Neo4j Browser 7687  Neo4j Bolt
+#
+# None of these three services authenticates inbound callers by default: the
+# proxy's /v1/* data plane is open unless HEADROOM_PROXY_TOKEN is set, Qdrant
+# has no API key, and Neo4j falls back to a published dev password. Publishing
+# them on 0.0.0.0 therefore hands any peer on your network a relay through the
+# proxy plus direct read/write on the embeddings and graph derived from your
+# prompts. They are bound to loopback so that `docker compose up -d` is safe on
+# a shared or untrusted network.
+#
+# To reach the proxy from another machine, publish it deliberately AND require
+# a token — never one without the other:
+#   HEADROOM_PROXY_TOKEN=$(openssl rand -hex 32)   # put this in .env
+#   ports: ["8787:8787"]                           # override in a compose override file
 # =============================================================================
 
 services:
@@ -31,6 +44,11 @@ services:
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
+      # The proxy binds 0.0.0.0 *inside* the container (required for Docker port
+      # forwarding); it is confined to host loopback by the published port below.
+      # A proxy token is required so the data plane is never open if you widen the
+      # bind. Generate one with: openssl rand -hex 32
+      - HEADROOM_PROXY_TOKEN=${HEADROOM_PROXY_TOKEN:?set HEADROOM_PROXY_TOKEN (see .env.example; e.g. openssl rand -hex 32)}
       - HOME=/home/nonroot
       # Keep all Headroom read/write state on the named volume below.
       - HEADROOM_WORKSPACE_DIR=/home/nonroot/.headroom
@@ -38,8 +56,14 @@ services:
       # if you want to use a custom OpenAI-compatible API endpoint,
       # uncomment and set the following line with the desired URL
       # - OPENAI_TARGET_API_URL=https://api.x.ai
+      # Required before publishing this port beyond loopback: without it the
+      # /v1/* data plane accepts unauthenticated callers.
+      # - HEADROOM_PROXY_TOKEN=${HEADROOM_PROXY_TOKEN}
     ports:
-      - "8787:8787"
+      # Loopback-only. The container still listens on 0.0.0.0 (above) so the
+      # other compose services can reach it by name; this line controls only
+      # which host interfaces the port is published on.
+      - "127.0.0.1:8787:8787"
     volumes:
       - headroom_workspace:/home/nonroot/.headroom
     # Readiness probe: the orchestrator polls /readyz so dependents and
@@ -62,8 +86,10 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.17.1
     ports:
-      - "6333:6333"  # REST API
-      - "6334:6334"  # gRPC
+      # Loopback-only: Qdrant runs unauthenticated here and holds embeddings
+      # derived from your prompts.
+      - "127.0.0.1:6333:6333"  # REST API
+      - "127.0.0.1:6334:6334"  # gRPC
     # Named volume keeps the vector index across container restarts/recreates.
     volumes:
       - qdrant_data:/qdrant/storage
@@ -75,20 +101,19 @@ services:
   neo4j:
     image: neo4j:5.26
     ports:
-      - "7474:7474"  # HTTP (Browser)
-      - "7687:7687"  # Bolt
+      # Loopback-only to keep the graph store off the network.
+      - "127.0.0.1:7474:7474"  # HTTP (Browser)
+      - "127.0.0.1:7687:7687"  # Bolt
     # Named volume persists the graph data across container restarts/recreates.
     volumes:
       - neo4j_data:/data
     environment:
-      # Credentials come from .env (NEO4J_AUTH=user/password). The default here
-      # is for LOCAL DEV ONLY — override it before exposing Neo4j anywhere.
-      - NEO4J_AUTH=${NEO4J_AUTH:-neo4j/devpassword}
+      # No default credential — must be supplied (see .env.example).
+      - NEO4J_AUTH=${NEO4J_AUTH:?set NEO4J_AUTH, e.g. neo4j/<strong-password>}
       # APOC: Neo4j's standard procedure library, needed by Headroom's queries.
       - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_apoc_export_file_enabled=true
-      - NEO4J_apoc_import_file_enabled=true
-      - NEO4J_apoc_import_file_use__neo4j__config=true
+      # APOC file import/export stays disabled (its Neo4j default) — it grants
+      # filesystem read/write via stored procedures. Do not enable unless required.
 
 # Named volumes — managed by Docker, survive `docker compose down` (use
 # `docker compose down -v` to delete the stored data as well).

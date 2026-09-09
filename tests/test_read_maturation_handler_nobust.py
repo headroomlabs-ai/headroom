@@ -248,9 +248,15 @@ def test_verbatim_read_never_cache_written_before_maturation(monkeypatch):
     )
 
 
-def _drive_session(config, n_turns: int, session_id: str) -> list[list[dict]]:
+def _drive_session(
+    config,
+    n_turns: int,
+    session_id: str,
+    saved_out: list[int] | None = None,
+) -> list[list[dict]]:
     """Drive ``n_turns`` cumulative turns through the real handler with a mocked
-    upstream; return the forwarded message arrays per turn."""
+    upstream; return the forwarded message arrays per turn. When ``saved_out``
+    is given, each turn's emitted ``x-headroom-tokens-saved`` is appended to it."""
     app = create_app(config)
     forwarded: list[list[dict]] = []
     with TestClient(app) as client:
@@ -303,6 +309,8 @@ def _drive_session(config, n_turns: int, session_id: str) -> list[list[dict]]:
                     },
                 )
                 assert r.status_code == 200, f"turn {n}: {r.text[:300]}"
+                if saved_out is not None:
+                    saved_out.append(int(r.headers.get("x-headroom-tokens-saved", 0)))
         finally:
             proxy._retry_request = original_retry
     return forwarded
@@ -360,6 +368,7 @@ def test_read_maturation_knobs_from_env(monkeypatch):
     monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
 
     monkeypatch.setenv("HEADROOM_READ_MATURATION", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_QUIESCE_TURNS", "3")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", "10")
     monkeypatch.setenv("HEADROOM_READ_MATURATION_MIN_SIZE_BYTES", "4096")
@@ -370,3 +379,62 @@ def test_read_maturation_knobs_from_env(monkeypatch):
     assert cfg.read_maturation_quiesce_turns == 3
     assert cfg.read_maturation_max_hold_turns == 10
     assert cfg.read_maturation_min_size_bytes == 4096
+
+
+def test_read_maturation_env_cannot_bypass_stable_rollout(monkeypatch):
+    """Every env-driven server composition root must enforce the beta gate."""
+    from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, _proxy_config_from_env
+
+    monkeypatch.delenv(_MULTI_WORKER_CONFIG_ENV, raising=False)
+    monkeypatch.setenv("HEADROOM_READ_MATURATION", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "stable")
+
+    cfg = _proxy_config_from_env()
+
+    assert cfg.read_maturation is False
+    assert cfg.rollout is not None
+    assert cfg.rollout.decision("read_maturation").reason.value == "blocked_by_channel"
+
+
+def test_replayed_marker_is_not_rebooked_in_the_emitted_savings(monkeypatch):
+    """The savings a request EMITS must be first-appearance.
+
+    Subtracting the replay debt inside the maturation block is not enough on
+    its own: the handler recomputes ``tokens_saved`` from the plain
+    original-vs-optimized diff twice more before the outcome is recorded (the
+    pre-send hook recount and the consistency recount), and either one throws
+    the adjustment away — so every replay turn re-books a removal that was
+    already booked when the Read matured. Assert on the emitted header, which
+    is the same figure the outcome and PERF line carry, not on the manager.
+    """
+    from headroom.cache.compression_store import reset_compression_store
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+
+    config = ProxyConfig(
+        optimize=True,
+        read_maturation=True,
+        read_maturation_quiesce_turns=2,
+        mode="token",
+        cache_enabled=True,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+    saved: list[int] = []
+    forwarded = _drive_session(config, n_turns=5, session_id="first-appearance-1", saved_out=saved)
+
+    first = _first_matured_turn(forwarded)
+    assert first is not None, "the Read never matured, so there is nothing to replay"
+    replays = saved[first + 1 :]
+    assert replays, "expected at least one replay turn after maturation"
+
+    # The turn that matures the Read books its removal, once.
+    assert saved[first] > 0, "the maturing turn booked nothing"
+    # Later turns forward the same marker instead of the verbatim Read, so the
+    # wire diff is just as large — but it is the SAME removal, already booked.
+    assert max(replays) < saved[first] * 0.2, (
+        f"replayed marker re-booked through the final accounting path: "
+        f"matured turn saved {saved[first]}, replay turns saved {replays}"
+    )

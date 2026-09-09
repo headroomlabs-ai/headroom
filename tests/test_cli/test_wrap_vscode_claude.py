@@ -25,7 +25,7 @@ def test_wrap_vscode_claude_configures_actual_port(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     env = json.loads(path.read_text(encoding="utf-8"))["env"]
     assert env["ANTHROPIC_BASE_URL"].startswith("http://127.0.0.1:9999/p/")
-    assert env["ENABLE_TOOL_SEARCH"] == "true"
+    assert env["ENABLE_TOOL_SEARCH"] == "false"
     assert "Reload VS Code" in result.output
     assert captured["agent_type"] == "claude"
 

@@ -17,6 +17,16 @@ from headroom.proxy.project_context import with_project_prefix
 _MARKER_START = "// --- Headroom Copilot proxy ---"
 _MARKER_END = "// --- end Headroom Copilot proxy ---"
 _PROXY_KEY = "github.copilot.advanced.debug.overrideProxyUrl"
+_CAPI_KEY = "github.copilot.advanced.debug.overrideCapiUrl"
+# Written by Headroom until #3076: it no longer exists. The modern Copilot Chat
+# extension — the only one left after `GitHub.copilot` was deprecated in early
+# 2026 — defines no `authType` setting in either its own configuration
+# (`advanced.authPermissions`, `advanced.authProvider`,
+# `advanced.debug.overrideCapiUrl`, `advanced.debug.overrideProxyUrl`,
+# `advanced.debug.use*Fetcher`) or in the completions code merged into it. Still
+# recognised below so a stale hand-written copy is detected, but never emitted:
+# VS Code flags unknown keys, and shipping one that does nothing invited the
+# conclusion that the override mechanism had stopped working.
 _AUTH_KEY = "github.copilot.advanced.debug.overrideAuthType"
 
 
@@ -118,7 +128,7 @@ def _managed_block(proxy_url: str, *, owns_preceding_comma: bool, line_sep: str)
     return (
         f"\t{marker}{line_sep}"
         f"\t{json.dumps(_PROXY_KEY)}: {json.dumps(proxy_url)},{line_sep}"
-        f'\t{json.dumps(_AUTH_KEY)}: "token"{line_sep}'
+        f"\t{json.dumps(_CAPI_KEY)}: {json.dumps(proxy_url)}{line_sep}"
         f"\t{_MARKER_END}"
     )
 
@@ -161,7 +171,7 @@ def configure_vscode_proxy_settings(path: Path, proxy_url: str) -> str:
     if had_managed_block:
         remove_vscode_proxy_settings(path)
         raw = _read_settings(path)
-    elif _PROXY_KEY in raw or _AUTH_KEY in raw:
+    elif _PROXY_KEY in raw or _CAPI_KEY in raw or _AUTH_KEY in raw:
         raise click.ClickException(
             f"{path} already configures a Copilot endpoint override outside Headroom's "
             "managed block; refusing to replace it. Remove it or use --no-configure."

@@ -63,11 +63,18 @@ def extract_memory_query_sources(
                     # Anthropic user turns carry the actual prompt as text blocks
                     # ({"type":"text","text":...}), not a plain string. Capture it
                     # so the memory retrieval query keys on the user's question and
-                    # not just any tool_result blocks in the same turn.
+                    # not just any tool_result blocks in the same turn. Skip Claude
+                    # Code's <system-reminder> harness blocks: they are appended to
+                    # the same turn and, concatenated into the embedding input,
+                    # dilute the user's question below the similarity floor so
+                    # nothing is retrieved (#2195). Filtering them keeps the query
+                    # on the substantive question.
                     user_text = "\n".join(
-                        b.get("text", "")
+                        text
                         for b in content
                         if isinstance(b, dict) and b.get("type") == "text"
+                        for text in (str(b.get("text", "")).strip(),)
+                        if text and not text.startswith("<system-reminder")
                     ).strip()
                     if user_text:
                         latest_user = user_text

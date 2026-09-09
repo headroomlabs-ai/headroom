@@ -8,6 +8,9 @@ from typing import Literal
 ToolInjectionDecision = Literal[
     "inject_first_time",
     "inject_sticky_replay",
+    # Sessionless path: history already references headroom_retrieve, so the
+    # tool definition is re-injected even without fresh compression (#2440).
+    "inject_history_reference",
     "skip",
     "skip_disabled_via_env",
 ]

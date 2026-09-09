@@ -23,7 +23,7 @@ default-members = [
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/chopratejas/headroom"
+repository = "https://github.com/headroomlabs-ai/headroom"
 authors = ["Headroom Maintainers"]
 
 [workspace.dependencies]
@@ -58,7 +58,7 @@ tracing = { version = "0.1", features = ["log"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }

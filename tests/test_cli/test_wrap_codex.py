@@ -40,6 +40,24 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
+_PROXY_DEP_TESTS = frozenset(
+    {
+        "test_wrap_codex_aborts_before_mutating_config_when_proxy_deps_missing",
+        "test_wrap_codex_skips_proxy_dependency_check_with_no_proxy",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_wrap_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrap-codex integration tests run in the base CI env without [proxy] extras."""
+    if request.node.name in _PROXY_DEP_TESTS:
+        return
+    monkeypatch.setattr("headroom.cli.wrap.ensure_proxy_dependencies", lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: helpers operating on ~/.codex/config.toml
 # ---------------------------------------------------------------------------
@@ -988,6 +1006,55 @@ def test_wrap_codex_prepare_only_creates_backup_and_config(
     backup = tmp_path / ".codex" / "config.toml.headroom-backup"
     assert backup.exists()
     assert backup.read_text(encoding="utf-8") == original
+
+
+def test_wrap_codex_aborts_before_mutating_config_when_proxy_deps_missing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model_provider = "openai"\n'
+    config_file.write_text(original, encoding="utf-8")
+
+    with patch("headroom.cli.wrap.ensure_proxy_dependencies", side_effect=SystemExit(1)):
+        result = runner.invoke(
+            main,
+            ["wrap", "codex", "--prepare-only", "--no-serena", "--port", "8787"],
+        )
+
+    assert result.exit_code == 1, result.output
+    assert config_file.read_text(encoding="utf-8") == original
+    assert "[mcp_servers.headroom]" not in config_file.read_text(encoding="utf-8")
+    assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
+
+
+def test_wrap_codex_skips_proxy_dependency_check_with_no_proxy(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('model_provider = "openai"\n', encoding="utf-8")
+
+    with patch(
+        "headroom.cli.wrap.ensure_proxy_dependencies",
+        side_effect=AssertionError("should not run with --no-proxy"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "codex",
+                "--prepare-only",
+                "--no-proxy",
+                "--no-serena",
+                "--port",
+                "8787",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
 
 
 def test_wrap_codex_registers_mcp_when_codex_home_does_not_exist_yet(

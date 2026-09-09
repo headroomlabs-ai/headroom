@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -450,6 +451,7 @@ class TrafficLearner:
         max_history: int = 20,
         dedup_window: int = 100,
         min_evidence: int = 5,
+        max_pending_patterns: int = 2048,
     ) -> None:
         """Initialize the traffic learner.
 
@@ -468,12 +470,19 @@ class TrafficLearner:
         self.agent_type = agent_type
         self._max_history = max_history
         self._min_evidence = min_evidence
+        self._max_pending_patterns = max_pending_patterns
 
         # Recent tool call history for error→recovery matching
         self._tool_history: list[dict[str, Any]] = []
 
-        # Pattern accumulator: hash → (pattern, count)
-        self._pattern_counts: dict[str, tuple[ExtractedPattern, int]] = {}
+        # Pattern accumulator: hash → (pattern, count). LRU-ordered and capped:
+        # a pattern that is seen once but never reaches ``min_evidence`` would
+        # otherwise linger here forever, so this dict grew unbounded over a
+        # long-lived proxy's traffic (the sibling ``_saved_hashes`` is trimmed
+        # to ``dedup_window`` for the same reason; this one was missed). Evicting
+        # the least-recently-corroborated pending pattern is safe: if it recurs
+        # it simply restarts accumulation.
+        self._pattern_counts: OrderedDict[str, tuple[ExtractedPattern, int]] = OrderedDict()
 
         # Dedup: hashes of patterns already saved to DB
         self._saved_hashes: set[str] = set()
@@ -1250,7 +1259,13 @@ class TrafficLearner:
             existing, count = self._pattern_counts[h]
             count += 1
             self._pattern_counts[h] = (existing, count)
+            # Mark as most-recently-corroborated so it survives LRU eviction.
+            self._pattern_counts.move_to_end(h)
         else:
+            # Bound the pending accumulator so one-off patterns can't grow it
+            # without limit; drop the least-recently-corroborated pending entry.
+            if len(self._pattern_counts) >= self._max_pending_patterns:
+                self._pattern_counts.popitem(last=False)
             self._pattern_counts[h] = (pattern, 1)
             return  # First sighting — wait for more evidence
 
@@ -1374,10 +1389,10 @@ class TrafficLearner:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        def _bump() -> None:
+        def _bump() -> bool:
             conn = sqlite3.connect(str(db_path))
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
                     "metadata, '$.evidence_count', "
                     "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1, "
@@ -1386,13 +1401,26 @@ class TrafficLearner:
                     (now_iso, memory_id),
                 )
                 conn.commit()
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
         try:
-            await asyncio.to_thread(_bump)
+            updated = await asyncio.to_thread(_bump)
         except Exception as e:
             logger.debug("Traffic learner evidence bump failed for %s: %s", memory_id, e)
+            return
+
+        refresh = getattr(self._backend, "refresh_memory_indexes", None)
+        if updated and refresh is not None:
+            try:
+                await refresh(memory_id)
+            except Exception as e:
+                logger.debug(
+                    "Traffic learner evidence index refresh failed for %s: %s",
+                    memory_id,
+                    e,
+                )
 
     # =========================================================================
     # Convenience: Extract from Anthropic messages format
@@ -1448,6 +1476,11 @@ class TrafficLearner:
                         "input": tool_use.get("input", {}),
                         "output": str(result_content),
                         "is_error": block.get("is_error", False) or _is_error(str(result_content)),
+                        # Stable per-turn identity (the tool_use/tool_result id).
+                        # Lets a caller dedup a replayed transcript so the same
+                        # result is not counted as evidence twice — used by the
+                        # Codex WebSocket ingestion path.
+                        "call_id": tool_use_id,
                     }
                 )
 

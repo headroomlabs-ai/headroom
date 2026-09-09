@@ -56,6 +56,32 @@ def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def _container_runtime_is_podman() -> bool:
+    """Best-effort: is the ``docker`` command actually Podman?
+
+    Rootless Podman maps the host user to container UID 0, so the
+    ``--user <host-uid>:<host-gid>`` flag that is correct for Docker instead
+    selects a subordinate UID that owns none of the bind-mounted host
+    directories, and every write into ``~/.headroom`` fails (#2804). Detect the
+    common ``docker -> podman`` shim (e.g. NixOS
+    ``/run/current-system/sw/bin/docker -> podman``) by resolving the binary and
+    checking its real name. ``HEADROOM_CONTAINER_RUNTIME`` (``podman`` / ``docker``)
+    is an explicit override for setups the symlink heuristic cannot see, such as a
+    wrapper script. No subprocess is spawned.
+    """
+    override = os.environ.get("HEADROOM_CONTAINER_RUNTIME", "").strip().lower()
+    if override:
+        return override == "podman"
+    resolved = shutil.which("docker")
+    if not resolved:
+        return False
+    try:
+        real = os.path.realpath(resolved)
+    except OSError:
+        real = resolved
+    return "podman" in os.path.basename(real).lower()
+
+
 def _deployment_env(manifest: DeploymentManifest) -> dict[str, str]:
     return {
         "HEADROOM_DEPLOYMENT_PROFILE": manifest.profile,
@@ -136,10 +162,18 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     if docker_gpus:
         command.extend(["--gpus", docker_gpus])
     if not _is_windows():
-        getuid = getattr(os, "getuid", None)
-        getgid = getattr(os, "getgid", None)
-        if callable(getuid) and callable(getgid):
-            command.extend(["--user", f"{getuid()}:{getgid()}"])
+        if _container_runtime_is_podman():
+            # Rootless Podman maps the host user to container UID 0, so --user
+            # would map to a subordinate UID that owns none of the bind mounts and
+            # every write into ~/.headroom fails (#2804). keep-id maps the host
+            # user to the same UID inside the container, keeping the mounts
+            # writable. Docker maps UIDs 1:1, so --user stays correct there.
+            command.append("--userns=keep-id")
+        else:
+            getuid = getattr(os, "getuid", None)
+            getgid = getattr(os, "getgid", None)
+            if callable(getuid) and callable(getgid):
+                command.extend(["--user", f"{getuid()}:{getgid()}"])
     runtime_env = {**manifest.base_env, **_deployment_env(manifest)}
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])

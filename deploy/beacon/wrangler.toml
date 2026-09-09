@@ -32,6 +32,24 @@ bucket_name = "headroom-telemetry"
 #   npx wrangler secret put METRICS_OTLP_AUTH
 # Absent = R2 only, which is the right place to start.
 
+# Hourly compaction of sessions/ into rollup/ — see scheduled() in worker.js.
+# At :05 so the hour being rolled up is definitely closed. A >=1h interval also
+# buys the 15-minute CPU limit instead of 30s, which the backfill run needs.
+[triggers]
+crons = ["5 * * * *"]
+
+# Every R2 binding call is a subrequest, and one hour is already ~4k objects.
+# The paid default of 10k would cap a run at two hours and stall the backfill
+# behind live traffic forever. This only raises a ceiling; a normal run spends
+# ~4k. READ_BUDGET in worker.js is what actually bounds the work.
+#
+# Workers Paid only — on the Free plan this key is rejected outright ("CPU
+# limits are not supported for the Free plan"), and the cron could not run
+# anyway: Free gives a scheduled handler 10ms of CPU, and parsing an hour of
+# heartbeats is tens of ms.
+[limits]
+subrequests = 100000
+
 [observability]
 enabled = true
 

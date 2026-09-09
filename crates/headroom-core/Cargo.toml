@@ -13,22 +13,22 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tiktoken-rs = "0.11"
+tiktoken-rs = "0.12"
 # `tokenizers` is the HuggingFace pure-Rust tokenizer crate. Default features
 # pull in `onig` for the BPE pre-tokenizer regex; that vendors oniguruma so it
 # builds without a system dep on macOS/Linux.
-tokenizers = "0.22"
+tokenizers = "0.23"
 # `hf-hub` is the HuggingFace Hub client. We use the blocking `ureq` transport
 # with `rustls` (no system OpenSSL dep — keeps the binary static-linkable for
 # AWS deploys). `from_pretrained` is called once at startup, so blocking is
 # fine; if a tokio caller needs it later we can wrap in `spawn_blocking`.
-hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 # `md5` for the CCR cache_key. Python's compression_store hashes the original
 # diff with MD5 truncated to 24 hex chars; we must match byte-for-byte.
-md-5 = "0.10"
+md-5 = "0.11"
 # `sha2` for `_hash_field_name` in smart_crusher (SHA256 truncated to 16
 # hex chars). Python uses `hashlib.sha256` so we need byte-exact parity.
-sha2 = "0.10"
+sha2 = "0.11"
 # `dashmap` for the CCR storage backend. Concurrent HashMap with sharded
 # locking — distinct keys hashed to different shards never contend, so
 # multi-worker proxy load doesn't queue on a single Mutex. Lock-free
@@ -125,7 +125,7 @@ blake3 = "1"
 # image may lag behind. Sub-1 MB binary cost. WAL is enabled at
 # connection-open time (see `ccr/backends/sqlite.rs`); no extra feature
 # flags required.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # `redis` for the optional multi-worker CCR backend. Cfg-gated behind
 # the `redis` feature so deploys that don't need it pay no compile
 # cost. Default features include the sync `Connection` API used in
@@ -196,7 +196,7 @@ redis = ["dep:redis"]
 
 [dev-dependencies]
 proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 
 [[bench]]
