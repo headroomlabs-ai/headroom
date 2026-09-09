@@ -666,3 +666,142 @@ def test_circuit_breaker_session_eviction_and_unserializable_dict() -> None:
     name, h = hash_tool_call("fn", {"obj": Unserializable()})
     assert name == "fn"
     assert len(h) == 16
+
+
+def test_openai_chat_handler_allows_recovery_after_detected_loop() -> None:
+    """A client can recover after the circuit breaker rejects a repeated loop."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import create_app
+
+    loop_messages = [
+        {"role": "user", "content": "inspect the project"},
+        *[
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_{index}",
+                        "type": "function",
+                        "function": {"name": "view", "arguments": '{"path": "src/main.py"}'},
+                    }
+                ],
+            }
+            for index in range(1, 4)
+        ],
+    ]
+
+    async def _mock_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_recovery",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "recovered"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            },
+        )
+
+    with TestClient(
+        create_app(
+            ProxyConfig(
+                circuit_breaker="enforce",
+                optimize=False,
+                ccr_inject_tool=False,
+                ccr_handle_responses=False,
+                log_requests=False,
+            )
+        )
+    ) as client:
+        client.app.state.proxy._retry_request = _mock_retry
+
+        blocked = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "******"},
+            json={"model": "gpt-4o", "messages": loop_messages},
+        )
+        assert blocked.status_code == 429
+
+        recovered = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "******"},
+            json={
+                "model": "gpt-4o",
+                "messages": [
+                    *loop_messages,
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_4",
+                                "type": "function",
+                                "function": {
+                                    "name": "view",
+                                    "arguments": '{"path": "src/other.py"}',
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        assert recovered.status_code == 200
+        assert recovered.json()["choices"][0]["message"]["content"] == "recovered"
+
+
+def test_openai_responses_handler_detects_native_function_calls() -> None:
+    """The circuit breaker detects native Responses function_call items."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.models import ProxyConfig
+    from headroom.proxy.server import create_app
+
+    input_items = [
+        *[
+            {
+                "type": "function_call",
+                "call_id": f"call_{index}",
+                "name": "view",
+                "arguments": '{"path": "src/main.py"}',
+            }
+            for index in range(1, 4)
+        ],
+        *[
+            {
+                "type": "function_call_output",
+                "call_id": f"call_{index}",
+                "output": "file contents",
+            }
+            for index in range(1, 4)
+        ],
+    ]
+
+    async def _mock_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        return httpx.Response(
+            200,
+            json={"id": "resp_1", "object": "response", "output": [], "usage": {}},
+        )
+
+    with TestClient(
+        create_app(
+            ProxyConfig(
+                circuit_breaker="enforce",
+                optimize=False,
+                ccr_inject_tool=False,
+                ccr_handle_responses=False,
+                log_requests=False,
+            )
+        )
+    ) as client:
+        client.app.state.proxy._retry_request = _mock_retry
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "******"},
+            json={"model": "gpt-4o", "instructions": "Inspect the project", "input": input_items},
+        )
+
+    assert response.status_code == 429
+    assert "Tool call loop detected" in response.json()["detail"]
+    assert "view" in response.json()["detail"]
