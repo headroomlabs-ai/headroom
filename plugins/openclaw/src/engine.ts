@@ -7,6 +7,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { readFile } from "node:fs/promises";
+
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
@@ -22,6 +24,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+async function delegateCompactionToRuntime(params: Record<string, unknown>): Promise<any> {
+  // Keep OpenClaw an optional peer: source-only tests and non-OpenClaw imports
+  // must not resolve the host SDK until compaction actually needs it.
+  const sdk = await import("openclaw/plugin-sdk/core");
+  return sdk.delegateCompactionToRuntime(params as any);
+}
+
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
@@ -29,12 +38,35 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   circuitBreakerCooldownMs?: number;
 }
 
+type TranscriptRewriteResult = {
+  changed: boolean;
+  bytesFreed: number;
+  rewrittenEntries: number;
+  reason?: string;
+};
+
+type HeadroomRuntimeContext = Record<string, unknown> & {
+  /**
+   * OpenClaw owns transcript persistence and serializes this operation with
+   * its session writer. Directly replacing the append-only JSONL file cannot
+   * be made race-safe by a third-party plugin.
+   */
+  rewriteTranscriptEntries?: (request: {
+    replacements: Array<{ entryId: string; message: any }>;
+  }) => Promise<TranscriptRewriteResult>;
+};
+
 export class HeadroomContextEngine {
   readonly info = {
     id: "headroom",
     name: "Headroom Context Compression",
     version: "0.1.0",
-    ownsCompaction: true,
+    acceptedHostParams: ["runtimeContext"],
+    // OpenClaw owns the durable compaction transaction. Headroom still
+    // compresses assembled prompts, while compact() delegates persistence to
+    // the host when the runtime does not expose its maintenance-only rewrite
+    // capability.
+    ownsCompaction: false,
   };
 
   private proxyManager: ProxyManager;
@@ -121,7 +153,7 @@ export class HeadroomContextEngine {
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
 
-      // Compress via proxy — pass tokenBudget so RollingWindow enforces it
+      // Compress via proxy with the configured request bound.
       const result = await withTimeout(
         compress(openaiMessages, {
           model: params.model ?? "claude-sonnet-4-5",
@@ -175,17 +207,36 @@ export class HeadroomContextEngine {
    * Calls compress() with the token budget, which triggers:
    * - SmartCrusher: aggressive JSON compression (70-90% on tool outputs)
    * - Kompress: ModernBERT text compression (40-60% on assistant text)
-   * - RollingWindow: drops oldest messages if still over budget
+   * - Pipeline: compresses message content in place without dropping history
    * - CCR: stores originals for retrieval via headroom_retrieve tool
    *
-   * Zero LLM calls. All algorithmic.
+   * Zero LLM calls. All algorithmic. Persistence is delegated to OpenClaw's
+   * runtime-owned transcript rewrite operation so it remains serialized with
+   * concurrent session appends.
    */
+  async maintain(params: {
+    sessionId: string;
+    sessionFile: string;
+    tokenBudget?: number;
+    force?: boolean;
+    runtimeContext?: HeadroomRuntimeContext;
+  }): Promise<{
+    ok: boolean;
+    compacted: boolean;
+    reason?: string;
+    result?: { tokensBefore: number; tokensAfter?: number };
+  }> {
+    // OpenClaw supplies rewriteTranscriptEntries on maintain(). Reuse the
+    // guarded transform here so the host serializes the rewrite with appends.
+    return this.compact(params);
+  }
+
   async compact(params: {
     sessionId: string;
     sessionFile: string;
     tokenBudget?: number;
     force?: boolean;
-    runtimeContext?: any;
+    runtimeContext?: HeadroomRuntimeContext;
   }): Promise<{
     ok: boolean;
     compacted: boolean;
@@ -199,24 +250,131 @@ export class HeadroomContextEngine {
       return { ok: false, compacted: false, reason: "Proxy not available" };
     }
 
-    // Read current messages from session file if available
-    // For now, compact() works in tandem with assemble() — the next assemble()
-    // call will compress with the token budget. When compact() is called
-    // independently, we report success since our pipeline handles it.
-    //
-    // TODO: Read session file, extract messages, call compress() with tokenBudget,
-    //       write back compacted messages.
+    const rewriteTranscriptEntries = params.runtimeContext?.rewriteTranscriptEntries;
+    if (!rewriteTranscriptEntries) {
+      // Current OpenClaw releases expose rewriteTranscriptEntries to
+      // maintain(), not compact(). Delegate the complete compaction
+      // transaction rather than touching the append-only transcript here.
+      return delegateCompactionToRuntime(params as any);
+    }
 
-    this.stats.compactions++;
-    this.logger.info(
-      `Compact called (budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
-    );
+    try {
+      const sessionContent = await readFile(params.sessionFile, "utf8");
+      const lines = sessionContent.split(/\r?\n/);
+      const records: Array<{ entryId: string; value: Record<string, any> }> = [];
 
-    return {
-      ok: true,
-      compacted: true,
-      reason: "Headroom applies SmartCrusher + Kompress + RollingWindow on next assemble()",
-    };
+      for (const [index, line] of lines.entries()) {
+        if (!line.trim()) continue;
+
+        let value: Record<string, any>;
+        try {
+          value = JSON.parse(line) as Record<string, any>;
+        } catch (error) {
+          throw new Error(`Invalid JSONL record at line ${index + 1}: ${error}`);
+        }
+
+        if (
+          value.type === "message" &&
+          value.message !== null &&
+          typeof value.message === "object" &&
+          !Array.isArray(value.message)
+        ) {
+          if (typeof value.id !== "string" || value.id.trim().length === 0) {
+            throw new Error(
+              `Message record at line ${index + 1} has no stable entry id; refusing transcript rewrite`,
+            );
+          }
+          records.push({ entryId: value.id, value });
+        }
+      }
+
+      if (records.length === 0) {
+        return { ok: true, compacted: false, reason: "Session contains no messages" };
+      }
+
+      const result = await withTimeout(
+        compress(
+          agentToOpenAI(records.map(({ value }) => value.message)),
+          {
+            model: "claude-sonnet-4-5",
+            baseUrl: this.proxyUrl,
+            fallback: true,
+            tokenBudget: params.tokenBudget,
+          } as any,
+        ),
+        this.config.requestTimeoutMs ?? 30_000,
+      );
+
+      const compactedMessages = openAIToAgent(result.messages);
+      if (!result.compressed || result.tokensSaved === 0) {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "Session did not need compression",
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: result.tokensAfter,
+          },
+        };
+      }
+
+      // The transcript is append-only and can contain non-message records.
+      // Refuse to rewrite if compression changes the message count, because
+      // there is no safe way to preserve the transcript's record envelopes.
+      if (compactedMessages.length !== records.length) {
+        return {
+          ok: false,
+          compacted: false,
+          reason: "Compression changed the session message count",
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: result.tokensAfter,
+          },
+        };
+      }
+
+      const rewriteResult = await rewriteTranscriptEntries({
+        replacements: records.map(({ entryId, value }, messageIndex) => ({
+          entryId,
+          message: {
+            ...value.message,
+            ...compactedMessages[messageIndex],
+          },
+        })),
+      });
+      if (!rewriteResult.changed || rewriteResult.rewrittenEntries !== records.length) {
+        return {
+          ok: false,
+          compacted: rewriteResult.changed,
+          reason:
+            rewriteResult.reason ??
+            `OpenClaw rewrote ${rewriteResult.rewrittenEntries} of ${records.length} message records`,
+          result: {
+            tokensBefore: result.tokensBefore,
+            tokensAfter: rewriteResult.changed ? result.tokensAfter : result.tokensBefore,
+          },
+        };
+      }
+
+      this.stats.compactions++;
+      this.logger.info(
+        `Compacted session (budget: ${params.tokenBudget ?? "none"}, ` +
+          `force: ${params.force ?? false}, saved: ${result.tokensSaved} tokens)`,
+      );
+
+      return {
+        ok: true,
+        compacted: true,
+        reason: "Compacted session with Headroom",
+        result: {
+          tokensBefore: result.tokensBefore,
+          tokensAfter: result.tokensAfter,
+        },
+      };
+    } catch (error) {
+      this.logger.error(`Compact failed: ${error}`);
+      return { ok: false, compacted: false, reason: `Compaction failed: ${error}` };
+    }
   }
 
   async afterTurn?(params: {
