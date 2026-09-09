@@ -132,6 +132,28 @@ class TestClaudeRouting:
         )
         assert check_claude_routing(path, 8787).status == PASS
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:8787",
+            "http://[::1]:8787",  # IPv6 loopback literal
+            "http://[::1]:8787/v1",
+            "HTTP://Localhost:8787",  # scheme/host are case-insensitive
+            "http://LOCALHOST:8787",
+        ],
+    )
+    def test_loopback_url_variants_pass(self, tmp_path, base_url):
+        """A correctly-routed loopback URL must not read as 'not routed'.
+
+        The routing regex only matched lowercase ``127.0.0.1``/``localhost`` with
+        an explicit port, so an IPv6 (``[::1]``) or upper-cased loopback URL — a
+        valid route — produced a misleading WARN (the false-negative class of
+        #3205 / #3213).
+        """
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == PASS
+
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "settings.json"
         path.write_text(
@@ -151,6 +173,28 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            # Userinfo lookalike: a prefix match sees "localhost:8787" but the
+            # URL's real host is evil.example (the loopback text is credentials).
+            "http://localhost:8787@evil.example/v1",
+            "http://127.0.0.1:8787@evil.example/v1",
+            # Userinfo present at all — a real Headroom route never carries it.
+            "http://evil.example@127.0.0.1:8787",
+            # Hostname-suffix lookalikes: not an exact loopback host.
+            "http://localhost.evil.example:8787",
+            "http://127.0.0.1.evil.example:8787",
+        ],
+    )
+    def test_loopback_lookalikes_warn(self, tmp_path, base_url):
+        """URL classification (not prefix matching) must reject userinfo and
+        hostname-suffix lookalikes that resolve to a non-loopback host, so
+        ``doctor`` never reports an attacker-controlled destination as routed."""
+        path = tmp_path / "settings.json"
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        assert check_claude_routing(path, 8787).status == WARN
 
 
 class TestClaudeDesktop:
@@ -482,6 +526,40 @@ class TestCodexRouting:
         path = tmp_path / "config.toml"
         path.write_text('model = "gpt-5"\n', encoding="utf-8")
         assert check_codex_routing(path, 8787).status == WARN
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:8787@evil.example/v1",  # userinfo lookalike
+            "http://localhost.evil.example:8787/v1",  # hostname suffix lookalike
+            "https://gateway.corp.example/v1",  # plainly remote
+        ],
+    )
+    def test_non_loopback_base_url_warns(self, tmp_path, base_url):
+        """The Headroom block's base_url is classified through the same URL
+        parser, so a non-loopback (or lookalike) base_url reads as not routed
+        rather than passing on a prefix match."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            f'[model_providers.headroom]\nbase_url = "{base_url}"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+
+    def test_base_url_read_from_headroom_block_not_earlier_provider(self, tmp_path):
+        """A base_url in an earlier provider block must not be mistaken for the
+        Headroom route; only the Headroom block's own base_url counts."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            "[model_providers.openai]\n"
+            'base_url = "https://api.openai.com/v1"\n'
+            "\n"
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 8787).status == PASS
 
     def test_garbage_bytes_warn_not_crash(self, tmp_path):
         path = tmp_path / "config.toml"

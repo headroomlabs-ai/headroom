@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
@@ -48,8 +49,56 @@ WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
 
-_LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+# The loopback host forms a proxy URL can take: IPv4, the ``localhost`` alias,
+# and the IPv6 literal ``::1`` (``urlsplit`` strips the ``[...]`` brackets and
+# lowercases the host, so ``HTTP://Localhost`` and ``http://[::1]`` normalize
+# into this set).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Codex TOML routes via a quoted ``base_url``. Capture the quoted value only and
+# classify it with the shared URL parser below — a prefix/regex match on the URL
+# would accept userinfo and hostname-suffix lookalikes such as
+# ``http://localhost:8787@evil.example`` as loopback.
+_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"([^"\n]*)"')
+
+
+def _loopback_route_port(url: str) -> int | None:
+    """Return the port if ``url`` is a well-formed loopback proxy route.
+
+    Classifies by parsing the URL rather than prefix-matching it: the scheme
+    must be http(s), there must be no userinfo, the host must be *exactly* a
+    loopback literal, and the port must be present and valid. This is what makes
+    ``doctor`` a URL classifier rather than a string matcher, so lookalikes that
+    a prefix match accepts are correctly rejected:
+
+    * userinfo — ``http://localhost:8787@evil.example/v1`` parses to host
+      ``evil.example`` (the ``localhost:8787`` is credentials), and any URL
+      carrying userinfo is refused outright;
+    * hostname suffix — ``http://localhost.evil.example:8787`` and
+      ``http://127.0.0.1.evil.example:8787`` are not exact loopback hosts.
+
+    A correctly-routed loopback URL (including ``[::1]`` and an upper-cased
+    scheme/host) still classifies, preserving the #3205 / #3213 fix.
+    """
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    # Reject any credentials in the authority: a real Headroom route never
+    # carries userinfo, and userinfo is the vector that masks the true host.
+    if parts.username is not None or parts.password is not None:
+        return None
+    try:
+        host = parts.hostname  # lowercased, brackets stripped
+        port = parts.port  # raises ValueError on an out-of-range port
+    except ValueError:
+        return None
+    if host is None or host not in _LOOPBACK_HOSTS or port is None:
+        return None
+    return port
+
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -425,14 +474,27 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
             summary="not routed (no Headroom provider in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
-    match = _CODEX_BASE_URL_RE.search(text)
-    if match and int(match.group(1)) != port:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
-            hint=f"re-run with: headroom doctor --port {match.group(1)}",
-        )
+    # Scope base_url extraction to the Headroom provider block: a config can
+    # declare several providers, and only this block's base_url should decide
+    # whether Codex is routed through Headroom.
+    match = _CODEX_BASE_URL_RE.search(_codex_headroom_block(text))
+    if match:
+        base_url = match.group(1)
+        routed_port = _loopback_route_port(base_url)
+        if routed_port is None:
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=f"base_url {base_url} is not the local Headroom proxy",
+                hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
+            )
+        if routed_port != port:
+            return CheckResult(
+                name=name,
+                status=WARN,
+                summary=f"routed to port {routed_port}, but doctor probed port {port}",
+                hint=f"re-run with: headroom doctor --port {routed_port}",
+            )
     # Routed, but Codex may still attach no credentials. A ChatGPT-OAuth user
     # needs `requires_openai_auth = true` in the provider block or Codex sends
     # no Authorization header at all and every request 401s with "Missing
@@ -448,14 +510,27 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
     return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
 
 
+def _codex_headroom_block(text: str) -> str:
+    """Return the text of the ``[model_providers.headroom]`` block (or "").
+
+    Scoped so that per-key lookups (base_url, requires_openai_auth) read this
+    provider's settings rather than another provider block that happens to
+    appear earlier in the file.
+    """
+    marker = "[model_providers.headroom]"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    rest = text[start + len(marker) :]
+    end = rest.find("\n[")
+    return rest if end == -1 else rest[:end]
+
+
 def _codex_block_missing_openai_auth(text: str, config_path: Path) -> bool:
     """ChatGPT-OAuth Codex routed without ``requires_openai_auth`` (#3206)."""
-    start = text.find("[model_providers.headroom]")
-    if start == -1:
+    block = _codex_headroom_block(text)
+    if not block:
         return False
-    rest = text[start + len("[model_providers.headroom]") :]
-    end = rest.find("\n[")
-    block = rest if end == -1 else rest[:end]
     if "requires_openai_auth" in block:
         return False
     try:
@@ -482,14 +557,13 @@ def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
 
 
 def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> CheckResult:
-    match = _LOOPBACK_URL_RE.match(url.strip())
-    if match is None:
+    found_port = _loopback_route_port(url)
+    if found_port is None:
         return CheckResult(
             name=name,
             status=WARN,
             summary=f"points at {url}, not the local Headroom proxy ({source})",
         )
-    found_port = int(match.group(1))
     if found_port != port:
         if found_port == _OLLAMA_DEFAULT_PORT:
             # Not a mis-probed Headroom port — this is Ollama's endpoint, so
