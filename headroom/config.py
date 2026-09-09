@@ -240,10 +240,22 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         # plugin that supplies only the first half cannot be relied on to be
         # installed.
         "read_file",
+        # Skill bodies (Claude Code's `Skill` tool) are INSTRUCTIONS, not tool
+        # output, and lossy compression on a directive does not degrade it --
+        # it inverts it. "do not guess at model names" losing its "not" is a
+        # correctness failure, not a quality tradeoff. Measured across 40 real
+        # SKILL.md bodies on the lossy path: only 73.5% of negations (not,
+        # never, avoid, unless, without) and 65.5% of modals (must, always,
+        # only, required) survived; two skills kept 0/2 and 1/6 of theirs.
+        # Bodies load on demand and are read once, so the tokens at stake are
+        # small and the downside is unbounded. Named below as well, because
+        # protecting a tool needs both halves.
+        "Skill",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
+        "skill",
         "write",
         "edit",
         "web_search",
@@ -324,6 +336,15 @@ DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         # partner-trial repo, which reported `read_file` reaching the provider
         # seam once the plugin started excluding it.
         "read_file",
+        # Skill bodies. The other half of the protection added above: excluding
+        # `Skill` from the lossy path routes it INTO the excluded-tool fold, and
+        # the fold rewrites what the model is SHOWN. On tool output that is a
+        # fair trade; on a directive it is not, because the folds that collapse
+        # repeated lines or hoist paths into headings can merge two distinct
+        # instructions into one. Skill bodies are prose and fold poorly anyway,
+        # so this costs close to nothing and removes the whole class.
+        "Skill",
+        "skill",
     }
 )
 

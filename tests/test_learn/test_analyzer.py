@@ -476,6 +476,67 @@ class TestSessionAnalyzer:
         assert result.analysis_error == "API key not set"
 
     @patch("headroom.learn.analyzer._call_llm")
+    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock):
+        """A context-overflow error rebuilds the digest at half the budget and retries."""
+        mock_call_llm.side_effect = [
+            RuntimeError("`claude -p` failed (exit 1):\nPrompt is too long"),
+            {"context_file_rules": [], "memory_file_rules": []},
+        ]
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    # Enough volume to overflow even the halved (40k-token) budget,
+                    # so the retry digest is visibly shorter than the first.
+                    _tc(msg_index=i, is_error=True, output="x" * 200)
+                    for i in range(2000)
+                ],
+            )
+        ]
+        result = analyzer.analyze(_project(), sessions)
+
+        assert mock_call_llm.call_count == 2
+        first_digest = mock_call_llm.call_args_list[0][0][0]
+        second_digest = mock_call_llm.call_args_list[1][0][0]
+        assert len(second_digest) < len(first_digest)
+        assert result.recommendations == []
+
+    @patch("headroom.learn.analyzer._call_llm")
+    def test_gives_up_when_min_digest_budget_still_too_long(self, mock_call_llm: MagicMock):
+        """Persistent overflow stops at the minimum budget instead of looping forever."""
+        mock_call_llm.side_effect = RuntimeError("Prompt is too long")
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[_tc(msg_index=0, is_error=True, output="error")],
+            )
+        ]
+        result = analyzer.analyze(_project(), sessions)
+
+        # Budgets: 80k, 40k, 20k, 10k — then give up.
+        assert mock_call_llm.call_count == 4
+        assert result.recommendations == []
+
+    @patch("headroom.learn.analyzer._call_llm")
+    def test_non_overflow_failure_does_not_retry(self, mock_call_llm: MagicMock):
+        mock_call_llm.side_effect = RuntimeError("API key not set")
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[_tc(msg_index=0, is_error=True, output="error")],
+            )
+        ]
+        analyzer.analyze(_project(), sessions)
+
+        mock_call_llm.assert_called_once()
+
+    @patch("headroom.learn.analyzer._call_llm")
     def test_passes_events_to_digest(self, mock_call_llm: MagicMock):
         """User messages and subagent events should appear in the digest."""
         mock_call_llm.return_value = {"context_file_rules": [], "memory_file_rules": []}

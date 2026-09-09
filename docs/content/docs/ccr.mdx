@@ -6,7 +6,7 @@ description: Compress-Cache-Retrieve architecture that makes compression lossles
 Headroom's CCR (Compress-Cache-Retrieve) architecture makes compression **reversible**. When content is compressed, the original data is cached locally. If the LLM needs the full data, it retrieves it instantly.
 
 <Callout type="info" title="Nothing is ever thrown away">
-  Unlike traditional lossy compression, CCR guarantees that every piece of original data remains accessible. You get 70-90% token savings with zero risk of permanent data loss.
+  Unlike traditional lossy compression, CCR guarantees that every piece of original data remains accessible in the compression store, even when the compressed content the LLM sees is much smaller. Actual token savings depend heavily on how redundant the source data is -- see [How Compression Works](/docs/how-compression-works#content-type-detection) for measured ranges per content type.
 </Callout>
 
 ## The problem with traditional compression
@@ -38,7 +38,7 @@ LLM PROCESSING
 
 When SmartCrusher compresses tool output:
 
-1. The original content is stored in an LRU cache
+1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `headroom/cache/compression_store.py:1000-1017`.
 2. A hash key is generated for retrieval
 3. A marker is added to the compressed output:
 
@@ -133,26 +133,33 @@ const ccrConfig: CCRConfig = {
 ```
 </Tab>
 <Tab value="Python">
+The full CCR loop -- markers injected, `headroom_retrieve` tool added to the
+request, and the model's retrieval call resolved automatically -- only runs
+through `headroom proxy` (`headroom/proxy/handlers/*.py` wire tool injection
+and the response handler; the direct SDK client does not). Point an OpenAI
+client at the proxy to get it:
+
 ```python
-from headroom import HeadroomClient, OpenAIProvider
 from openai import OpenAI
 
-client = HeadroomClient(
-    original_client=OpenAI(),
-    provider=OpenAIProvider(),
-    default_mode="optimize",
-)
+# Start `headroom proxy` first (defaults to port 8787); use --no-optimize
+# for a passthrough baseline or --no-ccr to disable CCR specifically.
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="local")
 
-# CCR happens automatically during chat completions.
-# The LLM calls headroom_retrieve when it needs more data.
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=messages,
 )
-
-# CCR is enabled by default in the current proxy path. Use --no-optimize for
-# full passthrough behavior.
 ```
+
+`HeadroomClient` (the direct SDK integration, no proxy) still routes JSON
+tool outputs through SmartCrusher and embeds `<<ccr:HASH>>` markers when a
+compression ratio warrants one, and the original is stored and retrievable
+via `headroom.cache.compression_store`. It does **not**, however, inject the
+`headroom_retrieve` tool or intercept the model's retrieval call for you --
+that wiring lives only in the proxy's request handlers. Resolve markers
+yourself with `headroom.ccr.marker_resolution.resolve_markers_in_text` if
+you're integrating CCR outside the proxy.
 </Tab>
 </Tabs>
 
@@ -184,7 +191,7 @@ Check the effective setting at `/v1/retrieve/stats` under
 | Approach | Risk | Savings |
 |---|---|---|
 | No compression | None | 0% |
-| Traditional compression | Data loss | 70-90% |
-| CCR compression | None (reversible) | 70-90% |
+| Traditional compression | Data loss | Depends on content and target ratio |
+| CCR compression | None (reversible) | Same range as traditional compression -- CCR changes the risk, not the ratio |
 
-CCR gives you the savings of aggressive compression with zero risk. The LLM can always retrieve the original data if needed.
+CCR gives you the savings of aggressive compression with zero risk: SmartCrusher, LogCompressor, SearchCompressor, and Kompress can all compress as aggressively as their configuration allows, because the original is always one retrieval away. See [How Compression Works](/docs/how-compression-works#content-type-detection) for measured savings ranges per compressor.

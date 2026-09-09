@@ -3,7 +3,7 @@
 This feature has live coverage on macOS and Windows. Additional Linux secret-store
 coverage is still useful (see [Status](#status)). If you have a GitHub Copilot
 subscription and 10 minutes, please run one of the flows below and
-[file a report](https://github.com/chopratejas/headroom/issues/new?template=copilot-subscription-test-report.md).
+[file a report](https://github.com/headroomlabs-ai/headroom/issues/new?template=copilot-subscription-test-report.md).
 
 > ⚠️ This reads your Copilot login token and routes your
 > Copilot CLI traffic through a local Headroom proxy. Only run it if you're
@@ -36,7 +36,7 @@ Headroom deliberately does **not** auto-select a per-account host from
 `api.individual.githubcopilot.com`) that does **not** serve newer models on the
 responses API and is not the host the official Copilot client routes with — using
 it regressed `headroom wrap copilot` after 0.22.4
-([#610](https://github.com/chopratejas/headroom/issues/610)).
+([#610](https://github.com/headroomlabs-ai/headroom/issues/610)).
 
 **Enterprise / data-residency:** if your organization is provisioned on a
 dedicated Copilot API host (GitHub Enterprise Cloud with data residency, or an
@@ -49,7 +49,7 @@ headroom wrap copilot --subscription -- --model gpt-5.4
 ```
 
 If you operate such an environment and would like Headroom to **auto-detect** the
-correct host instead of pinning it, please [open an issue](https://github.com/chopratejas/headroom/issues/new) —
+correct host instead of pinning it, please [open an issue](https://github.com/headroomlabs-ai/headroom/issues/new) —
 the intended path is to resolve it from GitHub's token-exchange endpoint (the
 source the official Copilot client uses), and we'd want to validate it against a
 real enterprise tenant.
@@ -163,7 +163,7 @@ Schema, for reference: Keychain generic password, service `copilot-cli`
 ## What to report
 
 Please open a
-[Copilot subscription test report](https://github.com/chopratejas/headroom/issues/new?template=copilot-subscription-test-report.md)
+[Copilot subscription test report](https://github.com/headroomlabs-ai/headroom/issues/new?template=copilot-subscription-test-report.md)
 with:
 
 - **OS + version** and **how you installed** (pipx/pip wheel, Docker, source).

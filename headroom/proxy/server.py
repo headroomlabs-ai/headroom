@@ -476,6 +476,16 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _code_syntax_breaker_status() -> dict[str, Any]:
+    """Per-language AST-compression breaker state, or {} if unavailable."""
+    try:
+        from headroom.transforms.code_compressor import syntax_breaker_status
+
+        return syntax_breaker_status()
+    except Exception:  # pragma: no cover - defensive; stats must not fail
+        return {}
+
+
 class _SuppressCancelledErrorFilter(logging.Filter):
     """Hide expected uvicorn CancelledError tracebacks during shutdown."""
 
@@ -2614,11 +2624,18 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     expected to be lowercase (Starlette's ``Headers`` is case-insensitive; the
     WebSocket middleware lowercases the raw ASGI pairs itself).
     """
+    raw = headers.get("x-headroom-proxy-token")
+    if raw is not None:
+        return str(raw) or None
+
+    # A provider credential can legitimately occupy Authorization (for example,
+    # an OAuth/subscription client). Prefer the explicit proxy header whenever
+    # it is present so that the upstream credential is not mistaken for the
+    # proxy credential.
     auth = str(headers.get("authorization") or "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip() or None
-    raw = headers.get("x-headroom-proxy-token")
-    return str(raw) if raw else None
+    return None
 
 
 class WebSocketAuthMiddleware:
@@ -3627,7 +3644,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # only names listed in config.proxy_extensions (CLI: --proxy-extension,
     # env: HEADROOM_PROXY_EXTENSIONS) actually get installed. Discovery alone
     # never runs third-party code. An extension that raises from its install()
-    # is a deliberate fail-closed signal and aborts startup.
+    # disables *itself*: `install_all` logs it, prints a SKIPPED line to stderr
+    # and the proxy keeps serving without that extension (extensions.py:169-183).
+    # One bad plugin must not brick the proxy. Note the consequence: a plugin
+    # whose licence gate raises is absent, not fatal — the feature fails closed,
+    # the process does not.
     from headroom.proxy.extensions import install_all as _install_extensions
 
     _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
@@ -4599,6 +4620,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "ccr_retrievals": compression_stats.get("total_retrievals", 0),
             },
             "compression_cache": compression_cache_stats,
+            # Per-language AST compression pauses. Empty on a healthy install;
+            # non-empty is the explanation for a savings drop in one language.
+            "code_syntax_breaker": _code_syntax_breaker_status(),
             # Always False: the anonymous telemetry beacon was removed, so no
             # telemetry is ever shipped externally (local collection only).
             "anon_telemetry_shipping": False,
