@@ -248,6 +248,72 @@ config = MemoryConfig(
 )
 ```
 
+### Cognee Backend (Knowledge Graph)
+
+The default storage above is fully embedded. As an alternative, Headroom can store memories in [cognee](https://github.com/topoteretes/cognee) -- an async AI-memory engine that builds a **knowledge graph** over your memories and supports both graph and vector retrieval.
+
+Install the extra:
+
+```bash
+pip install "headroom-ai[cognee]"
+```
+
+Enable it on the `Memory` facade or the proxy:
+
+```python
+from headroom.memory import Memory
+
+memory = Memory(backend="cognee")
+await memory.save("User prefers Python for backend work", user_id="alice")
+results = await memory.search("language preferences", user_id="alice")
+```
+
+```bash
+headroom proxy --memory --memory-backend cognee
+```
+
+How it works:
+
+1. **Save** -- each memory is added to a cognee dataset (default `headroom_memories`), tagged with `user:<id>`, `session:<id>`, and `entity:<name>` tags so retrieval can be scoped.
+2. **Cognify** -- after each save, `cognee.cognify()` extracts entities and relationships and folds the memory into the knowledge graph. This step is LLM-bound and slow, so it runs **in the background by default** -- saves return immediately and never block the request path. Set `HEADROOM_COGNEE_AUTO_COGNIFY=false` to skip it and run cognify on your own schedule.
+3. **Search** -- `cognee.search()` runs with the configured search type, scoped to the same tags. `CHUNKS` (the default) is raw retrieval with no LLM synthesis -- cheapest, and the right choice for a proxy request path. `GRAPH_COMPLETION` retrieves graph context instead (Headroom sends `only_context=True` so no LLM answer is generated).
+
+Configuration (explicit argument or CLI flag > env var > default):
+
+| Env Var | Proxy Flag | Description | Default |
+|---------|------------|-------------|---------|
+| `HEADROOM_COGNEE_DATASET` | `--memory-cognee-dataset` | cognee dataset that holds all Headroom memories | `headroom_memories` |
+| `HEADROOM_COGNEE_SYSTEM_ROOT` | `--memory-cognee-system-root` | Directory for cognee system state (databases, caches). Keeps Headroom's cognee state isolated from other cognee installs. | cognee's default |
+| `HEADROOM_COGNEE_DATA_ROOT` | `--memory-cognee-data-root` | Directory for cognee data storage | cognee's default |
+| `HEADROOM_COGNEE_SEARCH_TYPE` | `--memory-cognee-search-type` | cognee `SearchType` name used for retrieval (e.g. `CHUNKS`, `GRAPH_COMPLETION`) | `CHUNKS` |
+| `HEADROOM_COGNEE_AUTO_COGNIFY` | `--memory-cognee-auto-cognify` / `--no-memory-cognee-auto-cognify` | Run `cognee.cognify()` after each save so new memories join the knowledge graph | `true` |
+| `HEADROOM_COGNEE_METADATA_DB` | `--memory-cognee-metadata-db` | Path to the SQLite file holding the backend's durable memory registry and delete/update tombstones. Proxy workers that must share memories (and see each other's deletions) must point at the same file. | `headroom_cognee_meta.db` under the data root, else the system root, else `~/.headroom` |
+
+The same options are available programmatically via `CogneeConfig`:
+
+```python
+from headroom.memory.backends.cognee import CogneeBackend, CogneeConfig
+
+backend = CogneeBackend(CogneeConfig(
+    dataset_name="my_app_memories",
+    search_type="GRAPH_COMPLETION",
+    # background_cognify=True (default): cognify never blocks a save
+))
+```
+
+**Requirements and limitations** (cognee v1.x):
+
+- Headroom disables cognee's session memory (cognee >= 1.5 enables it by default) by setting `CACHING=false` if the variable is unset, as part of the one-time process-wide configuration: the session-aware layer adds an LLM call per search and can replay a previous turn's results, including content deleted through this backend. Export `CACHING` yourself to override.
+- Searching a dataset that exists but was never cognified returns no results (cognee itself raises `NoDataError` there; the backend treats an empty store as an empty result).
+- cognee needs an LLM provider for the cognify graph-build step. Configure it through cognee's own settings (e.g. `LLM_API_KEY`; cognee reads its environment and `.env` file). If the key is missing or cognify fails, the save itself still succeeds -- the enrichment failure is logged, never raised. Headroom snapshots the process environment around cognee's import (which happens once per process) and restores any pre-existing variables its `.env` load overwrote, so a `.env` in the proxy's working directory cannot silently override live environment variables.
+- **cognee's configuration is process-wide and immutable.** `import cognee` and its root directories (`system_root` / `data_root`) are process-global, so the first backend initialized in a process fixes them for every later instance. Initializing another cognee backend in the same process with *different* roots raises `RuntimeError` (fail closed -- one tenant can never redirect another tenant's cognee storage); the same roots reuse the already-configured module. Run one cognee root configuration per process.
+- cognee has **no per-item update API**. `update_memory` keeps the memory's ID: the durable registry row is rewritten in place (same ID, new content), the old content is tombstoned, and the new content is added to cognee as a fresh data item -- so searches keep returning the *original* ID for the updated content.
+- **The deletion contract depends on the search type.** Under `CHUNKS` (the default), results are verbatim stored text and the durable tombstones are authoritative: `delete_memory` removes the registry row, tombstones the content, and additionally attempts a hard delete through cognee's dataset API (`cognee.datasets.list_data` / `delete_data`, matched by content hash) to reclaim storage. Tombstones match in both directions (a chunk that is a fragment of deleted content is filtered too), so nothing derived from tombstoned text can pass the read path -- the delete succeeds even when the hard delete cannot be proven. Under any **other** search type, results may be graph-synthesized text that no longer contains the deleted source, which tombstones cannot enforce; there, `delete_memory`/`update_memory` succeed only when the hard delete is **proven** (matched, deleted, verified gone) and otherwise raise `CogneeDeletionUnverifiedError` -- delete still tombstones the content and keeps the memory for retry, update refuses before changing anything. Discovery is non-mutating (a partial match deletes nothing) and completed removals are recorded in a durable ledger, so failed or interrupted attempts are always retryable. The backend never reports a deletion it cannot stand behind.
+- The memory registry and tombstones live in a small **SQLite metadata store** (`HEADROOM_COGNEE_METADATA_DB`, WAL mode), so deletions and updates survive proxy restarts and apply immediately to every proxy worker sharing the same file.
+- Memory IDs are stable, content-derived UUIDs resolved through the durable registry, so IDs returned by `memory_search` can be passed to `memory_update` / `memory_delete` -- across restarts and across workers sharing the metadata store (cognee has no fetch-by-id API for raw memories).
+- Search scores are rank-based (descending with result order, mapped into the `(0.5, 1.0]` band) -- cognee does not expose similarity scores. Consequently `--memory-min-similarity` values of 0.5 or below (including the 0.3 default) have no filtering effect with this backend.
+- `importance` is recorded in the returned memory's metadata; cognee does not rank by it.
+
 ## Provider Compatibility
 
 Memory works with any OpenAI-compatible client:

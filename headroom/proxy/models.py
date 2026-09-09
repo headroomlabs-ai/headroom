@@ -12,7 +12,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-from headroom.memory import qdrant_env
+from headroom.memory import cognee_env, qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
 from headroom.proxy.model_router import ModelRouterConfig
@@ -40,6 +40,25 @@ def _qdrant_env_port_or_default() -> int:
             qdrant_env.DEFAULT_QDRANT_PORT,
         )
         return qdrant_env.DEFAULT_QDRANT_PORT
+
+
+def _cognee_env_auto_cognify_or_default() -> bool:
+    """Resolve ``HEADROOM_COGNEE_AUTO_COGNIFY``, falling back to True on a bad value.
+
+    ``cognee_env.cognee_env_auto_cognify`` raises on an unparseable boolean
+    (intended for explicit cognee setup). As a ``ProxyConfig`` field
+    ``default_factory`` it runs on EVERY ``ProxyConfig()`` construction, so a
+    typo'd env var would crash proxy startup for an off-by-default subsystem.
+    Fail soft here so config construction never raises.
+    """
+    try:
+        return cognee_env.cognee_env_auto_cognify()
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid HEADROOM_COGNEE_AUTO_COGNIFY; using default True. "
+            "Set true/false to override."
+        )
+        return True
 
 
 # =============================================================================
@@ -407,7 +426,7 @@ class ProxyConfig:
 
     # Memory System
     memory_enabled: bool = False
-    memory_backend: Literal["local", "qdrant-neo4j"] = "local"
+    memory_backend: Literal["local", "qdrant-neo4j", "cognee"] = "local"
     memory_db_path: str = ""  # Empty = auto: {cwd}/.headroom/memory.db
     # Per-project memory routing (GH #462). ``project`` (the new default)
     # gives each resolved workspace its own SQLite DB so cross-project
@@ -440,6 +459,15 @@ class ProxyConfig:
     memory_neo4j_uri: str = "neo4j://localhost:7687"
     memory_neo4j_user: str = "neo4j"
     memory_neo4j_password: str = ""
+    # cognee backend (defaults resolve from HEADROOM_COGNEE_* env vars)
+    memory_cognee_dataset: str = field(default_factory=cognee_env.cognee_env_dataset)
+    memory_cognee_system_root: str | None = field(default_factory=cognee_env.cognee_env_system_root)
+    memory_cognee_data_root: str | None = field(default_factory=cognee_env.cognee_env_data_root)
+    memory_cognee_search_type: str = field(default_factory=cognee_env.cognee_env_search_type)
+    memory_cognee_auto_cognify: bool = field(default_factory=_cognee_env_auto_cognify_or_default)
+    memory_cognee_metadata_db_path: str | None = field(
+        default_factory=cognee_env.cognee_env_metadata_db
+    )
     memory_bridge_enabled: bool = False
     memory_bridge_md_paths: list[str] = field(default_factory=list)
     memory_bridge_md_format: str = "auto"

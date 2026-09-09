@@ -26,9 +26,15 @@ Usage:
     # For production (requires Docker: docker compose up -d qdrant neo4j)
     memory = Memory(backend="qdrant-neo4j")
 
+    # Knowledge-graph memory via cognee (pip install 'headroom-ai[cognee]')
+    memory = Memory(backend="cognee")
+
 Backends:
     - "local" (default): SQLite + HNSW + InMemoryGraph. No setup required.
     - "qdrant-neo4j": Qdrant + Neo4j. Requires Docker services.
+    - "cognee": cognee knowledge-graph engine. Requires the cognee package
+      (pip install 'headroom-ai[cognee]'); configured via HEADROOM_COGNEE_*
+      env vars.
 """
 
 from __future__ import annotations
@@ -72,6 +78,9 @@ class Memory:
         backend: Which backend to use:
             - "local" (default): Embedded SQLite + HNSW. No Docker needed.
             - "qdrant-neo4j": External Qdrant + Neo4j. Requires Docker.
+            - "cognee": cognee knowledge-graph engine. Requires the cognee
+              package (pip install 'headroom-ai[cognee]'). Configured via
+              ``HEADROOM_COGNEE_*`` env vars (dataset, roots, search type).
         db_path: Path for local database (only for "local" backend).
             Defaults to ~/.headroom/memory.db
         qdrant_url: Full Qdrant URL (only for "qdrant-neo4j" backend). When set,
@@ -104,6 +113,9 @@ class Memory:
             qdrant_url="https://xyz.cloud.qdrant.io:6333",
             qdrant_api_key="...",
         )
+
+        # cognee knowledge-graph memory (or set HEADROOM_COGNEE_DATASET etc.)
+        memory = Memory(backend="cognee")
     """
 
     def __init__(
@@ -185,6 +197,13 @@ class Memory:
                     "Install with: pip install 'headroom-ai[memory-stack]'\n"
                     "And start Docker services: docker compose up -d qdrant neo4j"
                 ) from e
+
+        elif self._backend_type == "cognee":
+            # CogneeBackend imports the cognee package lazily on first use;
+            # a missing dependency surfaces there with install instructions.
+            from headroom.memory.backends.cognee import CogneeBackend, CogneeConfig
+
+            self._backend = CogneeBackend(CogneeConfig())
         else:
             raise ValueError(f"Unknown backend: {self._backend_type}")
 

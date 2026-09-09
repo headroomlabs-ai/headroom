@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from headroom.memory import qdrant_env
+from headroom.memory import cognee_env, qdrant_env
 from headroom.memory.storage_router import (
     BackendRouter,
     BackendRouterConfig,
@@ -120,12 +120,14 @@ class MemoryConfig:
     """Configuration for memory handler.
 
     Qdrant connection fields default to values read from ``HEADROOM_QDRANT_*``
-    environment variables (see :mod:`headroom.memory.qdrant_env`). Passing an
-    explicit value to the constructor always wins over the environment.
+    environment variables (see :mod:`headroom.memory.qdrant_env`); cognee
+    fields likewise default from ``HEADROOM_COGNEE_*`` (see
+    :mod:`headroom.memory.cognee_env`). Passing an explicit value to the
+    constructor always wins over the environment.
     """
 
     enabled: bool = False
-    backend: Literal["local", "qdrant-neo4j"] = "local"
+    backend: Literal["local", "qdrant-neo4j", "cognee"] = "local"
     db_path: str = "headroom_memory.db"
     inject_tools: bool = True
     inject_context: bool = True
@@ -155,6 +157,13 @@ class MemoryConfig:
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
+    # cognee config (defaults resolve from HEADROOM_COGNEE_* env vars)
+    cognee_dataset: str = field(default_factory=cognee_env.cognee_env_dataset)
+    cognee_system_root: str | None = field(default_factory=cognee_env.cognee_env_system_root)
+    cognee_data_root: str | None = field(default_factory=cognee_env.cognee_env_data_root)
+    cognee_search_type: str = field(default_factory=cognee_env.cognee_env_search_type)
+    cognee_auto_cognify: bool = field(default_factory=cognee_env.cognee_env_auto_cognify)
+    cognee_metadata_db_path: str | None = field(default_factory=cognee_env.cognee_env_metadata_db)
     # Memory Bridge (bidirectional markdown <-> Headroom sync)
     bridge_enabled: bool = False
     bridge_md_paths: list[str] = field(default_factory=list)
@@ -184,11 +193,13 @@ class MemoryHandler:
         self.config = config
         self.agent_type = agent_type
         self._backend: LocalBackend | Any = None
-        # Per-project routing for the local backend. Built in
-        # ``_init_backend_locked`` so a single, shared resolver / LRU is
-        # kept on the handler. Qdrant deployments use composite user-id
-        # partitioning instead (see ``_compose_effective_user_id``) — the
-        # router stays None in that case.
+        # Per-project routing. Built during backend init so a single,
+        # shared resolver / LRU is kept on the handler. The local backend
+        # routes to per-project SQLite files; the cognee backend keeps one
+        # shared dataset and uses the router only to resolve the scope,
+        # composing a ``user::project_key`` user_id instead (see
+        # ``_resolve_for_request``). Qdrant deployments pre-date the router
+        # and keep it None (legacy single-bucket behaviour).
         self._router: BackendRouter | None = None
         self._initialized = False
         # Async singleflight guard for backend init. Ensures concurrent first
@@ -439,6 +450,42 @@ class MemoryHandler:
                     "Install with: pip install 'headroom-ai[memory-stack]'"
                 )
                 raise
+        elif self.config.backend == "cognee":
+            try:
+                from headroom.memory.backends.cognee import (
+                    CogneeBackend,
+                    CogneeConfig,
+                )
+
+                cognee_config = CogneeConfig(
+                    dataset_name=self.config.cognee_dataset,
+                    system_root=self.config.cognee_system_root,
+                    data_root=self.config.cognee_data_root,
+                    search_type=self.config.cognee_search_type,
+                    auto_cognify=self.config.cognee_auto_cognify,
+                    metadata_db_path=self.config.cognee_metadata_db_path,
+                )
+                self._backend = CogneeBackend(cognee_config)
+                await self._backend.ensure_initialized()
+                # Per-project scoping (GH #462) for cognee: all memories
+                # share one dataset, so the partition must live in the
+                # user_id (``user::project_key``) rather than in a separate
+                # file. Build a router purely as a scope resolver —
+                # ``_resolve_for_request`` composes the effective user_id
+                # from the resolved scope, and the fail-closed
+                # unresolved-project guard applies exactly as for the
+                # local backend.
+                self._router = self._build_scope_router()
+                logger.info(
+                    f"Memory: Initialized cognee backend (dataset={cognee_config.dataset_name}, "
+                    f"storage_mode={self.config.storage_mode.value})"
+                )
+            except ImportError as e:
+                logger.error(
+                    f"Memory: Failed to import cognee dependencies: {e}. "
+                    "Install with: pip install 'headroom-ai[cognee]'"
+                )
+                raise
         else:
             raise ValueError(f"Unknown memory backend: {self.config.backend}")
 
@@ -614,6 +661,28 @@ class MemoryHandler:
             f"Beta header required: {NATIVE_MEMORY_BETA_HEADER}"
         )
         return tools, True
+
+    def _build_scope_router(self) -> BackendRouter:
+        """Build a router used only for scope resolution (no local DBs).
+
+        Shared-store backends (cognee today) keep a single physical store,
+        so per-project isolation is expressed by composing the effective
+        user_id with the resolved project key in ``_resolve_for_request``.
+        That path needs a ``BackendRouter`` for ``_resolve_scope``; this
+        helper builds one without ever calling ``backend_for`` (so no
+        SQLite files are opened).
+        """
+        storage_root = (
+            Path(self.config.storage_root)
+            if self.config.storage_root
+            else (Path(self.config.db_path).resolve().parent / "memories")
+        )
+        router_cfg = BackendRouterConfig(
+            mode=self.config.storage_mode,
+            root_dir=storage_root,
+            global_db_path=Path(self.config.db_path).resolve(),
+        )
+        return BackendRouter(router_cfg)
 
     def _resolve_for_request(
         self, base_user_id: str, request_context: RequestContext | None
