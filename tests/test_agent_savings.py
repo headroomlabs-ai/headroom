@@ -839,3 +839,9 @@ def test_explicit_min_chars_block_env_overrides_the_profile(
         min_tokens_to_crush = 500
 
     assert proxy_pipeline_kwargs(_Config())["min_chars_for_block_compression"] == 120
+
+
+def test_explicit_user_protection_overrides_aggressive_profile(monkeypatch):
+    monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", "0")
+    config = ProxyConfig(savings_profile="agent-90", compress_user_messages=False)
+    assert proxy_pipeline_kwargs(config)["compress_user_messages"] is False
