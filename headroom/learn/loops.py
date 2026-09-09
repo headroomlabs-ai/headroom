@@ -117,8 +117,19 @@ def detect_loops(
     a within-conversation phenomenon; the same command in two unrelated
     sessions is not a loop). Groups meeting ``min_occurrences`` become
     ``LoopPattern`` results, sorted by measured wasted tokens descending.
+
+    Tool calls carrying a non-empty ``tool_call_id`` are deduplicated
+    globally by that id, so a resume transcript that replays prior history
+    does not double-count the same calls. Calls with an empty id are never
+    deduplicated (nothing identifies them as replays). ``min_occurrences``
+    is re-checked after dedup so a group that only cleared the bar via
+    replays is dropped rather than reported. Scanners must therefore keep
+    synthesized ids unique *across* sessions (e.g. scope them by session
+    id); otherwise two unrelated sessions running the same loop would
+    collapse into one.
     """
     groups: dict[str, list[ToolCall]] = {}
+    seen_ids: set[str] = set()
     for session in sessions:
         per_session: dict[str, list[ToolCall]] = {}
         for tc in session.tool_calls:
@@ -127,7 +138,22 @@ def detect_loops(
         # signature so cross-session recurrence of the SAME loop accumulates.
         for sig, calls in per_session.items():
             if len(calls) >= min_occurrences:
-                groups.setdefault(sig, []).extend(calls)
+                unique: list[ToolCall] = []
+                for tc in calls:
+                    tid = (tc.tool_call_id or "").strip()
+                    if not tid:
+                        unique.append(tc)
+                        continue
+                    if tid in seen_ids:
+                        continue
+                    seen_ids.add(tid)
+                    unique.append(tc)
+                if unique:
+                    groups.setdefault(sig, []).extend(unique)
+
+    # Re-check the threshold after dedup: a group that only cleared the bar
+    # via replayed calls must not surface as a sub-threshold phantom loop.
+    groups = {sig: calls for sig, calls in groups.items() if len(calls) >= min_occurrences}
 
     loops: list[LoopPattern] = []
     for sig, calls in groups.items():

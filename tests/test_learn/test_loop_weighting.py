@@ -31,6 +31,8 @@ from headroom.learn.models import (
     ProjectInfo,
     Recommendation,
     RecommendationTarget,
+    SessionData,
+    ToolCall,
 )
 
 
@@ -85,6 +87,66 @@ class TestDetectLoops:
         assert err.count == ref.count
         # Same count, but error loop counts all N and re-fetch counts N-1.
         assert err.wasted_tokens >= 0 and ref.wasted_tokens >= 0
+
+
+def _read_call(tool_call_id: str, msg_index: int, out_bytes: int = 40000) -> ToolCall:
+    """Build a Read call matching the #3452 repro shape."""
+    return ToolCall(
+        name="Read",
+        tool_call_id=tool_call_id,
+        input_data={"file_path": "/repo/docs/design.md"},
+        output="x" * out_bytes,
+        is_error=False,
+        msg_index=msg_index,
+        output_bytes=out_bytes,
+    )
+
+
+class TestDetectLoopsDedup:
+    """Regression tests for #3452: replayed transcripts must not double-count."""
+
+    def test_replayed_resume_transcript_not_double_counted(self):
+        reads = [_read_call(f"call_r{i}", i) for i in range(3)]
+        one = detect_loops([SessionData(session_id="rollout-1", tool_calls=list(reads))])
+        fork = detect_loops(
+            [
+                SessionData(session_id="rollout-1", tool_calls=list(reads)),
+                SessionData(session_id="rollout-2-resume", tool_calls=list(reads)),
+            ]
+        )
+        assert len(one) == 1
+        assert len(fork) == 1
+        assert fork[0].count == one[0].count == 3
+        assert fork[0].wasted_tokens == one[0].wasted_tokens == 20000
+
+    def test_resume_with_genuinely_new_calls_accumulates(self):
+        base = [_read_call(f"call_r{i}", i) for i in range(3)]
+        resumed = list(base) + [_read_call("call_r3", 3), _read_call("call_r4", 4)]
+        loops = detect_loops(
+            [
+                SessionData(session_id="rollout-1", tool_calls=list(base)),
+                SessionData(session_id="rollout-2-resume", tool_calls=resumed),
+            ]
+        )
+        assert len(loops) == 1
+        assert loops[0].count == 5
+
+    def test_calls_without_ids_stay_counted(self):
+        reads = [_read_call("", i) for i in range(3)]
+        loops = detect_loops(
+            [
+                SessionData(session_id="rollout-1", tool_calls=list(reads)),
+                SessionData(session_id="rollout-2-resume", tool_calls=list(reads)),
+            ]
+        )
+        assert len(loops) == 1
+        assert loops[0].count == 6
+
+    def test_pure_replay_duplicates_dropped_below_threshold(self):
+        # One call duplicated 3x under a single id clears the raw threshold
+        # but is one call after dedup, so no loop may be reported.
+        dupes = [_read_call("call_only", i) for i in range(3)]
+        assert detect_loops([SessionData(session_id="s1", tool_calls=dupes)]) == []
 
 
 # =============================================================================
