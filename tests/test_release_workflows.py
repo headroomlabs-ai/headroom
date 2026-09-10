@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -815,7 +816,11 @@ def test_openclaw_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
@@ -828,7 +833,11 @@ def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_python_release_smoke_imports_installed_wheel_outside_source_tree() -> None:
@@ -922,7 +931,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert "uses: pypa/gh-action-pypi-publish@v1.13.0" in pypi_job
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 

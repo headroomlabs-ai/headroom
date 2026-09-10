@@ -94,12 +94,13 @@
   },
   "devDependencies": {
     "@ai-sdk/anthropic": "^3.0.64",
-    "@ai-sdk/openai": "^3.0.48",
+    "@ai-sdk/openai": "^4.0.60",
     "@ai-sdk/provider": "^1.0.0",
     "@anthropic-ai/sdk": "^0.124.0",
+    "@types/node": "^26.5.0",
     "ai": "^7.0.59",
     "dotenv": "^17.3.1",
-    "openai": "^4.80.0",
+    "openai": "^7.10.0",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^5.0.0"

@@ -17,9 +17,9 @@
 		"class-variance-authority": "0.7.1",
 		"clsx": "2.1.1",
 		"dotted-map": "^3.1.0",
-"fumadocs-core": "16.15.8",
+		"fumadocs-core": "16.15.8",
 		"fumadocs-mdx": "15.4.0",
-		"fumadocs-twoslash": "^3.3.0",
+		"fumadocs-twoslash": "^4.0.0",
 		"fumadocs-typescript": "^5.4.0",
 		"fumadocs-ui": "16.15.8",
 		"lucide-react": "^1.7.0",
@@ -30,7 +30,7 @@
 		"tailwind-merge": "^3.5.0"
 	},
 	"devDependencies": {
-		"@ai-sdk/openai": "^3.0.51",
+		"@ai-sdk/openai": "^4.0.60",
 		"@anthropic-ai/sdk": "^0.124.0",
 		"@tailwindcss/postcss": "^4.3.3",
 		"@types/mdx": "^2.0.14",
@@ -38,10 +38,10 @@
 		"@types/react": "^19.2.18",
 		"@types/react-dom": "^19.2.7",
 		"ai": "7.0.93",
-		"openai": "^6.47.0",
+		"openai": "^7.10.0",
 		"postcss": "^8.5.28",
 		"tailwindcss": "^4.2.2",
-		"typescript": "^5.9.3"
+		"typescript": "^7.0.2"
 	},
 	"overrides": {
 		"postcss": "$postcss"

@@ -40,6 +40,10 @@ updates:
     ignore:
       - dependency-name: "mcp"
         versions: [">=2.0.0"]
+      # 1.x replaces the Python node/language API used by code compression;
+      # upgrading silently disables compression (GH #1216).
+      - dependency-name: "tree-sitter-language-pack"
+        versions: [">=1.0.0,<2.0.0"]
       # These releases do not fix the optional-extra advisories documented in
       # SECURITY.md. Keep future versions eligible for review; do not suppress
       # alerts or ignore these packages indefinitely.
@@ -67,12 +71,31 @@ updates:
           - "minor"
           - "patch"
 
-  # npm dependency updates (TS SDK, plugins, docs site)
+  # tsup still needs the legacy TypeScript compiler API for declarations.
+  # TypeScript 7's default export has no `sys`; SDK/plugin declaration builds
+  # fail with useCaseSensitiveFileNames (e.g. GH #3528). Docs use a compatible
+  # native Twoslash release and stay eligible for TypeScript 7 below.
   - package-ecosystem: npm
     directories:
       - "/sdk/typescript"
       - "/plugins/openclaw"
       - "/plugins/opencode"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "typescript"
+        versions: [">=7.0.0 <8.0.0"]
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: npm
+    directories:
       - "/e2e/wrap/tools"
       - "/docs"
     schedule:

@@ -75,6 +75,8 @@ lockfile does not mean it is installed with every Headroom installation.
 The `crewai` extra brings in ChromaDB through CrewAI. The locked ChromaDB 1.1.1
 and the latest published version, 1.5.9, are affected by:
 
+- [GHSA-f4j7-r4q5-qw2c](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c):
+  pre-authentication code injection through model repository configuration.
 - [GHSA-36p7-vc44-83pf](https://github.com/advisories/GHSA-36p7-vc44-83pf):
   code injection through model repository configuration with `trust_remote_code`.
 - [GHSA-2wm9-hf6c-p5cr](https://github.com/advisories/GHSA-2wm9-hf6c-p5cr):
@@ -108,3 +110,7 @@ file-type validation. The proposed fixes
 [#4138](https://github.com/huggingface/accelerate/pull/4138) were closed without
 merging; the latter also explicitly leaves the named-pipe denial of service
 unfixed. Keep the alert open until a released fix covers both cases.
+
+Dependabot ignores only the reviewed unpatched ranges (ChromaDB through 1.5.9
+and Accelerate through 1.15.0). Later releases remain eligible for review. These
+update exceptions do not remediate the advisories or dismiss vulnerability alerts.
