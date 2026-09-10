@@ -485,8 +485,23 @@ def test_unbounded_mode_no_semaphore_instance():
 def test_unbounded_mode_requests_run_concurrently():
     """With concurrency=0 (sem disabled), two slow requests overlap."""
 
-    async def _run() -> float:
-        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=None, upstream_delay_s=0.10)
+    async def _run() -> None:
+        both_entered = asyncio.Event()
+        entered = 0
+
+        class _OverlapHandler(_DummyAnthropicHandler):
+            async def _retry_request(self, *args, **kwargs):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+                # Neither request can finish until both reach upstream. A
+                # serialized handler deadlocks here instead of merely running
+                # slower; the timeout below only bounds that failure.
+                await both_entered.wait()
+                return await super()._retry_request(*args, **kwargs)
+
+        handler = _OverlapHandler(anthropic_pre_upstream_sem=None)
         reqs = [
             _build_request(
                 {
@@ -497,15 +512,15 @@ def test_unbounded_mode_requests_run_concurrently():
             )
             for i in range(2)
         ]
-        start = time.perf_counter()
-        await asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs))
-        return time.perf_counter() - start
+        responses = await asyncio.wait_for(
+            asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs)),
+            timeout=10,
+        )
+        assert entered == 2
+        assert all(response.status_code == 200 for response in responses)
 
     with _tokenizer_patch():
-        elapsed = anyio.run(_run)
-    # Unbounded -> both sleeps run in parallel. Total should be ~0.10 s,
-    # nowhere near 0.20 s.
-    assert elapsed < 0.18, elapsed
+        anyio.run(_run)
 
 
 # --------------------------------------------------------------------------- #

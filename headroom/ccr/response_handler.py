@@ -531,7 +531,12 @@ class CCRResponseHandler:
             try:
                 current_response = await api_call_fn(current_messages, tools)
             except Exception as e:
-                logger.error(f"CCR: Continuation API call failed: {e}")
+                # Log the type and repr, not just str(e): many exceptions
+                # (httpx.TimeoutException(''), a bare Exception(), a connect
+                # error with no message) have an empty str(), which produced a
+                # log line with nothing after the colon and lost the cause
+                # entirely (#3129).
+                logger.error("CCR: Continuation API call failed: %s: %r", type(e).__name__, e)
                 # Return the response we had (with unhandled CCR calls)
                 # The client will see the tool_use and might handle it differently
                 break
