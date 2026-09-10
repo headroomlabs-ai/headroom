@@ -51,7 +51,10 @@ def test_configure_update_and_remove_preserve_jsonc_verbatim(tmp_path: Path) -> 
     assert "user comment" in configured
     assert '"github.copilot.advanced.debug.overrideProxyUrl"' in configured
     assert '"github.copilot.advanced.debug.overrideCapiUrl"' in configured
-    assert '"github.copilot.advanced.debug.overrideAuthType": "token"' in configured
+    # `overrideAuthType` is deliberately absent: no such setting exists in the
+    # modern Copilot Chat extension, and writing one made VS Code flag an
+    # unknown key while doing nothing (#3076).
+    assert "overrideAuthType" not in configured
 
     assert configure_vscode_proxy_settings(path, "http://127.0.0.1:9999") == "updated"
     assert "9999" in path.read_text(encoding="utf-8")

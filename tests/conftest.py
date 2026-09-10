@@ -155,6 +155,38 @@ def pytest_runtest_call(item):
 
 
 @pytest.fixture(autouse=True)
+def _null_binary_pins():
+    """Null the tools.json SHA-256 pins during tests.
+
+    Installer tests fetch small mock archives, whose digests can't match the
+    real published pins. Nulling the pins lets those download/extract mechanics
+    tests run (verification then falls back to HTTPS trust); the tests that
+    specifically exercise verification set their own pin explicitly. Production
+    keeps the real pins (this fixture is test-only) and the tools-hash-refresh
+    CI gate guarantees they stay correct.
+    """
+    try:
+        from headroom import binaries
+    except Exception:
+        # Lean CI environments (e.g. the native-installer jobs) omit heavy deps
+        # such as opentelemetry that importing `binaries` pulls in. There are no
+        # tool pins to null there, so skip cleanly rather than erroring at setup.
+        yield
+        return
+
+    saved = [
+        (asset, asset.get("sha256"))
+        for tool in binaries._registry().get("tools", {}).values()
+        for asset in tool.get("assets", {}).values()
+    ]
+    for asset, _original in saved:
+        asset["sha256"] = None
+    yield
+    for asset, original in saved:
+        asset["sha256"] = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 

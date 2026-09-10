@@ -258,6 +258,133 @@ def test_preindex_spawn_failure_is_non_fatal(
 
 
 # ---------------------------------------------------------------------------
+# HEADROOM_SERENA_INDEX_TIMEOUT — the stall budget is tunable (#3093)
+# ---------------------------------------------------------------------------
+
+
+def _clear_index_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve from a known-empty environment, not the developer's shell."""
+    monkeypatch.delenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, raising=False)
+
+
+def test_index_timeout_defaults_when_env_is_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_index_timeout(monkeypatch)
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == wrap_cli._SERENA_INDEX_TIMEOUT
+
+
+def test_index_timeout_reads_the_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "45")
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == 45
+
+
+@pytest.mark.parametrize("raw", ["  30  ", "\t30\n"])
+def test_index_timeout_tolerates_surrounding_whitespace(
+    raw: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An env var exported from a shell heredoc keeps its padding."""
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, raw)
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == 30
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_index_timeout_treats_a_blank_value_as_unset(
+    raw: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``export HEADROOM_SERENA_INDEX_TIMEOUT=`` is not a misconfiguration."""
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, raw)
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == wrap_cli._SERENA_INDEX_TIMEOUT
+    assert capsys.readouterr().out == ""  # no warning noise on the default path
+
+
+def test_index_timeout_accepts_the_smallest_useful_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "1")
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == 1
+
+
+def test_index_timeout_accepts_a_budget_longer_than_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deliberately huge monorepo may want *more* than 300s, not less."""
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "86400")
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == 86400
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "abc", "30s", "1.5", "1e3", "0x10", "None"])
+def test_index_timeout_falls_back_on_an_unusable_value(
+    raw: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Best-effort means degrade to the default, never abort the launch."""
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, raw)
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == wrap_cli._SERENA_INDEX_TIMEOUT
+
+    # A silently-ignored knob is the bug being fixed, so say so — and quote the
+    # value back, since the usual cause is a unit suffix the parser rejects.
+    out = capsys.readouterr().out
+    assert wrap_cli._SERENA_INDEX_TIMEOUT_ENV in out
+    assert repr(raw) in out
+
+
+def test_index_timeout_survives_a_float_unrepresentable_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``int()`` accepts integers ``float()`` cannot hold; resolving must not raise.
+
+    ``communicate`` would go on to raise ``OverflowError`` adding that to a
+    monotonic clock, which the caller's generic handler already absorbs as a
+    non-fatal skip — so the budget is honoured as given rather than clamped.
+    """
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "1" + "0" * 400)
+
+    assert wrap_cli._resolve_serena_index_timeout_seconds() == 10**400
+
+
+def test_preindex_uses_the_env_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The resolved budget reaches ``communicate`` — the point of #3093."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "5")
+    _stub_uvx(monkeypatch)
+    proc = _FakeProc()
+    _stub_popen(monkeypatch, proc)
+    seen: list[float | None] = []
+    monkeypatch.setattr(
+        proc, "communicate", lambda timeout=None: (seen.append(timeout), ("", ""))[1]
+    )
+
+    wrap_cli._index_serena_project()
+
+    assert seen == [5]
+
+
+def test_preindex_still_runs_on_an_unusable_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bad value must not skip the pre-index or propagate out of it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(wrap_cli._SERENA_INDEX_TIMEOUT_ENV, "not-a-number")
+    _stub_uvx(monkeypatch)
+    proc = _FakeProc()
+    mock_popen = _stub_popen(monkeypatch, proc)
+    seen: list[float | None] = []
+    monkeypatch.setattr(
+        proc, "communicate", lambda timeout=None: (seen.append(timeout), ("", ""))[1]
+    )
+
+    wrap_cli._index_serena_project()  # must not propagate
+
+    mock_popen.assert_called_once()
+    assert seen == [wrap_cli._SERENA_INDEX_TIMEOUT]
+
+
+# ---------------------------------------------------------------------------
 # _kill_serena_index_tree — no orphaned `serena project index` on timeout
 # ---------------------------------------------------------------------------
 

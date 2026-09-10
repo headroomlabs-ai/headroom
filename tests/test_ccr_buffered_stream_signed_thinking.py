@@ -62,8 +62,35 @@ def _config() -> ProxyConfig:
     )
 
 
-def _body(*, with_thinking: bool) -> dict:
-    messages: list[dict] = [{"role": "user", "content": "hi"}]
+@pytest.fixture
+def ccr_marker() -> str:
+    """A marker this proxy actually owns, so retrieval could really fire.
+
+    The buffered path is only taken when the outgoing body carries a redeemable
+    marker (#3071) — ``headroom_retrieve`` has nothing to expand otherwise. These
+    tests are about what happens *on* that path, so they have to earn it.
+    """
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    store = get_compression_store(backend=InMemoryBackend())
+    hash_key = store.store(
+        "the original, uncompressed tool output",
+        "<<ccr:placeholder>>",
+        original_tokens=100,
+        compressed_tokens=5,
+        tool_name="Read",
+    )
+    try:
+        yield hash_key
+    finally:
+        reset_compression_store()
+
+
+def _body(*, with_thinking: bool, marker: str | None = None) -> dict:
+    first = "hi" if marker is None else f"hi — earlier output is at <<ccr:{marker}>>"
+    messages: list[dict] = [{"role": "user", "content": first}]
     if with_thinking:
         messages.append(SIGNED_THINKING_TURN)
         messages.append({"role": "user", "content": "continue"})
@@ -81,13 +108,30 @@ def _headers() -> dict[str, str]:
 
 
 @pytest.mark.parametrize(
-    ("with_thinking", "expect_plain_streaming"),
-    [(True, True), (False, False)],
+    ("with_thinking", "relaxation_enabled", "expect_plain_streaming"),
+    [
+        # Locked (kill switch engaged): the flip cannot reach upstream, so
+        # buffering would ask for a stream and then parse it as JSON, stranding
+        # the client with an unreadable 200. This is #2952 exactly.
+        (True, False, True),
+        # Relaxed (default): no transform touched the thinking block, so the
+        # flip DOES land and buffered retrieval becomes the coherent choice --
+        # the outcome #2952 wanted before the blanket lock made it unreachable.
+        (True, True, False),
+        # No thinking block: unaffected in either regime.
+        (False, True, False),
+        (False, False, False),
+    ],
 )
 def test_signed_thinking_history_skips_the_buffered_ccr_path(
-    with_thinking: bool, expect_plain_streaming: bool
+    with_thinking: bool,
+    relaxation_enabled: bool,
+    expect_plain_streaming: bool,
+    ccr_marker: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The buffered path is only chosen when the stream:false flip can land."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1" if relaxation_enabled else "0")
     calls: dict[str, object] = {}
 
     async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
@@ -115,7 +159,9 @@ def test_signed_thinking_history_skips_the_buffered_ccr_path(
         client.app.state.proxy._stream_response = fake_stream_response
         client.app.state.proxy._retry_request = fake_retry
         resp = client.post(
-            "/v1/messages", json=_body(with_thinking=with_thinking), headers=_headers()
+            "/v1/messages",
+            json=_body(with_thinking=with_thinking, marker=ccr_marker),
+            headers=_headers(),
         )
 
     assert resp.status_code == 200, resp.text
@@ -133,7 +179,7 @@ def test_signed_thinking_history_skips_the_buffered_ccr_path(
 
 @pytest.mark.parametrize("upstream_delay", [0.0, 1.2], ids=["prompt", "past-keepalive"])
 def test_buffered_ccr_relays_an_unexpected_sse_reply_and_does_not_cache_it(
-    upstream_delay: float,
+    upstream_delay: float, ccr_marker: str
 ) -> None:
     """A 200 SSE reply on the buffered path reaches the client as a stream.
 
@@ -153,7 +199,11 @@ def test_buffered_ccr_relays_an_unexpected_sse_reply_and_does_not_cache_it(
     with TestClient(app) as client:
         proxy = client.app.state.proxy
         proxy._retry_request = fake_retry
-        resp = client.post("/v1/messages", json=_body(with_thinking=False), headers=_headers())
+        resp = client.post(
+            "/v1/messages",
+            json=_body(with_thinking=False, marker=ccr_marker),
+            headers=_headers(),
+        )
 
         assert resp.status_code == 200, resp.text
         assert resp.headers["content-type"].startswith("text/event-stream")
@@ -162,6 +212,76 @@ def test_buffered_ccr_relays_an_unexpected_sse_reply_and_does_not_cache_it(
         # served a stream to a buffered caller in the first place.
         assert proxy.cache is not None
         assert len(proxy.cache._cache) == 0, "an unparseable body must never be cached"
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "expect_buffered"),
+    [
+        ("owned", True),
+        ("none", False),
+        ("foreign", False),
+    ],
+)
+def test_buffering_is_gated_on_a_redeemable_marker(
+    marker_kind: str, expect_buffered: bool, ccr_marker: str
+) -> None:
+    """A resident ``headroom_retrieve`` is not on its own a reason to buffer (#3071).
+
+    The tool is injected once and kept resident so the tools array stays
+    byte-stable for the prompt cache. Buffering on its presence alone meant
+    every later streaming turn of a sticky session lost incremental delivery —
+    time-to-first-byte became the whole generation. Retrieval can only expand a
+    marker that is in the outgoing body *and* redeemable now, so that is what
+    the wire-format decision keys on.
+    """
+    marker = {
+        "owned": ccr_marker,
+        "none": None,
+        # Correct shape, not ours: adopting it would send the model to a
+        # retrieval that is guaranteed to miss (#2836).
+        "foreign": "deadbeefcafe",
+    }[marker_kind]
+
+    calls: dict[str, object] = {}
+
+    async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
+        calls["stream_body"] = body
+        return fastapi.responses.StreamingResponse(iter([SSE_BODY]), media_type="text/event-stream")
+
+    async def fake_retry(method, url, headers, req_body, *args, **kwargs):  # noqa: ANN001
+        calls["buffered_body"] = json.loads(json.dumps(req_body))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-20250514",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    app = create_app(_config())
+    with TestClient(app) as client:
+        client.app.state.proxy._stream_response = fake_stream_response
+        client.app.state.proxy._retry_request = fake_retry
+        resp = client.post(
+            "/v1/messages",
+            json=_body(with_thinking=False, marker=marker),
+            headers=_headers(),
+        )
+
+    assert resp.status_code == 200, resp.text
+    if expect_buffered:
+        assert "buffered_body" in calls, "a redeemable marker must still buffer"
+        assert calls["buffered_body"]["stream"] is False
+    else:
+        assert "stream_body" in calls, "nothing to retrieve — the client must keep streaming"
+        assert "buffered_body" not in calls
+        assert calls["stream_body"]["stream"] is True
 
 
 def test_cache_hit_never_replays_a_foreign_content_type() -> None:

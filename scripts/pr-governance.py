@@ -41,6 +41,28 @@ ROLLOUT_FIELDS = (
     "Rollback path",
 )
 
+# Conventional-commit types accepted by .commitlintrc.json. Keep the two in
+# sync: commitlint gates the *commits* on a PR, but the repo squash-merges, so
+# it is the PR *title* that becomes the subject line on main.
+COMMIT_TYPES = (
+    "build",
+    "chore",
+    "ci",
+    "deps",
+    "docs",
+    "feat",
+    "fix",
+    "parity",
+    "perf",
+    "refactor",
+    "revert",
+    "style",
+    "test",
+)
+
+# type(optional-scope)!: subject
+TITLE_RE = re.compile(rf"^(?:{'|'.join(COMMIT_TYPES)})(?:\([^)]+\))?!?: .+")
+
 SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 CHECKBOX_RE = re.compile(r"^- \[(?P<checked>[ xX])\] (?P<label>.+)$", re.MULTILINE)
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -171,6 +193,19 @@ def validate_pull_request(event: dict[str, Any]) -> GovernanceReport:
 
     sections = extract_sections(body)
     problems: list[str] = []
+
+    # A squash-merge uses the PR title as the commit subject on main, and
+    # release-please parses those subjects. One unparseable title stops it
+    # building a release PR at all, and the change is silently dropped from the
+    # changelog either way. commitlint cannot catch this: it lints the commits
+    # inside the PR, not the title that replaces them.
+    title = (pull_request.get("title") or "").strip()
+    if not TITLE_RE.match(title):
+        problems.append(
+            f"PR title must be a Conventional Commit — `type(scope): subject` — because "
+            f"squash-merge makes it the commit subject on `main` and release-please parses it. "
+            f"Got: `{title or '(empty)'}`. Valid types: {', '.join(f'`{t}`' for t in COMMIT_TYPES)}."
+        )
 
     for section_name in REQUIRED_SECTIONS:
         if section_name not in sections:

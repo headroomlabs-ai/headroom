@@ -123,6 +123,20 @@ def test_terminal_helper_remains_deferrable():
     assert helper.get("defer_loading") is True
 
 
+def test_prefixed_core_and_terminal_names_stay_resident():
+    resident = ["_bash", "_read", "_write", "_edit", "_glob", "_grep", "_terminal"]
+    noncore = ["_hub", "_todo", "_eval", "mcp__server__read", "terminal_helper"]
+    tools = [_fn(name) for name in resident + noncore]
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    by_name = {tool["name"]: tool for tool in out if tool.get("type") == "function"}
+    for name in resident:
+        assert by_name[name].get("defer_loading") is None, name
+    for name in noncore:
+        assert by_name[name].get("defer_loading") is True, name
+
+
 def test_defers_mcp_server():
     tools = [_fn(n) for n in _CORE] + [{"type": "mcp", "server_label": "sentry"}]
     tools += [_fn(f"x{i}") for i in range(8)]

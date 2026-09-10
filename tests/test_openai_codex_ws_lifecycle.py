@@ -412,7 +412,8 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
     sent = json.loads(upstream.sent[0])
     payload = sent["response"]
     assert "<headroom_output_shaping>" in payload["instructions"]
-    assert payload["text"]["verbosity"] == "low"
+    # text.verbosity is no longer injected: steering is the only lever.
+    assert "text" not in payload
     assert any(t == "output_shaper:verbosity:L2" for t in outcomes[-1].transforms_applied)
 
 
@@ -2243,3 +2244,56 @@ async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call(
     assert second_response[6]["item"] == function_call_two
     assert second_response[7]["response"]["id"] == "r-2"
     assert executed == [("memory_search", {}, "user-1", "openai")]
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_track_model_per_response_create():
+    """A model switch on one WS session must affect the next request outcome."""
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "model": "model-a",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "model": "model-b",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-a", "input": "first turn"},
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-b", "input": "second turn"},
+        }
+    )
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert [request["model"] for request in handler.metrics.recorded_requests] == [
+        "model-a",
+        "model-b",
+    ]

@@ -445,7 +445,15 @@ async def test_streaming_handler_falls_back_to_buffer_on_processing_error(
         lambda data: (_ for _ in ()).throw(RuntimeError("parse failed")),
     )
 
-    chunks = [b'{"type":"tool_use","name":"headroom_retrieve"', b',"stop_reason":"tool_use"}']
+    # Real OpenAI wire shape: a `tool_calls` delta naming the CCR tool, then
+    # the `[DONE]` sentinel. This test previously fed Anthropic-shaped bytes to
+    # an ``openai`` handler, so it never reached the OpenAI detection path.
+    chunks = [
+        b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,'
+        b'"id":"call_1","function":{"name":"headroom_retrieve",'
+        b'"arguments":"{}"}}]}}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
     streamed = [
         chunk
         async for chunk in handler.process_stream(_async_iter(chunks), [], None, lambda m, t: None)
@@ -462,7 +470,14 @@ async def test_response_to_sse_formats() -> None:
 
     openai = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
     openai_chunks = [chunk async for chunk in openai._response_to_sse({"choices": []})]
-    assert openai_chunks == [b'data: {"choices": []}\n\n', b"data: [DONE]\n\n"]
+    # An empty body still produces well-formed chunk frames (role, then a
+    # terminal frame carrying finish_reason) rather than a single non-streaming
+    # body a streaming client cannot read.
+    assert openai_chunks[-1] == b"data: [DONE]\n\n"
+    frames = [json.loads(chunk.decode()[len("data: ") :]) for chunk in openai_chunks[:-1]]
+    assert [frame["object"] for frame in frames] == ["chat.completion.chunk"] * 2
+    assert frames[0]["choices"][0]["delta"] == {"role": "assistant"}
+    assert frames[-1]["choices"][0]["finish_reason"] == "stop"
 
 
 @pytest.mark.asyncio
@@ -533,3 +548,229 @@ def test_reconstruct_server_tool_use_input_from_partial_json() -> None:
     assert block["type"] == "server_tool_use"
     assert block["input"] == {"query": "x"}
     assert "_partial_json" not in block
+
+
+def _openai_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> bytes:
+    """One `chat.completion.chunk` SSE frame in the shape a real backend sends."""
+    payload = {
+        "id": "chatcmpl_1",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def test_streaming_buffer_detects_ccr_in_openai_tool_calls_delta() -> None:
+    # An OpenAI-compatible stream never emits Anthropic's `"type":"tool_use"`
+    # marker; its tool calls arrive as a `tool_calls` array inside
+    # `choices[].delta`. Scanning only for the Anthropic marker meant CCR was
+    # never detected on this provider.
+    buffer = StreamingCCRBuffer(provider="openai")
+
+    assert buffer.add_chunk(_openai_chunk({"role": "assistant"})) is False
+    detected = buffer.add_chunk(
+        _openai_chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {"name": CCR_TOOL_NAME, "arguments": ""},
+                    }
+                ]
+            }
+        )
+    )
+
+    assert detected is True
+    assert buffer.detected_ccr is True
+
+    # A non-CCR tool call on the same provider must not trip detection.
+    other = StreamingCCRBuffer(provider="openai")
+    assert (
+        other.add_chunk(
+            _openai_chunk(
+                {"tool_calls": [{"index": 0, "id": "c", "function": {"name": "other_tool"}}]}
+            )
+        )
+        is False
+    )
+    assert other.detected_ccr is False
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_without_ccr_yields_every_chunk() -> None:
+    # A short OpenAI stream with no CCR call must pass through byte for byte.
+    # End-of-stream was detected by scanning for Anthropic's `stop_reason`,
+    # which an OpenAI stream never contains, so nothing was ever flushed and
+    # the client received an empty response.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    chunks = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk({"content": "hello "}),
+        _openai_chunk({"content": "world"}),
+        _openai_chunk({}, finish_reason="stop"),
+        b"data: [DONE]\n\n",
+    ]
+
+    streamed = [
+        chunk
+        async for chunk in handler.process_stream(_async_iter(chunks), [], None, lambda m, t: None)
+    ]
+
+    assert streamed == chunks
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_past_flush_threshold_keeps_the_tail() -> None:
+    # Past 10 000 buffered bytes the handler flushes in batches. Without an
+    # end-of-stream match the final sub-threshold batch was never flushed, so
+    # a long response visibly stopped mid-sentence.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    chunks = [
+        _openai_chunk({"role": "assistant"}),
+        _openai_chunk({"content": "x" * 11000}),
+        _openai_chunk({"content": "the tail that used to be dropped"}),
+        _openai_chunk({}, finish_reason="stop"),
+        b"data: [DONE]\n\n",
+    ]
+
+    streamed = [
+        chunk
+        async for chunk in handler.process_stream(_async_iter(chunks), [], None, lambda m, t: None)
+    ]
+
+    assert streamed == chunks
+    assert b"the tail that used to be dropped" in b"".join(streamed)
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_without_done_sentinel_still_flushes() -> None:
+    # Upstream can truncate before `[DONE]`, and some gateways omit it. Bytes
+    # left in the buffer when the source iterator is exhausted are real
+    # response data, so they are flushed rather than discarded.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    chunks = [_openai_chunk({"role": "assistant"}), _openai_chunk({"content": "partial answer"})]
+
+    streamed = [
+        chunk
+        async for chunk in handler.process_stream(_async_iter(chunks), [], None, lambda m, t: None)
+    ]
+
+    assert streamed == chunks
+
+
+def test_reconstruct_openai_response_marks_tool_calls_finish_reason() -> None:
+    # OpenAI requires `finish_reason: "tool_calls"` when the message carries
+    # tool calls. It was hardcoded to "stop", so a client driving its agent
+    # loop off `finish_reason` ended the turn instead of running the tools.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+
+    parsed = handler._reconstruct_openai_response(
+        [
+            {"id": "chatcmpl_1", "model": "gpt-4o-mini", "created": 1700000000},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": CCR_TOOL_NAME,
+                                        "arguments": '{"hash":"abc"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [{"delta": None, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+            },
+        ]
+    )
+
+    assert parsed["choices"][0]["finish_reason"] == "tool_calls"
+    # The chunk envelope is carried through so the reconstructed body is a
+    # valid `chat.completion` rather than a bare `choices` list.
+    assert parsed["object"] == "chat.completion"
+    assert parsed["id"] == "chatcmpl_1"
+    assert parsed["model"] == "gpt-4o-mini"
+    assert parsed["created"] == 1700000000
+    assert parsed["usage"] == {"prompt_tokens": 12, "completion_tokens": 3}
+
+
+def test_reconstruct_openai_response_keeps_upstream_finish_reason() -> None:
+    # With no tool calls, the upstream reason is preserved instead of being
+    # rewritten to "stop": a truncated turn must stay reported as truncated.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+
+    parsed = handler._reconstruct_openai_response(
+        [
+            {"choices": [{"delta": {"content": "half an ans"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        ]
+    )
+
+    assert parsed["choices"][0]["finish_reason"] == "length"
+    assert parsed["choices"][0]["message"]["content"] == "half an ans"
+
+    # And an absent reason still defaults to "stop".
+    defaulted = handler._reconstruct_openai_response(
+        [{"choices": [{"delta": {"content": "hi"}}]}],
+    )
+    assert defaulted["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_response_to_sse_emits_openai_chunk_frames() -> None:
+    # A streaming client reads `choices[].delta`. Re-serialising the
+    # reconstructed non-streaming body (`choices[].message`) into one SSE frame
+    # made both the content and the tool calls invisible to it.
+    handler = StreamingCCRHandler(CCRResponseHandler(), provider="openai")
+    response = {
+        "id": "chatcmpl_2",
+        "object": "chat.completion",
+        "created": 1700000001,
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "tool_calls": [
+                        {
+                            "id": "call_9",
+                            "type": "function",
+                            "function": {"name": "do_thing", "arguments": '{"a":1}'},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+    chunks = [chunk async for chunk in handler._response_to_sse(response)]
+
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    frames = [json.loads(chunk.decode()[len("data: ") :]) for chunk in chunks[:-1]]
+    assert all(frame["object"] == "chat.completion.chunk" for frame in frames)
+    assert all("delta" in frame["choices"][0] for frame in frames)
+    assert all(frame["id"] == "chatcmpl_2" for frame in frames)
+
+    deltas = [frame["choices"][0]["delta"] for frame in frames]
+    assert deltas[0] == {"role": "assistant"}
+    assert deltas[1] == {"content": "done"}
+    assert deltas[2]["tool_calls"][0]["id"] == "call_9"
+    assert deltas[2]["tool_calls"][0]["index"] == 0
+    assert deltas[2]["tool_calls"][0]["function"] == {"name": "do_thing", "arguments": '{"a":1}'}
+    assert frames[-1]["choices"][0]["finish_reason"] == "tool_calls"

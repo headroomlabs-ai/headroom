@@ -21,11 +21,20 @@ def compute_semantic_cache_key(
     model: str,
     **key_fields: Any,
 ) -> str:
-    """Compute the proxy semantic-cache key from generation-shaping inputs."""
+    """Compute the proxy semantic-cache key from generation-shaping inputs.
+
+    ``cache_control`` is stripped from ``messages`` as well as the shaping
+    fields: it is a prompt-caching directive for the upstream provider that
+    never changes the generated completion, so a moved breakpoint must not
+    fragment the key. Messages are the primary key component and, on the
+    Anthropic path, the most common place a client (e.g. Claude Code) moves a
+    breakpoint between turns, so leaving them un-stripped defeated the strip for
+    the field that matters most.
+    """
     normalized = json.dumps(
         {
             "model": model,
-            "messages": messages,
+            "messages": strip_cache_control(messages),
             **{k: strip_cache_control(v) for k, v in key_fields.items()},
         },
         sort_keys=True,

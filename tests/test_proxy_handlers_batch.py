@@ -156,6 +156,9 @@ class FakeRequest:
         self.method = method
         self.url = SimpleNamespace(path=path, query=query)
         self.query_params = {}
+        # Every real Starlette Request has one, and handlers now share a
+        # per-request attribution ledger through it (savings_attribution).
+        self.scope: dict = {"type": "http", "method": method}
 
     async def body(self) -> bytes:
         return self._body

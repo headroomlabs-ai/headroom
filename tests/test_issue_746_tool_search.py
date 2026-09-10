@@ -350,6 +350,42 @@ def test_resident_real_tool_survives_pascal_case_surface() -> None:
     assert any(not t.get("type") and not t.get("defer_loading") for t in out)
 
 
+def _omp_tools() -> list[dict]:
+    """Oh My Pi's 12-tool surface: underscore-prefixed built-ins plus typed tools."""
+    named = [
+        "_hub",
+        "_edit",
+        "_task",
+        "_todo",
+        "_eval",
+        "_read",
+        "_bash",
+        "_glob",
+        "_grep",
+        "_write",
+    ]
+    return [
+        *[{"name": name, "description": name, "input_schema": {}} for name in named],
+        {"type": "computer_20250124", "name": "computer"},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+
+
+def test_core_tools_match_leading_underscore_namespace() -> None:
+    tools = _omp_tools()
+    assert len(tools) == _TOOL_SEARCH_MIN_TOOLS
+
+    out = inject_tool_search_deferral(tools)
+
+    by_name = {tool.get("name"): tool for tool in out if isinstance(tool, dict)}
+    for name in ("_edit", "_task", "_read", "_bash", "_glob", "_grep", "_write"):
+        assert by_name[name].get("defer_loading") is None, name
+    for name in ("_hub", "_todo", "_eval"):
+        assert by_name[name].get("defer_loading") is True, name
+    for name in ("computer", "web_search"):
+        assert by_name[name].get("defer_loading") is None, name
+
+
 # ---------------------------------------------------------------------------
 # Tool-search history repair (#2805)
 #

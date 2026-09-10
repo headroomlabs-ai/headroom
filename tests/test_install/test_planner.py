@@ -330,3 +330,38 @@ def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
     # telemetry_enabled=False in _base_manifest_kwargs would normally set "off";
     # an explicit --env must win.
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"
+
+
+def test_build_manifest_grok_build_only_sets_xai_upstream() -> None:
+    """Persistent install for Grok Build alone must route proxy upstream to xAI."""
+    from headroom.providers.grok import DEFAULT_API_URL
+
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["grok_build"], backend="openai"))
+
+    assert manifest.base_env.get("OPENAI_TARGET_API_URL") == DEFAULT_API_URL
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == DEFAULT_API_URL
+
+
+def test_build_manifest_grok_with_codex_does_not_force_xai() -> None:
+    """Do not override OpenAI upstream when OpenAI-native tools share the proxy."""
+    manifest = build_manifest(
+        **_base_manifest_kwargs(targets=["grok_build", "codex"], backend="openai")
+    )
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_build_manifest_extra_env_wins_over_grok_xai_default() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            targets=["grok_build"],
+            backend="openai",
+            extra_env={"OPENAI_TARGET_API_URL": "https://gateway.example/v1"},
+        )
+    )
+
+    assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"
