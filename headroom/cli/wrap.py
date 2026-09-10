@@ -2829,6 +2829,67 @@ def _strip_existing_codex_headroom_provider_table(content: str) -> str:
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 
+# A ``[mcp_servers.headroom_memory]`` key may use quoted or bare segments
+# and arbitrary whitespace around the dot (e.g.
+# ``[mcp_servers."headroom_memory"]`` or ``[ mcp_servers . headroom_memory ]``)
+# — TOML treats all of these as the same table. Recognise every spelling so a
+# variant doesn't slip past this guard and become a second, semantically
+# duplicate ``mcp_servers.headroom_memory`` table (``tomllib.loads`` raises
+# ``TOMLDecodeError: Cannot declare ('mcp_servers', 'headroom_memory')
+# twice``).
+_TOML_BARE_OR_QUOTED_KEY = r'(?:"{key}"|\'{key}\'|{key})'
+_TOML_MCP_SERVERS_KEY = _TOML_BARE_OR_QUOTED_KEY.format(key="mcp_servers")
+_TOML_HEADROOM_MEMORY_KEY = _TOML_BARE_OR_QUOTED_KEY.format(key="headroom_memory")
+# Matches a `[mcp_servers.headroom_memory]` header line, tolerating quoted
+# keys and stray whitespace around the dot (e.g. `[mcp_servers."headroom_memory"]`
+# or `[ mcp_servers . headroom_memory ]`) -- TOML treats all of these as the
+# same table, and a variant spelling must not slip past this guard and
+# become a second, semantically-duplicate table (`tomllib.loads` raises
+# `TOMLDecodeError: Cannot declare (\'mcp_servers\', \'headroom_memory\') twice`).
+_TOML_MEMORY_MCP_HEADER_RE = re.compile(
+    r"^[ \t]*\[[ \t]*"
+    + _TOML_MCP_SERVERS_KEY
+    + r"[ \t]*\.[ \t]*"
+    + _TOML_HEADROOM_MEMORY_KEY
+    + r"[ \t]*\][ \t]*(#.*)?$"
+)
+# Any real top-level TOML table header, e.g. `[foo]` or `[foo.bar]` (not an
+# array-of-tables `[[foo]]`). Used to find where a table's body ends.
+_TOML_GENERIC_HEADER_RE = re.compile(r"^[ \t]*\[(?!\[)[^\[\]\n]+\][ \t]*(#.*)?$")
+# A triple-quoted string delimiter, basic (\"\"\") or literal (\'\'\').
+_TOML_TRIPLE_QUOTE_RE = re.compile(r'"""|\'\'\'')
+
+
+def _multiline_string_start_flags(lines: list[str]) -> list[bool]:
+    """For each line, whether it *begins* already inside an open triple-
+    quoted string (i.e. a preceding line opened one that this line's own
+    content has not yet closed).
+
+    This only tracks triple-quote (multiline) string delimiters -- it is a
+    heuristic guard against corrupting multiline string *values*, not a
+    full TOML tokenizer, so ordinary quoted strings and escapes are not
+    modelled. That is enough to stop a `[table]`-looking line embedded in
+    an `instructions = \"\"\"...\"\"\"` value from being mistaken for a
+    real table header.
+    """
+    flags = []
+    open_delim: str | None = None
+    for line in lines:
+        flags.append(open_delim is not None)
+        pos = 0
+        while True:
+            match = _TOML_TRIPLE_QUOTE_RE.search(line, pos)
+            if match is None:
+                break
+            token = match.group(0)
+            if open_delim is None:
+                open_delim = token
+            elif token == open_delim:
+                open_delim = None
+            pos = match.end()
+    return flags
+
+
 def _strip_existing_codex_memory_mcp_table(content: str) -> str:
     """Remove a pre-existing, unmarked ``[mcp_servers.headroom_memory]`` table.
 
@@ -2836,16 +2897,55 @@ def _strip_existing_codex_memory_mcp_table(content: str) -> str:
     the section exists without the ``_MEMORY_MCP_MARKER``/``_MEMORY_MCP_END``
     comments that make the marker-based idempotency check work (e.g. hand-
     added from the usage example in ``headroom/memory/mcp_server.py``).
+
+    Table boundaries are found by scanning line-by-line while tracking
+    whether each line starts inside an open triple-quoted string (see
+    ``_multiline_string_start_flags``), rather than with a DOTALL ``.*?``.
+    A ``[mcp_servers.headroom_memory]``-looking line that is really part of
+    a multiline string *value* (e.g. an ``instructions = \"\"\"...\"\"\"``
+    block) is therefore left untouched instead of being mistaken for a real
+    header and stripped out from under the string, which previously could
+    delete the string's closing delimiter and any settings after it. Quoted-
+    key and whitespace variants of the header (see
+    ``_TOML_MEMORY_MCP_HEADER_RE``) are also recognised so they don't slip
+    past this guard as a distinct, semantically-duplicate table.
     """
-    if "[mcp_servers.headroom_memory]" not in content:
+    if "headroom_memory" not in content or "mcp_servers" not in content:
         return content
 
-    import re  # local import to match surrounding helper convention
+    if not content.endswith("\n"):
+        content += "\n"
 
-    memory_table = re.compile(
-        r"(?ms)^[ \t]*\[mcp_servers\.headroom_memory\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
-    )
-    content = memory_table.sub("", content)
+    lines = content.split("\n")
+    # ``split`` always leaves a trailing empty element after the final "\n";
+    # drop it here and restore it via the join below.
+    trailing = lines.pop()
+    in_string_flags = _multiline_string_start_flags(lines)
+
+    start_index = None
+    for i, line in enumerate(lines):
+        if not in_string_flags[i] and _TOML_MEMORY_MCP_HEADER_RE.match(line):
+            start_index = i
+            break
+
+    if start_index is None:
+        return content
+
+    end_index = len(lines)
+    for i in range(start_index + 1, len(lines)):
+        if in_string_flags[i]:
+            continue
+        if _TOML_MEMORY_MCP_HEADER_RE.match(lines[i]):
+            # A duplicate target header immediately follows -- consume it
+            # (and its body) too rather than stopping here.
+            continue
+        if _TOML_GENERIC_HEADER_RE.match(lines[i]):
+            end_index = i
+            break
+
+    del lines[start_index:end_index]
+    lines.append(trailing)
+    content = "\n".join(lines)
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
 

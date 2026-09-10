@@ -302,6 +302,79 @@ class TestCodexMemoryMcpConfig:
         parsed = tomllib.loads(content)
         assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
 
+    def test_inject_preserves_table_looking_text_in_multiline_string(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A `[mcp_servers.headroom_memory]`-looking line embedded inside an
+        unrelated multiline string value must not be mistaken for a real
+        table and stripped -- doing so previously deleted the string's
+        closing delimiter and any settings after it, corrupting the file.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        original = (
+            'instructions = """\n'
+            "[mcp_servers.headroom_memory]\n"
+            'keep this instruction\n'
+            '"""\n'
+            'model="gpt-4o"\n'
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        # The unrelated multiline string and the setting after it must
+        # survive untouched.
+        assert 'keep this instruction' in content
+        assert 'model="gpt-4o"' in content
+        # The real, marker-wrapped memory MCP block must still be injected.
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+
+        parsed = tomllib.loads(content)
+        assert parsed["model"] == "gpt-4o"
+        assert parsed["instructions"] == "[mcp_servers.headroom_memory]\nkeep this instruction\n"
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_replaces_quoted_key_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """TOML allows `[mcp_servers."headroom_memory"]` as an equivalent
+        spelling of `[mcp_servers.headroom_memory]`; an unmarked table using
+        this spelling must still be replaced in place, not left behind
+        alongside a second, semantically-duplicate table.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            '[mcp_servers."headroom_memory"]\n'
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--user", "old-user"]\n\n'
+            "[mcp_servers.other]\n"
+            'command = "other-tool"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert '"--user", "codex-user"' in content
+        assert "old-user" not in content
+        assert 'model = "gpt-4o"' in content
+        assert "[mcp_servers.other]" in content
+        assert 'command = "other-tool"' in content
+
+        # Must parse as valid TOML with exactly one `mcp_servers.headroom_memory`
+        # table -- the original bug left the quoted-key table behind, and
+        # `tomllib.loads` raises `Cannot declare (\'mcp_servers\', \'headroom_memory\')
+        # twice` once the marker-wrapped table is appended alongside it.
+        parsed = tomllib.loads(content)
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+        assert parsed["mcp_servers"]["other"]["command"] == "other-tool"
+
 
 class TestInjectAndRestoreRoundTrip:
     """End-to-end wrap → unwrap cycle operating directly on a temp $HOME."""
