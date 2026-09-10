@@ -95,7 +95,7 @@
   "devDependencies": {
     "@ai-sdk/anthropic": "^3.0.64",
     "@ai-sdk/openai": "^4.0.60",
-    "@ai-sdk/provider": "^1.0.0",
+    "@ai-sdk/provider": "^4.0.10",
     "@anthropic-ai/sdk": "^0.124.0",
     "@types/node": "^26.5.0",
     "ai": "^7.0.59",
