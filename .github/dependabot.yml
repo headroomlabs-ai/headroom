@@ -33,13 +33,20 @@ updates:
       interval: weekly
     commit-message:
       prefix: "deps"
-    # Only open PRs for security updates to avoid noise
+    # Limit simultaneous version-update PRs; security updates have a separate limit.
     open-pull-requests-limit: 5
     # MCP SDK 2.x removes the low-level Server API used by the shipping
     # proxy and mcp extras. Keep 1.x until the port tracked in GH #2658 lands.
     ignore:
       - dependency-name: "mcp"
         versions: [">=2.0.0"]
+      # These releases do not fix the optional-extra advisories documented in
+      # SECURITY.md. Keep future versions eligible for review; do not suppress
+      # alerts or ignore these packages indefinitely.
+      - dependency-name: "chromadb"
+        versions: ["<=1.5.9"]
+      - dependency-name: "accelerate"
+        versions: ["<=1.15.0"]
     groups:
       pip-minor-patch:
         update-types:
