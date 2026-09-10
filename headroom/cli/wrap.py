@@ -7609,13 +7609,34 @@ def openclaw(
         install_cmd.append(plugin_spec)
         install_cwd = None
 
-    click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
+    click.echo("  Installing OpenClaw plugin...")
     install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
     )
+    if install_result.returncode != 0:
+        combined_error = "\n".join(
+            x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x
+        )
+        # New OpenClaw releases retired the legacy scan override and require
+        # source/capability confirmation instead. Retry only this explicit CLI
+        # migration request for the selected plugin, preserving older releases
+        # and terminal install-policy blocks.
+        if (
+            "--dangerously-force-unsafe-install is deprecated" in combined_error
+            and "Install cancelled; rerun with --force" in combined_error
+        ):
+            install_cmd[3:4] = ["--force", "--accept-capabilities"]
+            click.echo("  Confirming the selected plugin source and its declared capabilities...")
+            install_result = run(
+                install_cmd,
+                cwd=str(install_cwd) if install_cwd else None,
+                capture_output=True,
+                text=True,
+            )
+
     if install_result.returncode != 0:
         combined_error = "\n".join(
             x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shutil
 import signal
 import stat
@@ -494,7 +495,9 @@ def wait_for_command_success(
 def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[str]:
     log("Starting OpenClaw gateway for e2e verification")
     return subprocess.Popen(
-        ["openclaw", "gateway"],
+        # Container defaults now bind to all interfaces; this isolated harness
+        # only needs local clients and must not expose an unauthenticated port.
+        ["openclaw", "gateway", "--bind", "loopback"],
         env=env,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
@@ -503,11 +506,6 @@ def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[s
         encoding="utf-8",
         errors="replace",
     )
-
-
-def stop_openclaw_gateway(env: dict[str, str], cwd: Path) -> None:
-    log("Stopping OpenClaw gateway after e2e verification")
-    run(["openclaw", "gateway", "stop"], env=env, cwd=cwd, timeout=60)
 
 
 def verify_installs() -> None:
@@ -990,6 +988,9 @@ def verify_openclaw_wrap(
     project_dir: Path,
     plugin_dir: Path,
 ) -> None:
+    # Both gateway startup and health checks require credentials in current
+    # OpenClaw. Keep a per-run token in the child environment, out of argv/logs.
+    base_env = {**base_env, "OPENCLAW_GATEWAY_TOKEN": secrets.token_hex(32)}
     port = OPENCLAW_PROXY_PORT
     gateway_proc: subprocess.Popen[str] | None = None
     run(
@@ -1004,6 +1005,9 @@ def verify_openclaw_wrap(
             "--startup-timeout-ms",
             # 5s is too tight for cold Python+pyo3 import on a busy CI runner.
             "30000",
+            # This harness owns a foreground gateway under an isolated HOME.
+            # OpenClaw refuses OS service management for noncanonical homes.
+            "--no-restart",
             "--verbose",
         ],
         env=base_env,
@@ -1050,6 +1054,7 @@ def verify_openclaw_wrap(
                     ["openclaw", "health"], env=base_env, cwd=project_dir, timeout=30
                 )
             except RuntimeError as exc:
+                stop_process(gateway_proc)
                 gateway_output = ""
                 if gateway_proc.stdout is not None:
                     gateway_output = gateway_proc.stdout.read()
@@ -1073,9 +1078,13 @@ def verify_openclaw_wrap(
     finally:
         if gateway_proc is not None:
             stop_process(gateway_proc)
-        stop_openclaw_gateway(base_env, project_dir)
 
-    run(["headroom", "unwrap", "openclaw"], env=base_env, cwd=project_dir, timeout=120)
+    run(
+        ["headroom", "unwrap", "openclaw", "--no-restart"],
+        env=base_env,
+        cwd=project_dir,
+        timeout=120,
+    )
     state = json.loads(config_path.read_text(encoding="utf-8"))
     assert_true(
         state["plugins"]["slots"]["contextEngine"] == "legacy",
