@@ -199,7 +199,18 @@ def test_bypass_header_does_not_invoke_cached_prefix_replay(monkeypatch):
     assert captured[-1]["messages"] == messages
 
 
-def test_backpressure_does_not_invoke_cached_prefix_replay(monkeypatch):
+def test_backpressure_still_invokes_cached_prefix_replay(monkeypatch):
+    """INVERTED from the pre-#3261 contract this test used to pin.
+
+    Backpressure sheds the compression PIPELINE (the CPU-heavy stage), but
+    the byte-identical cached-prefix replay must STILL run: skipping it
+    forwarded raw originals over a compressed cached prefix, busting every
+    gated session's prompt cache exactly at peak load (the saturated path
+    previously emitted `Cached-prefix replay skipped:
+    reason=pre_upstream_backpressure` — that skip was the bug). The replay
+    self-guards and no-ops here (no previous turn), so the raw messages
+    still pass through unchanged.
+    """
     app = create_app(
         _config(
             optimize=True,
@@ -208,12 +219,29 @@ def test_backpressure_does_not_invoke_cached_prefix_replay(monkeypatch):
         )
     )
 
-    def fail_if_called(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("cached-prefix replay must be skipped under backpressure")
+    from headroom.cache import prefix_tracker as _pt
 
-    monkeypatch.setattr("headroom.cache.prefix_tracker.overlay_cached_prefix", fail_if_called)
-    debug = Mock()
-    monkeypatch.setattr("headroom.proxy.handlers.anthropic.logger.debug", debug)
+    real_overlay = _pt.overlay_cached_prefix
+    overlay_calls: list[int] = []
+
+    def spy(*args, **kwargs):  # noqa: ANN002, ANN003
+        overlay_calls.append(1)
+        return real_overlay(*args, **kwargs)
+
+    # Patch every binding of overlay_cached_prefix: the handler historically
+    # imported it from prefix_tracker per-request, and the shared session
+    # engine (headroom.proxy.session_engine, later in this stack) binds it
+    # at module import — cover both so this test holds across the stack.
+    monkeypatch.setattr("headroom.cache.prefix_tracker.overlay_cached_prefix", spy)
+    try:
+        import headroom.proxy.session_engine as _se
+
+        monkeypatch.setattr(_se, "overlay_cached_prefix", spy)
+    except ImportError:
+        pass
+
+    info = Mock()
+    monkeypatch.setattr("headroom.proxy.handlers.anthropic.logger.info", info)
     proxy = app.state.proxy
 
     class _SaturatedSemaphore:
@@ -236,10 +264,13 @@ def test_backpressure_does_not_invoke_cached_prefix_replay(monkeypatch):
         proxy.anthropic_pre_upstream_sem.release()
 
     assert response.status_code == 200, response.text
-    assert captured[-1]["messages"] == messages
-    assert any(
-        call.args and call.args[-1] == "pre_upstream_backpressure" for call in debug.call_args_list
+    # Backpressure engaged (pipeline shed)...
+    assert any("pre_upstream_backpressure" in str(call) for call in info.call_args_list), (
+        "backpressure did not engage — the test setup no longer saturates"
     )
+    # ...but the replay ran (and, with no previous turn, no-op'd safely).
+    assert overlay_calls, "cached-prefix replay must run under backpressure"
+    assert captured[-1]["messages"] == messages
 
 
 def test_optimize_on_aligned_history_preserves_replay():

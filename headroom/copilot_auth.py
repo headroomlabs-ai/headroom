@@ -25,6 +25,7 @@ from headroom import paths
 from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+from headroom.proxy import ssl_context as proxy_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,15 @@ _OAUTH_TOKEN_KEYS = (
     "accessToken",
 )
 _EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry", "expires")
+
+
+def _urlopen(request: urllib_request.Request, *, timeout: float) -> Any:
+    """Open a GitHub request with Headroom's configured corporate trust roots."""
+
+    context = proxy_ssl_context.build_urlopen_context()
+    if context is not None:
+        return urllib_request.urlopen(request, timeout=timeout, context=context)
+    return urllib_request.urlopen(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -662,7 +672,7 @@ def start_copilot_device_authorization(
         },
         method="POST",
     )
-    with urllib_request.urlopen(request, timeout=timeout) as response:
+    with _urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8", errors="replace"))
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -700,7 +710,7 @@ def poll_copilot_device_authorization(
             },
             method="POST",
         )
-        with urllib_request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
         if not isinstance(payload, dict):
             raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -1341,7 +1351,7 @@ def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
     headers = _copilot_token_exchange_headers(token)
     request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
     try:
-        with urllib_request.urlopen(request, timeout=10.0) as response:
+        with _urlopen(request, timeout=10.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         logger.debug("Unable to resolve Copilot API URL from user info: %s", exc)
@@ -1457,7 +1467,7 @@ class CopilotTokenProvider:
     def _exchange_token_sync(headers: dict[str, str]) -> dict[str, Any]:
         request = urllib_request.Request(_token_exchange_url(), headers=headers, method="GET")
         try:
-            with urllib_request.urlopen(request, timeout=10.0) as response:
+            with _urlopen(request, timeout=10.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 if not isinstance(payload, dict):
                     return {}

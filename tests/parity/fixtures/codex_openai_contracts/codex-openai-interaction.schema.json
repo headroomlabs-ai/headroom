@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/chopratejas/headroom/blob/main/tests/parity/fixtures/codex_openai_contracts/codex-openai-interaction.schema.json",
+  "$id": "https://github.com/headroomlabs-ai/headroom/blob/main/tests/parity/fixtures/codex_openai_contracts/codex-openai-interaction.schema.json",
   "title": "Codex <-> OpenAI interaction contracts (PR #794)",
   "description": "Enshrines the OpenAI interaction expectations this changeset depends on, so drift is detectable. Header values are transported as strings on the wire; the `x-headroom-parsed-type` annotation on each records the semantic type the parser (headroom/subscription/codex_rate_limits.py) coerces them to. Sources: codex_rate_limits.parse_codex_rate_limits (header family + gating), openai._extract_codex_handshake_headers (WS-101 forward filter), streaming.py (SSE forward filter).",
   "$defs": {

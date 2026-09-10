@@ -94,6 +94,9 @@ def _reset_module_state(monkeypatch):
 
 def _make_compressor(monkeypatch, model: FakeModel, **config_kwargs) -> KompressCompressor:
     config_kwargs.setdefault("enable_ccr", False)
+    # These fixtures are deliberately tiny; drop the production word floor
+    # (min_input_words=64) to its clamp so the failsafe paths under test run.
+    config_kwargs.setdefault("min_input_words", 10)
     compressor = KompressCompressor(config=KompressConfig(**config_kwargs))
     monkeypatch.setattr(
         kc,
