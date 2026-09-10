@@ -26,6 +26,11 @@ from headroom.proxy.output_savings import (
 # ---------------------------------------------------------------------------
 
 
+# A treatment observation only counts when the request was actually shaped,
+# evidenced by the shaper's own verbosity label on the same channel.
+SHAPED = "output_shaper:verbosity:L2"
+
+
 class TestStratification:
     def test_input_buckets_monotone(self):
         assert input_bucket(0) == "xs"
@@ -406,6 +411,7 @@ class TestHoldoutClusterGate:
             assert recorder.record_from_labels(
                 [
                     "router:noop",
+                    "output_shaper:verbosity:concise",
                     stratum_label("treatment", "opus|a|s|tools"),
                     conversation_label(key),
                 ],
@@ -419,7 +425,9 @@ class TestHoldoutClusterGate:
 
     def test_a_request_without_a_conversation_label_still_records(self, tmp_path):
         recorder = SavingsRecorder(tmp_path / "savings.json", flush_every=1)
-        assert recorder.record_from_labels([stratum_label("treatment", "opus|a|s|tools")], 800)
+        assert recorder.record_from_labels(
+            [stratum_label("treatment", "opus|a|s|tools"), "output_shaper:verbosity:concise"], 800
+        )
         ledger = SavingsLedger.load(tmp_path / "savings.json")
         assert ledger.treatment["opus|a|s|tools"].n == 1
         assert ledger.treatment["opus|a|s|tools"].n_clusters == 0
@@ -434,6 +442,8 @@ class TestHoldoutClusterGate:
         cluster gate exists to exclude -- and nothing on disk can say.
         """
         return {
+            # Shaped-only arms can predate conversation provenance.
+            "shaped_only": True,
             "baseline": {"strata": {}},
             "treatment": {
                 "opus|a|s|tools": {
@@ -589,7 +599,7 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels([stratum_label("treatment", key), SHAPED], output_tokens)
 
         # No baseline to compare against yet, so there is nothing to estimate.
         assert recorder.estimate().n_requests == 0
@@ -620,7 +630,7 @@ class TestRecorderBaselineReload:
         learned.save(path)
         assert SavingsLedger.load(path).baseline.total_samples == 4
 
-        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 200)
         recorder.flush()
 
         # The flush must keep the learned baseline rather than writing the empty
@@ -649,7 +659,7 @@ class TestRecorderBaselineReload:
 
         recorder = SavingsRecorder(path, flush_every=1)
         for output_tokens in (200, 210, 190):
-            recorder.record_from_labels([stratum_label("treatment", key)], output_tokens)
+            recorder.record_from_labels([stratum_label("treatment", key), SHAPED], output_tokens)
 
         # First learn writes a baseline; the recorder adopts it.
         first = SavingsLedger.load(path)
@@ -692,7 +702,7 @@ class TestFlushDurability:
         key = SAMPLE_KEY
 
         recorder = SavingsRecorder(path, flush_every=1)
-        recorder.record_from_labels([stratum_label("treatment", key)], 200)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 200)
         recorder.flush()
         assert SavingsLedger.load(path).treatment[key].n == 1
 
@@ -700,7 +710,7 @@ class TestFlushDurability:
             raise OSError(5, "simulated crash before rename")
 
         monkeypatch.setattr(headroom.fsutil.os, "replace", _die_before_rename)
-        recorder.record_from_labels([stratum_label("treatment", key)], 210)
+        recorder.record_from_labels([stratum_label("treatment", key), SHAPED], 210)
         recorder.flush()  # OSError swallowed by the recorder — fail-open by design
 
         # The pre-crash sample must survive and no temp residue may be left
@@ -758,7 +768,7 @@ class TestFlushDurability:
             output_tokens=50,
             tokens_saved=20,
             attempted_input_tokens=100,
-            transforms_applied=(stratum_label("treatment", SAMPLE_KEY),),
+            transforms_applied=(stratum_label("treatment", SAMPLE_KEY), SHAPED),
         )
         asyncio.run(emit_request_outcome(_Handler(), outcome))
 
