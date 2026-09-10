@@ -1062,6 +1062,18 @@ def append_text_to_latest_user_input_item(
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
 
+# A *decompressed* body obeys the same ceiling as an uncompressed one. The
+# Content-Length gate at the handlers only ever saw the compressed wire size, so
+# a client could buy unlimited extra capacity with a compression ratio: ~2MB of
+# zeros expands to 2GB and the process dies allocating it (#3284). Same number,
+# deliberately: nobody should get more room by arriving gzipped.
+MAX_DECOMPRESSED_BODY_SIZE = MAX_REQUEST_BODY_SIZE
+
+# How much decompressed output to pull per step. The cap is re-checked after
+# every chunk, so the peak allocation is the limit plus one chunk — never the
+# full expansion of a bomb.
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
+
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
 
@@ -1549,37 +1561,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -2537,24 +2576,145 @@ def apply_session_sticky_ccr_tool(
     return tools_out, True
 
 
+class RequestBodyTooLarge(ValueError):
+    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` call site
+    keeps answering 400 unchanged, while giving a caller that would rather
+    answer 413 a type to branch on.
+    """
+
+
+def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
+    """Incrementally inflate ``raw``, stopping the instant output passes the cap.
+
+    ``zlib.decompress``/``gzip.decompress`` materialize the whole expansion
+    before anything can inspect it, which is what makes a bomb fatal. Feeding
+    the stream through ``decompressobj`` with a ``max_length`` keeps unproduced
+    output in ``unconsumed_tail`` instead of memory, so the check below runs
+    before the allocation rather than after it.
+    """
+    import zlib
+
+    out = bytearray()
+    pending = raw
+    first_member = True
+    while True:
+        if multi_member and not first_member:
+            # gzip is a *sequence* of members and CPython's reader skips NUL
+            # padding between and after them — real clients emit it, and
+            # `gzip.decompress(member + b"\x00" * 16)` returns the payload
+            # rather than raising. Parsing that padding as a fresh member
+            # would reject bodies the one-shot call accepted.
+            pending = pending.lstrip(b"\x00")
+        if multi_member and not pending:
+            # Either an empty body (`gzip.decompress(b"")` == b"") or a clean
+            # end after the last member. A body that is *only* padding never
+            # reaches here: `first_member` is still True, so it falls through
+            # to the header parse below and fails there, as CPython does.
+            break
+        decompressor = zlib.decompressobj(wbits)
+        while True:
+            chunk = decompressor.decompress(pending, _DECOMPRESS_CHUNK_SIZE)
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed {label} request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+            pending = decompressor.unconsumed_tail
+            if decompressor.eof or not pending:
+                break
+            if not chunk:
+                # Input left over but nothing produced: the stream cannot
+                # advance, and looping again would spin forever.
+                raise ValueError(f"Failed to decompress {label} request body: stalled stream")
+        out += decompressor.flush()
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed {label} request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        if not decompressor.eof:
+            raise ValueError(f"Failed to decompress {label} request body: truncated stream")
+        # gzip streams may carry several members; `gzip.decompress` concatenates
+        # them, so restart on the trailer to keep that behavior.
+        pending = decompressor.unused_data
+        first_member = False
+        if not multi_member:
+            break
+    return bytes(out)
+
+
+def _zstd_bounded(raw: bytes) -> bytes:
+    """Read a zstd frame in chunks so a high-ratio frame cannot outrun the cap."""
+    import zstandard
+
+    out = bytearray()
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(raw) as reader:
+        while True:
+            chunk = reader.read(_DECOMPRESS_CHUNK_SIZE)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed zstd request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+    return bytes(out)
+
+
+def _brotli_bounded(raw: bytes) -> bytes:
+    """Feed brotli input in slices, checking the cap after each one."""
+    import brotli
+
+    decompressor_cls = getattr(brotli, "Decompressor", None)
+    if decompressor_cls is None:
+        # Fail closed rather than fall back to the unbounded one-shot call: an
+        # old library is not a reason to reopen the hole.
+        raise ValueError(
+            "Installed 'brotli' is too old for incremental decompression "
+            "(needs brotli.Decompressor); upgrade it to accept br request bodies."
+        )
+
+    decompressor = decompressor_cls()
+    out = bytearray()
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed brotli request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    is_finished = getattr(decompressor, "is_finished", None)
+    if is_finished is not None and not is_finished():
+        raise ValueError("Failed to decompress brotli request body: truncated stream")
+    return bytes(out)
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure.
+    Raises ``ValueError`` on any decompression failure, and the
+    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
+    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
 
+    # Every branch below decompresses incrementally against
+    # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
+    # generic handlers so the size refusal is not reworded into a vague
+    # "failed to decompress" (#3284).
     if encoding in ("zstd", "zstandard"):
         try:
-            import zstandard
-
-            dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
+            raw = _zstd_bounded(raw)
+        except RequestBodyTooLarge:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is zstd-compressed but the 'zstandard' package is not installed. "
@@ -2563,24 +2723,30 @@ async def _read_request_body_bytes(request: Request) -> bytes:
         except Exception as exc:
             raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
     elif encoding == "gzip":
-        import gzip as _gzip
+        import zlib
 
         try:
-            raw = _gzip.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
+            # both already carrying the message we want.
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
     elif encoding == "deflate":
         import zlib
 
         try:
-            raw = zlib.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
         try:
-            import brotli
-
-            raw = brotli.decompress(raw)
+            raw = _brotli_bounded(raw)
+        except ValueError:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is brotli-compressed but the 'brotli' package is not installed."
@@ -2875,7 +3041,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 
