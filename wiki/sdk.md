@@ -45,30 +45,26 @@ messages = [
     {
         "role": "assistant",
         "content": None,
-        "tool_calls": [{
-            "id": "call_123",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q": "python"}'},
-        }],
+        "tool_calls": [
+            {
+                "id": "call_123",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "python"}'},
+            }
+        ],
     },
     {
         "role": "tool",
         "tool_call_id": "call_123",
-        "content": json.dumps({
-            "results": [
-                {"title": f"Tutorial {i}", "score": 100-i}
-                for i in range(500)
-            ]
-        }),
+        "content": json.dumps(
+            {"results": [{"title": f"Tutorial {i}", "score": 100 - i} for i in range(500)]}
+        ),
     },
     {"role": "user", "content": "What are the top 3?"},
 ]
 
 # Headroom compresses 500 results to ~15, keeping highest-scoring items
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=messages
-)
+response = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
 
 # Check savings
 stats = client.get_stats()
@@ -111,7 +107,8 @@ response = client.messages.create(
 ### Google
 
 ```python
-from headroom import HeadroomClient, GoogleProvider
+from headroom import HeadroomClient
+from headroom.providers import GoogleProvider
 import google.generativeai as genai
 
 client = HeadroomClient(
@@ -187,13 +184,10 @@ print(f"Transforms: {plan.transforms}")
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=[...],
-
     # Override mode for this request
     headroom_mode="audit",
-
     # Reserve more tokens for output
     headroom_output_buffer_tokens=8000,
-
     # Keep last N turns
     headroom_keep_turns=5,
 )
@@ -203,6 +197,7 @@ response = client.chat.completions.create(
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.INFO)
 
 # Now you'll see:

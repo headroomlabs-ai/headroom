@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +20,7 @@ from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.token_counting import gemini_output_tokens
 
@@ -316,6 +316,13 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = extract_tags(headers)
+        # Anthropic and OpenAI bind here; Gemini did not, so anything an ASGI
+        # extension recorded into the request scope was dropped on the floor
+        # for Gemini traffic only — silently, because an empty ledger and an
+        # unbound one look identical at the outcome funnel.
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
@@ -335,10 +342,7 @@ class GeminiHandlerMixin:
         memory_user_id: str | None = None
         memory_request_ctx = None
         if self.memory_handler:
-            memory_user_id = request.headers.get(
-                "x-headroom-user-id",
-                os.environ.get("USER", os.environ.get("USERNAME", "default")),
-            )
+            memory_user_id = resolve_memory_identity(request)
             # Per-project memory routing (GH #462). Gemini's
             # ``systemInstruction`` field carries the system prompt;
             # ``extract_system_prompt`` doesn't know that shape, so we
@@ -869,9 +873,22 @@ class GeminiHandlerMixin:
                     resp_json = final_resp_json
                     response_content = json.dumps(resp_json).encode()
                     usage = resp_json.get("usageMetadata", {})
-                    total_input_tokens = usage.get("promptTokenCount", total_input_tokens)
-                    output_tokens = usage.get("candidatesTokenCount", output_tokens)
-                    cache_read_tokens = usage.get("cachedContentTokenCount", cache_read_tokens)
+                    # A CCR continuation response can carry a present-null count
+                    # (e.g. a safety-blocked continuation turn), where
+                    # ``.get(key, prior)`` returns None rather than the prior
+                    # value, and the ``max(0, prompt - cache_read)`` /
+                    # ``total_input_tokens > 0`` arithmetic below would then raise
+                    # TypeError and the outer handler would mask a successful 200
+                    # as a synthetic 502. Guard with ``_usage_int`` (keeping the
+                    # pre-continuation count as the fallback), mirroring the two
+                    # sibling extraction sites above.
+                    total_input_tokens = _usage_int(
+                        usage.get("promptTokenCount"), total_input_tokens
+                    )
+                    output_tokens = _usage_int(usage.get("candidatesTokenCount"), output_tokens)
+                    cache_read_tokens = _usage_int(
+                        usage.get("cachedContentTokenCount"), cache_read_tokens
+                    )
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
@@ -1027,6 +1044,9 @@ class GeminiHandlerMixin:
         headers.pop("content-length", None)
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         # Note: streaming handlers delegate to _stream_response, which
         # does its own classify_client. No need to compute here.
         is_antigravity = self._is_cloudcode_antigravity_request(body, headers)
@@ -1180,6 +1200,9 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = extract_tags(headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         # Streaming variant — delegates to _stream_response which
         # classifies the client itself from headers.
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
@@ -1328,6 +1351,9 @@ class GeminiHandlerMixin:
         # outcome. Extract here so apply_to_tags below has a dict to
         # mutate and the outcome at end-of-call inherits the tag.
         tags = extract_tags(request.headers)
+        from headroom.proxy.savings_attribution import bind_scope
+
+        bind_scope(tags, request.scope)
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,

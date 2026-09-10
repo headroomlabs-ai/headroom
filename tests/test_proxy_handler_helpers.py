@@ -8,9 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import StreamingResponse
 
-from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin, _is_googleapis_endpoint
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
@@ -32,6 +33,23 @@ def _jwt(payload: object) -> str:
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
     return f"{encode(header)}.{encode(payload)}."
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://us-central1-aiplatform.googleapis.com/v1", True),
+        ("https://googleapis.com/v1", True),
+        ("https://AIPLATFORM.GOOGLEAPIS.COM./v1", True),
+        ("https://googleapis.com.example.test/v1", False),
+        ("https://notgoogleapis.com/v1", False),
+        ("https://googleapis.com@attacker.test/v1", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_googleapis_endpoint_gate_uses_hostname_boundary(url: str, expected: bool) -> None:
+    assert _is_googleapis_endpoint(url) is expected
 
 
 class _ImageCompressor:
@@ -117,6 +135,7 @@ class _VertexGeminiImageRequest:
     method = "POST"
     headers = {}
     query_params = {}
+    scope: dict = {"type": "http", "method": "POST"}
     url = SimpleNamespace(
         path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
         query="",
@@ -309,6 +328,80 @@ def test_relocate_system_messages_noop_without_system_entry() -> None:
     assert changed is False
     assert clean is messages
     assert system == "A"
+
+
+def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+    messages = [
+        {"role": "user", "content": "Run the tests."},
+        {
+            "role": "system",
+            "content": "The user added: update the changelog too.",
+        },
+        {"role": "assistant", "content": "I will do both."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, "base", "claude-opus-5"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system == "base"
+
+
+def test_relocate_system_messages_preserves_consecutive_valid_section_at_end() -> None:
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        {"role": "system", "content": "First update."},
+        {"role": "system", "content": "Second update."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "global.anthropic.claude-sonnet-5-v1:0"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system is None
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "assistant", "content": "answer"},
+            {"role": "system", "content": "bad predecessor"},
+        ],
+        [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "bad successor"},
+            {"role": "user", "content": "another question"},
+        ],
+    ],
+)
+def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement(
+    messages: list[dict],
+) -> None:
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, "claude-fable-5")
+
+    assert changed is True
+    assert all(message.get("role") != "system" for message in clean)
+    assert system == [{"type": "text", "text": messages[1]["content"]}]
+
+
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": "mid-turn instruction"},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "claude-sonnet-4-6"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "question"}]
+    assert system == [{"type": "text", "text": "mid-turn instruction"}]
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:

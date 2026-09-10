@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider, TokenCounter
@@ -199,6 +200,11 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
@@ -208,7 +214,10 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -222,6 +231,9 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
+
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
 
             openai_config = loaded.get("openai", {})
             if "context_limits" in openai_config:
@@ -238,7 +250,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -637,20 +649,16 @@ class OpenAIProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        # Try LiteLLM first (most up-to-date pricing)
-        litellm = _get_litellm_module()
-        if litellm is not None:
-            try:
-                # LiteLLM uses per-token pricing, returns total cost
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt_tokens=input_tokens,
-                    completion_tokens=output_tokens,
-                )
-                if cost is not None and cost > 0:
-                    return float(cost)
-            except Exception:
-                pass  # Fall through to manual pricing
+        # Try LiteLLM first (most up-to-date pricing, and it knows each model's
+        # real cached-input rate rather than the manual path's flat estimate)
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None and cost > 0:
+            return float(cost)
 
         # Fall back to hardcoded pricing
         return self._estimate_cost_manual(input_tokens, output_tokens, model, cached_tokens)

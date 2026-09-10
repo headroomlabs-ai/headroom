@@ -14,6 +14,7 @@ from .opencode import OpencodeRegistrar
 
 #: Default proxy URL used when none is given.
 DEFAULT_PROXY_URL = "http://127.0.0.1:8787"
+CLAUDE_SERENA_CONTEXT = "claude-code"
 
 
 def get_all_registrars() -> list[MCPRegistrar]:

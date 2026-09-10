@@ -582,6 +582,7 @@ class TestProxyClientRefCounting:
         stopped: list[int] = []
         monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 123})
         monkeypatch.setattr(
             wrap_mod,
             "_stop_local_proxy_for_unwrap",
@@ -592,6 +593,51 @@ class TestProxyClientRefCounting:
 
         assert not proc.terminated
         assert stopped == [self.PORT]
+
+    def test_kill_proxy_uses_taskkill_tree_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows cleanup must terminate the native launcher's whole tree."""
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        checks = iter([True, False])
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: next(checks))
+        monkeypatch.setattr(
+            wrap_mod.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        assert wrap_mod._kill_proxy_by_pid(456, self.PORT)
+        assert calls == [
+            (
+                ["taskkill", "/F", "/T", "/PID", "456"],
+                {"capture_output": True, "timeout": 10, "check": False},
+            )
+        ]
+
+    def test_cleanup_uses_pre_shutdown_pid_when_health_probe_races(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transient post-terminate /health miss must not orphan the listener."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 456})
+        monkeypatch.setattr(wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "unidentified")
+        monkeypatch.setattr(
+            wrap_mod,
+            "_kill_proxy_by_pid",
+            lambda pid, port: killed.append((pid, port)) or True,
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert proc.terminated
+        assert killed == [(456, self.PORT)]
 
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
@@ -752,10 +798,57 @@ def test_resolve_1m_model_is_idempotent() -> None:
     assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
 
-def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
-    """With no model selected, fall back to the default Opus carrying [1m]."""
-    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
-    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
+def test_resolve_1m_model_falls_back_to_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no model selected, fall back to the built-in default carrying [1m]."""
+    monkeypatch.delenv("HEADROOM_1M_MODEL", raising=False)
+    expected = f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+    assert wrap_mod._resolve_1m_model(None) == expected
+    assert wrap_mod._resolve_1m_model("  ") == expected
+
+
+def test_resolve_1m_model_env_overrides_builtin_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_1M_MODEL overrides the built-in fallback so --1m can track new
+    Opus releases without a code change or pinning ANTHROPIC_MODEL (#2937)."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_current_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit ANTHROPIC_MODEL still wins; HEADROOM_1M_MODEL is only the
+    fallback default when nothing else is selected."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model("claude-sonnet-5") == "claude-sonnet-5[1m]"
+
+
+def test_resolve_1m_model_env_idempotent_on_suffixed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HEADROOM_1M_MODEL that already carries [1m] is not double-suffixed."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9[1m]")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_blank_env_falls_back_to_builtin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank/whitespace HEADROOM_1M_MODEL falls back to the built-in default."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "   ")
+    assert wrap_mod._resolve_1m_model(None) == f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+
+
+def test_headroom_1m_model_is_documented_and_default_matches_code() -> None:
+    """The HEADROOM_1M_MODEL knob must stay documented, and the documented
+    default must track the code, so the supported configuration surface cannot
+    silently drift or disappear (#2937).
+    """
+    docs = Path(__file__).resolve().parents[2] / "docs" / "content" / "docs" / "configuration.mdx"
+    text = docs.read_text(encoding="utf-8")
+    assert wrap_mod._1M_MODEL_ENV in text, f"{wrap_mod._1M_MODEL_ENV} is not documented"
+    # The env-var catalog row must advertise the current built-in default.
+    assert f"`{wrap_mod._DEFAULT_1M_MODEL}`" in text, (
+        "documented HEADROOM_1M_MODEL default is out of sync with "
+        f"_DEFAULT_1M_MODEL={wrap_mod._DEFAULT_1M_MODEL!r}"
+    )
 
 
 class TestFindAvailablePort:

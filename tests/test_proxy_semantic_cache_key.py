@@ -106,6 +106,36 @@ def test_tools_cache_control_ignored():
     assert _key(cache, tools=tools_cc) == _key(cache, tools=tools_plain)
 
 
+def test_message_cache_control_breakpoint_move_same_key():
+    """A moved cache_control breakpoint on a *message* must not fragment the key.
+
+    Messages are the primary key component and, on the Anthropic path, the most
+    common place a client (e.g. Claude Code) moves a breakpoint between turns.
+    cache_control is a prompt-caching directive that never changes the
+    completion, so the two requests must share a cache entry — previously only
+    system/tools breakpoints were stripped, so a message breakpoint missed.
+    """
+    cache = SemanticCache()
+    messages_with_cc = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    assert cache._compute_key(messages_with_cc, MODEL) == cache._compute_key(
+        messages_without_cc, MODEL
+    )
+
+
+def test_message_content_change_still_distinct_key():
+    """Stripping cache_control must not collapse genuinely different messages."""
+    cache = SemanticCache()
+    a = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    b = [{"role": "user", "content": [{"type": "text", "text": "goodbye"}]}]
+    assert cache._compute_key(a, MODEL) != cache._compute_key(b, MODEL)
+
+
 # --- behavioral get/set: collision prevented end to end -----------------------
 
 

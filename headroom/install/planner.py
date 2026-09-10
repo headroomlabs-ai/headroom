@@ -9,6 +9,7 @@ from collections.abc import Iterable
 import click
 
 from headroom import paths as _paths
+from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
 from headroom.rollout import RolloutChannel
 
@@ -177,6 +178,19 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
+    # OpenAI-compatible tools share this proxy (those may need api.openai.com /
+    # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
+    _openai_native = {
+        ToolTarget.CODEX.value,
+        ToolTarget.COPILOT.value,
+        ToolTarget.AIDER.value,
+        ToolTarget.OPENCODE.value,
+    }
+    _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
+    target_set = set(resolved_targets)
+    if target_set & _grok_targets and not (target_set & _openai_native):
+        base_env.setdefault("OPENAI_TARGET_API_URL", _GROK_DEFAULT_API_URL)
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:
@@ -241,6 +255,9 @@ def build_manifest(
         proxy_args.extend(["--protect-tool-results", protect_tool_results])
     if bedrock_profile:
         proxy_args.extend(["--bedrock-profile", bedrock_profile])
+    openai_target = base_env.get("OPENAI_TARGET_API_URL")
+    if openai_target:
+        proxy_args.extend(["--openai-api-url", openai_target])
 
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(

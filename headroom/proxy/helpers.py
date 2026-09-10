@@ -317,6 +317,40 @@ def _headroom_bypass_enabled(headers: Any) -> bool:
     return bypass or passthrough
 
 
+# Response headers that describe how the *upstream* framed its body on the
+# wire, not what the payload means. Every one of them is invalid to replay:
+# Starlette recomputes content-length, and uvicorn owns the connection
+# framing. Forwarding a stale ``transfer-encoding: chunked`` onto a
+# fixed-length body is the worst of them — RFC 9112 §6.1 makes
+# Transfer-Encoding override Content-Length, so the client tries to parse a
+# plain JSON body as chunked frames, finds no valid chunk-size line, and
+# reads an empty body out of an HTTP 200 (#3019).
+FRAMING_RESPONSE_HEADERS: tuple[str, ...] = (
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "server",
+)
+
+
+def sanitize_forwarded_response_headers(
+    headers: Any,
+    *extra_names: str,
+) -> dict[str, str]:
+    """Drop wire-framing headers before replaying an upstream response.
+
+    Pass any additional header names to strip as ``extra_names`` (for
+    example ``"content-type"`` when the caller sets its own media type).
+
+    Matching is case-insensitive, but the casing of the headers that
+    survive is left untouched.
+    """
+    drop = {name.lower() for name in (*FRAMING_RESPONSE_HEADERS, *extra_names)}
+    return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -871,16 +905,15 @@ def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
 def relocate_system_messages_to_top_level(
     messages: list[dict[str, Any]],
     system: Any,
+    model: str | None = None,
 ) -> tuple[list[dict[str, Any]], Any, bool]:
-    """Move any ``role="system"`` entries out of ``messages`` into ``system``.
+    """Relocate only system messages invalid for the selected Anthropic model.
 
-    Anthropic's Messages API rejects a ``system`` role inside ``messages`` with
-    HTTP 400 ("messages.0: use the top-level 'system' parameter for the initial
-    system prompt"). Internal transforms / pipeline extensions can leave a stray
-    system message in the list (e.g. a relocated harness system block during
-    compression). This is the Anthropic forwarder's last line of defense: it
-    guarantees the forwarded body never violates the wire contract, regardless
-    of which transform introduced the entry.
+    Supported models accept mid-conversation system sections after a user turn
+    (or an assistant server-tool result) when followed by an assistant turn or
+    placed at the end. Hoisting those changes semantics and invalidates the
+    cached prefix. The initial/invalid forms are still moved to the top-level
+    field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
@@ -890,9 +923,58 @@ def relocate_system_messages_to_top_level(
     message is present the inputs pass through unchanged (``changed=False``) so
     the common path is untouched.
     """
-    system_indices = {
-        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == _ROLE_SYSTEM
-    }
+    model_id = str(model or "").lower()
+    supports_mid_conversation = any(
+        family in model_id
+        for family in (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        )
+    )
+
+    def _assistant_ends_in_server_tool_result(message: object) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        final = content[-1]
+        if not isinstance(final, dict):
+            return False
+        block_type = str(final.get("type") or "")
+        return block_type == "server_tool_use" or block_type.endswith("_tool_result")
+
+    system_indices: set[int] = set()
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            index += 1
+            continue
+
+        section_start = index
+        while (
+            index + 1 < len(messages)
+            and isinstance(messages[index + 1], dict)
+            and messages[index + 1].get("role") == _ROLE_SYSTEM
+        ):
+            index += 1
+        section_end = index
+
+        previous = messages[section_start - 1] if section_start > 0 else None
+        following = messages[section_end + 1] if section_end + 1 < len(messages) else None
+        valid_previous = (
+            isinstance(previous, dict) and previous.get("role") == "user"
+        ) or _assistant_ends_in_server_tool_result(previous)
+        valid_following = following is None or (
+            isinstance(following, dict) and following.get("role") == "assistant"
+        )
+        if not (supports_mid_conversation and valid_previous and valid_following):
+            system_indices.update(range(section_start, section_end + 1))
+        index += 1
     if not system_indices:
         return messages, system, False
 
@@ -979,6 +1061,18 @@ def append_text_to_latest_user_input_item(
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+
+# A *decompressed* body obeys the same ceiling as an uncompressed one. The
+# Content-Length gate at the handlers only ever saw the compressed wire size, so
+# a client could buy unlimited extra capacity with a compression ratio: ~2MB of
+# zeros expands to 2GB and the process dies allocating it (#3284). Same number,
+# deliberately: nobody should get more room by arriving gzipped.
+MAX_DECOMPRESSED_BODY_SIZE = MAX_REQUEST_BODY_SIZE
+
+# How much decompressed output to pull per step. The cap is re-checked after
+# every chunk, so the peak allocation is the limit plus one chunk — never the
+# full expansion of a bomb.
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
 
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
@@ -1163,8 +1257,54 @@ try:
 except ValueError:
     EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
 
-# Maximum compression cache sessions (prevents unbounded memory growth)
-MAX_COMPRESSION_CACHE_SESSIONS = 500
+# Maximum compression cache sessions (prevents unbounded memory growth).
+# Overridable via HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS for gateway
+# deployments (e.g. Kong sidecars) that fan many concurrent sessions into one
+# proxy process. Falls back to 500 on an unparseable value; floor of 1.
+try:
+    MAX_COMPRESSION_CACHE_SESSIONS = max(
+        1, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS", "500"))
+    )
+except ValueError:
+    MAX_COMPRESSION_CACHE_SESSIONS = 500
+
+# Idle TTL for per-session compression caches. Eviction is bust-free only
+# once the provider's own prompt cache has lapsed, so this must exceed the
+# LONGEST provider cache TTL Headroom serves — Anthropic's 1h extended
+# breakpoint (3600s), not just the common 5m ephemeral cache. Evicting
+# earlier would itself cause the bust this state exists to prevent: the
+# session returns, the provider still holds the old bytes, but the map that
+# replays them is gone. The cache must also outlive the prefix TRACKER's
+# session TTL (600s): after the tracker expires, `apply_cached`'s
+# byte-identical swap is the only thing still protecting the provider
+# prefix. Default 3900s = 1h + 5m grace. Deployments that never opt into
+# the 1h breakpoint can lower it via HEADROOM_COMPRESSION_CACHE_TTL_SECONDS.
+try:
+    # Floor of 600s: never below the prefix tracker's session TTL, or the
+    # sweep could reclaim the byte-identical swap map while it is the only
+    # remaining protection for a still-live provider prefix (see above).
+    # Non-finite floats ("nan"/"inf") parse but poison every idle comparison,
+    # so they are rejected like any other unparseable value.
+    _ttl_env = float(os.environ.get("HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", "3900"))
+    if _ttl_env != _ttl_env or _ttl_env in (float("inf"), float("-inf")):
+        raise ValueError("non-finite TTL")
+    COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
+except ValueError:
+    COMPRESSION_CACHE_TTL_SECONDS = 3900.0
+
+# Entries per session compression cache. 10k covers a single conversation with
+# ~2x headroom even at a 1M-token context (a compressible tool_result is at
+# least a few hundred tokens, so at most ~5k can be live at once). Raise via
+# HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES only for workloads that fan many
+# concurrent conversations into ONE session id (shared fallback ids, heavy
+# subagent fan-out) — entry LRU is hit-refreshed, so an undersized cap shows
+# up as misses on still-live entries, i.e. prefix-cache busts. Floor of 100.
+try:
+    COMPRESSION_CACHE_MAX_ENTRIES = max(
+        100, int(os.environ.get("HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", "10000"))
+    )
+except ValueError:
+    COMPRESSION_CACHE_MAX_ENTRIES = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -1421,37 +1561,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -1520,15 +1687,40 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
-def merge_extra_headers(headers: dict[str, str], extra: dict[str, str] | None) -> dict[str, str]:
+def merge_extra_headers(
+    headers: dict[str, str],
+    extra: dict[str, str] | None,
+    *,
+    upstream_url: str | None,
+    config: Any = None,
+) -> dict[str, str]:
     """Merge configured extra headers into ``headers``, overriding same-named keys.
 
     ``extra`` comes from ``ProxyConfig.anthropic_extra_headers``/``openai_extra_headers``
     (settings-panel/CLI-configured, for gateways that need one extra header alongside the
     client's own auth). Returns ``headers`` unchanged (no copy) when nothing is configured.
+
+    ``upstream_url`` is where these headers are about to be sent, and it is
+    **required** rather than optional on purpose. These values are secrets, and
+    several handlers accept a per-request upstream from the ``x-headroom-base-url``
+    request header; merging before the destination was known is what let a client
+    redirect the operator's gateway key to a host of its choosing. Making the
+    destination part of the signature means a new forwarder cannot merge a secret
+    without saying where it goes, so this cannot silently regress.
+
+    Pass ``None`` when the caller is going to its configured target with no
+    per-request override. Anything else is checked against
+    ``upstream_trust.is_trusted_upstream``; an undesignated host still gets its
+    request proxied, just without these headers.
     """
     if not extra:
         return headers
+    if upstream_url is not None:
+        from headroom.proxy.upstream_trust import is_trusted_upstream, warn_untrusted_once
+
+        if not is_trusted_upstream(upstream_url, config):
+            warn_untrusted_once(upstream_url)
+            return headers
     # HTTP header names are case-insensitive: drop any existing key that
     # case-insensitively collides with a configured extra so the extra wins.
     # A plain {**headers, **extra} would emit both casings upstream.
@@ -2384,24 +2576,145 @@ def apply_session_sticky_ccr_tool(
     return tools_out, True
 
 
+class RequestBodyTooLarge(ValueError):
+    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` call site
+    keeps answering 400 unchanged, while giving a caller that would rather
+    answer 413 a type to branch on.
+    """
+
+
+def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
+    """Incrementally inflate ``raw``, stopping the instant output passes the cap.
+
+    ``zlib.decompress``/``gzip.decompress`` materialize the whole expansion
+    before anything can inspect it, which is what makes a bomb fatal. Feeding
+    the stream through ``decompressobj`` with a ``max_length`` keeps unproduced
+    output in ``unconsumed_tail`` instead of memory, so the check below runs
+    before the allocation rather than after it.
+    """
+    import zlib
+
+    out = bytearray()
+    pending = raw
+    first_member = True
+    while True:
+        if multi_member and not first_member:
+            # gzip is a *sequence* of members and CPython's reader skips NUL
+            # padding between and after them — real clients emit it, and
+            # `gzip.decompress(member + b"\x00" * 16)` returns the payload
+            # rather than raising. Parsing that padding as a fresh member
+            # would reject bodies the one-shot call accepted.
+            pending = pending.lstrip(b"\x00")
+        if multi_member and not pending:
+            # Either an empty body (`gzip.decompress(b"")` == b"") or a clean
+            # end after the last member. A body that is *only* padding never
+            # reaches here: `first_member` is still True, so it falls through
+            # to the header parse below and fails there, as CPython does.
+            break
+        decompressor = zlib.decompressobj(wbits)
+        while True:
+            chunk = decompressor.decompress(pending, _DECOMPRESS_CHUNK_SIZE)
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed {label} request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+            pending = decompressor.unconsumed_tail
+            if decompressor.eof or not pending:
+                break
+            if not chunk:
+                # Input left over but nothing produced: the stream cannot
+                # advance, and looping again would spin forever.
+                raise ValueError(f"Failed to decompress {label} request body: stalled stream")
+        out += decompressor.flush()
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed {label} request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        if not decompressor.eof:
+            raise ValueError(f"Failed to decompress {label} request body: truncated stream")
+        # gzip streams may carry several members; `gzip.decompress` concatenates
+        # them, so restart on the trailer to keep that behavior.
+        pending = decompressor.unused_data
+        first_member = False
+        if not multi_member:
+            break
+    return bytes(out)
+
+
+def _zstd_bounded(raw: bytes) -> bytes:
+    """Read a zstd frame in chunks so a high-ratio frame cannot outrun the cap."""
+    import zstandard
+
+    out = bytearray()
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(raw) as reader:
+        while True:
+            chunk = reader.read(_DECOMPRESS_CHUNK_SIZE)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed zstd request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+    return bytes(out)
+
+
+def _brotli_bounded(raw: bytes) -> bytes:
+    """Feed brotli input in slices, checking the cap after each one."""
+    import brotli
+
+    decompressor_cls = getattr(brotli, "Decompressor", None)
+    if decompressor_cls is None:
+        # Fail closed rather than fall back to the unbounded one-shot call: an
+        # old library is not a reason to reopen the hole.
+        raise ValueError(
+            "Installed 'brotli' is too old for incremental decompression "
+            "(needs brotli.Decompressor); upgrade it to accept br request bodies."
+        )
+
+    decompressor = decompressor_cls()
+    out = bytearray()
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed brotli request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    is_finished = getattr(decompressor, "is_finished", None)
+    if is_finished is not None and not is_finished():
+        raise ValueError("Failed to decompress brotli request body: truncated stream")
+    return bytes(out)
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure.
+    Raises ``ValueError`` on any decompression failure, and the
+    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
+    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
 
+    # Every branch below decompresses incrementally against
+    # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
+    # generic handlers so the size refusal is not reworded into a vague
+    # "failed to decompress" (#3284).
     if encoding in ("zstd", "zstandard"):
         try:
-            import zstandard
-
-            dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
+            raw = _zstd_bounded(raw)
+        except RequestBodyTooLarge:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is zstd-compressed but the 'zstandard' package is not installed. "
@@ -2410,24 +2723,30 @@ async def _read_request_body_bytes(request: Request) -> bytes:
         except Exception as exc:
             raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
     elif encoding == "gzip":
-        import gzip as _gzip
+        import zlib
 
         try:
-            raw = _gzip.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
+            # both already carrying the message we want.
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
     elif encoding == "deflate":
         import zlib
 
         try:
-            raw = zlib.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
         try:
-            import brotli
-
-            raw = brotli.decompress(raw)
+            raw = _brotli_bounded(raw)
+        except ValueError:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is brotli-compressed but the 'brotli' package is not installed."
@@ -2722,7 +3041,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 
@@ -2811,6 +3130,13 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+def _tool_search_resident_key(name: Any) -> str:
+    """Normalize a client tool name for resident-tool membership checks."""
+    # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
+    # markers so internal separators such as ``mcp__server__read`` stay intact.
+    return str(name or "").lower().lstrip("_")
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -2872,17 +3198,17 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
-    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
-    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
-    # the exemption applies to both — an exact match silently deferred *every*
-    # tool for PascalCase clients, including their own tool-search tool.
-    core_lower = {name.lower() for name in core_tools}
+    # Clients disagree on casing and leading namespace markers for the same tool:
+    # Claude Code sends ``Bash``, opencode sends ``bash``, and Oh My Pi sends
+    # ``_bash``. Normalize both the configured names and each candidate so the
+    # exemption applies consistently across clients.
+    core_keys = {_tool_search_resident_key(name) for name in core_tools}
 
     for tool in tools:
         if (
             not isinstance(tool, dict)
             or tool.get("type")
-            or str(tool.get("name") or "").lower() in core_lower
+            or _tool_search_resident_key(tool.get("name")) in core_keys
         ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
@@ -3259,10 +3585,10 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
-    # Case-insensitive for the same reason as the Anthropic path above: the
-    # resident-name sets are lowercase, clients are not required to be.
-    resident_lower = {name.lower() for name in core_tools} | {
-        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    # Normalize for the same reason as the Anthropic path above: clients may use
+    # different casing or a leading namespace marker for the same resident tool.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
+        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
     }
     for tool in tools:
         if not isinstance(tool, dict):
@@ -3273,7 +3599,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
+            ttype == "function" and _tool_search_resident_key(tool.get("name")) not in resident_keys
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)

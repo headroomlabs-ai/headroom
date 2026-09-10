@@ -505,9 +505,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--port",
     "-p",
     default=8787,
+    envvar="HEADROOM_PORT",
     type=click.IntRange(1, 65535),
     show_default=True,
-    help="Persistent proxy port.",
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",
@@ -682,7 +683,13 @@ def install_apply(
 @main.command("deploy")
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    envvar="HEADROOM_PORT",
+    type=int,
+    show_default=True,
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",

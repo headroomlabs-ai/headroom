@@ -24,6 +24,7 @@ import warnings
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
     coerce_countable_text,
@@ -65,6 +66,21 @@ def sanitize_anthropic_model_id(model: str) -> str:
     """Return an Anthropic model id without terminal styling artifacts."""
     cleaned = _ANSI_ESCAPE_RE.sub("", str(model)).strip()
     return _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
+
+
+# `[1m]` is not only an ANSI artifact: Claude Code appends it to a model id to
+# request the 1M context tier, and only then sends the `context-1m` beta header
+# (#1158). Upstream rejects the suffix, so `sanitize_anthropic_model_id()` must
+# keep stripping it before forwarding (#2027) — but the tier it encodes has to
+# be read off the id *before* that happens, or a 1M request gets budgeted as if
+# it were the base model's window.
+_CONTEXT_1M_SUFFIX_RE = re.compile(r"(?:\[1m\])+$")
+CONTEXT_1M_TOKENS = 1_000_000
+
+
+def has_context_1m_suffix(model: str) -> bool:
+    """Return True if ``model`` carries Claude Code's ``[1m]`` 1M-tier marker."""
+    return bool(_CONTEXT_1M_SUFFIX_RE.search(_ANSI_ESCAPE_RE.sub("", str(model)).strip()))
 
 
 def sanitize_anthropic_model_metadata(value: Any) -> Any:
@@ -154,6 +170,40 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25, "cached_input": 0.03},
 }
 
+# Anthropic's long-context premium. On models that reach 1M over a 200K base,
+# a prompt above 200K re-prices the *entire* request -- input, output and cache
+# alike -- rather than only the tokens past the threshold. Multipliers are
+# derived from LiteLLM's `*_above_200k_tokens` fields ($3->$6 in, $15->$22.50
+# out, $0.30->$0.60 cache read).
+#
+# Only the Sonnet 4 / 4.5 family is tiered: Opus, and Sonnet 4.6 onward, are
+# flat-rated across their whole window. This is the same population that needs
+# the `[1m]` suffix to reach 1M at all, so a session that fills the window this
+# unlocks is billed at these rates.
+_LONG_CONTEXT_THRESHOLD = 200_000
+_LONG_CONTEXT_PREMIUM: dict[str, float] = {"input": 2.0, "output": 1.5, "cached_input": 2.0}
+_LONG_CONTEXT_TIERED_MODELS = (
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-20250514",
+    "claude-4-sonnet-20250514",
+)
+
+
+def _apply_long_context_premium(
+    model: str, pricing: dict[str, float], input_tokens: int
+) -> dict[str, float]:
+    """Return ``pricing`` scaled by the long-context premium where it applies.
+
+    Used only on the manual fallback path; the LiteLLM path already applies the
+    published above-threshold rates itself.
+    """
+    if input_tokens <= _LONG_CONTEXT_THRESHOLD:
+        return pricing
+    if not any(model.startswith(tiered) for tiered in _LONG_CONTEXT_TIERED_MODELS):
+        return pricing
+    return {key: rate * _LONG_CONTEXT_PREMIUM.get(key, 1.0) for key, rate in pricing.items()}
+
+
 # Default limits for pattern-based inference
 # Used when a model isn't in the explicit list but matches a known pattern
 _PATTERN_DEFAULTS = {
@@ -226,15 +276,48 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             # Check for anthropic-specific config, fall back to root level
             anthropic_config = loaded.get("anthropic", loaded)
             if "context_limits" in anthropic_config:
                 config["context_limits"].update(anthropic_config["context_limits"])
             if "pricing" in anthropic_config:
                 config["pricing"].update(anthropic_config["pricing"])
+            # Another provider's namespaced section ({"openai": {"context_limits":
+            # ...}}) is a correctly shaped config that this loader is simply not
+            # meant to consume, so it must not trip the no-effect warning below.
+            other_provider_section = "anthropic" not in loaded and any(
+                isinstance(section, dict)
+                and any(key in section for key in ("context_limits", "pricing", "encodings"))
+                for section in loaded.values()
+            )
+            if (
+                "context_limits" not in anthropic_config
+                and "pricing" not in anthropic_config
+                and not other_provider_section
+            ):
+                # Valid JSON object, but none of the keys we consume. Previously
+                # this was a SILENT no-op: the unknown-model warning tells the
+                # operator to "set HEADROOM_MODEL_LIMITS", they set the obvious
+                # flat shape {"my-model": 262144}, nothing happens, and there is
+                # no diagnostic anywhere. Name the expected shape instead.
+                logger.warning(
+                    "HEADROOM_MODEL_LIMITS parsed but contained no 'context_limits' "
+                    "or 'pricing' key, so it had NO EFFECT. Expected shape: "
+                    '{"context_limits": {"<model>": <int>}, "pricing": {...}} '
+                    '(optionally nested under an "anthropic" key). '
+                    f"Got top-level keys: {sorted(map(str, anthropic_config))[:10]}"
+                )
 
             logger.debug(f"Loaded custom model config from HEADROOM_MODEL_LIMITS: {loaded}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -249,6 +332,9 @@ def _load_custom_model_config() -> dict[str, Any]:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
+
             # Only load anthropic-specific config
             anthropic_config = loaded.get("anthropic", loaded)
             if "context_limits" in anthropic_config:
@@ -262,7 +348,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["pricing"][model] = pricing
 
             logger.debug(f"Loaded custom model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -605,8 +691,16 @@ class AnthropicProvider(Provider):
         6. Pattern-based inference (opus/sonnet/haiku)
         7. Default fallback (200K for any Claude model)
 
+        A ``[1m]`` suffix raises the result to at least 1M: the caller asked for
+        the 1M tier and Claude Code sent the `context-1m` beta header, so the
+        real upstream window is 1M even when the base model's default is 200K.
+
         Never raises an exception - uses sensible defaults for unknown models.
         """
+        if has_context_1m_suffix(model):
+            # Recursion terminates: the sanitized id has no `[1m]` left.
+            base = self.get_context_limit(sanitize_anthropic_model_id(model))
+            return max(base, CONTEXT_1M_TOKENS)
         model = sanitize_anthropic_model_id(model)
         # Check explicit and loaded limits
         if model in self._context_limits:
@@ -685,58 +779,38 @@ class AnthropicProvider(Provider):
         """Estimate cost for a request.
 
         Tries LiteLLM first for up-to-date pricing, falls back to manual pricing.
+        Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
+        family a prompt over 200K re-prices the whole request (see
+        ``_LONG_CONTEXT_PREMIUM``).
         """
         model = sanitize_anthropic_model_id(model)
-        # Try LiteLLM first for cost estimation
-        litellm, litellm_get_model_info = _get_litellm_clients()
-        if litellm is not None:
-            try:
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt="",
-                    completion="",
-                    prompt_tokens=input_tokens - cached_tokens,
-                    completion_tokens=output_tokens,
-                )
-                # Add cached token cost if applicable
-                if cached_tokens > 0:
-                    try:
-                        # Get cached input pricing from LiteLLM model info
-                        info = (
-                            litellm_get_model_info(model)
-                            if litellm_get_model_info is not None
-                            else None
-                        )
-                        if info and "input_cost_per_token" in info:
-                            # LiteLLM typically applies 90% discount for cached tokens
-                            cached_cost = cached_tokens * info["input_cost_per_token"] * 0.1
-                            cost += cached_cost
-                    except Exception:
-                        # Fall back to manual cached pricing
-                        pricing = self._get_pricing(model)
-                        if pricing:
-                            cached_cost = (cached_tokens / 1_000_000) * pricing.get(
-                                "cached_input", pricing["input"]
-                            )
-                            cost += cached_cost
-                return cost  # type: ignore[no-any-return]
-            except Exception as e:
-                logger.debug(f"LiteLLM cost estimation failed for {model}: {e}")
+        # LiteLLM knows per-model cache and long-context rates, so let it price
+        # the whole request rather than rebuilding the rate card here.
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None:
+            return cost
 
         # Fall back to manual pricing
         pricing = self._get_pricing(model)
         if not pricing:
             return None
 
+        rates = _apply_long_context_premium(model, pricing, input_tokens)
+
         # Calculate cost
         non_cached_input = input_tokens - cached_tokens
         cost = (
-            (non_cached_input / 1_000_000) * pricing["input"]
-            + (cached_tokens / 1_000_000) * pricing.get("cached_input", pricing["input"])
-            + (output_tokens / 1_000_000) * pricing["output"]
+            (non_cached_input / 1_000_000) * rates["input"]
+            + (cached_tokens / 1_000_000) * rates.get("cached_input", rates["input"])
+            + (output_tokens / 1_000_000) * rates["output"]
         )
 
-        return cost  # type: ignore[no-any-return]
+        return cost
 
     def _get_pricing(self, model: str) -> dict[str, float] | None:
         """Get pricing for a model with fallback logic."""

@@ -250,6 +250,104 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     assert captured["no_http2"] is True
 
 
+def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
+    """Stub out the apply side effects and capture ``build_manifest`` kwargs."""
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations: list = []
+        artifacts: list = []
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return Manifest()
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+
+def test_install_apply_honors_headroom_port_env(monkeypatch) -> None:
+    """An explicit HEADROOM_PORT must reach build_manifest, like `proxy --port` honors it.
+
+    Regression for #3072 bug 1: `install apply` ignored HEADROOM_PORT and always
+    configured 8787 because the --port option had no envvar binding.
+    """
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
+def test_install_apply_explicit_port_overrides_env(monkeypatch) -> None:
+    """An explicit --port still wins over HEADROOM_PORT (Click precedence)."""
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+
+
+def test_deploy_honors_headroom_port_env(monkeypatch) -> None:
+    """`headroom deploy` must honor HEADROOM_PORT the same way (#3072 bug 1)."""
+    captured: dict[str, object] = {}
+
+    plan = SimpleNamespace(
+        preset="persistent-service",
+        runtime="python",
+        reason="test",
+        supervisor_kind="service",
+        base_env={},
+    )
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        port=0,
+        health_url="http://127.0.0.1:8788/readyz",
+        targets=["claude"],
+    )
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr(
+        "headroom.cli.install._select_turnkey_plan", lambda prefer_docker=True: plan
+    )
+    monkeypatch.setattr("headroom.cli.install._build_deployment_manifest", fake_build)
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install._echo_installed", lambda m, prefix="": None)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["deploy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
 def test_install_apply_help_lists_no_http2() -> None:
     runner = CliRunner()
 

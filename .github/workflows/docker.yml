@@ -94,7 +94,7 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.version != ''
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -293,6 +293,18 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          # `latest=false` is load-bearing (#3150). The action defaults to
+          # `latest=auto`, which appends a bare `latest` for any semver
+          # release — and it logs `suffixLatest=false`, so the per-tag
+          # `suffix=` below never reaches it. Every one of the 8 variant
+          # cells therefore pushed `ghcr.io/.../headroom:latest`, and the
+          # last cell to finish won. At 0.36.0 that was `code-slim`, so
+          # `:latest` resolved to the distroless build, whose
+          # `import onnxruntime` segfaults on arm64 — `headroom deploy`
+          # crash-looped on Apple Silicon. `:latest` has exactly one
+          # writer: the root-cell promotion step at the end of this job.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=ref,event=pr,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
@@ -311,6 +323,9 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           DIGEST_DIR: ${{ runner.temp }}/digests
+          # Read by the bare-`latest` guard below. Via `env:` rather than
+          # inline `${{ }}` so the value is never spliced into the script.
+          VARIANT_NAME: ${{ matrix.variant.name }}
         run: |
           # Reconstruct full image references from the digest marker
           # filenames (each file is named after the bare hex digest
@@ -329,6 +344,16 @@ jobs:
             digest="$(basename "$f")"
             digest_refs+=("${IMAGE}@sha256:${digest}")
           done
+
+          # Belt-and-braces for #3150: only the root cell may ever carry a
+          # bare `latest`. A suffixed variant reaching this point with one
+          # means the tag rules regressed, and shipping it would repoint
+          # `:latest` at a non-default image. Fail instead of publishing.
+          if [ -n "${VARIANT_NAME}" ] && jq -e '.tags[]? | select(endswith(":latest"))' \
+               <<< "${DOCKER_METADATA_OUTPUT_JSON}" >/dev/null 2>&1; then
+            echo "::error::variant '${VARIANT_NAME}' would publish a bare :latest tag" >&2
+            exit 1
+          fi
 
           # Build `--tag` args from the metadata-action JSON output.
           # Empty tags array is valid (PR builds without ref-tags

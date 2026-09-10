@@ -223,14 +223,14 @@ def test_cache_affinity_ignores_only_cache_directive_movement() -> None:
 
 def test_pure_append_replays_forwarded_blocks_and_advances_breakpoint() -> None:
     previous_original = _pure_append(30)
-    previous_forwarded = _message([_text(f"COMPRESSED-{index}") for index in range(30)])
+    previous_forwarded = _message([_text(f"C-{index}") for index in range(30)])
     current = _pure_append(34)
 
     overlaid = overlay_cached_prefix(current, current, previous_original, previous_forwarded)
     normalized = normalize_message_cache_control(overlaid, previous_forwarded)
 
     assert [block["text"] for block in normalized[0]["content"][:30]] == [
-        f"COMPRESSED-{index}" for index in range(30)
+        f"C-{index}" for index in range(30)
     ]
     assert [block["text"] for block in normalized[0]["content"][30:]] == [
         f"block-{index}" for index in range(30, 34)

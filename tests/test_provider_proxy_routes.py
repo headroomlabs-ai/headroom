@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
+from headroom.proxy import upstream_guard
 from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
@@ -30,6 +31,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []
@@ -427,12 +431,21 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    assert (
-        proxy_routes._select_passthrough_base_url(
-            proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+    # The azure branch honours the override, but only after the SSRF guard
+    # clears the destination (CVE-2026-77775). `azure.example` does not
+    # resolve, and the guard fails closed on resolution failure, so pin a
+    # public answer to keep this assertion about target *precedence*.
+    with patch.object(
+        upstream_guard.socket,
+        "getaddrinfo",
+        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
+    ):
+        assert (
+            proxy_routes._select_passthrough_base_url(
+                proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+            )
+            == "https://azure.example/base"
         )
-        == "https://azure.example/base"
-    )
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )

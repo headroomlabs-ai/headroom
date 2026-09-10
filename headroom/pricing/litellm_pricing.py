@@ -282,6 +282,47 @@ def estimate_cost(
     return input_cost + output_cost
 
 
+def estimate_cost_from_tokens(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_tokens: int = 0,
+) -> float | None:
+    """Cost for one request from token counts, using LiteLLM's own cost model.
+
+    Prefer this over :func:`estimate_cost` whenever a request may carry cached
+    tokens or exceed a model's long-context threshold. Flat per-1M rates cannot
+    express either: cache reads bill at their own rate, and on Anthropic's
+    Sonnet 4 / 4.5 family a prompt over 200K re-prices the *whole* request --
+    input, output and cache alike. ``litellm.cost_per_token`` applies both.
+
+    ``input_tokens`` is the TOTAL prompt, ``cached_tokens`` included. LiteLLM
+    subtracts the cached portion itself and tests the long-context threshold
+    against the total, so passing a cache-exclusive count would both
+    double-discount the cached tokens and understate the threshold.
+
+    Returns ``None`` when LiteLLM is unavailable (the dependency is gated
+    ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
+    to fall back to its own table.
+    """
+    if not LITELLM_AVAILABLE:
+        return None
+    candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
+    if candidate is None:
+        return None
+    try:
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=candidate,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            cache_read_input_tokens=cached_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - depends on litellm internals
+        logger.debug("litellm.cost_per_token failed for %s: %s", candidate, exc)
+        return None
+    return float(prompt_cost) + float(completion_cost)
+
+
 def list_available_models() -> list[str]:
     """List all models with pricing info in LiteLLM's database.
 

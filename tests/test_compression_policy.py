@@ -19,6 +19,7 @@ import pytest
 from headroom.proxy.auth_mode import AuthMode
 from headroom.transforms.compression_policy import (
     CompressionPolicy,
+    cache_write_multiplier_for_ttl,
     policy_default_payg,
     policy_for_mode,
 )
@@ -182,6 +183,26 @@ class TestNetCostFormula:
         gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0)
         assert abs(gain - 3_500.0) < 1.0
         assert p.should_mutate_deep(50_000, 10_000, 3.0, 1.0)
+
+        one_hour_gain = p.net_mutation_gain(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            write_multiplier=2.0,
+        )
+        assert abs(one_hour_gain - (-4_000.0)) < 1.0
+        assert not p.should_mutate_deep(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            write_multiplier=2.0,
+        )
+
+    def test_cache_write_multiplier_follows_ttl_tier(self):
+        assert cache_write_multiplier_for_ttl(300) == 1.25
+        assert cache_write_multiplier_for_ttl(3600) == 2.0
 
     def test_no_suffix_edit_profitable_with_reads_remaining(self):
         # S = 0: warm-case saving is the avoided rereads, dT*r*R —
