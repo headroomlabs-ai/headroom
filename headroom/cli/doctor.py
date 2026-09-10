@@ -49,7 +49,8 @@ FAIL = "fail"
 SKIP = "skip"
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+_CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
+_CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -402,9 +403,10 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
     """Is Codex configured to route through the proxy?
 
-    Detection keys on the ``[model_providers.headroom]`` section, which both
-    writers emit (install's persistent block and wrap's auto-injected block).
-    Substring matching keeps malformed TOML a WARN instead of a crash.
+    Detection prefers the active ``model_provider`` section's loopback
+    ``base_url``, while retaining the ``[model_providers.headroom]`` fallback
+    emitted by persistent and wrap installs. Best-effort matching keeps
+    malformed TOML a WARN instead of a crash.
     """
     name = "codex"
     if not config_path.exists():
@@ -418,42 +420,56 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
         text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return CheckResult(name=name, status=WARN, summary=f"could not read {config_path}: {exc}")
-    if "[model_providers.headroom]" not in text:
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    provider_id = active_match.group(1) if active_match else "headroom"
+    base_url = _codex_provider_base_url(text, provider_id)
+    if base_url is None:
         return CheckResult(
             name=name,
             status=WARN,
-            summary="not routed (no Headroom provider in config.toml)",
+            summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
-    match = _CODEX_BASE_URL_RE.search(text)
-    if match and int(match.group(1)) != port:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
-            hint=f"re-run with: headroom doctor --port {match.group(1)}",
-        )
+    routing = _classify_routing_url(name, base_url, port, source=str(config_path))
+    if routing.status != PASS:
+        return routing
     # Routed, but Codex may still attach no credentials. A ChatGPT-OAuth user
-    # needs `requires_openai_auth = true` in the provider block or Codex sends
-    # no Authorization header at all and every request 401s with "Missing
-    # bearer" (#3206). That failure is invisible from here -- the proxy is up,
-    # the block is present -- so this check is the only place it can surface.
-    if _codex_block_missing_openai_auth(text, config_path):
+    # needs `requires_openai_auth = true` in the active provider block or Codex
+    # sends no Authorization header and every request fails with 401 (#3206).
+    if _codex_block_missing_openai_auth(text, config_path, provider_id):
         return CheckResult(
             name=name,
             status=WARN,
             summary="routed, but Codex will send no Authorization (missing requires_openai_auth)",
             hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
         )
-    return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
+    return routing
 
 
-def _codex_block_missing_openai_auth(text: str, config_path: Path) -> bool:
+def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
+    section_match = re.search(
+        rf"(?m)^[ \t]*\[model_providers\.{re.escape(provider_id)}\][ \t]*(?:#.*)?$",
+        text,
+    )
+    if section_match is None:
+        return None
+    section = text[section_match.end() :]
+    next_section = re.search(r"(?m)^[ \t]*\[", section)
+    if next_section is not None:
+        section = section[: next_section.start()]
+    base_url_match = _CODEX_BASE_URL_RE.search(section)
+    return base_url_match.group(1) if base_url_match else None
+
+
+def _codex_block_missing_openai_auth(
+    text: str, config_path: Path, provider_id: str = "headroom"
+) -> bool:
     """ChatGPT-OAuth Codex routed without ``requires_openai_auth`` (#3206)."""
-    start = text.find("[model_providers.headroom]")
+    section = f"[model_providers.{provider_id}]"
+    start = text.find(section)
     if start == -1:
         return False
-    rest = text[start + len("[model_providers.headroom]") :]
+    rest = text[start + len(section) :]
     end = rest.find("\n[")
     block = rest if end == -1 else rest[:end]
     if "requires_openai_auth" in block:
