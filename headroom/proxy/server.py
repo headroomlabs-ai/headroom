@@ -476,6 +476,58 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
+    """/stats payload for the output-shaping layer.
+
+    A deployment whose shaper is off (rollout-blocked channel, kill switch,
+    disabled config) is shaping nothing, so /stats must not publish the
+    persisted ledger's estimate as this deployment's live layer: the ledger
+    survives restarts and can span periods or key schemas where arms
+    accumulated unshaped traffic — which is how a rollout-blocked stable
+    install came to advertise a "measured" -147.9% output reduction it never
+    performed. The ledger itself stays untouched; only the claim is gated.
+
+    Every branch emits the SAME key set, nulls where a value does not exist,
+    so a consumer reading ``ci_low_percent`` or ``band_is_ci`` cannot KeyError
+    on the inactive or no-data paths. Numeric totals stay 0 rather than null:
+    callers already sum them.
+    """
+    payload: dict[str, Any] = {
+        "available": False,
+        "active": bool(shaper_active),
+        "method": None,
+        "band_is_ci": None,
+        "tokens_saved": 0,
+        "baseline_tokens": 0,
+        "reduction_percent": 0.0,
+        "ci_low_percent": None,
+        "ci_high_percent": None,
+        "requests": 0,
+    }
+    if not shaper_active:
+        payload["available"] = True
+        payload["method"] = "inactive"
+        return payload
+    if getattr(est, "n_requests", 0) <= 0:
+        return payload
+    payload.update(
+        {
+            "available": True,
+            "method": est.kind,  # "measured" | "estimated" | "modelled"
+            # A modelled band is the spread between the two benchmarked
+            # models, not a sampling CI. The UI must not call it one.
+            "band_is_ci": est.kind != "modelled",
+            "tokens_saved": round(est.tokens_saved),
+            "baseline_tokens": round(est.baseline_tokens),
+            "reduction_percent": round(est.pct, 1),
+            "ci_low_percent": round(est.ci_low_pct, 1),
+            "ci_high_percent": round(est.ci_high_pct, 1),
+            "requests": est.n_requests,
+        }
+    )
+    return payload
+
+
 def _code_syntax_breaker_status() -> dict[str, Any]:
     """Per-language AST-compression breaker state, or {} if unavailable."""
     try:
@@ -2737,13 +2789,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from contextlib import asynccontextmanager
 
+    # Resolve config before file logging so the log can be keyed by port
+    # (below). Tradeoff: any log record emitted while ``ProxyConfig`` is
+    # constructed on the no-config path (e.g. an invalid HEADROOM_QDRANT_PORT
+    # warning) predates the file handler and so is not captured in the file log;
+    # the port must be known first, and it is always present (``port`` defaults
+    # to 8787), so this is accepted.
+    config = config or ProxyConfig()
+
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
-    # to the user's live proxy.log.
-    _setup_file_logging()
-
-    config = config or ProxyConfig()
+    # to the user's live proxy log. Multi-worker processes add their PID so
+    # same-port workers never share a RotatingFileHandler target.
+    _setup_file_logging(
+        config.port,
+        process_id=os.getpid() if config.worker_processes > 1 else None,
+    )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
@@ -4313,44 +4375,51 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # tokens the model didn't emit because we steered verbosity / routed
         # effort down. Always labelled estimated-vs-measured + a CI so it's
         # never mistaken for an exact count. Best-effort — never break /stats.
-        output_reduction: dict[str, Any] = {"available": False}
+        # Same key set as every other branch: a consumer must not have to
+        # discriminate on which failure produced the payload.
+        output_reduction: dict[str, Any] = _output_reduction_payload(False)
+        output_reduction["available"] = False
+        output_reduction["method"] = None
         try:
             from headroom.proxy.output_savings import get_recorder
             from headroom.proxy.output_shaper import (
                 OutputShaperSettings,
                 resolve_verbosity_level,
                 shaper_enabled_for,
+                steering_allowed_for,
             )
 
             # The active steering level enables the modelled fallback, which is
             # what a deployment with no holdout and no learned baseline has --
             # i.e. every fresh install, since `learn --verbosity` needs history
             # that predates the shaper.
+            _shaper_active = False
             _olevel: int | None = None
             try:
+                _oconfig = getattr(proxy, "config", None)
                 _osettings = OutputShaperSettings.from_env(
-                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
+                    enabled=shaper_enabled_for(_oconfig),
+                    # Cache mode forces the resolved level to 0. The request
+                    # handlers pass this too; /stats has to build the SAME
+                    # settings or it reads a level the handlers never used.
+                    steering_enabled=steering_allowed_for(_oconfig),
                 )
                 if _osettings.enabled:
                     _olevel = resolve_verbosity_level(_osettings)[0]
+                    # Steering is the only lever this layer's ledger measures,
+                    # and level 0 is the documented "no steering" value -- the
+                    # same test `shape_request` applies before it touches a
+                    # body. An enabled shaper resolved to 0 (cache mode, an
+                    # explicit HEADROOM_VERBOSITY_LEVEL=0, a learned or
+                    # controller zero) shapes nothing, so it must not publish
+                    # the persisted ledger as a live claim either.
+                    _shaper_active = _olevel > 0
             except Exception:  # pragma: no cover - defensive
+                _shaper_active = False
                 _olevel = None
 
             _oest = get_recorder().estimate(_olevel)
-            if _oest.n_requests > 0:
-                output_reduction = {
-                    "available": True,
-                    "method": _oest.kind,  # "measured" | "estimated" | "modelled"
-                    # A modelled band is the spread between the two benchmarked
-                    # models, not a sampling CI. The UI must not call it one.
-                    "band_is_ci": _oest.kind != "modelled",
-                    "tokens_saved": round(_oest.tokens_saved),
-                    "baseline_tokens": round(_oest.baseline_tokens),
-                    "reduction_percent": round(_oest.pct, 1),
-                    "ci_low_percent": round(_oest.ci_low_pct, 1),
-                    "ci_high_percent": round(_oest.ci_high_pct, 1),
-                    "requests": _oest.n_requests,
-                }
+            output_reduction = _output_reduction_payload(_shaper_active, _oest)
         except Exception:  # pragma: no cover - defensive
             pass
 
