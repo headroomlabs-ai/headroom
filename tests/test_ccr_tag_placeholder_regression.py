@@ -142,8 +142,9 @@ def test_compress_batch_validates_ccr_originals_length():
 # it keeps the first two words of each chunk so the compression ratio clears the
 # ``< 0.8`` CCR-store threshold.
 
-_RAW = "<system-reminder>CRITICAL: invoke the skill</system-reminder> " + " ".join(["filler"] * 40)
-_PLACEHOLDER = "{{HEADROOM_TAG_0}} " + " ".join(["filler"] * 40)
+# 100 filler words: keeping two saves ~99, well past the marker cost gate.
+_RAW = "<system-reminder>CRITICAL: invoke the skill</system-reminder> " + " ".join(["filler"] * 100)
+_PLACEHOLDER = "{{HEADROOM_TAG_0}} " + " ".join(["filler"] * 100)
 
 
 class _FakeEncoding:

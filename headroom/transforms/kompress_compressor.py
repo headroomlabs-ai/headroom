@@ -1294,6 +1294,41 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+_payload_encoder: Any = None
+
+
+def payload_tokens(text: str) -> int:
+    """Token count of a complete payload, in one consistent unit.
+
+    The unit is cl100k_base (tiktoken, a hard dependency), used as a fixed
+    estimate. Actual model tokenizers, including those of other OpenAI
+    models, can differ. Without an encoder, the fallback compares character
+    counts; that heuristic is not a bound on provider token counts.
+
+    The CCR gate measures the whole original and the whole candidate-plus-
+    marker with this, never a marker-only cost against a word count: the
+    marker is 36-45 tokens for 12 words, the words Kompress drops can be one
+    token each, and the word left at the head of the candidate can tokenize
+    differently from its space-prefixed form in the source. Only a comparison
+    of the two complete texts in one unit establishes that the shipped
+    payload is smaller.
+    """
+    global _payload_encoder
+    if _payload_encoder is None:
+        try:
+            import tiktoken
+
+            _payload_encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _payload_encoder = False
+    if _payload_encoder:
+        try:
+            return len(_payload_encoder.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return len(text)
+
+
 def ccr_retrieval_marker(
     n_words: int, compressed_count: int, ccr_source: str, cache_key: str
 ) -> str:
@@ -1725,30 +1760,43 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=ratio,
-                model_used=self.config.model_id,
-            )
-
-            # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            # CCR marker: anything the lossy pass shrank must stay retrievable,
+            # and the complete marked payload must be smaller than the
+            # original. Both are measured whole, in one unit (payload_tokens);
+            # a candidate that is not is passed through. The accounting then
+            # reports that same measurement, so ``tokens_saved`` describes
+            # the shipped payload rather than a word count.
+            if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    result.compressed += ccr_retrieval_marker(
+                    marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        return self._passthrough(content, n_words)
+                    compressed = marked
+
+            ratio = compressed_tokens / original_tokens if original_tokens else 1.0
+            result = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=ratio,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
             if inference_ms >= 1000.0:
                 logger.info(
@@ -2119,33 +2167,40 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            comp_ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=comp_ratio,
-                model_used=self.config.model_id,
-            )
-
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            # Same gate and accounting as the single path.
+            if self.config.enable_ccr:
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    result.compressed += ccr_retrieval_marker(
+                    marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        results[text_idx] = self._passthrough(content, n_words)
+                        continue
+                    compressed = marked
 
-            results[text_idx] = result
+            results[text_idx] = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=compressed_tokens / original_tokens if original_tokens else 1.0,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
         # Safety: every slot must be populated.
         final: list[KompressResult] = []
