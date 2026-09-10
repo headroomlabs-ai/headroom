@@ -35,8 +35,9 @@ Headroom automatically:
 
 ```python
 # After some usage
-print(llm.get_metrics())
-# {'tokens_saved': 12500, 'savings_percent': 45.2, 'requests': 50}
+print(llm.get_savings_summary())
+# {'total_requests': 50, 'total_tokens_saved': 12500, 'average_savings_percent': 45.2,
+#  'total_tokens_before': ..., 'total_tokens_after': ...}
 ```
 
 ---
@@ -61,13 +62,10 @@ llm = HeadroomChatModel(ChatAnthropic(model="claude-3-5-sonnet-20241022"))
 # Custom configuration
 from headroom import HeadroomConfig, HeadroomMode
 
-config = HeadroomConfig(
-    default_mode=HeadroomMode.OPTIMIZE,
-    smart_crusher_target_ratio=0.3,  # Target 70% compression
-)
+config = HeadroomConfig(default_mode=HeadroomMode.OPTIMIZE)
 llm = HeadroomChatModel(
     ChatOpenAI(model="gpt-4o"),
-    headroom_config=config,
+    config=config,
 )
 ```
 

@@ -7,20 +7,22 @@ description: Install Headroom via pip, npm, or Docker. Includes all Python extra
 
 ## Install options
 
-**uv tool** - you want the `headroom` CLI (`proxy`, `wrap`, `mcp`, `learn`, `perf`) installed once on your machine in an isolated app environment.
+**uv tool** - you want the `headroom` CLI (`deploy`, `proxy`, `wrap`, `doctor`, `mcp`, `learn`, and the other CLI commands) installed once on your machine in an isolated app environment.
 
-**pip** - you're writing Python, or you need the CLI (`headroom proxy`, `wrap`, `mcp`, `learn`, `perf`), regardless of what language your app is in.
+**pip** - you're writing Python, or you need the CLI, regardless of what language your app is in.
 
 **npm** - you're writing TypeScript/Node and want inline `compress()`, SDK wrapping (`withHeadroom`), or Vercel AI SDK middleware.
 
 ## Python
 
 Headroom requires **Python 3.10+** and is published as `headroom-ai` on PyPI.
-Current release wheels are built for Python **3.10 through 3.13** on Linux
-(manylinux_2_28 x86_64 / aarch64) and macOS (Apple Silicon). Other targets —
-**Windows** and **Intel macOS** — fall back to building the Rust extension
-from the sdist and need a working native toolchain. If your installer is
-using a newer Python, force a supported interpreter.
+Release wheels are built for CPython **3.10 through 3.13** on Linux
+(manylinux_2_28 x86_64 / aarch64), macOS (Apple Silicon and Intel), and
+Windows x86_64. The Rust extension uses the CPython stable ABI, so those wheels
+are forward-compatible with newer supported CPython versions; optional
+dependencies may impose their own Python/platform limits. Platforms outside
+that matrix fall back to the source distribution and need a Rust/native
+toolchain.
 
 ### CLI install with uv
 
@@ -60,11 +62,6 @@ command = "/Users/you/.local/bin/headroom"
 args = ["mcp", "serve"]
 ```
 
-Native Intel macOS installs are currently tracked in
-[headroomlabs-ai/headroom#525](https://github.com/headroomlabs-ai/headroom/issues/525).
-Use [Docker-Native Install](/docs/docker-install) on Intel Macs until native
-wheel support lands.
-
 ### Core package
 
 ```bash
@@ -85,22 +82,36 @@ pip install "headroom-ai[all]"
 
 | Extra | What it adds | Install command |
 |---|---|---|
-| `proxy` | Proxy server, MCP tools, HTTP API | `pip install "headroom-ai[proxy]"` |
-| `ml` | Kompress (ModernBERT text compression, requires PyTorch) | `pip install "headroom-ai[ml]"` |
+| `proxy` | Proxy server, HTTP API, MCP runtime, local ONNX Kompress path | `pip install "headroom-ai[proxy]"` |
+| `proxy-prod` | `proxy` plus gunicorn on Unix production hosts | `pip install "headroom-ai[proxy,proxy-prod]"` |
+| `ml` | PyTorch/Hugging Face Kompress backend and model tooling | `pip install "headroom-ai[ml]"` |
 | `code` | CodeCompressor (tree-sitter AST parsing) | `pip install "headroom-ai[code]"` |
 | `memory` | Persistent memory (sqlite-vec, sentence-transformers) — pure-Python default backend, no compiler | `pip install "headroom-ai[memory]"` |
 | `vector` | Optional HNSW vector backend (hnswlib) — needs a C++ toolchain; **not in `[all]`** | `pip install "headroom-ai[vector]"` |
+| `memory-stack` | Optional Qdrant + Neo4j memory backend helpers; **not in `[all]`** | `pip install "headroom-ai[memory-stack]"` |
 | `relevance` | fastembed-based relevance scoring (BAAI/bge-small-en-v1.5, ONNX) | `pip install "headroom-ai[relevance]"` |
 | `image` | Image compression (Pillow, ONNX runtime, OCR) | `pip install "headroom-ai[image]"` |
 | `reports` | HTML/Markdown report generation (Jinja2) | `pip install "headroom-ai[reports]"` |
 | `otel` | OpenTelemetry exporter (OTLP) | `pip install "headroom-ai[otel]"` |
 | `voice` | Voice/audio support | `pip install "headroom-ai[voice]"` |
+| `voice-train` | Voice training dependencies; **not in `[all]`** | `pip install "headroom-ai[voice-train]"` |
 | `mcp` | MCP server tools (`headroom_compress`, `headroom_retrieve`, `headroom_stats`) | `pip install "headroom-ai[mcp]"` |
-| `langchain` | LangChain `HeadroomChatModel` wrapper | `pip install "headroom-ai[langchain]"` |
-| `agno` | Agno `HeadroomAgnoModel` wrapper | `pip install "headroom-ai[agno]"` |
+| `langchain` | LangChain `HeadroomChatModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[langchain]"` |
+| `agno` | Agno `HeadroomAgnoModel` wrapper; **not in `[all]`** | `pip install "headroom-ai[agno]"` |
+| `strands` | AWS Strands Agents integration; **not in `[all]`** | `pip install "headroom-ai[strands]"` |
+| `crewai` | CrewAI integration; **not in `[all]`** | `pip install "headroom-ai[crewai]"` |
+| `autogen` | AutoGen AgentChat integration; **not in `[all]`** | `pip install "headroom-ai[autogen]"` |
+| `anyllm` | any-llm multi-provider backend (Python 3.11+); **not in `[all]`** | `pip install "headroom-ai[anyllm]"` |
+| `bedrock` | Native AWS Bedrock credentials/backend support; **not in `[all]`** | `pip install "headroom-ai[bedrock]"` |
 | `evals` | Evaluation framework (GSM8K, SQuAD, BFCL benchmarks) | `pip install "headroom-ai[evals]"` |
 | `pytorch-mps` | Apple-GPU (MPS) memory-embedder offload — **macOS only**, not in `[all]` (torch + sentence-transformers); opt in with `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` | `pip install "headroom-ai[pytorch-mps]"` |
-| `all` | Everything above | `pip install "headroom-ai[all]"` |
+| `html` | HTML main-content extraction with trafilatura | `pip install "headroom-ai[html]"` |
+| `spreadsheet` | `.xlsx` / `.xls` ingestion with openpyxl and xlrd | `pip install "headroom-ai[spreadsheet]"` |
+| `sandbox` | Torch-free proxy bundle for constrained environments | `pip install "headroom-ai[sandbox]"` |
+| `all` | Runtime bundle: `proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet` | `pip install "headroom-ai[all]"` |
+
+`[all]` is the full built-in runtime bundle, not every integration or optional
+backend. The rows marked “not in `[all]`” must be requested explicitly.
 
 You can combine extras:
 
@@ -108,12 +119,13 @@ You can combine extras:
 pip install "headroom-ai[proxy,langchain,ml]"
 ```
 
-### Windows
+### Source builds and unsupported targets
 
-There are no prebuilt Windows wheels yet, so `pip install headroom-ai`
-(and `uv tool install`, `pipx install`, …) will fall back to building the
-Rust extension from the sdist. The build needs the MSVC toolchain on
-`PATH`. Without it you'll see:
+Windows x86_64, Intel/Apple Silicon macOS, and Linux x86_64/aarch64 have
+release wheels. If pip selects the source distribution on another target (or
+because a matching wheel is unavailable), the build needs Rust plus the
+platform C/C++ toolchain. On Windows without MSVC on `PATH`, for example,
+you'll see:
 
 ```text
 error: linker `link.exe` not found
@@ -138,9 +150,8 @@ To install the prerequisites:
    pip install "headroom-ai[all]"
    ```
 
-If you'd rather avoid the native toolchain entirely, run Headroom
-through Docker — see the [Docker](#docker) section below. Native
-Windows wheels are tracked in [#636](https://github.com/headroomlabs-ai/headroom/issues/636).
+If you'd rather avoid a source build, use a supported interpreter/platform or
+run Headroom through Docker — see the [Docker](#docker) section below.
 
 ### pipx
 
@@ -155,10 +166,10 @@ Use Python 3.13 explicitly. If you already use uv, prefer the
 pipx install --python python3.13 "headroom-ai[all]"
 ```
 
-For a pinned release:
+For a pinned release, replace `<version>` with the version you require:
 
 ```bash
-pipx install --python python3.13 "headroom-ai[all]==0.21.4"
+pipx install --python python3.13 "headroom-ai[all]==<version>"
 ```
 
 Check which Python an existing `pipx` environment uses:
@@ -230,15 +241,15 @@ If you want a host `headroom` CLI that keeps Headroom itself inside a container 
 
 | Tag | Extras | Base image | Description |
 |---|---|---|---|
-| `latest` | `proxy` | Debian slim | Default image, runs the proxy |
-| `<version>` | `proxy` | Debian slim | Pinned version |
-| `nonroot` | `proxy` | Debian slim | Runs as non-root user |
-| `code` | `proxy,code` | Debian slim | Includes tree-sitter for code compression |
-| `code-nonroot` | `proxy,code` | Debian slim | Code compression, non-root |
-| `slim` | `proxy` | Distroless | Minimal image, no shell |
-| `slim-nonroot` | `proxy` | Distroless | Minimal, non-root |
-| `code-slim` | `proxy,code` | Distroless | Code compression, minimal |
-| `code-slim-nonroot` | `proxy,code` | Distroless | Code compression, minimal, non-root |
+| `latest` | `proxy,bedrock` | Debian slim | Default image, runs as non-root |
+| `<version>` | `proxy,bedrock` | Debian slim | Pinned release, same default variant |
+| `nonroot` | `proxy,bedrock` | Debian slim | Explicit non-root variant |
+| `code` | `proxy,code,bedrock` | Debian slim | Includes tree-sitter for code compression |
+| `code-nonroot` | `proxy,code,bedrock` | Debian slim | Code compression, non-root |
+| `slim` | `proxy,bedrock` | Distroless | Minimal image, no shell |
+| `slim-nonroot` | `proxy,bedrock` | Distroless | Minimal, non-root |
+| `code-slim` | `proxy,code,bedrock` | Distroless | Code compression, minimal |
+| `code-slim-nonroot` | `proxy,code,bedrock` | Distroless | Code compression, minimal, non-root |
 
 ### Build from source
 
