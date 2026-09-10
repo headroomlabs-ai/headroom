@@ -66,6 +66,7 @@ updates:
       - "/sdk/typescript"
       - "/plugins/openclaw"
       - "/plugins/opencode"
+      - "/e2e/wrap/tools"
       - "/docs"
     schedule:
       interval: weekly

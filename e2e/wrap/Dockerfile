@@ -69,16 +69,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Install Node.js 22 from NodeSource (matches what node:22-trixie gives,
-# but layered onto python:3.11-slim so we get py3.11 + node22 + glibc 2.41
-# in one image). Also install git for any package that clones at install.
+# OpenClaw 2026.9.3 requires Node >=24.16.0 (or >=26.1.0). Install the
+# Node 24 LTS line alongside Python 3.11. Also install git for packages
+# that clone at install time.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
       gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
