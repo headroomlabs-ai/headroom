@@ -40,7 +40,16 @@ def test_detect_editable(monkeypatch):
 
 
 def test_detect_docker(monkeypatch):
+    # A bare /.dockerenv container whose system interpreter owns the install
+    # (no venv / pipx / uv / user-site) still refuses. When an install method
+    # owns it, ownership wins over the container environment (#2816) -- see
+    # test_update_helpers.test_venv_inside_bare_dockerenv_still_self_updates.
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
     monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(up, "_is_user_site_install", lambda loc: False)
+    monkeypatch.setattr(up.sys, "prefix", "/usr")
+    monkeypatch.setattr(up.sys, "executable", "/usr/bin/python3")
     m = up.detect_install_method()
     assert m.kind == "docker" and m.can_self_update is False
 

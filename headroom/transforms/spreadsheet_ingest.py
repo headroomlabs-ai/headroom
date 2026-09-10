@@ -18,11 +18,30 @@ from pathlib import Path
 __all__ = ["load_spreadsheet"]
 
 
+def _is_blank_row(row: list[object]) -> bool:
+    return all(cell is None or str(cell).strip() == "" for cell in row)
+
+
 def _rows_to_csv(rows: list[list[object]]) -> str:
-    """Render rows to CSV text, dropping fully empty trailing rows."""
+    """Render rows to CSV text, dropping fully empty trailing rows.
+
+    openpyxl's ``iter_rows`` walks the sheet's *used range*, which routinely
+    extends past the last data row (leftover formatting, a cleared cell), so a
+    real sheet commonly ends in ``(None, None, ...)`` tuples. Those were written
+    out as blank ``,`` rows — contradicting this function's own contract — so the
+    trailing empties are dropped here first.
+
+    ``lineterminator="\\n"`` is load-bearing: ``csv.writer`` defaults to
+    ``\\r\\n``, and the old ``.strip("\\n")`` removed only the ``\\n``, leaving a
+    dangling ``\\r`` on the final line (and ``,\\r`` residue behind each undropped
+    empty row). Using ``\\n`` makes the strip clean.
+    """
+    last = len(rows)
+    while last > 0 and _is_blank_row(rows[last - 1]):
+        last -= 1
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    for row in rows:
+    writer = csv.writer(buf, lineterminator="\n")
+    for row in rows[:last]:
         writer.writerow(["" if cell is None else cell for cell in row])
     return buf.getvalue().strip("\n")
 

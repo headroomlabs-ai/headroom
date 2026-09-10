@@ -13,12 +13,40 @@ from headroom.install.supervisors import (
     _macos_launchd_plist,
     _render_unix_runner,
     _render_windows_runner,
+    _windows_boot_trigger,
+    _windows_health_trigger,
+    _windows_task_xml,
     install_supervisor,
     remove_supervisor,
     render_runner_scripts,
     start_supervisor,
     stop_supervisor,
 )
+
+
+def test_windows_task_xml_user_scope_is_hidden_s4u() -> None:
+    # #2453: user-scope tasks must run S4U (non-interactive, no window) and
+    # hidden so the 5-minute health run never steals keyboard focus.
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.cmd",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+    )
+    assert "<LogonType>S4U</LogonType>" in xml
+    assert "<Hidden>true</Hidden>" in xml
+    assert "<Interval>PT5M</Interval>" in xml
+    assert "<Command>C:\\tmp\\default\\ensure-headroom.cmd</Command>" in xml
+
+
+def test_windows_task_xml_system_scope_uses_localsystem() -> None:
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.cmd",
+        trigger_xml=_windows_boot_trigger(),
+        scope="system",
+    )
+    assert "<UserId>S-1-5-18</UserId>" in xml
+    assert "<LogonType>ServiceAccount</LogonType>" in xml
+    assert "<BootTrigger>" in xml
 
 
 def _manifest(
@@ -377,19 +405,16 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         "sc.exe create headroom-default "
         'binPath= "cmd.exe /c \\"C:\\tmp\\default\\run-headroom.cmd\\"" start= auto'
     ) in calls
-    assert [
-        "schtasks",
-        "/Create",
-        "/TN",
-        "headroom-default-health",
-        "/TR",
-        "C:\\tmp\\default\\ensure-headroom.cmd",
-        "/SC",
-        "MINUTE",
-        "/MO",
-        "5",
-        "/F",
-    ] in calls
+    # #2453: tasks are registered from S4U/hidden XML via `schtasks /XML`, not
+    # interactive-token flag creation. Assert the startup and health tasks are
+    # each created from an XML file (the temp path varies).
+    task_creates = [
+        c for c in calls if isinstance(c, list) and c[:2] == ["schtasks", "/Create"] and "/XML" in c
+    ]
+    created_names = {c[c.index("/TN") + 1] for c in task_creates}
+    assert {"headroom-default-startup", "headroom-default-health"} <= created_names
+    for c in task_creates:
+        assert c[-1] == "/F"
 
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "plan9")
     monkeypatch.setattr("headroom.install.supervisors.sys.platform", "plan9")

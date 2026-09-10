@@ -128,9 +128,13 @@ async def handle_codex_live_websocket(
     )
     forwarded_headers = await apply_copilot_api_auth(forwarded_headers, url=upstream_url)
     config = getattr(proxy, "config", None)
+    # `openai_base_url` comes from the resolved provider target, not from a
+    # request header, so there is no per-request override to gate on here.
     forwarded_headers = merge_extra_headers(
         forwarded_headers,
         getattr(config, "openai_extra_headers", None),
+        upstream_url=None,
+        config=config,
     )
     if not any(key.lower() == "authorization" for key in forwarded_headers):
         if os.environ.get("OPENAI_API_KEY", "").strip():

@@ -299,32 +299,58 @@ class TestMemoryTopKValidation:
 class TestMissingProxyDepsError:
     """When proxy dependencies are absent the CLI should print an actionable error and exit 1."""
 
-    def test_import_error_exits_nonzero(self, runner: CliRunner) -> None:
-        with patch.dict(
-            "sys.modules",
-            {"headroom.proxy.server": None},
+    @pytest.mark.proxy_dependency_gate
+    def test_proxy_command_exits_when_mcp_missing(
+        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(
+            name: str,
+            globals: dict | None = None,
+            locals: dict | None = None,
+            fromlist: tuple = (),
+            level: int = 0,
         ):
-            result = runner.invoke(main, ["proxy"])
-        # Click CliRunner may raise SystemExit or catch it; exit code must be non-zero
-        assert result.exit_code != 0
+            if name == "mcp":
+                raise ImportError("No module named 'mcp'")
+            return real_import(name, globals, locals, fromlist, level)
 
-    def test_import_error_message_is_actionable(self, runner: CliRunner) -> None:
-        """The error message should tell the user how to fix the problem."""
-        original_import = (
-            __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-        )
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        result = runner.invoke(main, ["proxy"])
+        assert result.exit_code == 1, result.output
+        assert "pip install headroom-ai[proxy]" in result.output
+        assert "No module named 'mcp'" in result.output
 
-        def patched_import(name, *args, **kwargs):
-            if name == "headroom.proxy.server":
-                raise ImportError("No module named 'headroom.proxy.server'")
-            return original_import(name, *args, **kwargs)
+    @pytest.mark.proxy_dependency_gate
+    def test_ensure_proxy_dependencies_exits_when_fastapi_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
 
-        with patch("builtins.__import__", side_effect=patched_import):
-            result = runner.invoke(main, ["proxy"])
+        from headroom.cli.proxy import ensure_proxy_dependencies
 
-        # Either exit code 1 or output with actionable guidance
-        # (some test environments may shadow the import differently)
-        assert result.exit_code != 0 or "proxy" in result.output.lower()
+        real_import = builtins.__import__
+
+        def fake_import(
+            name: str,
+            globals: dict | None = None,
+            locals: dict | None = None,
+            fromlist: tuple = (),
+            level: int = 0,
+        ):
+            if name == "fastapi":
+                raise ImportError("No module named 'fastapi'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        with pytest.raises(SystemExit) as exc_info:
+            ensure_proxy_dependencies()
+
+        assert exc_info.value.code == 1
 
 
 class TestKeyboardInterruptExitCode:

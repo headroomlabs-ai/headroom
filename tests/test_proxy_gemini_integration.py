@@ -23,6 +23,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from tests._gemini_live import skip_if_gemini_quota_exhausted  # noqa: E402
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
@@ -63,6 +64,7 @@ class TestGeminiChatCompletions:
                 ],
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -93,6 +95,7 @@ class TestGeminiChatCompletions:
                 ],
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -110,6 +113,7 @@ class TestGeminiChatCompletions:
                 "messages": [{"role": "user", "content": "Count from 1 to 3."}],
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
 
         # Parse SSE stream
@@ -154,6 +158,7 @@ class TestGeminiChatCompletions:
                 "tool_choice": "auto",
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -182,6 +187,7 @@ class TestGeminiChatCompletions:
                 "response_format": {"type": "json_object"},
             },
         )
+        skip_if_gemini_quota_exhausted(response)
         assert response.status_code == 200
         data = response.json()
 
@@ -198,6 +204,7 @@ class TestGeminiModels:
     def test_list_models(self, gemini_client, api_key):
         """Can list available models."""
         response = gemini_client.get("/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+        skip_if_gemini_quota_exhausted(response)
         # This goes through passthrough handler
         assert response.status_code == 200
         data = response.json()
@@ -211,11 +218,12 @@ class TestProxyStats:
     def test_stats_track_requests(self, gemini_client, api_key):
         """Proxy stats track Gemini requests."""
         # Make a request
-        gemini_client.post(
+        response = gemini_client.post(
             "/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": "gemini-2.0-flash", "messages": [{"role": "user", "content": "Hi"}]},
         )
+        skip_if_gemini_quota_exhausted(response)
 
         # Check stats
         stats_response = gemini_client.get("/stats")

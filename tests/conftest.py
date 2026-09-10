@@ -23,6 +23,22 @@ from tests._skip_helpers import external_model_skip_reason
 # config instead of the test's. Scrub them so local runs match CI; tests
 # that need a value set it explicitly via monkeypatch or CliRunner env.
 @pytest.fixture(autouse=True)
+def _skip_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Most CLI tests run without headroom-ai[proxy] extras installed."""
+    if request.node.get_closest_marker("proxy_dependency_gate") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        # Native-wrapper jobs intentionally install only pytest and exercise the
+        # installer scripts without importing Headroom's runtime dependencies.
+        return
+    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _scrub_developer_headroom_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
@@ -91,6 +107,29 @@ def _reset_copilot_routing_flag():
     reset_request_routed_to_copilot()
 
 
+# `savings_tracker._resolve_litellm_model` is an `lru_cache`d, module-global,
+# process-lifetime cache keyed by model name (bounded — see #2860). Many test
+# files monkeypatch `savings_tracker.litellm` to a fake with different
+# `model_cost`/`cost_per_token` behavior per test, but reuse common model
+# names like "gpt-4o" across them. Without a reset, whichever test resolves
+# "gpt-4o" first "wins" the cache entry for the rest of the run, and later
+# tests silently stop exercising their own fake — a real-not-hypothetical
+# order-dependence bug once the cache is process-lifetime instead of per-call.
+# Clear before AND after so a test's own within-test resolutions never leak
+# in from, or leak out to, a neighboring test either.
+@pytest.fixture(autouse=True)
+def _reset_litellm_model_resolution_cache():
+    try:
+        from headroom.proxy.savings_tracker import _resolve_litellm_model
+    except ModuleNotFoundError:
+        yield
+        return
+
+    _resolve_litellm_model.cache_clear()
+    yield
+    _resolve_litellm_model.cache_clear()
+
+
 # =============================================================================
 # Global test hooks
 # =============================================================================
@@ -113,6 +152,38 @@ def pytest_runtest_call(item):
         reason = external_model_skip_reason(exc_value)
         if reason is not None:
             pytest.skip(reason)
+
+
+@pytest.fixture(autouse=True)
+def _null_binary_pins():
+    """Null the tools.json SHA-256 pins during tests.
+
+    Installer tests fetch small mock archives, whose digests can't match the
+    real published pins. Nulling the pins lets those download/extract mechanics
+    tests run (verification then falls back to HTTPS trust); the tests that
+    specifically exercise verification set their own pin explicitly. Production
+    keeps the real pins (this fixture is test-only) and the tools-hash-refresh
+    CI gate guarantees they stay correct.
+    """
+    try:
+        from headroom import binaries
+    except Exception:
+        # Lean CI environments (e.g. the native-installer jobs) omit heavy deps
+        # such as opentelemetry that importing `binaries` pulls in. There are no
+        # tool pins to null there, so skip cleanly rather than erroring at setup.
+        yield
+        return
+
+    saved = [
+        (asset, asset.get("sha256"))
+        for tool in binaries._registry().get("tools", {}).values()
+        for asset in tool.get("assets", {}).values()
+    ]
+    for asset, _original in saved:
+        asset["sha256"] = None
+    yield
+    for asset, original in saved:
+        asset["sha256"] = original
 
 
 @pytest.fixture(autouse=True)

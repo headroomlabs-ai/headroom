@@ -52,6 +52,10 @@ DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_S
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
+# Previews carry verbatim tool-result content (post-redaction), which makes
+# proxy.log too sensitive for users to share in bug reports. Set to
+# 0/false/no/off to log byte counts only.
+PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
     r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
@@ -108,7 +112,21 @@ def _redact_retrieval_log_payload(payload: str) -> str:
     return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
 
 
+def _payload_preview_enabled() -> bool:
+    raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
+    if not _payload_preview_enabled():
+        return {
+            "payload_chars": len(payload),
+            "payload_preview_chars": 0,
+            "payload_truncated": len(payload) > 0,
+            "payload_preview": "",
+        }
     redacted = _redact_retrieval_log_payload(payload)
     preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
     truncated = len(redacted) > len(preview)

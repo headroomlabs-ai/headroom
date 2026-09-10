@@ -55,6 +55,19 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|\.[a-z]{2,4}\b"  # extensions: .py .so .json
     r"|--?[a-z][\w-]*"  # flags: --verbose, -n
     r"|\b[A-Z][a-z]+[A-Z]\w*"  # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+    # Directive words. Every other class above protects a token the model could
+    # not RECONSTRUCT; these protect tokens whose loss INVERTS the surrounding
+    # sentence. Compressed prompts carry instructions as often as they carry
+    # tool output, and "do not guess at model names" without its "not" is not a
+    # degraded instruction, it is the opposite instruction. Measured over 40
+    # real skill bodies with THIS pattern: negation retention rose
+    # 73.5% -> 91.9% and modal retention 65.5% -> 96.8%, for 0.2 percentage
+    # points of compression (ratio 0.716 -> 0.718) -- these are short, common
+    # words, so the model was already keeping most of them and pinning the rest
+    # costs almost nothing.
+    r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
+    r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
+    r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
@@ -746,15 +759,27 @@ def _load_kompress_onnx(
 
 
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
-    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False."""
+    """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
+
+    Always tries the local cache FIRST, even when downloading is allowed. With
+    ``local_files_only=False`` transformers re-validates against the Hub on every
+    load — a tree listing plus a HEAD per tokenizer file — even when the repo is
+    fully cached. MEASURED ~900ms warm-cache versus ~150ms local-only, i.e. ~750ms
+    of pure network round-trip on every process start, and it is also what makes
+    a cold start slow on a bad network rather than merely offline.
+
+    Same files, same tokenizer, so the loaded object is identical; this only
+    changes whether the Hub is consulted to confirm what is already on disk.
+    Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
+    this loader already uses.
+    """
     try:
-        return auto_tokenizer.from_pretrained(
-            "answerdotai/ModernBERT-base", local_files_only=not allow_download
-        )
+        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-        raise
+    # Genuine cache miss and downloading is permitted: fetch it.
+    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
 
 
 # Sub-state-dict keys inside a merged v2-style checkpoint (see
@@ -1039,6 +1064,45 @@ def unload_kompress_model(model_id: str | None = None) -> bool:
 _download_threads: dict[str, threading.Thread] = {}
 _download_threads_lock = threading.Lock()
 
+#: Retry backoff for a FAILED background download, in seconds. A finished-or-failed
+#: thread is replaced on the next call so a transient network blip recovers, but
+#: without a floor an unreachable Hub means every request spawns a fresh download
+#: thread for the life of the process — each one importing transformers and
+#: resolving the Hub, all holding the GIL against the event loop. The window grows
+#: per consecutive failure and resets on success, so the happy path and the
+#: transient-failure path are both unchanged; only the permanently-broken case is
+#: bounded.
+_DOWNLOAD_RETRY_BASE_SECONDS = 5.0
+_DOWNLOAD_RETRY_MAX_SECONDS = 300.0
+_download_failures: dict[str, tuple[int, float]] = {}
+
+
+def _record_download_failure(model_id: str) -> None:
+    with _download_threads_lock:
+        failures, _ = _download_failures.get(model_id, (0, 0.0))
+        _download_failures[model_id] = (failures + 1, time.monotonic())
+
+
+def _clear_download_failures(model_id: str) -> None:
+    with _download_threads_lock:
+        _download_failures.pop(model_id, None)
+
+
+def _download_retry_blocked(model_id: str) -> bool:
+    """True when the last attempt failed and the backoff window has not elapsed.
+
+    Caller must hold ``_download_threads_lock``.
+    """
+    entry = _download_failures.get(model_id)
+    if entry is None:
+        return False
+    failures, last_attempt = entry
+    window = min(
+        _DOWNLOAD_RETRY_MAX_SECONDS,
+        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+    )
+    return bool((time.monotonic() - last_attempt) < window)
+
 
 def _background_download(model_id: str, device: str) -> None:
     try:
@@ -1046,7 +1110,10 @@ def _background_download(model_id: str, device: str) -> None:
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
     except Exception as exc:
+        _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
+    else:
+        _clear_download_failures(model_id)
 
 
 def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto") -> None:
@@ -1054,7 +1121,9 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
 
     Idempotent and non-blocking: at most one download thread runs per model_id,
     and a finished or failed thread is replaced on the next call so a transient
-    network failure can be retried by a later request. Once the download
+    network failure can be retried by a later request — subject to a growing
+    backoff after consecutive failures, so an unreachable Hub cannot turn every
+    request into another download thread. Once the download
     completes the deep path activates on subsequent requests without ever
     blocking one on the network.
     """
@@ -1065,6 +1134,8 @@ def ensure_background_download(model_id: str = HF_MODEL_ID, device: str = "auto"
             return
         existing = _download_threads.get(model_id)
         if existing is not None and existing.is_alive():
+            return
+        if _download_retry_blocked(model_id):
             return
         thread = threading.Thread(
             target=_background_download,
@@ -1192,6 +1263,12 @@ class KompressConfig:
     model_id: str = HF_MODEL_ID
     chunk_words: int = 350
     score_threshold: float = 0.5
+    # Lossy word-dropping below this size is a net loss: the CCR retrieval
+    # marker alone is ~20 words, and short blocks are disproportionately
+    # instruction-like (sanitizer banners, section headers) where dropped
+    # words read as garbling rather than compression. Values below the
+    # historical floor of 10 are clamped up to it.
+    min_input_words: int = 64
 
 
 @dataclass
@@ -1217,6 +1294,61 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+_payload_encoder: Any = None
+
+
+def payload_tokens(text: str) -> int:
+    """Token count of a complete payload, in one consistent unit.
+
+    The unit is cl100k_base (tiktoken, a hard dependency), used as a fixed
+    estimate. Actual model tokenizers, including those of other OpenAI
+    models, can differ. Without an encoder, the fallback compares character
+    counts; that heuristic is not a bound on provider token counts.
+
+    The CCR gate measures the whole original and the whole candidate-plus-
+    marker with this, never a marker-only cost against a word count: the
+    marker is 36-45 tokens for 12 words, the words Kompress drops can be one
+    token each, and the word left at the head of the candidate can tokenize
+    differently from its space-prefixed form in the source. Only a comparison
+    of the two complete texts in one unit establishes that the shipped
+    payload is smaller.
+    """
+    global _payload_encoder
+    if _payload_encoder is None:
+        try:
+            import tiktoken
+
+            _payload_encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _payload_encoder = False
+    if _payload_encoder:
+        try:
+            return len(_payload_encoder.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return len(text)
+
+
+def ccr_retrieval_marker(
+    n_words: int, compressed_count: int, ccr_source: str, cache_key: str
+) -> str:
+    """The retrieval marker appended after a lossy Kompress pass.
+
+    Says "words" — Kompress drops words from prose; the counts are word
+    counts. The old wording said "items", which models (and humans) read
+    as an item-structured payload that compression mangled. The source
+    line span is reported so a reader can tell content was compressed
+    away rather than absent (#2586).
+    """
+    source_lines = ccr_source.count("\n") + 1
+    line_word = "line" if source_lines == 1 else "lines"
+    return (
+        f"\n[{n_words} words compressed to {compressed_count}"
+        f" (from {source_lines} source {line_word})."
+        f" Retrieve more: hash={cache_key}]"
+    )
+
+
 def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) -> str | None:
     """Store an original->compressed mapping in the proxy-local CCR store and
     return its retrieval hash (or None on any failure).
@@ -1237,8 +1369,12 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
             compressed,
             original_tokens=original_tokens,
             compressed_tokens=compressed_tokens,
-            original_item_count=original_tokens,
-            compressed_item_count=compressed_tokens,
+            # No item counts: kompress compresses prose, not item lists.
+            # These fields used to carry the word counts, so a retrieval
+            # of a 33-word banner reported "original_item_count: 33" — a
+            # model (and a debugging human) reads that as a 33-item data
+            # structure that compression mangled. Token counts already
+            # carry the size story in their own fields above.
             tool_signature_hash=signature.structure_hash,
             compression_strategy="kompress",
         )
@@ -1426,7 +1562,7 @@ class KompressCompressor(Transform):
         words = content.split()
         n_words = len(words)
 
-        if n_words < 10 or self._degraded_reason is not None:
+        if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
@@ -1624,34 +1760,43 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=ratio,
-                model_used=self.config.model_id,
-            )
-
-            # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            # CCR marker: anything the lossy pass shrank must stay retrievable,
+            # and the complete marked payload must be smaller than the
+            # original. Both are measured whole, in one unit (payload_tokens);
+            # a candidate that is not is passed through. The accounting then
+            # reports that same measurement, so ``tokens_saved`` describes
+            # the shipped payload rather than a word count.
+            if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    marked = compressed + ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        return self._passthrough(content, n_words)
+                    compressed = marked
+
+            ratio = compressed_tokens / original_tokens if original_tokens else 1.0
+            result = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=ratio,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
             if inference_ms >= 1000.0:
                 logger.info(
@@ -1836,9 +1981,10 @@ class KompressCompressor(Transform):
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
+        _floor = max(10, self.config.min_input_words)
         chunk_queue: list[tuple[int, int, list[str], float | None]] = []
         for i, (words, ratio) in enumerate(zip(word_lists, ratios, strict=True)):
-            if len(words) < 10:
+            if len(words) < _floor:
                 results[i] = self._passthrough(contents[i], len(words))
                 continue
             for chunk_start in range(0, len(words), max_chunk_words):
@@ -2021,37 +2167,40 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            comp_ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=comp_ratio,
-                model_used=self.config.model_id,
-            )
-
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            # Same gate and accounting as the single path.
+            if self.config.enable_ccr:
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    source_lines = ccr_source.count("\n") + 1
-                    line_word = "line" if source_lines == 1 else "lines"
-                    result.compressed += (
-                        f"\n[{n_words} items compressed to {compressed_count}"
-                        f" (from {source_lines} source {line_word})."
-                        f" Retrieve more: hash={cache_key}]"
+                    marked = compressed + ccr_retrieval_marker(
+                        n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        results[text_idx] = self._passthrough(content, n_words)
+                        continue
+                    compressed = marked
 
-            results[text_idx] = result
+            results[text_idx] = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=compressed_tokens / original_tokens if original_tokens else 1.0,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
         # Safety: every slot must be populated.
         final: list[KompressResult] = []
@@ -2145,7 +2294,9 @@ class KompressCompressor(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
 
-            if not isinstance(content, str) or len(content.split()) < 10:
+            if not isinstance(content, str) or len(content.split()) < max(
+                10, self.config.min_input_words
+            ):
                 transformed.append(message)
                 continue
 

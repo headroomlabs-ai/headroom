@@ -35,6 +35,37 @@ def _make_config() -> ProxyConfig:
     )
 
 
+@pytest.fixture(autouse=True)
+def _fresh_compression_store():
+    """Each test gets its own store, so seeded markers cannot leak between them."""
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    get_compression_store(backend=InMemoryBackend())
+    try:
+        yield
+    finally:
+        reset_compression_store()
+
+
+def _buffered(text: str) -> str:
+    """User content carrying a marker this proxy owns.
+
+    The buffered path engages only when retrieval has something to expand
+    (#3071); a resident ``headroom_retrieve`` with no redeemable marker in the
+    request keeps streaming. Every test below that is *about* the buffered path
+    therefore has to earn it with a real marker rather than the tool alone.
+    """
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"earlier": "tool output"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+    return f"{text} (earlier output at <<ccr:{hash_key}>>)"
+
+
 def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> dict:
     return {
         "id": "msg_test",
@@ -50,10 +81,6 @@ def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> 
             "cache_creation_input_tokens": 0,
         },
     }
-
-
-def _is_client_visible_sse(body: bytes) -> bool:
-    return b"event:" in body or b"data:" in body
 
 
 class _ContinuationClient:
@@ -131,7 +158,7 @@ def test_streaming_headroom_retrieve_is_intercepted_and_returned_as_sse() -> Non
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "retrieve it"}],
+                    "messages": [{"role": "user", "content": _buffered("retrieve it")}],
                 },
             )
 
@@ -217,7 +244,7 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "hello"}],
+                    "messages": [{"role": "user", "content": _buffered("hello")}],
                 },
             )
 
@@ -286,7 +313,7 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
                             "input_schema": {"type": "object", "properties": {}},
                         },
                     ],
-                    "messages": [{"role": "user", "content": "use tools"}],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
                 },
             )
 
@@ -345,7 +372,7 @@ def test_unresolved_ccr_only_streams_through_as_200() -> None:
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "use tools"}],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
                 },
             )
 
@@ -355,7 +382,14 @@ def test_unresolved_ccr_only_streams_through_as_200() -> None:
 
 
 @pytest.mark.asyncio
-async def test_buffered_ccr_emits_keepalive_before_delayed_upstream() -> None:
+async def test_buffered_ccr_withholds_output_until_delayed_upstream_resolves() -> None:
+    """Nothing is sent — no status, no body — until the buffered result exists.
+
+    The response used to commit ``200 text/event-stream`` on a 1s keepalive
+    timer, which made every later failure unreportable: the client saw a 200
+    with no ``message_start`` and the real status was gone. See
+    ``test_buffered_ccr_preserves_late_failure_status_and_headers``.
+    """
     config = _make_config()
     final_response = _message_response([{"type": "text", "text": "done"}])
     started = asyncio.Event()
@@ -365,10 +399,19 @@ async def test_buffered_ccr_emits_keepalive_before_delayed_upstream() -> None:
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "wait"}],
+        "messages": [{"role": "user", "content": _buffered("wait")}],
     }
+    request_delivered = False
 
     async def receive():
+        # Mirror a real ASGI server: the body arrives once, then the channel
+        # stays open because the client is still connected. Returning instantly
+        # on every call spins `StreamingResponse.listen_for_disconnect`, which
+        # never yields, so the response body would never be scheduled.
+        nonlocal request_delivered
+        if request_delivered:
+            await asyncio.Event().wait()
+        request_delivered = True
         return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
 
     scope = {
@@ -400,24 +443,23 @@ async def test_buffered_ccr_emits_keepalive_before_delayed_upstream() -> None:
             await started.wait()
             response = await asyncio.wait_for(asyncio.shield(task), 1)
             events: list[dict] = []
-            first_visible_body = asyncio.Event()
 
             async def send(message):  # noqa: ANN001
                 events.append(message)
-                if message["type"] == "http.response.body" and _is_client_visible_sse(
-                    message["body"]
-                ):
-                    first_visible_body.set()
 
             response_task = asyncio.create_task(response(scope, receive, send))
-            await asyncio.wait_for(first_visible_body.wait(), 2)
-            assert not release.is_set()
+            # Longer than the deleted 1.0s keepalive deadline: an unresolved
+            # upstream must still have produced no ASGI message at all.
+            await asyncio.sleep(1.1)
+            assert events == []
             release.set()
             await response_task
 
-    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
-    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
-    assert b"done" in b"".join(bodies)
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 200
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"event: ping" not in bodies
+    assert b"done" in bodies
 
 
 @pytest.mark.asyncio
@@ -428,7 +470,7 @@ async def test_buffered_ccr_preserves_early_failure_status_and_headers() -> None
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "fail early"}],
+        "messages": [{"role": "user", "content": _buffered("fail early")}],
     }
 
     async def receive():
@@ -480,7 +522,15 @@ async def test_buffered_ccr_preserves_early_failure_status_and_headers() -> None
 
 
 @pytest.mark.asyncio
-async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
+async def test_buffered_ccr_preserves_late_failure_status_and_headers() -> None:
+    """The reported failure: a non-200 landing after the old keepalive deadline.
+
+    Headroom had already committed ``200 text/event-stream`` by then, so the 429
+    reached Claude Code as a 200 whose body carried no ``message_start`` — shown
+    as "API returned an empty or malformed response (HTTP 200) — check for a
+    proxy or gateway intercepting the request" — and ``retry-after`` was dropped,
+    so the client never backed off.
+    """
     config = _make_config()
     started = asyncio.Event()
     release = asyncio.Event()
@@ -489,7 +539,107 @@ async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "wait"}],
+        "messages": [{"role": "user", "content": _buffered("fail late")}],
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [(b"x-api-key", b"test-key"), (b"anthropic-version", b"2023-06-01")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app):
+            proxy = app.state.proxy
+
+            async def delayed_failure(*args, **kwargs):  # noqa: ANN002, ANN003
+                started.set()
+                await release.wait()
+                return httpx.Response(
+                    429,
+                    headers={"retry-after": "7"},
+                    json={"error": {"message": "slow down"}},
+                )
+
+            proxy._retry_request = delayed_failure
+            task = asyncio.create_task(proxy.handle_anthropic_messages(Request(scope, receive)))
+            await started.wait()
+            response = await asyncio.wait_for(asyncio.shield(task), 1)
+            events: list[dict] = []
+
+            async def send(message):  # noqa: ANN001
+                events.append(message)
+
+            response_task = asyncio.create_task(response(scope, receive, send))
+            # Past the deleted 1.0s keepalive deadline before the upstream fails.
+            await asyncio.sleep(1.1)
+            assert events == []
+            release.set()
+            await response_task
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 429
+    assert dict(start["headers"])[b"retry-after"] == b"7"
+    assert b"slow down" in b"".join(
+        event["body"] for event in events if event["type"] == "http.response.body"
+    )
+
+
+def test_buffered_ccr_rejects_malformed_success_as_502() -> None:
+    """A non-SSE, non-JSON 200 is an upstream protocol error, not success."""
+    config = _make_config()
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = app.state.proxy
+            proxy._retry_request = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    content=b"<html>gateway timeout</html>",
+                    headers={"content-type": "text/html"},
+                )
+            )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": _buffered("fail safely")}],
+                },
+            )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_protocol_error"
+    assert b"gateway timeout" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_buffered_ccr_late_failure_returns_sanitized_json_error() -> None:
+    """A slow crash gets the same 502 the fast one does, not a downgraded 200."""
+    config = _make_config()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    body = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 64,
+        "stream": True,
+        "tools": [create_ccr_tool_definition("anthropic")],
+        "messages": [{"role": "user", "content": _buffered("wait")}],
     }
 
     async def receive():
@@ -533,24 +683,23 @@ async def test_buffered_ccr_late_failure_emits_sanitized_error_event() -> None:
                 await started.wait()
                 response = await asyncio.wait_for(asyncio.shield(task), 1)
                 events: list[dict] = []
-                first_body = asyncio.Event()
 
                 async def send(message):  # noqa: ANN001
                     events.append(message)
-                    if message["type"] == "http.response.body" and message["body"]:
-                        first_body.set()
 
                 response_task = asyncio.create_task(response(scope, receive, send))
-                await asyncio.wait_for(first_body.wait(), 2)
+                await asyncio.sleep(0)
+                assert events == []
                 release.set()
                 await response_task
                 record_failed.assert_awaited_once_with(provider="anthropic")
             proxy_logger.removeHandler(log_handler)
 
-    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
-    assert bodies[0] == b'event: ping\ndata: {"type":"ping"}\n\n'
-    assert b"An error occurred while processing the request." in bodies[-1]
-    assert b"boom" not in bodies[-1]
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 502
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"An error occurred while processing your request." in bodies
+    assert b"boom" not in bodies
     assert events[-1]["more_body"] is False
     assert any(
         record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
@@ -566,7 +715,7 @@ async def test_buffered_ccr_pre_keepalive_exception_returns_json_error() -> None
         "max_tokens": 64,
         "stream": True,
         "tools": [create_ccr_tool_definition("anthropic")],
-        "messages": [{"role": "user", "content": "fail before keepalive"}],
+        "messages": [{"role": "user", "content": _buffered("fail before keepalive")}],
     }
 
     async def receive():

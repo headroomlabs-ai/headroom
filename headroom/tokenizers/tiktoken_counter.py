@@ -16,7 +16,7 @@ import threading
 from functools import lru_cache
 from typing import Any
 
-from .base import BaseTokenizer, coerce_countable_text
+from .base import BaseTokenizer, TokenCountCache, coerce_countable_text
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +237,7 @@ class TiktokenCounter(BaseTokenizer):
         self.model = model
         self.encoding_name = encoding or get_encoding_for_model(model)
         self._encoding = None  # Lazy load
+        self._count_cache = TokenCountCache()
 
     @property
     def encoding(self):
@@ -256,6 +257,14 @@ class TiktokenCounter(BaseTokenizer):
         """
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self.encoding.encode(text))
         except ValueError:

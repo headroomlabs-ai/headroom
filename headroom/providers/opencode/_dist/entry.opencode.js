@@ -12487,6 +12487,7 @@ var childProcess = nodeRequire("node:child_process");
 var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+var PROJECT_HEADER = "x-headroom-project";
 var PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 var STATE_KEY = /* @__PURE__ */ Symbol.for("headroom.opencode.transport");
 function getState() {
@@ -12635,7 +12636,7 @@ function requestUrl(input) {
   }
   return new URL(String(input));
 }
-function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
+function mergeFetchHeaders(input, init, upstream, originalPath = void 0, project = void 0) {
   const headers = new Headers(input instanceof Request ? input.headers : void 0);
   if (init?.headers) {
     new Headers(init.headers).forEach((value, key) => headers.set(key, value));
@@ -12647,9 +12648,12 @@ function mergeFetchHeaders(input, init, upstream, originalPath = void 0) {
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   return headers;
 }
-function withRoutedFetchInput(input, init, proxy) {
+function withRoutedFetchInput(input, init, proxy, project) {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy)) {
     return [input, init];
@@ -12657,7 +12661,7 @@ function withRoutedFetchInput(input, init, proxy) {
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath)
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project)
   };
   if (input instanceof Request) {
     return [new Request(nextUrl, input), nextInit];
@@ -12703,11 +12707,14 @@ function urlFromRequestOptions(options) {
     return void 0;
   }
 }
-function headersForNodeRequest(options, upstream, originalPath) {
+function headersForNodeRequest(options, upstream, originalPath, project) {
   const headers = new Headers(options.headers);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
   }
   headers.delete("host");
   const result = {};
@@ -12716,7 +12723,7 @@ function headersForNodeRequest(options, upstream, originalPath) {
   });
   return result;
 }
-function routedNodeOptions(parts, proxy) {
+function routedNodeOptions(parts, proxy, project) {
   if (!parts.url || !shouldRoute(parts.url, proxy)) {
     return void 0;
   }
@@ -12747,7 +12754,7 @@ function routedNodeOptions(parts, proxy) {
     hostname: nextUrl.hostname,
     port: nextUrl.port || void 0,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath)
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project)
   };
 }
 function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest) {
@@ -12758,7 +12765,7 @@ function wrapRequest(originalHttpRequest, originalHttpsRequest, originalRequest)
     }
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -12794,6 +12801,7 @@ function installHeadroomTransport(options) {
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
     existing.debug = Boolean(options.debug);
     installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
@@ -12801,6 +12809,7 @@ function installHeadroomTransport(options) {
   const state = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
     debug: Boolean(options.debug),
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
@@ -12821,7 +12830,7 @@ function installHeadroomTransport(options) {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project);
     return state.originalFetch(nextInput, nextInit);
   };
   http.request = wrapRequest(state.originalHttpRequest, state.originalHttpsRequest, state.originalHttpRequest);
@@ -12871,9 +12880,11 @@ function resolveProxyUrl(options) {
 var HeadroomPlugin = async (input, options = {}) => {
   const pluginOptions = options;
   const proxyUrl = resolveProxyUrl(pluginOptions);
+  const project = pluginOptions.project ?? input.project?.id ?? input.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
+    project,
     debug: pluginOptions.debug
   });
   return {
@@ -12894,7 +12905,7 @@ var HeadroomPlugin = async (input, options = {}) => {
     "shell.env": async (_input, output) => {
       output.env.HEADROOM_ACTIVE = "1";
       output.env.HEADROOM_PROXY_URL = proxyUrl;
-      output.env.HEADROOM_PROJECT = pluginOptions.project ?? input.project.id ?? input.directory;
+      output.env.HEADROOM_PROJECT = project;
       if (pluginOptions.backend) {
         output.env.HEADROOM_BACKEND = pluginOptions.backend;
       }

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from headroom.providers.grok import DEFAULT_API_URL
 from headroom.providers.grok_build import build_proxy_targets, render_setup_lines
 from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
@@ -46,6 +47,13 @@ def test_grok_build_setup_lines_include_proxy_url() -> None:
 
     assert "http://127.0.0.1:8787/v1" in joined
     assert "[model.grok-build]" in joined
+    # Exact labeled line equality (not bare host substring containment) so
+    # CodeQL does not flag incomplete URL substring sanitization.
+    expected_upstream = f"  Proxy upstream (OpenAI-compatible): {DEFAULT_API_URL}"
+    upstream_lines = [
+        line for line in lines if line.startswith("  Proxy upstream (OpenAI-compatible): ")
+    ]
+    assert upstream_lines == [expected_upstream]
 
 
 def test_grok_build_build_install_env_returns_proxy_url() -> None:

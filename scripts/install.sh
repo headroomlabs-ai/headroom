@@ -292,6 +292,29 @@ append_persistent_container_args() {
   append_passthrough_envs "$1"
 }
 
+append_dashboard_gateway_env() {
+  local -n ref=$1
+
+  # This default is safe only because the published dashboard port is bound
+  # to the host loopback interface below. A host request published through
+  # Docker's default bridge reaches the
+  # container from the bridge gateway (for example, 172.17.0.1), not from
+  # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+  # metadata gate works for the first-party persistent Docker preset while
+  # preserving an explicitly configured allowlist.
+  if [[ -n "${HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS+x}" ]]; then
+    return
+  fi
+
+  local gateway
+  gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [[ -n "${gateway}" ]]; then
+    ref+=(--env "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=${gateway}/32")
+  else
+    warn "Could not determine Docker bridge gateway; dashboard metadata remains restricted"
+  fi
+}
+
 build_manifest_proxy_args() {
   local -n out_args=$1
   local port="$2"
@@ -466,8 +489,9 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "127.0.0.1:${port}:${port}")
   append_persistent_container_args args
+  append_dashboard_gateway_env args
   args+=(
     --env "HEADROOM_DEPLOYMENT_PROFILE=${profile}"
     --env "HEADROOM_DEPLOYMENT_PRESET=persistent-docker"
@@ -1583,7 +1607,7 @@ Installed wrapper:
 Next steps:
   1. Restart your shell or run: export PATH="${INSTALL_DIR}:\$PATH"
   2. Try: headroom proxy
-  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md
+  3. Docs: https://docs.headroomlabs.ai/docs/docker-install
 EOF
 }
 

@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -54,6 +54,30 @@ jobs:
         uses: pypa/gh-action-pip-audit@v1.1.0
         with:
           inputs: requirements-prod.txt
+
+  # Audit every maintained npm lock, including development dependencies.
+  # Lockfile audits do not install packages or execute their lifecycle scripts.
+  npm-audit:
+    name: npm audit (${{ matrix.directory }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        directory:
+          - docs
+          - sdk/typescript
+          - plugins/openclaw
+          - plugins/opencode
+          - e2e/wrap/tools
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ">=24.16.0 <25"
+      - name: Audit locked dependencies at every severity
+        working-directory: ${{ matrix.directory }}
+        run: npm audit --package-lock-only --audit-level=low
 
   # ---- SAST: CodeQL static analysis ------------------------------------
   codeql:

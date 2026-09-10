@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..models import Memory, ScopeLevel
+from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
@@ -227,7 +227,11 @@ class SQLiteMemoryStore:
             last_accessed=datetime.fromisoformat(row["last_accessed"])
             if row["last_accessed"]
             else None,
-            entity_refs=json.loads(row["entity_refs"]) if row["entity_refs"] else [],
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(
+                json.loads(row["entity_refs"]) if row["entity_refs"] else []
+            ),
             embedding=self._deserialize_embedding(row["embedding"]),
             metadata=json.loads(row["metadata"]) if row["metadata"] else {},
         )

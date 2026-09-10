@@ -94,6 +94,18 @@ class HeadroomCallback(_CustomLogger):
         """Whether cloud compression is enabled."""
         return self._api_key is not None
 
+    async def aclose(self) -> None:
+        """Close the shared cloud HTTP client, if it was initialized.
+
+        Applications using LiteLLM should await this method during their async
+        shutdown lifecycle. It is safe to call when cloud mode was not used or
+        after the client has already been closed.
+        """
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
     async def async_pre_call_hook(
         self,
         user_api_key_dict: Any = None,

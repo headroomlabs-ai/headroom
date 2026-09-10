@@ -19,11 +19,14 @@ client = HeadroomClient(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `original_client` | `OpenAI \| Anthropic` | Required | The underlying LLM client |
-| `provider` | `Provider` | Auto-detected | Token counting provider |
+| `provider` | `Provider` | Required (no default) | Token counting provider — e.g. `OpenAIProvider()`, `AnthropicProvider()` |
 | `default_mode` | `str` | `"audit"` | Default mode: "audit", "optimize", "off" |
 | `store_url` | `str` | `None` | Storage URL for metrics |
-| `smart_crusher_config` | `SmartCrusherConfig` | Default | Compression settings |
-| `cache_aligner_config` | `CacheAlignerConfig` | Default | Cache alignment settings |
+| `model_context_limits` | `dict[str, int]` | `None` | Override context limits for models |
+| `cache_optimizer` | `BaseCacheOptimizer` | `None` (auto-detect) | Custom cache optimizer |
+| `enable_cache_optimizer` | `bool` | `True` | Enable provider-specific cache optimization |
+| `enable_semantic_cache` | `bool` | `False` | Enable query-level semantic caching |
+| `config` | `HeadroomConfig` | `None` | Full config object; set `config.smart_crusher` / `config.cache_aligner` here to override compression/cache-alignment settings — there is no separate `smart_crusher_config`/`cache_aligner_config` constructor kwarg |
 
 ### Methods
 
@@ -101,9 +104,9 @@ config = CacheAlignerConfig(
 from headroom import RelevanceScorerConfig
 
 config = RelevanceScorerConfig(
-    scorer_type="bm25",      # "bm25", "embedding", or "hybrid"
-    embedding_model=None,    # Model name for embedding scorer
-    hybrid_alpha=0.5,        # Weight for hybrid scoring
+    scorer_type="bm25",  # "bm25", "embedding", or "hybrid"
+    embedding_model=None,  # Model name for embedding scorer
+    hybrid_alpha=0.5,  # Weight for hybrid scoring
 )
 ```
 
@@ -286,10 +289,12 @@ result = aligner.align(messages)
 ```python
 from headroom import TransformPipeline
 
-pipeline = TransformPipeline([
-    SmartCrusher(),
-    CacheAligner(),
-])
+pipeline = TransformPipeline(
+    [
+        SmartCrusher(),
+        CacheAligner(),
+    ]
+)
 
 result = pipeline.transform(messages)
 ```

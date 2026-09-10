@@ -124,6 +124,21 @@ def update_openclaw_package_json(file_path: Path, version: str) -> None:
         f.write("\n")
 
 
+def update_opencode_package_json(file_path: Path, version: str) -> None:
+    """Update opencode package.json version.
+
+    Keep the source `headroom-ai` dependency registry-installable. The release
+    workflow rewrites the packed dependency to the exact release range right
+    before npm publication.
+    """
+    with open(file_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["version"] = version
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
 def update_pyproject_version(root: Path, version: str) -> None:
     """Update pyproject.toml version."""
     pyproject_path = root / "pyproject.toml"
@@ -145,6 +160,7 @@ def write_release_metadata(root: Path, version: str) -> None:
             "pypi": version,
             "npm-sdk": version,
             "npm-openclaw": version,
+            "npm-opencode": version,
             "agent-hooks-plugin": version,
         },
     }
@@ -192,6 +208,7 @@ def main() -> None:
     # Update all versioned files
     update_pyproject_version(args.root, version)
     update_openclaw_package_json(args.root / "plugins" / "openclaw" / "package.json", version)
+    update_opencode_package_json(args.root / "plugins" / "opencode" / "package.json", version)
     update_package_json(args.root / "sdk" / "typescript" / "package.json", version)
     update_plugin_versions(args.root, version)
     update_server_json(args.root / "server.json", version)

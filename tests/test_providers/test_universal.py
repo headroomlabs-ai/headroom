@@ -443,22 +443,13 @@ class TestLiteLLMProvider:
                 "output-model": {"max_output_tokens": 6000},
             }[model],
         )
+        # Cost now resolves through the shared pricing helper rather than a
+        # direct `litellm.completion_cost` call, so patch that seam. The helper
+        # returns None (not an exception) for a model LiteLLM can't price.
         monkeypatch.setattr(
             litellm_module,
-            "litellm",
-            type(
-                "LiteLLM",
-                (),
-                {
-                    "completion_cost": staticmethod(
-                        lambda **kwargs: (
-                            1.23
-                            if kwargs["model"] == "priced-model"
-                            else (_ for _ in ()).throw(RuntimeError("missing price"))
-                        )
-                    )
-                },
-            )(),
+            "estimate_cost_from_tokens",
+            lambda model, **kwargs: 1.23 if model == "priced-model" else None,
         )
 
         provider = litellm_module.LiteLLMProvider()

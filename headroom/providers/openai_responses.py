@@ -32,9 +32,19 @@ OPENAI_RESPONSES_ROOT_PATHS: tuple[str, ...] = (
     "/v1/codex/responses",
     "/backend-api/responses",
     "/backend-api/codex/responses",
+    # Copilot Chat derives this unprefixed path from overrideCapiUrl. Without an
+    # explicit root route it falls through to uncompressed generic passthrough.
+    "/responses",
 )
 
-OPENAI_RESPONSES_WEBSOCKET_PATHS: tuple[str, ...] = OPENAI_RESPONSES_ROOT_PATHS
+# The Codex websocket relay speaks a different protocol; do not register the
+# Copilot HTTP alias as a websocket route without separate wire validation.
+OPENAI_RESPONSES_WEBSOCKET_PATHS: tuple[str, ...] = (
+    "/v1/responses",
+    "/v1/codex/responses",
+    "/backend-api/responses",
+    "/backend-api/codex/responses",
+)
 
 OPENAI_RESPONSES_SUBPATH_ROUTES: tuple[OpenAIResponsesSubpathRoute, ...] = (
     OpenAIResponsesSubpathRoute("/v1/responses/{sub_path:path}", ("GET", "POST", "DELETE")),

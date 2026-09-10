@@ -48,6 +48,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 from tests._dotenv import autouse_apply_env, load_env_overrides  # noqa: E402
+from tests._gemini_live import skip_if_gemini_quota_exhausted  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Module-level config
@@ -639,6 +640,7 @@ def test_gemini_multi_turn_through_proxy(proxy_client: TestClient) -> None:
     ]
 
     resp1 = proxy_client.post(url, json={"contents": contents})
+    skip_if_gemini_quota_exhausted(resp1)
     assert resp1.status_code == 200, resp1.text
     data1 = resp1.json()
     text1 = data1["candidates"][0]["content"]["parts"][0]["text"]
@@ -648,6 +650,7 @@ def test_gemini_multi_turn_through_proxy(proxy_client: TestClient) -> None:
     contents.append({"role": "user", "parts": [{"text": "Now reply with the single word WORLD."}]})
 
     resp2 = proxy_client.post(url, json={"contents": contents})
+    skip_if_gemini_quota_exhausted(resp2)
     assert resp2.status_code == 200, resp2.text
     data2 = resp2.json()
     text2 = data2["candidates"][0]["content"]["parts"][0]["text"]
