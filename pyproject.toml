@@ -143,7 +143,7 @@ ml = [
 # [memory]) fail on any machine without a compiler — see #1368.
 memory = [
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
 # kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
@@ -242,7 +242,7 @@ strands = [
 ]
 # CrewAI agent framework integration
 crewai = [
-    "crewai>=1.0",
+    "crewai>=1.15.21",
 ]
 # AutoGen agent framework integration
 autogen = [
@@ -271,7 +271,7 @@ voice-train = [
 # Evaluation framework
 evals = [
     "datasets>=5.0.1",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "anthropic>=0.18.0",
@@ -296,7 +296,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.16.3",
+    "ruff==0.16.4",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -312,7 +312,7 @@ dev = [
     "langchain-ollama>=0.2.0",
     "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0",
+    "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests

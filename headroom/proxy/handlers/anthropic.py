@@ -1797,6 +1797,7 @@ class AnthropicHandlerMixin:
                                     model_limit=context_limit,
                                     context=extract_user_query(working_messages),
                                     frozen_message_count=frozen_message_count,
+                                    prefix_replay_guaranteed=True,
                                     idle_seconds=idle_seconds,
                                     biases=biases,
                                     request_id=request_id,
@@ -1842,6 +1843,7 @@ class AnthropicHandlerMixin:
                                             model_limit=context_limit,
                                             context=extract_user_query(working_messages),
                                             frozen_message_count=frozen_message_count,
+                                            prefix_replay_guaranteed=True,
                                             idle_seconds=idle_seconds,
                                             biases=biases,
                                             request_id=request_id,
@@ -1893,6 +1895,7 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(working_messages),
                                         frozen_message_count=frozen_message_count,
+                                        prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         request_id=request_id,
@@ -1936,6 +1939,7 @@ class AnthropicHandlerMixin:
                                     model_limit=context_limit,
                                     context=extract_user_query(messages),
                                     frozen_message_count=frozen_message_count,
+                                    prefix_replay_guaranteed=True,
                                     biases=biases,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
@@ -1997,6 +2001,7 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(messages),
                                         frozen_message_count=frozen_message_count,
+                                        prefix_replay_guaranteed=True,
                                         biases=biases,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
@@ -2278,6 +2283,11 @@ class AnthropicHandlerMixin:
             # request. Session state (matured markers) rides on the
             # prefix tracker — same affinity and TTL cleanup as the
             # freeze state. Advisory: must never fail the request.
+            # Bound when maturation runs, so the final accounting step below
+            # can charge this request's replayed-marker debt. Every earlier
+            # `tokens_saved` assignment is overwritten by that recount, so the
+            # adjustment belongs there and nowhere else.
+            _maturation_mgr = None
             if self.config.read_maturation and not _bypass:
                 try:
                     from headroom.config import ReadMaturationConfig
@@ -2298,6 +2308,7 @@ class AnthropicHandlerMixin:
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr
+                    _maturation_mgr = maturation_mgr
                     maturation = maturation_mgr.apply(
                         optimized_messages,
                         frozen_message_count=frozen_message_count,
@@ -3183,7 +3194,27 @@ class AnthropicHandlerMixin:
                 if 0 < _tool_tokens_after < _tool_tokens_before:
                     original_tokens += _tool_tokens_before
                     optimized_tokens += _tool_tokens_after
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # First-appearance accounting for matured Reads. The client
+                # re-sends the raw conversation every turn, so this diff would
+                # otherwise re-book a matured Read's removal on every request
+                # until end of session. Charged here, on the request's real
+                # endpoints, because after maturation the marker usually
+                # reaches the wire through the cached-prefix replay rather than
+                # through the maturation pass — and because every earlier
+                # `tokens_saved` assignment is overwritten right here.
+                # tok_before/tok_after stay the honest wire counts; only the
+                # booked saving is first-appearance.
+                _replay_debt = 0
+                if _maturation_mgr is not None:
+                    try:
+                        _replay_debt = _maturation_mgr.replayed_token_debt(
+                            _orig_snapshot, optimized_messages, tokenizer.count_text
+                        )
+                    except Exception:
+                        # Advisory, like the maturation pass itself: a failure
+                        # here must not skip the recount around it.
+                        logger.debug("maturation replay debt skipped", exc_info=True)
+                tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.
@@ -3201,6 +3232,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.output_savings import (
                     assign_arm,
                     conversation_key_from_body,
+                    conversation_label,
                     stratum_key,
                     stratum_label,
                 )
@@ -3227,7 +3259,8 @@ class AnthropicHandlerMixin:
                         _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                     except ValueError:
                         _holdout = 0.0
-                    _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                    _conversation = conversation_key_from_body(body)
+                    _arm = assign_arm(_conversation, _holdout)
 
                     # Stratum from request features observable now (mirrors the
                     # offline baseline so live and learned strata line up).
@@ -3240,7 +3273,10 @@ class AnthropicHandlerMixin:
                     )
                     # Carry (arm, stratum) on the existing label channel so the
                     # outcome funnel can feed the savings ledger from any path.
+                    # The conversation rides with it: it is the unit the arm was
+                    # assigned to, so it is the unit the estimator has to count.
                     transforms_applied.append(stratum_label(_arm, _stratum))
+                    transforms_applied.append(conversation_label(_conversation))
 
                     if _arm == "treatment":
                         _level, _src = resolve_verbosity_level(_shaper_settings)
