@@ -287,6 +287,13 @@ def test_response_to_sse_preserves_thinking_redacted_and_citations() -> None:
     assert "citations_delta" in sse_text
     assert "redacted_thinking" in sse_text
     assert redacted_blob in sse_text
+    events = _sse_events(sse_text)
+    thinking_start = next(
+        event
+        for event in events
+        if event["type"] == "content_block_start" and event["content_block"]["type"] == "thinking"
+    )
+    assert "signature" not in thinking_start["content_block"]
 
     round_tripped = parser._parse_sse_to_response(sse_text, "anthropic")
     assert round_tripped is not None
@@ -358,7 +365,7 @@ def test_response_to_sse_tolerates_malformed_content_and_usage() -> None:
     assert text_deltas[0]["delta"]["text"] == "hi"
 
 
-def test_response_to_sse_emits_server_tool_use_without_delta() -> None:
+def test_response_to_sse_streams_server_tool_use_input_as_json_delta() -> None:
     parser = _Parser()
     server_tool_use = {
         "type": "server_tool_use",
@@ -383,14 +390,42 @@ def test_response_to_sse_emits_server_tool_use_without_delta() -> None:
 
     block_starts = [ev for ev in events if ev["type"] == "content_block_start"]
     assert block_starts[1]["index"] == 1
-    assert block_starts[1]["content_block"] == server_tool_use
-    assert not any(ev["type"] == "content_block_delta" and ev["index"] == 1 for ev in events)
+    assert block_starts[1]["content_block"] == {
+        "type": "server_tool_use",
+        "id": "srvtoolu_123",
+        "name": "web_search",
+        "input": {},
+    }
+    server_delta = next(
+        ev for ev in events if ev["type"] == "content_block_delta" and ev["index"] == 1
+    )
+    assert server_delta["delta"]["type"] == "input_json_delta"
+    assert json.loads(server_delta["delta"]["partial_json"]) == server_tool_use["input"]
     assert any(
         ev["type"] == "content_block_delta"
         and ev["index"] == 0
         and ev["delta"] == {"type": "text_delta", "text": "Searching."}
         for ev in events
     )
+
+
+def test_response_to_sse_emits_stop_sequence_in_envelope_and_delta() -> None:
+    parser = _Parser()
+    sse_text = b"".join(
+        parser._response_to_sse(
+            {
+                "content": [],
+                "stop_reason": "stop_sequence",
+                "stop_sequence": "END",
+            },
+            "anthropic",
+        )
+    ).decode("utf-8")
+    events = _sse_events(sse_text)
+    message_start = next(ev for ev in events if ev["type"] == "message_start")
+    message_delta = next(ev for ev in events if ev["type"] == "message_delta")
+    assert message_start["message"]["stop_sequence"] is None
+    assert message_delta["delta"]["stop_sequence"] == "END"
 
 
 # Issue #1876: CCR buffered-stream re-synthesis corrupted extended-thinking

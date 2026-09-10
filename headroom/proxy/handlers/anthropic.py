@@ -4837,10 +4837,11 @@ class AnthropicHandlerMixin:
 
                             try:
                                 sse_events = self._response_to_sse(resp_json, "anthropic")
-                            except ValueError as sse_err:
+                            except Exception as sse_err:
                                 logger.warning(
                                     f"[{request_id}] CCR: Failed to convert buffered response "
-                                    f"to SSE: {sse_err}"
+                                    f"to SSE: {sse_err}",
+                                    exc_info=True,
                                 )
 
                                 async def _conversion_error_sse():

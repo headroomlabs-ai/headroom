@@ -651,6 +651,7 @@ class StreamingMixin:
                 "model": response.get("model", "unknown"),
                 "content": [],
                 "stop_reason": None,
+                "stop_sequence": None,
                 "usage": response.get("usage", {}),
             },
         }
@@ -674,12 +675,12 @@ class StreamingMixin:
                     "index": idx,
                     "content_block": {"type": "text", "text": ""},
                 }
-            elif block.get("type") == "tool_use":
+            elif block.get("type") in ("tool_use", "server_tool_use"):
                 block_start = {
                     "type": "content_block_start",
                     "index": idx,
                     "content_block": {
-                        "type": "tool_use",
+                        "type": block["type"],
                         "id": block.get("id", f"toolu_{idx}"),
                         "name": block.get("name", ""),
                         "input": {},
@@ -690,8 +691,6 @@ class StreamingMixin:
                     "type": "thinking",
                     "thinking": "",
                 }
-                if "signature" in block:
-                    content_block["signature"] = block["signature"]
                 block_start = {
                     "type": "content_block_start",
                     "index": idx,
@@ -705,12 +704,6 @@ class StreamingMixin:
                         "type": "redacted_thinking",
                         "data": block.get("data", ""),
                     },
-                }
-            elif block.get("type") == "server_tool_use":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": block,
                 }
             else:
                 block_start = {
@@ -740,13 +733,16 @@ class StreamingMixin:
                     events.append(
                         f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
                     )
-            elif block.get("type") == "tool_use" and block.get("input"):
+            elif block.get("type") in ("tool_use", "server_tool_use"):
+                tool_input = block.get("input", {})
+                if not isinstance(tool_input, dict):
+                    raise TypeError(f"Anthropic {block.get('type')} input must be an object")
                 delta = {
                     "type": "content_block_delta",
                     "index": idx,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": json.dumps(block["input"]),
+                        "partial_json": json.dumps(tool_input),
                     },
                 }
                 events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
@@ -778,6 +774,8 @@ class StreamingMixin:
         msg_delta_payload: dict[str, Any] = {}
         if "stop_reason" in response:
             msg_delta_payload["stop_reason"] = response["stop_reason"]
+        if "stop_sequence" in response:
+            msg_delta_payload["stop_sequence"] = response["stop_sequence"]
         if "stop_details" in response:
             msg_delta_payload["stop_details"] = response["stop_details"]
         usage = response.get("usage")
