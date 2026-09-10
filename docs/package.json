@@ -19,7 +19,7 @@
 		"dotted-map": "^3.1.0",
 "fumadocs-core": "16.11.5",
 		"fumadocs-mdx": "15.2.0",
-		"fumadocs-twoslash": "^3.3.0",
+		"fumadocs-twoslash": "^4.0.0",
 		"fumadocs-typescript": "^5.3.0",
 		"fumadocs-ui": "16.11.5",
 		"lucide-react": "^1.7.0",
