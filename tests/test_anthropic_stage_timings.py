@@ -101,17 +101,23 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
                 record_request=lambda *a, **k: None,
+                update_from_response=lambda *a, **k: None,
             ),
             resolve_tracker=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
                 record_request=lambda *a, **k: None,
+                update_from_response=lambda *a, **k: None,
             ),
         )
 
     async def _next_request_id(self) -> str:
         return "req-anth-test"
+
+    async def _record_request_outcome(self, outcome) -> None:
+        return None
 
     def _extract_tags(self, headers):
         return {}
@@ -285,6 +291,132 @@ def test_anthropic_no_optimize_preserves_client_tool_order():
 
     _, _, _, forwarded_body = handler.captured
     assert [tool["name"] for tool in forwarded_body["tools"]] == ["Read", "Bash"]
+
+
+def test_anthropic_third_party_upstream_strips_tool_search_tools():
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {
+            "name": "Bash",
+            "description": "run a command",
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        response = anyio.run(
+            handler.handle_anthropic_messages,
+            request,
+            "https://api.deepseek.com/anthropic",
+        )
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    assert response.status_code == 200
+    _, forwarded_url, _, forwarded_body = handler.captured
+    assert forwarded_url == "https://api.deepseek.com/anthropic/v1/messages"
+    assert forwarded_body["tools"] == [tools[1], tools[2]]
+    assert not any(
+        str(tool.get("type", "")).startswith("tool_search_tool_")
+        for tool in forwarded_body["tools"]
+    )
+
+
+def test_anthropic_direct_path_repairs_typeless_tool_search_regression():
+    """Do not double-inject a typeless search tool; heal its stale history."""
+    tools = [
+        {
+            "name": f"mcp_tool_{index}",
+            "description": f"tool {index}",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        for index in range(20)
+    ]
+    tools.append(
+        {
+            "name": "tool_search_tool_regex",
+            "description": "client-provided tool search",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    )
+    messages = [
+        {"role": "user", "content": "search for a tool"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_regex",
+                    "name": "tool_search_tool_regex",
+                    "input": {"pattern": "regex"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_regex",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {
+                                "type": "tool_reference",
+                                "tool_name": "tool_search_tool_regex",
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    request = _build_request(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 100,
+            "messages": messages,
+            "tools": tools,
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    handler = _DummyAnthropicHandler()
+
+    import headroom.tokenizers as _tk
+
+    orig_get = _tk.get_tokenizer
+    _tk.get_tokenizer = lambda model: _DummyTokenizer()
+    try:
+        response = anyio.run(handler.handle_anthropic_messages, request)
+    finally:
+        _tk.get_tokenizer = orig_get
+
+    assert response.status_code == 200
+    _, _, _, forwarded_body = handler.captured
+    # The client-owned typeless entry suppresses Headroom's typed search-tool
+    # injection, and the tools array remains byte-for-byte equivalent.
+    assert forwarded_body["tools"] == tools
+    assert not any(tool.get("type") for tool in forwarded_body["tools"])
+    # The stale server-side round trip is removed before Anthropic validates it.
+    block_types = [
+        block.get("type")
+        for message in forwarded_body["messages"]
+        for block in message.get("content", [])
+        if isinstance(message.get("content"), list) and isinstance(block, dict)
+    ]
+    assert "server_tool_use" not in block_types
+    assert "tool_search_tool_result" not in block_types
 
 
 def test_anthropic_http_invalid_body_still_emits_stage_timings(stage_log_capture):

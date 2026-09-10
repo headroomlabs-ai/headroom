@@ -154,7 +154,7 @@ class MemoryConfig:
     qdrant_api_key: str | None = field(default_factory=qdrant_env.qdrant_env_api_key)
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
     # Memory Bridge (bidirectional markdown <-> Headroom sync)
     bridge_enabled: bool = False
     bridge_md_paths: list[str] = field(default_factory=list)
@@ -316,6 +316,27 @@ class MemoryHandler:
             self._initialized = False
             logger.info(f"Memory: backend initialization cancelled (backend={self.config.backend})")
             raise
+        except Exception as exc:
+            # Fail-open for ANY init failure, not just timeout. Memory is an
+            # optional subsystem: a backend that cannot open (e.g. a SQLite
+            # ``unable to open database file`` on a Docker Desktop macOS
+            # bind-mount, issue #3251) must NOT propagate and 500 the whole
+            # request — the docstring's fail-open contract has to hold here too.
+            # Null the possibly-half-assigned backend (same reasoning as the
+            # timeout branch) and leave ``_initialized=False`` so a later
+            # request can retry once the environment recovers.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="init_error")
+            self._backend = None
+            self._initialized = False
+            logger.error(
+                "Memory: backend initialization failed (backend=%s); "
+                "serving requests without memory context. Subsequent requests will retry: %s",
+                self.config.backend,
+                exc,
+            )
+            return
 
     async def _init_backend_locked(self) -> None:
         """Actual backend-init body. Must be called with ``_init_lock`` held."""

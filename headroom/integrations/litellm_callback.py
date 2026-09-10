@@ -33,6 +33,10 @@ except ImportError:  # litellm not installed — fall back to plain object
 class HeadroomCallback(_CustomLogger):
     """LiteLLM callback that compresses messages before each API call.
 
+    Implements the LiteLLM callback hooks looked up by name:
+    ``async_pre_call_hook``, ``async_post_call_success_hook``,
+    ``async_success_handler`` and ``async_failure_handler``.
+
     Inherits from litellm.integrations.custom_logger.CustomLogger so that
     any hook LiteLLM adds in future versions (e.g. async_post_call_success_hook
     added in 1.89.x) has a no-op default and won't raise AttributeError (#1114).
@@ -89,6 +93,18 @@ class HeadroomCallback(_CustomLogger):
     def cloud_mode(self) -> bool:
         """Whether cloud compression is enabled."""
         return self._api_key is not None
+
+    async def aclose(self) -> None:
+        """Close the shared cloud HTTP client, if it was initialized.
+
+        Applications using LiteLLM should await this method during their async
+        shutdown lifecycle. It is safe to call when cloud mode was not used or
+        after the client has already been closed.
+        """
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     async def async_pre_call_hook(
         self,
@@ -191,6 +207,15 @@ class HeadroomCallback(_CustomLogger):
 
         result: dict[str, Any] = resp.json()
         return result
+
+    async def async_post_call_success_hook(
+        self,
+        data: dict[str, Any],
+        user_api_key_dict: Any,
+        response: Any,
+    ) -> Any:
+        """Called by the LiteLLM proxy after a successful call. Returns response unchanged."""
+        return response
 
     async def async_success_handler(
         self, kwargs: dict, response: Any, start_time: Any, end_time: Any

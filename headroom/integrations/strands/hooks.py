@@ -50,6 +50,7 @@ except ImportError:
 from headroom import HeadroomConfig
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
 from headroom.config import is_tool_excluded
+from headroom.telemetry.session import BeaconCompressionObserver
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 logger = logging.getLogger(__name__)
@@ -173,7 +174,11 @@ class HeadroomHookProvider(HookProvider):  # type: ignore[misc]
                         crusher_config = SmartCrusherConfig(
                             min_tokens_to_crush=self.min_tokens_to_compress
                         )
-                    self._crusher = SmartCrusher(config=crusher_config)
+                    # observer: no proxy here, so nothing else reports these
+                    # compressions to the beacon. See BeaconCompressionObserver.
+                    self._crusher = SmartCrusher(
+                        config=crusher_config, observer=BeaconCompressionObserver()
+                    )
                     logger.debug(
                         "SmartCrusher initialized with min_tokens=%d", self.min_tokens_to_compress
                     )

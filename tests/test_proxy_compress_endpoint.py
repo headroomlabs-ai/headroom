@@ -134,6 +134,45 @@ class TestCompressEndpointBasic:
         assert data["tokens_saved"] >= 0
         assert data["compression_ratio"] > 0
 
+    def test_response_ccr_hashes_extracts_only_retrievable_hashes(self):
+        """Embedded CCR markers are reported without unrelated transform metadata."""
+        from headroom.proxy.handlers.openai import _response_ccr_hashes
+
+        messages = [
+            {
+                "role": "tool",
+                "content": ("[100 rows compressed. Retrieve more: hash=abc123def4567890abc123de]"),
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<<ccr:feedface00112233 10_rows_offloaded>>",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Retrieve original: hash=ABC123DEF4567890ABC123DE",
+                    },
+                ],
+            },
+        ]
+
+        hashes = _response_ccr_hashes(
+            messages,
+            [
+                "deadbeef0000000000000000",
+                "<headroom:tool_digest sha256=1234567890abcdef>",
+                "stable_prefix_hash:feedface00112233",
+            ],
+        )
+
+        assert hashes == [
+            "deadbeef0000000000000000",
+            "abc123def4567890abc123de",
+            "feedface00112233",
+        ]
+
     def test_bypass_header_returns_uncompressed(self, client):
         """X-Headroom-Bypass header should skip compression."""
         messages = [
@@ -264,7 +303,12 @@ class TestCompressEndpointCompression:
             transforms_summary={"test_transform": 1},
             markers_inserted=[],
         )
-        run_compression = AsyncMock(return_value=result)
+        # The executor callable returns the 5-tuple contract of
+        # _run_stateless/_run_session_turn:
+        # (result, final_messages, tokens_before, tokens_after, session_info).
+        run_compression = AsyncMock(
+            return_value=(result, result.messages, result.tokens_before, result.tokens_after, None)
+        )
         record_outcome = AsyncMock()
         monkeypatch.setattr(proxy, "_run_compression_in_executor", run_compression)
         monkeypatch.setattr(proxy, "_record_request_outcome", record_outcome)
@@ -289,6 +333,47 @@ class TestCompressEndpointCompression:
         assert outcome.num_messages == 1
         assert outcome.transforms_applied == ("test_transform",)
         assert outcome.total_latency_ms >= 0
+
+    def test_response_reports_embedded_ccr_hashes(self, client, monkeypatch):
+        """The endpoint reports a CCR marker even when the transform omitted its registry."""
+        proxy = client.app.state.proxy
+        ccr_hash = "abc123def4567890abc123de"
+        result = SimpleNamespace(
+            messages=[
+                {
+                    "role": "tool",
+                    "content": f"<<ccr:{ccr_hash} 10_rows_offloaded>>",
+                }
+            ],
+            tokens_before=12,
+            tokens_after=7,
+            transforms_applied=["test_transform"],
+            transforms_summary={"test_transform": 1},
+            markers_inserted=["<headroom:tool_digest sha256=1234567890abcdef>"],
+        )
+        monkeypatch.setattr(
+            proxy,
+            "_run_compression_in_executor",
+            # Same 5-tuple contract as _run_stateless (see above).
+            AsyncMock(
+                return_value=(
+                    result,
+                    result.messages,
+                    result.tokens_before,
+                    result.tokens_after,
+                    None,
+                )
+            ),
+        )
+        monkeypatch.setattr(proxy, "_record_request_outcome", AsyncMock())
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": [{"role": "user", "content": "compress me"}], "model": "gpt-4"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ccr_hashes"] == [ccr_hash]
 
     def test_compression_error_records_failed_request(self, client, monkeypatch):
         """A hard compression failure should increment failed metrics."""

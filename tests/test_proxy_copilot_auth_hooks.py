@@ -52,11 +52,22 @@ def _load_handler_module(monkeypatch: pytest.MonkeyPatch, module_name: str, rela
     responses_mod = types.ModuleType("fastapi.responses")
 
     class Response:
-        def __init__(self, content=None, status_code: int = 200, headers=None, media_type=None):
+        def __init__(
+            self,
+            content=None,
+            status_code: int = 200,
+            headers=None,
+            media_type=None,
+            background=None,
+        ):
             self.content = content
             self.status_code = status_code
             self.headers = headers or {}
             self.media_type = media_type
+            # The streaming forwarder attaches a background task that releases the
+            # upstream stream when the body is never consumed (#2882); the double
+            # must accept and store it so the real StreamingResponse call works.
+            self.background = background
 
     class StreamingResponse(Response):
         pass
@@ -228,6 +239,9 @@ def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch
     assert sent_headers["Authorization"] == "Bearer upstream-token"
     assert sent_headers["content-type"] == "application/json"
     assert response.status_code == 200
+    # The Copilot auth hook and the #2882 upstream-stream cleanup coexist: the
+    # streaming response still carries its background release task.
+    assert response.background is not None
 
 
 def test_openai_chat_routes_copilot_requests_per_model(monkeypatch: pytest.MonkeyPatch) -> None:

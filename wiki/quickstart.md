@@ -38,7 +38,7 @@ npm install headroom-ai
 **Docker-native:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
 ```
 
 See [Docker-native install](docker-install.md) if you want Docker to provide the Headroom runtime while your agent CLIs stay on the host.
@@ -149,19 +149,21 @@ messages = [
     {
         "role": "assistant",
         "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "search", "arguments": '{"q": "python"}'},
-        }],
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": '{"q": "python"}'},
+            }
+        ],
     },
     {
         "role": "tool",
         "tool_call_id": "call_1",
         # This is where Headroom shines - compressing large outputs
-        "content": json.dumps({
-            "results": [{"title": f"Result {i}", "score": 100-i} for i in range(500)]
-        }),
+        "content": json.dumps(
+            {"results": [{"title": f"Result {i}", "score": 100 - i} for i in range(500)]}
+        ),
     },
     {"role": "user", "content": "What are the top 3 results?"},
 ]
@@ -188,7 +190,9 @@ plan = client.chat.completions.simulate(
 
 print(f"Tokens before: {plan.tokens_before}")
 print(f"Tokens after: {plan.tokens_after}")
-print(f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved/plan.tokens_before*100:.0f}%)")
+print(
+    f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved / plan.tokens_before * 100:.0f}%)"
+)
 print(f"Transforms: {plan.transforms}")
 print(f"Estimated savings: {plan.estimated_savings}")
 ```
@@ -227,6 +231,7 @@ print(response.content[0].text)
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.INFO)
 
 # Now you'll see:
@@ -322,7 +327,7 @@ response = client.chat.completions.create(
 |--------------|-------------------|-----------------|
 | **Tool outputs with lists** | Keeps errors, anomalies, high-score items | 70-90% |
 | **Repeated search results** | Deduplicates and samples | 60-80% |
-| **Long conversations** | Drops old turns, keeps recent | 40-60% |
+| **Long conversations** | Compresses the newest tool output / user turn only (live-zone-only); never drops messages | varies |
 | **System prompts with dates** | Stabilizes for cache hits | Cache savings |
 
 ---
@@ -347,6 +352,7 @@ print(stats["config"]["mode"])  # Should be "optimize"
 
 # 2. Enable logging to see what's happening
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 ```
 

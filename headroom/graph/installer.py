@@ -77,13 +77,17 @@ def download_cbm(version: str | None = None) -> Path:
     except Exception as e:
         raise RuntimeError(f"Failed to download codebase-memory-mcp from {url}: {e}") from e
 
+    from headroom.binaries import verify_download_bytes
+
+    verify_download_bytes(data, url=url, name="codebase-memory-mcp")
+
     # Extract binary from tar.gz
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             for member in tar.getmembers():
                 if member.name.endswith(CBM_BIN_NAME) or member.name == CBM_BIN_NAME:
                     member.name = target_path.name
-                    tar.extract(member, CBM_BIN_DIR)
+                    tar.extract(member, CBM_BIN_DIR, filter="data")
                     break
             else:
                 raise RuntimeError("codebase-memory-mcp binary not found in archive")

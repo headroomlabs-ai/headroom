@@ -15,6 +15,7 @@ class _FakeRequest:
         self.headers: dict[str, str] = {}
         self.query_params: dict[str, str] = {}
         self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
+        self.scope: dict = {"type": "http", "method": "POST"}
 
 
 class _NonJsonResponse:

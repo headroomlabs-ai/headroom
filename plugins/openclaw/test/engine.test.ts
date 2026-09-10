@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
+  compress: vi.fn(),
+  delegateCompactionToRuntime: vi.fn(),
   start: vi.fn(async () => "http://127.0.0.1:8787"),
   stop: vi.fn(async () => undefined),
   logger: {
@@ -12,7 +14,11 @@ const mocked = vi.hoisted(() => ({
 }));
 
 vi.mock("headroom-ai", () => ({
-  compress: vi.fn(),
+  compress: mocked.compress,
+}));
+
+vi.mock("../src/openclaw-compaction.js", () => ({
+  delegateCompactionToRuntime: mocked.delegateCompactionToRuntime,
 }));
 
 vi.mock("../src/proxy-manager.js", () => ({
@@ -24,8 +30,11 @@ vi.mock("../src/proxy-manager.js", () => ({
 }));
 
 import { HeadroomContextEngine } from "../src/engine.js";
+import { compress } from "headroom-ai";
 
 afterEach(() => {
+    mocked.compress.mockReset();
+    mocked.delegateCompactionToRuntime.mockReset();
   mocked.start.mockReset();
   mocked.start.mockResolvedValue("http://127.0.0.1:8787");
   mocked.stop.mockClear();
@@ -33,6 +42,73 @@ afterEach(() => {
   mocked.logger.error.mockClear();
   mocked.logger.info.mockClear();
   mocked.logger.warn.mockClear();
+});
+
+describe("HeadroomContextEngine compaction", () => {
+  it("delegates persistent compaction to OpenClaw without claiming ownership", async () => {
+    const engine = new HeadroomContextEngine();
+    const params = {
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      tokenBudget: 12_000,
+      force: true,
+      runtimeContext: { workspaceDir: "/tmp/workspace" },
+    };
+    const delegatedResult = {
+      ok: true,
+      compacted: true,
+      result: {
+        tokensBefore: 20_000,
+        tokensAfter: 8_000,
+      },
+    };
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
+
+    expect(engine.info.ownsCompaction).toBe(false);
+    await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
+
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
+    expect(mocked.compress).not.toHaveBeenCalled();
+    expect(engine.getStats().compactions).toBe(1);
+  });
+
+  it("does not count a delegated no-op as a compaction", async () => {
+    const engine = new HeadroomContextEngine();
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce({
+      ok: true,
+      compacted: false,
+      reason: "Below compaction threshold",
+    });
+
+    await expect(
+      engine.compact({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      compacted: false,
+      reason: "Below compaction threshold",
+    });
+
+    expect(engine.getStats().compactions).toBe(0);
+  });
+
+  it("propagates delegated compaction failures without reporting success", async () => {
+    const engine = new HeadroomContextEngine();
+    const failure = new Error("native compaction failed");
+    mocked.delegateCompactionToRuntime.mockRejectedValueOnce(failure);
+
+    await expect(
+      engine.compact({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+      }),
+    ).rejects.toBe(failure);
+
+    expect(engine.getStats().compactions).toBe(0);
+    expect(mocked.logger.info).not.toHaveBeenCalled();
+  });
 });
 
 describe("HeadroomContextEngine proxy startup helpers", () => {
@@ -195,5 +271,57 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
       estimatedTokens: 0,
     });
     expect(mocked.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the request timeout after successful compression", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(compress).mockResolvedValue({
+        compressed: false,
+        messages: [{ role: "user", content: "hello" }],
+        tokensBefore: 5,
+        tokensAfter: 5,
+        tokensSaved: 0,
+      });
+
+      const engine = new HeadroomContextEngine({ requestTimeoutMs: 30_000 });
+      (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+      await expect(
+        engine.assemble({
+          sessionId: "session-1",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      ).resolves.toEqual({
+        messages: [{ role: "user", content: "hello" }],
+        estimatedTokens: 5,
+      });
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens the circuit after consecutive compression failures", async () => {
+    vi.mocked(compress).mockRejectedValue(new Error("proxy stalled"));
+    const messages = [{ role: "user", content: "hello" }];
+    const engine = new HeadroomContextEngine({
+      circuitBreakerThreshold: 2,
+      circuitBreakerCooldownMs: 60_000,
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({ sessionId: "session-1", messages });
+    await engine.assemble({ sessionId: "session-1", messages });
+    await expect(engine.assemble({ sessionId: "session-1", messages })).resolves.toEqual({
+      messages,
+      estimatedTokens: 0,
+    });
+
+    expect(compress).toHaveBeenCalledTimes(2);
+    expect(mocked.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Circuit breaker opened"),
+    );
   });
 });

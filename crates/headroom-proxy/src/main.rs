@@ -28,8 +28,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_body_bytes = config.max_body_bytes,
         rewrite_host = config.rewrite_host,
         graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),
+        rollout_channel = config.rollout.config.channel.as_str(),
+        rollout_features_enabled = ?config.rollout.enabled(),
+        rollout_features_disabled = ?config.rollout.config.disabled,
+        unsafe_allow_unstable_features = config.rollout.config.unsafe_allow_unstable,
+        rollout_registry_digest = %config.rollout.registry_digest,
+        rollout_snapshot_digest = %config.rollout.snapshot_digest(),
+        qualification_eligible = config.rollout.qualification_eligible(),
         "headroom-proxy starting"
     );
+
+    // Session-sticky beta headers only run inside the compression
+    // interceptor: with `--compression` off the proxy is a strict
+    // byte-pipe and never mutates headers. Say so loudly at startup —
+    // an operator reading `beta_header_sticky=enabled` (the default)
+    // must not believe the protection is active when it isn't.
+    if config.beta_header_sticky.is_enabled() && !config.compression {
+        tracing::warn!(
+            event = "beta_header_sticky_inactive",
+            beta_header_sticky = config.beta_header_sticky.as_str(),
+            compression = config.compression,
+            "beta-header stickiness is enabled but the compression \
+             interceptor is off; enable --compression (or \
+             HEADROOM_PROXY_COMPRESSION=1) to activate it"
+        );
+    }
 
     let mut state = AppState::new(config.clone())?;
 

@@ -126,9 +126,21 @@ def parse_response_with_memory(response_text: str) -> ParsedResponse:
         # Parse the JSON
         try:
             data = json.loads(memory_json)
-            memories = data.get("memories", [])
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse memory JSON: {e}")
+        else:
+            # The model controls the block content. A valid-JSON non-object
+            # (e.g. a bare array) would make `.get` raise AttributeError, which
+            # the JSONDecodeError guard above does not catch; likewise a
+            # non-list `memories` would break downstream iteration.
+            if isinstance(data, dict):
+                extracted = data.get("memories", [])
+                if isinstance(extracted, list):
+                    memories = extracted
+                else:
+                    logger.warning("Memory JSON 'memories' field is not a list; ignoring")
+            else:
+                logger.warning("Memory JSON is not an object; ignoring")
 
     return ParsedResponse(
         content=content,

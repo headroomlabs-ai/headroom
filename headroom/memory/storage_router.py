@@ -160,7 +160,15 @@ class ProjectResolver:
         if explicit:
             safe = self._sanitize_basename(explicit)
             if safe:
-                return safe, explicit
+                # Append a digest of the raw id like `_identity_from_cwd` does:
+                # `_sanitize_basename` maps every disallowed character to a dash
+                # and truncates to 64 chars, so distinct ids such as "acme/api"
+                # and "acme api" both collapse to "acme-api" and would otherwise
+                # share one project store (cross-project memory leak). The digest
+                # keeps distinct ids on distinct keys while the sanitized prefix
+                # stays human-readable on disk.
+                digest = hashlib.sha256(explicit.encode("utf-8")).hexdigest()[:16]
+                return f"{safe}-{digest}", explicit
 
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
@@ -294,12 +302,20 @@ class BackendRouter:
 
         if mode is MemoryStorageMode.USER:
             user_safe = ProjectResolver._sanitize_basename(ctx.base_user_id) or "default"
-            db_path = self._config.root_dir / "users" / user_safe / "memory.db"
+            # Append a digest of the raw user id for the same reason as the
+            # project keys above: `_sanitize_basename` collapses distinct ids
+            # ("alice/qa", "alice qa", "alice@qa") to the same "alice-qa", which
+            # in USER mode would pool two different users into one memory.db —
+            # a cross-user data-isolation leak, the one thing USER mode exists to
+            # prevent. The digest keeps distinct users on distinct stores.
+            digest = hashlib.sha256(ctx.base_user_id.encode("utf-8")).hexdigest()[:16]
+            user_key = f"{user_safe}-{digest}"
+            db_path = self._config.root_dir / "users" / user_key / "memory.db"
             return ResolvedScope(
                 mode=MemoryStorageMode.USER,
                 db_path=db_path,
                 display_name=ctx.base_user_id,
-                project_key=user_safe,
+                project_key=user_key,
             )
 
         # PROJECT mode.

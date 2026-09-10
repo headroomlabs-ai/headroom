@@ -17,6 +17,116 @@ def small_cache() -> CompressionCache:
     return CompressionCache(max_entries=3)
 
 
+class TestCompressionCacheRetention:
+    def test_stable_hashes_are_bounded(self) -> None:
+        cache = CompressionCache(max_entries=3)
+        hashes = [CompressionCache.content_hash(f"stable-{index}") for index in range(4)]
+
+        for content_hash in hashes:
+            cache.mark_stable(content_hash)
+
+        assert len(cache._stable_hashes) == 3
+        assert hashes[0] not in cache._stable_hashes
+        assert hashes[-1] in cache._stable_hashes
+
+    def test_first_seen_is_bounded(self) -> None:
+        cache = CompressionCache(max_entries=3)
+        hashes = [CompressionCache.content_hash(f"first-seen-{index}") for index in range(4)]
+
+        for content_hash in hashes:
+            cache.should_defer_compression(content_hash)
+
+        assert len(cache._first_seen) == 3
+        assert hashes[0] not in cache._first_seen
+        assert hashes[-1] in cache._first_seen
+
+    def test_expired_first_seen_starts_new_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache = CompressionCache(max_entries=3)
+        content_hash = CompressionCache.content_hash("repeated content")
+        timestamps = iter([1_000.0, 1_271.0, 1_272.0])
+
+        monkeypatch.setattr(
+            "headroom.cache.compression_cache.time.time",
+            lambda: next(timestamps),
+        )
+
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is False
+        )
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is False
+        )
+        assert cache._first_seen[content_hash] == 1_271.0
+        assert (
+            cache.should_defer_compression(
+                content_hash,
+                ttl_seconds=300,
+                batch_window=30,
+            )
+            is True
+        )
+
+    def test_evicted_stable_hash_does_not_extend_frozen_prefix(self) -> None:
+        cache = CompressionCache(max_entries=1)
+        old_content = "old stable tool output"
+        new_content = "new stable tool output"
+
+        cache.mark_stable(CompressionCache.content_hash(old_content))
+        cache.mark_stable(CompressionCache.content_hash(new_content))
+
+        messages = [
+            {"role": "user", "content": "start"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": old_content,
+                    }
+                ],
+            },
+            {"role": "user", "content": "follow up"},
+        ]
+
+        assert cache.compute_frozen_count(messages) == 1
+
+    def test_concurrent_bookkeeping_stays_bounded(self) -> None:
+        import threading
+
+        cache = CompressionCache(max_entries=50)
+        errors: list[Exception] = []
+
+        def worker(thread_id: int) -> None:
+            try:
+                for index in range(100):
+                    content_hash = CompressionCache.content_hash(f"thread-{thread_id}-{index}")
+                    cache.mark_stable(content_hash)
+                    cache.should_defer_compression(content_hash)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert len(cache._stable_hashes) <= cache.max_entries
+        assert len(cache._first_seen) <= cache.max_entries
+
+
 class TestCompressionCache:
     def test_cache_miss_returns_none(self, cache: CompressionCache) -> None:
         h = CompressionCache.content_hash("some content")

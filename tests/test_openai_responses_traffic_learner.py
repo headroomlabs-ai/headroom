@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
 from fastapi.testclient import TestClient
 
 from headroom.memory.traffic_learner import TrafficLearner
-from headroom.proxy.handlers.openai import _responses_input_to_learner_messages
+from headroom.proxy.handlers.openai import (
+    OpenAIHandlerMixin,
+    _responses_input_to_learner_messages,
+)
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -80,6 +84,7 @@ def test_responses_input_normalizes_messages_and_tool_results() -> None:
             "input": {"cmd": "missing-command"},
             "output": "command not found",
             "is_error": True,
+            "call_id": "call_1",
         }
     ]
 
@@ -141,3 +146,76 @@ def test_responses_http_request_reaches_traffic_learner() -> None:
             "is_error": True,
         }
     ]
+
+
+def _ws_frame(call_ids: list[str]) -> dict[str, Any]:
+    """A response.create inner payload whose input carries one shell tool
+    round-trip per call id."""
+    input_items: list[dict[str, Any]] = []
+    for cid in call_ids:
+        input_items.append(
+            {"type": "function_call", "call_id": cid, "name": "shell", "arguments": "{}"}
+        )
+        input_items.append(
+            {
+                "type": "function_call_output",
+                "call_id": cid,
+                "output": "ok",
+                "status": "completed",
+            }
+        )
+    return {"input": input_items}
+
+
+def test_ws_response_create_baselines_and_dedups_replayed_transcript() -> None:
+    handler = OpenAIHandlerMixin()
+    learner = _RecordingLearner()
+    handler.traffic_learner = learner
+    seen: set[str] = set()
+
+    # First frame is the baseline: A and B are recorded as seen but NOT learned,
+    # and preference extraction is skipped.
+    asyncio.run(
+        handler._observe_openai_ws_response_create(
+            _ws_frame(["A", "B"]), seen_call_ids=seen, baseline=True, request_id="r"
+        )
+    )
+    assert learner.tool_results == []
+    assert learner.message_batches == []
+    assert seen == {"A", "B"}
+
+    # Second frame replays A, B and appends C -> only C is learned.
+    asyncio.run(
+        handler._observe_openai_ws_response_create(
+            _ws_frame(["A", "B", "C"]), seen_call_ids=seen, baseline=False, request_id="r"
+        )
+    )
+    assert len(learner.tool_results) == 1
+    assert seen == {"A", "B", "C"}
+    assert len(learner.message_batches) == 1
+
+    # Third frame replays A, B, C and appends D -> only D is learned.
+    asyncio.run(
+        handler._observe_openai_ws_response_create(
+            _ws_frame(["A", "B", "C", "D"]), seen_call_ids=seen, baseline=False, request_id="r"
+        )
+    )
+    assert len(learner.tool_results) == 2  # C then D, never A/B again
+    assert seen == {"A", "B", "C", "D"}
+
+
+def test_ws_reconnect_replay_adds_no_evidence() -> None:
+    # A reconnect is a fresh connection: its first frame replays the whole
+    # transcript, which is baselined, so nothing is re-learned.
+    handler = OpenAIHandlerMixin()
+    learner = _RecordingLearner()
+    handler.traffic_learner = learner
+    seen: set[str] = set()
+
+    asyncio.run(
+        handler._observe_openai_ws_response_create(
+            _ws_frame(["A", "B", "C", "D"]), seen_call_ids=seen, baseline=True, request_id="r"
+        )
+    )
+    assert learner.tool_results == []
+    assert seen == {"A", "B", "C", "D"}

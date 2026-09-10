@@ -23,7 +23,7 @@ tower-http = { version = "0.7", features = ["trace", "request-id", "util"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,7 +38,7 @@ http-body-util = "0.1"
 hyper = "1"
 url = "2"
 humantime = "2"
-bytesize = "1"
+bytesize = "2"
 tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
 # Phase D PR-D1: native Bedrock InvokeModel route. SigV4 + AWS
@@ -74,7 +74,7 @@ prometheus = { version = "=0.14.0", default-features = false }
 # `aws-smithy-runtime-api`); promoted here to a direct, normal-build
 # dependency so the drift detector compiles outside `cfg(test)`. Also
 # used by PR-E4 for `prompt_cache_key` derivation.
-sha2 = "0.10"
+sha2 = "0.11"
 # PR-E6: bounded session-scoped cache of structural hashes. The
 # detector evicts the oldest session at 1000 entries — we never want
 # unbounded memory growth from a flood of unique session keys. `lru`
@@ -92,13 +92,13 @@ async-trait = "0.1"
 # ordering — never persisted, never compared cross-host. Same crate
 # the core uses for the CCR cache_key, so no additional hash backend
 # enters the dep tree.
-md-5 = "0.10"
+md-5 = "0.11"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time", "test-util", "process"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
@@ -110,7 +110,7 @@ tokio-stream = "0.1"
 # way to gate "the proxy did not perturb the request" because JSON
 # value-equality misses whitespace, key order, and Unicode escape
 # differences that all bust the prompt cache.
-sha2 = "0.10"
+sha2 = "0.11"
 # PR-C1: property tests for the byte-level SSE parser. The parser
 # must never panic on arbitrary input bytes (TCP can hand us anything,
 # including malformed UTF-8 split mid-codepoint or fuzz-generated

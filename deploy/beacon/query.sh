@@ -20,6 +20,7 @@
 set -euo pipefail
 
 BUCKET="${R2_BUCKET:-headroom-telemetry}"
+[[ "$BUCKET" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid R2_BUCKET value — must contain only alphanumeric, hyphen, or underscore characters" >&2; exit 1; }
 _repo_env="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.env"
 ENV_FILE="${HEADROOM_ENV_FILE:-$HOME/env.txt}"
 [ -f "$ENV_FILE" ] || ENV_FILE="$_repo_env"
@@ -74,6 +75,15 @@ case "${1:-summary}" in
                  / nullif(sum(tokens.attempted), 0), 2)                AS yield_pct,
            round(sum(tokens.saved) * 100.0
                  / nullif(sum(tokens.original), 0), 2)                 AS saved_pct,
+           -- saved_pct/yield_pct above are context-compression only, because
+           -- tool_saved never lands in original/attempted. This is the
+           -- dashboard headline (server.py `savings_percent`): tool-schema
+           -- savings on BOTH sides, since deferred schemas were attempted work
+           -- that succeeded whole. On a tool-heavy fleet the two differ several-
+           -- fold, so say which one you are quoting.
+           round(sum(tokens.saved + tokens.tool_saved) * 100.0
+                 / nullif(sum(tokens.original + tokens.tool_saved), 0), 2)
+                                                                       AS all_layers_pct,
            sum(failures)                                               AS failures
     FROM sessions;"
     ;;

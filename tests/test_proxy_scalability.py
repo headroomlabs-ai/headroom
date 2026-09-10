@@ -275,6 +275,7 @@ class TestWorkerConfiguration:
             payload = json.loads(os.environ[_MULTI_WORKER_CONFIG_ENV])
             assert payload["host"] == "0.0.0.0"
             assert payload["port"] == 8787
+            assert payload["worker_processes"] == 4
             assert payload["max_connections"] == 200
             assert payload["http_proxy"] == "http://proxy.local:8080"
         finally:

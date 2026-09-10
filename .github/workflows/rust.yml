@@ -84,7 +84,7 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Provide ONNX Runtime dylib
@@ -189,7 +189,7 @@ jobs:
         # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
@@ -224,8 +224,12 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      - name: cargo audit (soft-fail)
-        continue-on-error: true
+      # Blocking. Soft-failing this made it useless: RUSTSEC-2026-0258 (h2,
+      # unbounded empty DATA frames -> unbounded memory or a panic) was
+      # reported by this job for as long as it existed and never turned a run
+      # red, so nobody acted on it. Accepted advisories go in audit.toml with
+      # a written reason rather than being swallowed wholesale here.
+      - name: cargo audit
         run: cargo audit
       - name: cargo deny check licenses
         continue-on-error: true

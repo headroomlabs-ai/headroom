@@ -10,8 +10,17 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy import runtime_env  # noqa: E402
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_env_overrides():
+    """Keep loopback hot-reload state from leaking into later test modules."""
+    runtime_env.clear_overrides()
+    yield
+    runtime_env.clear_overrides()
 
 
 def _make_client() -> TestClient:
@@ -49,6 +58,7 @@ async def _ok_response(
 
 def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "2")
     monkeypatch.delenv("HEADROOM_OUTPUT_HOLDOUT", raising=False)
     captured: dict[str, Any] = {}
@@ -91,19 +101,19 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     assert response.status_code == 200
     sent = captured["body"]
     assert "<headroom_output_shaping>" in sent["instructions"]
-    assert sent["reasoning"]["effort"] == "low"
-    assert sent["text"]["verbosity"] == "low"
+    # Steering is the only lever; request params pass through untouched.
+    assert sent["reasoning"]["effort"] == "xhigh"
+    assert sent["text"]["verbosity"] == "medium", "client value passes through"
     assert captured["retry_kwargs"]["body_mutated"] is True
     assert captured["retry_kwargs"]["original_body_bytes"] is not None
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:stratum:") for t in transforms)
     assert "output_shaper:verbosity:L2" in transforms
-    assert "output_shaper:reasoning_effort:xhigh->low" in transforms
-    assert "output_shaper:text_verbosity:medium->low" in transforms
 
 
 def test_http_responses_output_shaper_respects_bypass(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     captured: dict[str, Any] = {}
     payload = {"model": "gpt-5", "input": "hi"}
 
@@ -131,6 +141,7 @@ def test_http_responses_output_shaper_respects_bypass(monkeypatch):
 
 def test_http_responses_output_shaper_holdout_labels_without_rewrite(monkeypatch):
     monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
     monkeypatch.setenv("HEADROOM_OUTPUT_HOLDOUT", "1")
     captured: dict[str, Any] = {}
     outcomes: list[Any] = []
@@ -160,3 +171,43 @@ def test_http_responses_output_shaper_holdout_labels_without_rewrite(monkeypatch
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:control:") for t in transforms)
     assert "output_shaper:verbosity:L2" not in transforms
+
+
+def test_http_output_shaper_hot_reload_changes_the_running_request_path(monkeypatch):
+    """The admin endpoint must not report success while traffic stays unchanged."""
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+    payload = {
+        "model": "gpt-5",
+        "input": [{"type": "function_call_output", "call_id": "call_1", "output": "ok"}],
+        "reasoning": {"effort": "high"},
+        "text": {"verbosity": "medium"},
+    }
+    sent: list[dict[str, Any]] = []
+
+    with _make_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(*args: Any, **kwargs: Any) -> httpx.Response:
+            sent.append(copy.deepcopy(args[3]))
+            return await _ok_response(*args, **kwargs)
+
+        proxy._retry_request = _fake_retry
+        first = client.post(
+            "/v1/responses", headers={"authorization": "Bearer test-key"}, json=payload
+        )
+        update = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        second = client.post(
+            "/v1/responses", headers={"authorization": "Bearer test-key"}, json=payload
+        )
+
+    assert first.status_code == second.status_code == update.status_code == 200
+    assert sent[0] == payload
+    assert "<headroom_output_shaping>" in sent[1]["instructions"]
+    decision = next(
+        item
+        for item in update.json()["rollout"]["features"]
+        if item["name"] == "proxy_output_shaper"
+    )
+    assert decision["enabled"] is True
+    assert decision["decision"] == "legacy_alias"

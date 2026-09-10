@@ -56,6 +56,55 @@ def test_resolve_api_targets_normalizes_trailing_v1() -> None:
     assert targets.vertex == "https://vertex.example"
 
 
+def test_copilot_openai_target_routes_anthropic_to_copilot() -> None:
+    """When the OpenAI target is a Copilot host and no Anthropic override is set,
+    the Anthropic target must default to the same Copilot host.
+
+    Copilot serves Claude models via its Anthropic surface (``/v1/messages``) on
+    the same host. Without this, Claude requests fell back to api.anthropic.com
+    and 401'd with the Copilot bearer ("Invalid bearer token", #3247).
+    """
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic=None,
+            openai="https://api.githubcopilot.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.openai == "https://api.githubcopilot.com"
+    assert targets.anthropic == "https://api.githubcopilot.com"
+
+
+def test_explicit_anthropic_override_wins_over_copilot_default() -> None:
+    """An explicit Anthropic target is never overridden by the Copilot default."""
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic="https://api.anthropic.com",
+            openai="https://api.githubcopilot.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.anthropic == "https://api.anthropic.com"
+
+
+def test_non_copilot_openai_target_leaves_anthropic_default() -> None:
+    """A non-Copilot OpenAI target must not touch the Anthropic default."""
+    targets = resolve_api_targets(
+        ProviderApiOverrides(
+            anthropic=None,
+            openai="https://api.openai.com",
+            gemini=None,
+            cloudcode=None,
+            vertex=None,
+        )
+    )
+    assert targets.anthropic == "https://api.anthropic.com"
+
+
 def test_proxy_config_exposes_provider_api_overrides() -> None:
     config = ProxyConfig(
         anthropic_api_url="https://anthropic.example",

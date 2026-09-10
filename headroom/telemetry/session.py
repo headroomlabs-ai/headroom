@@ -94,6 +94,39 @@ _SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # vocabulary. Values are slug-validated before they are counted.
 _REASON_TAGS = ("passthrough_reason", "image_skip_reason", "memory_skip_reason")
 
+# Cardinality cap on `by_strategy`. The real vocabulary is CompressionStrategy
+# plus a couple of literals — under a dozen — but `record_compression` takes a
+# free string, so an extension or a future caller could invent keys per request.
+# Matches the same guard on `requests_by_stack` (MAX_DISTINCT_STACKS).
+MAX_STRATEGIES = 32
+
+# Compression events arrive on the compression executor thread, mid-request,
+# before that request's outcome ever reaches `SessionAggregator.record`. They
+# are staged here rather than written straight into the live session, which
+# keeps three things true at once:
+#
+#   * The executor thread never takes the aggregator's lock, so compression
+#     cannot serialise against the request path. The beacon is on by default,
+#     and ContentRouter observes once per routing decision — once per content
+#     section per request — so that contention would be real.
+#   * A compression event cannot CREATE a session. Sessions are started only by
+#     an outcome, which preserves the invariant that every emitted session has
+#     turns >= 1; otherwise a request abandoned between compression and its
+#     outcome (Claude Code users interrupt streaming routinely) would emit a
+#     phantom all-zero row that inflates fleet session and install counts.
+#   * The first turn's numbers still survive, because the outcome that follows
+#     milliseconds later drains this into the session it opens.
+#
+# A request that dies before its outcome leaves its events staged, and they are
+# attributed to the next session instead. That is a rounding error against
+# inventing a session that never happened.
+_staged_lock = threading.Lock()
+_staged_strategies: dict[str, list[int]] = {}
+# Per-request stack slugs, for `detect_stack`'s by_stack branch. Same staging
+# and the same reason: the proxy sees the X-Headroom-Stack header per request,
+# and this is the only place the beacon can learn it without importing proxy.
+_staged_stacks: dict[str, int] = {}
+
 
 def _pct(numerator: float, denominator: float) -> float:
     """Percentage to 2dp, or 0.0 when undefined.
@@ -218,6 +251,28 @@ def resource_attributes(
     }
     if install_mode:
         attrs["headroom.install_mode"] = install_mode
+    # Detect when the caller did not supply one. Every caller so far supplies
+    # nothing, so `headroom.stack` was absent from the entire corpus while the
+    # detector sat unused — which made the fleet unsegmentable by agent, the
+    # question the corpus is most often asked ("what does this look like under
+    # Claude Code?").
+    #
+    # The env vars detect_stack checks first are only set by `headroom wrap`.
+    # The common deployment points an agent at a persistent proxy through
+    # ANTHROPIC_BASE_URL and sets neither, so environment-only detection would
+    # answer the literal "proxy" for almost the whole fleet — a populated,
+    # authoritative-looking column that cannot answer the question it exists
+    # for. The slugs staged by `record_stack` are that fleet's only real
+    # signal, so they are fed to detect_stack's by_stack branch.
+    if stack is None:
+        try:
+            from headroom.telemetry.context import detect_stack
+
+            with _staged_lock:
+                by_stack = dict(_staged_stacks)
+            stack = detect_stack({"requests": {"by_stack": by_stack}} if by_stack else None)
+        except Exception:  # a broken detector must not silence telemetry
+            logger.debug("telemetry: stack detection failed", exc_info=True)
     if stack:
         attrs["headroom.stack"] = stack
     return attrs
@@ -246,11 +301,16 @@ class _Session:
     cache_write_tokens: int = 0
     uncached_tokens: int = 0
     failures: int = 0
+    failure_statuses: dict[str, int] = field(default_factory=dict)
     passthrough_turns: int = 0
     response_cache_hits: int = 0
     overhead_ms: float = 0.0
     latency_ms: float = 0.0
     transforms: dict[str, int] = field(default_factory=dict)
+    # strategy slug -> [events, tokens_in, tokens_out]. `transforms` says which
+    # compressors ran; this says whether they were worth running. A list rather
+    # than three parallel dicts so the three numbers cannot drift apart.
+    strategies: dict[str, list[int]] = field(default_factory=dict)
     skips: dict[str, int] = field(default_factory=dict)
     sources: dict[str, int] = field(default_factory=dict)
     providers: set[str] = field(default_factory=set)
@@ -325,6 +385,24 @@ class _Session:
                 # Of what we touched, how much did we remove? THIS is the
                 # compressor quality number, and the one Kompress moves.
                 "yield_pct": _pct(self.tokens_saved, self.attempted_tokens),
+                # The two above are context-compression only, because
+                # `tool_saved` never lands in original/attempted. On a
+                # tool-heavy fleet that understates the product several-fold —
+                # observed 2.80% vs 12.82% across the first 516 sessions.
+                # These two are what the dashboard headline shows
+                # (`tokens.savings_percent` / `active_savings_percent` in
+                # server.py): tool-schema savings added to BOTH sides, since
+                # deferred schemas were attempted work that succeeded whole.
+                # Kept alongside rather than folded into `saved_pct`, which
+                # already means context-only in every row of the corpus.
+                "all_layers_saved_pct": _pct(
+                    self.tokens_saved + self.tool_saved_tokens,
+                    self.original_tokens + self.tool_saved_tokens,
+                ),
+                "all_layers_yield_pct": _pct(
+                    self.tokens_saved + self.tool_saved_tokens,
+                    self.attempted_tokens + self.tool_saved_tokens,
+                ),
                 # Provider prompt cache participation. Headroom freezes prefixes
                 # to protect this, so it is the other side of eligible_pct.
                 "cache_read_pct": _pct(self.cache_read_tokens, self.original_tokens),
@@ -344,6 +422,37 @@ class _Session:
             },
             "compression": {
                 "transforms": dict(self.transforms),
+                # Per-strategy effectiveness. `transforms` counts invocations,
+                # which cannot tell a compressor that saved 60% from one that
+                # ran constantly and saved nothing — the fleet's top transform
+                # by count contributes an unknown share of `tokens.saved`.
+                #
+                # These do NOT sum to `tokens.saved`, and must not be presented
+                # as if they do: strategies compose (the router routes, a
+                # strategy runs inside it) so the same text is measured by more
+                # than one, and tool-schema savings never appear here at all.
+                # Read a row as "of what this strategy was handed, it removed
+                # this much" — a per-strategy yield, not a share of the total.
+                #
+                # A LIST of uniform records, not a {strategy: {...}} object,
+                # and that shape is deliberate. DuckDB infers a JSON object as
+                # a STRUCT while its keys are few and consistent and as a MAP
+                # once they are not, so an object keyed by strategy would
+                # change COLUMN TYPE as the fleet adopts new compressors —
+                # exactly the break that silently took out the `transforms`
+                # report. A list of records has fixed field names, so the type
+                # is the same on day one and after the 30th strategy ships, and
+                # a new field inside a record is absorbed by union_by_name.
+                # Sorted so a payload is byte-comparable between heartbeats.
+                "by_strategy": [
+                    {
+                        "strategy": name,
+                        "n": counts[0],
+                        "tokens_in": counts[1],
+                        "tokens_out": counts[2],
+                    }
+                    for name, counts in sorted(self.strategies.items())
+                ],
                 "overhead_ms_total": round(self.overhead_ms, 1),
                 # Sum of per-request durations, NOT elapsed time: concurrent turns
                 # make this exceed `session.duration_s`. Kept under the original
@@ -374,6 +483,12 @@ class _Session:
             "providers": sorted(self.providers),
             "models": sorted(self.models),
             "failures": self.failures,
+            # The same failures split by status, because the count alone cannot
+            # answer the only question worth asking about it: a 529 is the
+            # provider shedding load (nothing to fix here) and a 500 is usually
+            # ours. Keys are the bare status string; the set is closed and tiny
+            # (500/502/503/504/529), so this needs no slug bounding.
+            "failure_statuses": dict(self.failure_statuses),
         }
         self.seq += 1
         return snapshot
@@ -480,6 +595,20 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     sess.last_seen = now
     sess.turns += 1
     sess.sources[source] = sess.sources.get(source, 0) + 1
+
+    # Compression ran on the executor thread before this outcome arrived; take
+    # what it staged. Done here rather than in the observer so the executor
+    # thread never touches the aggregator lock — see the note on _staged_lock.
+    for name, staged in _drain_staged_strategies().items():
+        counts = sess.strategies.get(name)
+        if counts is None:
+            if len(sess.strategies) >= MAX_STRATEGIES:
+                continue
+            counts = [0, 0, 0]
+            sess.strategies[name] = counts
+        counts[0] += staged[0]
+        counts[1] += staged[1]
+        counts[2] += staged[2]
     sess.original_tokens += int(get("original_tokens") or 0)
     sess.attempted_tokens += int(get("attempted_input_tokens") or 0)
     # Billed/volume figure, so prefer the provider's own count and fall back to
@@ -495,8 +624,14 @@ def _fold(sess: _Session, outcome: Any, now: float, source: str = "proxy") -> No
     sess.uncached_tokens += int(get("uncached_input_tokens") or 0)
     sess.overhead_ms += float(get("overhead_ms", 0.0) or 0.0)
     sess.latency_ms += float(get("total_latency_ms", 0.0) or 0.0)
-    if int(get("status_code", 200) or 200) >= 500:
+    status = int(get("status_code", 200) or 200)
+    if status >= 500:
         sess.failures += 1
+        # ponytail: str(status) verbatim for the 5xx range, one bucket for
+        # anything outside it. Nothing here can be user data, and the range
+        # check is what keeps a garbage status_code from inventing map keys.
+        key = str(status) if status < 600 else "other"
+        sess.failure_statuses[key] = sess.failure_statuses.get(key, 0) + 1
     if get("from_response_cache", False):
         sess.response_cache_hits += 1
 
@@ -745,6 +880,116 @@ def record_mcp_compression(
     )
 
 
+def record_compression(strategy: str, original_tokens: int, compressed_tokens: int) -> None:
+    """Beacon entry point for one compression event.
+
+    Signature-compatible with
+    :class:`headroom.transforms.observability.CompressionObserver`, so the
+    proxy's existing observer can forward here without a second measurement
+    pass — the numbers are already computed on the hot path for Prometheus
+    (``PrometheusMetrics.tokens_saved_by_strategy``); they just never left the
+    process.
+
+    Same discipline as the rest of this module: off by default and cheap when
+    off, never raises. This runs once per routing decision, so it must not do
+    anything a request would notice.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    # A slug, not the raw string. The real values are CompressionStrategy enum
+    # tags, but the observer protocol takes a free string, and anything that is
+    # not already a bounded lowercase identifier collapses to "other" rather
+    # than reaching the wire.
+    slug = _safe_slug(strategy)
+    try:
+        before = int(original_tokens or 0)
+        after = int(compressed_tokens or 0)
+    except (TypeError, ValueError):
+        return
+    if before <= 0:
+        return
+    # Clamped at the input: a compressor that emits more than it received is a
+    # bug, and letting `out` exceed `in` would surface downstream as negative
+    # savings rather than as the bug it is. Prometheus clamps the same way.
+    after = min(max(after, 0), before)
+    with _staged_lock:
+        counts = _staged_strategies.get(slug)
+        if counts is None:
+            if len(_staged_strategies) >= MAX_STRATEGIES:
+                return
+            counts = [0, 0, 0]
+            _staged_strategies[slug] = counts
+        counts[0] += 1
+        counts[1] += before
+        counts[2] += after
+
+
+def record_stack(slug: str) -> None:
+    """Beacon entry point for one request's stack slug.
+
+    The harness identity lives in the ``X-Headroom-Stack`` header, which only
+    the proxy sees, and per request rather than per process. Counting slugs
+    here lets :func:`resource_attributes` answer ``detect_stack``'s by_stack
+    branch without the telemetry package importing ``headroom.proxy``.
+
+    Without this the beacon can only read the two environment variables, so
+    every install that points an agent at a persistent proxy — the common
+    deployment for Claude Code, Cursor, Codex and the adapters — reports the
+    literal ``"proxy"`` and the fleet is unsegmentable by agent.
+    """
+    from headroom.telemetry.beacon import is_beacon_enabled
+
+    if not is_beacon_enabled():
+        return
+    # normalize_stack is the same chokepoint the proxy applies at ingress; an
+    # unbounded header value must not reach the wire or grow this dict.
+    from headroom.telemetry.context import normalize_stack
+
+    clean = normalize_stack(slug)
+    if not clean:
+        return
+    with _staged_lock:
+        if clean not in _staged_stacks and len(_staged_stacks) >= MAX_STRATEGIES:
+            return
+        _staged_stacks[clean] = _staged_stacks.get(clean, 0) + 1
+
+
+class BeaconCompressionObserver:
+    """A `CompressionObserver` that forwards to the beacon and nothing else.
+
+    The proxy's `PrometheusMetrics` is already an observer and forwards from
+    there, so this is for the paths that never had one: the MCP servers, the
+    bare transform pipeline, and the LangChain/Strands integrations. Those
+    processes report `tokens.saved` either way, so without this they emit
+    sessions with real token totals and an empty `by_strategy` — a silently
+    biased subset that cannot be reconciled with the fleet totals.
+
+    Only `record_compression` is implemented. ContentRouter's two other
+    observer hooks (`record_kompress_size_gate`, `record_router_route_counts`)
+    are each individually guarded at the call site, and both feed `/stats`
+    rather than the beacon.
+    """
+
+    __slots__ = ()
+
+    def record_compression(
+        self, strategy: str, original_tokens: int, compressed_tokens: int
+    ) -> None:
+        record_compression(strategy, original_tokens, compressed_tokens)
+
+
+def _drain_staged_strategies() -> dict[str, list[int]]:
+    """Take everything staged since the last drain. Caller merges it."""
+    with _staged_lock:
+        if not _staged_strategies:
+            return {}
+        drained = {name: counts[:] for name, counts in _staged_strategies.items()}
+        _staged_strategies.clear()
+        return drained
+
+
 def record_outcome(outcome: Any) -> None:
     """Beacon entry point, called from the proxy's outcome funnel.
 
@@ -811,6 +1056,10 @@ def demo() -> None:
     assert r["rates"]["overhead_pct"] == 5.0, r["rates"]
     # Tool savings are invisible in `saved` by design; they must not be lost.
     assert r["tokens"]["tool_saved"] == 1000, r["tokens"]
+    # ...and the all-layers rates are the ones that do count them: 1300 saved
+    # of 2000 sent, 1300 of 1400 attempted. Both denominators grow too.
+    assert r["rates"]["all_layers_saved_pct"] == 65.0, r["rates"]
+    assert r["rates"]["all_layers_yield_pct"] == 92.86, r["rates"]
     assert r["compression"]["response_cache_hits"] == 1
     assert r["tokens"]["cache_write"] == 100 and r["tokens"]["uncached"] == 400
 
@@ -833,11 +1082,103 @@ def demo() -> None:
     assert event["compression"]["transforms"] == {"crush": 2, "dedupe": 2}
     assert event["providers"] == ["anthropic"]
     assert event["failures"] == 0
+    assert event["failure_statuses"] == {}
 
     # The new burst is a distinct session, not a continuation.
     agg.flush_all()
     assert len(emitted) == 2, emitted
     assert emitted[1]["session"]["turns"] == 1
+
+    # --- per-strategy compression -----------------------------------------
+    # Compression runs on the executor thread before its request's outcome
+    # arrives, so events are staged and drained by the next outcome. That is
+    # what keeps the first turn's numbers while letting only an outcome open a
+    # session. `_staged_*` is module state, so clear it between cases.
+    _staged_strategies.clear()
+    _staged_stacks.clear()
+
+    strat: list[dict[str, Any]] = []
+    sa = SessionAggregator(strat.append, idle_s=10.0)
+    record_compression("smart_crusher", 1000, 400)
+    record_compression("smart_crusher", 500, 300)
+    record_compression("code_aware", 800, 800)
+    assert sa._current is None, "a compression event must not open a session"
+    sa.record(FakeOutcome(), now=2000.0)
+    sa.flush_all()
+    by = {row["strategy"]: row for row in strat[-1]["compression"]["by_strategy"]}
+    assert by["smart_crusher"] == {
+        "strategy": "smart_crusher",
+        "n": 2,
+        "tokens_in": 1500,
+        "tokens_out": 700,
+    }, by
+    # A strategy that ran and saved nothing must still appear: "ran 800 tokens
+    # through and removed none" is the finding, and dropping it would make
+    # every strategy look effective.
+    assert by["code_aware"]["tokens_in"] == by["code_aware"]["tokens_out"] == 800, by
+    assert strat[-1]["session"]["turns"] == 1, "compression events are not turns"
+    # A list of records, not an object keyed by strategy: the type must not
+    # change as strategies are added. See the note in payload().
+    assert isinstance(strat[-1]["compression"]["by_strategy"], list)
+    assert [r["strategy"] for r in strat[-1]["compression"]["by_strategy"]] == sorted(
+        r["strategy"] for r in strat[-1]["compression"]["by_strategy"]
+    ), "sorted so heartbeats are byte-comparable"
+
+    # Draining is exhaustive: a second session must not re-count the first
+    # session's events.
+    assert not _staged_strategies, "record() drains everything it staged"
+    again: list[dict[str, Any]] = []
+    sb = SessionAggregator(again.append, idle_s=10.0)
+    sb.record(FakeOutcome(), now=3000.0)
+    sb.flush_all()
+    assert again[-1]["compression"]["by_strategy"] == [], again[-1]
+
+    # An abandoned request — compression ran, the outcome never arrived — must
+    # not invent a session. Before staging, this emitted a phantom turns=0 row
+    # with all-zero tokens that inflated fleet session and install counts.
+    ghost: list[dict[str, Any]] = []
+    sc = SessionAggregator(ghost.append, idle_s=10.0)
+    record_compression("smart_crusher", 900, 100)
+    sc.flush_all()
+    assert ghost == [], "no outcome, no session"
+    _staged_strategies.clear()
+
+    # Over the cardinality cap, extra strategies are dropped rather than
+    # allowed to grow the payload without bound.
+    cap: list[dict[str, Any]] = []
+    cc = SessionAggregator(cap.append, idle_s=10.0)
+    for i in range(MAX_STRATEGIES + 5):
+        record_compression(f"s{i}", 100, 50)
+    cc.record(FakeOutcome(), now=4000.0)
+    cc.flush_all()
+    assert len(cap[-1]["compression"]["by_strategy"]) == MAX_STRATEGIES, cap[-1]
+    _staged_strategies.clear()
+
+    # Strategy names are slugged, never passed through: the observer protocol
+    # takes a free string and this is the only chokepoint before the wire.
+    assert _safe_slug("smart_crusher") == "smart_crusher"
+    assert _safe_slug("../../etc/passwd") == "other"
+
+    # --- stack detection ---------------------------------------------------
+    # Environment-only detection answers "proxy" for every install that points
+    # an agent at a persistent proxy instead of using `headroom wrap` — i.e.
+    # most of the fleet. The per-request slugs are the only real signal.
+    _staged_stacks.clear()
+    for _ in range(9):
+        record_stack("wrap_claude")
+    record_stack("wrap_cursor")
+    assert resource_attributes()["headroom.stack"] == "wrap_claude", "dominant stack wins"
+    _staged_stacks.clear()
+    for _ in range(5):
+        record_stack("wrap_claude")
+    for _ in range(5):
+        record_stack("wrap_cursor")
+    assert resource_attributes()["headroom.stack"] == "mixed", "no dominant stack"
+    _staged_stacks.clear()
+    record_stack("../../etc/passwd")
+    assert not _staged_stacks, "junk slugs never reach the wire"
+    assert resource_attributes()["headroom.stack"] == "proxy", "falls back with no signal"
+
     assert emitted[1]["session"]["id"] != emitted[0]["session"]["id"]
     assert emitted[1]["session"]["ended"] == "shutdown"
 
@@ -954,10 +1295,18 @@ def demo() -> None:
     class Failed(FakeOutcome):
         status_code = 529
 
+    class Broke(FakeOutcome):
+        status_code = 500
+
     agg2 = SessionAggregator(emitted.append)
     agg2.record(Failed(), now=2000.0)
+    agg2.record(Failed(), now=2001.0)
+    agg2.record(Broke(), now=2002.0)
     agg2.flush_all()
-    assert emitted[-1]["failures"] == 1
+    assert emitted[-1]["failures"] == 3
+    # Provider load-shedding and our own 500s have to be separable, or the
+    # count says "0.7% of turns failed" and nothing about whose fault it is.
+    assert emitted[-1]["failure_statuses"] == {"529": 2, "500": 1}
 
     # Flushing an empty aggregator is a no-op, not a null event.
     before = len(emitted)

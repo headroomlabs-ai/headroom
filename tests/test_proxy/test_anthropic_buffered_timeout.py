@@ -56,7 +56,10 @@ def _assert_buffered_timeout(timeout: httpx.Timeout | None) -> None:
     assert isinstance(timeout, httpx.Timeout)
     assert timeout.connect == 3.0
     assert timeout.read == 19.0
-    assert timeout.write == 7.0
+    # `write` is no longer request_timeout_seconds (7): sending the request is a
+    # separate operation from waiting for the answer, so it has its own bound --
+    # the fixture's write_timeout_seconds, not the read budget (#3259).
+    assert timeout.write == 11.0
     assert timeout.pool == 3.0
 
 
@@ -73,6 +76,7 @@ def _make_config() -> ProxyConfig:
         image_optimize=False,
         connect_timeout_seconds=3,
         request_timeout_seconds=7,
+        write_timeout_seconds=11,
         anthropic_buffered_request_timeout_seconds=19,
     )
 
@@ -108,6 +112,59 @@ def _anthropic_list_response() -> httpx.Response:
         json={"object": "list", "data": [], "first_id": None, "last_id": None},
         headers={"content-type": "application/json"},
     )
+
+
+def _anthropic_null_usage_response() -> dict[str, object]:
+    """An Anthropic Messages response whose usage counts are present but null.
+
+    An Anthropic-compatible gateway (custom ANTHROPIC_TARGET_API_URL) can emit
+    this shape on a stopped or empty turn — the same class that crashed the
+    Gemini path in #2347.
+    """
+    return {
+        "id": "msg_test_null",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_input_tokens": None,
+            "cache_creation_input_tokens": None,
+        },
+    }
+
+
+def test_anthropic_messages_buffered_survives_null_usage_counts():
+    config = _make_config()
+    app = create_app(config)
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        # Use the real prefix tracker (its `_cached_token_count` is read on this
+        # path); only pin the session id so the tracker resolves deterministically.
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "s1"
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(200, json=_anthropic_null_usage_response())
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    # Null usage counts must not crash outcome recording / cache-bust math.
+    assert response.status_code == 200, response.text
 
 
 def test_anthropic_messages_buffered_timeout_override_reaches_retry_request():
@@ -408,5 +465,9 @@ def test_generic_proxy_timeout_defaults_stay_unchanged():
 
     assert timeout.connect == 10.0
     assert timeout.read == 300.0
-    assert timeout.write == 300.0
     assert timeout.pool == 10.0
+    # `write` deliberately no longer tracks read. Inheriting 300s put the send
+    # bound above the ~180-220s point where the OS abandons retransmission, so
+    # it could never fire against a dead peer (#3259).
+    assert timeout.write == 150.0
+    assert timeout.write < timeout.read

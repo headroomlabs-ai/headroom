@@ -1,4 +1,5 @@
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
@@ -328,6 +329,35 @@ describe("Headroom OpenCode transport", () => {
     }
   });
 
+  it("skips the shim preload when the bundle ships without it (#2798)", () => {
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(fs, "existsSync").mockReturnValue(false);
+
+    try {
+      process.env.NODE_OPTIONS = "--trace-warnings";
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+      // A missing --import target aborts the child before it speaks JSON-RPC,
+      // which OpenCode reports as `MCP error -32000: Connection closed`.
+      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+
+      childProcess.spawn("npx", ["-y", "firecrawl-mcp"]);
+      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.NODE_OPTIONS).not.toContain("--import");
+    } finally {
+      if (originalNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = originalNodeOptions;
+      }
+      childProcess.spawn = originalSpawn;
+      uninstallHeadroomTransport();
+    }
+  });
+
   it("injects the Headroom shim into child processes with custom env", () => {
     const originalSpawn = childProcess.spawn;
     const spawnMock = vi.fn(() => ({
@@ -354,6 +384,58 @@ describe("Headroom OpenCode transport", () => {
       uninstallHeadroomTransport();
       childProcess.spawn = originalSpawn;
     }
+  });
+
+  it("sends x-headroom-project header on routed fetch calls when project is set", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project: "my-project" });
+
+    await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("x-headroom-project")).toBe("my-project");
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("omits x-headroom-project header when project is not set", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
+
+    const headers = new Headers(fetchMock.mock.calls[0][1]?.headers);
+    expect(headers.get("x-headroom-project")).toBeNull();
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("sends x-headroom-project header on routed Node https.request calls when project is set", async () => {
+    const proxy = await proxyServer();
+    installHeadroomTransport({ proxyUrl: proxy.url, project: "my-project" });
+
+    await new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        "https://api.anthropic.com/v1/messages",
+        { method: "POST" },
+        (res) => {
+          res.resume();
+          res.on("end", resolve);
+        },
+      );
+      req.on("error", reject);
+      req.end("{}");
+    });
+
+    expect(proxy.seen[0].headers["x-headroom-project"]).toBe("my-project");
+
+    await proxy.close();
   });
 
   it("restores patched transports only after the final disposer", () => {
