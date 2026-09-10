@@ -316,7 +316,7 @@ class TestCodexMemoryMcpConfig:
         original = (
             'instructions = """\n'
             "[mcp_servers.headroom_memory]\n"
-            'keep this instruction\n'
+            "keep this instruction\n"
             '"""\n'
             'model="gpt-4o"\n'
         )
@@ -327,7 +327,7 @@ class TestCodexMemoryMcpConfig:
         content = config_file.read_text()
         # The unrelated multiline string and the setting after it must
         # survive untouched.
-        assert 'keep this instruction' in content
+        assert "keep this instruction" in content
         assert 'model="gpt-4o"' in content
         # The real, marker-wrapped memory MCP block must still be injected.
         assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
@@ -374,6 +374,64 @@ class TestCodexMemoryMcpConfig:
         parsed = tomllib.loads(content)
         assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
         assert parsed["mcp_servers"]["other"]["command"] == "other-tool"
+
+    def test_inject_preserves_array_table_after_unmarked_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Removing an old memory table must stop before an unrelated array table."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            "[mcp_servers.headroom_memory]\n"
+            'command = "old"\n\n'
+            "[[profiles.custom.entries]]\n"
+            'name = "preserve"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        parsed = tomllib.loads(config_file.read_text())
+        assert parsed["profiles"]["custom"]["entries"] == [{"name": "preserve"}]
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_ignores_triple_quote_in_comment_before_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A comment delimiter cannot hide the real old memory table from cleanup."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '# Example triple quote: """\n[mcp_servers.headroom_memory]\ncommand = "old"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        parsed = tomllib.loads(content)
+        assert content.count("[mcp_servers.headroom_memory]") == 1
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_leaves_file_unchanged_when_candidate_is_invalid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An invalid candidate must never overwrite the user's configuration."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        original = (
+            "broken = [\n"
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "old"\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        assert config_file.read_text() == original
 
 
 class TestInjectAndRestoreRoundTrip:
@@ -1101,6 +1159,40 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         }
         assert parsed["profiles"]["default"]["model"] == "gpt-5"
         assert parsed["notice"] == {"hide_rate_limit_model_nudge": True}
+
+    def test_inject_preserves_array_table_after_legacy_provider_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Provider cleanup must stop before an unrelated TOML array table."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir()
+        config_file.write_text(
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n\n'
+            "[[profiles.custom.entries]]\n"
+            'name = "preserve"\n'
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        parsed = tomllib.loads(config_file.read_text())
+        assert parsed["profiles"]["custom"]["entries"] == [{"name": "preserve"}]
+        assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
+
+    def test_inject_leaves_invalid_provider_config_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Provider injection must not overwrite a config that cannot validate."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir()
+        original = 'broken = [\n[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/v1"\n'
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert config_file.read_text() == original
 
     def test_unwrap_restores_prior_headroom_provider_table(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
