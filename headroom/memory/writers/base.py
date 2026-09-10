@@ -49,7 +49,12 @@ class MemoryEntry:
     @property
     def score(self) -> float:
         """Combined score for ranking: importance × recency × access."""
-        age_days = (time.time() - self.created_at) / 86400
+        # Clamp to non-negative: a future created_at (clock skew, a timestamp
+        # set on another machine) otherwise drives the denominator to zero at
+        # exactly +10 days (ZeroDivisionError) and negative past that, inverting
+        # the ranking. A future memory is treated as brand new (no decay), which
+        # matches memory_rank_policy.memory_recency_factor.
+        age_days = max(0.0, (time.time() - self.created_at) / 86400)
         recency = 1.0 / (1.0 + age_days * 0.1)  # Decay over ~10 days
         access_boost = min(1.0, 0.5 + self.access_count * 0.1)
         return self.importance * recency * access_boost
