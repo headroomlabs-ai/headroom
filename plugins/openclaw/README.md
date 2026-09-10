@@ -215,8 +215,8 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | Content-aware compression (zero LLM) |
-| Cost of compaction | Tokens (LLM calls) | Zero |
+| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
+| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
 
