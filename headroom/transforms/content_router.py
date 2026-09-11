@@ -44,7 +44,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1706,6 +1706,29 @@ class ContentRouterConfig:
     search_group_by_file: bool = False
 
 
+@dataclass(frozen=True)
+class CompressionRequestContext:
+    """Immutable per-request state for one ``ContentRouter.apply`` call.
+
+    A ``ContentRouter`` is long-lived and shared: the proxy builds one per provider
+    pipeline and runs ``apply`` on a thread pool, so a request-scoped value stored on
+    the instance can be overwritten mid-``apply`` by a concurrent request (#3549).
+    Building this once per request and passing it down keeps that state owned by the
+    request instead of the router.
+    """
+
+    tool_names: Mapping[str, str] = field(default_factory=dict)
+    tool_call_args: Mapping[str, str] = field(default_factory=dict)
+    tool_call_commands: Mapping[str, str] = field(default_factory=dict)
+    protected_tool_ids: frozenset[str] = frozenset()
+    protected_message_indices: frozenset[int] = frozenset()
+
+
+# Stand-in for helpers reached without going through ``apply``: no tool metadata,
+# no read protection.
+_EMPTY_REQUEST_CONTEXT = CompressionRequestContext()
+
+
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -1850,11 +1873,6 @@ class ContentRouter(Transform):
         # different strategies for the same block, share one provider
         # invocation. See `_lossless_provider_result`.
         self._lossless_provider_memo: dict[tuple[int, int, int], tuple[str, str] | None] = {}
-
-        # tool_call_id → compact args text, populated by _build_tool_name_map.
-        self._tool_call_args: dict[str, str] = {}
-        # tool_call_id → raw shell command (bash-search fold), same population.
-        self._tool_call_commands: dict[str, str] = {}
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -4529,16 +4547,14 @@ class ContentRouter(Transform):
 
     # Transform interface
 
-    def _build_tool_name_map(self, messages: list[dict[str, Any]]) -> dict[str, str]:
-        """Build mapping from tool_call_id to tool_name.
+    def _scan_tool_calls(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Collect tool-call metadata in one scan: names, compact args, shell commands.
 
-        Scans assistant messages to find tool calls and extract their names.
-        Supports both OpenAI and Anthropic message formats. Also populates
-        ``self._tool_call_args`` (id → compact args text) in the same scan, so
-        the relevance split can score a tool output against the *precise* ask
-        that triggered it (grep pattern, read path, …), not just the user
-        prompt. Read-only after build → safe to read from the parallel
-        compression pass.
+        Supports both OpenAI and Anthropic message formats. Returns the values
+        instead of storing them on the router, so a concurrent request cannot
+        overwrite them mid-``apply`` (#3549).
         """
         mapping: dict[str, str] = {}
         args_map: dict[str, str] = {}
@@ -4592,9 +4608,69 @@ class ContentRouter(Transform):
                             if command:
                                 commands_map[tc_id] = command
 
-        self._tool_call_args = args_map
-        self._tool_call_commands = commands_map
-        return mapping
+        return mapping, args_map, commands_map
+
+    def _build_tool_name_map(self, messages: list[dict[str, Any]]) -> dict[str, str]:
+        """Build mapping from tool_call_id to tool_name."""
+        return self._scan_tool_calls(messages)[0]
+
+    def _build_request_context(self, messages: list[dict[str, Any]]) -> CompressionRequestContext:
+        """Build the per-request state ``apply`` needs, owned by the caller (#3549)."""
+        tool_names, tool_call_args, tool_call_commands = self._scan_tool_calls(messages)
+
+        protected_tool_ids: frozenset[str] = frozenset()
+        protected_message_indices: frozenset[int] = frozenset()
+        if read_protection_enabled():
+            # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
+            # exclude-by-tool-NAME set never catches file reads (they are `bash`
+            # tool calls whose COMMAND is a cat/sed/head/...). Mark those tool_use_ids
+            # so their output is never LOSSY-compressed (the agent needs exact bytes
+            # to edit; lossy reads caused re-reads/turn-inflation + resolve loss on
+            # SWE-bench). Type-specific by design: grep/test/ls output stays
+            # compressible, so the cache-mode delta still compresses whenever the
+            # newest turn is NOT a read.
+            #
+            # Use tool_call_commands (the parsed shell command), NOT tool_call_args
+            # (a compact free-text blob that, for OpenAI-style JSON-string args, is
+            # the raw ``{"command": ...}`` JSON — on which _is_read_command always
+            # returns False, silently disabling read protection for OpenAI-native
+            # harnesses). tool_call_commands is extracted via
+            # _tool_call_command_text, correct for both wire shapes.
+            protected_tool_ids = frozenset(
+                tid for tid in tool_names if _is_read_command(tool_call_commands.get(tid, ""))
+            )
+
+            # Read protection — TEXT-BASED shape (shape-agnostic twin of the above).
+            # Text-based agents (GPT-5.4/Codex/Cursor backticks) have no tool_use
+            # blocks: the command is in the PRECEDING assistant message's fenced
+            # block and the observation is a plain user string with no id to match.
+            # Detect the producing command by walking back to that assistant turn and
+            # mark the observation's message index so it is passed verbatim — so
+            # cat/sed/head code reads are protected on ANY model/harness, not just
+            # those that emit tool-call/tool_result blocks.
+            indices: set[int] = set()
+            for _idx, _m in enumerate(messages):
+                if _m.get("role") != "user":
+                    continue
+                _cmd = ""
+                for _j in range(_idx - 1, -1, -1):
+                    _rj = messages[_j].get("role")
+                    if _rj == "assistant":
+                        _cmd = _fenced_shell_command(messages[_j].get("content"))
+                        break
+                    if _rj == "user":
+                        break
+                if _cmd and _is_read_command(_cmd):
+                    indices.add(_idx)
+            protected_message_indices = frozenset(indices)
+
+        return CompressionRequestContext(
+            tool_names=tool_names,
+            tool_call_args=tool_call_args,
+            tool_call_commands=tool_call_commands,
+            protected_tool_ids=protected_tool_ids,
+            protected_message_indices=protected_message_indices,
+        )
 
     def _net_cost_allows(
         self,
@@ -4854,8 +4930,9 @@ class ContentRouter(Transform):
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
 
-        # Build tool name map for exclusion checking
-        tool_name_map = self._build_tool_name_map(messages)
+        # Per-request tool-call/read-protection state, owned by this call (#3549).
+        request_context = self._build_request_context(messages)
+        tool_name_map = request_context.tool_names
 
         # Compute excluded tool IDs based on config
         exclude_tools = (
@@ -4892,50 +4969,8 @@ class ContentRouter(Transform):
             if is_tool_excluded(name, ("headroom_retrieve",))
         }
 
-        # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
-        # exclude-by-tool-NAME set above never catches file reads (they are `bash`
-        # tool calls whose COMMAND is a cat/sed/head/...). Mark those tool_use_ids so
-        # their output is never LOSSY-compressed (the agent needs exact bytes to edit;
-        # lossy reads caused re-reads/turn-inflation + resolve loss on SWE-bench).
-        # Type-specific by design: grep/test/ls output stays compressible, so the
-        # cache-mode delta still compresses whenever the newest turn is NOT a read.
-        self._protect_read_tool_ids = set()
-        if read_protection_enabled():
-            # Use _tool_call_commands (the parsed shell command), NOT
-            # _tool_call_args (a compact free-text blob that, for OpenAI-style
-            # JSON-string args, is the raw ``{"command": ...}`` JSON — on which
-            # _is_read_command always returns False, silently disabling read
-            # protection for OpenAI-native harnesses). _tool_call_commands is
-            # extracted via _tool_call_command_text, correct for both wire shapes.
-            self._protect_read_tool_ids = {
-                tid
-                for tid in tool_name_map
-                if _is_read_command(self._tool_call_commands.get(tid, ""))
-            }
-
-        # Read protection — TEXT-BASED shape (shape-agnostic twin of the above).
-        # Text-based agents (GPT-5.4/Codex/Cursor backticks) have no tool_use
-        # blocks: the command is in the PRECEDING assistant message's fenced
-        # block and the observation is a plain user string with no id to match.
-        # Detect the producing command by walking back to that assistant turn and
-        # mark the observation's message index so it is passed verbatim — so
-        # cat/sed/head code reads are protected on ANY model/harness, not just
-        # those that emit tool-call/tool_result blocks.
-        self._protect_read_msg_indices: set[int] = set()
-        if read_protection_enabled():
-            for _idx, _m in enumerate(messages):
-                if _m.get("role") != "user":
-                    continue
-                _cmd = ""
-                for _j in range(_idx - 1, -1, -1):
-                    _rj = messages[_j].get("role")
-                    if _rj == "assistant":
-                        _cmd = _fenced_shell_command(messages[_j].get("content"))
-                        break
-                    if _rj == "user":
-                        break
-                if _cmd and _is_read_command(_cmd):
-                    self._protect_read_msg_indices.add(_idx)
+        # Read-protection sets are built with the rest of the request context
+        # (see _build_request_context) so a concurrent request cannot overwrite them.
 
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
@@ -5165,6 +5200,7 @@ class ContentRouter(Transform):
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
                     prefix_replay_guaranteed=prefix_replay_guaranteed,
+                    request_context=request_context,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -5240,7 +5276,9 @@ class ContentRouter(Transform):
                 # Bash-search lossless pre-empt: a read-only search (grep/rg/git
                 # grep) run via a shell tool yields byte-losslessly foldable
                 # output. Fold it instead of the lossy strategy path.
-                bash_folded = self._bash_search_fold(tool_name, tool_call_id, content)
+                bash_folded = self._bash_search_fold(
+                    tool_name, tool_call_id, content, request_context
+                )
                 if bash_folded is not None:
                     result_slots[i] = {**message, "content": bash_folded}
                     transforms_applied.append("router:bash:lossless_search")
@@ -5263,8 +5301,9 @@ class ContentRouter(Transform):
             # in the block path; this covers STRING-content observations.)
             if role in ("user", "tool", "function"):
                 _tcid = message.get("tool_call_id") or message.get("tool_use_id") or ""
-                _is_read_obs = _tcid in getattr(self, "_protect_read_tool_ids", ()) or i in getattr(
-                    self, "_protect_read_msg_indices", ()
+                _is_read_obs = (
+                    _tcid in request_context.protected_tool_ids
+                    or i in request_context.protected_message_indices
                 )
                 if _is_read_obs and _read_output_should_be_protected(content):
                     _exp = self._experimental_compress_read(content, context)
@@ -5838,7 +5877,13 @@ class ContentRouter(Transform):
         minified = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         return minified if len(minified) < len(content) else None
 
-    def _bash_search_fold(self, tool_name: str, tool_id: str, content: Any) -> str | None:
+    def _bash_search_fold(
+        self,
+        tool_name: str,
+        tool_id: str,
+        content: Any,
+        request_context: CompressionRequestContext,
+    ) -> str | None:
         """Byte-lossless fold for a read-only search run through a shell tool.
 
         ``bash`` is not excluded, so its output normally takes the lossy strategy
@@ -5856,7 +5901,7 @@ class ContentRouter(Transform):
             return None
         if tool_name.lower() not in self.config.bash_tool_names:
             return None
-        command = self._tool_call_commands.get(tool_id, "")
+        command = request_context.tool_call_commands.get(tool_id, "")
         if not command or not _bash_command_is_search(command, self.config.bash_search_commands):
             return None
         try:
@@ -6055,8 +6100,13 @@ class ContentRouter(Transform):
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
         prefix_replay_guaranteed: bool = False,
+        request_context: CompressionRequestContext | None = None,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
+
+        ``request_context`` carries this request's tool-call metadata and
+        read-protection sets (#3549). ``None`` (a direct caller that never went
+        through ``apply``) means no read protection and no bash-search fold.
 
         Cache-safety contract:
           1. Any block carrying `cache_control` is the client's explicit
@@ -6120,6 +6170,7 @@ class ContentRouter(Transform):
         Returns:
             Transformed message with compressed content blocks.
         """
+        request_context = request_context or _EMPTY_REQUEST_CONTEXT
         new_blocks = []
         any_compressed = False
         role = message.get("role", "")
@@ -6189,9 +6240,9 @@ class ContentRouter(Transform):
                 # log/lockfile/text) is not byte-patched, so it falls through to its
                 # content-specific compressor. Cross-turn dedup still runs later, so
                 # re-reads of the same file are losslessly de-duplicated either way.
-                if tool_use_id in getattr(
-                    self, "_protect_read_tool_ids", ()
-                ) and _read_output_should_be_protected(_tr_text):
+                if tool_use_id in request_context.protected_tool_ids and (
+                    _read_output_should_be_protected(_tr_text)
+                ):
                     _exp = self._experimental_compress_read(_tr_text, context or "")
                     if _exp is not None:
                         new_blocks.append({**block, "content": _exp})
@@ -6262,7 +6313,7 @@ class ContentRouter(Transform):
                 # signal. Gated so default behavior is byte-identical.
                 block_context = context
                 if self.config.relevance_split and tool_use_id:
-                    call_args = self._tool_call_args.get(tool_use_id, "")
+                    call_args = request_context.tool_call_args.get(tool_use_id, "")
                     if call_args:
                         block_context = build_relevance_query(context, tool_name, call_args)
 
@@ -6292,7 +6343,9 @@ class ContentRouter(Transform):
                 # Bash-search lossless pre-empt (twin of the string-form path):
                 # fold read-only search output (grep/rg/git grep) byte-losslessly
                 # instead of taking the lossy strategy path.
-                bash_folded = self._bash_search_fold(tool_name, tool_use_id, tool_text)
+                bash_folded = self._bash_search_fold(
+                    tool_name, tool_use_id, tool_text, request_context
+                )
                 if bash_folded is not None:
                     new_blocks.append(
                         {
