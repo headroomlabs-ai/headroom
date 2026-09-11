@@ -76,7 +76,7 @@ def test_unknown_counter_stays_unknown_across_rounds(bad):
 def test_missing_usage_is_not_a_complete_final_call_total():
     for missing in ({}, {"usage": None}, {"usage": {}}):
         result = _combine_anthropic_usage(missing, message(2))
-        assert result["usage"] is None or result["usage"]["input_tokens"] is None
+        assert result["usage"]["input_tokens"] is None
 
 
 @pytest.mark.parametrize("limited", [False, True])
@@ -101,3 +101,26 @@ def test_partial_exit_retains_only_completed_call_usage(limited):
     assert result["usage"] == message(3)["usage"]
     assert result["content"][0]["type"] == "tool_use"
     reset_compression_store()
+
+
+@pytest.mark.parametrize("missing_round", [0, 1, 2])
+def test_missing_whole_usage_keeps_nested_cache_unknown(missing_round):
+    responses = [message(n) for n in (1, 2, 3)]
+    responses[missing_round].pop("usage")
+    original = copy.deepcopy(responses)
+    result = responses[0]
+    for response in responses[1:]:
+        result = _combine_anthropic_usage(result, response)
+    assert result["usage"]["cache_creation_input_tokens"] is None
+    assert result["usage"].get("cache_creation") is None
+    assert responses == original
+
+
+@pytest.mark.parametrize("empty_details", [False, True])
+def test_absent_optional_cache_counters_are_not_invented(empty_details):
+    usage = {"input_tokens": 11, "output_tokens": 7}
+    if empty_details:
+        usage["cache_creation"] = {}
+    result = _combine_anthropic_usage({"usage": usage}, {"usage": usage})
+    expected = {**usage, "input_tokens": 22, "output_tokens": 14}
+    assert result["usage"] == expected

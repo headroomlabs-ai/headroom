@@ -62,6 +62,7 @@ def _combine_anthropic_usage(previous: dict[str, Any], current: dict[str, Any]) 
                     "output_tokens",
                     "cache_read_input_tokens",
                     "cache_creation_input_tokens",
+                    "cache_creation",
                 )
             ),
         }

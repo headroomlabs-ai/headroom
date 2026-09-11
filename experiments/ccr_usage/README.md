@@ -133,3 +133,50 @@ imported modules bypass that mock; the first test can start a real proxy instead
 of exiting. The baseline file run yielded two failures and 57 passes with a
 15-second timeout. These tests were not changed or excluded to manufacture a
 passing result. The accounting fix and its tests passed in the full run.
+
+### Follow-up: unknown cache-duration propagation
+
+Self-review found a hole in the proposed fix: if the first or second of three
+completed calls omitted its entire usage object, a later call could publish its
+own nested cache-duration counts as though they were complete. Both cases failed
+before the follow-up. The missing-usage result now explicitly marks
+`cache_creation` unknown, preserving that state through subsequent calls. Three
+regression cases cover each missing-call position; optional cache fields remain
+absent when neither call supplied them.
+
+The offline SDK check uses the pinned Anthropic 1.5.0 / httpx2 2.12.0 environment
+in `isolated-test-dependencies.lock`:
+
+```sh
+PYTHONPATH="$PWD" python -m pytest experiments/ccr_usage/test_sdk_usage.py -q
+```
+
+It verifies final content and unknown usage fields through the SDK's JSON and
+SSE decoders using an in-process synthetic transport. This proves those decoder
+paths tolerate nulls; it does not prove every client, strict schema validation,
+live provider billing, or proxy metrics preserve unknown values.
+
+The six real loopback HTTP accounting cases still pass after this follow-up.
+Whole-project CI-version mypy 1.20.2 passes (532 files); Ruff check/format pass.
+The earlier isolated full-suite results remain tied to their recorded revision,
+not this follow-up. Upstream workflows require approval and have not executed;
+no clean full-suite or upstream CI pass is claimed.
+
+Combined follow-up check: **114 passed, one upstream deprecation warning**.
+To repeat the affected tests and standalone decoder checks:
+
+```sh
+HF_HUB_OFFLINE=1 python -m pytest \
+  tests/test_ccr_anthropic_usage_accounting.py \
+  tests/test_ccr_response_handler.py tests/test_ccr_response_handler_extra.py \
+  tests/test_ccr_response_handler_openai_responses.py \
+  tests/test_ccr_buffered_stream_signed_thinking.py \
+  tests/test_no_ccr_disables_response_handling.py \
+  tests/test_proxy/test_anthropic_streaming_ccr_retrieve.py \
+  experiments/ccr_usage/test_decoder.py experiments/ccr_usage/test_sdk_usage.py -q
+```
+
+Coverage was also measured with pytest-cov after pre-importing
+`pydantic.root_model` (avoids an installed Pydantic/coverage collection error).
+`followup-results.json` records helper coverage separately from whole-module
+coverage. The earlier full-suite result has not been rerun or relabeled green.
