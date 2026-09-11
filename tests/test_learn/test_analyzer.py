@@ -15,6 +15,7 @@ from headroom.learn.analyzer import (
     _call_cli_llm,
     _call_llm,
     _detect_default_model,
+    _output_snippet,
     _parse_llm_response,
     _resolve_timeout_secs,
     _strip_fenced_json,
@@ -476,6 +477,67 @@ class TestSessionAnalyzer:
         assert result.analysis_error == "API key not set"
 
     @patch("headroom.learn.analyzer._call_llm")
+    def test_retries_smaller_digest_on_prompt_too_long(self, mock_call_llm: MagicMock):
+        """A context-overflow error rebuilds the digest at half the budget and retries."""
+        mock_call_llm.side_effect = [
+            RuntimeError("`claude -p` failed (exit 1):\nPrompt is too long"),
+            {"context_file_rules": [], "memory_file_rules": []},
+        ]
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[
+                    # Enough volume to overflow even the halved (40k-token) budget,
+                    # so the retry digest is visibly shorter than the first.
+                    _tc(msg_index=i, is_error=True, output="x" * 200)
+                    for i in range(2000)
+                ],
+            )
+        ]
+        result = analyzer.analyze(_project(), sessions)
+
+        assert mock_call_llm.call_count == 2
+        first_digest = mock_call_llm.call_args_list[0][0][0]
+        second_digest = mock_call_llm.call_args_list[1][0][0]
+        assert len(second_digest) < len(first_digest)
+        assert result.recommendations == []
+
+    @patch("headroom.learn.analyzer._call_llm")
+    def test_gives_up_when_min_digest_budget_still_too_long(self, mock_call_llm: MagicMock):
+        """Persistent overflow stops at the minimum budget instead of looping forever."""
+        mock_call_llm.side_effect = RuntimeError("Prompt is too long")
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[_tc(msg_index=0, is_error=True, output="error")],
+            )
+        ]
+        result = analyzer.analyze(_project(), sessions)
+
+        # Budgets: 80k, 40k, 20k, 10k — then give up.
+        assert mock_call_llm.call_count == 4
+        assert result.recommendations == []
+
+    @patch("headroom.learn.analyzer._call_llm")
+    def test_non_overflow_failure_does_not_retry(self, mock_call_llm: MagicMock):
+        mock_call_llm.side_effect = RuntimeError("API key not set")
+
+        analyzer = SessionAnalyzer(model="test-model")
+        sessions = [
+            SessionData(
+                session_id="s1",
+                tool_calls=[_tc(msg_index=0, is_error=True, output="error")],
+            )
+        ]
+        analyzer.analyze(_project(), sessions)
+
+        mock_call_llm.assert_called_once()
+
+    @patch("headroom.learn.analyzer._call_llm")
     def test_passes_events_to_digest(self, mock_call_llm: MagicMock):
         """User messages and subagent events should appear in the digest."""
         mock_call_llm.return_value = {"context_file_rules": [], "memory_file_rules": []}
@@ -723,7 +785,67 @@ class TestCallCliLlm:
             result = _call_cli_llm("test digest", "claude-cli")
         assert result == {"context_file_rules": [], "memory_file_rules": []}
         cmd = popen.call_args[0][0]
-        assert cmd == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+        assert cmd == [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]
+
+    def test_claude_cli_progress_callback_is_throttled(self):
+        stdout = [
+            _stream_event("system", subtype="init"),
+            *[_stream_event("assistant", message={"content": "..."}) for _ in range(5)],
+            _result_event('{"context_file_rules": [], "memory_file_rules": []}'),
+        ]
+        progress: list[str] = []
+        with patch(
+            "headroom.learn.analyzer.subprocess.Popen", _fake_claude_popen(stdout_lines=stdout)
+        ):
+            result = _call_cli_llm("test digest", "claude-cli", on_progress=progress.append)
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        # All 6 progress-worthy events arrive well within one 3s throttle
+        # window, so only the first ("session started") should be echoed.
+        assert progress == ["session started"]
+
+    def test_claude_cli_progress_callback_reports_spaced_events(self, monkeypatch):
+        monkeypatch.setattr("headroom.learn.analyzer._PROGRESS_THROTTLE_SECS", 0.01)
+        stdout = [
+            _stream_event("system", subtype="init"),
+            _stream_event("assistant", message={"content": "thinking..."}),
+            _stream_event("stream_event", event={"type": "content_block_delta"}),
+            _stream_event("user", message={"content": []}),
+            _result_event('{"context_file_rules": [], "memory_file_rules": []}'),
+        ]
+        progress: list[str] = []
+        with patch(
+            "headroom.learn.analyzer.subprocess.Popen",
+            _fake_claude_popen(stdout_lines=stdout, stdout_delay=0.03),
+        ):
+            result = _call_cli_llm("test digest", "claude-cli", on_progress=progress.append)
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
+        assert progress[0] == "session started"
+        assert progress[1].startswith("assistant responding, ")
+        assert progress[2].startswith("assistant responding, ")  # stream_event maps like assistant
+        assert progress[3].startswith("tool running, ")
+        assert len(progress) == 4  # the terminal "result" event is never echoed as progress
+
+    def test_claude_cli_progress_callback_exception_does_not_abort_analysis(self):
+        stdout = [
+            _stream_event("system", subtype="init"),
+            _result_event('{"context_file_rules": [], "memory_file_rules": []}'),
+        ]
+
+        def _boom(_detail: str) -> None:
+            raise RuntimeError("wrapper UI pipe closed")
+
+        with patch(
+            "headroom.learn.analyzer.subprocess.Popen", _fake_claude_popen(stdout_lines=stdout)
+        ):
+            result = _call_cli_llm("test digest", "claude-cli", on_progress=_boom)
+        assert result == {"context_file_rules": [], "memory_file_rules": []}
 
     def test_claude_cli_parses_fenced_result(self):
         stdout = [
@@ -849,6 +971,31 @@ class TestCallCliLlm:
         ):
             with pytest.raises(RuntimeError, match="unparseable output"):
                 _call_cli_llm("test digest", "claude-cli")
+
+    def test_claude_cli_unparseable_result_shows_both_ends(self):
+        # A head-only excerpt of a long answer is valid-looking JSON in every
+        # case; the reason it did not parse -- truncated mid-value, or prose
+        # after the closing fence -- is only visible at the end.
+        payload = '```json\n{"context_file_rules": [' + '{"section": "x"}, ' * 400 + "]}\n```"
+        payload += "\n\nLet me know if you want this in another shape!"
+        with patch(
+            "headroom.learn.analyzer.subprocess.Popen",
+            _fake_claude_popen(stdout_lines=[_result_event(payload)]),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                _call_cli_llm("test digest", "claude-cli")
+        message = str(exc_info.value)
+        assert "unparseable output" in message
+        assert "```json" in message, "head is missing"
+        assert "another shape" in message, "tail is missing"
+        assert "chars omitted" in message
+        # Still bounded: the excerpt cannot grow with the payload.
+        assert len(message) < len(payload)
+
+    def test_output_snippet_leaves_short_output_alone(self):
+        assert _output_snippet("short") == "short"
+        edge = "x" * 2000
+        assert _output_snippet(edge) == edge
 
     def test_claude_cli_not_installed_raises(self):
         popen = MagicMock(side_effect=FileNotFoundError("No such file or directory: 'claude'"))
@@ -1143,14 +1290,14 @@ class TestCallLlmRouting:
     def test_routes_cli_model_to_cli_backend(self, mock_cli: MagicMock):
         mock_cli.return_value = {"context_file_rules": [], "memory_file_rules": []}
         result = _call_llm("test digest", "claude-cli")
-        mock_cli.assert_called_once_with("test digest", "claude-cli")
+        mock_cli.assert_called_once_with("test digest", "claude-cli", on_progress=None)
         assert result == {"context_file_rules": [], "memory_file_rules": []}
 
     @patch("headroom.learn.analyzer._call_cli_llm")
     def test_routes_codex_cli(self, mock_cli: MagicMock):
         mock_cli.return_value = {}
         _call_llm("digest", "codex-cli")
-        mock_cli.assert_called_once_with("digest", "codex-cli")
+        mock_cli.assert_called_once_with("digest", "codex-cli", on_progress=None)
 
 
 # =============================================================================

@@ -557,3 +557,206 @@ class TestIdentityPreservesFieldBoundaries:
         call = _call(name, "c-0", {field: "a b c"}, msg_index=0)
 
         assert _identity_input(call) == "a b c"
+
+
+def _mixed_calls() -> list[ToolCall]:
+    return [
+        _call("Read", "call_r0", {"file_path": "/repo/a.py"}, msg_index=0),
+        _call("Read", "call_r1", {"file_path": "/repo/a.py"}, msg_index=1),
+        _call("Read", "call_r2", {"file_path": "/repo/a.py"}, msg_index=2),
+        _call("Bash", "call_b0", {"command": "rg alpha /repo"}, msg_index=3),
+        _call("Bash", "call_b1", {"command": "rg alpha /repo"}, msg_index=4),
+        _call("Bash", "call_b2", {"command": "rg alpha /repo"}, msg_index=5),
+        _call("Grep", "call_g0", {"pattern": "beta"}, msg_index=6),
+    ]
+
+
+class TestReplayedTranscriptsDoNotDoubleCount:
+    """A resume that replays prior history must not recount the same calls.
+
+    ``detect_loops`` accumulates a signature across sessions so a recurring loop
+    adds up. Providers whose resume writes a *new* transcript replaying earlier
+    turns therefore present the same tool call more than once; identity comes
+    from ``tool_call_id``, which the provider assigns.
+    """
+
+    def _reads(self) -> list[ToolCall]:
+        return [
+            _call("Read", f"call_r{i}", {"file_path": "/repo/docs/design.md"}, msg_index=i)
+            for i in range(3)
+        ]
+
+    def test_replayed_calls_counted_once(self):
+        reads = self._reads()
+        single = detect_loops([SessionData(session_id="rollout-1", tool_calls=list(reads))])
+        replayed = detect_loops(
+            [
+                SessionData(session_id="rollout-1", tool_calls=list(reads)),
+                SessionData(session_id="rollout-2-resume", tool_calls=list(reads)),
+            ]
+        )
+        assert replayed[0].count == single[0].count
+        assert replayed[0].wasted_tokens == single[0].wasted_tokens
+
+    def test_new_calls_in_a_resume_still_accumulate(self):
+        # Dedup must not swallow genuinely new repetitions in the resumed run.
+        reads = self._reads()
+        extra = [
+            _call("Read", f"call_r{i}", {"file_path": "/repo/docs/design.md"}, msg_index=i)
+            for i in range(3, 6)
+        ]
+        replayed = detect_loops(
+            [
+                SessionData(session_id="rollout-1", tool_calls=list(reads)),
+                SessionData(session_id="rollout-2-resume", tool_calls=list(reads) + extra),
+            ]
+        )
+        assert replayed[0].count == 6
+
+    def test_calls_without_ids_are_not_deduped(self):
+        # An id-less scanner must keep counting repetitions rather than collapse.
+        calls = [
+            _call("Read", "", {"file_path": "/repo/docs/design.md"}, msg_index=i) for i in range(3)
+        ]
+        loops = detect_loops(
+            [
+                SessionData(session_id="a", tool_calls=list(calls)),
+                SessionData(session_id="b", tool_calls=list(calls)),
+            ]
+        )
+        assert loops[0].count == 6
+
+    @pytest.mark.parametrize("replays", [1, 2, 3, 5])
+    def test_replaying_a_transcript_never_changes_the_count(self, replays):
+        calls = _mixed_calls()
+        sessions = [
+            SessionData(session_id=f"rollout-{i}", tool_calls=list(calls)) for i in range(replays)
+        ]
+
+        once = detect_loops([SessionData(session_id="rollout-0", tool_calls=list(calls))])
+        many = detect_loops(sessions)
+
+        assert sorted(lp.count for lp in many) == sorted(lp.count for lp in once)
+
+
+class TestDedupRespectsTheOccurrenceThreshold:
+    """Dedup must not leave behind loops that no longer meet the bar.
+
+    ``detect_loops`` screens a group against ``min_occurrences`` before removing
+    replayed calls, so a group can clear the bar only *because* of duplicates and
+    still be reported once they are gone. Real transcripts do repeat a
+    ``tool_use_id`` within one file, so this is reachable from the default
+    Claude Code path.
+    """
+
+    def test_a_group_that_only_duplicates_is_not_a_loop(self):
+        # One call, written into the transcript three times.
+        calls = [
+            _call("Read", "toolu_SAME", {"file_path": "/repo/design.md"}, msg_index=i)
+            for i in range(3)
+        ]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_partial_dedup_still_has_to_clear_the_bar(self):
+        # Three calls, two distinct — below DEFAULT_MIN_OCCURRENCES once deduped.
+        calls = [
+            _call("Read", "toolu_A", {"file_path": "/repo/design.md"}, msg_index=0),
+            _call("Read", "toolu_A", {"file_path": "/repo/design.md"}, msg_index=1),
+            _call("Read", "toolu_B", {"file_path": "/repo/design.md"}, msg_index=2),
+        ]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_a_real_loop_padded_with_duplicates_is_still_reported(self):
+        # Dedup must subtract the replays without dropping the genuine loop.
+        distinct = [
+            _call("Read", f"toolu_{i}", {"file_path": "/repo/design.md"}, msg_index=i)
+            for i in range(3)
+        ]
+        padded = distinct + [
+            _call("Read", "toolu_0", {"file_path": "/repo/design.md"}, msg_index=9)
+        ]
+
+        loops = detect_loops([SessionData(session_id="s", tool_calls=padded)])
+
+        assert [lp.count for lp in loops] == [3]
+
+    def test_no_loop_is_reported_with_zero_measured_waste(self):
+        """A zero-waste loop is the tell that a group survived on duplicates.
+
+        ``format_loops_for_digest`` bills every entry to the LLM as HIGHEST
+        PRIORITY, and ``SessionAnalyzer.analyze`` treats a non-empty loop list as
+        reason enough to call the model, so a zero-waste entry buys an LLM round
+        trip for a session with nothing to report.
+        """
+        calls = [
+            _call("Read", "toolu_SAME", {"file_path": "/repo/design.md"}, msg_index=i)
+            for i in range(4)
+        ]
+
+        loops = detect_loops([SessionData(session_id="s", tool_calls=calls)])
+
+        assert [lp for lp in loops if lp.wasted_tokens == 0] == []
+
+
+class TestFixturesSatisfyTheDedupContract:
+    """Dedup keys on ``tool_call_id``, so the shipped fixtures must scope theirs.
+
+    ``detect_loops`` accumulates a signature across sessions. An id that is only
+    unique *within* a session makes two unrelated sessions look like one replayed
+    twice, silently halving a real loop.
+    """
+
+    def test_the_same_loop_in_two_sessions_accumulates(self):
+        monday = refetch_loop_session("session-monday")
+        tuesday = refetch_loop_session("session-tuesday")
+
+        one = detect_loops([monday])
+        both = detect_loops([monday, tuesday])
+
+        assert both[0].count == one[0].count * 2
+
+    def test_fixture_ids_are_unique_across_sessions(self):
+        monday = {c.tool_call_id for c in refetch_loop_session("session-monday").tool_calls}
+        tuesday = {c.tool_call_id for c in refetch_loop_session("session-tuesday").tool_calls}
+
+        assert monday.isdisjoint(tuesday)
+
+
+class TestSubThresholdSessionsDoNotCombine:
+    """A session that only looped in replays must not contribute at all.
+
+    ``min_occurrences`` is screened against the *pre-dedup* per-session group, so
+    a session whose repetitions are all replays of one call still qualifies and
+    hands its single real call to the global view. Three such sessions then clear
+    the bar together, reporting a loop no conversation actually ran.
+    """
+
+    def _replay_padded_session(self, session_id: str, call_id: str) -> SessionData:
+        # One real Read, written into this transcript three times.
+        return SessionData(
+            session_id=session_id,
+            tool_calls=[
+                _call("Read", call_id, {"file_path": "/repo/design.md"}, msg_index=i)
+                for i in range(3)
+            ],
+        )
+
+    def test_each_session_alone_is_not_a_loop(self):
+        sessions = [
+            self._replay_padded_session("s1", "toolu_s1"),
+            self._replay_padded_session("s2", "toolu_s2"),
+            self._replay_padded_session("s3", "toolu_s3"),
+        ]
+
+        assert [detect_loops([s]) for s in sessions] == [[], [], []]
+
+    def test_sub_threshold_sessions_do_not_combine_into_a_loop(self):
+        sessions = [
+            self._replay_padded_session("s1", "toolu_s1"),
+            self._replay_padded_session("s2", "toolu_s2"),
+            self._replay_padded_session("s3", "toolu_s3"),
+        ]
+
+        assert detect_loops(sessions) == []
