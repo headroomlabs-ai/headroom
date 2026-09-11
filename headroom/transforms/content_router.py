@@ -6088,7 +6088,7 @@ class ContentRouter(Transform):
         transforms_applied: list[str],
         excluded_tool_ids: set[str],
         ccr_retrieve_tool_ids: set[str],
-        tool_name_map: dict[str, str] | None = None,
+        tool_name_map: Mapping[str, str] | None = None,
         route_counts: dict[str, int] | None = None,
         compressed_details: list[str] | None = None,
         min_ratio: float = 0.85,
