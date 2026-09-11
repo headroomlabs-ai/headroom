@@ -89,6 +89,7 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--missing-usage-call", type=int, choices=(1, 2))
+    parser.add_argument("--capture-metrics", action="store_true")
     args = parser.parse_args()
     # Strip provider/service settings before Headroom is imported.
     for key in list(os.environ):
@@ -213,9 +214,28 @@ def run():
             disable_kompress=True,
             disable_kompress_fallback=True,
         )
-        server = uvicorn.Server(
-            uvicorn.Config(create_app(config), log_level="error", access_log=False)
-        )
+        app = create_app(config)
+        metric_rows = []
+        if args.capture_metrics:
+            original_record = app.state.proxy.metrics.record_request
+
+            async def record_metrics(**values):
+                result = await original_record(**values)
+                metric_rows.append(
+                    {
+                        key: values[key]
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_tokens",
+                            "cache_write_tokens",
+                        )
+                    }
+                )
+                return result
+
+            app.state.proxy.metrics.record_request = record_metrics
+        server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
         thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
         thread.start()
         rows = []
@@ -227,6 +247,7 @@ def run():
             for streaming in (False, True):
                 for target in (2, 3) if args.missing_usage_call else (1, 2, 3):
                     Provider.calls = []
+                    metric_rows.clear()
                     Provider.target_calls = target
                     body = {
                         "model": "claude-haiku-4-5-20251001",
@@ -254,6 +275,8 @@ def run():
                         raw = response.read()
                         content_type = response.headers.get("Content-Type", "")
                         actual = read_usage(raw, content_type)
+                    if args.capture_metrics:
+                        assert len(metric_rows) == 1, metric_rows
                     assert len(Provider.calls) == target, Provider.calls
                     assert all(c["retrieval_verified"] for c in Provider.calls[1:])
                     expected = (
@@ -266,6 +289,7 @@ def run():
                             "streaming": streaming,
                             "calls": target,
                             "upstream": Provider.calls,
+                            **({"metrics": list(metric_rows)} if args.capture_metrics else {}),
                             "expected": expected,
                             "actual": actual,
                             "passed": {k: actual[k] for k in KEYS} == expected,

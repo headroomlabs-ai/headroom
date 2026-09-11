@@ -207,3 +207,37 @@ SSE clients. Missing-usage upstream SSE events are not covered. Proxy metrics
 are also outside this contract: existing metrics code converts null counters
 to zero with `int(value or 0)`. Do not use these results to claim those internal
 metrics distinguish unknown usage from zero, or that all billing is correct.
+
+### Observed metrics fallback (not a new defect claim)
+
+`--capture-metrics` wraps the live proxy's `metrics.record_request`, calls the
+original unchanged, then retains four numeric arguments after it completes.
+It requires exactly one emission per request. Response-usage scoring remains
+separate; capturing metrics does not claim they equal provider billing.
+
+```sh
+PYTHONPATH="$PWD" python experiments/ccr_usage/reproduce_usage.py \
+  --capture-metrics --output complete-metrics.json
+PYTHONPATH="$PWD" python experiments/ccr_usage/reproduce_usage.py \
+  --capture-metrics --missing-usage-call 1 --output missing-metrics.json
+```
+
+The six complete-usage cases emit the expected cumulative metrics. For three
+calls, input volume is 246 (66 uncached + 78 cache reads + 102 cache writes),
+output 42. The four missing-usage cases preserve null response counters, but
+emit 33 input tokens (the local estimate), zero output and zero cache counts.
+`metrics-observations.json` preserves those ten observations. The local estimate
+is fixture/environment-specific, not a provider usage measurement.
+
+This is the documented `RequestOutcome` contract in `headroom/proxy/outcome.py`:
+unavailable provider input is zero, and the emitter uses
+`provider_input_tokens or optimized_tokens`. The earlier statement that metrics
+turn unknown into zero needs this qualification: **input volume falls back to an
+estimate**. Output/cache counts remain zero. Cost tracking is disabled in this
+reproduction; these observations are not invoice or cost-tracker validation.
+
+Replacing these defaults would require a shared missing-data contract for
+metrics, cost tracking, logs and their consumers across providers. It is not a
+one-line extension of the CCR response fix. Per CONTRIBUTING.md, architectural
+changes require core-maintainer agreement before implementation; none is sought
+or included by this reproduction.
