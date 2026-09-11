@@ -415,8 +415,18 @@ class TestCCRResponseHandling:
 
         # Should have made continuation call
         assert call_count == 1
-        # Should return final response
-        assert result == final_response
+        # Content survives; missing usage must not become a complete total.
+        assert result == {
+            **final_response,
+            "usage": dict.fromkeys(
+                (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            ),
+        }
 
     @pytest.mark.asyncio
     async def test_continuation_failure_logs_cause_for_empty_str_exception(self, caplog):

@@ -50,6 +50,53 @@ RESIDUAL_CCR_SKIPPED_MIXED = "skipped_mixed_tools"
 RESIDUAL_CCR_ERROR = "error"
 
 
+def _combine_anthropic_usage(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Sum completed CCR calls without mutating responses or inventing missing usage."""
+    before, after = previous.get("usage"), current.get("usage")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {
+            **current,
+            "usage": dict.fromkeys(
+                (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            ),
+        }
+    combined = dict(after)
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ):
+        if key not in before and key not in after and key.startswith("cache_"):
+            continue
+        default = 0 if key.startswith("cache_") else None
+        left, right = before.get(key, default), after.get(key, default)
+        combined[key] = (
+            left + right
+            if type(left) is int and type(right) is int and left >= 0 and right >= 0
+            else None
+        )
+    if "cache_creation" in before or "cache_creation" in after:
+        left, right = before.get("cache_creation", {}), after.get("cache_creation", {})
+        if isinstance(left, dict) and isinstance(right, dict):
+            details = dict(right)
+            for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+                if key in left or key in right:
+                    a, b = left.get(key, 0), right.get(key, 0)
+                    details[key] = (
+                        a + b if type(a) is int and type(b) is int and a >= 0 and b >= 0 else None
+                    )
+            combined["cache_creation"] = details
+        else:
+            combined["cache_creation"] = None
+    return {**current, "usage": combined}
+
+
 @dataclass
 class CCRToolResult:
     """Result of handling a CCR tool call."""
@@ -529,7 +576,12 @@ class CCRResponseHandler:
 
             # Make continuation API call
             try:
-                current_response = await api_call_fn(current_messages, tools)
+                continuation = await api_call_fn(current_messages, tools)
+                current_response = (
+                    _combine_anthropic_usage(current_response, continuation)
+                    if provider == "anthropic"
+                    else continuation
+                )
             except Exception as e:
                 # Log the type and repr, not just str(e): many exceptions
                 # (httpx.TimeoutException(''), a bare Exception(), a connect
