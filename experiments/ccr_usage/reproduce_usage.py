@@ -88,6 +88,7 @@ def read_usage(raw, content_type):
 def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--missing-usage-call", type=int, choices=(1, 2))
     args = parser.parse_args()
     # Strip provider/service settings before Headroom is imported.
     for key in list(os.environ):
@@ -147,7 +148,7 @@ def run():
                     assert "error" not in retrieved
                 self.calls.append(
                     {
-                        "usage": usage(n),
+                        "usage": None if n == args.missing_usage_call else usage(n),
                         "stream": body.get("stream", False),
                         "retrieval_verified": n > 1,
                     }
@@ -174,6 +175,8 @@ def run():
                     "stop_sequence": None,
                     "usage": usage(n),
                 }
+                if n == args.missing_usage_call:
+                    message.pop("usage")
                 raw = sse(message) if body.get("stream") else json.dumps(message).encode()
                 self.send_response(200)
                 self.send_header(
@@ -222,7 +225,7 @@ def run():
                 assert thread.is_alive() and time.monotonic() < deadline, "Proxy startup failed"
                 time.sleep(0.05)
             for streaming in (False, True):
-                for target in (1, 2, 3):
+                for target in (2, 3) if args.missing_usage_call else (1, 2, 3):
                     Provider.calls = []
                     Provider.target_calls = target
                     body = {
@@ -253,7 +256,11 @@ def run():
                         actual = read_usage(raw, content_type)
                     assert len(Provider.calls) == target, Provider.calls
                     assert all(c["retrieval_verified"] for c in Provider.calls[1:])
-                    expected = {k: sum(c["usage"][k] for c in Provider.calls) for k in KEYS}
+                    expected = (
+                        dict.fromkeys(KEYS)
+                        if args.missing_usage_call
+                        else {k: sum(c["usage"][k] for c in Provider.calls) for k in KEYS}
+                    )
                     rows.append(
                         {
                             "streaming": streaming,
@@ -261,7 +268,7 @@ def run():
                             "upstream": Provider.calls,
                             "expected": expected,
                             "actual": actual,
-                            "passed": actual == expected,
+                            "passed": {k: actual[k] for k in KEYS} == expected,
                             "usage_events": [
                                 json.loads(line[6:])
                                 for line in raw.decode().splitlines()

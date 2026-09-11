@@ -180,3 +180,30 @@ Coverage was also measured with pytest-cov after pre-importing
 `pydantic.root_model` (avoids an installed Pydantic/coverage collection error).
 `followup-results.json` records helper coverage separately from whole-module
 coverage. The earlier full-suite result has not been rerun or relabeled green.
+
+### Real proxy check with missing provider usage
+
+The reproduction also supports omitting the entire first or second upstream
+usage object. It runs two- and three-call requests through the real loopback
+proxy, with both JSON and SSE clients:
+
+```sh
+PYTHONPATH="$PWD" python experiments/ccr_usage/reproduce_usage.py \
+  --missing-usage-call 1 --output missing-first.json
+PYTHONPATH="$PWD" python experiments/ccr_usage/reproduce_usage.py \
+  --missing-usage-call 2 --output missing-second.json
+```
+
+Both runs pass all four cases: eight additional HTTP cases preserve unknown
+principal counters. Versioned evidence: `usage-missing-first.json` and
+`usage-missing-second.json`. The default six complete-usage cases also pass.
+The score compares only the four declared principal counters, retaining extra
+JSON usage metadata in the evidence. Comparing the entire JSON usage object
+against only four expected fields previously produced a false failure when
+`cache_creation` was also present.
+
+This still uses the seeded CCR path that buffers upstream JSON, including for
+SSE clients. Missing-usage upstream SSE events are not covered. Proxy metrics
+are also outside this contract: existing metrics code converts null counters
+to zero with `int(value or 0)`. Do not use these results to claim those internal
+metrics distinguish unknown usage from zero, or that all billing is correct.
