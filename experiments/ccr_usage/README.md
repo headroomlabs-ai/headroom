@@ -64,3 +64,24 @@ It needs coordination: once the shared handler sums all calls, its own usage
 combination must not count the initial response twice, and terminal SSE usage
 must carry cumulative input/cache counters. This main-based PR does not modify
 that unmerged implementation.
+
+## Broader validation follow-up
+
+Whole-repository Ruff check and format-check pass after formatting the reproduction.
+The repository's Rust checks pass: 1,493 tests passed, three ignored, including
+doctests; formatting and Clippy also pass. `make ci-precheck-python` rebuilt and
+verified the native extension and passed 175 tests, with four skipped. Commitlint
+and the installed commit hooks (including whole-project mypy) pass.
+
+A full `python -m pytest --maxfail=5 -q` run reached 1,501 passing tests and 103
+skips before stopping at five failures in bundled-tool and CLI-install tests.
+Those five failures also occur on unmodified base `04cdf79`: tests try to write
+binary caches or deployment state outside this environment's writable sandbox.
+This is not a green full-suite result; remaining tests were not executed. No
+sandbox restriction was relaxed to permit changes to the developer's environment.
+
+The development environment required pip plus lightweight test extras after initial
+collection errors. The CUDA-heavy full dev install remains incomplete. Provider
+API keys were removed for the full-suite attempt; model downloads were disabled.
+The formatted standalone reproduction was rechecked against both baseline and
+patched source: two passes/four failures before, six passes after; decoder tests pass.
