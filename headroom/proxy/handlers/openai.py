@@ -5998,6 +5998,28 @@ class OpenAIHandlerMixin:
                     ) from _e
 
         if not _bypass:
+            if self.config.ccr_inject_tool:
+                from headroom.ccr import CCRToolInjector
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                ccr_injector = CCRToolInjector(
+                    provider="openai_responses",
+                    inject_tool=False,
+                    inject_system_instructions=False,
+                )
+                ccr_injector.scan_for_markers(_responses_input_to_items(body.get("input")))
+                ccr_injector.verify_ownership()
+                response_tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                    provider="openai_responses",
+                    session_id=_responses_session_id,
+                    request_id=request_id,
+                    existing_tools=body.get("tools"),
+                    has_compressed_content_this_turn=ccr_injector.has_compressed_content,
+                )
+                if ccr_tool_injected:
+                    body["tools"] = response_tools
+                    body_mutation_tracker.mark_mutated("responses_ccr_retrieve_tool")
+
             _http_conversation_key = request.headers.get("x-headroom-session-id")
             _shape_result = _shape_openai_responses_for_output(
                 body,
