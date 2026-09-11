@@ -1897,27 +1897,30 @@ def test_compression_fanout_inherits_per_request_options(
     monkeypatch.setenv("HEADROOM_COMPRESS_WORKERS", "4")
     router = ContentRouter(ContentRouterConfig(lossless=True, enable_kompress=False))
 
-    seen: list[tuple[object, object]] = []
+    seen: list[tuple[int, object, object]] = []
     seen_lock = threading.Lock()
     orig_compress = router.compress
 
     def probe(*args: object, **kwargs: object) -> object:
         with seen_lock:
-            seen.append((router._runtime_target_ratio, router._runtime_kompress_model))
+            seen.append(
+                (
+                    threading.get_ident(),
+                    router._runtime_target_ratio,
+                    router._runtime_kompress_model,
+                )
+            )
         return orig_compress(*args, **kwargs)
 
     router.compress = probe  # type: ignore[method-assign]
 
+    # ``role="tool"`` STRING content: only these reach the cache-miss
+    # ``pending_tasks`` list that Pass 2 hands to the pool. Anthropic
+    # ``tool_result`` BLOCKS compress inline on the calling thread, where the
+    # options are already set, so they cannot detect a lost context.
     messages: list[dict[str, object]] = [{"role": "user", "content": "go"}]
     for i in range(4):
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": f"t{i}", "content": _rows(tag=f"t{i}")}
-                ],
-            }
-        )
+        messages.append({"role": "tool", "content": _rows(tag=f"t{i}")})
 
     router.apply(
         messages,
@@ -1927,6 +1930,8 @@ def test_compression_fanout_inherits_per_request_options(
     )
 
     assert seen, "no content reached compress()"
-    assert all(entry == (0.25, "test-model") for entry in seen), (
-        f"fan-out workers lost the request's options: {seen}"
+    off_thread = [entry for entry in seen if entry[0] != threading.get_ident()]
+    assert off_thread, f"compression never left the calling thread: {seen}"
+    assert all(entry[1:] == (0.25, "test-model") for entry in off_thread), (
+        f"fan-out workers lost the request's options: {off_thread}"
     )
