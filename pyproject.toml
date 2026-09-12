@@ -316,7 +316,7 @@ dev = [
 # who need standard accuracy benchmarks can install `lm-eval[api]` in their
 # benchmark environment separately.
 all = [
-    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
+    "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet,bedrock]",
 ]
 # Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
 # a locked-down/low-resource sandbox and offloading heavy ML elsewhere.

@@ -1,0 +1,131 @@
+---
+title: Claude Code on Amazon Bedrock
+description: Run Claude Code against Claude models on AWS Bedrock, with Headroom compressing your prompts — fewer input tokens, same answers, your own AWS credentials.
+---
+
+If your Claude models live on **AWS Bedrock**, you can still get Headroom's
+prompt compression. Headroom sits between Claude Code and Bedrock: it shrinks the
+big stuff in each request (file reads, logs, tool output), **re-signs the
+compressed request with SigV4**, and forwards it to the regional Bedrock endpoint
+using **your own AWS credentials**. You keep your AWS setup; Headroom just makes
+each call cheaper.
+
+## Why re-signing matters
+
+Claude Code in Bedrock mode signs every request with AWS SigV4, and the
+signature covers a hash of the request body. Headroom rewrites that body to
+compress it — which invalidates the original signature. So Headroom **re-signs
+the compressed body** before forwarding to AWS. Without that, AWS would reject
+the request with `InvalidSignatureException`. This is automatic; you don't
+configure it.
+
+## What you get
+
+- **Fewer input tokens** on every Claude Code request to Bedrock (often 30–60% on
+  agent workloads), so you pay Bedrock for less.
+- **Same answers** — compression is reversible and content-aware.
+- **No new secrets** — Headroom never holds long-lived AWS keys. It re-signs with
+  the standard AWS credential chain (the same env vars, profile, SSO cache, or
+  instance/task role Claude Code already uses).
+
+## Before you start
+
+You should already have Claude Code working against Bedrock **without** Headroom.
+That means these are set in your shell:
+
+```bash
+export CLAUDE_CODE_USE_BEDROCK=1
+export AWS_REGION=us-west-2            # your Bedrock region
+# plus working AWS credentials: AWS_PROFILE, env keys, SSO, or an instance role
+```
+
+Confirm `aws bedrock-runtime invoke-model ...` (or a normal Claude Code session)
+works first.
+
+## Run it (one command)
+
+```bash
+pip install "headroom-ai[proxy,bedrock]"
+headroom wrap claude
+```
+
+The `bedrock` extra pulls in `boto3` for SigV4 re-signing; `proxy` provides the
+local proxy `headroom wrap claude` starts. (`headroom-ai[all]` includes both.)
+
+That's it. Because `CLAUDE_CODE_USE_BEDROCK=1` is set, `headroom wrap claude`
+automatically:
+
+1. starts the Headroom proxy in **SigV4 re-signing mode** (`--bedrock-sign`),
+2. points Claude Code's Bedrock endpoint at it (`ANTHROPIC_BEDROCK_BASE_URL`),
+3. leaves your region and AWS credentials untouched.
+
+You'll see a line like:
+
+```
+Bedrock mode: ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:8787
+  → compress, re-sign (SigV4), then forward to AWS [us-west-2]
+```
+
+Use Claude Code exactly as you normally would, including cross-region inference
+profiles (`us.anthropic.…`, `eu.anthropic.…`, `global.anthropic.…`) and 1M-context
+models — the model id travels in the request path and is preserved end to end.
+
+## How it works
+
+```
+Claude Code ──(Bedrock InvokeModel)──▶ Headroom ──(compressed + re-signed)──▶ AWS Bedrock
+   in Bedrock mode                     compresses,                            your region
+   (SigV4 by Claude Code)              re-signs with your AWS creds ─────────▶ verifies SigV4
+```
+
+Claude Code sends its normal Bedrock `/model/{modelId}/invoke` (and
+`/invoke-with-response-stream`) request to Headroom. Headroom compresses the
+messages (keeping the Bedrock request shape intact), re-signs the **post-compression**
+bytes with SigV4 using your AWS credentials, then forwards to the regional Bedrock
+host derived from `AWS_REGION`.
+
+## Check that compression is working
+
+1. Open the dashboard: [http://localhost:8787/dashboard](http://localhost:8787/dashboard).
+   "Tokens saved" should climb as you use Claude Code.
+2. Or look at the response headers on a request: `x-headroom-tokens-before`,
+   `x-headroom-tokens-after`, `x-headroom-tokens-saved`.
+
+## Troubleshooting
+
+- **It still goes straight to AWS (no savings).** Make sure `CLAUDE_CODE_USE_BEDROCK=1`
+  is exported *in the same shell* before `headroom wrap claude`. The wrapper only
+  switches to Bedrock mode when it sees that variable.
+- **`InvalidSignatureException` / 403.** Headroom re-signs with the default AWS
+  credential chain. If `aws sts get-caller-identity` works in the same shell,
+  signing works. If you use a non-default profile, set `AWS_PROFILE` before
+  wrapping.
+- **`UnrecognizedClientException` / no credentials.** The proxy logs a clear
+  `BedrockSigningError` and returns 500 — there is no silent fallback to an
+  unsigned request. Configure credentials (env vars, `~/.aws/credentials`, SSO,
+  or an instance/task role) and retry.
+- **Wrong region / 404 from Bedrock.** Confirm `AWS_REGION` matches a region
+  where your Claude model (or inference profile) is enabled.
+
+## Alternative: route through a re-signing gateway
+
+If you'd rather not have Headroom hold AWS credentials at all, point it at a
+gateway that re-signs (LiteLLM, LocalStack, a corporate Bedrock proxy) instead:
+
+```bash
+export BEDROCK_TARGET_API_URL=https://your-bedrock-gateway
+headroom wrap claude
+```
+
+When `BEDROCK_TARGET_API_URL` (or `--bedrock-api-url`) is set, Headroom forwards
+the compressed body there **verbatim** and the gateway owns signing. The native
+re-signing flow above is recommended — it keeps your existing AWS auth and has
+the smallest moving parts.
+
+## Notes
+
+- Streaming, tool use, and prompt caching all work through Headroom.
+- Bedrock guardrail headers (`X-Amzn-Bedrock-*`) and anthropic beta headers
+  (e.g. the 1M-context header) are preserved and included in the signature.
+- For the operator-level Bedrock surface (the native Rust proxy, metrics, IAM
+  policy), see the [AWS Bedrock operator guide](/docs/bedrock).

@@ -504,6 +504,19 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Cloud region for Bedrock/Vertex/etc backends.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_BEDROCK_SIGN",
+        "bedrock_sign",
+        "Sign Bedrock requests",
+        "Backend",
+        "bool",
+        default=False,
+        help=(
+            "Re-sign transformed Bedrock requests with AWS SigV4 before forwarding "
+            "to the regional runtime endpoint. Uses the configured region/profile credentials."
+        ),
+        tier="advanced",
+    ),
     # --- Timeouts ---
     SettingField(
         "HEADROOM_RETRY_MAX_ATTEMPTS",
