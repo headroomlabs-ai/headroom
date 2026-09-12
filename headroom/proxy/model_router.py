@@ -47,6 +47,14 @@ class ModelRoute:
     require_no_tools: bool = False
     """Match only when the request declares no tools (a proxy for low-risk work)."""
 
+    require_tools: bool = False
+    """Match only when the request declares tools (a proxy for agentic work).
+
+    The inverse of ``require_no_tools``: lets an operator route tool-using turns
+    to a *more* capable model while keeping plain chat on a cheaper one. Setting
+    both on one rule makes it unmatchable (an AND of contradictory conditions),
+    which is a harmless operator error, not a crash."""
+
     from_models: tuple[str, ...] = ()
     """Restrict this rule to these source models. Empty = any source model."""
 
@@ -58,6 +66,8 @@ class ModelRoute:
         if self.from_models and model not in self.from_models:
             return False
         if self.require_no_tools and has_tools:
+            return False
+        if self.require_tools and not has_tools:
             return False
         if self.max_input_tokens is not None and input_tokens > self.max_input_tokens:
             return False
@@ -205,7 +215,15 @@ _INVALID = object()
 """Sentinel: a route field was present but malformed (fail open, skip the route)."""
 
 _ALLOWED_ROUTE_KEYS = frozenset(
-    {"to_model", "max_input_tokens", "min_input_tokens", "require_no_tools", "from_models", "name"}
+    {
+        "to_model",
+        "max_input_tokens",
+        "min_input_tokens",
+        "require_no_tools",
+        "require_tools",
+        "from_models",
+        "name",
+    }
 )
 
 
@@ -244,6 +262,11 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
         )
         return None
 
+    require_tools = entry.get("require_tools", False)
+    if not isinstance(require_tools, bool):
+        logger.warning("model route #%d 'require_tools' must be a boolean; skipping route", index)
+        return None
+
     from_models_raw = entry.get("from_models", [])
     if not isinstance(from_models_raw, list) or not all(
         isinstance(m, str) for m in from_models_raw
@@ -258,6 +281,7 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
         max_input_tokens=max_tokens,  # type: ignore[arg-type]
         min_input_tokens=min_tokens,  # type: ignore[arg-type]
         require_no_tools=require_no_tools,
+        require_tools=require_tools,
         from_models=tuple(from_models_raw),
         name=str(entry.get("name", "")),
     )

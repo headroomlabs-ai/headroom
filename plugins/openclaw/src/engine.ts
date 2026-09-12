@@ -10,6 +10,11 @@
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import {
+  delegateCompactionToRuntime,
+  type OpenClawCompactParams,
+  type OpenClawCompactResult,
+} from "./openclaw-compaction.js";
 
 /** Race a promise against a timeout and always release the timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -34,7 +39,7 @@ export class HeadroomContextEngine {
     id: "headroom",
     name: "Headroom Context Compression",
     version: "0.1.0",
-    ownsCompaction: true,
+    ownsCompaction: false,
   };
 
   private proxyManager: ProxyManager;
@@ -169,54 +174,19 @@ export class HeadroomContextEngine {
     }
   }
 
-  /**
-   * Compact context — zero-cost alternative to LLM summarization.
-   *
-   * Calls compress() with the token budget, which triggers:
-   * - SmartCrusher: aggressive JSON compression (70-90% on tool outputs)
-   * - Kompress: ModernBERT text compression (40-60% on assistant text)
-   * - RollingWindow: drops oldest messages if still over budget
-   * - CCR: stores originals for retrieval via headroom_retrieve tool
-   *
-   * Zero LLM calls. All algorithmic.
-   */
-  async compact(params: {
-    sessionId: string;
-    sessionFile: string;
-    tokenBudget?: number;
-    force?: boolean;
-    runtimeContext?: any;
-  }): Promise<{
-    ok: boolean;
-    compacted: boolean;
-    reason?: string;
-    result?: {
-      tokensBefore: number;
-      tokensAfter?: number;
-    };
-  }> {
-    if (!this.proxyUrl) {
-      return { ok: false, compacted: false, reason: "Proxy not available" };
+  /** Delegate persistent compaction to OpenClaw's built-in runtime. */
+  async compact(params: OpenClawCompactParams): Promise<OpenClawCompactResult> {
+    const result = await delegateCompactionToRuntime(params);
+
+    if (result.compacted) {
+      this.stats.compactions++;
     }
-
-    // Read current messages from session file if available
-    // For now, compact() works in tandem with assemble() — the next assemble()
-    // call will compress with the token budget. When compact() is called
-    // independently, we report success since our pipeline handles it.
-    //
-    // TODO: Read session file, extract messages, call compress() with tokenBudget,
-    //       write back compacted messages.
-
-    this.stats.compactions++;
     this.logger.info(
-      `Compact called (budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
+      `Compaction ${result.compacted ? "completed" : "skipped"} ` +
+        `(budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
     );
 
-    return {
-      ok: true,
-      compacted: true,
-      reason: "Headroom applies SmartCrusher + Kompress + RollingWindow on next assemble()",
-    };
+    return result;
   }
 
   async afterTurn?(params: {

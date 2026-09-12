@@ -38,7 +38,7 @@ npm install headroom-ai
 **Docker-native:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
 ```
 
 See [Docker-native install](docker-install.md) if you want Docker to provide the Headroom runtime while your agent CLIs stay on the host.
@@ -327,7 +327,7 @@ response = client.chat.completions.create(
 |--------------|-------------------|-----------------|
 | **Tool outputs with lists** | Keeps errors, anomalies, high-score items | 70-90% |
 | **Repeated search results** | Deduplicates and samples | 60-80% |
-| **Long conversations** | Drops old turns, keeps recent | 40-60% |
+| **Long conversations** | Compresses the newest tool output / user turn only (live-zone-only); never drops messages | varies |
 | **System prompts with dates** | Stabilizes for cache hits | Cache savings |
 
 ---

@@ -468,6 +468,44 @@ class TestCodexRouting:
         )
         assert check_codex_routing(path, 8787).status == PASS
 
+    def test_preserved_provider_id_right_port_passes(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == PASS
+        assert result.hint is None
+
+    def test_preserved_provider_id_port_mismatch_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://localhost:9999/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "9999" in result.summary
+
+    def test_active_provider_takes_precedence_over_headroom_block(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "corp"\n'
+            "[model_providers.corp]\n"
+            'base_url = "https://gateway.corp.example/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "gateway.corp.example" in result.summary
+
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text(
@@ -525,6 +563,20 @@ class TestCodexRouting:
         self._chatgpt_auth(tmp_path)
 
         assert check_codex_routing(path, 8787).status == PASS
+
+    def test_preserved_provider_id_without_requires_openai_auth_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        self._chatgpt_auth(tmp_path)
+
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "Authorization" in result.summary
 
     def test_api_key_user_without_requires_openai_auth_still_passes(self, tmp_path):
         """API-key users must not be nagged -- the flag would break them (#406)."""
