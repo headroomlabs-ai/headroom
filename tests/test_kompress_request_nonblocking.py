@@ -235,7 +235,9 @@ def test_capacity_available_still_compresses(monkeypatch):
         lambda *args, **kwargs: (_FakeModel(), _FakeTokenizer(), "onnx"),
     )
 
-    result = KompressCompressor(KompressConfig(min_input_words=10)).compress(
+    # No CCR: this test is about capacity, and 10 saved words would not pay
+    # for a retrieval marker (CCR_MARKER_COST_WORDS), which is a passthrough.
+    result = KompressCompressor(KompressConfig(min_input_words=10, enable_ccr=False)).compress(
         " ".join(["word"] * 20), allow_download=False
     )
     assert 0 < result.compression_ratio < 1.0
