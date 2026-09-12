@@ -58,6 +58,7 @@ try:
     _env_snapshot = set(_os.environ)
     import litellm
     from litellm import acompletion
+    from litellm.utils import supports_prompt_caching
 
     for _leaked_key in set(_os.environ) - _env_snapshot:
         del _os.environ[_leaked_key]
@@ -68,6 +69,7 @@ except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore
     acompletion = None  # type: ignore
+    supports_prompt_caching = None  # type: ignore
 
 
 # =============================================================================
@@ -170,6 +172,49 @@ def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         and not key.startswith("x-headroom-")
         and not key.startswith("x_headroom_")
     }
+
+
+def _place_system_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``messages`` with an ephemeral cache breakpoint on the first system message.
+
+    litellm turns the marker into a Bedrock Converse ``cachePoint``, which caches
+    every tool and system block before it. The first system message is marked
+    (not the last) so a client that appends volatile system messages later does
+    not turn every turn into a cache write. Returned unchanged when the client
+    already placed markers anywhere (it owns breakpoint placement then) or when
+    there is no system message with content to mark. Never mutates the input:
+    the proxy still reads ``body["messages"]`` after the request is built.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if "cache_control" in message or (
+            isinstance(content, list)
+            and any(isinstance(block, dict) and "cache_control" in block for block in content)
+        ):
+            return messages
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            marked = {**message, "cache_control": {"type": "ephemeral"}}
+        elif isinstance(content, list):
+            # litellm only reads block-level markers off list content.
+            blocks = list(content)
+            for block_index in range(len(blocks) - 1, -1, -1):
+                block = blocks[block_index]
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    blocks[block_index] = {**block, "cache_control": {"type": "ephemeral"}}
+                    break
+            else:
+                continue
+            marked = {**message, "content": blocks}
+        else:
+            continue
+        return [*messages[:index], marked, *messages[index + 1 :]]
+    return messages
 
 
 def _fetch_bedrock_inference_profiles(
@@ -656,6 +701,15 @@ class LiteLLMBackend(Backend):
                 f"Loaded {len(self._model_overrides)} Bedrock model override(s) "
                 f"from HEADROOM_BEDROCK_MODEL_MAP: {sorted(self._model_overrides)}"
             )
+
+        # Opt-in (rollout feature): mark the system prompt for Bedrock prompt
+        # caching on the OpenAI-format path, where clients such as OpenAI-compat
+        # gateways never send `cache_control` themselves.
+        from headroom.rollout import resolve_rollout
+
+        self._openai_prompt_caching = provider == "bedrock" and resolve_rollout().is_enabled(
+            "bedrock_openai_prompt_caching"
+        )
 
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
 
@@ -1363,6 +1417,9 @@ class LiteLLMBackend(Backend):
             if extra_body:
                 kwargs["extra_body"] = extra_body
 
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
+
             # Provider-specific region config
             if self.region:
                 if self.provider == "bedrock":
@@ -1547,6 +1604,9 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
