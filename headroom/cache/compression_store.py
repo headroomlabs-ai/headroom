@@ -1053,6 +1053,26 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
         return None
 
 
+_RECOVERY_REFERENCE = re.compile(
+    r"(?:<<ccr:|Retrieve (?:more|original): hash=|\[[^\]\n]*compressed[^\]\n]*hash=)"
+    r"([a-fA-F0-9]{12,24})(?![a-fA-F0-9])"
+)
+
+
+def cached_references_available(content: str) -> bool:
+    """Reject cached references whose original data is no longer available."""
+    hashes = set(_RECOVERY_REFERENCE.findall(content))
+    if not hashes:
+        return True
+    try:
+        store = get_compression_store()
+        return all(store.get_entry_status(key.lower())["status"] == "available" for key in hashes)
+    except Exception:
+        # A storage failure must preserve evidence, not replay an unusable reference.
+        logger.warning("CCR availability check failed; discard cached compression", exc_info=True)
+        return False
+
+
 def get_compression_store(
     max_entries: int = 1000,
     default_ttl: int | None = None,
