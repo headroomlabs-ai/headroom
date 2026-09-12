@@ -63,7 +63,13 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["schema_version"] == 5
-    assert saved["lifetime"] == legacy_state["lifetime"]
+    # Legacy values survive verbatim; the disjoint tool-schema fields are new
+    # and default to zero for state written before they existed.
+    assert saved["lifetime"] == {
+        **legacy_state["lifetime"],
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
+    }
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80
