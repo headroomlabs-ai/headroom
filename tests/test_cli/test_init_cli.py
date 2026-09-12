@@ -6,6 +6,7 @@ import os
 import sys
 import types
 from contextlib import contextmanager
+from hashlib import sha1
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,10 @@ except ModuleNotFoundError:  # Python < 3.11
 import click
 import pytest
 from click.testing import CliRunner
+
+
+def _digest(path: Path) -> str:
+    return sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:8]
 
 
 def _load_init_module(monkeypatch):
@@ -1554,3 +1559,26 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+def test_local_profile_slugifies_non_ascii_directory_names(monkeypatch, tmp_path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    cjk = tmp_path / "海洋腐蚀专项"
+    cjk.mkdir()
+    accented = tmp_path / "café-app"
+    accented.mkdir()
+
+    assert init_cli._local_profile(cjk) == f"init-repo-{_digest(cjk)}"
+    assert init_cli._local_profile(accented) == f"init-caf--app-{_digest(accented)}"
+
+
+def test_local_profile_keeps_non_ascii_directories_distinct(monkeypatch, tmp_path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    first = tmp_path / "海洋"
+    first.mkdir()
+    second = tmp_path / "腐蚀"
+    second.mkdir()
+
+    assert init_cli._local_profile(first) != init_cli._local_profile(second)

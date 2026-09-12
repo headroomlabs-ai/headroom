@@ -114,9 +114,9 @@ def _enable_verbose_logging() -> None:
 
 def _local_profile(cwd: Path | None = None) -> str:
     root = (cwd or Path.cwd()).resolve()
-    slug = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in root.name.lower()).strip(
-        "-"
-    )
+    slug = "".join(
+        ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
+    ).strip("-")
     digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
