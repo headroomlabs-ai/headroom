@@ -160,6 +160,9 @@ class _VertexGeminiImageRequest:
             }
         ).encode("utf-8")
 
+    async def stream(self):
+        yield await self.body()
+
 
 class _VertexUsageClient:
     async def request(self, **kwargs):  # noqa: ANN001, ANN201
