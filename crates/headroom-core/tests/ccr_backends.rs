@@ -335,6 +335,18 @@ mod redis_tests {
         std::env::var("HEADROOM_TEST_REDIS_URL").ok()
     }
 
+    /// A key prefix that is genuinely unique per run, so a leftover key
+    /// from an earlier run — or a concurrent run against a shared
+    /// server — cannot influence a result. The pid alone is not enough:
+    /// pids are recycled.
+    fn unique_prefix(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!("ccr_test_{tag}_{}_{nanos}", std::process::id())
+    }
+
     #[test]
     fn redis_round_trip() {
         let Some(url) = redis_url() else {
@@ -391,5 +403,162 @@ mod redis_tests {
         // Go idle past the window.
         std::thread::sleep(Duration::from_millis(3_100));
         assert_eq!(store.get(&hash), None);
+    }
+
+    #[test]
+    fn redis_max_lifetime_caps_sliding_window() {
+        let Some(url) = redis_url() else {
+            eprintln!(
+                "skipping redis_max_lifetime_caps_sliding_window: HEADROOM_TEST_REDIS_URL not set"
+            );
+            return;
+        };
+        // Idle 2s with a 5s ceiling, both set explicitly rather than
+        // riding the 8x default — deriving the ceiling would force an
+        // idle TTL of 1s (the whole-second floor for EXPIRE/TTL) and so
+        // an 8s ceiling, roughly doubling this test's wall clock.
+        let store = RedisCcrStore::open_with_ttls(&url, unique_prefix("ceiling"), 2, 5)
+            .expect("open redis store with ceiling");
+        let payload = "capped redis";
+        let hash = compute_key(payload.as_bytes());
+        store.put(&hash, payload);
+
+        // Assert a hit before the ceiling first. Without this the test
+        // passes if the very first `get` returns None — i.e. it cannot
+        // tell "purged by the ceiling" from "purged on contact", which
+        // is what a ceiling-arithmetic bug at small TTLs looks like.
+        // Mirrors the positive assertion in the SQLite equivalent.
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            store.get(&hash).as_deref(),
+            Some(payload),
+            "entry inside both the idle window and the ceiling must hit"
+        );
+
+        // Touch every 700ms: inside the 2s idle window, so the entry
+        // never dies of idleness and the purge below can only come from
+        // the ceiling — the thing under test.
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_millis(12_000);
+        let mut expired_after = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(700));
+            if store.get(&hash).is_none() {
+                expired_after = Some(start.elapsed());
+                break;
+            }
+        }
+        let expired_after =
+            expired_after.expect("constant access must not extend an entry past its max lifetime");
+        // The 5s ceiling runs from the `put` ~0.7s before `start`, and
+        // TTL/EXPIRE truncate to whole seconds, so the earliest
+        // legitimate purge is ~3.3s into this loop. Anything much faster
+        // means the entry died of something other than the ceiling.
+        assert!(
+            expired_after >= Duration::from_millis(1_500),
+            "entry was purged after only {expired_after:?} — too early to be the 5s ceiling"
+        );
+    }
+
+    #[test]
+    fn redis_ceiling_is_independent_of_the_reading_stores_ttl() {
+        let Some(url) = redis_url() else {
+            eprintln!(
+                "skipping redis_ceiling_is_independent_of_the_reading_stores_ttl: \
+                 HEADROOM_TEST_REDIS_URL not set"
+            );
+            return;
+        };
+        // Regression test: the ceiling used to be encoded as the born
+        // marker's TTL plus a grace period equal to the *writing* store's
+        // idle TTL, which `get` then subtracted using the *reading*
+        // store's idle TTL. Any store configured with a larger idle TTL
+        // than the writer therefore computed a negative remainder,
+        // saturated to zero, and purged a live entry on first read. That
+        // is the shared-keyspace case this backend exists for, and it is
+        // also what raising HEADROOM_CCR_TTL_SECONDS would have done to
+        // every in-flight entry.
+        let prefix = unique_prefix("reconfig");
+        let payload = "survives a ttl reconfiguration";
+        let hash = compute_key(payload.as_bytes());
+
+        // Writer: short idle window, generous ceiling.
+        let writer =
+            RedisCcrStore::open_with_ttls(&url, prefix.clone(), 2, 60).expect("open writing store");
+        writer.put(&hash, payload);
+
+        // Reader: same keyspace, much larger idle window — a second
+        // worker configured differently, or the same worker after an
+        // operator raised the TTL. The birth instant is absolute, so the
+        // reader must derive a ceiling that has barely elapsed and hit.
+        let reader =
+            RedisCcrStore::open_with_prefix(&url, prefix, 300).expect("open reading store");
+        assert_eq!(
+            reader.get(&hash).as_deref(),
+            Some(payload),
+            "a store with a larger idle TTL must not purge an entry nowhere near its ceiling"
+        );
+    }
+
+    #[test]
+    fn redis_legacy_born_placeholder_is_backfilled_not_purged() {
+        use redis::Commands as _;
+
+        let Some(url) = redis_url() else {
+            eprintln!(
+                "skipping redis_legacy_born_placeholder_is_backfilled_not_purged: \
+                 HEADROOM_TEST_REDIS_URL not set"
+            );
+            return;
+        };
+        // Builds before the birth-instant change wrote a `1` placeholder
+        // as the born marker's value. Read naively as a unix timestamp
+        // that is 1970, making every such entry look infinitely old and
+        // purging it on the first `get` after an upgrade. It must be
+        // recognised as a legacy marker and backfilled instead.
+        let prefix = unique_prefix("legacy_born");
+        let payload = "legacy born marker";
+        let hash = compute_key(payload.as_bytes());
+        let store = RedisCcrStore::open_with_ttls(&url, prefix.clone(), 300, 2_400)
+            .expect("open redis store");
+        store.put(&hash, payload);
+
+        let client = redis::Client::open(url.as_str()).expect("raw client");
+        let mut conn = client.get_connection().expect("raw connection");
+        let born_key = format!("{prefix}:{hash}:born");
+        let _: () = conn
+            .set_ex(&born_key, 1_u8, 2_400)
+            .expect("overwrite born marker with the legacy placeholder");
+
+        assert_eq!(
+            store.get(&hash).as_deref(),
+            Some(payload),
+            "a legacy `1` placeholder must backfill the ceiling, not purge the entry"
+        );
+        let born: String = conn.get(&born_key).expect("read back born marker");
+        assert!(
+            born.parse::<u64>().expect("born marker must be numeric") >= 1_600_000_000,
+            "backfill must replace the placeholder with a unix-second birth instant, got {born}"
+        );
+    }
+
+    #[test]
+    fn redis_rejects_a_zero_idle_ttl() {
+        // No server needed — the guard runs before the client is opened,
+        // so this covers contributors with no Redis available too.
+        //
+        // A zero idle TTL is accepted by `SqliteCcrStore` but makes every
+        // Redis `SETEX` fail server-side, so without this guard the store
+        // opens fine and then silently stores nothing.
+        //
+        // Matched rather than `expect_err`'d because `RedisCcrStore` holds a
+        // `redis::Client` and so cannot derive `Debug`.
+        let Err(err) = RedisCcrStore::open("redis://127.0.0.1:6379", 0) else {
+            panic!("a zero idle TTL must be rejected at open");
+        };
+        assert!(
+            err.to_string().contains("default_ttl_seconds"),
+            "the error must name the offending setting, got: {err}"
+        );
     }
 }
