@@ -184,7 +184,7 @@ start_proxy_container() {
 
   local container_name="headroom-proxy-${port}-$$"
   local args=()
-  args=(docker run -d --rm --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --rm --name "${container_name}" -p "127.0.0.1:${port}:${port}")
   append_common_container_args args
   args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")
   "${args[@]}" >/dev/null
@@ -1557,8 +1557,8 @@ EOF
       run_args=(docker run --rm)
       append_tty_args run_args
       append_common_container_args run_args
-      run_args+=(-p "${port}:${port}")
-      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" "${args[@]}")
+      run_args+=(-p "127.0.0.1:${port}:${port}")
+      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" proxy --host 0.0.0.0 --port "${port}" "${args[@]:1}")
       "${run_args[@]}"
       ;;
     *)

@@ -294,7 +294,7 @@ If the upstream base URL itself must vary per request, use the `x-headroom-base-
 ```bash
 headroom proxy \
   --port 8787 \              # Port to listen on
-  --host 0.0.0.0 \           # Host to bind to
+  --host 127.0.0.1 \         # Host to bind to
   --mode cache \             # default; freezes prior turns for prefix-cache stability
   --budget 10.00 \           # Daily budget limit in USD
   --log-file headroom.jsonl  # Log file path

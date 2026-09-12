@@ -63,3 +63,51 @@ def test_top_level_compose_marks_source_build_version() -> None:
     assert ".git/*" in dockerignore
     assert "!.git/HEAD" in dockerignore
     assert "!.git/refs/**" in dockerignore
+
+
+def test_native_compose_keeps_host_publication_loopback_and_optional_token() -> None:
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "docker-compose.native.yml").read_text(encoding="utf-8")
+    )
+    proxy = compose["services"]["proxy"]
+
+    assert proxy["ports"] == ["127.0.0.1:${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"]
+    assert proxy["environment"]["HEADROOM_HOST"] == "0.0.0.0"
+    assert proxy["environment"]["HEADROOM_PROXY_TOKEN"] == "${HEADROOM_PROXY_TOKEN:-}"
+    assert proxy["command"] == ["--host", "0.0.0.0", "--port", "${HEADROOM_PORT:-8787}"]
+
+
+def test_differential_capture_compose_keeps_proxy_internal_and_host_ports_loopback() -> None:
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "differential-network-capture" / "docker-compose.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    services = compose["services"]
+    assert (
+        services["headroom-proxy"]["environment"]["HEADROOM_PROXY_TOKEN"]
+        == "${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}"
+    )
+    assert (
+        services["mitm-headroom-client"]["environment"]["CAPTURE_PROXY_TOKEN"]
+        == "${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}"
+    )
+    assert (
+        services["mitm-headroom-client"]["environment"]["CAPTURE_PROXY_TOKEN_HOSTS"]
+        == "headroom-proxy"
+    )
+    assert services["mitm-direct"]["ports"] == ["127.0.0.1:${DIRECT_MITM_PORT:-18080}:8080"]
+    assert services["mitm-headroom-upstream"]["ports"] == [
+        "127.0.0.1:${HEADROOM_MITM_PORT:-18081}:8080"
+    ]
+    assert "ports" not in services["mitm-headroom-client"]
+    assert "HEADROOM_CLIENT_MITM_PORT" not in compose["services"]["mitm-headroom-client"].get(
+        "environment", {}
+    )
+
+
+def test_published_dockerfile_stages_default_to_loopback() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert dockerfile.count("ENV HEADROOM_HOST=127.0.0.1") == 2
+    assert dockerfile.count('CMD ["--port", "8787"]') == 2
