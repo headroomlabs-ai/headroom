@@ -58,6 +58,7 @@ def _drive(*, with_marker: bool, accept: str | None) -> dict[str, object]:
         memory_enabled=False,
         ccr_inject_tool=True,
         ccr_handle_responses=True,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
     )
@@ -180,6 +181,7 @@ def _drive_responses(*, accept: str) -> dict[str, object]:
         memory_enabled=False,
         ccr_inject_tool=True,
         ccr_handle_responses=True,
+        ccr_event_streaming=False,
         ccr_context_tracking=False,
         image_optimize=False,
     )

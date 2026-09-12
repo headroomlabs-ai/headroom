@@ -224,6 +224,7 @@ def _ccr_cache_config() -> ProxyConfig:
         ccr_inject_tool=True,
         ccr_handle_responses=True,
         ccr_context_tracking=False,
+        ccr_event_streaming=False,
         image_optimize=False,
     )
 
