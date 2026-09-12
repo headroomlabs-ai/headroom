@@ -8,6 +8,7 @@ from pathlib import Path
 import click
 import pytest
 
+from headroom import proxy_client_liveness
 from headroom.cli import wrap as wrap_cli
 
 
@@ -300,10 +301,16 @@ def test_wrap_marker_is_not_stale_for_live_pid(tmp_path: Path) -> None:
 def test_wrap_marker_is_stale_when_pid_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Inject a deterministic PID identity: _proc_identity returns None on
+    # Inject a deterministic PID identity: proc_identity returns None on
     # macOS without psutil, where reuse detection is deliberately best-effort
-    # and this scenario would be undetectable.
-    monkeypatch.setattr(wrap_cli, "_proc_identity", lambda pid: ("test", 50_000.0))
+    # and this scenario would be undetectable. Two targets needed: the write
+    # path (_write_wrap_marker) calls wrap_cli's own _proc_identity name
+    # directly; the later staleness check (_wrap_marker_is_stale ->
+    # _identity_mismatch) resolves proc_identity from proxy_client_liveness's
+    # own globals -- patching only one leaves the other on the real impl.
+    identity = lambda pid: ("test", 50_000.0)  # noqa: E731
+    monkeypatch.setattr(wrap_cli, "_proc_identity", identity)
+    monkeypatch.setattr(proxy_client_liveness, "proc_identity", identity)
     path = _settings(tmp_path)
     wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
     marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
