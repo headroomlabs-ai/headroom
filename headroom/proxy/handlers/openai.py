@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.proxy.conversation_savings import savings_conversation_key
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -740,6 +741,7 @@ def _shape_openai_responses_payload(
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_responses_body,
+            conversation_label,
             stratum_key,
             stratum_label,
         )
@@ -758,7 +760,8 @@ def _shape_openai_responses_payload(
             holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
         except ValueError:
             holdout = 0.0
-        arm = assign_arm(conversation_key_from_responses_body(payload), holdout)
+        conversation = conversation_key_from_responses_body(payload)
+        arm = assign_arm(conversation, holdout)
 
         turn_kind = classify_responses_turn(payload.get("input")).value
         approx_input_tokens = len(json.dumps(payload)) // 4
@@ -768,7 +771,9 @@ def _shape_openai_responses_payload(
             model=model or str(payload.get("model", "")),
             has_tools=bool(payload.get("tools")),
         )
-        labels = [stratum_label(arm, stratum)]
+        # The conversation is the unit the arm was assigned to, so the ledger
+        # needs it to count distinct conversations rather than requests.
+        labels = [stratum_label(arm, stratum), conversation_label(conversation)]
 
         if arm != "treatment":
             return labels, False
@@ -3898,6 +3903,7 @@ class OpenAIHandlerMixin:
                                 if is_cache_mode(self.config.mode)
                                 else openai_frozen_count
                             ),
+                            prefix_replay_guaranteed=True,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
@@ -3939,6 +3945,7 @@ class OpenAIHandlerMixin:
                             model_limit=context_limit,
                             context=extract_user_query(messages),
                             frozen_message_count=apply_frozen_count,
+                            prefix_replay_guaranteed=True,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
@@ -4543,6 +4550,7 @@ class OpenAIHandlerMixin:
             from headroom.proxy.output_savings import (
                 assign_arm,
                 conversation_key_from_body,
+                conversation_label,
                 stratum_key,
                 stratum_label,
             )
@@ -4567,7 +4575,8 @@ class OpenAIHandlerMixin:
                     _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                 except ValueError:
                     _holdout = 0.0
-                _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                _conversation = conversation_key_from_body(body)
+                _arm = assign_arm(_conversation, _holdout)
                 _turn_kind = classify_turn(body.get("messages", [])).value
                 _stratum = stratum_key(
                     turn_kind=_turn_kind,
@@ -4576,8 +4585,10 @@ class OpenAIHandlerMixin:
                     has_tools=bool(body.get("tools")),
                 )
                 # Carry (arm, stratum) on the transforms channel so the outcome
-                # funnel feeds the output-savings ledger from the chat path too.
+                # funnel feeds the output-savings ledger from the chat path too,
+                # plus the conversation the arm was actually assigned to.
                 transforms_applied.append(stratum_label(_arm, _stratum))
+                transforms_applied.append(conversation_label(_conversation))
                 if _arm == "treatment":
                     _level, _src = resolve_verbosity_level(_shaper_settings)
                     _shape_result = shape_openai_chat_request(
@@ -5686,6 +5697,11 @@ class OpenAIHandlerMixin:
 
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+        # Messages-only count, preserved for the output shaper's turn/size
+        # classifier: the accounting pair below may widen original_tokens by
+        # the tools schema after compression, and shaper strata must not
+        # shift when it does.
+        message_input_tokens = original_tokens
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed
@@ -5903,6 +5919,28 @@ class OpenAIHandlerMixin:
             )
             url = _append_request_query(url, request.url.query)
 
+        # Responses re-sends the whole transcript every turn and the router
+        # recompresses all of it, so ``tokens_saved`` below is the running
+        # total for the CONVERSATION, not for this turn. Carrying the key and
+        # the total lets the funnel count each removed token once instead of
+        # once per remaining turn (see ``conversation_savings``). Derived
+        # before compression so a rewritten first user message cannot move the
+        # key mid-conversation. Left None when compression did not run: a
+        # bypassed turn saves nothing and must not reset the running total.
+        # ``savings_conversation_key`` is None without an explicit conversation
+        # id (a body id, a session header) or when the body carries
+        # ``previous_response_id``/``conversation`` (incremental input against
+        # server-side state); the funnel then books per request.
+        responses_conversation_key: str | None = None
+        _pre_compression_conversation_key = savings_conversation_key(
+            body,
+            session_id=(
+                request.headers.get("conversation_id")
+                or request.headers.get("session_id")
+                or request.headers.get("x-headroom-session-id")
+            ),
+        )
+
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
         # Python runtime path here by extracting mutable Responses text into
@@ -5910,6 +5948,10 @@ class OpenAIHandlerMixin:
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
         if self.config.optimize and not _bypass:
+            # Pre-compression tools reference: the compression pass is
+            # copy-on-write on the payload, so this still points at the
+            # original schemas after `body` is rebound below.
+            _tools_before = body.get("tools")
             try:
                 (
                     body,
@@ -5938,6 +5980,18 @@ class OpenAIHandlerMixin:
                 if _modified:
                     body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
+                    # tokens_saved includes tool schema/desc compaction, which
+                    # is measured against the tools array — content the
+                    # messages-only original_tokens count above never
+                    # included. Fold the tools schema into the pair so it
+                    # stays coherent (original - optimized == saved, savings
+                    # rate <= 100%); without this, schema-heavy turns clamp
+                    # optimized to 0 and record rates above 100%.
+                    if _tools_before:
+                        original_tokens += await asyncio.to_thread(
+                            tokenizer.count_text, _json_debug_dumps(_tools_before)
+                        )
+                    responses_conversation_key = _pre_compression_conversation_key
                     optimized_tokens = max(0, original_tokens - tokens_saved)
                     logger.info(
                         "[%s] /v1/responses compressed %d→%d bytes "
@@ -6010,7 +6064,7 @@ class OpenAIHandlerMixin:
             _http_conversation_key = request.headers.get("x-headroom-session-id")
             _shape_result = _shape_openai_responses_for_output(
                 body,
-                input_tokens=original_tokens,
+                input_tokens=message_input_tokens,
                 model=str(model or ""),
                 conversation_key=(
                     f"header:x-headroom-session-id:{_http_conversation_key}"
@@ -6120,6 +6174,8 @@ class OpenAIHandlerMixin:
                     body_mutated=body_mutation_tracker.mutated,
                     mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
+                    conversation_key=responses_conversation_key,
+                    conversation_tokens_saved=tokens_saved,
                 )
             else:
 
@@ -6585,6 +6641,8 @@ class OpenAIHandlerMixin:
                             waste_signals=waste_signals_dict,
                             num_messages=len(messages) if isinstance(messages, list) else 0,
                             tags=_resp_log_tags,
+                            conversation_key=responses_conversation_key,
+                            conversation_tokens_saved=tokens_saved,
                             turn_id=compute_turn_id(model, body.get("instructions"), messages),
                             request_messages=messages
                             if getattr(self.config, "log_full_messages", False)
@@ -7271,6 +7329,14 @@ class OpenAIHandlerMixin:
             attempted_input_tokens_total = 0
             transforms_applied: list[str] = []
             ws_frames_compressed = 0
+            # ``tokens_saved`` below SUMS each frame's figure, and each frame's
+            # figure is the whole transcript's removals as of that turn. The
+            # conversation's running total is therefore the LAST frame's
+            # figure, not the sum -- that is what the funnel differences to
+            # count a removed token once (see ``conversation_savings``).
+
+            ws_conversation_key: str | None = None
+            ws_conversation_tokens_saved: int | None = None
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -7773,6 +7839,10 @@ class OpenAIHandlerMixin:
                                 )
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
+                                ws_conversation_tokens_saved = int(_ws_saved)
+                                ws_conversation_key = savings_conversation_key(
+                                    _send_body, session_id=f"ws:{session_id}"
+                                )
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
                                 logger.info(
                                     "[%s] WS /v1/responses compressed "
@@ -7981,6 +8051,7 @@ class OpenAIHandlerMixin:
                         frames in the WS session.
                         """
                         nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
+                        nonlocal ws_conversation_key, ws_conversation_tokens_saved
                         nonlocal ws_frames_compressed
                         _preflight_started = time.perf_counter()
                         try:
@@ -8243,6 +8314,10 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
+                        ws_conversation_tokens_saved = int(frame_saved)
+                        ws_conversation_key = savings_conversation_key(
+                            new_inner, session_id=f"ws:{session_id}"
+                        )
                         attempted_input_tokens_total += int(frame_attempted_tokens)
                         ws_frames_compressed += 1
                         logger.info(
@@ -8597,6 +8672,8 @@ class OpenAIHandlerMixin:
                                     if isinstance(body, dict)
                                     else 0,
                                     tags=ws_tags,
+                                    conversation_key=ws_conversation_key,
+                                    conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
                                 )
                             )
@@ -9201,6 +9278,8 @@ class OpenAIHandlerMixin:
                         pipeline_timing=final_pipeline_timing,
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
+                        conversation_key=ws_conversation_key,
+                        conversation_tokens_saved=ws_conversation_tokens_saved,
                         client=client,
                         request_messages=ws_messages_for_log
                         if getattr(self.config, "log_full_messages", False)
@@ -10018,6 +10097,10 @@ class OpenAIHandlerMixin:
                     )
                     session_frozen = prep.frozen_message_count
                     pipeline_kwargs["frozen_message_count"] = session_frozen
+                    # finalize_turn below replays last turn's forwarded prefix,
+                    # which is what lets the router compress the final
+                    # message's cache_control tool_result (contract 1).
+                    pipeline_kwargs["prefix_replay_guaranteed"] = True
                     result = pipeline.apply(
                         messages=prep.pipeline_input, model=model, **pipeline_kwargs
                     )

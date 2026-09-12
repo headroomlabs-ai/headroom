@@ -419,6 +419,53 @@ class TestCCRResponseHandling:
         assert result == final_response
 
     @pytest.mark.asyncio
+    async def test_continuation_failure_logs_cause_for_empty_str_exception(self, caplog):
+        """A continuation exception whose str() is empty (e.g.
+        httpx.TimeoutException(''), a bare Exception()) must still log its
+        cause. Interpolating str(e) alone produced a log line with nothing
+        after the colon, losing the type entirely (#3129)."""
+        store = get_compression_store()
+        hash_key = store.store(
+            original=json.dumps([{"id": i} for i in range(50)]),
+            compressed="[]",
+            original_item_count=50,
+        )
+
+        handler = CCRResponseHandler()
+        initial_response = {
+            "content": [
+                {"type": "text", "text": "Let me get that data."},
+                {
+                    "type": "tool_use",
+                    "id": "tool_123",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+            ]
+        }
+
+        async def failing_api_call(messages, tools):
+            raise Exception("")  # empty str(e), non-empty repr()
+
+        with caplog.at_level("ERROR", logger="headroom.ccr.response_handler"):
+            result = await handler.handle_response(
+                initial_response,
+                [{"role": "user", "content": "Get me the data"}],
+                None,
+                failing_api_call,
+                "anthropic",
+            )
+
+        # Degrades to the current response rather than raising.
+        assert result == initial_response
+        # The cause survives: the type name appears even though str(e) is "".
+        failure_logs = [r.getMessage() for r in caplog.records if "Continuation" in r.getMessage()]
+        assert failure_logs
+        assert "Exception" in failure_logs[0]
+        # Regression guard: never a bare "...failed: " with nothing after it.
+        assert not failure_logs[0].rstrip().endswith("failed:")
+
+    @pytest.mark.asyncio
     async def test_handle_response_max_rounds(self):
         """Respects max retrieval rounds limit."""
         store = get_compression_store()
