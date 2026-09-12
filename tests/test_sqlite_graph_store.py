@@ -413,6 +413,46 @@ class TestSQLiteGraphStoreTraversal:
         assert "A" in entity_names
 
     @pytest.mark.asyncio
+    async def test_query_subgraph_both_direction_respects_relation_type_filter(self, tmp_path):
+        """A relation_types filter must apply to BOTH the outgoing and incoming
+        sides of a ``direction=BOTH`` traversal.
+
+        Regression: the BOTH query was ``WHERE source_id = ? OR target_id = ?``
+        without parentheses, then ``AND relation_type IN (...)`` was appended.
+        SQL binds ``AND`` tighter than ``OR``, so the type filter applied only to
+        the incoming (target_id) side, letting outgoing edges of every type leak
+        into the subgraph.
+        """
+        store = SQLiteGraphStore(db_path=str(tmp_path / "graph.db"))
+        x = Entity(user_id="u", name="X", entity_type="node")
+        liked = Entity(user_id="u", name="Liked", entity_type="node")
+        disliked = Entity(user_id="u", name="Disliked", entity_type="node")
+        for entity in (x, liked, disliked):
+            await store.add_entity(entity)
+        # Two OUTGOING edges from X of different types.
+        await store.add_relationship(
+            Relationship(user_id="u", source_id=x.id, target_id=liked.id, relation_type="likes")
+        )
+        await store.add_relationship(
+            Relationship(
+                user_id="u", source_id=x.id, target_id=disliked.id, relation_type="dislikes"
+            )
+        )
+
+        subgraph = await store.query_subgraph(
+            [x.id],
+            max_hops=1,
+            direction=RelationshipDirection.BOTH,
+            relation_types=["likes"],
+        )
+
+        types = {r.relation_type for r in subgraph.relationships}
+        assert types == {"likes"}, f"type filter leaked non-'likes' edges: {types}"
+        names = {e.name for e in subgraph.entities}
+        assert "Disliked" not in names
+        assert names == {"X", "Liked"}
+
+    @pytest.mark.asyncio
     async def test_find_path_direct(self, store_with_graph):
         """Test finding a direct path."""
         store, nodes = store_with_graph
