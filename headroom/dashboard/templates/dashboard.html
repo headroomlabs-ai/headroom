@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Headroom Dashboard</title>
     <script src="/dashboard/static/tailwind.min.js"></script>
-    <script src="/dashboard/static/htmx.min.js"></script>
     <script src="/dashboard/static/alpine.min.js" defer></script>
     <script>
         (function() {
@@ -114,7 +113,10 @@
         .hover-bg-surface:hover { background: var(--color-surface); }
     </style>
 </head>
-<body class="text-gray-200 min-h-screen" x-data="dashboard()" x-init="init()">
+<!-- No x-init: Alpine already calls the x-data object's own init(). Naming it
+     here too ran init() twice, which started two 5s poll timers and registered
+     the R shortcut twice, doubling every request the dashboard makes. -->
+<body class="text-gray-200 min-h-screen" x-data="dashboard()">
     <!-- Header -->
     <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div class="flex items-center gap-4">
@@ -2010,6 +2012,7 @@
                 savingsHistory: [],
                 expandedRows: {},
                 pollInterval: null,
+                polling_: false,
                 statsPollMs: 5000,
                 lifetimePollMs: 30000,
                 historyPollMs: 30000,
@@ -2043,18 +2046,29 @@
 
                 async pollDashboard(force = false) {
                     if (!force && document.hidden) return;
+                    // The timer and the R shortcut share this method, and each
+                    // run fetches at least /stats and /health. If a poll is
+                    // still outstanding, skip rather than stack a second
+                    // sequence on top of it; finally, so a rejection releases
+                    // the guard instead of wedging polling permanently.
+                    if (this.polling_) return;
+                    this.polling_ = true;
 
-                    await this.fetchStats();
+                    try {
+                        await this.fetchStats();
 
-                    const now = Date.now();
-                    if (this.viewMode === 'lifetime' && (force || now - this.lastLifetimeFetchMs >= this.lifetimePollMs)) {
-                        await this.fetchLifetimeStats();
-                    }
-                    if (this.viewMode === 'history' && (force || now - this.lastHistoryFetchMs >= this.historyPollMs)) {
-                        await this.fetchHistoryStats();
-                    }
-                    if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
-                        await this.fetchTransformations();
+                        const now = Date.now();
+                        if (this.viewMode === 'lifetime' && (force || now - this.lastLifetimeFetchMs >= this.lifetimePollMs)) {
+                            await this.fetchLifetimeStats();
+                        }
+                        if (this.viewMode === 'history' && (force || now - this.lastHistoryFetchMs >= this.historyPollMs)) {
+                            await this.fetchHistoryStats();
+                        }
+                        if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
+                            await this.fetchTransformations();
+                        }
+                    } finally {
+                        this.polling_ = false;
                     }
                 },
 

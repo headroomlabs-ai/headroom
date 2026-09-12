@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     created_at REAL NOT NULL,
     ttl INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_ccr_expiry ON ccr_entries (created_at);
+CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + ttl);
+-- Superseded by idx_ccr_expiry_deadline: no query searches or orders by bare
+-- created_at, so the old index only cost writes. Drop it from existing files.
+DROP INDEX IF EXISTS idx_ccr_expiry;
 """
 
 # Purge expired rows at most this often (seconds). Purging is hygiene,
@@ -153,17 +156,31 @@ class SQLiteBackend:
         known = {f.name for f in fields(CompressionEntry)}
         return CompressionEntry(**{k: v for k, v in data.items() if k in known})
 
+    def _purge_expired(self, now: float) -> int:
+        """Delete expired rows using metadata; caller holds ``_lock``."""
+        cursor = self._conn.execute(
+            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
+            (now,),
+        )
+        self._conn.commit()
+        self._last_purge = now
+        return cursor.rowcount
+
+    def purge_expired(self, now: float | None = None) -> int:
+        """Delete expired rows without deserializing their payloads."""
+        with self._lock:
+            try:
+                return self._purge_expired(time.time() if now is None else now)
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "purge")
+                return 0
+
     def _maybe_purge(self) -> None:
         """Delete expired rows; called opportunistically under the lock."""
         now = time.time()
         if now - self._last_purge < _PURGE_INTERVAL:
             return
-        self._last_purge = now
-        self._conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (now,),
-        )
-        self._conn.commit()
+        self._purge_expired(now)
 
     def get(self, hash_key: str) -> CompressionEntry | None:
         with self._lock:
