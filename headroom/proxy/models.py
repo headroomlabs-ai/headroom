@@ -140,6 +140,9 @@ class ProxyConfig:
     # Server
     host: str = "127.0.0.1"
     port: int = 8787
+    # Serve on this Unix domain socket instead of host:port. POSIX only; see
+    # headroom/proxy/uds.py for why a socket transport exists at all (GH #1779).
+    uds: str | None = None
     # Resolved at this configuration boundary and then injected unchanged.
     rollout: RolloutSnapshot | None = None
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
