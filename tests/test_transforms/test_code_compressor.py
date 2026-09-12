@@ -9,7 +9,9 @@ Comprehensive tests covering:
 - Edge cases: Empty content, unavailable dependency, fallbacks
 """
 
+import json
 import textwrap
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -208,6 +210,355 @@ def generate_go_code(n_functions: int = 3) -> str:
         )
 
     return "\n".join(lines)
+
+
+def ruby_compressor(config: CodeCompressorConfig | None = None) -> CodeAwareCompressor:
+    return CodeAwareCompressor(
+        config
+        or CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=1,
+            enable_ccr=False,
+            fallback_to_kompress=False,
+        )
+    )
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_import_calls_are_limited_to_loader_names():
+    code = """require 'json'
+require_relative 'local'
+load 'extra'
+autoload :Thing, 'thing'
+puts 'runtime call'
+class X
+  def run
+    first = 1
+    second = first + 1
+    third = second + 1
+  end
+end
+"""
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.preserved_imports == 4
+    assert result.compressed.index("require 'json'") < result.compressed.index("puts")
+    assert result.compressed.count("puts 'runtime call'") == 1
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_ordered_edits_reproduction():
+    fixture = Path(__file__).parents[1] / "fixtures" / "code_compressor" / "ruby_ordered_edits.rb"
+    code = fixture.read_text()
+    result = ruby_compressor().compress(code)
+
+    assert result.language == CodeLanguage.RUBY
+    assert result.compressed != code
+    assert result.compression_ratio < 1.0
+    assert result.syntax_valid is True
+    assert result.compressed.count("lines omitted") == 1
+    assert result.compressed.count("def helper") == 1
+    assert result.compressed.index('require "json"') < result.compressed.index("class Worker")
+    assert result.compressed.index("class Worker") < result.compressed.index("describe Worker")
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_preserves_source_order_for_loaders_and_opaque_calls():
+    code = """puts :before
+require 'json'
+describe Widget do
+  def helper
+    one = 1
+    two = 2
+    three = 3
+    four = 4
+    four
+  end
+end
+load 'after'
+puts :after
+"""
+    result = ruby_compressor().compress(code, language="ruby")
+    markers = ("puts :before", "require 'json'", "describe Widget", "load 'after'", "puts :after")
+    positions = [result.compressed.index(marker) for marker in markers]
+
+    assert positions == sorted(positions)
+    assert result.compressed.count("def helper") == 1
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_malformed_source_is_returned_before_compression():
+    code = "class Broken\n  def value\n    missing = 1\n"
+
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.compressed == code
+    assert result.compression_ratio == 1.0
+    assert result.syntax_valid is True
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_dsl_call_is_opaque_and_not_revisited():
+    code = 'describe "widget" do\n  def helper\n    a = 1\n    b = 2\n    c = 3\n    d = 4\n  end\nend\n'
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.compressed == code
+    assert result.compressed.count("def helper") == 1
+    assert "omitted" not in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_no_benefit_is_exact_passthrough():
+    code = """class X
+  def run
+    a0 = 0
+    a1 = 1
+    a2 = 2
+    a3 = 3
+    a4 = 4
+    a5 = 5
+    a6 = 6
+    a7 = 7
+  end
+end
+"""
+    result = CodeAwareCompressor(
+        CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=5,
+            enable_ccr=False,
+            fallback_to_kompress=False,
+        )
+    ).compress(code, language="ruby")
+    assert result.compressed == code
+    assert result.compression_ratio == 1.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_fail_open_skips_kompress_fallback(monkeypatch: pytest.MonkeyPatch):
+    compressor = CodeAwareCompressor(
+        CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=5,
+            enable_ccr=False,
+            fallback_to_kompress=True,
+        )
+    )
+
+    def fail_fallback(*_args: object, **_kwargs: object) -> CodeCompressionResult:
+        raise AssertionError("Ruby fail-open must not invoke Kompress")
+
+    monkeypatch.setattr(compressor, "_fallback_compress", fail_fallback)
+    code = "class Broken\n  def run\n    value = 1\n"
+    result = compressor.compress(code, language="ruby")
+
+    assert result.compressed == code
+    assert result.compression_ratio == 1.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_same_line_kept_statement_stays_live_after_marker():
+    code = """class X
+  def run
+    a = 1
+    b = 2
+    c = 3
+    if c
+      x = 4
+    end; d = 5
+    e = 6
+  end
+end
+"""
+    result = CodeAwareCompressor(
+        CodeCompressorConfig(
+            min_tokens_for_compression=1,
+            max_body_lines=5,
+            enable_ccr=False,
+            fallback_to_kompress=False,
+        )
+    ).compress(code, language="ruby")
+
+    assert "d = 5" in code
+    assert "d = 5" in result.compressed
+    assert "; d = 5" in result.compressed
+    assert result.syntax_valid is True
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_valid_heredoc_body_is_not_an_omittable_statement():
+    code = """class X
+  def run
+    first = 1
+    query = <<~SQL
+      SELECT 1
+    SQL
+    second = 2
+    third = 3
+    fourth = 4
+  end
+end
+"""
+    result = ruby_compressor().compress(code, language="ruby")
+    assert result.syntax_valid is True
+    assert "query = <<~SQL" in result.compressed
+    assert "SELECT 1" in result.compressed
+    assert "SQL" in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_rescue_else_ensure_bodies_are_preserved():
+    code = """def run(value)
+  first = 1
+  begin
+    risky = value.call
+  rescue StandardError => error
+    fallback = error.message
+  else
+    success = true
+  ensure
+    cleanup = true
+  end
+  second = 2
+  third = 3
+  fourth = 4
+  fifth = 5
+  sixth = 6
+  seventh = 7
+  eighth = 8
+  ninth = 9
+end
+"""
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert "rescue StandardError => error" in result.compressed
+    assert "fallback = error.message" in result.compressed
+    assert "else\n    success = true" in result.compressed
+    assert "ensure\n    cleanup = true" in result.compressed
+    assert result.compressed.count("# [") == 1
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_nested_method_definition_is_not_an_omittable_statement():
+    code = """class Outer
+  def outer
+    def inner
+      inner_value = 1
+      inner_value
+    end
+    first = 1
+    second = 2
+    third = 3
+    fourth = 4
+    fifth = 5
+    sixth = 6
+  end
+end
+"""
+
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert "def inner" in result.compressed
+    assert "inner_value = 1" in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_same_line_marker_preserves_crlf_line_endings():
+    code = (
+        "class X\r\n"
+        "  def run\r\n"
+        "    a = 1\r\n"
+        "    b = 2\r\n"
+        "    c = 3\r\n"
+        "    d = 4\r\n"
+        "    e = 5\r\n"
+        "    f = 6\r\n"
+        "  end\r\n"
+        "end\r\n"
+    )
+
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert "# [" in result.compressed
+    assert "\n" not in result.compressed.replace("\r\n", "")
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_default_ccr_path_accepts_operator_signature(monkeypatch: pytest.MonkeyPatch):
+    compressor = CodeAwareCompressor(
+        CodeCompressorConfig(min_tokens_for_compression=1, max_body_lines=1)
+    )
+    monkeypatch.setattr(compressor, "_store_in_ccr", lambda *_args: "a" * 24)
+    code = """class Vector
+  def +(other)
+    first = @x + other.x
+    second = first + 1
+    third = second + 1
+    fourth = third + 1
+    fourth
+  end
+end
+"""
+
+    result = compressor.compress(code, language="ruby")
+
+    assert result.cache_key == "a" * 24
+    assert result.compressed_bodies == 1
+    assert "1 function bodies compressed" in result.compressed
+    assert "def +(other)" in result.compressed
+    assert result.syntax_valid is True
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "def empty; end\n",
+        "def value(x) = x * 2\n",
+        "class X\n  def value\n    text = <<~TXT\n      hello\n    other = 1\n    other\n  end\nend",
+        "class X\n  def value\n    text = <<~TXT\n      hello\n    TXT\n    other = 1\n    other\n  end",
+    ],
+)
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_parser_edge_cases_are_safe_passthrough(code):
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.compressed == code
+    assert result.syntax_valid is True
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_same_line_class_method_boundary_has_one_class_and_method():
+    fixture = (
+        Path(__file__).parents[1]
+        / "parity"
+        / "fixtures"
+        / "code_aware_compressor"
+        / "72e229fb1c3b89cf.json"
+    )
+    payload = json.loads(fixture.read_text())
+    code = payload["input"]
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.compressed == payload["output"]["compressed"] == code
+    assert result.compression_ratio == payload["output"]["compression_ratio"] == 1.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_method_and_class_terminators_sharing_line_have_two_ends():
+    code = "class X\n  def value\n    a=1\n    b=2\n    c=3\n    d=4\n    d\n  end; end\n"
+
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert result.compressed.count("end") == 2
+
+
+@pytest.mark.parametrize("hint", ["erb", "rake", "gemspec"])
+def test_ruby_related_aliases_remain_unknown(hint):
+    assert coerce_language(hint) == CodeLanguage.UNKNOWN
 
 
 # =============================================================================

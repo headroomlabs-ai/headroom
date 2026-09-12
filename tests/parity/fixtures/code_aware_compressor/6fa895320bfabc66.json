@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "require 'json'\nrequire_relative 'processor'\nload 'extensions'\nautoload :Helper, 'helper'\nclass Processor\n  include Enumerable\n  attr_reader :name\n  CONST = 'stable'\n  def process(items)\n    first = items.map(&:strip)\n    second = first.map(&:upcase)\n    third = second.reverse\n    fourth = third.join(',')\n    fifth = fourth.strip\n    sixth = fifth.reverse\n    seventh = sixth.upcase\n    eighth = seventh\n    ninth = eighth\n    tenth = ninth\n    tenth\n  end\n  def reset\n    @name = nil\n    @name = 'reset'\n    @name\n  end\nend\n",
+  "input_sha256": "6fa895320bfabc66060898d2adff5c03d0ac100dea76af77711b562daa5ec596",
+  "output": {
+    "cache_key": null,
+    "compressed": "require 'json'\nrequire_relative 'processor'\nload 'extensions'\nautoload :Helper, 'helper'\nclass Processor\n  include Enumerable\n  attr_reader :name\n  CONST = 'stable'\n  def process(items)\n    first = items.map(&:strip)\n    second = first.map(&:upcase)\n    third = second.reverse\n    fourth = third.join(',')\n    fifth = fourth.strip\n    # [6 lines omitted]\n    \n    \n    \n    \n    \n  end\n  def reset\n    @name = nil\n    @name = 'reset'\n    @name\n  end\nend\n",
+    "compressed_bodies": 1,
+    "compressed_tokens": 113,
+    "compression_ratio": 0.8625954198473282,
+    "language": "ruby",
+    "language_confidence": 1.0,
+    "original": "require 'json'\nrequire_relative 'processor'\nload 'extensions'\nautoload :Helper, 'helper'\nclass Processor\n  include Enumerable\n  attr_reader :name\n  CONST = 'stable'\n  def process(items)\n    first = items.map(&:strip)\n    second = first.map(&:upcase)\n    third = second.reverse\n    fourth = third.join(',')\n    fifth = fourth.strip\n    sixth = fifth.reverse\n    seventh = sixth.upcase\n    eighth = seventh\n    ninth = eighth\n    tenth = ninth\n    tenth\n  end\n  def reset\n    @name = nil\n    @name = 'reset'\n    @name\n  end\nend\n",
+    "original_tokens": 131,
+    "preserved_imports": 4,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-08-27T15:38:04.706493+00:00",
+  "transform": "code_aware_compressor"
+}

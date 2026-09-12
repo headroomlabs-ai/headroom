@@ -143,7 +143,7 @@ http = "1"
 # node-for-node identical ASTs — the precondition for byte-parity. Same
 # version number on crates.io + PyPI means the same `grammar.js` source,
 # hence the same generated `parser.c`. The grammar-parity canary (9
-# samples × 8 languages) confirmed 100% identical node-type + line-span
+# samples × 9 languages) confirmed 100% identical node-type + line-span
 # trees at these exact pins. Bumping any pin requires re-running the
 # canary and re-recording the code_aware_compressor fixtures.
 tree-sitter = "=0.26.12"
@@ -155,6 +155,7 @@ tree-sitter-rust = "=0.24.2"
 tree-sitter-java = "=0.23.5"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
+tree-sitter-ruby = "=0.23.1"
 
 # Load ONNX Runtime dynamically on every platform. The alternative,
 # `ort-download-binaries-*`, statically links Microsoft's prebuilt ORT:

@@ -256,6 +256,26 @@ def test_code_detection_identifies_language_and_thresholds() -> None:
     assert result.confidence == 0.8628571428571429
     assert detect_content_type(python_code).content_type is ContentType.SOURCE_CODE
 
+    from headroom.transforms.code_compressor import is_tree_sitter_available
+
+    if is_tree_sitter_available():
+        ruby_code = "class Box\n  def value\n    @value = 1\n    @value\n  end\nend\n"
+        ruby_result = detect_content_type(ruby_code)
+        assert ruby_result.content_type is ContentType.SOURCE_CODE
+        assert ruby_result.metadata["language"] == "ruby"
+
+    python_without_imports = """@dataclass
+class Service:  # Python class
+    def run(self):  # Python method
+        return 1
+
+    def stop(self):  # Python method
+        return 2
+"""
+    assert _try_detect_code(python_without_imports).metadata["language"] == "python"
+
+    assert _try_detect_code(python_without_imports).metadata["language"] != "ruby"
+
     assert _try_detect_code("function maybe() {}\nplain text") is None
     assert _try_detect_code("import os\ndef main():") is None
     assert _try_detect_code("\n\n") is None

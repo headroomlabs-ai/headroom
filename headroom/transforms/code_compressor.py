@@ -16,7 +16,7 @@ Supported Languages (Tier 1):
 - Python, JavaScript, TypeScript
 
 Supported Languages (Tier 2):
-- Go, Rust, Java, C, C++
+- Go, Rust, Java, C, C++, C#, PHP, Ruby
 - Bash (validated and preserved losslessly)
 
 Compression Strategy:
@@ -49,7 +49,7 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -331,6 +331,7 @@ class CodeLanguage(Enum):
     PERL = "perl"
     CSHARP = "csharp"
     PHP = "php"
+    RUBY = "ruby"
     BASH = "bash"
     SHELL = "bash"  # Alias: tree-sitter-language-pack exposes the Bash grammar.
     UNKNOWN = "unknown"
@@ -361,11 +362,49 @@ _LANGUAGE_ALIASES: dict[str, CodeLanguage] = {
     "php5": CodeLanguage.PHP,
     "php7": CodeLanguage.PHP,
     "php8": CodeLanguage.PHP,
+    "rb": CodeLanguage.RUBY,
     "shell": CodeLanguage.BASH,
     "sh": CodeLanguage.BASH,
     "zsh": CodeLanguage.BASH,
     "shellscript": CodeLanguage.BASH,
 }
+_UNSUPPORTED_RUBY_HINTS = frozenset({"erb", "rake", "gemspec"})
+
+
+@dataclass(frozen=True)
+class SourceEdit:
+    start_byte: int
+    end_byte: int
+    replacement: str
+
+
+def apply_source_edits(source: str, edits: Sequence[SourceEdit]) -> str | None:
+    """Apply validated, non-overlapping edits while copying source gaps verbatim."""
+    raw = source.encode("utf-8")
+    ordered = sorted(edits, key=lambda edit: (edit.start_byte, edit.end_byte))
+    previous = 0
+    previous_range: tuple[int, int] | None = None
+    for edit in ordered:
+        if edit.start_byte < 0 or edit.end_byte < edit.start_byte or edit.end_byte > len(raw):
+            return None
+        if edit.start_byte < previous or previous_range == (edit.start_byte, edit.end_byte):
+            return None
+        for boundary in (edit.start_byte, edit.end_byte):
+            if boundary not in (0, len(raw)) and raw[boundary] & 0xC0 == 0x80:
+                return None
+        previous = edit.end_byte
+        previous_range = (edit.start_byte, edit.end_byte)
+    output = bytearray()
+    cursor = 0
+    for edit in ordered:
+        output.extend(raw[cursor : edit.start_byte])
+        output.extend(edit.replacement.encode("utf-8"))
+        cursor = edit.end_byte
+    output.extend(raw[cursor:])
+    try:
+        return bytes(output).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def coerce_language(value: str) -> CodeLanguage:
@@ -436,6 +475,10 @@ class LangConfig:
     # descendants individually while the top-level pass re-emits the whole
     # wrapper verbatim, duplicating content. Prefer the false negative.
     opaque_node_types: frozenset[str] | None = None
+    reconstruction_mode: str = "assemble"
+    source_edit_node_types: frozenset[str] = frozenset()
+    source_edit_opaque_ancestors: frozenset[str] = frozenset()
+    loader_names: frozenset[str] = frozenset()
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -595,6 +638,21 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         package_node="namespace_definition",
         detection_hints=("<?php", "function ", "namespace ", "->", "$this"),
         class_body_node_types=frozenset({"declaration_list"}),
+    ),
+    CodeLanguage.RUBY: LangConfig(
+        import_nodes=frozenset(),
+        function_nodes=frozenset({"method", "singleton_method"}),
+        class_nodes=frozenset({"class", "module", "singleton_class"}),
+        type_nodes=frozenset(),
+        body_node_types=frozenset({"body_statement"}),
+        decorator_node=None,
+        comment_prefix="#",
+        uses_colon_after_signature=False,
+        detection_hints=("class ", "module ", "def ", "require ", "require_relative "),
+        reconstruction_mode="source_edits",
+        source_edit_node_types=frozenset({"method", "singleton_method"}),
+        source_edit_opaque_ancestors=frozenset({"call"}),
+        loader_names=frozenset({"require", "require_relative", "load", "autoload"}),
     ),
     CodeLanguage.BASH: LangConfig(
         # Shell control-flow nodes are opaque: their `then`/`fi`, `do`/`done`,
@@ -839,6 +897,11 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
         ),
         re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
     ],
+    CodeLanguage.RUBY: [
+        re.compile(r"^\s*(class|module|def)\s+[\w:!?=]+", re.MULTILINE),
+        re.compile(r"^\s*(require|require_relative|load|autoload)\s+['\"]", re.MULTILINE),
+        re.compile(r"^\s*@[A-Za-z_]\w*", re.MULTILINE),
+    ],
     CodeLanguage.BASH: [
         re.compile(r"^\s*#!.*\b(?:bash|sh|zsh)\b", re.MULTILINE),
         re.compile(
@@ -912,6 +975,10 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
     if CodeLanguage.PHP in candidates and "<?php" in sample:
         candidates.pop(CodeLanguage.PERL, None)
 
+    # Parser-confirmed Ruby beats Perl's broad sigil match for inline instance variables.
+    if CodeLanguage.RUBY in candidates and _ruby_structural_evidence_for_detection(sample):
+        candidates.pop(CodeLanguage.PERL, None)
+
     perl_score = candidates.get(CodeLanguage.PERL, 0)
     if perl_score > 0:
         best_non_perl = max(
@@ -938,6 +1005,8 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
             try:
                 parser = _get_parser(lang.value)
                 tree = parser.parse(code_bytes)
+                if lang == CodeLanguage.RUBY and not _ruby_structural_evidence(tree.root_node):
+                    continue
                 error_count = _count_error_nodes(tree.root_node)
                 node_count = tree.root_node.child_count
 
@@ -967,6 +1036,21 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
 
     confidence = min(1.0, 0.3 + (best_score * 0.1))
     return best_lang, confidence
+
+
+def _ruby_structural_evidence(root: Any) -> bool:
+    if root.type in {"class", "module", "method", "singleton_method"}:
+        return True
+    return any(_ruby_structural_evidence(child) for child in root.named_children)
+
+
+def _ruby_structural_evidence_for_detection(code: str) -> bool:
+    """Probe Ruby structure through the compressor's cached parser authority."""
+    try:
+        tree = _get_parser("ruby").parse(code.encode("utf-8"))
+        return _ruby_structural_evidence(tree.root_node)
+    except Exception:
+        return False
 
 
 # =========================================================================
@@ -1321,12 +1405,33 @@ class CodeAwareCompressor(Transform):
         # instead of constructing CodeLanguage() directly (which raises), and
         # fall back to content detection when the hint is unknown.
         if language:
+            if language.strip().lower() in _UNSUPPORTED_RUBY_HINTS:
+                return CodeCompressionResult(
+                    compressed=code,
+                    original=code,
+                    original_tokens=original_tokens,
+                    compressed_tokens=original_tokens,
+                    compression_ratio=1.0,
+                    language=CodeLanguage.UNKNOWN,
+                    language_confidence=0.0,
+                    syntax_valid=True,
+                )
             detected_lang = coerce_language(language)
             if detected_lang == CodeLanguage.UNKNOWN:
                 detected_lang, confidence = detect_language(code)
             else:
                 confidence = 1.0
         elif self.config.language_hint:
+            if self.config.language_hint.strip().lower() in _UNSUPPORTED_RUBY_HINTS:
+                return CodeCompressionResult(
+                    compressed=code,
+                    original=code,
+                    original_tokens=original_tokens,
+                    compressed_tokens=original_tokens,
+                    compression_ratio=1.0,
+                    language=CodeLanguage.UNKNOWN,
+                    syntax_valid=True,
+                )
             detected_lang = coerce_language(self.config.language_hint)
             if detected_lang == CodeLanguage.UNKNOWN:
                 detected_lang, confidence = detect_language(code)
@@ -1391,6 +1496,17 @@ class CodeAwareCompressor(Transform):
         # Check if tree-sitter is available
         if not _check_tree_sitter_available():
             logger.warning("tree-sitter not available. Install with: pip install headroom-ai[code]")
+            if detected_lang == CodeLanguage.RUBY:
+                return CodeCompressionResult(
+                    compressed=code,
+                    original=code,
+                    original_tokens=original_tokens,
+                    compressed_tokens=original_tokens,
+                    compression_ratio=1.0,
+                    language=detected_lang,
+                    language_confidence=confidence,
+                    syntax_valid=True,
+                )
             if self.config.fallback_to_kompress:
                 return self._fallback_compress(code, original_tokens)
             return CodeCompressionResult(
@@ -1422,6 +1538,17 @@ class CodeAwareCompressor(Transform):
 
         # Parse and compress
         try:
+            if detected_lang == CodeLanguage.RUBY and not self._verify_syntax(code, detected_lang):
+                return CodeCompressionResult(
+                    compressed=code,
+                    original=code,
+                    original_tokens=original_tokens,
+                    compressed_tokens=original_tokens,
+                    compression_ratio=1.0,
+                    language=detected_lang,
+                    language_confidence=confidence,
+                    syntax_valid=True,
+                )
             compressed, structure, symbol_scores = self._compress_with_ast(
                 code, detected_lang, context, tokenizer
             )
@@ -1468,7 +1595,7 @@ class CodeAwareCompressor(Transform):
             ratio = compressed_tokens / max(original_tokens, 1)
 
             # Guard against over-aggressive compression (data loss)
-            if ratio < 0.05:
+            if ratio < 0.05 or (detected_lang == CodeLanguage.RUBY and ratio >= 1.0):
                 logger.warning(
                     "Code compression too aggressive (ratio=%.3f), returning original",
                     ratio,
@@ -1524,6 +1651,17 @@ class CodeAwareCompressor(Transform):
 
         except Exception as e:
             logger.warning("AST compression failed: %s, falling back", e)
+            if detected_lang == CodeLanguage.RUBY:
+                return CodeCompressionResult(
+                    compressed=code,
+                    original=code,
+                    original_tokens=original_tokens,
+                    compressed_tokens=original_tokens,
+                    compression_ratio=1.0,
+                    language=detected_lang,
+                    language_confidence=confidence,
+                    syntax_valid=True,
+                )
             if self.config.fallback_to_kompress:
                 return self._fallback_compress(code, original_tokens)
             return CodeCompressionResult(
@@ -1562,6 +1700,10 @@ class CodeAwareCompressor(Transform):
         parser = _get_parser(language.value)
         tree = parser.parse(bytes(code, "utf-8"))
         root = tree.root_node
+
+        lang_config = _LANG_CONFIGS.get(language)
+        if lang_config and lang_config.reconstruction_mode == "source_edits":
+            return self._compress_ruby_source_edits(code, root, tokenizer, lang_config)
         candidate_validator: Callable[[Any, str], str] | None = None
 
         if recover_invalid_python_nodes and language == CodeLanguage.PYTHON:
@@ -1611,6 +1753,108 @@ class CodeAwareCompressor(Transform):
                     symbol_scores[short] = score
 
         return compressed, structure, symbol_scores
+
+    def _compress_ruby_source_edits(
+        self,
+        code: str,
+        root: Any,
+        tokenizer: Tokenizer | None,
+        lang_config: LangConfig,
+    ) -> tuple[str, CodeStructure, dict[str, float]]:
+        """Compress Ruby by replacing only complete, parser-owned statements."""
+        edits: list[SourceEdit] = []
+        structure = CodeStructure()
+        source_edit_node_types = lang_config.source_edit_node_types
+        opaque_ancestor_types = lang_config.source_edit_opaque_ancestors
+
+        def contains_method(node: Any) -> bool:
+            if node.type in source_edit_node_types:
+                return True
+            return any(contains_method(child) for child in node.named_children)
+
+        def contains_opaque_call(node: Any) -> bool:
+            if node.type in opaque_ancestor_types and contains_method(node):
+                return True
+            return any(contains_opaque_call(child) for child in node.named_children)
+
+        def contains_heredoc(node: Any) -> bool:
+            return node.type in {"heredoc_beginning", "heredoc_body"} or any(
+                contains_heredoc(child) for child in node.named_children
+            )
+
+        def contains_control_clause(node: Any) -> bool:
+            return node.type in {"rescue", "else", "ensure"} or any(
+                contains_control_clause(child) for child in node.named_children
+            )
+
+        def visit(node: Any) -> None:
+            if node.type in source_edit_node_types:
+                if node.start_point[0] == node.end_point[0]:
+                    return
+                body = next(
+                    (child for child in node.named_children if child.type == "body_statement"), None
+                )
+                if body is None:
+                    return
+                statements = [
+                    child
+                    for child in body.named_children
+                    if child.type not in {"comment", "heredoc_body"}
+                    and child.is_named
+                    and child.type not in source_edit_node_types
+                    and not contains_opaque_call(child)
+                    and not contains_heredoc(child)
+                    and not contains_control_clause(child)
+                ]
+                if len(statements) <= self.config.max_body_lines:
+                    return
+                kept = 0
+                omitted: list[Any] = []
+                for statement in statements:
+                    lines = statement.end_point[0] - statement.start_point[0] + 1
+                    if kept + lines <= self.config.max_body_lines:
+                        kept += lines
+                    else:
+                        omitted.append(statement)
+                if not omitted:
+                    return
+                omitted_lines = sum(
+                    statement.end_point[0] - statement.start_point[0] + 1 for statement in omitted
+                )
+                for index, statement in enumerate(omitted):
+                    replacement = ""
+                    if index == 0:
+                        name = _get_definition_name(node)
+                        replacement = _make_omitted_comment(
+                            name,
+                            omitted_lines,
+                            "",
+                            lang_config.comment_prefix,
+                            None,
+                        )
+                        raw_code = code.encode("utf-8")
+                        line_end = raw_code.find(b"\n", statement.end_byte)
+                        if line_end < 0:
+                            line_end = len(raw_code)
+                        if raw_code[statement.end_byte : line_end].strip():
+                            replacement += "\r\n" if "\r\n" in code else "\n"
+                    edits.append(SourceEdit(statement.start_byte, statement.end_byte, replacement))
+                signature = _slice_code_bytes(code, node.start_byte, body.start_byte).rstrip()
+                structure.function_bodies.append((signature, "", node.start_point[0]))
+                return
+            if node.type == "call":
+                method = node.child_by_field_name("method")
+                if method is not None and _get_node_text(method, code) in lang_config.loader_names:
+                    structure.imports.append(_get_node_text(node, code))
+                return
+            for child in node.named_children:
+                visit(child)
+
+        visit(root)
+        compressed = apply_source_edits(code, edits)
+        if compressed is None or compressed == code:
+            return code, structure, {}
+        return compressed, structure, {}
 
     # =========================================================================
     # Unified structure extraction (data-driven, replaces per-language methods)

@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "class Query\n  def run\n    first = 1\n    query = <<~SQL\n      SELECT 1\n    SQL\n    second = 2\n    third = 3\n    fourth = 4\n    fifth = fourth + 1\n    sixth = fifth + 1\n    seventh = sixth + 1\n    eighth = seventh + 1\n    ninth = eighth + 1\n    tenth = ninth + 1\n    eleventh = tenth + 1\n    twelfth = eleventh + 1\n    thirteenth = twelfth + 1\n    fourteenth = thirteenth + 1\n    fifteenth = fourteenth + 1\n    sixteenth = fifteenth + 1\n    seventeenth = sixteenth + 1\n    eighteenth = seventeenth + 1\n    nineteenth = eighteenth + 1\n    twentieth = nineteenth + 1\n  end\nend\n",
+  "input_sha256": "5d6f388cf516c6f8733af5d3d8a48af8084d7a15a4cdbb368b0d84074849a6a7",
+  "output": {
+    "cache_key": null,
+    "compressed": "class Query\n  def run\n    first = 1\n    query = <<~SQL\n      SELECT 1\n    SQL\n    second = 2\n    third = 3\n    fourth = 4\n    fifth = fourth + 1\n    # [15 lines omitted]\n    \n    \n    \n    \n    \n    \n    \n    \n    \n    \n    \n    \n    \n    \n  end\nend\n",
+    "compressed_bodies": 1,
+    "compressed_tokens": 62,
+    "compression_ratio": 0.43356643356643354,
+    "language": "ruby",
+    "language_confidence": 1.0,
+    "original": "class Query\n  def run\n    first = 1\n    query = <<~SQL\n      SELECT 1\n    SQL\n    second = 2\n    third = 3\n    fourth = 4\n    fifth = fourth + 1\n    sixth = fifth + 1\n    seventh = sixth + 1\n    eighth = seventh + 1\n    ninth = eighth + 1\n    tenth = ninth + 1\n    eleventh = tenth + 1\n    twelfth = eleventh + 1\n    thirteenth = twelfth + 1\n    fourteenth = thirteenth + 1\n    fifteenth = fourteenth + 1\n    sixteenth = fifteenth + 1\n    seventeenth = sixteenth + 1\n    eighteenth = seventeenth + 1\n    nineteenth = eighteenth + 1\n    twentieth = nineteenth + 1\n  end\nend\n",
+    "original_tokens": 143,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-08-27T19:07:15.088565+00:00",
+  "transform": "code_aware_compressor"
+}
