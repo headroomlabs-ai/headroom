@@ -1404,7 +1404,10 @@ class TestSettingsFileToEnv:
                 ["proxy"],
                 env={
                     "HEADROOM_WORKSPACE_DIR": str(tmp_path),
-                    # Ensure nothing ambient shadows the file-applied values.
+                    # Ensure nothing ambient shadows the file-applied values —
+                    # including the per-test HEADROOM_SETTINGS_PATH from
+                    # conftest, so the file resolves via the workspace dir.
+                    "HEADROOM_SETTINGS_PATH": None,
                     "HEADROOM_PORT": None,
                     "HEADROOM_CODE_AWARE_ENABLED": None,
                 },

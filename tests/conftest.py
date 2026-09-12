@@ -39,11 +39,17 @@ def _skip_proxy_dependency_gate_unless_exercised(
 
 
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch):
+def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # The proxy re-applies file-backed settings at construction time
+    # (settings-first precedence), so the developer's real
+    # ~/.headroom/settings.json would leak live knobs (e.g. output_shaper)
+    # into assertions. Point the store at a per-test path that doesn't exist;
+    # tests that exercise the store set their own path explicitly.
+    monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
