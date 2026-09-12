@@ -36,6 +36,22 @@ def test_route_from_models_restriction() -> None:
     assert not route.matches(model="claude-sonnet-4-6", input_tokens=1, has_tools=False)
 
 
+def test_route_require_tools_matches_only_with_tools() -> None:
+    # Inverse of require_no_tools: route agentic (tool-using) turns to a
+    # stronger model, leaving plain chat alone.
+    route = ModelRoute(to_model="strong", require_tools=True)
+    assert route.matches(model="cheap", input_tokens=1, has_tools=True)
+    assert not route.matches(model="cheap", input_tokens=1, has_tools=False)
+
+
+def test_route_require_tools_and_require_no_tools_never_matches() -> None:
+    # Contradictory conditions on one rule are an AND that can never be true —
+    # a harmless operator error, not a crash.
+    route = ModelRoute(to_model="x", require_tools=True, require_no_tools=True)
+    assert not route.matches(model="m", input_tokens=1, has_tools=True)
+    assert not route.matches(model="m", input_tokens=1, has_tools=False)
+
+
 def test_route_matches_even_for_same_model() -> None:
     # A same-model rule still MATCHES (strict first-match-wins); it is a no-op
     # that short-circuits later rules, enabling explicit exemption rules.
@@ -174,6 +190,22 @@ def test_from_env_malformed_int_skips_route() -> None:
 def test_from_env_malformed_require_no_tools_skips_route() -> None:
     # A string "false" must not be coerced to True.
     cfg = ModelRouterConfig.from_env("yes", '[{"to_model":"m","require_no_tools":"false"}]')
+    assert cfg.routes == ()
+
+
+def test_from_env_parses_require_tools() -> None:
+    cfg = ModelRouterConfig.from_env(
+        "yes", '[{"name":"agentic","require_tools":true,"to_model":"strong"}]'
+    )
+    assert len(cfg.routes) == 1
+    route = cfg.routes[0]
+    assert route.require_tools is True
+    assert route.to_model == "strong"
+
+
+def test_from_env_malformed_require_tools_skips_route() -> None:
+    # A non-boolean must fail open (skip), never be coerced.
+    cfg = ModelRouterConfig.from_env("yes", '[{"to_model":"m","require_tools":"yes"}]')
     assert cfg.routes == ()
 
 

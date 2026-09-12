@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use headroom_core::ccr::{CcrStore, InMemoryCcrStore};
 
 // ─── Baseline: the old single-Mutex<HashMap> design ────────────────

@@ -275,8 +275,11 @@ class TestShapeHandlerHelper:
         labels, mutated = _shape_openai_responses_payload(body, model="gpt-5.5", request_id="t3")
         assert mutated is False
         assert json.dumps(body, sort_keys=True) == snapshot  # control arm untouched
-        assert len(labels) == 1
+        # Stratum + the conversation it was assigned to, and nothing else: the
+        # control arm labels itself but never shapes.
+        assert len(labels) == 2
         assert labels[0].startswith("output_shaper:control:")
+        assert labels[1].startswith("output_shaper:conv:")
 
 
 class TestHandlerPathControlLabels:

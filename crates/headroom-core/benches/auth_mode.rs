@@ -11,7 +11,9 @@
 //! The bench measures one classifier call per iteration. The
 //! `HeaderMap` is constructed once outside the timing loop.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use headroom_core::auth_mode::classify;
 use http::{HeaderMap, HeaderValue};
 

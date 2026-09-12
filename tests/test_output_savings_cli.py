@@ -9,6 +9,10 @@ from click.testing import CliRunner
 from headroom.cli.main import main
 from headroom.proxy.output_savings import SavingsRecorder, stratum_label
 
+# A treatment observation only counts when the request was actually shaped,
+# evidenced by the shaper's own verbosity label on the same channel.
+SHAPED = "output_shaper:verbosity:L2"
+
 
 def test_output_savings_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
@@ -41,7 +45,11 @@ def test_recorder_round_trips_via_labels(tmp_path):
     rec = SavingsRecorder(path, flush_every=1)
     # Baseline so the estimate has something to compare against.
     rec._ledger.baseline.observe("opus|new_user_ask|s|tools", 1000)
-    labels = ["compress:smartcrush", stratum_label("treatment", "opus|new_user_ask|s|tools")]
+    labels = [
+        "compress:smartcrush",
+        stratum_label("treatment", "opus|new_user_ask|s|tools"),
+        SHAPED,
+    ]
     assert rec.record_from_labels(labels, output_tokens=600) is True
     assert rec.record_from_labels(["no-shaper-label"], output_tokens=999) is False
     est = rec.estimate()

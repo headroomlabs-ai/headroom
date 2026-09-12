@@ -106,6 +106,24 @@ def _tokens(tc: ToolCall) -> int:
     return nbytes // _BYTES_PER_TOKEN
 
 
+def _without_replays(calls: list[ToolCall], seen: set[str]) -> list[ToolCall]:
+    """Drop calls whose ``tool_call_id`` is already in ``seen``, recording the rest.
+
+    ``seen`` is mutated, so the caller chooses the scope a replay is judged
+    against: a fresh set collapses a transcript's own repeated turns, while a
+    set carried across sessions suppresses a resume's replay of earlier ones.
+    An id-less call is always kept — nothing identifies it as a replay.
+    """
+    kept: list[ToolCall] = []
+    for call in calls:
+        if call.tool_call_id:
+            if call.tool_call_id in seen:
+                continue
+            seen.add(call.tool_call_id)
+        kept.append(call)
+    return kept
+
+
 def detect_loops(
     sessions: list[SessionData],
     *,
@@ -117,8 +135,30 @@ def detect_loops(
     a within-conversation phenomenon; the same command in two unrelated
     sessions is not a loop). Groups meeting ``min_occurrences`` become
     ``LoopPattern`` results, sorted by measured wasted tokens descending.
+
+    A call is counted once per ``tool_call_id``. A resumed conversation can be
+    written as a fresh transcript that replays earlier turns, which presents the
+    same provider-assigned call to the scanner more than once; without this the
+    replayed turns would inflate the loop. Calls carrying no id are always
+    counted, since nothing identifies them as replays.
+
+    This makes ``tool_call_id`` uniqueness a scanner contract: an id must be
+    unique across sessions, not just within one, or two unrelated sessions look
+    like one replayed twice. Scanners that synthesize ids scope them by session
+    (see ``GeminiPlugin`` and ``OpenCodePlugin``).
+
+    Dedup runs *before* the threshold, twice over. A session is screened on its
+    distinct calls, because the question the threshold asks — did this
+    conversation repeat itself? — is not answered by one call written into the
+    transcript three times. Only then are its calls merged, deduped again
+    against the calls already collected for that signature so a resume that
+    replays an earlier session adds only what is new. Screening the raw group
+    instead would let three sessions that each merely replayed one call
+    contribute one real call apiece and clear the bar together, reporting a loop
+    no conversation ran.
     """
     groups: dict[str, list[ToolCall]] = {}
+    seen_ids: dict[str, set[str]] = {}
     for session in sessions:
         per_session: dict[str, list[ToolCall]] = {}
         for tc in session.tool_calls:
@@ -126,11 +166,17 @@ def detect_loops(
         # Merge each session's qualifying groups into the global view keyed by
         # signature so cross-session recurrence of the SAME loop accumulates.
         for sig, calls in per_session.items():
-            if len(calls) >= min_occurrences:
-                groups.setdefault(sig, []).extend(calls)
+            distinct = _without_replays(calls, set())
+            if len(distinct) < min_occurrences:
+                continue
+            bucket = groups.setdefault(sig, [])
+            bucket.extend(_without_replays(distinct, seen_ids.setdefault(sig, set())))
 
     loops: list[LoopPattern] = []
     for sig, calls in groups.items():
+        # No post-merge threshold re-check: every group here was seeded by a
+        # session that cleared the bar on its own distinct calls, and merging
+        # only ever adds.
         count = len(calls)
         is_error_loop = sum(1 for c in calls if c.is_error) >= (count / 2)
         if is_error_loop:
