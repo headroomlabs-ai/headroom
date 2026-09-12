@@ -3600,6 +3600,45 @@ def _normalize_proxy_api_url(url: object) -> str | None:
     return normalized or None
 
 
+def _require_no_proxy_openai_upstream(port: int, openai_api_url: str) -> None:
+    """Refuse ``--no-proxy`` unless the proxy on ``port`` already targets ``openai_api_url``.
+
+    ``--no-proxy`` reuses a listener wrap does not own, so it can neither
+    start nor re-point one. Reusing it unchecked would present a third-party
+    key (DeepSeek, Together, ...) to whatever upstream that proxy was started
+    with — usually OpenAI, which rejects it with a 401 — while the flag
+    implies the key went to the requested provider (#3107). Fail closed
+    instead: require a healthy Headroom listener whose advertised upstream
+    matches exactly after normalization.
+    """
+    helpers = _live_wrap_module()
+    start_cmd = f"headroom proxy --port {port} --openai-api-url {openai_api_url}"
+    if not helpers._check_proxy(port):
+        raise click.ClickException(
+            f"No Headroom proxy is listening on port {port}, so --no-proxy cannot honor "
+            f"the requested OpenAI-compatible upstream {openai_api_url}. "
+            f"Start it separately with `{start_cmd}`, or drop --no-proxy so wrap can start it."
+        )
+    running_config = helpers._proxy_health_config(helpers._query_proxy_health(port))
+    if running_config is None:
+        running_config = helpers._query_proxy_config(port)
+    if running_config is None:
+        raise click.ClickException(
+            f"The listener on port {port} did not report a Headroom config, so wrap "
+            f"cannot confirm it forwards to {openai_api_url}. "
+            f"Start a Headroom proxy separately with `{start_cmd}`, or drop --no-proxy "
+            "so wrap can start it."
+        )
+    running_url = running_config.get("openai_api_url")
+    if _normalize_proxy_api_url(running_url) != _normalize_proxy_api_url(openai_api_url):
+        raise click.ClickException(
+            f"The Headroom proxy on port {port} forwards OpenAI-compatible traffic to "
+            f"{running_url or 'https://api.openai.com/v1'}, not {openai_api_url}. "
+            f"Restart it with `{start_cmd}`, or drop --no-proxy so wrap can restart it "
+            "when no other wrapper is attached."
+        )
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -4063,6 +4102,7 @@ def _ensure_proxy_unlocked(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    require_openai_api_url: bool = False,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
@@ -4421,7 +4461,12 @@ def _ensure_proxy_unlocked(
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
-        if not helpers._check_proxy(port):
+        if require_openai_api_url and openai_api_url:
+            # A user-chosen upstream cannot be applied to a proxy wrap does
+            # not own; fail closed unless the running one already matches.
+            _require_no_proxy_openai_upstream(port, openai_api_url)
+            click.echo(f"  Proxy on port {port} already targets {openai_api_url}")
+        elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
         elif vertex_api_url or clear_vertex_api_url:
             health_payload = helpers._query_proxy_health(port)
@@ -7893,6 +7938,7 @@ def opencode(
         openai_api_url=(
             subscription_resolution.api_url if subscription_resolution else openai_api_url
         ),
+        require_openai_api_url=bool(openai_api_url),
         copilot_api_token=(subscription_resolution.token if subscription_resolution else None),
         copilot_refresh_oauth_token=(
             subscription_resolution.refresh_oauth_token if subscription_resolution else None

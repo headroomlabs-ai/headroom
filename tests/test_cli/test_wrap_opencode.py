@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -1154,7 +1155,7 @@ def _capture_ensure_proxy_kwargs(
     captured: dict[str, object] = {}
 
     def fake_ensure_proxy(port: int, no_proxy: bool, **kwargs):  # noqa: ANN003
-        captured.update(kwargs)
+        captured.update(kwargs, no_proxy=no_proxy)
         return None, port
 
     with (
@@ -1253,3 +1254,152 @@ def test_wrap_opencode_rejects_openai_api_url_with_copilot_subscription(
 
     assert result.exit_code != 0
     assert "cannot be combined with --copilot-subscription" in result.output
+
+
+def _no_proxy_health(openai_api_url: str | None) -> dict[str, object]:
+    """A /health payload from a Headroom listener advertising ``openai_api_url``."""
+    return {
+        "version": wrap_mod._HEADROOM_VERSION,
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "openai_api_url": openai_api_url,
+        },
+    }
+
+
+def test_no_proxy_with_openai_api_url_rejects_absent_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-proxy cannot honor an upstream override when nothing is listening."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "No Headroom proxy" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_with_openai_api_url_rejects_non_headroom_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A port that accepts connections but exposes no Headroom config is not trusted."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "did not report a Headroom config" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_with_openai_api_url_reuses_matching_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running proxy already pointed at the requested upstream is reused as-is."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    # Trailing slash on the advertised URL: the comparison must be normalized.
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_health",
+        lambda _port: _no_proxy_health("https://api.deepseek.com/v1/"),
+    )
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_config",
+        lambda _port: pytest.fail("config must come from the /health payload"),
+    )
+
+    assert wrap_mod._ensure_proxy_unlocked(
+        8787,
+        True,
+        openai_api_url="https://api.deepseek.com/v1",
+        require_openai_api_url=True,
+    ) == (None, 8787)
+
+
+def test_no_proxy_with_openai_api_url_rejects_mismatched_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy on the default OpenAI upstream must not receive a DeepSeek-bound key (#3107)."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: _no_proxy_health(None))
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "https://api.openai.com/v1" in message
+    assert "https://api.deepseek.com/v1" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_without_required_openai_api_url_keeps_lenient_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrappers with a built-in upstream (grok, kimi, ...) keep the historical warn-and-reuse."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_health",
+        lambda _port: pytest.fail("no upstream check without require_openai_api_url"),
+    )
+
+    assert wrap_mod._ensure_proxy_unlocked(8787, True, openai_api_url="https://api.x.ai/v1") == (
+        None,
+        8787,
+    )
+
+
+def test_wrap_opencode_no_proxy_requires_openai_api_url_match(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-proxy with an upstream override asks _ensure_proxy to fail closed on a mismatch."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        [
+            "wrap",
+            "opencode",
+            "--port",
+            "9000",
+            "--no-mcp",
+            "--no-serena",
+            "--no-proxy",
+            "--openai-api-url",
+            "https://api.deepseek.com/v1",
+        ],
+    )
+
+    assert captured["no_proxy"] is True
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+    assert captured["require_openai_api_url"] is True
