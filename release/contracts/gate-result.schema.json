@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://headroom.dev/schemas/release/v1/gate-result.schema.json",
+  "title": "Headroom release gate result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "gate_id",
+    "gate",
+    "evaluated_at",
+    "candidate_sha",
+    "policy_version",
+    "risk_class",
+    "status",
+    "reasons",
+    "required_evidence",
+    "observed_evidence",
+    "overrides"
+  ],
+  "properties": {
+    "schema_version": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "gate_id": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+    "gate": { "type": "string", "enum": ["gate_a", "gate_b"] },
+    "evaluated_at": { "type": "string", "format": "date-time" },
+    "candidate_sha": { "$ref": "common.schema.json#/$defs/gitSha" },
+    "policy_version": { "$ref": "common.schema.json#/$defs/releasePolicyVersion" },
+    "risk_class": { "$ref": "common.schema.json#/$defs/riskClass" },
+    "status": { "$ref": "common.schema.json#/$defs/decisionStatus" },
+    "reasons": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+      "uniqueItems": true
+    },
+    "required_evidence": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/nonEmptyString" },
+      "uniqueItems": true
+    },
+    "observed_evidence": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/evidenceReference" }
+    },
+    "overrides": {
+      "type": "array",
+      "items": { "$ref": "common.schema.json#/$defs/override" }
+    },
+    "runtime_payload_equivalence": {
+      "$ref": "common.schema.json#/$defs/runtimePayloadEquivalence"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "pass" } }, "required": ["status"] },
+      "then": { "properties": { "reasons": { "maxItems": 0 } } },
+      "else": { "properties": { "reasons": { "minItems": 1 } } }
+    },
+    {
+      "if": { "required": ["runtime_payload_equivalence"] },
+      "then": { "properties": { "gate": { "const": "gate_b" } } }
+    },
+    {
+      "if": { "properties": { "gate": { "const": "gate_b" } }, "required": ["gate"] },
+      "then": { "required": ["runtime_payload_equivalence"] }
+    },
+    {
+      "if": {
+        "properties": { "gate": { "const": "gate_b" }, "status": { "const": "pass" } },
+        "required": ["gate", "status", "runtime_payload_equivalence"]
+      },
+      "then": {
+        "properties": {
+          "runtime_payload_equivalence": {
+            "properties": {
+              "identity_verification": {
+                "properties": { "status": { "const": "pass" } },
+                "required": ["status"]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

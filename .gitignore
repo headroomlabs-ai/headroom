@@ -36,6 +36,7 @@ scripts/*
 !scripts/smoke_issue_327.py
 !scripts/refresh_model_limits.sh
 !scripts/audit_wheel_glibc_symbols.py
+!scripts/candidate_manifest.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
 !scripts/refresh_tool_hashes.py
