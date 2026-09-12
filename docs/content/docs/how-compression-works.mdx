@@ -41,7 +41,7 @@ The router auto-detects content type by analyzing structure and patterns. No man
 
 ## Quick Start
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from "headroom-ai";
@@ -70,11 +70,31 @@ print(result.messages)
 print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 ```
 </Tab>
+<Tab value="Go">
+```go
+import (
+    "context"
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+ctx := context.Background()
+client := headroom.NewClient()
+
+messages := []headroom.Message{
+    {Role: "system", Content: headroom.TextContent("You are a helpful assistant.")},
+    {Role: "user", Content: headroom.TextContent("Summarize this data")},
+    {Role: "tool", ToolCallID: "call_1", Content: headroom.TextContent(`{"results": [...]}`)},
+}
+
+result, _ := client.Compress(ctx, messages, headroom.CompressOptions{})
+fmt.Printf("Tokens saved: %d\nCompression ratio: %.2f\n", result.TokensSaved, result.CompressionRatio)
+```
+</Tab>
 </Tabs>
 
 ## Configuring the Compressor
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from "headroom-ai";
@@ -103,6 +123,18 @@ config = CompressConfig(
 result = compress(messages, model="gpt-4o", config=config)
 print(f"Saved: {result.tokens_saved} tokens")
 print(result.transforms_applied)
+```
+</Tab>
+<Tab value="Go">
+```go
+result, _ := client.Compress(ctx, messages, headroom.CompressOptions{
+    Model:       "gpt-4o",
+    TokenBudget: 50000,
+})
+
+fmt.Printf("Before: %d tokens\n", result.TokensBefore)
+fmt.Printf("After:  %d tokens\n", result.TokensAfter)
+fmt.Printf("Transforms: %v\n", result.TransformsApplied)
 ```
 </Tab>
 </Tabs>

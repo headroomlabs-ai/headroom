@@ -7,7 +7,7 @@ This guide gets you from zero to compressed LLM calls in under 5 minutes.
 
 ## 1. Install
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```bash
 npm install headroom-ai
@@ -22,10 +22,15 @@ uv tool install --python 3.13 "headroom-ai[all]"
 pip install "headroom-ai[all]"
 ```
 </Tab>
+<Tab value="Go">
+```bash
+go get github.com/headroomlabs-ai/headroom/sdk/golang
+```
+</Tab>
 </Tabs>
 
-<Callout type="info" title="TypeScript SDK requires the proxy">
-The TypeScript SDK sends messages to a local Headroom proxy for compression. Start the proxy before using the TS SDK:
+<Callout type="info" title="TypeScript and Go SDKs require the proxy">
+The TypeScript and Go SDKs send messages to a local Headroom proxy for compression. Start the proxy before using either SDK:
 
 ```bash
 uv tool install --python 3.13 "headroom-ai[proxy]"
@@ -33,12 +38,12 @@ uv tool install --python 3.13 "headroom-ai[proxy]"
 headroom proxy --port 8787
 ```
 
-The proxy runs the compression pipeline (Python) and exposes an HTTP API that the TS SDK calls.
+The proxy runs the compression pipeline (Python) and exposes an HTTP API that the TS and Go SDKs call.
 </Callout>
 
 ## 2. Compress messages
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -108,13 +113,60 @@ messages = [
 result = compress(messages, model="gpt-4o")
 ```
 </Tab>
+<Tab value="Go">
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+
+    headroom "github.com/headroomlabs-ai/headroom/sdk/golang"
+)
+
+func main() {
+    ctx := context.Background()
+    client := headroom.NewClient(headroom.WithBaseURL("http://localhost:8787"))
+
+    items := make([]map[string]any, 500)
+    for i := range items {
+        items[i] = map[string]any{
+            "title":   fmt.Sprintf("Result %d", i),
+            "snippet": fmt.Sprintf("Description %d", i),
+            "score":   100 - i,
+        }
+    }
+    body, _ := json.Marshal(map[string]any{"results": items})
+
+    msgs := []headroom.Message{
+        {Role: "system", Content: headroom.TextContent("You analyze search results.")},
+        {Role: "user", Content: headroom.TextContent("Search for Python tutorials.")},
+        {
+            Role:    "assistant",
+            Content: json.RawMessage("null"),
+            ToolCalls: []headroom.ToolCall{{
+                ID: "call_1", Type: "function",
+                Function: headroom.ToolFunction{Name: "search", Arguments: `{"q":"python"}`},
+            }},
+        },
+        {Role: "tool", ToolCallID: "call_1", Content: headroom.TextContent(string(body))},
+        {Role: "user", Content: headroom.TextContent("What are the top 3 results?")},
+    }
+
+    result, err := client.Compress(ctx, msgs, headroom.CompressOptions{Model: "gpt-4o"})
+    if err != nil { panic(err) }
+    _ = result
+}
+```
+</Tab>
 </Tabs>
 
 ## 3. Send to your LLM
 
 Use the compressed messages exactly like the originals:
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import OpenAI from 'openai';
@@ -145,11 +197,25 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 </Tab>
+<Tab value="Go">
+```go
+// Use any OpenAI-compatible Go client (e.g. sashabaranov/go-openai).
+// result.Messages from the previous step is a []headroom.Message you can
+// re-marshal into the client's expected message type, or use the proxy's
+// /v1/chat/completions passthrough:
+out, err := client.ChatCompletionsCreate(ctx, map[string]any{
+    "model":    "gpt-4o",
+    "messages": msgs,
+}, nil)
+if err != nil { panic(err) }
+fmt.Println(out["choices"])
+```
+</Tab>
 </Tabs>
 
 ## 4. Check your savings
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 const result = {
@@ -198,6 +264,25 @@ Tokens after:  4500
 Tokens saved:  40500
 Compression:   90%
 Transforms:    ['smart_crusher', 'cache_aligner']
+```
+</Tab>
+<Tab value="Go">
+```go
+fmt.Printf("Tokens before: %d\n", result.TokensBefore)
+fmt.Printf("Tokens after:  %d\n", result.TokensAfter)
+fmt.Printf("Tokens saved:  %d\n", result.TokensSaved)
+fmt.Printf("Compression:   %.0f%%\n", result.CompressionRatio*100)
+fmt.Printf("Transforms:    %v\n", result.TransformsApplied)
+```
+
+Example output:
+
+```
+Tokens before: 45000
+Tokens after:  4500
+Tokens saved:  40500
+Compression:   90%
+Transforms:    [smart_crusher cache_aligner]
 ```
 </Tab>
 </Tabs>
