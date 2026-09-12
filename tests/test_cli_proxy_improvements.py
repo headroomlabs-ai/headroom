@@ -328,24 +328,12 @@ class TestMissingProxyDepsError:
     def test_ensure_proxy_dependencies_exits_when_fastapi_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import builtins
-
         from headroom.cli.proxy import ensure_proxy_dependencies
 
-        real_import = builtins.__import__
-
-        def fake_import(
-            name: str,
-            globals: dict | None = None,
-            locals: dict | None = None,
-            fromlist: tuple = (),
-            level: int = 0,
-        ):
-            if name == "fastapi":
-                raise ImportError("No module named 'fastapi'")
-            return real_import(name, globals, locals, fromlist, level)
-
-        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(
+            "headroom.cli.proxy.find_spec",
+            lambda name: None if name == "fastapi" else object(),
+        )
 
         with pytest.raises(SystemExit) as exc_info:
             ensure_proxy_dependencies()

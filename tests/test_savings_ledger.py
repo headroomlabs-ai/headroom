@@ -69,6 +69,13 @@ def test_zero_or_negative_savings_not_recorded(monkeypatch, tmp_path):
     assert L.aggregate_savings().lifetime["calls"] == 0
 
 
+def test_stateless_mode_does_not_create_ledger(monkeypatch, tmp_path):
+    path = _events_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_STATELESS", "true")
+    assert L.record_savings_event(tokens_before=100, tokens_after=50) is False
+    assert not path.exists()
+
+
 def test_breakdowns_aggregate_by_dimension(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     L.record_savings_event(tokens_before=1000, tokens_after=300, model=None, client="claude-code")
