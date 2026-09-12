@@ -123,6 +123,7 @@ class BM25Scorer(RelevanceScorer):
         query_tokens: list[str],
         avg_doc_len: float | None = None,
         idf_map: dict[str, float] | None = None,
+        query_freq: Counter[str] | None = None,
     ) -> tuple[float, list[str]]:
         """Compute BM25 score between document and query.
 
@@ -130,6 +131,10 @@ class BM25Scorer(RelevanceScorer):
             doc_tokens: Tokenized document.
             query_tokens: Tokenized query.
             avg_doc_len: Average document length (optional).
+            query_freq: Pre-computed ``Counter(query_tokens)``. In a batch the
+                query (context) is identical for every item, so counting it once
+                and passing it in avoids rebuilding the same Counter per item.
+                When ``None`` it is computed from ``query_tokens`` as before.
             idf_map: Pre-computed corpus IDF per term. When supplied (batch
                 scoring, where a real corpus exists) each term is weighted by
                 its inverse document frequency, so a discriminative term such
@@ -148,7 +153,8 @@ class BM25Scorer(RelevanceScorer):
         avgdl = avg_doc_len or doc_len or 1
 
         doc_freq = Counter(doc_tokens)
-        query_freq = Counter(query_tokens)
+        if query_freq is None:
+            query_freq = Counter(query_tokens)
 
         score = 0.0
         matched_terms: list[str] = []
@@ -231,6 +237,11 @@ class BM25Scorer(RelevanceScorer):
         if not context_tokens:
             return [RelevanceScore(score=0.0, reason="BM25: empty context") for _ in items]
 
+        # Count the query once: it is the same context for every item, so
+        # rebuilding Counter(context_tokens) inside each _bm25_score call would
+        # redo identical work per item.
+        context_freq = Counter(context_tokens)
+
         # Compute average document length for normalization
         all_tokens = [self._tokenize(item) for item in items]
         avg_len = sum(len(t) for t in all_tokens) / max(len(items), 1)
@@ -253,7 +264,11 @@ class BM25Scorer(RelevanceScorer):
         results = []
         for item_tokens in all_tokens:
             raw_score, matched = self._bm25_score(
-                item_tokens, context_tokens, avg_doc_len=avg_len, idf_map=idf_map
+                item_tokens,
+                context_tokens,
+                avg_doc_len=avg_len,
+                idf_map=idf_map,
+                query_freq=context_freq,
             )
 
             # Normalize
