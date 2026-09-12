@@ -1401,6 +1401,47 @@ class RoutingDecision:
         return self.compressed_tokens / self.original_tokens
 
 
+def _record_beacon_shapes(routing_log: list[RoutingDecision]) -> None:
+    """Report (content_type -> strategy -> yield) for one compress() call.
+
+    `RoutingDecision` already carries the content type the detector assigned
+    alongside the strategy that was picked for it, so the joint table costs
+    nothing to measure -- it has simply never been reported anywhere. The
+    beacon's `by_strategy` sees the strategy and its yield but not the input,
+    which leaves it able to rank compressors and unable to say which one suits
+    a given piece of content.
+
+    Deliberately NOT routed through `CompressionObserver`: that protocol is
+    implemented outside this repo as well, and widening it would break every
+    such implementation. This is a direct call to a function that is off by
+    default, cheap when off, and cannot raise.
+
+    Runs whether or not an observer is installed, since the beacon path and the
+    Prometheus path are independent -- an install with no observer still
+    reports token totals, and would otherwise report an empty shape table
+    against them.
+    """
+    if not routing_log:
+        return
+    try:
+        from ..telemetry.session import record_content_shapes
+
+        # One call, not one per decision: the beacon's staging lock is shared
+        # with `record_compression` on this same executor thread, and the note
+        # there is explicit that the contention is real.
+        record_content_shapes(
+            (
+                decision.content_type.value,
+                decision.strategy.value,
+                decision.original_tokens,
+                decision.compressed_tokens,
+            )
+            for decision in routing_log
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("beacon shape recording failed (non-fatal): %s", e)
+
+
 @dataclass
 class RouterCompressionResult:
     """Result from ContentRouter with routing metadata.
@@ -2328,6 +2369,7 @@ class ContentRouter(Transform):
         anyway, swallow at debug level. Compression already succeeded;
         a buggy observer must not turn a 200 into a 500.
         """
+        _record_beacon_shapes(result.routing_log)
         if self._observer is None:
             return
         for d in result.routing_log:

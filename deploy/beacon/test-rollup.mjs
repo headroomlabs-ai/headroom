@@ -13,7 +13,7 @@
  */
 import { readdirSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { oldestRawDay, rollupHour } from './worker.js';
+import { inflate, oldestRawDay, rollupHour } from './worker.js';
 
 // R2 returns at most 1000 keys per list page, so on a real hour (~4,000
 // objects) the cursor loop in rollupHour is load-bearing. The stub paginates at
@@ -209,6 +209,49 @@ if (dir) {
     `real corpus: ${spend.read} objects -> ${rows.length} sessions in 1 object` +
       ` (${Math.ceil(spend.read / PAGE)} list pages)`
   );
+}
+
+// 8. Upload compression. A schema-v2 event is ~8KB of repetitive JSON and
+//    gzips ~6x, so fetch() sniffs the gzip magic number and inflates. Three
+//    things have to hold, and none of them can be checked in production without
+//    risking every upload:
+//
+//    a) a real gzip body round-trips to the exact bytes that went in;
+//    b) DecompressionStream exists in this runtime at all (it is the one part
+//       of the ingest path with no fallback -- if it is missing, inflate throws,
+//       fetch answers 400, and every compressed upload is refused);
+//    c) the size cap is enforced WHILE the stream is read, not after, or a
+//       decompression bomb has already been decompressed by the time it is
+//       noticed.
+{
+  const gzipBytes = async (text) => {
+    const stream = new Response(new TextEncoder().encode(text)).body.pipeThrough(
+      new CompressionStream('gzip')
+    );
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  };
+
+  const payload = JSON.stringify({
+    resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: { stringValue: 'x'.repeat(4000) } }] }] }],
+  });
+  const packed = await gzipBytes(payload);
+
+  assert.equal(packed[0], 0x1f, 'gzip magic byte 0');
+  assert.equal(packed[1], 0x8b, 'gzip magic byte 1');
+  assert.ok(packed.length < payload.length / 3, 'gzip did not actually compress');
+  assert.equal(await inflate(packed.buffer, 256 * 1024), payload, 'round trip changed the body');
+
+  // A bomb: highly compressible input that expands past the cap. The cap must
+  // bite, and it must bite from the stream rather than from the final size.
+  const bomb = await gzipBytes('A'.repeat(2 * 1024 * 1024));
+  assert.ok(bomb.length < 64 * 1024, 'fixture is not actually a bomb');
+  await assert.rejects(
+    () => inflate(bomb.buffer, 256 * 1024),
+    /too large/,
+    'a decompression bomb was inflated in full'
+  );
+
+  console.log(`gzip: ${payload.length} B -> ${packed.length} B, bomb refused`);
 }
 
 console.log('ok');

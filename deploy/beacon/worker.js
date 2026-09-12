@@ -53,6 +53,51 @@ const ALLOWED_KEYS = [
   // real minimum cacheable prefix, how long a cache actually survives, and how
   // far predicted cache hits are from the ones that happened.
   'routing',
+
+  // ---- schema v2 -----------------------------------------------------------
+  //
+  // Additive. Every v1 key above is untouched, so a v1 client keeps storing
+  // exactly what it stores today and rows from the two versions union cleanly
+  // (`schema_version` separates them, `union_by_name` handles the rest).
+  //
+  // Read the ordering rule at the top of this list literally: this deploy must
+  // go out BEFORE the client release that starts sending these, or the first
+  // weeks of the new signals are dropped on arrival and cannot be recovered.
+  // Removing one line here is also the rollback -- it reverts that signal for
+  // every install in the wild without a client release, which is the whole
+  // reason the allowlist is server-side.
+
+  // Regret. `reread_compressed_tokens` is the counter-pressure on `saved_pct`:
+  // tokens the agent had to fetch again because compression removed them.
+  // Without it a compression ratio is unfalsifiable.
+  'quality',
+  // Fixed-bucket distributions for quantities otherwise reported only as
+  // session sums. Ships its own bucket edges, so no reader needs to know which
+  // client version wrote a row.
+  'hist',
+  // (content_type x strategy x yield), and the same for JSON tool output keyed
+  // by structural shape. The input term the corpus has never had.
+  // Structural descriptors only -- never TOIN's structure_hash, which is a
+  // digest of field names.
+  'shapes',
+  // Prompt-cache survival by gap since the previous turn: the empirical TTL
+  // and minimum-prefix curve per provider.
+  'cache',
+  // Session shape over time -- log-spaced turn buckets plus a run-length
+  // encoded turn-kind string from a closed seven-letter alphabet.
+  'trajectory',
+  // Identified client harness, per turn. `headroom.stack` answers this by
+  // detection and resolves to a literal "proxy" for most of the fleet.
+  'clients',
+  // 4xx, kept strictly separate from the 5xx-only `failures` above so neither
+  // metric changes meaning. 429 rate is the routing signal here.
+  'errors',
+  // output_shaper A/B strata as validated enums. Model family is not among
+  // them -- see the note in session.py's payload().
+  'strata',
+  // Allowlisted, slug-validated configuration, so the corpus can tell
+  // "compression underperformed" from "compression was switched off".
+  'config',
 ];
 
 // Resource attributes we keep. Same rule: allowlist, not denylist.
@@ -66,8 +111,60 @@ const ALLOWED_RESOURCE = [
   'host.arch',
 ];
 
-// A beacon event is ~2KB. Anything far past that is a bug or an attack.
-const MAX_BODY_BYTES = 64 * 1024;
+// Cap on what ARRIVES, compressed or not.
+//
+// Was 64KB, chosen when the comment above it read "a beacon event is ~2KB" --
+// i.e. 32x the payload. Schema v2 made a typical event ~8KB uncompressed, and
+// a session that fills every table (the shape cross product is 10 content
+// types x 13 strategies) reaches ~82KB. That silently eroded the multiple to
+// under 1x: a busy session sending uncompressed -- the kill switch is set, or
+// the gzip fallback fired -- would have been answered 413 and, correctly, not
+// retried, so the event would simply be lost.
+//
+// Restored to ~3x the worst legitimate payload. This is not the abuse control
+// and never was: the endpoint is unauthenticated by design and the WAF rate
+// limit (60 req/min/IP, see wrangler.toml) is what bounds a bad actor. At 60
+// requests a minute the difference between these two ceilings is 3.8 MB/min
+// and 15 MB/min, neither of which is interesting to Cloudflare.
+const MAX_BODY_BYTES = 256 * 1024;
+
+// Cap on what an arriving body EXPANDS to. `raw.byteLength` cannot see this:
+// a small gzip can expand to gigabytes, and a decompression bomb that is only
+// noticed after it has been decompressed has already won. Enforced while the
+// stream is read, not after. ~3x the worst legitimate payload, same as above.
+const MAX_DECOMPRESSED_BYTES = 256 * 1024;
+
+/**
+ * Decompress a gzip body, refusing anything that expands past `limit`.
+ *
+ * Counts bytes as chunks arrive and aborts mid-stream, so a bomb costs the
+ * limit rather than whatever it would have expanded to.
+ */
+export async function inflate(buffer, limit) {
+  const stream = new Response(buffer).body.pipeThrough(new DecompressionStream('gzip'));
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) throw new Error('decompressed body too large');
+      chunks.push(value);
+    }
+  } finally {
+    // Releases the stream on the bomb path; a no-op once it has closed.
+    reader.cancel().catch(() => {});
+  }
+  const joined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
 
 /** OTLP AnyValue -> plain JS. The inverse of _any_value() in session.py. */
 function unwrap(value) {
@@ -315,9 +412,31 @@ export default {
 
     let records;
     try {
-      records = extract(JSON.parse(new TextDecoder().decode(raw)));
+      // Sniff the gzip magic number rather than trusting Content-Encoding.
+      // Three things can each independently decide whether a body arrives
+      // compressed -- the client, Cloudflare's edge, and any proxy between
+      // them -- and only the bytes know which of them acted. Keying off the
+      // header instead means a body that something already decompressed gets
+      // fed to DecompressionStream, or vice versa, and every upload 400s.
+      //
+      // It also means an old client that never sets the header keeps working
+      // through the identical code path it uses today: no header, no magic
+      // number, straight to TextDecoder.
+      const bytes = new Uint8Array(raw);
+      const gzipped = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+      const text = gzipped
+        ? await inflate(raw, MAX_DECOMPRESSED_BYTES)
+        : new TextDecoder().decode(raw);
+      records = extract(JSON.parse(text));
     } catch {
       // Malformed input is not worth a retry storm from clients.
+      //
+      // This 400 is also load-bearing in the other direction: it is what a
+      // client that gzipped against a Worker too old to inflate sees, and
+      // _post_blocking treats a 4xx on a compressed body as "this endpoint
+      // does not do gzip", falls back to sending it uncompressed, and stops
+      // compressing for the life of the process. So deploying the client
+      // before this Worker costs one retry per process, not the data.
       return new Response('bad request', { status: 400 });
     }
     if (records.length === 0) return new Response(null, { status: 204 });

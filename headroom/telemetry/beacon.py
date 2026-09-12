@@ -124,17 +124,24 @@ def format_telemetry_notice(*, prefix: str = "") -> str:
     # so this notice is the only place a user learns it is running at all —
     # surprise is what turns anonymous telemetry into a trust incident.
     #
-    # Wording: lead with what the data *is* (compression ratios) and why it is
-    # useful (understanding when compression works), not with the fact of
+    # Wording: lead with what the data *is* (counters) and why it is useful
+    # (understanding when compression works), not with the fact of
     # transmission. "Stats are sent to Headroom Labs" is accurate but reads like
     # extraction, which misrepresents a payload that is entirely counters. The
     # reassurance has to stay concrete, though — "never prompts, code, or file
     # paths" names the things people actually worry about, and every one of
     # those is enforced by the allowlist, not just promised here.
+    #
+    # "compression stats" until schema v2, which widened the payload to cache
+    # behaviour, session shape, harness and configuration. All still counters,
+    # all still content-free — but this notice is the only place an opt-out
+    # beacon is disclosed at all, so it has to describe what is actually sent
+    # rather than the narrowest true thing. `headroom telemetry --show` prints
+    # the exact payload for anyone who wants the specifics.
     if beacon:
         return (
-            f"{prefix}Telemetry:    anonymous compression stats — never prompts, code, or "
-            "file paths. Helps us improve compression | Off: HEADROOM_BEACON=off"
+            f"{prefix}Telemetry:    anonymous usage counters — never prompts, code, or file "
+            "paths. See: headroom telemetry --show | Off: HEADROOM_BEACON=off"
         )
     return (
         f"{prefix}Telemetry:    ENABLED (local aggregate stats only — nothing sent externally) | "
