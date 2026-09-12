@@ -901,6 +901,14 @@ def test_is_copilot_api_url_matches_ghe_copilot_hosts() -> None:
     assert not copilot_auth.is_copilot_api_url("https://not-copilot-api.acme.ghe.com/v1/responses")
 
 
+def test_is_copilot_upstream_url_matches_public_and_enterprise_hosts() -> None:
+    assert copilot_auth.is_copilot_upstream_url("https://api.githubcopilot.com/v1/messages/batches")
+    assert copilot_auth.is_copilot_upstream_url(
+        "https://copilot-api.acme.ghe.com/v1/messages/batches"
+    )
+    assert not copilot_auth.is_copilot_upstream_url("https://api.anthropic.com/v1/messages/batches")
+
+
 def test_is_copilot_api_url_trusts_configured_enterprise_api_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
