@@ -300,11 +300,14 @@ def test_router_project_mode_unresolved_fails_closed_by_default(
     """
     router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
 
-    _, scope = router.backend_for(_ctx(system_prompt="no env block"))
+    backend, scope = router.backend_for(_ctx(system_prompt="no env block"))
     # Fail-closed signal: PROJECT mode preserved, project_key is None.
+    assert backend is None
     assert scope.mode is MemoryStorageMode.PROJECT
     assert scope.project_key is None
+    assert scope.db_path is None
     assert scope.display_name == "unresolved (no memory)"
+    assert router.open_backends() == []
 
 
 def test_router_project_mode_unresolved_global_fallback_when_opted_in(
