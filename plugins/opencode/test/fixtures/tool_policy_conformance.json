@@ -1,0 +1,277 @@
+[
+  {
+    "name": "deny direct shell command",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "deny-curl",
+          "scope": "shell",
+          "action": "deny",
+          "command": "curl"
+        }
+      ]
+    },
+    "request": {
+      "tool": "bash",
+      "input": {
+        "command": "curl https://example.com"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-curl"
+    }
+  },
+  {
+    "name": "deny command in compound shell line",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "deny-curl",
+          "scope": "shell",
+          "action": "deny",
+          "command": "curl"
+        }
+      ]
+    },
+    "request": {
+      "tool": "bash",
+      "input": {
+        "command": "echo ready && env TOKEN=x curl https://example.com"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-curl"
+    }
+  },
+  {
+    "name": "deny command nested in shell wrapper",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "deny-rm",
+          "scope": "shell",
+          "action": "deny",
+          "command": "rm"
+        }
+      ]
+    },
+    "request": {
+      "tool": "bash",
+      "input": {
+        "command": "bash -c \"echo checking; rm -rf build\""
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-rm"
+    }
+  },
+  {
+    "name": "deny command substitution on later line",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "deny-curl",
+          "scope": "shell",
+          "action": "deny",
+          "command": "curl"
+        }
+      ]
+    },
+    "request": {
+      "tool": "bash",
+      "input": {
+        "command": "echo ready\nvalue=$(curl https://example.com)"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-curl"
+    }
+  },
+  {
+    "name": "match non-shell native tool",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "protect-production",
+          "scope": "tool_call",
+          "action": "require_approval",
+          "tool": [
+            "write_file",
+            "apply_patch"
+          ],
+          "argsPattern": "production"
+        }
+      ]
+    },
+    "request": {
+      "tool": "write_file",
+      "input": {
+        "path": "config/production.env"
+      }
+    },
+    "expected": {
+      "action": "require_approval",
+      "effectiveAction": "require_approval",
+      "matchedRule": "protect-production"
+    }
+  },
+  {
+    "name": "first matching rule wins",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "allow-status",
+          "scope": "shell",
+          "action": "allow",
+          "command": "git",
+          "argsPattern": "\\bstatus\\b"
+        },
+        {
+          "id": "deny-git",
+          "scope": "shell",
+          "action": "deny",
+          "command": "git"
+        }
+      ]
+    },
+    "request": {
+      "tool": "bash",
+      "input": {
+        "command": "git status"
+      }
+    },
+    "expected": {
+      "action": "allow",
+      "effectiveAction": "allow",
+      "matchedRule": "allow-status"
+    }
+  },
+  {
+    "name": "tool cwd constraint prevents broad allow",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "allow-safe-write",
+          "scope": "tool_call",
+          "action": "allow",
+          "tool": "write_file",
+          "cwdPattern": "^/safe$"
+        },
+        {
+          "id": "deny-other-writes",
+          "scope": "tool_call",
+          "action": "deny",
+          "tool": "write_file"
+        }
+      ]
+    },
+    "request": {
+      "tool": "write_file",
+      "cwd": "/unsafe",
+      "input": {
+        "path": "settings.json"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-other-writes"
+    }
+  },
+  {
+    "name": "tool environment constraint prevents broad allow",
+    "policy": {
+      "version": 1,
+      "rules": [
+        {
+          "id": "allow-ci-deploy",
+          "scope": "tool_call",
+          "action": "allow",
+          "tool": "deploy",
+          "envKeys": [
+            "CI"
+          ]
+        },
+        {
+          "id": "deny-local-deploy",
+          "scope": "tool_call",
+          "action": "deny",
+          "tool": "deploy"
+        }
+      ]
+    },
+    "request": {
+      "tool": "deploy",
+      "env": {},
+      "input": {
+        "environment": "production"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": "deny-local-deploy"
+    }
+  },
+  {
+    "name": "report only preserves recorded denial",
+    "policy": {
+      "version": 1,
+      "mode": "report_only",
+      "rules": [
+        {
+          "id": "audit-push",
+          "scope": "shell",
+          "action": "deny",
+          "command": "git",
+          "argsPattern": "\\bpush\\b"
+        }
+      ]
+    },
+    "request": {
+      "tool": "powershell",
+      "input": {
+        "command": "git push origin main"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "allow",
+      "matchedRule": "audit-push"
+    }
+  },
+  {
+    "name": "default deny unmatched tool",
+    "policy": {
+      "version": 1,
+      "defaultAction": "deny",
+      "rules": []
+    },
+    "request": {
+      "tool": "read_file",
+      "input": {
+        "path": "README.md"
+      }
+    },
+    "expected": {
+      "action": "deny",
+      "effectiveAction": "deny",
+      "matchedRule": null
+    }
+  }
+]
