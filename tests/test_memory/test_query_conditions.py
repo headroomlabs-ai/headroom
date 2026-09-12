@@ -38,3 +38,37 @@ def test_agent_id_only_still_applied():
 
     assert "agent_id = ?" in conditions
     assert "turn_id = ?" not in conditions
+
+
+def test_metadata_scalar_filters_bind_native_values():
+    """A metadata filter on a numeric/boolean value must bind the NATIVE value.
+
+    ``json_extract`` returns a native SQLite value, so binding ``json.dumps(value)``
+    ("5", "true") compared the column against text and matched nothing (SQLite
+    never equates ``5 = '5'``). Scalars must be bound as-is; only non-scalar
+    (dict/list) values keep the JSON-text form.
+    """
+    conditions, params = _conditions(
+        user_id="u",
+        metadata_filters={"priority": 5, "archived": True, "score": 1.5, "tag": "x"},
+    )
+
+    assert any("json_extract(metadata, '$.priority')" in c for c in conditions)
+    # Native scalars, not their json.dumps text forms.
+    assert 5 in params and "5" not in params
+    assert 1.5 in params
+    assert "x" in params
+    # bool binds as its native value (a JSON ``true`` extracts to 1).
+    assert True in params
+    assert "true" not in params
+
+
+def test_metadata_non_scalar_filter_keeps_json_text():
+    """A dict/list metadata value is not a bindable SQLite type, so it keeps the
+    JSON-text comparison rather than raising when the query runs."""
+    import json
+
+    conditions, params = _conditions(user_id="u", metadata_filters={"tags": ["a", "b"]})
+
+    assert any("json_extract(metadata, '$.tags')" in c for c in conditions)
+    assert json.dumps(["a", "b"]) in params
