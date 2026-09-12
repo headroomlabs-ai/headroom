@@ -679,9 +679,12 @@ def test_wrap_opencode_handles_empty_config_file(
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text("")
 
-    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
-        with patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)):
-            result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_find_available_port", return_value=9000),
+        patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)),
+    ):
+        result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
 
     assert result.exit_code == 0, result.output
     config = json.loads(config_file.read_text(encoding="utf-8"))

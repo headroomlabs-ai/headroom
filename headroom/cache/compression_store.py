@@ -631,6 +631,18 @@ class CompressionStore:
 
             return status
 
+    @property
+    def backend_kind(self) -> str:
+        """Identify the initialized backend without scanning stored content."""
+        from .backends.memory import InMemoryBackend
+        from .backends.sqlite import SQLiteBackend
+
+        if isinstance(self._backend, InMemoryBackend):
+            return "memory"
+        if isinstance(self._backend, SQLiteBackend):
+            return "sqlite"
+        return "custom"
+
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
         with self._lock:
@@ -1013,6 +1025,11 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
     """
+    from headroom import paths
+
+    if paths.process_is_stateless():
+        return None
+
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None

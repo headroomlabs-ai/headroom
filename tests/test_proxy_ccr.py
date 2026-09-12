@@ -18,8 +18,10 @@ from headroom.proxy.server import ProxyConfig, create_app
 
 
 @pytest.fixture
-def client():
-    """Create test client with fresh compression store."""
+def client(request, monkeypatch):
+    """Configure the store before app startup resolves its capability."""
+    if hasattr(request, "param"):
+        monkeypatch.setenv("HEADROOM_CCR_TTL_SECONDS", str(request.param))
     reset_compression_store()
     config = ProxyConfig(
         optimize=False,  # Disable optimization for simpler tests
@@ -70,9 +72,13 @@ class TestCCRRetrieveEndpoint:
         assert "Entry not found" in response.json()["detail"]
         assert "CCR TTL: 1800 seconds" in response.json()["detail"]
 
+    @pytest.mark.parametrize("client", [1], indirect=True)
     def test_retrieve_expired_hash_reports_expiration_detail(self, client):
         """Expired entries report expiration separately from missing hashes."""
-        store = get_compression_store(default_ttl=1)
+        # The app has already initialized the store to report its effective
+        # backend. Singleton options must be configured before that first use.
+        store = get_compression_store()
+        assert store.default_ttl_seconds == 1
         with patch("headroom.cache.compression_store.time.time", return_value=1000.0):
             hash_key = store.store(original="payload", compressed="payload")
 
