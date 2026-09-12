@@ -34,6 +34,11 @@ from headroom.memory.sync_adapters.claude_code import (
     encode_claude_project_path,
     get_claude_memory_dir,
 )
+from headroom.memory.sync_adapters.codebuddy_code import (
+    CodeBuddyAdapter,
+    encode_codebuddy_project_path,
+    get_codebuddy_memory_dir,
+)
 from headroom.memory.sync_adapters.codex_agent import CodexAdapter
 
 # ---------------------------------------------------------------------------
@@ -534,6 +539,154 @@ class TestClaudeCodeAdapter:
 
 
 # ---------------------------------------------------------------------------
+# CodeBuddy adapter tests
+# ---------------------------------------------------------------------------
+
+
+class TestCodeBuddyAdapter:
+    """Test CodeBuddy adapter read/write."""
+
+    @pytest.fixture
+    def memory_dir(self, tmp_path):
+        d = tmp_path / "codebuddy_memory"
+        d.mkdir()
+        return d
+
+    def test_encode_codebuddy_project_path_posix(self):
+        assert encode_codebuddy_project_path("/Users/me/repo") == "-Users-me-repo"
+
+    def test_encode_codebuddy_project_path_windows(self):
+        assert encode_codebuddy_project_path(r"C:\Users\john.doe\work") == "-C-Users-john.doe-work"
+
+    def test_get_codebuddy_memory_dir(self):
+        memory_dir = get_codebuddy_memory_dir(Path(r"C:\Users\john.doe\work"))
+        rendered = str(memory_dir)
+        assert "-C-Users-john.doe-work" in rendered
+        assert rendered.endswith("memory")
+
+    @pytest.mark.asyncio
+    async def test_read_memories_skips_memory_md(self, memory_dir):
+        (memory_dir / "MEMORY.md").write_text("# Index\n- entry")
+        (memory_dir / "fact.md").write_text(
+            "---\nname: Fact\ntype: project\n---\n\nImportant fact."
+        )
+
+        adapter = CodeBuddyAdapter(memory_dir)
+        mems = await adapter.read_memories()
+
+        assert len(mems) == 1
+        assert mems[0].content == "Important fact."
+        assert mems[0].source_file == "fact.md"
+
+    @pytest.mark.asyncio
+    async def test_read_memories_empty_dir(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        adapter = CodeBuddyAdapter(empty)
+        mems = await adapter.read_memories()
+        assert mems == []
+
+    @pytest.mark.asyncio
+    async def test_read_memories_skips_empty_body(self, memory_dir):
+        (memory_dir / "empty.md").write_text("---\nname: Empty\ntype: project\n---\n\n")
+
+        adapter = CodeBuddyAdapter(memory_dir)
+        mems = await adapter.read_memories()
+        assert len(mems) == 0
+
+    @pytest.mark.asyncio
+    async def test_write_creates_valid_md(self, memory_dir):
+        adapter = CodeBuddyAdapter(memory_dir)
+        written = await adapter.write_memories(
+            [
+                {
+                    "content": "Project uses FastAPI",
+                    "category": "architecture",
+                    "headroom_id": "mem_002",
+                    "source_agent": "codex",
+                    "content_hash": "def456",
+                }
+            ]
+        )
+
+        assert written == 1
+        files = list(memory_dir.glob("headroom_*.md"))
+        assert len(files) == 1
+
+        content = files[0].read_text()
+        fm, body = _parse_frontmatter(content)
+        assert fm["type"] == "architecture"
+        assert fm["headroom_id"] == "mem_002"
+        assert fm["source_agent"] == "codex"
+        assert "FastAPI" in body
+
+    @pytest.mark.asyncio
+    async def test_write_updates_memory_md_index(self, memory_dir):
+        adapter = CodeBuddyAdapter(memory_dir)
+        await adapter.write_memories(
+            [
+                {
+                    "content": "Important discovery",
+                    "category": "project",
+                    "headroom_id": "mem_003",
+                    "source_agent": "codebuddy",
+                    "content_hash": "ghi789",
+                }
+            ]
+        )
+
+        memory_md = memory_dir / "MEMORY.md"
+        assert memory_md.exists()
+        index_content = memory_md.read_text()
+        assert "Headroom Shared Memory" in index_content
+        assert "Important discovery" in index_content
+
+    @pytest.mark.asyncio
+    async def test_write_skips_duplicate_content(self, memory_dir):
+        adapter = CodeBuddyAdapter(memory_dir)
+
+        # Pre-create file with same content hash
+        existing = memory_dir / "headroom_project_uses_fastapi.md"
+        fm = "---\nname: Project uses FastAPI\ntype: architecture\n---"
+        body = "Project uses FastAPI"
+        existing.write_text(f"{fm}\n\n{body}\n")
+        import hashlib
+
+        content_hash = hashlib.sha256(body.strip().encode()).hexdigest()[:16]
+
+        written = await adapter.write_memories(
+            [
+                {
+                    "content": "Project uses FastAPI",
+                    "category": "architecture",
+                    "headroom_id": "mem_004",
+                    "source_agent": "codex",
+                    "content_hash": content_hash,
+                }
+            ]
+        )
+
+        assert written == 0
+
+    def test_fingerprint_changes_on_modification(self, memory_dir):
+        (memory_dir / "test.md").write_text("content 1")
+
+        adapter = CodeBuddyAdapter(memory_dir)
+        fp1 = adapter.fingerprint()
+
+        (memory_dir / "test.md").write_text("content 2")
+        fp2 = adapter.fingerprint()
+
+        assert fp1 != fp2
+
+    def test_fingerprint_empty_dir(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        adapter = CodeBuddyAdapter(empty)
+        assert adapter.fingerprint() == "empty"
+
+
+# ---------------------------------------------------------------------------
 # Codex adapter tests
 # ---------------------------------------------------------------------------
 
@@ -672,6 +825,12 @@ class TestCrossAgentInterop:
         return d
 
     @pytest.fixture
+    def codebuddy_dir(self, tmp_path):
+        d = tmp_path / "codebuddy_memory"
+        d.mkdir()
+        return d
+
+    @pytest.fixture
     def agents_md(self, tmp_path):
         return tmp_path / "AGENTS.md"
 
@@ -747,6 +906,65 @@ class TestCrossAgentInterop:
         # AGENTS.md has both (from DB)
         agents_content = agents_md.read_text()
         assert "FastAPI" in agents_content or "8787" in agents_content
+
+    @pytest.mark.asyncio
+    async def test_claude_saves_codebuddy_finds(
+        self, backend, claude_dir, codebuddy_dir, state_path
+    ):
+        """Memory saved in Claude's files appears in CodeBuddy's memory dir after sync."""
+        fm = "---\nname: Linting\ndescription: use ruff\ntype: project\n---"
+        (claude_dir / "linting.md").write_text(f"{fm}\n\nAlways use ruff for linting\n")
+
+        # Sync Claude → DB
+        claude_adapter = ClaudeCodeAdapter(claude_dir)
+        await sync(backend, claude_adapter, "tcms", state_path=state_path, force=True)
+
+        # Sync DB → CodeBuddy
+        codebuddy_adapter = CodeBuddyAdapter(codebuddy_dir)
+        result = await sync(backend, codebuddy_adapter, "tcms", state_path=state_path, force=True)
+
+        assert result.exported >= 1
+        files = list(codebuddy_dir.glob("headroom_*.md"))
+        all_content = " ".join(f.read_text() for f in files)
+        assert "ruff" in all_content
+
+    @pytest.mark.asyncio
+    async def test_codebuddy_saves_claude_finds(
+        self, backend, claude_dir, codebuddy_dir, state_path
+    ):
+        """Memory saved in CodeBuddy's files appears in Claude's memory dir after sync."""
+        fm = "---\nname: Port\ndescription: default port\ntype: project\n---"
+        (codebuddy_dir / "port.md").write_text(f"{fm}\n\nDefault port is 8787\n")
+
+        # Sync CodeBuddy → DB
+        codebuddy_adapter = CodeBuddyAdapter(codebuddy_dir)
+        await sync(backend, codebuddy_adapter, "tcms", state_path=state_path, force=True)
+
+        # Sync DB → Claude
+        claude_adapter = ClaudeCodeAdapter(claude_dir)
+        result = await sync(backend, claude_adapter, "tcms", state_path=state_path, force=True)
+
+        assert result.exported >= 1
+        files = list(claude_dir.glob("headroom_*.md"))
+        all_content = " ".join(f.read_text() for f in files)
+        assert "8787" in all_content
+
+    @pytest.mark.asyncio
+    async def test_codebuddy_saves_codex_finds(self, backend, codebuddy_dir, agents_md, state_path):
+        """Memory saved in CodeBuddy's files appears in Codex AGENTS.md after sync."""
+        fm = "---\nname: Framework\ndescription: web framework\ntype: project\n---"
+        (codebuddy_dir / "framework.md").write_text(f"{fm}\n\nUses FastAPI\n")
+
+        # Sync CodeBuddy → DB
+        codebuddy_adapter = CodeBuddyAdapter(codebuddy_dir)
+        await sync(backend, codebuddy_adapter, "tcms", state_path=state_path, force=True)
+
+        # Sync DB → Codex
+        codex_adapter = CodexAdapter(agents_md)
+        result = await sync(backend, codex_adapter, "tcms", state_path=state_path, force=True)
+
+        assert result.exported >= 1
+        assert "FastAPI" in agents_md.read_text()
 
 
 def test_sync_backend_uses_onnx_embedder(tmp_path):

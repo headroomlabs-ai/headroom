@@ -32,19 +32,13 @@ def test_ensure_proxy_recovers_matching_persistent_deployment(monkeypatch) -> No
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: False)
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
     monkeypatch.setattr(
         "headroom.install.supervisors.start_supervisor",
         lambda manifest: calls.append(f"start:{manifest.profile}"),
     )
     monkeypatch.setattr(
         "headroom.install.runtime.wait_ready", lambda manifest, timeout_seconds=45: True
-    )
-    monkeypatch.setattr(
-        wrap_cli,
-        "_start_proxy",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("ephemeral proxy should not start")
-        ),
     )
 
     proc, actual_port = wrap_cli._ensure_proxy(8787, False)
@@ -60,6 +54,8 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_port_bind_error", lambda port: None)
     monkeypatch.setattr(
         "headroom.install.supervisors.start_supervisor",
         lambda manifest: calls.append(f"start:{manifest.profile}"),
@@ -72,7 +68,7 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
 
     assert proc is None
     assert actual_port == 8787
-    assert calls == ["start:default"]
+    assert calls == []
 
 
 def test_ensure_proxy_rejects_unhealthy_persistent_deployment(monkeypatch) -> None:
@@ -870,6 +866,41 @@ def test_ensure_proxy_restarts_recovered_persistent_for_openai_api_url_mismatch(
         False,
         openai_api_url="https://api.business.githubcopilot.com",
     )
+
+    assert proc is None
+    assert actual_port == 8787
+    assert calls == [("restart", "default", 8787)]
+
+
+def test_ensure_proxy_restarts_recovered_persistent_for_codebuddy_backend(
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    health = {
+        "version": wrap_cli._HEADROOM_VERSION,
+        "runtime": {"websocket_sessions": {"active_sessions": 0, "active_relay_tasks": 0}},
+        "config": {
+            "pid": 12345,
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "backend": "anthropic",
+            "openai_api_url": None,
+        },
+    }
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
+    monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
+    monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_cli, "_query_proxy_health", lambda port: health)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_restart_persistent_proxy",
+        lambda manifest, port: calls.append(("restart", manifest.profile, port)) or True,
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, backend="codebuddy")
 
     assert proc is None
     assert actual_port == 8787

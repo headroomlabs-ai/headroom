@@ -64,6 +64,7 @@ def test_env_target_and_config_paths(monkeypatch, tmp_path: Path) -> None:
     ]
 
     assert install_paths.claude_settings_path() == tmp_path / ".claude" / "settings.json"
+    assert install_paths.codebuddy_settings_path() == tmp_path / ".codebuddy" / "settings.json"
     assert install_paths.codex_config_path() == tmp_path / ".codex" / "config.toml"
     assert install_paths.openclaw_config_path() == tmp_path / ".openclaw" / "openclaw.json"
     assert (

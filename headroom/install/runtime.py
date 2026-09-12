@@ -119,11 +119,34 @@ def _mount_source(home: str, subdir: str) -> str:
     return f"{home}/{subdir}"
 
 
+def _override_backend(proxy_args: list[str], backend: str) -> list[str]:
+    """Replace the --backend value in proxy_args with *backend*.
+
+    If ``--backend`` is not present, append it.  Returns a new list.
+    """
+    result = list(proxy_args)
+    for i, arg in enumerate(result):
+        if arg == "--backend" and i + 1 < len(result):
+            result[i + 1] = backend
+            return result
+    # --backend not found; append it
+    return result + ["--backend", backend]
+
+
 def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     """Build the raw foreground command that runs the proxy."""
 
+    proxy_args = manifest.proxy_args
+
+    # Allow HEADROOM_BACKEND env var to override the manifest's --backend value.
+    # This lets wrappers like `wrap codebuddy` pass HEADROOM_BACKEND=codebuddy
+    # to the install agent run subprocess, overriding the manifest default.
+    env_backend = os.environ.get("HEADROOM_BACKEND")
+    if env_backend:
+        proxy_args = _override_backend(proxy_args, env_backend)
+
     if manifest.runtime_kind == RuntimeKind.PYTHON.value:
-        return [sys.executable, "-m", "headroom.cli", "proxy", *manifest.proxy_args]
+        return [sys.executable, "-m", "headroom.cli", "proxy", *proxy_args]
 
     _ensure_host_dirs()
     home = str(Path.home())

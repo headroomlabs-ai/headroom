@@ -30,7 +30,7 @@ This installs a background service on the current machine, applies persistent to
 ### Persistent watchdog task
 
 ```bash
-headroom install apply --preset persistent-task --providers manual --target claude --target codex
+headroom install apply --preset persistent-task --providers manual --target claude --target codebuddy --target codex
 ```
 
 This installs a scheduled recovery path instead of a traditional always-running service.
@@ -86,6 +86,7 @@ For `persistent-docker`, the runtime is always Docker.
 Provider scope is intentionally conservative. The current direct adapters are:
 
 - Claude Code -> `~/.claude/settings.json` `env`
+- CodeBuddy -> `~/.codebuddy/settings.json` `env`
 - Codex -> managed block in `~/.codex/config.toml`
 - OpenClaw -> existing `wrap openclaw` / `unwrap openclaw` flow
 
@@ -97,7 +98,7 @@ For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user`
 |---|---|
 | `--providers auto` | Detect supported tools on the host and configure the best available defaults |
 | `--providers all` | Configure all known targets |
-| `--providers manual --target ...` | Configure only the named tools |
+| `--providers manual --target ...` | Configure only the named tools (claude, codebuddy, codex, copilot, aider, cursor, openclaw) |
 
 Examples:
 

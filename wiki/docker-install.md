@@ -36,6 +36,7 @@ The wrapper keeps Headroom inside Docker and mounts host state back into the con
 - project workspace -> `/workspace`
 - `~/.headroom`
 - `~/.claude`
+- `~/.codebuddy`
 - `~/.codex`
 - `~/.gemini`
 
@@ -78,6 +79,7 @@ docker run --rm -it \
 Supported host wrap flows:
 
 - `headroom wrap claude`
+- `headroom wrap codebuddy`
 - `headroom wrap codex`
 - `headroom wrap aider`
 - `headroom wrap cursor`
@@ -194,7 +196,7 @@ That keeps provider auth and runtime config working without maintaining a separa
 ## Notes
 
 - Docker is the only required Headroom runtime dependency on the host.
-- Wrapped tools like Claude Code, Codex CLI, Aider, and Cursor still run on the host when you use `headroom wrap ...`.
+- Wrapped tools like Claude Code, CodeBuddy, Codex CLI, Aider, and Cursor still run on the host when you use `headroom wrap ...`.
 - The install scripts are idempotent: rerunning them refreshes the wrapper and image without duplicating shell profile blocks.
 - For persistent service and task installs, use the Python-native `headroom install ...` workflow described in [Persistent Installs](persistent-installs.md).
 - For Docker-native `headroom install ...`, the wrapper persists its profile manifest under `~/.headroom/deploy/<profile>/`.

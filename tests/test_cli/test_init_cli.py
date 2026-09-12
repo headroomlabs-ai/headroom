@@ -69,7 +69,7 @@ def test_init_fails_when_auto_detection_empty(monkeypatch) -> None:
     assert "No supported user-scope agents were found on PATH" in result.output
     assert "probed the following agents" in result.output
     # Every in-scope target is listed with its lookup status.
-    for target in ("claude", "codex", "copilot", "openclaw"):
+    for target in ("claude", "codebuddy", "codex", "copilot", "openclaw"):
         assert target in result.output
     # The user is told that -g is still valid and given a concrete next step.
     assert "-g" in result.output
@@ -85,7 +85,7 @@ def test_format_empty_detection_error_local_scope(monkeypatch) -> None:
     message = init_cli._format_empty_detection_error(global_scope=False)
 
     assert "local-scope agents" in message
-    assert "claude" in message and "codex" in message
+    assert "claude" in message and "codebuddy" in message and "codex" in message
     # Copilot / openclaw are global-only; must not be suggested for local.
     assert "headroom init copilot" not in message
     assert "headroom init openclaw" not in message
@@ -138,7 +138,7 @@ def test_init_verbose_enables_debug_logging_on_stderr(monkeypatch) -> None:
     assert "[headroom init]" in stderr
     assert "detect_init_targets" in stderr
     assert "global_scope=True" in stderr
-    for target in ("claude", "codex", "copilot", "openclaw"):
+    for target in ("claude", "codebuddy", "codex", "copilot", "openclaw"):
         assert target in stderr
 
 
@@ -316,11 +316,19 @@ def test_detect_init_targets_respects_scope(monkeypatch) -> None:
     monkeypatch.setattr(
         init_cli.shutil,
         "which",
-        lambda name: name if name in {"claude", "copilot", "codex", "openclaw"} else None,
+        lambda name: (
+            name if name in {"claude", "codebuddy", "copilot", "codex", "openclaw"} else None
+        ),
     )
 
-    assert init_cli.detect_init_targets(False) == ["claude", "codex"]
-    assert init_cli.detect_init_targets(True) == ["claude", "copilot", "codex", "openclaw"]
+    assert init_cli.detect_init_targets(False) == ["claude", "codebuddy", "codex"]
+    assert init_cli.detect_init_targets(True) == [
+        "claude",
+        "codebuddy",
+        "copilot",
+        "codex",
+        "openclaw",
+    ]
 
 
 def test_marketplace_source_prefers_env_override(monkeypatch) -> None:
@@ -1354,6 +1362,13 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         init_cli,
+        "_init_codebuddy",
+        lambda **kwargs: calls.append(
+            ("codebuddy", (kwargs["global_scope"], kwargs["profile"], kwargs["port"]))
+        ),
+    )
+    monkeypatch.setattr(
+        init_cli,
         "_init_copilot",
         lambda **kwargs: calls.append(
             ("copilot", (kwargs["global_scope"], kwargs["profile"], kwargs["port"]))
@@ -1373,7 +1388,7 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
     )
 
     init_cli._run_init_targets(
-        targets=["claude", "copilot", "codex", "openclaw"],
+        targets=["claude", "codebuddy", "copilot", "codex", "openclaw"],
         global_scope=True,
         port=9000,
         backend="openai",
@@ -1384,6 +1399,7 @@ def test_run_init_targets_dispatches_supported_targets(monkeypatch) -> None:
 
     assert calls == [
         ("claude", (True, "init-profile", 9000)),
+        ("codebuddy", (True, "init-profile", 9000)),
         ("copilot", (True, "init-profile", 9000)),
         ("codex", (True, "init-profile", 9000)),
         ("openclaw", (True, 9000)),
@@ -1554,3 +1570,48 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+# ---------------------------------------------------------------------------
+# CodeBuddy hooks tests
+# ---------------------------------------------------------------------------
+
+
+def test_init_codebuddy_hooks_sets_env_with_v2(monkeypatch, tmp_path: Path) -> None:
+    """_ensure_codebuddy_hooks must set CODEBUDDY_BASE_URL with /v2 prefix."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings = tmp_path / ".codebuddy" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}", encoding="utf-8")
+
+    init_cli._ensure_codebuddy_hooks(settings, "test-profile", 8787)
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["env"]["CODEBUDDY_BASE_URL"] == "http://127.0.0.1:8787/v2"
+
+
+def test_init_codebuddy_hooks_adds_session_start_hook(monkeypatch, tmp_path: Path) -> None:
+    """_ensure_codebuddy_hooks must add SessionStart and PreToolUse hooks."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings = tmp_path / ".codebuddy" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}", encoding="utf-8")
+
+    init_cli._ensure_codebuddy_hooks(settings, "test-profile", 8787)
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert "hooks" in data
+    assert "SessionStart" in data["hooks"]
+    assert "PreToolUse" in data["hooks"]
+
+    # Verify hooks contain the headroom marker
+    session_hooks = data["hooks"]["SessionStart"]
+    assert any(
+        isinstance(entry, dict)
+        and isinstance(entry.get("hooks"), list)
+        and any(
+            isinstance(h, dict) and "headroom-init-codebuddy" in str(h.get("command", ""))
+            for h in entry["hooks"]
+        )
+        for entry in session_hooks
+    )

@@ -248,6 +248,13 @@ def _register_openai_image_routes(app: FastAPI, proxy: Any) -> None:
         _register_openai_image_route(app, proxy, endpoint)
 
 
+def _register_codebuddy_routes(app: FastAPI, proxy: Any) -> None:
+    @app.post("/v2/chat/completions")
+    async def codebuddy_v2_chat(request: Request):
+        request.state.upstream_path = "/v2/chat/completions"
+        return await proxy.handle_openai_chat(request)
+
+
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
@@ -298,6 +305,8 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
     _register_openai_responses_routes(app, proxy)
+
+    _register_codebuddy_routes(app, proxy)
 
     _register_provider_handler_routes(app, proxy)
 

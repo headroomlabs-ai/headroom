@@ -429,6 +429,29 @@ def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
     assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
 
 
+def test_install_apply_codebuddy_target_selects_manual_mode_and_backend(monkeypatch) -> None:
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(main, ["install", "apply", "--target", "codebuddy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["targets"] == ["codebuddy"]
+    assert captured["provider_mode"] == "manual"
+    assert captured["backend"] == "codebuddy"
+
+
+def test_install_apply_codebuddy_respects_explicit_backend(monkeypatch) -> None:
+    captured = _apply_capturing_build_manifest(monkeypatch)
+
+    result = CliRunner().invoke(
+        main,
+        ["install", "apply", "--target", "codebuddy", "--backend", "anthropic"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["backend"] == "anthropic"
+
+
 def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 

@@ -9,6 +9,7 @@ coding agent reads on startup. Writers handle:
 
 Supported agents:
 - Claude Code: MEMORY.md (auto-memory) + per-topic files
+- CodeBuddy: MEMORY.md (project memory) + per-topic files
 - Cursor: .cursor/rules/*.mdc (YAML frontmatter + markdown)
 - Codex: AGENTS.md / ~/.codex/instructions.md
 - Aider: Convention files referenced in .aider.conf.yml
@@ -18,6 +19,7 @@ Supported agents:
 
 from headroom.memory.writers.base import AgentWriter, ExportResult, MemoryEntry
 from headroom.memory.writers.claude_writer import ClaudeCodeMemoryWriter
+from headroom.memory.writers.codebuddy_writer import CodeBuddyMemoryWriter
 from headroom.memory.writers.codex_writer import CodexMemoryWriter
 from headroom.memory.writers.cursor_writer import CursorMemoryWriter
 from headroom.memory.writers.generic_writer import GenericMemoryWriter
@@ -25,6 +27,7 @@ from headroom.memory.writers.generic_writer import GenericMemoryWriter
 __all__ = [
     "AgentWriter",
     "ClaudeCodeMemoryWriter",
+    "CodeBuddyMemoryWriter",
     "CodexMemoryWriter",
     "CursorMemoryWriter",
     "ExportResult",

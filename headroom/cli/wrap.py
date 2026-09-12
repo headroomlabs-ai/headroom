@@ -2,6 +2,7 @@
 
 Usage:
     headroom wrap claude                    # Start proxy + claude
+    headroom wrap codebuddy                 # Start proxy + codebuddy
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap vscode                    # Transparently proxy VS Code Copilot
     headroom wrap vscode-claude             # Transparently proxy VS Code Claude Code
@@ -93,6 +94,7 @@ from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
+from headroom.providers.codebuddy import proxy_base_url as _codebuddy_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
@@ -191,6 +193,10 @@ from headroom.providers.zcode import (
 from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
+
+# Default upstream API URL for CodeBuddy (Tencent SSO Copilot gateway).
+# Can be overridden via OPENAI_TARGET_API_URL environment variable.
+DEFAULT_CODEBUDDY_API_URL = "https://tencent.sso.copilot.tencent.com"
 
 _COPILOT_PROXY_SEED_ENV_VARS = (
     "GITHUB_COPILOT_API_TOKEN",
@@ -698,7 +704,9 @@ def _start_proxy(
     if _region:
         cmd.extend(["--region", _region])
 
-    if openai_api_url:
+    # When backend is "codebuddy", skip --openai-api-url on the command line;
+    # proxy.py normalises codebuddy→anthropic internally and sets the URL.
+    if openai_api_url and backend != "codebuddy":
         cmd.extend(["--openai-api-url", openai_api_url])
 
     if anthropic_api_url:
@@ -733,10 +741,14 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    # Propagate backend to subprocess env so install agent run can pick it up
+    # when it builds the proxy command from a persistent manifest.
+    if backend:
+        proxy_env["HEADROOM_BACKEND"] = backend
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
-    if openai_api_url:
+    if openai_api_url and backend != "codebuddy":
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
     if anthropic_api_url:
         proxy_env["ANTHROPIC_TARGET_API_URL"] = anthropic_api_url
@@ -1162,6 +1174,75 @@ def _foundry_proxy_url(proxy_url: str) -> str:
     proxy URL Claude Code receives mirrors the real Foundry URL shape.
     """
     return proxy_url.rstrip("/") + "/anthropic"
+
+
+def _remove_codebuddy_rtk_hooks(settings_path: Path | None = None) -> bool:
+    """Remove Headroom/rtk-managed CodeBuddy hook entries from settings.json."""
+
+    path = settings_path or (Path.home() / ".codebuddy" / "settings.json")
+    if not path.exists():
+        return False
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+
+    changed = False
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        retained_entries: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                retained_entries.append(entry)
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                retained_entries.append(entry)
+                continue
+            retained_hooks = [
+                item
+                for item in hook_items
+                if not (
+                    isinstance(item, dict)
+                    and "rtk" in str(item.get("command", "")).lower()
+                    and ("hook" in str(item.get("command", "")).lower())
+                    and (
+                        "claude" in str(item.get("command", "")).lower()
+                        or "codebuddy" in str(item.get("command", "")).lower()
+                    )
+                )
+            ]
+            if len(retained_hooks) != len(hook_items):
+                changed = True
+            if retained_hooks:
+                retained_entries.append({**entry, "hooks": retained_hooks})
+            elif len(retained_hooks) == len(hook_items):
+                retained_entries.append(entry)
+            else:
+                changed = True
+        if retained_entries:
+            hooks[event] = retained_entries
+        else:
+            del hooks[event]
+            changed = True
+
+    if not changed:
+        return False
+
+    if hooks:
+        payload["hooks"] = hooks
+    else:
+        payload.pop("hooks", None)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return True
 
 
 def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
@@ -4078,6 +4159,12 @@ def _ensure_proxy_unlocked(
     under the same startup critical section.
     """
     helpers = _live_wrap_module()
+    # Propagate the requested backend so that persistent-proxy restarts
+    # (via ``install agent run``) pick up the correct --backend value from
+    # HEADROOM_BACKEND rather than the manifest default.
+    if backend:
+        os.environ["HEADROOM_BACKEND"] = backend
+
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
         or bool(copilot_refresh_oauth_token)
@@ -4154,6 +4241,17 @@ def _ensure_proxy_unlocked(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    elif backend == "codebuddy":
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(DEFAULT_CODEBUDDY_API_URL)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+                    if backend:
+                        effective_backend = "anthropic" if backend == "codebuddy" else backend
+                        if running_config.get("backend", "anthropic") != effective_backend:
+                            missing.append("backend")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
@@ -4172,6 +4270,7 @@ def _ensure_proxy_unlocked(
                             memory,
                             learn,
                             code_graph,
+                            backend,
                             openai_api_url,
                             copilot_subscription_seed_requested,
                         )
@@ -4218,6 +4317,17 @@ def _ensure_proxy_unlocked(
                         requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                         if running_openai_url != requested_openai_url:
                             missing.append("openai-api-url")
+                    elif backend == "codebuddy":
+                        running_openai_url = _normalize_proxy_api_url(
+                            running_config.get("openai_api_url")
+                        )
+                        requested_openai_url = _normalize_proxy_api_url(DEFAULT_CODEBUDDY_API_URL)
+                        if running_openai_url != requested_openai_url:
+                            missing.append("openai-api-url")
+                    if backend:
+                        effective_backend = "anthropic" if backend == "codebuddy" else backend
+                        if running_config.get("backend", "anthropic") != effective_backend:
+                            missing.append("backend")
 
                     if missing:
                         flags_str = ", ".join(f"--{f}" for f in missing)
@@ -4313,6 +4423,23 @@ def _ensure_proxy_unlocked(
                     requested_openai_url = _normalize_proxy_api_url(openai_api_url)
                     if running_openai_url != requested_openai_url:
                         missing.append("openai-api-url")
+                elif backend == "codebuddy":
+                    # codebuddy implies a specific openai_api_url; check it.
+                    running_openai_url = _normalize_proxy_api_url(
+                        running_config.get("openai_api_url")
+                    )
+                    requested_openai_url = _normalize_proxy_api_url(DEFAULT_CODEBUDDY_API_URL)
+                    if running_openai_url != requested_openai_url:
+                        missing.append("openai-api-url")
+
+                # Check backend mismatch: "codebuddy" normalises to "anthropic" inside
+                # the proxy, so compare against the effective backend that the proxy
+                # would report after normalisation.
+                if backend:
+                    _effective_requested = "anthropic" if backend == "codebuddy" else backend
+                    running_backend = running_config.get("backend", "anthropic")
+                    if running_backend != _effective_requested:
+                        missing.append("backend")
                 if vertex_api_url or clear_vertex_api_url:
                     running_vertex_url = _normalize_proxy_api_url(
                         running_config.get("vertex_api_url")
@@ -5612,6 +5739,217 @@ def unwrap_claude(
         click.echo(
             "  Claude local wrap settings were removed, but effective routing residue remains."
         )
+    click.echo()
+
+
+# =============================================================================
+# CodeBuddy
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Skip headroom MCP server registration (compression markers will be unactionable)",
+)
+@click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option(
+    "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
+)
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("codebuddy_args", nargs=-1, type=click.UNPROCESSED)
+def codebuddy(
+    port: int,
+    no_mcp: bool,
+    no_serena: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    codebuddy_args: tuple,
+) -> None:
+    """Launch CodeBuddy through Headroom proxy.
+
+    \b
+    Sets CODEBUDDY_BASE_URL to route all CodeBuddy API calls through Headroom.
+    All unknown flags are passed through to codebuddy (e.g. --resume, --model).
+
+    \b
+    Examples:
+        headroom wrap codebuddy                    # Start everything
+        headroom wrap codebuddy --memory           # With persistent memory
+        headroom wrap codebuddy --resume <id>      # Resume a session
+        headroom wrap codebuddy --no-mcp           # Skip MCP retrieve tool registration
+    """
+    if prepare_only:
+        return
+
+    codebuddy_bin = shutil.which("codebuddy")
+    if not codebuddy_bin:
+        click.echo("Error: 'codebuddy' not found in PATH.")
+        click.echo("Install CodeBuddy first.")
+        raise SystemExit(1)
+
+    proxy_holder: list[subprocess.Popen | None] = [None]
+    cleanup = _make_cleanup(proxy_holder, port)
+    signal.signal(signal.SIGINT, _ignore_child_sigint)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Memory sync BEFORE proxy startup
+    if memory:
+        try:
+            from headroom._subprocess import run as _sp_run
+
+            mem_dir = Path.cwd() / ".headroom"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            _sync_db = str(mem_dir / "memory.db")
+            _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+            click.echo(f"  Syncing memory (user={_sync_user})...")
+            sync_result = _sp_run(
+                [
+                    sys.executable,
+                    "-m",
+                    "headroom.memory.sync",
+                    "--db",
+                    _sync_db,
+                    "--user",
+                    _sync_user,
+                    "--agent",
+                    "codebuddy",
+                    "--force",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if sync_result.returncode == 0 and sync_result.stdout.strip():
+                import json as _json
+
+                stats = _json.loads(sync_result.stdout.strip().split("\n")[-1])
+                imp, exp, ms = stats["imported"], stats["exported"], stats["ms"]
+                if imp or exp:
+                    click.echo(f"  Memory synced: {imp} imported, {exp} exported ({ms}ms)")
+                else:
+                    click.echo(f"  Memory: up to date ({ms}ms)")
+            elif sync_result.returncode != 0:
+                click.echo(f"  Warning: memory sync error: {sync_result.stderr[-200:]}")
+        except Exception as e:
+            click.echo(f"  Warning: memory sync failed: {e}")
+
+    try:
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║          HEADROOM WRAP: CODEBUDDY             ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+
+        # --backend codebuddy routes to tencent.sso.copilot.tencent.com.
+        # The proxy normalises codebuddy→anthropic internally and sets the
+        # default openai_api_url, so we do NOT pass --openai-api-url on the
+        # command line.  Mismatch detection in _ensure_proxy uses
+        # DEFAULT_CODEBUDDY_API_URL when backend is "codebuddy".
+        proxy_holder[0], actual_port = _ensure_proxy(
+            port,
+            no_proxy,
+            learn=learn,
+            memory=memory,
+            agent_type="codebuddy",
+            backend="codebuddy",
+        )
+
+        if not no_mcp:
+            from headroom.mcp_registry import CodeBuddyRegistrar
+
+            _setup_headroom_mcp(CodeBuddyRegistrar(), port, verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping MCP retrieve tool (--no-mcp)")
+
+        if not no_serena:
+            from headroom.mcp_registry import CodeBuddyRegistrar
+
+            _setup_serena_mcp(CodeBuddyRegistrar(), context="codebuddy", verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping Serena MCP (--no-serena)")
+
+        click.echo()
+        click.echo("  Launching CodeBuddy (API routed through Headroom)...")
+        click.echo(f"  CODEBUDDY_BASE_URL={_codebuddy_proxy_base_url(port)}")
+        if codebuddy_args:
+            click.echo(f"  Extra args: {' '.join(codebuddy_args)}")
+        _print_telemetry_notice()
+        click.echo()
+
+        env = os.environ.copy()
+        env["CODEBUDDY_BASE_URL"] = _codebuddy_proxy_base_url(port)
+
+        result = subprocess.run([codebuddy_bin, *codebuddy_args], env=env)
+        raise SystemExit(result.returncode)
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(f"  Error: {e}")
+        raise SystemExit(1) from e
+    finally:
+        cleanup()
+
+
+# =============================================================================
+# CodeBuddy (unwrap)
+# =============================================================================
+
+
+@unwrap.command("codebuddy")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+@click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
+def unwrap_codebuddy(
+    port: int,
+    no_stop_proxy: bool,
+    keep_mcp: bool,
+) -> None:
+    """Undo durable setup from ``headroom wrap codebuddy``."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║        HEADROOM UNWRAP: CODEBUDDY             ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    if not keep_mcp:
+        from headroom.mcp_registry import CodeBuddyRegistrar
+
+        registrar = CodeBuddyRegistrar()
+        if registrar.detect():
+            removed_headroom = registrar.unregister_server("headroom")
+            serena_status = _remove_headroom_installed_serena_mcp(registrar)
+            if removed_headroom:
+                click.echo("  Removed Headroom MCP retrieve tool from CodeBuddy.")
+            else:
+                click.echo("  Headroom MCP retrieve tool was not registered in CodeBuddy.")
+            if serena_status == "removed":
+                click.echo("  Removed Headroom-installed Serena MCP server from CodeBuddy.")
+            elif serena_status == "failed":
+                click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+        else:
+            click.echo("  CodeBuddy not detected; skipped MCP cleanup.")
+    else:
+        click.echo("  Kept CodeBuddy MCP registrations (--keep-mcp).")
+
+    if _remove_codebuddy_rtk_hooks():
+        click.echo("  Removed retired rtk CodeBuddy hook from settings.json.")
+
+    click.echo()
+    click.echo("✓ CodeBuddy is no longer durably wrapped by Headroom.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
 
 
