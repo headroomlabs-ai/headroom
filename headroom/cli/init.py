@@ -332,7 +332,10 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'model_provider = "headroom"\n'
         f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
         "[model_providers.headroom]\n"
-        'name = "Headroom init proxy"\n'
+        # Codex derives remote-compaction support from the provider display
+        # name. Keep the proxy's provider id as ``headroom`` for routing, but
+        # use the built-in OpenAI name so the capability is preserved.
+        'name = "OpenAI"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
         f"{requires_openai_auth}"
