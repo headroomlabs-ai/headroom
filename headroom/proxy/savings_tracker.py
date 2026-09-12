@@ -24,6 +24,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.proxy import project_name_policy
+from headroom.proxy.cost import _bucket_by_cache_mix, _cache_input_rates
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
@@ -329,6 +330,71 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return 0.0
 
 
+def _model_input_rates(model: str) -> tuple[float, float, float]:
+    """``(cache_read, cache_write, list)`` per-token input rates for ``model``.
+
+    Rates and the missing-cache-price fallback come from ``cost.py``'s
+    ``_cache_input_rates``, the same policy the cost card prices real requests
+    with, so the two surfaces cannot disagree about what a deferred token would
+    have cost. Only the catalog lookup is local, because this module resolves
+    model names through its own alias-aware ``_resolve_litellm_model``.
+
+    Mirrors ``_estimate_compression_savings_usd``'s outer rules: an unavailable
+    litellm or an unpriced model falls back to
+    ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN`` for all three rates, and a
+    legitimately free model (a real ``0.0``) prices as free rather than as
+    "unknown".
+    """
+    litellm = _get_litellm_module()
+    if litellm is not None:
+        try:
+            rates = _cache_input_rates(litellm.model_cost.get(_resolve_litellm_model(model), {}))
+        except Exception:
+            rates = None
+        if rates is not None:
+            return rates
+    fallback = float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
+    return (fallback, fallback, fallback)
+
+
+def _estimate_tool_schema_savings_usd(
+    model: str,
+    tokens_saved: int,
+    *,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_tokens: int = 0,
+) -> float:
+    """Estimate tool-schema deferral savings in USD, priced by the cache mix.
+
+    Deferred schemas are byte-stable prompt-prefix content. Had they been sent
+    they would have ridden the SAME region of the request as everything else in
+    the prefix: cold-written once, read at the cache-read discount on warm
+    turns, re-written when the TTL expired. Pricing the whole layer at the full
+    input rate (as message compression correctly is) therefore overstates it by
+    roughly 10x on cache-heavy traffic -- enough to push a blended $/token
+    figure past the input list price of every model in the mix, a rate no real
+    input saving can reach.
+
+    Splits by the request's own observed mix with ``cost.py``'s
+    ``_bucket_by_cache_mix``, the same helper the cost card uses for exactly
+    this counterfactual, so the two surfaces cannot drift into quoting
+    different prices for the same deferred tokens. A request with no billed
+    input breakdown falls back to list price for the whole amount, matching
+    that helper's documented behaviour.
+    """
+    if tokens_saved <= 0:
+        return 0.0
+    read_share, write_share, list_share = _bucket_by_cache_mix(
+        tokens_saved,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        uncached_tokens=uncached_tokens,
+    )
+    read_rate, write_rate, list_rate = _model_input_rates(model)
+    return read_share * read_rate + write_share * write_rate + list_share * list_rate
+
+
 def estimate_request_savings_usd(
     model: str,
     *,
@@ -336,6 +402,8 @@ def estimate_request_savings_usd(
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
     cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    uncached_tokens: int = 0,
 ) -> dict[str, float]:
     """Price one request's distinct savings layers for external telemetry.
 
@@ -348,8 +416,12 @@ def estimate_request_savings_usd(
         "compression": _estimate_compression_savings_usd(
             model, max(_coerce_int(compression_tokens_saved), 0)
         ),
-        "tool_schema": _estimate_compression_savings_usd(
-            model, max(_coerce_int(tool_schema_tokens_saved), 0)
+        "tool_schema": _estimate_tool_schema_savings_usd(
+            model,
+            max(_coerce_int(tool_schema_tokens_saved), 0),
+            cache_read_tokens=max(_coerce_int(cache_read_tokens), 0),
+            cache_write_tokens=max(_coerce_int(cache_write_tokens), 0),
+            uncached_tokens=max(_coerce_int(uncached_tokens), 0),
         ),
         "output_shaping": _estimate_output_savings_usd(
             model, max(_coerce_int(output_tokens_saved), 0)

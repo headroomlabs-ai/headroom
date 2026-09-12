@@ -12,6 +12,7 @@ import importlib.util
 import logging
 import math
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -169,6 +170,35 @@ def _bucket_by_cache_mix(
     read_part = tokens * max(0, cache_read_tokens) / billed_in
     write_part = tokens * max(0, cache_write_tokens) / billed_in
     return read_part, write_part, tokens - read_part - write_part
+
+
+def _cache_input_rates(
+    info: Mapping[str, Any], *, long_context: bool = False
+) -> tuple[float, float, float] | None:
+    """``(cache_read, cache_write, list)`` per-token rates from a catalog entry.
+
+    The single fallback policy for every consumer of LiteLLM cache pricing
+    (``CostTracker._get_cache_prices`` here, ``savings_tracker``'s tool-schema
+    estimator there), so two surfaces cannot quote different prices for the same
+    tokens of the same request. A model that publishes no cache pricing bills
+    its cache traffic at list, so an absent ``cache_read_input_token_cost`` /
+    ``cache_creation_input_token_cost`` reads as ``input_cost_per_token`` —
+    never as a hardcoded provider multiplier, which goes stale per model and
+    per context tier and would overstate a non-Anthropic provider's savings.
+
+    Returns ``None`` only when the list price itself is unknown; a real ``0.0``
+    is a genuinely free model and prices as free.
+    """
+    uncached = info.get("input_cost_per_token")
+    if uncached is None:
+        return None
+    cache_read = info.get("cache_read_input_token_cost", uncached)
+    cache_write = info.get("cache_creation_input_token_cost", uncached)
+    if long_context:
+        uncached = info.get("input_cost_per_token_above_200k_tokens") or uncached
+        cache_read = info.get("cache_read_input_token_cost_above_200k_tokens") or cache_read
+        cache_write = info.get("cache_creation_input_token_cost_above_200k_tokens") or cache_write
+    return (float(cache_read), float(cache_write), float(uncached))
 
 
 def _summarize_transforms(transforms: list[str]) -> str:
@@ -1294,20 +1324,13 @@ class CostTracker:
         try:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-            resolved = resolve_litellm_model(model)
-            info = litellm.model_cost.get(resolved, {})
-            uncached = info.get("input_cost_per_token")
-            if not uncached:
+            info = litellm.model_cost.get(resolve_litellm_model(model), {})
+            # A free model (a real 0.0) has always read as "no pricing" here and
+            # the callers below all skip it; keep that, and let
+            # _cache_input_rates own the rate/fallback policy itself.
+            if not info.get("input_cost_per_token"):
                 return None
-            cache_read = info.get("cache_read_input_token_cost", uncached)
-            cache_write = info.get("cache_creation_input_token_cost", uncached)
-            if long_context:
-                uncached = info.get("input_cost_per_token_above_200k_tokens") or uncached
-                cache_read = info.get("cache_read_input_token_cost_above_200k_tokens") or cache_read
-                cache_write = (
-                    info.get("cache_creation_input_token_cost_above_200k_tokens") or cache_write
-                )
-            return (cache_read, cache_write, uncached)
+            return _cache_input_rates(info, long_context=long_context)
         except Exception:
             return None
 
