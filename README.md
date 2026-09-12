@@ -121,9 +121,10 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 Launch a wrapped agent session each time, so the setup runs. `headroom wrap`
 starts a local proxy, installs **[Serena](https://github.com/oraios/serena)** for
 semantic code navigation, and launches the agent configured to route through
-Headroom. Serena is registered at user scope (for Claude Code, in
-`~/.claude.json`), so it stays available in your other projects until you run
-`headroom unwrap`. Skip it with `--code-memory none`.
+Headroom. For Claude Code, Serena is registered for the wrapped project only
+(as a `local`-scope MCP server in `~/.claude.json`). Use
+`--code-memory-scope user` to make it available in every project, or
+`--code-memory none` to skip it. `headroom unwrap` removes either registration.
 
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import

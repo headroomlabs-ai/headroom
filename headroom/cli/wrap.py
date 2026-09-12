@@ -1032,6 +1032,64 @@ _code_memory_option = click.option(
 )
 
 
+# --- Code-memory MCP scope (Claude Code only) --------------------------------
+# Where the code-memory MCP entry is written. Claude Code is the only agent we
+# wrap that has scopes: 'project' keeps the entry in ``projects[<cwd>]`` of
+# ~/.claude.json, 'user' puts it in the machine-wide map. Project is the default
+# because a code-memory server that fails to start at user scope degrades every
+# Claude Code session on the machine, including projects Headroom never touched
+# (#2787). Flows through an env var for the same reason as _code_memory_option.
+_CODE_MEMORY_SCOPE_ENV = "HEADROOM_CODE_MEMORY_SCOPE"
+_CODE_MEMORY_SCOPE_PROJECT = "project"
+_CODE_MEMORY_SCOPE_USER = "user"
+_VALID_CODE_MEMORY_SCOPES = {_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER}
+
+
+def _resolve_code_memory_scope() -> str:
+    """Resolve the requested code-memory scope ('project' by default)."""
+    env = os.environ.get(_CODE_MEMORY_SCOPE_ENV, "").strip().lower()
+    if env:
+        if env not in _VALID_CODE_MEMORY_SCOPES:
+            raise click.ClickException(
+                f"{_CODE_MEMORY_SCOPE_ENV} must be one of: "
+                f"{', '.join(sorted(_VALID_CODE_MEMORY_SCOPES))}"
+            )
+        return env
+    return _CODE_MEMORY_SCOPE_PROJECT
+
+
+def _claude_code_memory_scope() -> str:
+    """Translate the requested scope into Claude Code's own scope name."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    if _resolve_code_memory_scope() == _CODE_MEMORY_SCOPE_USER:
+        return SCOPE_USER
+    return SCOPE_LOCAL
+
+
+def _code_memory_scope_flag_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: mirror ``--code-memory-scope`` into the env var the
+    resolver reads, so no subcommand signature changes."""
+    if value:
+        os.environ[_CODE_MEMORY_SCOPE_ENV] = value
+    return value
+
+
+_code_memory_scope_option = click.option(
+    "--code-memory-scope",
+    type=click.Choice([_CODE_MEMORY_SCOPE_PROJECT, _CODE_MEMORY_SCOPE_USER]),
+    default=None,
+    expose_value=False,
+    is_eager=True,
+    callback=_code_memory_scope_flag_callback,
+    help=(
+        "Where to register the code-memory MCP: 'project' (default, this "
+        "directory only) or 'user' (every Claude Code session on the machine). "
+        "Also set by HEADROOM_CODE_MEMORY_SCOPE."
+    ),
+)
+
+
 # Hook-command markers Headroom manages in Claude settings.json. unwrap drops
 # any hook entry whose command contains one of these. (Retired rtk / lean-ctx
 # hooks are removed separately, by
@@ -2333,6 +2391,8 @@ def _setup_serena_mcp(
     from headroom.mcp_registry.base import RegisterStatus
     from headroom.mcp_registry.ledger import headroom_installed_matching, record_install
 
+    ownership_key = getattr(registrar, "ownership_key", lambda name: name)("serena")
+
     if not registrar.detect():
         if verbose:
             click.echo(f"  Serena MCP: {registrar.display_name} not detected — skipping")
@@ -2350,7 +2410,9 @@ def _setup_serena_mcp(
     owned_drift = (
         result.status == RegisterStatus.MISMATCH
         and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+        and headroom_installed_matching(
+            registrar.name, registrar.get_server("serena"), ownership_key=ownership_key
+        )
     )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
@@ -2363,8 +2425,15 @@ def _setup_serena_mcp(
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
 
+    # Retire the machine-wide entry once the project-scoped one is in place.
+    # Must run before record_install below: the ledger still holds the
+    # fingerprint of the entry that was installed globally, which is how we
+    # recognise it as ours.
+    if result.ok:
+        _retire_user_scope_serena(registrar)
+
     if result.status == RegisterStatus.REGISTERED:
-        record_install(registrar.name, spec)
+        record_install(registrar.name, spec, ownership_key=ownership_key)
 
     line = format_result(
         registrar.name,
@@ -2382,6 +2451,11 @@ def _setup_serena_mcp(
     )
     if line is not None:
         click.echo(line)
+
+    # Say where it landed, so the scope is discoverable without reading docs.
+    # Only on an actual write (or in verbose): re-wraps should stay quiet.
+    if result.status == RegisterStatus.REGISTERED or verbose:
+        _echo_serena_scope_note(registrar)
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
@@ -2408,9 +2482,89 @@ def _setup_serena_mcp(
     _index_serena_project(verbose=verbose)
 
 
+def _echo_serena_scope_note(registrar: Any) -> None:
+    """Tell the user which sessions the Serena entry will load in."""
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+    scope = getattr(registrar, "scope", None)
+    if scope == SCOPE_LOCAL:
+        click.echo(
+            "    scoped to this project — pass --code-memory-scope user to register it "
+            "for every Claude Code session"
+        )
+    elif scope == SCOPE_USER:
+        click.echo(
+            "    registered for every Claude Code session on this machine "
+            "(--code-memory-scope user)"
+        )
+
+
+def _retire_user_scope_serena(registrar: Any) -> None:
+    """Remove a machine-wide Serena entry left by a pre-#2787 wrap.
+
+    Headroom used to register Serena at Claude Code's user scope, where a
+    Serena that fails to start breaks *every* Claude Code session on the
+    machine — including projects that were never wrapped (#2783). Now that the
+    entry is written per project, the global one is redundant, so an upgrading
+    user gets it cleaned up on their next wrap instead of carrying the blast
+    radius forever.
+
+    Only entries the ledger proves Headroom installed are removed; a Serena the
+    user registered globally themselves is left exactly where it is. No-ops for
+    registrars without scopes (Codex, Grok, OpenCode) and when the user asked
+    for user scope explicitly.
+    """
+    from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+    from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    if getattr(registrar, "scope", None) != SCOPE_LOCAL:
+        return
+    try:
+        global_entry = registrar.get_server("serena", scope=SCOPE_USER)
+    except TypeError:  # registrar predates scoped reads
+        return
+    if not headroom_installed_matching(registrar.name, global_entry):
+        return
+    if registrar.unregister_server("serena", scope=SCOPE_USER):
+        # Clear the legacy ledger record along with the config entry it
+        # authorized — otherwise its fingerprint outlives the migration and
+        # can later be mistaken for proof that Headroom owns a same-named
+        # entry the user installs globally themselves.
+        clear_install(registrar.name, "serena")
+        click.echo(
+            "  Serena MCP: removed the machine-wide entry an earlier wrap installed "
+            "(it now loads only in this project)"
+        )
+
+
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
     """Remove Serena MCP only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
+
+    # Claude can own one Serena entry per project plus a legacy user entry.
+    # Examine each relevant scope independently: an unscoped delete would
+    # remove entries whose scope-specific ledger record did not authorize it.
+    if hasattr(registrar, "ownership_key"):
+        from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER
+
+        found_owned = False
+        for scope in (SCOPE_LOCAL, SCOPE_USER):
+            current = registrar.get_server("serena", scope=scope)
+            ownership_key = registrar.ownership_key("serena", scope=scope)
+            if current is None:
+                # Nothing left to protect — an ownership record must not
+                # outlive the entry it authorized.
+                clear_install(registrar.name, "serena", ownership_key=ownership_key)
+                continue
+            if not headroom_installed_matching(
+                registrar.name, current, ownership_key=ownership_key
+            ):
+                continue
+            found_owned = True
+            if not registrar.unregister_server("serena", scope=scope):
+                return "failed"
+            clear_install(registrar.name, "serena", ownership_key=ownership_key)
+        return "removed" if found_owned else "not_headroom_owned"
 
     current = registrar.get_server("serena")
     if not headroom_installed_matching(registrar.name, current):
@@ -2469,10 +2623,21 @@ def _remove_headroom_installed_tokensave_mcp(registrar: Any) -> str:
     """Remove the tokensave MCP entry only if the ledger proves Headroom installed it."""
     from headroom.mcp_registry.ledger import clear_install, headroom_installed_matching
 
-    current = registrar.get_server("tokensave")
+    # Headroom only ever installed tokensave machine-wide: it was retired before
+    # #2787 introduced project scope, so its ledger key is the pre-scope (user
+    # scope) one. Pin the ownership check and the delete to that scope — an
+    # unscoped delete now also takes the project entry, which no ledger record
+    # authorizes, and an unscoped read lets a project entry shadow ours.
+    at_user_scope: dict[str, Any] = {}
+    if hasattr(registrar, "ownership_key"):  # Claude; the others have no scopes
+        from headroom.mcp_registry.claude import SCOPE_USER
+
+        at_user_scope = {"scope": SCOPE_USER}
+
+    current = registrar.get_server("tokensave", **at_user_scope)
     if not headroom_installed_matching(registrar.name, current):
         return "not_headroom_owned"
-    if registrar.unregister_server("tokensave"):
+    if registrar.unregister_server("tokensave", **at_user_scope):
         clear_install(registrar.name, "tokensave")
         return "removed"
     return "failed"
@@ -5063,6 +5228,7 @@ def wrap_selfheal(marker: str | None) -> None:
     help="Skip headroom MCP server registration (compression markers will be unactionable)",
 )
 @_code_memory_option
+@_code_memory_scope_option
 @click.option(
     "--no-tokensave",
     is_flag=True,
@@ -5162,6 +5328,7 @@ def claude(
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --code-memory none # No code-memory MCP
+        headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
     """
     if prepare_only:
@@ -5303,10 +5470,15 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
+        # Registered per project by default so a Serena that cannot start takes
+        # down this project's sessions only, never every Claude Code session on
+        # the machine (#2787). --code-memory-scope user restores the old
+        # machine-wide registration. The Headroom MCP registrar above keeps user
+        # scope: it is our own server and every wrap exercises it.
         from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
-            ClaudeRegistrar(),
+            ClaudeRegistrar(scope=_claude_code_memory_scope()),
             serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,

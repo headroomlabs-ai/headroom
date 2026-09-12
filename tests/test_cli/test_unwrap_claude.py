@@ -205,6 +205,66 @@ def test_unwrap_claude_removes_headroom_installed_serena(
     assert "Removed Headroom-installed Serena MCP server" in result.output
 
 
+def test_unwrap_claude_removes_project_scoped_serena(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unwrap must find the Serena entry wherever wrap put it (#2787).
+
+    Wrap now registers Serena under ``projects[<cwd>].mcpServers`` rather than
+    the machine-wide map, so this runs against a real registrar and real config
+    JSON — a fake registrar would not catch a scope mismatch between the two.
+    """
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / ".headroom"))
+
+    from headroom.mcp_registry import build_serena_spec
+    from headroom.mcp_registry.claude import ClaudeRegistrar
+    from headroom.mcp_registry.ledger import record_install
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    serena_spec = build_serena_spec("claude-code")
+    registrar = ClaudeRegistrar(
+        claude_cli=None, home_dir=tmp_path, scope="local", project_dir=project
+    )
+    record_install(
+        "claude",
+        serena_spec,
+        ownership_key=registrar.ownership_key("serena", scope="local"),
+    )
+    (tmp_path / ".claude.json").write_text(
+        json.dumps(
+            {
+                "projects": {
+                    project.as_posix(): {
+                        "mcpServers": {
+                            "serena": {
+                                "command": serena_spec.command,
+                                "args": list(serena_spec.args),
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (
+        patch("headroom.mcp_registry.ClaudeRegistrar", return_value=registrar),
+        patch("headroom.cli.wrap._remove_claude_managed_hooks", return_value=False),
+        patch("headroom.cli.wrap._stop_local_proxy_for_unwrap"),
+    ):
+        result = runner.invoke(main, ["unwrap", "claude"])
+
+    assert result.exit_code == 0, result.output
+    assert "Removed Headroom-installed Serena MCP server" in result.output
+    config = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert config["projects"][project.as_posix()]["mcpServers"] == {}
+
+
 def test_unwrap_claude_keep_flags_skip_cleanup(
     runner: CliRunner,
 ) -> None:
