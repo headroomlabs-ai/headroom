@@ -9,7 +9,8 @@
     # Cloud mode (managed CCR, TOIN, analytics via Headroom Cloud):
     litellm.callbacks = [HeadroomCallback(api_key="hdr_xxx")]
 
-Works with LiteLLM's completion(), acompletion(), and proxy modes.
+Works with LiteLLM's completion(), acompletion(), the Anthropic Messages
+proxy routes (/v1/messages), and proxy modes.
 Cloud mode requires httpx: pip install httpx
 """
 
@@ -122,7 +123,16 @@ class HeadroomCallback(_CustomLogger):
         if data is None:
             return None
 
-        if call_type not in ("completion", "acompletion"):
+        # LiteLLM's proxy maps the Anthropic Messages API routes to their own
+        # call types (CallTypes.anthropic_messages for /v1/messages and
+        # /anthropic/v1/messages, plus the async twin), and the payload still
+        # carries "messages" in Anthropic format, which compress() handles.
+        if call_type not in (
+            "completion",
+            "acompletion",
+            "anthropic_messages",
+            "aanthropic_messages",
+        ):
             return data
 
         messages = data.get("messages", [])

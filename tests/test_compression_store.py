@@ -939,6 +939,59 @@ class TestCompressionStoreRetrievalEvents:
         assert len(events) >= 1
         assert events[-1].tool_signature_hash == "sig_123"
 
+    def test_history_past_the_cap_keeps_the_newest_in_order(self, store: CompressionStore):
+        """The cap drops the oldest events and nothing else.
+
+        ``_retrieval_events`` is capped by its container rather than by an
+        append-then-reslice, so this pins what the cap must still mean:
+        exactly ``_max_events`` retained, newest first, oldest discarded.
+        """
+        hash_key = store.store(original="[1]", compressed="[]")
+        overflow = 5
+        total = store._max_events + overflow
+
+        for i in range(total):
+            store.retrieve(hash_key, f"q{i}")
+
+        events = store.get_retrieval_events(limit=total)
+
+        assert len(events) == store._max_events
+        # get_retrieval_events returns newest first.
+        assert [e.query for e in events] == [f"q{i}" for i in reversed(range(overflow, total))]
+
+    @patch("headroom.cache.compression_feedback.get_compression_feedback")
+    @patch("headroom.telemetry.get_telemetry_collector")
+    @patch("headroom.telemetry.toin.get_toin")
+    def test_events_dropped_from_history_still_reach_feedback(
+        self, mock_toin, mock_telemetry, mock_feedback
+    ):
+        """Capping the display history must not cost a feedback notification.
+
+        ``_pending_feedback_events`` is a separate drain-by-swap queue that owes
+        a notification for every event, including the ones the bounded history
+        has already discarded. Bounding it too would silently lose feedback.
+        """
+        mock_feedback.return_value = MagicMock()
+        mock_telemetry.return_value = MagicMock()
+        mock_toin.return_value = MagicMock()
+
+        store = CompressionStore(enable_feedback=True)
+        hash_key = store.store(
+            original="[1]",
+            compressed="[]",
+            tool_signature_hash="sig_123",
+            compression_strategy="top_k",
+        )
+        overflow = 5
+        total = store._max_events + overflow
+
+        for i in range(total):
+            store.retrieve(hash_key, f"q{i}")
+
+        # One notification per retrieval, not one per surviving history entry.
+        assert mock_feedback.return_value.record_retrieval.call_count == total
+        assert len(store.get_retrieval_events(limit=total)) == store._max_events
+
 
 # =============================================================================
 # Edge Cases Tests

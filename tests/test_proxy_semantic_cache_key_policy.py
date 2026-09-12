@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from headroom.proxy.semantic_cache_key import (
+from headroom.proxy.semantic_cache_key_policy import (
     compute_semantic_cache_key,
     strip_cache_control,
 )
