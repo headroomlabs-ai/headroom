@@ -466,8 +466,9 @@ def test_text_based_read_protection_shape_agnostic(monkeypatch=None):
         min_tokens_to_compress=25,
     )
     # the observation AFTER the cat (index 3) must be read-protected; the grep one (5) must not
-    assert 3 in r._protect_read_msg_indices, r._protect_read_msg_indices
-    assert 5 not in r._protect_read_msg_indices, r._protect_read_msg_indices
+    ctx = r._build_request_context([dict(m) for m in msgs])
+    assert 3 in ctx.protected_message_indices, ctx.protected_message_indices
+    assert 5 not in ctx.protected_message_indices, ctx.protected_message_indices
 
 
 def test_bugB_read_detection_across_tool_call_wire_shapes():
@@ -581,8 +582,7 @@ def test_read_protection_role_agnostic_openai_role_tool():
         protect_recent=0,
         min_tokens_to_compress=25,
     )
-    assert "c_read" in r._protect_read_tool_ids, (
-        "read cmd must be identified from OpenAI tool_calls"
-    )
+    ctx = r._build_request_context([dict(m) for m in msgs])
+    assert "c_read" in ctx.protected_tool_ids, "read cmd must be identified from OpenAI tool_calls"
     # the role:tool READ observation is protected verbatim (was the bug: unprotected)
     assert out.messages[3]["content"] == code, "role:tool code read must be protected verbatim"
