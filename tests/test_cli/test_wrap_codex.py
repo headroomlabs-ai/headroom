@@ -1403,7 +1403,7 @@ def test_start_proxy_uses_separate_session_for_signal_isolation(
         popen_kwargs.update(kwargs)
         return FakeProc()
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
 
@@ -1441,7 +1441,7 @@ def test_start_proxy_does_not_apply_agent_90_defaults(
         popen_kwargs.update(kwargs)
         return FakeProc()
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
 
@@ -1473,7 +1473,7 @@ def test_start_proxy_preserves_explicit_savings_overrides(
 
     monkeypatch.setenv("HEADROOM_TARGET_RATIO", "0.20")
     monkeypatch.setenv("HEADROOM_MAX_ITEMS", "12")
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
     monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
 

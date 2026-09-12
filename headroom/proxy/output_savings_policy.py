@@ -11,6 +11,13 @@ _INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
 
 _STRATUM_LABEL = "output_shaper:stratum:"
 _CONTROL_LABEL = "output_shaper:control:"
+_CONVERSATION_LABEL = "output_shaper:conv:"
+
+# Enough of the conversation digest to separate conversations without
+# carrying a full key around: 48 bits, so a machine would need ~16M
+# conversations before two collided, and a collision only ever merges two
+# clusters (it cannot invent one).
+_CONVERSATION_LABEL_CHARS = 12
 
 
 def input_bucket(input_tokens: int) -> str:
@@ -169,6 +176,28 @@ def stratum_label(arm: str, key: str) -> str:
     """Encode (arm, stratum) as a transforms_applied label."""
     prefix = _STRATUM_LABEL if arm == "treatment" else _CONTROL_LABEL
     return prefix + key
+
+
+def conversation_label(conversation_key: str) -> str:
+    """Encode the conversation a request belongs to as a label.
+
+    Rides the same ``transforms_applied`` channel as the stratum so the
+    ledger can count DISTINCT conversations per arm, not just requests.
+    Randomization is per conversation (see :func:`assign_arm`), so the
+    conversation is the independent unit; a single long agent session
+    otherwise enters the estimate as thousands of independent draws.
+
+    ``conversation_key`` is already a digest, so this only truncates it --
+    no request content reaches the label or the ledger.
+    """
+    return _CONVERSATION_LABEL + conversation_key[:_CONVERSATION_LABEL_CHARS]
+
+
+def parse_conversation_label(label: str) -> str | None:
+    """Decode a conversation label, or None if not one of ours."""
+    if label.startswith(_CONVERSATION_LABEL):
+        return label[len(_CONVERSATION_LABEL) :]
+    return None
 
 
 def parse_stratum_label(label: str) -> tuple[str, str] | None:
