@@ -265,6 +265,12 @@ class GoogleProvider(Provider):
                     If provided, uses countTokens API for accurate counts.
         """
         self._client = client
+        # Cache counters per model so their internal TokenCountCache (and any
+        # lazily-built genai model) persist across requests, like the Anthropic
+        # and OpenAI providers. Rebuilding a fresh counter every call threw the
+        # cache away every request, so a stable prefix (system prompt + tools)
+        # was re-tokenized on every turn.
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -291,7 +297,9 @@ class GoogleProvider(Provider):
                 f"Model '{model}' is not recognized as a Google model. "
                 f"Supported models: {list(_CONTEXT_LIMITS.keys())}"
             )
-        return GeminiTokenCounter(model, client=self._client)
+        if model not in self._token_counters:
+            self._token_counters[model] = GeminiTokenCounter(model, client=self._client)
+        return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Gemini model.
