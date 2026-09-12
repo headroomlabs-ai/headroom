@@ -3913,7 +3913,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
         )
 
-    # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
+    # Vendored dashboard JS (tailwind/alpine). Mounted before
     # register_provider_routes' catch-all so it is not tunneled upstream.
     from starlette.staticfiles import StaticFiles
 
