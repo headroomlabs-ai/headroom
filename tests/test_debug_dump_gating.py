@@ -8,6 +8,7 @@ operator explicitly opts in to full content.
 from __future__ import annotations
 
 import inspect
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -94,3 +95,94 @@ def test_both_handlers_gate_the_dump(module_name):
         assert 'if dump_mode != "off":' in src, (
             f"{module_name} debug dump is not guarded by an off-by-default check"
         )
+
+
+# ---------------------------------------------------------------------------
+# write_upstream_error_dump: the shared writer used by the streaming handler
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dump_dir(tmp_path, monkeypatch):
+    """Point ``paths.debug_400_dir()`` at a temp dir for the writer tests."""
+    from headroom import paths
+
+    target = tmp_path / "debug_400"
+    monkeypatch.setattr(paths, "debug_400_dir", lambda: target)
+    return target
+
+
+def _write(**kwargs):
+    from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
+
+    params = {
+        "request_id": "req_1",
+        "url": "https://api.anthropic.com/v1/messages",
+        "status": 400,
+        "provider": "anthropic",
+        "model": "claude-opus-5",
+        "body": {"messages": [{"role": "user", "content": "secret prompt content " * 20}]},
+        "transforms": ["tool_search_history_repair"],
+        "stream": True,
+    }
+    params.update(kwargs)
+    config = params.pop("config", _config())
+    return write_upstream_error_dump(config, **params)
+
+
+def test_upstream_dump_off_by_default_writes_nothing(dump_dir, monkeypatch):
+    monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
+    assert _write() is None
+    assert not dump_dir.exists()
+
+
+def test_upstream_dump_stateless_writes_nothing(dump_dir, monkeypatch):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    assert _write(config=_config(stateless=True)) is None
+    assert not dump_dir.exists()
+
+
+def test_upstream_dump_full_records_request(dump_dir, monkeypatch):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    path = _write()
+    assert path is not None and path.parent == dump_dir
+    payload = json.loads(path.read_text())
+    assert payload["request_id"] == "req_1"
+    assert payload["status"] == 400
+    assert payload["provider"] == "anthropic"
+    assert payload["model"] == "claude-opus-5"
+    assert payload["stream"] is True
+    assert payload["transforms"] == ["tool_search_history_repair"]
+    assert "secret prompt content" in payload["body"]["messages"][0]["content"]
+
+
+def test_upstream_dump_redacted_elides_content(dump_dir, monkeypatch):
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "1")
+    path = _write()
+    assert path is not None
+    payload = json.loads(path.read_text())
+    content = payload["body"]["messages"][0]["content"]
+    assert content.startswith("<redacted:") and "secret prompt" not in content
+    # Structure is still there to debug with:
+    assert payload["body"]["messages"][0]["role"] == "user"
+
+
+def test_upstream_dump_serializes_non_json_values(dump_dir, monkeypatch):
+    # ``default=str`` must keep an exotic body from raising mid-dump.
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+    path = _write(body={"when": object()})
+    assert path is not None
+    assert "object object" in json.loads(path.read_text())["body"]["when"]
+
+
+def test_upstream_dump_never_raises_when_write_fails(monkeypatch):
+    # A diagnostic must not turn an upstream error into a proxy error.
+    from headroom import paths
+
+    monkeypatch.setenv("HEADROOM_DEBUG_DUMP", "full")
+
+    def _boom():
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(paths, "debug_400_dir", _boom)
+    assert _write() is None

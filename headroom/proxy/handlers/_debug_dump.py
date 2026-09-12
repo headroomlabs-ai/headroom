@@ -8,8 +8,14 @@ OpenAI handlers so the gating stays consistent across providers.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _debug_dump_mode(config: Any) -> str:
@@ -45,3 +51,52 @@ def _redact_debug_value(value: Any, _max_len: int = 80) -> Any:
     if isinstance(value, list):
         return [_redact_debug_value(v, _max_len) for v in value]
     return value
+
+
+def write_upstream_error_dump(
+    config: Any,
+    *,
+    request_id: str,
+    url: str,
+    status: int,
+    provider: str | None = None,
+    model: str | None = None,
+    body: Any = None,
+    transforms: Any = None,
+    stream: bool = False,
+) -> Path | None:
+    """Write a diagnostic dump of an erroring (>=400) upstream request.
+
+    Returns the path written, or ``None`` when the dump is disabled (the
+    default, and always in stateless mode) or could not be written. Never
+    raises: a diagnostic must not turn an upstream error into a proxy error.
+    """
+    mode = _debug_dump_mode(config)
+    if mode == "off":
+        return None
+    try:
+        from headroom import paths as _hr_paths
+
+        dump_dir = _hr_paths.debug_400_dir()
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.json"
+        dump_path.write_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "url": url,
+                    "status": status,
+                    "provider": provider,
+                    "model": model,
+                    "stream": stream,
+                    "transforms": transforms,
+                    "body": body if mode == "full" else _redact_debug_value(body),
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return dump_path
+    except Exception:
+        logger.debug("upstream error debug dump skipped", exc_info=True)
+        return None

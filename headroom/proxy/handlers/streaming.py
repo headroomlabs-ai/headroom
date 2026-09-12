@@ -13,6 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
+from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
@@ -1463,6 +1464,23 @@ class StreamingMixin:
                 upstream_response.status_code,
                 url,
             )
+            # Diagnostic dump of the erroring request — parity with the
+            # non-streaming handlers, which dump on >=400 but never fire for a
+            # streaming turn (Claude Code streams every request, so the most
+            # common 400s were invisible). Same gating: OFF by default, never
+            # in stateless mode, content redacted unless HEADROOM_DEBUG_DUMP=full.
+            write_upstream_error_dump(
+                getattr(self, "config", None),
+                request_id=request_id,
+                url=url,
+                status=upstream_response.status_code,
+                provider=provider,
+                model=model,
+                body=body,
+                transforms=transforms_applied,
+                stream=True,
+            )
+
             response_headers = dict(upstream_response.headers)
             response_headers.pop("content-length", None)
             response_headers.pop("transfer-encoding", None)
