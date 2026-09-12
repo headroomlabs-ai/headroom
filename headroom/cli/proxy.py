@@ -1547,18 +1547,36 @@ Memory (Multi-Provider):
             "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
         )
 
-    from headroom.telemetry.beacon import is_telemetry_enabled
+    # Build telemetry section for the startup banner.
+    #
+    # HEADROOM_TELEMETRY (local aggregate stats, off by default) and
+    # HEADROOM_BEACON (the anonymous upload beacon, ON by default —
+    # see telemetry/beacon.py) are two independent switches. This banner
+    # used to check only is_telemetry_enabled() and print "DISABLED" for
+    # any operator who had merely turned local stats off, even though the
+    # beacon — the switch that actually ships data off the machine — was
+    # still on and unmentioned. Delegate to format_telemetry_notice(), the
+    # one place that already gets the beacon-vs-local distinction right,
+    # instead of re-deriving (and re-drifting from) the same wording here.
+    from headroom.telemetry.beacon import (
+        format_telemetry_notice,
+        is_beacon_enabled,
+        is_telemetry_enabled,
+    )
 
-    # Build telemetry section for the startup banner. Telemetry is opt-in
-    # (off by default); the disabled line surfaces how to opt in.
-    if is_telemetry_enabled():
-        telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
-            "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
-        )
+    _notice = format_telemetry_notice(prefix="  ")
+    if _notice:
+        telemetry_line = _notice
+    elif is_beacon_enabled() or is_telemetry_enabled():
+        # format_telemetry_notice() returns "" when HEADROOM_TELEMETRY_WARN=off
+        # suppresses the notice text itself — still say ON/OFF plainly rather
+        # than silently showing nothing in the one place an operator is most
+        # likely to be checking.
+        telemetry_line = "  Telemetry:    ON (notice suppressed via HEADROOM_TELEMETRY_WARN=off)"
     else:
         telemetry_line = (
-            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+            "  Telemetry:    OFF (local stats: HEADROOM_TELEMETRY=on to enable | "
+            "beacon: HEADROOM_BEACON=on to enable)"
         )
 
     # Discover proxy extensions (third-party packages registered via the
