@@ -82,8 +82,11 @@ def _open_dashboard(page: Page, stats: dict) -> None:
     page.wait_for_load_state("networkidle")
 
 
-def test_dashboard_renders_compression_vs_cache_net_metrics() -> None:
-    artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR")
+def test_dashboard_renders_compression_vs_cache_net_metrics(tmp_path: Path) -> None:
+    configured_artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR", "").strip()
+    artifact_dir = (
+        Path(configured_artifact_dir) if configured_artifact_dir else tmp_path / "artifacts"
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -101,13 +104,20 @@ def test_dashboard_renders_compression_vs_cache_net_metrics() -> None:
         )
         expect(page.get_by_test_id("freeze-net-value")).to_have_text("+67.0k")
         expect(page.get_by_text("6 busts avoided, 21.0k foregone")).to_be_visible()
+        expect(page.get_by_text("Savings Over Time", exact=True)).to_be_visible()
+        expect(page.get_by_text("143.0k tokens total", exact=True)).to_have_count(0)
+        token_usage = page.get_by_test_id("token-usage")
+        expect(token_usage.get_by_text("Proxy Removed", exact=True)).to_be_visible()
+        expect(token_usage.get_by_text("91.0k", exact=True)).to_be_visible()
+        expect(page.get_by_test_id("proxy-share-of-total")).to_have_text(
+            "23.5% of before-compression tokens"
+        )
 
-        if artifact_dir:
-            Path(artifact_dir).mkdir(parents=True, exist_ok=True)
-            page.screenshot(
-                path=str(Path(artifact_dir) / "dashboard-compression-vs-cache.png"),
-                full_page=True,
-            )
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        page.screenshot(
+            path=str(artifact_dir / "dashboard-compression-vs-cache.png"),
+            full_page=True,
+        )
 
         browser.close()
 
@@ -156,5 +166,75 @@ def test_dashboard_hides_compression_vs_cache_section_without_data() -> None:
         _open_dashboard(page, stats)
 
         expect(page.get_by_test_id("cvc-net-headline")).to_have_count(0)
+
+        browser.close()
+
+
+def test_dashboard_canonical_metric_homes_at_responsive_viewports(tmp_path: Path) -> None:
+    configured_artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR", "").strip()
+    artifact_dir = (
+        Path(configured_artifact_dir)
+        if configured_artifact_dir
+        else tmp_path / "responsive-artifacts"
+    )
+
+    Path(artifact_dir).mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        for theme in ("light", "dark"):
+            for width in (1280, 768, 400):
+                page = browser.new_page(
+                    viewport={"width": width, "height": 1400}, color_scheme=theme
+                )
+                _open_dashboard(page, _stats_with_compression_vs_cache())
+                session_metrics = page.get_by_test_id("session-optimization")
+                expect(session_metrics.get_by_text("Tokens Saved", exact=True)).to_be_visible()
+                expect(session_metrics.get_by_text("143.0k", exact=True)).to_be_visible()
+                expect(page.get_by_test_id("proxy-share-of-total")).to_have_text(
+                    "23.5% of before-compression tokens"
+                )
+                expect(
+                    page.get_by_test_id("token-usage").get_by_text("91.0k", exact=True)
+                ).to_be_visible()
+                performance = page.get_by_text("Performance", exact=True).locator("..")
+                expect(performance.get_by_text("Overhead Range", exact=True)).to_be_visible()
+                expect(performance.get_by_text("5 - 43ms", exact=True)).to_be_visible()
+                expect(performance.get_by_text("TTFB Range", exact=True)).to_be_visible()
+                expect(performance.get_by_text("0.42 - 2.90s", exact=True)).to_be_visible()
+                page.get_by_test_id("session-view").screenshot(
+                    path=str(Path(artifact_dir) / f"dashboard-session-{theme}-{width}.png")
+                )
+                ttl_metrics = page.get_by_test_id("ttl-metrics")
+                expect(ttl_metrics.get_by_text("Bucket Mix", exact=True)).to_be_visible()
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-mix-1h-total")).to_have_text("235.0k")
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-mix-5m-total")).to_have_text("185.0k")
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-1h-value")).to_have_count(0)
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-5m-value")).to_have_count(0)
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-1h-requests")).to_have_text("24")
+                expect(ttl_metrics.get_by_test_id("ttl-bucket-5m-requests")).to_have_text("18")
+                ttl_metrics.screenshot(
+                    path=str(Path(artifact_dir) / f"dashboard-ttl-{theme}-{width}.png")
+                )
+                page.get_by_role("button", name="Historical", exact=True).click()
+                history_summary = page.get_by_test_id("history-summary")
+                expect(
+                    history_summary.get_by_text("Lifetime Tokens Saved", exact=True)
+                ).to_be_visible()
+                expect(page.get_by_test_id("history-total-value")).to_have_text("143.0k")
+                expect(page.get_by_test_id("history-total-value")).to_have_count(1)
+                expect(page.get_by_text("Latest total", exact=True)).to_have_count(0)
+                expect(
+                    page.get_by_text("Recent Historical Checkpoints", exact=True)
+                ).to_be_visible()
+                historical_card = page.get_by_test_id("historical-summary-card")
+                expect(historical_card).to_be_visible()
+                historical_checkpoints = page.get_by_text(
+                    "Recent Historical Checkpoints", exact=True
+                ).locator("..")
+                expect(historical_checkpoints).to_be_visible()
+                historical_checkpoints.screenshot(
+                    path=str(Path(artifact_dir) / f"dashboard-history-{theme}-{width}.png")
+                )
+                page.close()
 
         browser.close()
