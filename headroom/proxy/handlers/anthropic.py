@@ -1197,6 +1197,7 @@ class AnthropicHandlerMixin:
             # point on, `headers` is the upstream-bound copy.
             from headroom.proxy.helpers import (
                 _strip_internal_headers,
+                apply_keep_last_turns,
                 log_outbound_headers,
                 merge_extra_headers,
             )
@@ -1478,6 +1479,25 @@ class AnthropicHandlerMixin:
                     logger.debug(f"[{request_id}] pre_compress hook error: {e}")
             else:
                 _hook_ctx = None
+
+            # x-headroom-keep-last-turns: N — trim history before optimization.
+            # Consumed here (after bypass check, after _strip_internal_headers)
+            # so it never leaks upstream.  Fail-open: any malformed value is
+            # silently ignored and the full message list is used instead.
+            _klt_raw = request.headers.get("x-headroom-keep-last-turns", "").strip()
+            if _klt_raw and not _bypass:
+                try:
+                    _klt = int(_klt_raw)
+                    messages, _klt_dropped = apply_keep_last_turns(messages, _klt)
+                    if _klt_dropped:
+                        logger.info(
+                            "[%s] keep-last-turns=%d: dropped %d leading messages",
+                            request_id,
+                            _klt,
+                            _klt_dropped,
+                        )
+                except ValueError:
+                    pass  # malformed value — never break the request
 
             # Apply optimization
             transforms_applied = []

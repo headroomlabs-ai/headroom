@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom.cache.compression_cache import _is_tool_result_message
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -3612,3 +3613,78 @@ def inject_tool_search_deferral_openai(
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
+
+
+_KEEP_LAST_TURNS_INSTRUCTION_ROLES = frozenset({"system", "developer"})
+
+
+def apply_keep_last_turns(
+    messages: list[dict[str, Any]],
+    n: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Trim ``messages`` to the last *n* conversation turns.
+
+    A "turn" starts at a genuine user message and runs up to (but not
+    including) the next one — so a tool-calling round trip stays part of
+    the turn that triggered it, however many messages it spans:
+    ``user -> assistant(tool_calls) -> tool -> tool -> assistant`` is one
+    turn, not the two-message ``user, assistant`` pair a fixed-size slice
+    would assume. A message only starts a *new* turn when its role is
+    ``"user"`` AND it is not itself a tool-result continuation of the
+    previous turn — Anthropic represents tool results as ``role="user"``
+    messages (``content`` blocks of type ``tool_result``), so a bare
+    role check would misfire on ordinary Anthropic tool use and orphan the
+    tool_use/tool_result pairing exactly like the arithmetic slice did.
+
+    ``system``/``developer`` messages are application instructions, not
+    historical conversation turns — OpenAI keeps them inline in the same
+    ``messages`` array a client sends, so without this they'd be silently
+    dropped the moment *n* trims far enough back to reach them. They are
+    never counted as, or dropped by, turn trimming, and are kept in their
+    original relative position rather than hoisted to the front.
+
+    The trailing turn (the last turn-start through the end of the list) is
+    always kept in full regardless of *n* — it is the current, not-yet-
+    answered request. *n* counts complete turns before that one.
+
+    Returns ``(trimmed_messages, n_dropped)`` — the caller can log
+    *n_dropped* and append ``keep_last_turns:{n}:{n_dropped}_dropped``
+    to ``transforms_applied``. *n_dropped* counts only messages actually
+    removed — a retained system/developer message never counts as dropped
+    even though the turn-boundary cutoff logically falls past it. When
+    nothing is dropped (n_dropped == 0) the original list is returned
+    unchanged so callers can detect a no-op with an identity check.
+
+    Invariants:
+    - n < 0 is treated as no-op (invalid, never trim).
+    - A dropped prefix always ends exactly on a turn boundary: every
+      message belonging to a retained turn (including its tool_calls/
+      tool_result messages) is kept, and every message belonging to a
+      dropped turn is dropped — never a partial turn.
+    - Every system/developer message survives, in its original order,
+      regardless of *n*.
+    """
+    if n < 0 or not messages:
+        return messages, 0
+    turn_starts = [
+        i
+        for i, msg in enumerate(messages)
+        if msg.get("role") == "user" and not _is_tool_result_message(msg)
+    ]
+    if not turn_starts:
+        return messages, 0
+    prior_turns = len(turn_starts) - 1
+    if n >= prior_turns:
+        return messages, 0
+    tail = turn_starts[prior_turns - n]
+    if tail == 0:
+        return messages, 0
+    result = [
+        msg
+        for i, msg in enumerate(messages)
+        if msg.get("role") in _KEEP_LAST_TURNS_INSTRUCTION_ROLES or i >= tail
+    ]
+    dropped = len(messages) - len(result)
+    if dropped == 0:
+        return messages, 0
+    return result, dropped
