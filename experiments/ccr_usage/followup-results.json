@@ -1,0 +1,32 @@
+{
+  "parent_revision": "dcfa5043de88276410e97ecd55c02719bf72ebbe",
+  "focused_tests": {
+    "passed": 114,
+    "failed": 0,
+    "warnings": 1
+  },
+  "helper_coverage": {
+    "covered_lines": 21,
+    "num_statements": 21,
+    "percent_covered": 100.0,
+    "percent_covered_display": "100",
+    "missing_lines": 0,
+    "excluded_lines": 0,
+    "percent_statements_covered": 100.0,
+    "percent_statements_covered_display": "100",
+    "num_branches": 14,
+    "num_partial_branches": 0,
+    "covered_branches": 14,
+    "missing_branches": 0,
+    "percent_branches_covered": 100.0,
+    "percent_branches_covered_display": "100"
+  },
+  "http_cases": {
+    "passed": 6,
+    "failed": 0
+  },
+  "sdk": "anthropic 1.5.0; httpx2 2.12.0; synthetic JSON and SSE decoding",
+  "mypy": "1.20.2; 532 files; pass",
+  "full_suite_rerun": false,
+  "upstream_ci_executed": false
+}

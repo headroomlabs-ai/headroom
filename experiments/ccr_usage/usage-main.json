@@ -1,0 +1,323 @@
+[
+  {
+    "streaming": false,
+    "calls": 1,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      }
+    ],
+    "expected": {
+      "input_tokens": 11,
+      "output_tokens": 7,
+      "cache_read_input_tokens": 13,
+      "cache_creation_input_tokens": 17
+    },
+    "actual": {
+      "input_tokens": 11,
+      "output_tokens": 7,
+      "cache_read_input_tokens": 13,
+      "cache_creation_input_tokens": 17
+    },
+    "passed": true,
+    "usage_events": []
+  },
+  {
+    "streaming": false,
+    "calls": 2,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      },
+      {
+        "usage": {
+          "input_tokens": 22,
+          "output_tokens": 14,
+          "cache_read_input_tokens": 26,
+          "cache_creation_input_tokens": 34
+        },
+        "stream": false,
+        "retrieval_verified": true
+      }
+    ],
+    "expected": {
+      "input_tokens": 33,
+      "output_tokens": 21,
+      "cache_read_input_tokens": 39,
+      "cache_creation_input_tokens": 51
+    },
+    "actual": {
+      "input_tokens": 22,
+      "output_tokens": 14,
+      "cache_read_input_tokens": 26,
+      "cache_creation_input_tokens": 34
+    },
+    "passed": false,
+    "usage_events": []
+  },
+  {
+    "streaming": false,
+    "calls": 3,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      },
+      {
+        "usage": {
+          "input_tokens": 22,
+          "output_tokens": 14,
+          "cache_read_input_tokens": 26,
+          "cache_creation_input_tokens": 34
+        },
+        "stream": false,
+        "retrieval_verified": true
+      },
+      {
+        "usage": {
+          "input_tokens": 33,
+          "output_tokens": 21,
+          "cache_read_input_tokens": 39,
+          "cache_creation_input_tokens": 51
+        },
+        "stream": false,
+        "retrieval_verified": true
+      }
+    ],
+    "expected": {
+      "input_tokens": 66,
+      "output_tokens": 42,
+      "cache_read_input_tokens": 78,
+      "cache_creation_input_tokens": 102
+    },
+    "actual": {
+      "input_tokens": 33,
+      "output_tokens": 21,
+      "cache_read_input_tokens": 39,
+      "cache_creation_input_tokens": 51
+    },
+    "passed": false,
+    "usage_events": []
+  },
+  {
+    "streaming": true,
+    "calls": 1,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      }
+    ],
+    "expected": {
+      "input_tokens": 11,
+      "output_tokens": 7,
+      "cache_read_input_tokens": 13,
+      "cache_creation_input_tokens": 17
+    },
+    "actual": {
+      "input_tokens": 11,
+      "output_tokens": 7,
+      "cache_read_input_tokens": 13,
+      "cache_creation_input_tokens": 17
+    },
+    "passed": true,
+    "usage_events": [
+      {
+        "type": "message_start",
+        "message": {
+          "id": "msg_1",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-haiku-4-5-20251001",
+          "content": [],
+          "stop_reason": null,
+          "usage": {
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "cache_read_input_tokens": 13,
+            "cache_creation_input_tokens": 17
+          }
+        }
+      },
+      {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn"
+        },
+        "usage": {
+          "output_tokens": 7
+        }
+      }
+    ]
+  },
+  {
+    "streaming": true,
+    "calls": 2,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      },
+      {
+        "usage": {
+          "input_tokens": 22,
+          "output_tokens": 14,
+          "cache_read_input_tokens": 26,
+          "cache_creation_input_tokens": 34
+        },
+        "stream": false,
+        "retrieval_verified": true
+      }
+    ],
+    "expected": {
+      "input_tokens": 33,
+      "output_tokens": 21,
+      "cache_read_input_tokens": 39,
+      "cache_creation_input_tokens": 51
+    },
+    "actual": {
+      "input_tokens": 22,
+      "output_tokens": 14,
+      "cache_read_input_tokens": 26,
+      "cache_creation_input_tokens": 34
+    },
+    "passed": false,
+    "usage_events": [
+      {
+        "type": "message_start",
+        "message": {
+          "id": "msg_2",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-haiku-4-5-20251001",
+          "content": [],
+          "stop_reason": null,
+          "usage": {
+            "input_tokens": 22,
+            "output_tokens": 14,
+            "cache_read_input_tokens": 26,
+            "cache_creation_input_tokens": 34
+          }
+        }
+      },
+      {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn"
+        },
+        "usage": {
+          "output_tokens": 14
+        }
+      }
+    ]
+  },
+  {
+    "streaming": true,
+    "calls": 3,
+    "upstream": [
+      {
+        "usage": {
+          "input_tokens": 11,
+          "output_tokens": 7,
+          "cache_read_input_tokens": 13,
+          "cache_creation_input_tokens": 17
+        },
+        "stream": false,
+        "retrieval_verified": false
+      },
+      {
+        "usage": {
+          "input_tokens": 22,
+          "output_tokens": 14,
+          "cache_read_input_tokens": 26,
+          "cache_creation_input_tokens": 34
+        },
+        "stream": false,
+        "retrieval_verified": true
+      },
+      {
+        "usage": {
+          "input_tokens": 33,
+          "output_tokens": 21,
+          "cache_read_input_tokens": 39,
+          "cache_creation_input_tokens": 51
+        },
+        "stream": false,
+        "retrieval_verified": true
+      }
+    ],
+    "expected": {
+      "input_tokens": 66,
+      "output_tokens": 42,
+      "cache_read_input_tokens": 78,
+      "cache_creation_input_tokens": 102
+    },
+    "actual": {
+      "input_tokens": 33,
+      "output_tokens": 21,
+      "cache_read_input_tokens": 39,
+      "cache_creation_input_tokens": 51
+    },
+    "passed": false,
+    "usage_events": [
+      {
+        "type": "message_start",
+        "message": {
+          "id": "msg_3",
+          "type": "message",
+          "role": "assistant",
+          "model": "claude-haiku-4-5-20251001",
+          "content": [],
+          "stop_reason": null,
+          "usage": {
+            "input_tokens": 33,
+            "output_tokens": 21,
+            "cache_read_input_tokens": 39,
+            "cache_creation_input_tokens": 51
+          }
+        }
+      },
+      {
+        "type": "message_delta",
+        "delta": {
+          "stop_reason": "end_turn"
+        },
+        "usage": {
+          "output_tokens": 21
+        }
+      }
+    ]
+  }
+]

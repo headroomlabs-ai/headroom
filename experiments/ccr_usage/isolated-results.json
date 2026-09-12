@@ -1,0 +1,33 @@
+{
+  "full_suite": {
+    "passed": 12091,
+    "failed": 7,
+    "skipped": 594,
+    "failure_cases": [
+      "tests.test_cli.test_wrap_helpers.TestProxyClientRefCounting.test_cleanup_leaves_proxy_running_when_other_client_alive",
+      "tests.test_cli.test_wrap_helpers.TestProxyClientRefCounting.test_matching_identity_within_tolerance_is_kept",
+      "tests.test_cli.test_wrap_helpers.TestProxyClientRefCounting.test_identity_check_skipped_when_source_unavailable",
+      "tests.test_cli_proxy_improvements.TestMissingProxyDepsError.test_proxy_command_exits_when_mcp_missing",
+      "tests.test_cli_proxy_improvements.TestMissingProxyDepsError.test_ensure_proxy_dependencies_exits_when_fastapi_missing",
+      "tests.test_image_compression.TestOnnxRouter.test_full_classify_with_image",
+      "tests.test_install.test_supervisors.test_install_supervisor_darwin_windows_and_unsupported"
+    ],
+    "warnings": 6138,
+    "elapsed_seconds": 842.8
+  },
+  "setup_recheck": {
+    "passed": 111,
+    "failed": 0,
+    "skipped": 7,
+    "failure_cases": [],
+    "warnings": 3,
+    "elapsed_seconds": 10.99
+  },
+  "source_revision": "f8778ea2b1744089c4dc4f38b76b0dd7cb99372e",
+  "baseline_revision": "04cdf79ab0a8423d88148ba63e960ac6b4007b9c",
+  "python": "3.13.12",
+  "platform": "Ubuntu 26.04 Docker, four CPUs, 8 GiB memory",
+  "timeout_seconds": 120,
+  "provider_credentials_supplied": false,
+  "full_suite_clean": false
+}
