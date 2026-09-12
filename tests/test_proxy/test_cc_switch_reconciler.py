@@ -115,6 +115,33 @@ def test_official_left_direct_by_default(tmp_path, monkeypatch):
     assert json.loads(sf.read_text())["env"] == {}
 
 
+def test_official_resets_a_captured_third_party_upstream(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", raising=False)
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "https://api.kimi.com/anthropic"}})
+    assert r.tick() is True
+    assert captured[-1] == "https://api.kimi.com/anthropic"
+
+    # Switching back to Claude Official leaves settings.json direct, but the
+    # process-wide upstream must not stay on Kimi -- otherwise Anthropic OAuth
+    # traffic from any client still routed through this proxy is sent there.
+    _write(sf, {"env": {}})
+    assert r.tick() is False
+    assert json.loads(sf.read_text())["env"] == {}
+    assert captured[-1] == DEFAULT
+    assert r.current_upstream == DEFAULT
+
+
+def test_official_does_not_reset_upstream_when_never_captured(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", raising=False)
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {}})
+    assert r.tick() is False
+    # Nothing was captured, so nothing to reset: an operator-configured
+    # upstream must not be clobbered by a passing official tick.
+    assert captured == []
+
+
 def test_official_routed_when_opted_in(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", "1")
     r, sf, captured = _make(tmp_path)
