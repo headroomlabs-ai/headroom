@@ -42,6 +42,28 @@ def test_different_tools_distinct_keys():
     assert _key(cache, tools=tools_a) != _key(cache, tools=tools_b)
 
 
+def test_tool_schema_cache_control_property_produces_distinct_key():
+    """A user-defined schema property is not a prompt-cache annotation."""
+    tools_without = [{"name": "maintain", "input_schema": {"type": "object", "properties": {}}}]
+    tools_with = [
+        {
+            "name": "maintain",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cache_control": {
+                        "type": "boolean",
+                        "description": "Flush the application cache",
+                    }
+                },
+            },
+        }
+    ]
+
+    cache = SemanticCache()
+    assert _key(cache, tools=tools_without) != _key(cache, tools=tools_with)
+
+
 @pytest.mark.parametrize(
     "field,a,b",
     [
