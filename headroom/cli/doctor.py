@@ -665,14 +665,18 @@ _STATUS_STYLE = {PASS: "green", WARN: "yellow", FAIL: "red", SKIP: "dim"}
 _STATUS_GLYPH = {PASS: "✓", WARN: "⚠", FAIL: "✗", SKIP: "·"}
 
 
-def _render(checks: list[CheckResult], port: int, installed: str) -> None:
+def _render(
+    checks: list[CheckResult], port: int, installed: str, port_origin: str = "explicit"
+) -> None:
     from rich.console import Console
     from rich.markup import escape
     from rich.table import Table
 
     console = Console()
+    port_suffix = " (auto-detected)" if port_origin == "discovered" else ""
     console.print(
-        f"[bold]Headroom Doctor[/bold] [dim]{format_version_label(installed)} · port {port}[/dim]\n"
+        f"[bold]Headroom Doctor[/bold] "
+        f"[dim]{format_version_label(installed)} · port {port}{port_suffix}[/dim]\n"
     )
     table = Table(show_header=True, header_style="bold")
     table.add_column("check")
@@ -703,13 +707,15 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
 @click.option(
     "--port",
     "-p",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
-    help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
+    help=(
+        "Proxy port to check. Defaults to auto-detecting the most recently started "
+        "live wrap session (falls back to 8787). Env: HEADROOM_PORT."
+    ),
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
-def doctor(port: int, emit_json: bool) -> None:
+def doctor(port: int | None, emit_json: bool) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -718,7 +724,10 @@ def doctor(port: int, emit_json: bool) -> None:
         1  warnings only (working, but not optimally wired)
         2  at least one failure (proxy down / deployment down)
     """
-    base_url = f"http://127.0.0.1:{port}"
+    from headroom.cli._utils.proxy_discovery import resolve_proxy_port
+
+    resolved_port, port_origin = resolve_proxy_port(port)
+    base_url = f"http://127.0.0.1:{resolved_port}"
     livez = probe_json(f"{base_url}/livez")
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
@@ -730,12 +739,12 @@ def doctor(port: int, emit_json: bool) -> None:
         check_version_drift(livez, installed),
         check_claude_routing(
             claude_settings_path(),
-            port,
+            resolved_port,
             [project_local_claude_settings, project_claude_settings],
         ),
         check_wrap_marker_staleness(project_local_claude_settings),
-        check_codex_routing(codex_config_path(), port),
-        check_shell_env(os.environ, port),
+        check_codex_routing(codex_config_path(), resolved_port),
+        check_shell_env(os.environ, resolved_port),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
@@ -773,7 +782,8 @@ def doctor(port: int, emit_json: bool) -> None:
         click.echo(
             json.dumps(
                 {
-                    "port": port,
+                    "port": resolved_port,
+                    "port_origin": port_origin,
                     "installed_version": installed,
                     "exit_code": exit_code,
                     "checks": [asdict(c) for c in checks],
@@ -782,5 +792,5 @@ def doctor(port: int, emit_json: bool) -> None:
             )
         )
     else:
-        _render(checks, port, installed)
+        _render(checks, resolved_port, installed, port_origin)
     raise SystemExit(exit_code)

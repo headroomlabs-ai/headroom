@@ -4757,6 +4757,10 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
+        # Let Headroom commands launched inside the wrapped session target the
+        # proxy's actual port, including fallback/dedicated-session ports.
+        env["HEADROOM_PORT"] = str(actual_port)
+
         # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():

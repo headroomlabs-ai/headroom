@@ -838,11 +838,28 @@ class TestDoctorCommand:
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
-        result = runner.invoke(main, ["doctor", "--json"])
+        result = runner.invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["port"] == 8787
+        assert payload["port_origin"] == "explicit"
         assert {c["name"] for c in payload["checks"]} >= {"proxy", "version", "budget"}
         assert all(c["status"] in ("pass", "warn", "fail", "skip") for c in payload["checks"])
+
+    def test_json_output_reports_auto_detected_port(self, runner, isolated, monkeypatch):
+        from headroom.cli._utils import proxy_discovery
+
+        monkeypatch.setattr(
+            proxy_discovery,
+            "resolve_proxy_port",
+            lambda explicit: (8788, "discovered"),
+        )
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+
+        result = runner.invoke(main, ["doctor", "--json"])
+
+        payload = json.loads(result.output)
+        assert payload["port"] == 8788
+        assert payload["port_origin"] == "discovered"
 
     def test_port_option_changes_probe_url(self, runner, isolated, monkeypatch):
         seen: list[str] = []
