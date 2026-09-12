@@ -38,6 +38,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -48,8 +49,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
+# Idle window, not an absolute lifetime: the clock restarts on every
+# successful retrieve(). An entry the agent keeps touching survives an
+# arbitrarily long burst; only genuinely unused entries expire. See #2604 —
+# the previous 1800s absolute TTL killed entries mid-session while their
+# <<ccr:...>> markers were still in context.
+DEFAULT_CCR_TTL_SECONDS = 3600  # override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+
+# Absolute ceiling so a repeatedly-touched entry cannot live forever (and
+# so originals, which may contain sensitive tool output, do not sit on disk
+# indefinitely). Expressed as a multiple of the entry's idle TTL.
+DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER = 8
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # Previews carry verbatim tool-result content (post-redaction), which makes
@@ -97,13 +108,47 @@ def format_retrieval_miss_detail(status: dict[str, Any]) -> str:
     default_ttl = status.get("default_ttl_seconds", DEFAULT_CCR_TTL_SECONDS)
     ttl_seconds = status.get("ttl_seconds", default_ttl)
 
-    if status.get("status") == "expired":
-        age_seconds = status.get("age_seconds")
-        if isinstance(age_seconds, (int, float)):
-            return f"Entry expired (CCR TTL: {ttl_seconds} seconds; age: {age_seconds:.0f} seconds)"
-        return f"Entry expired (CCR TTL: {ttl_seconds} seconds)"
+    entry_status = status.get("status")
 
-    return f"Entry not found (CCR TTL: {default_ttl} seconds)"
+    if entry_status == "expired":
+        age_seconds = status.get("age_seconds")
+        idle_seconds = status.get("idle_seconds")
+        reason = status.get("expiry_reason")
+        if reason == "max_lifetime":
+            if isinstance(age_seconds, (int, float)):
+                return (
+                    "Entry expired (CCR max lifetime: "
+                    f"{status.get('max_lifetime_seconds')} seconds; "
+                    f"age: {age_seconds:.0f} seconds)"
+                )
+            return f"Entry expired (CCR max lifetime: {status.get('max_lifetime_seconds')} seconds)"
+        if isinstance(idle_seconds, (int, float)):
+            return (
+                f"Entry expired (CCR idle TTL: {ttl_seconds} seconds; "
+                f"idle: {idle_seconds:.0f} seconds)"
+            )
+        return f"Entry expired (CCR idle TTL: {ttl_seconds} seconds)"
+
+    # The entry is gone from the store. A tombstone tells us *why*, which
+    # is the difference between "raise the TTL" and "raise max_entries".
+    if entry_status == "evicted":
+        return f"Entry evicted for capacity (CCR store limit: {status.get('max_entries')} entries)"
+    if entry_status == "expired_and_purged":
+        if status.get("expiry_reason") == "max_lifetime":
+            return (
+                "Entry expired and was purged (CCR max lifetime: "
+                f"{status.get('max_lifetime_seconds')} seconds)"
+            )
+        return f"Entry expired and was purged (CCR idle TTL: {ttl_seconds} seconds)"
+
+    # No tombstone either. That is not proof the hash was never stored: reasons
+    # are process-local (see CompressionStore._tombstones), so a backend sweep
+    # in another worker, or any purge that happened before this process started,
+    # leaves none behind. Name both possibilities rather than implying the first.
+    return (
+        "Entry not found - never stored, or expired/evicted with no reason "
+        f"recorded (CCR idle TTL: {default_ttl} seconds)"
+    )
 
 
 def _redact_retrieval_log_payload(payload: str) -> str:
@@ -146,8 +191,9 @@ CCR_MISS_MESSAGE = (
     "Entry not found or expired. To recover: if the compression marker "
     "references a file Read, re-read that file (the path is in the "
     "marker; disk is the source of truth). If it was command output, "
-    "re-run the command. Entries expire after the store TTL "
-    "(default 30 minutes; configurable via HEADROOM_CCR_TTL_SECONDS)."
+    "re-run the command. Entries expire after the store goes untouched "
+    "for the idle TTL (default 60 minutes, restarted on every retrieval; "
+    "configurable via HEADROOM_CCR_TTL_SECONDS)."
 )
 
 
@@ -167,6 +213,9 @@ class CompressionEntry:
     query_context: str | None
     created_at: float
     ttl: int = DEFAULT_CCR_TTL_SECONDS
+    # Absolute ceiling measured from created_at. None means
+    # ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER.
+    max_lifetime: int | None = None
 
     # TOIN integration: Store the tool signature hash for retrieval correlation
     # This MUST match the hash used by SmartCrusher when recording compression
@@ -178,9 +227,43 @@ class CompressionEntry:
     search_queries: list[str] = field(default_factory=list)
     last_accessed: float | None = None
 
+    @property
+    def max_lifetime_seconds(self) -> int:
+        """Absolute lifetime ceiling, derived from ttl when unset."""
+        if self.max_lifetime is not None:
+            return self.max_lifetime
+        return self.ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER
+
+    @property
+    def idle_since(self) -> float:
+        """Timestamp the idle window is measured from."""
+        return self.last_accessed if self.last_accessed is not None else self.created_at
+
+    @property
+    def expires_at(self) -> float:
+        """Earliest moment this entry can expire, given current access state."""
+        return min(
+            self.idle_since + self.ttl,
+            self.created_at + self.max_lifetime_seconds,
+        )
+
+    def expiry_reason(self, now: float | None = None) -> str | None:
+        """Return why this entry is expired, or None if it is still live."""
+        now = time.time() if now is None else now
+        if now - self.created_at > self.max_lifetime_seconds:
+            return "max_lifetime"
+        if now - self.idle_since > self.ttl:
+            return "idle"
+        return None
+
     def is_expired(self) -> bool:
-        """Check if this entry has expired."""
-        return time.time() - self.created_at > self.ttl
+        """Check if this entry has expired.
+
+        The TTL is an *idle* window: record_access() moves ``last_accessed``,
+        so an entry the agent keeps retrieving stays alive until it goes
+        untouched for ``ttl`` seconds, bounded by ``max_lifetime_seconds``.
+        """
+        return self.expiry_reason() is not None
 
     def record_access(self, query: str | None = None) -> None:
         """Record an access to this entry for feedback tracking."""
@@ -217,7 +300,8 @@ class CompressionStore:
     Design principles:
     - Zero external dependencies (pure Python)
     - Thread-safe for concurrent access
-    - TTL-based expiration (default 300 seconds, env-configurable)
+    - Idle-based expiration (default 3600 seconds since last access,
+      env-configurable) with an absolute lifetime ceiling
     - LRU-style eviction when capacity is reached
     - Hash-keyed retrieval that always returns the full original content
     """
@@ -228,12 +312,16 @@ class CompressionStore:
         default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
+        default_max_lifetime: int | None = None,
     ):
         """Initialize the compression store.
 
         Args:
             max_entries: Maximum number of entries to store.
-            default_ttl: Default TTL in seconds (default 30 minutes — session scale).
+            default_ttl: Default idle TTL in seconds (default 60 minutes,
+                restarted on every retrieval).
+            default_max_lifetime: Absolute lifetime ceiling in seconds.
+                Defaults to ``default_ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER``.
             enable_feedback: Whether to track retrieval events.
             backend: Storage backend to use. Defaults to InMemoryBackend
                      when constructed directly; `get_compression_store()`
@@ -248,7 +336,29 @@ class CompressionStore:
         self._lock = threading.Lock()
         self._max_entries = max_entries
         self._default_ttl = default_ttl
+        self._default_max_lifetime = (
+            default_max_lifetime
+            if default_max_lifetime is not None
+            else default_ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER
+        )
         self._enable_feedback = enable_feedback
+
+        # Why a hash went away, kept after the entry itself is deleted so a
+        # miss can say "expired" / "evicted for capacity" instead of the
+        # indistinguishable "not found" that #2604 reported. Bounded ring —
+        # this is diagnostics, not state.
+        #
+        # Best-effort by construction, and deliberately so: a reason is only
+        # recorded when *this* store instance performs the deletion. The
+        # backend also drops expired rows on its own — SQLiteBackend._open()
+        # sweeps at startup and _maybe_purge() sweeps on write — and a process
+        # restart takes the whole ring with it. Those misses degrade to a plain
+        # "not found", which format_retrieval_miss_detail() reports as
+        # ambiguous. Persisting reasons would need backend support every
+        # backend can opt out of (Redis/Mongo load by entry point), so the
+        # honest wording is required regardless; see the follow-up issue.
+        self._tombstones: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._max_tombstones = 512
 
         # Feedback tracking
         self._retrieval_events: list[RetrievalEvent] = []
@@ -256,12 +366,29 @@ class CompressionStore:
         self._pending_feedback_events: list[RetrievalEvent] = []
 
         # MEDIUM FIX #16: Use a min-heap for O(log n) eviction instead of O(n)
-        # Heap entries are (created_at, hash_key) tuples
+        # Heap entries are (idle_since, hash_key) tuples — keyed on last
+        # access, not creation, so eviction drops the coldest entry rather
+        # than the oldest one the agent is still actively retrieving.
         self._eviction_heap: list[tuple[float, str]] = []
         # CRITICAL FIX: Track stale entries count to know when heap cleanup is needed
         self._stale_heap_entries = 0
         # Threshold for triggering heap rebuild (when 50% are stale)
         self._heap_rebuild_threshold = 0.5
+
+    def _record_tombstone(self, hash_key: str, reason: str, entry: CompressionEntry) -> None:
+        """Remember why a hash was removed. Must be called with lock held."""
+        self._tombstones.pop(hash_key, None)
+        self._tombstones[hash_key] = {
+            "reason": reason,
+            "at": time.time(),
+            "ttl_seconds": entry.ttl,
+            "max_lifetime_seconds": entry.max_lifetime_seconds,
+            "created_at": entry.created_at,
+            "last_accessed": entry.last_accessed,
+            "retrieval_count": entry.retrieval_count,
+        }
+        while len(self._tombstones) > self._max_tombstones:
+            self._tombstones.popitem(last=False)
 
     @property
     def default_ttl_seconds(self) -> int:
@@ -283,6 +410,7 @@ class CompressionStore:
         tool_signature_hash: str | None = None,
         compression_strategy: str | None = None,
         ttl: int | None = None,
+        max_lifetime: int | None = None,
         explicit_hash: str | None = None,
     ) -> str:
         """Store compressed content and return hash for retrieval.
@@ -299,7 +427,10 @@ class CompressionStore:
             query_context: User query context for relevance matching.
             tool_signature_hash: Hash from ToolSignature for TOIN correlation.
             compression_strategy: Strategy used for compression.
-            ttl: Custom TTL in seconds (uses default if not specified).
+            ttl: Custom idle TTL in seconds (uses default if not specified).
+            max_lifetime: Custom absolute lifetime ceiling in seconds. Defaults
+                to the store default when ttl is also default, otherwise to
+                ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER.
             explicit_hash: Use this exact hex hash as the storage key
                 instead of computing SHA-256(original)[:24]. Required when
                 the marker that points at this entry was emitted by a
@@ -372,6 +503,14 @@ class CompressionStore:
             )
             return hash_key
 
+        effective_ttl = ttl if ttl is not None else self._default_ttl
+        if max_lifetime is not None:
+            effective_max_lifetime = max_lifetime
+        elif ttl is None:
+            effective_max_lifetime = self._default_max_lifetime
+        else:
+            effective_max_lifetime = effective_ttl * DEFAULT_CCR_MAX_LIFETIME_MULTIPLIER
+
         entry = CompressionEntry(
             hash=hash_key,
             original_content=original,
@@ -384,7 +523,8 @@ class CompressionStore:
             tool_call_id=tool_call_id,
             query_context=query_context,
             created_at=time.time(),
-            ttl=ttl if ttl is not None else self._default_ttl,
+            ttl=effective_ttl,
+            max_lifetime=effective_max_lifetime,
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
         )
@@ -428,7 +568,10 @@ class CompressionStore:
 
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
-            heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
+            heapq.heappush(self._eviction_heap, (entry.idle_since, hash_key))
+            # A re-store makes the hash live again; drop any stale tombstone
+            # so a later miss is not misreported with an old reason.
+            self._tombstones.pop(hash_key, None)
 
         return hash_key
 
@@ -452,16 +595,23 @@ class CompressionStore:
             if entry is None:
                 return None
 
-            if entry.is_expired():
+            expiry_reason = entry.expiry_reason()
+            if expiry_reason is not None:
                 self._backend.delete(hash_key)
+                self._record_tombstone(hash_key, f"expired:{expiry_reason}", entry)
                 # CRITICAL FIX: Track stale heap entry
                 self._stale_heap_entries += 1
                 return None
 
-            # Track access for feedback
+            # Track access for feedback. This also restarts the idle window,
+            # so an entry in active use never expires under the agent.
             entry.record_access(query)
             # Update the backend with the modified entry
             self._backend.set(hash_key, entry)
+            # Re-key the entry in the eviction heap on its new access time.
+            # The old tuple becomes stale; the counter drives the rebuild.
+            heapq.heappush(self._eviction_heap, (entry.idle_since, hash_key))
+            self._stale_heap_entries += 1
 
             # Log retrieval event
             if self._enable_feedback:
@@ -516,8 +666,12 @@ class CompressionStore:
             if entry is None:
                 return None
 
-            if entry.is_expired():
+            reason = entry.expiry_reason()
+            if reason is not None:
                 self._backend.delete(hash_key)
+                # Record why, so a later get_entry_status() on this hash still
+                # reports the expiry instead of a generic "not found".
+                self._record_tombstone(hash_key, f"expired:{reason}", entry)
                 self._stale_heap_entries += 1
                 return None
 
@@ -581,11 +735,13 @@ class CompressionStore:
             entry = self._backend.get(hash_key)
             if entry is None:
                 return False
-            if entry.is_expired():
+            reason = entry.expiry_reason()
+            if reason is not None:
                 # LOW FIX #20: Only delete if explicitly requested
                 # This makes exists() a pure check by default
                 if clean_expired:
                     self._backend.delete(hash_key)
+                    self._record_tombstone(hash_key, f"expired:{reason}", entry)
                     # CRITICAL FIX: Track stale heap entry
                     self._stale_heap_entries += 1
                 return False
@@ -602,30 +758,53 @@ class CompressionStore:
         with self._lock:
             entry = self._backend.get(hash_key)
             if entry is None:
-                return {
-                    "hash": hash_key,
-                    "status": "missing",
-                    "default_ttl_seconds": self._default_ttl,
-                }
+                return self._missing_status(hash_key)
 
-            age_seconds = now - entry.created_at
-            expires_at = entry.created_at + entry.ttl
-            expired = age_seconds > entry.ttl
+            reason = entry.expiry_reason(now)
             status = {
                 "hash": hash_key,
-                "status": "expired" if expired else "available",
+                "status": "expired" if reason else "available",
                 "ttl_seconds": entry.ttl,
+                "max_lifetime_seconds": entry.max_lifetime_seconds,
                 "default_ttl_seconds": self._default_ttl,
                 "created_at": entry.created_at,
-                "expires_at": expires_at,
-                "age_seconds": age_seconds,
+                "last_accessed": entry.last_accessed,
+                "expires_at": entry.expires_at,
+                "age_seconds": now - entry.created_at,
+                "idle_seconds": now - entry.idle_since,
+                "expiry_reason": reason,
             }
 
-            if expired and clean_expired:
+            if reason and clean_expired:
                 self._backend.delete(hash_key)
+                self._record_tombstone(hash_key, f"expired:{reason}", entry)
                 self._stale_heap_entries += 1
 
             return status
+
+    def _missing_status(self, hash_key: str) -> dict[str, Any]:
+        """Status for a hash the store no longer holds. Lock must be held."""
+        status: dict[str, Any] = {
+            "hash": hash_key,
+            "status": "missing",
+            "default_ttl_seconds": self._default_ttl,
+            "max_entries": self._max_entries,
+        }
+        tombstone = self._tombstones.get(hash_key)
+        if tombstone is None:
+            return status
+
+        reason = tombstone["reason"]
+        status["removed_at"] = tombstone["at"]
+        status["ttl_seconds"] = tombstone["ttl_seconds"]
+        status["max_lifetime_seconds"] = tombstone["max_lifetime_seconds"]
+        status["retrieval_count"] = tombstone["retrieval_count"]
+        if reason == "evicted":
+            status["status"] = "evicted"
+        elif reason.startswith("expired:"):
+            status["status"] = "expired_and_purged"
+            status["expiry_reason"] = reason.split(":", 1)[1]
+        return status
 
     def get_stats(self) -> dict[str, Any]:
         """Get store statistics for monitoring."""
@@ -646,6 +825,7 @@ class CompressionStore:
                 "entry_count": self._backend.count(),
                 "max_entries": self._max_entries,
                 "default_ttl_seconds": self._default_ttl,
+                "default_max_lifetime_seconds": self._default_max_lifetime,
                 "total_original_tokens": total_original_tokens,
                 "total_compressed_tokens": total_compressed_tokens,
                 "total_retrievals": total_retrievals,
@@ -718,6 +898,7 @@ class CompressionStore:
             self._retrieval_events.clear()
             self._pending_feedback_events.clear()
             self._eviction_heap.clear()  # MEDIUM FIX #16: Clear heap too
+            self._tombstones.clear()
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
 
     def _evict_if_needed(self) -> None:
@@ -739,13 +920,14 @@ class CompressionStore:
 
         # If still at capacity, remove oldest entries using heap
         while self._backend.count() >= self._max_entries and self._eviction_heap:
-            # Pop oldest from heap (O(log n))
-            created_at, hash_key = heapq.heappop(self._eviction_heap)
+            # Pop coldest from heap (O(log n))
+            idle_since, hash_key = heapq.heappop(self._eviction_heap)
 
             # Check if entry still exists and matches timestamp
-            # (entry might have been deleted or replaced)
+            # (entry might have been deleted, replaced, or accessed since —
+            # an accessed entry has a newer tuple further up the heap)
             entry = self._backend.get(hash_key)
-            if entry is not None and entry.created_at == created_at:
+            if entry is not None and entry.idle_since == idle_since:
                 # HIGH FIX: Track eviction as "successful compression" if never retrieved
                 # This prevents state divergence between store and feedback loop
                 if self._enable_feedback and entry.retrieval_count == 0:
@@ -753,6 +935,7 @@ class CompressionStore:
                     # Notify feedback system so it knows this strategy worked
                     self._record_eviction_success(entry)
                 self._backend.delete(hash_key)
+                self._record_tombstone(hash_key, "evicted", entry)
             else:
                 # CRITICAL FIX: This was a stale entry, decrement counter
                 # (we already popped it, so the stale entry is now gone)
@@ -764,9 +947,14 @@ class CompressionStore:
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
         """
-        expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
-        for key in expired_keys:
+        expired = [
+            (key, entry, reason)
+            for key, entry in self._backend.items()
+            if (reason := entry.expiry_reason()) is not None
+        ]
+        for key, entry, reason in expired:
             self._backend.delete(key)
+            self._record_tombstone(key, f"expired:{reason}", entry)
             # CRITICAL FIX: Increment stale counter - the heap still has an entry
             # for this key that will be stale when we try to evict
             self._stale_heap_entries += 1
@@ -779,7 +967,7 @@ class CompressionStore:
         """
         # Build new heap from current store entries only
         self._eviction_heap = [
-            (entry.created_at, hash_key) for hash_key, entry in self._backend.items()
+            (entry.idle_since, hash_key) for hash_key, entry in self._backend.items()
         ]
         heapq.heapify(self._eviction_heap)
         # Reset stale counter - heap is now clean
@@ -1002,7 +1190,7 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
 
     Default (env unset or "sqlite"): SQLiteBackend at workspace_dir()/ccr_store.db
     — restart-safe and shared across worker processes, which the
-    session-scale 30-minute TTL assumes.
+    session-scale idle TTL assumes.
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
@@ -1061,7 +1249,7 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call for global store).
         default_ttl: Default TTL (only used on first call for global store).
-            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 1800-second default.
+            When omitted, HEADROOM_CCR_TTL_SECONDS overrides the 3600-second default.
         backend: Custom storage backend (only used on first call for global store).
                  Defaults to InMemoryBackend if not provided; env backend used if backend is None.
 
