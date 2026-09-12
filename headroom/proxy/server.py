@@ -4297,9 +4297,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # any power over. Tokens Headroom removed never reached the
         # provider at all, so they're added back to form the baseline.
         _pc_totals = prefix_cache_stats.get("totals", {})
-        new_input_tokens = int(_pc_totals.get("uncached_input_tokens", 0) or 0) + int(
-            _pc_totals.get("cache_write_tokens", 0) or 0
-        )
+        new_input_tokens = int(_pc_totals.get("new_input_tokens", 0) or 0)
+        # Paired numerator: savings from the SAME requests that supplied the
+        # denominator, accumulated on one predicate in record_request.
+        # tokens_saved_total also counts requests with no usage breakdown
+        # (Bedrock, MCP tools), which would lend savings to a denominator they
+        # never entered: one qualified request at 50 percent plus one
+        # unqualified 10,000-token saving read as 99 percent.
+        new_input_saved_tokens = int(_pc_totals.get("new_input_saved_tokens", 0) or 0)
 
         # Build human-readable summary
         summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
@@ -4545,14 +4550,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # 200x into the denominator and long-running sessions
                 # (1M-context models never compact) read as ~0% no
                 # matter how well compression performs on new content.
-                # Guarded on new_input_tokens > 0 (not the full sum): the
-                # cache accumulators only see requests with cache
-                # activity, so a deployment with no cache metrics (e.g.
-                # Bedrock) would otherwise divide savings by themselves
-                # and report ~100%. No usage data -> report 0, not a lie.
+                # Guarded on new_input_tokens > 0 (not the full sum): a
+                # deployment that reports no usage breakdown at all (e.g.
+                # Bedrock) contributes to neither side, and would
+                # otherwise divide savings by themselves and report
+                # ~100%. No usage data -> report 0, not a lie. This is
+                # the same cohort `headroom savings` reports from the
+                # ledger, so the two figures cannot disagree.
                 "new_input_tokens": new_input_tokens,
                 "new_input_savings_percent": round(
-                    (proxy_compression_tokens / (new_input_tokens + proxy_compression_tokens) * 100)
+                    (new_input_saved_tokens / (new_input_tokens + new_input_saved_tokens) * 100)
                     if new_input_tokens > 0
                     else 0,
                     2,

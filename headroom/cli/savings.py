@@ -39,10 +39,18 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     saved = int(window.get("tokens_saved", 0) or 0)
     before = int(window.get("tokens_before", 0) or 0)
     cost = float(window.get("cost_usd", 0.0) or 0.0)
-    return (
+    line = (
         f"{label:<12} {_bar(pct)} {pct:5.1f}%  "
         f"saved {_tokens(saved)} / {_tokens(before)} tokens  {_money(cost)}"
     )
+    # Second basis, only when the window has provider cache data: the share of
+    # tokens that newly entered context. The bar's ratio counts a session's
+    # cached history on every turn, so a long session reads near 0% there
+    # while compression is working; this is the figure the dashboard leads with.
+    if int(window.get("new_input_tokens", 0) or 0) > 0:
+        new_pct = float(window.get("new_input_savings_percent", 0.0) or 0.0)
+        line += f"  · of new input {new_pct:.1f}%"
+    return line
 
 
 @main.command(name="savings")
@@ -88,6 +96,11 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
     click.echo(_window_line("Today", report.windows["today"]))
     click.echo(_window_line("Last 7 days", report.windows["last_7_days"]))
     click.echo(_window_line("Last 30 days", report.windows["last_30_days"]))
+    if any(int(w.get("new_input_tokens", 0) or 0) > 0 for w in report.windows.values()):
+        click.echo(
+            "  % is of all forwarded input (cached history recounted every turn); "
+            "'of new input' is of tokens that newly entered context."
+        )
 
     if report.by_model:
         click.echo("")

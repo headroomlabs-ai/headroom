@@ -127,11 +127,29 @@ def record_savings_event(
     cost_usd: float | None = None,
     fallback_rate: float = DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
     path: str | os.PathLike[str] | None = None,
+    new_input_tokens: int | None = None,
+    deferred_tokens: int = 0,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
     Returns ``True`` when a line was written. ``cost_usd`` is computed from the
     model + tokens saved when not supplied by the caller.
+
+    ``new_input_tokens`` is the provider-billed input that newly entered
+    context this request (uncached + cache-write), the denominator /stats
+    reports as ``new_input_savings_percent``. ``deferred_tokens`` is the part
+    of ``saved`` that is tool-schema deferral, which rides the cached prefix
+    and is never part of new input; it is subtracted from the numerator so the
+    ledger pairs compression-only savings with new input exactly as /stats
+    does. Both are optional so MCP-tool events and older callers keep writing
+    the same line they always did.
+
+    A request that saved nothing but carries ``new_input_tokens`` is still
+    written, as a denominator-only observation: the new-input basis must see
+    every request that newly billed input, not only the ones compression
+    touched, or a 100-saved/100-new turn followed by a 0-saved/10,000-new turn
+    reads as 50 percent instead of under 1. Without ``new_input_tokens`` a
+    zero-saving request is skipped exactly as before.
     """
 
     try:
@@ -141,7 +159,7 @@ def record_savings_event(
         return False
 
     saved = max(before - after, 0)
-    if saved <= 0:
+    if saved <= 0 and new_input_tokens is None:
         return False
 
     model_label = _normalize_model(model)
@@ -165,6 +183,13 @@ def record_savings_event(
         "source": str(source or UNKNOWN),
         "pid": os.getpid(),
     }
+    if new_input_tokens is not None:
+        try:
+            event["new_input"] = max(int(new_input_tokens), 0)
+            event["deferred"] = min(max(int(deferred_tokens), 0), saved)
+        except (TypeError, ValueError):
+            event.pop("new_input", None)
+            event.pop("deferred", None)
 
     target = _resolve_path(path)
     try:
@@ -231,18 +256,53 @@ class _Bucket:
     tokens_before: int = 0
     cost_usd: float = 0.0
     calls: int = 0
+    # Only events that recorded new input contribute to BOTH of these, so the
+    # ratio never pairs one event's savings with another event's denominator.
+    new_input_tokens: int = 0
+    new_input_saved: int = 0
 
-    def add(self, *, saved: int, before: int, cost: float) -> None:
+    def add(
+        self,
+        *,
+        saved: int,
+        before: int,
+        cost: float,
+        new_input: int | None = None,
+        deferred: int = 0,
+    ) -> None:
+        if saved <= 0 and new_input is not None:
+            # Denominator-only observation (see record_savings_event): it
+            # belongs in the new-input basis and nowhere else, so calls,
+            # before/saved and cost keep their saved-event semantics.
+            self.new_input_tokens += new_input
+            return
         self.tokens_saved += saved
         self.tokens_before += before
         self.cost_usd += cost
         self.calls += 1
+        if new_input is not None:
+            self.new_input_tokens += new_input
+            self.new_input_saved += max(saved - deferred, 0)
 
     @property
     def savings_percent(self) -> float:
         if self.tokens_before <= 0:
             return 0.0
         return round(self.tokens_saved / self.tokens_before * 100, 1)
+
+    @property
+    def new_input_savings_percent(self) -> float:
+        """Compression-only savings as a share of what newly entered context.
+
+        The whole-wire ratio above recounts a session's cached history every
+        turn, so long sessions read as ~0% no matter how well compression does
+        on new content. Same definition as /stats ``new_input_savings_percent``:
+        saved / (new input + saved), since removed tokens never reached the
+        provider and are added back to form the baseline.
+        """
+        if self.new_input_tokens <= 0:
+            return 0.0
+        return round(self.new_input_saved / (self.new_input_tokens + self.new_input_saved) * 100, 1)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +311,8 @@ class _Bucket:
             "cost_usd": round(self.cost_usd, 6),
             "calls": self.calls,
             "savings_percent": self.savings_percent,
+            "new_input_tokens": self.new_input_tokens,
+            "new_input_savings_percent": self.new_input_savings_percent,
         }
 
 
@@ -321,19 +383,26 @@ def aggregate_savings(
             cost = max(float(event.get("cost_usd", 0.0) or 0.0), 0.0)
         except (TypeError, ValueError):
             cost = 0.0
+        new_input: int | None = None
+        deferred = 0
+        if event.get("new_input") is not None:
+            try:
+                new_input = max(int(event.get("new_input") or 0), 0)
+                deferred = max(int(event.get("deferred", 0) or 0), 0)
+            except (TypeError, ValueError):
+                new_input = None
 
-        windowed.add(saved=saved, before=before, cost=cost)
+        targets = [windowed]
         if ts >= today_cutoff:
-            today.add(saved=saved, before=before, cost=cost)
+            targets.append(today)
         if ts >= week_cutoff:
-            last_7.add(saved=saved, before=before, cost=cost)
-
-        by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()).add(
-            saved=saved, before=before, cost=cost
-        )
-        by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()).add(
-            saved=saved, before=before, cost=cost
-        )
+            targets.append(last_7)
+        targets.append(by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()))
+        targets.append(by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()))
+        for bucket in targets:
+            bucket.add(
+                saved=saved, before=before, cost=cost, new_input=new_input, deferred=deferred
+            )
 
     model_rows = _ranked(by_model, "model")
     top_model = model_rows[0]["model"] if model_rows else UNKNOWN

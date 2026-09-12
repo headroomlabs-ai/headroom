@@ -288,6 +288,16 @@ class PrometheusMetrics:
         # Track per-model cache request count to distinguish cold starts from busts
         self._cache_requests_by_model: dict[str, int] = defaultdict(int)
 
+        # New-input basis. The cohort is every request that newly BILLED input
+        # (uncached or cache-write tokens), which is not the same set as the
+        # cache accumulators above: those are gated on cache activity, so they
+        # both admit cache-read-only requests (numerator, no denominator) and
+        # drop uncached-only ones (real new input, dropped entirely). The
+        # ledger pairs the same two figures over the same predicate; keeping
+        # one gate here is what stops /stats and `headroom savings` disagreeing.
+        self.new_input_tokens_total: int = 0
+        self.new_input_saved_tokens_total: int = 0
+
         # Prefix freeze stats (cache-aware compression)
         self.prefix_freeze_busts_avoided: int = 0
         self.prefix_freeze_tokens_preserved: int = 0
@@ -843,6 +853,11 @@ class PrometheusMetrics:
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
 
+            # New-input cohort, on the same predicate the ledger uses below.
+            if uncached_input_tokens > 0 or cache_write_tokens > 0:
+                self.new_input_tokens_total += uncached_input_tokens + cache_write_tokens
+                self.new_input_saved_tokens_total += max(0, int(tokens_saved))
+
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
                 pc = self.cache_by_provider[provider]
@@ -981,7 +996,13 @@ class PrometheusMetrics:
         # sessions and drops deferral-only turns from the ledger entirely (#2795).
         deferral_saved = max(0, int(tool_search_saved))
         ledger_saved = tokens_saved + deferral_saved
-        if ledger_saved > 0 and not self._stateless:
+        # A request that newly billed input is written even when it saved
+        # nothing: the ledger's new-input basis needs the denominator from
+        # every such request (see record_savings_event). Same predicate as the
+        # `new_input_*_total` accumulators above, so the two rates share a
+        # cohort — /stats and `headroom savings` are the same measurement.
+        has_new_input = uncached_input_tokens > 0 or cache_write_tokens > 0
+        if (ledger_saved > 0 or has_new_input) and not self._stateless:
             # `input_tokens` here is the optimized (post-compression) count
             # that was actually forwarded — see emit_request_outcome, which
             # passes `input_tokens=outcome.optimized_tokens`. The ledger's
@@ -1004,6 +1025,15 @@ class PrometheusMetrics:
                 model=model,
                 client=client or "proxy",
                 source="proxy",
+                # Provider-billed new input (the /stats new_input denominator)
+                # and the deferral share of `saved`, so `headroom savings` can
+                # show the same new-input rate the dashboard headline does.
+                # Omitted when there is no cache breakdown (e.g. Bedrock), so
+                # the ledger never divides savings by themselves.
+                new_input_tokens=(
+                    int(uncached_input_tokens) + int(cache_write_tokens) if has_new_input else None
+                ),
+                deferred_tokens=deferral_saved,
             )
 
         otel_metrics = self._get_otel_metrics()
