@@ -293,6 +293,52 @@ class TestHeadroomChatModel:
         assert summary["total_tokens_saved"] == 70
         assert summary["average_savings_percent"] == 22.5
 
+    def test_get_metrics_empty(self, mock_chat_model):
+        """get_metrics with no history."""
+        from headroom.integrations import HeadroomChatModel
+
+        model = HeadroomChatModel(mock_chat_model)
+        metrics = model.get_metrics()
+
+        assert metrics["tokens_saved"] == 0
+        assert metrics["total_requests"] == 0
+
+    def test_get_metrics_with_data(self, mock_chat_model):
+        """get_metrics returns tokens_saved from tracked optimization history."""
+        from headroom.integrations import HeadroomChatModel
+        from headroom.integrations.langchain import OptimizationMetrics
+
+        model = HeadroomChatModel(mock_chat_model)
+
+        model._metrics_history = [
+            OptimizationMetrics(
+                request_id="1",
+                timestamp=datetime.now(),
+                tokens_before=100,
+                tokens_after=80,
+                tokens_saved=20,
+                savings_percent=20.0,
+                transforms_applied=["smart_crusher"],
+                model="gpt-4o",
+            ),
+            OptimizationMetrics(
+                request_id="2",
+                timestamp=datetime.now(),
+                tokens_before=200,
+                tokens_after=150,
+                tokens_saved=50,
+                savings_percent=25.0,
+                transforms_applied=["cache_aligner"],
+                model="gpt-4o",
+            ),
+        ]
+        model._total_tokens_saved = 70
+
+        metrics = model.get_metrics()
+
+        assert metrics["tokens_saved"] == 70
+        assert metrics["total_requests"] == 2
+
 
 class TestHeadroomCallbackHandler:
     """Tests for HeadroomCallbackHandler."""
