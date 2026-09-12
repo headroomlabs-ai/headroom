@@ -13,8 +13,45 @@ from headroom.providers.registry import (
     call_client_transport,
     create_proxy_backend,
     format_backend_status,
+    format_backend_usage_section,
+    model_matches_provider,
 )
 from headroom.proxy import upstream_guard
+
+
+@pytest.mark.parametrize(
+    ("provider", "model", "expected"),
+    [
+        ("anthropic", "claude-sonnet-4-6", True),
+        ("vertex:anthropic", "claude-sonnet-4-6", True),
+        ("openai", "gpt-5.4", True),
+        ("openai", "claude-sonnet-4-6", False),
+        ("gemini", "gemini-3.1-pro", True),
+        ("bedrock", "anthropic.claude-sonnet-4-6-v1", True),
+    ],
+)
+def test_model_matches_provider(provider: str, model: str, expected: bool) -> None:
+    assert model_matches_provider(provider, model) is expected
+
+
+@pytest.mark.parametrize("model", ["azure/gpt-4o", "openrouter/openai/gpt-4o", "chatgpt-4o-latest"])
+def test_prefix_cache_pricing_retains_qualified_openai_models(model: str) -> None:
+    from headroom.proxy.cost import CostTracker, build_prefix_cache_stats
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+    tracker = CostTracker()
+    tracker._tokens_sent_by_model = {model: 1_000_000}
+    metrics = PrometheusMetrics()
+    metrics.cache_by_provider["openai"].update(requests=1, cache_read_tokens=1_000_000)
+    with (
+        patch.object(tracker, "_get_list_price", return_value=2.5) as price,
+        patch.object(tracker, "_get_cache_prices", return_value=(1.25e-6, 2.5e-6, 2.5e-6)),
+    ):
+        result = build_prefix_cache_stats(metrics, tracker)["by_provider"]["openai"]
+
+    price.assert_called_once_with(model)
+    assert result["cache_pricing_source"] == "catalog"
+    assert result["savings_usd"] == pytest.approx(1.25)
 
 
 class DummyStorage:
@@ -211,6 +248,30 @@ def test_format_backend_status_uses_litellm_provider_metadata(
         )
         == "OPENAI via LiteLLM"
     )
+
+
+def test_format_backend_usage_section_uses_litellm_provider_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "headroom.backends.litellm.get_provider_config",
+        lambda provider: SimpleNamespace(
+            display_name=provider.upper(),
+            env_vars=("BEDROCK_PROFILE", "AWS_REGION"),
+            model_format_hint="bedrock/anthropic.claude",
+        ),
+    )
+
+    section = format_backend_usage_section(
+        backend="litellm-bedrock",
+        host="127.0.0.1",
+        port=8787,
+    )
+
+    assert "IMPORTANT for BEDROCK users" in section
+    assert "BEDROCK_PROFILE, AWS_REGION" in section
+    assert "ANTHROPIC_BASE_URL=http://127.0.0.1:8787" in section
+    assert "bedrock/anthropic.claude" in section
 
 
 def test_call_client_transport_covers_openai_and_anthropic_paths() -> None:

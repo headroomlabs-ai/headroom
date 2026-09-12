@@ -1496,34 +1496,13 @@ def proxy(
     openai_url = provider_api_targets.openai
     cloudcode_url = provider_api_targets.cloudcode
     vertex_url = provider_api_targets.vertex
-    backend_section = ""
+    from headroom.providers.registry import format_backend_usage_section
 
-    if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
-        # any-llm backend
-        backend_section = """
-  Set credentials for your provider (e.g., OPENAI_API_KEY, MISTRAL_API_KEY)
-  Providers: https://mozilla-ai.github.io/any-llm/providers/
-"""
-    elif config.backend != "anthropic":
-        # LiteLLM backend
-        from headroom.backends.litellm import get_provider_config
-
-        provider = config.backend.replace("litellm-", "")
-        provider_config = get_provider_config(provider)
-
-        # Build usage instructions from provider config
-        env_vars_str = (
-            ", ".join(provider_config.env_vars) if provider_config.env_vars else "See docs"
-        )
-        backend_section = f"""
-IMPORTANT for {provider_config.display_name} users:
-  1. Set credentials: {env_vars_str}
-  2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
-     (Headroom ignores this - it uses your {provider_config.display_name} credentials)
-  3. Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"""
-        if provider_config.model_format_hint:
-            backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
-        backend_section += "\n"
+    backend_section = format_backend_usage_section(
+        backend=config.backend,
+        host=config.host,
+        port=config.port,
+    )
 
     # Build memory section if enabled
     memory_section = ""
