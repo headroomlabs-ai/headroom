@@ -30,6 +30,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,13 @@ from .compression_strategy_outcomes import CompressionStrategyOutcomes
 
 if TYPE_CHECKING:
     from .compression_store import CompressionStore, RetrievalEvent
+
+# Cap on distinct tools tracked in ``_tool_patterns``. ``tool_name`` is
+# client-controlled — MCP servers can expose arbitrarily named tools — so the
+# outer key set is LRU-bounded like the interior per-pattern structures already
+# are (see LocalToolPattern's capped queries/fields/hashes). Well above the tool
+# count of any real deployment.
+_MAX_TRACKED_TOOLS = 1024
 
 
 @dataclass
@@ -185,8 +193,10 @@ class CompressionFeedback:
         self._enable_learning = enable_learning
         self._lock = threading.Lock()
 
-        # Learned patterns per tool
-        self._tool_patterns: dict[str, LocalToolPattern] = {}
+        # Learned patterns per tool. LRU-ordered so the tracked-tool set can be
+        # capped (tool_name is client-controlled); most-recently-recorded tools
+        # stay, one-off tool names are evicted past _MAX_TRACKED_TOOLS.
+        self._tool_patterns: OrderedDict[str, LocalToolPattern] = OrderedDict()
 
         # Time-based tracking
         self._last_analysis: float = 0.0
@@ -207,6 +217,24 @@ class CompressionFeedback:
 
             self._store = get_compression_store()
         return self._store
+
+    def _touch_tool_pattern(self, tool_name: str) -> LocalToolPattern:
+        """Get-or-create a tool's pattern, LRU-capping the tracked-tool set.
+
+        ``tool_name`` is client-controlled, so the outer dict is bounded: past
+        ``_MAX_TRACKED_TOOLS`` the least-recently-recorded tool is evicted, and
+        recording a tool moves it to the most-recent end. The caller holds
+        ``self._lock``.
+        """
+        pattern = self._tool_patterns.get(tool_name)
+        if pattern is None:
+            if len(self._tool_patterns) >= _MAX_TRACKED_TOOLS:
+                self._tool_patterns.popitem(last=False)
+            pattern = LocalToolPattern(tool_name=tool_name)
+            self._tool_patterns[tool_name] = pattern
+        else:
+            self._tool_patterns.move_to_end(tool_name)
+        return pattern
 
     def record_compression(
         self,
@@ -233,10 +261,7 @@ class CompressionFeedback:
         with self._lock:
             self._total_compressions += 1
 
-            if tool_name not in self._tool_patterns:
-                self._tool_patterns[tool_name] = LocalToolPattern(tool_name=tool_name)
-
-            pattern = self._tool_patterns[tool_name]
+            pattern = self._touch_tool_pattern(tool_name)
             pattern.total_compressions += 1
             pattern.last_compression = time.time()
 
@@ -289,10 +314,7 @@ class CompressionFeedback:
         with self._lock:
             self._total_retrievals += 1
 
-            if tool_name not in self._tool_patterns:
-                self._tool_patterns[tool_name] = LocalToolPattern(tool_name=tool_name)
-
-            pattern = self._tool_patterns[tool_name]
+            pattern = self._touch_tool_pattern(tool_name)
             pattern.total_retrievals += 1
             pattern.last_retrieval = time.time()
 
