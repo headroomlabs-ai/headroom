@@ -46,7 +46,7 @@ file content is sent anywhere to be compressed.
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app.
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language.
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`.
+- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode|droid` in one command; undo with `headroom unwrap <tool>`.
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client.
 - **Cross-agent memory** — one shared store across Claude, Codex, Gemini and Grok, with automatic dedup.
 - **`headroom learn`** — mines failed sessions and writes corrections to `CLAUDE.local.md` (default, gitignored), `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or `GROK.md`.
@@ -242,6 +242,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | OpenHands | ✅ | starts proxy + launches |
 | Mistral Vibe | ✅ | starts proxy + launches |
 | Oh My Pi | ✅ | injects config · starts proxy + launches |
+| Factory Droid | ✅ | routes via `FACTORY_API_BASE_URL`; all models incl. Droid Core |
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |

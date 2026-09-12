@@ -297,6 +297,50 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         async def bedrock_invoke_stream(request: Request, model_id: str):
             return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
+    # Factory Droid inference passthrough. Registered ONLY when an upstream is
+    # configured (`--factory-api-url` / FACTORY_TARGET_API_URL). Factory exposes
+    # three inference shapes and Droid picks per model: Anthropic Messages at
+    # `/api/llm/a/v1/messages` (e.g. Bedrock-backed models) and OpenAI Chat
+    # Completions at `/api/llm/o/v1/chat/completions` (e.g. Fireworks-backed
+    # Droid Core / Kimi), plus OpenAI Responses at
+    # `/api/llm/o/v1/responses` (e.g. GPT-5.6). All are compressed by reusing
+    # the matching pipeline;
+    # auth (`Authorization: Bearer fk-...`) passes through untouched and all
+    # other Factory REST paths fall through to the catch-all, which
+    # `select_passthrough_base_url` points at the same upstream.
+    factory_api_url = getattr(proxy.config, "factory_api_url", None)
+    if factory_api_url:
+        _factory_base = factory_api_url.rstrip("/")
+
+        @app.post("/api/llm/a/v1/messages")
+        async def factory_llm_messages(request: Request):
+            return await proxy.handle_anthropic_messages(
+                request,
+                upstream_base_url=_factory_base,
+                provider_name="factory",
+            )
+
+        # The Factory base is trusted server configuration, not a client routing
+        # override. Pass it through the handler's private seam so the client SSRF
+        # guard cannot reject it and fall back to the unrelated OpenAI target.
+        @app.post("/api/llm/o/v1/chat/completions")
+        async def factory_llm_chat(request: Request):
+            return await proxy.handle_openai_chat(
+                request,
+                trusted_upstream_base_url=_factory_base,
+                trusted_original_path=request.url.path,
+                trusted_provider_name="factory",
+            )
+
+        @app.post("/api/llm/o/v1/responses")
+        async def factory_llm_responses(request: Request):
+            return await proxy.handle_openai_responses(
+                request,
+                trusted_upstream_base_url=_factory_base,
+                trusted_original_path=request.url.path,
+                trusted_provider_name="factory",
+            )
+
     _register_openai_responses_routes(app, proxy)
 
     _register_provider_handler_routes(app, proxy)

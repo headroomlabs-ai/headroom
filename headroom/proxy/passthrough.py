@@ -14,13 +14,19 @@ def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> 
     # custom-base tool traffic as LLM provider telemetry.
     if method.upper() != "POST":
         return "", ""
+    normalized_path = path[1:] if path.startswith("/") else path
+    # Factory Droid routes OpenAI-shaped Droid Core traffic through
+    # `/api/llm/o/v1/chat/completions`. Key on the distinctive path (not the
+    # host) so enterprise / EU Factory gateways tag telemetry `factory` too,
+    # matching the Anthropic `/api/llm/a/v1/messages` route.
+    if normalized_path == "api/llm/o/v1/chat/completions":
+        return "chat/completions", "factory"
     try:
         host = (urlparse(base_url.strip()).hostname or "").lower()
     except ValueError:
         return "", ""
     if host not in OPENCODE_ZEN_HOSTS:
         return "", ""
-    normalized_path = path[1:] if path.startswith("/") else path
     if normalized_path == "zen/v1/chat/completions":
         return "chat/completions", "zen"
     return "", ""
