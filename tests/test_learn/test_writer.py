@@ -1,5 +1,6 @@
 """Tests for recommendation writer — marker-based file updates."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -549,3 +550,100 @@ class TestEncodingResilience:
 
         assert "Use uv" in merged
         assert "Notes — existing" in merged
+
+
+def _git_project(tmp_path: Path) -> ProjectInfo:
+    """A project whose directory is a real git repo."""
+    proj = _project(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=proj.project_path, check=True)
+    return proj
+
+
+def _exclude(proj: ProjectInfo) -> Path:
+    return proj.project_path / ".git" / "info" / "exclude"
+
+
+def _is_ignored(proj: ProjectInfo, name: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "check-ignore", "-q", "--", name],
+            cwd=proj.project_path,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+class TestClaudeLocalMdStaysOutOfGit:
+    """CLAUDE.local.md is only personal if git actually ignores it (#1070)."""
+
+    def test_apply_adds_exclude_entry(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert "CLAUDE.local.md" in _exclude(proj).read_text()
+        # The point is the effect, not the file contents.
+        assert _is_ignored(proj, "CLAUDE.local.md")
+        assert result.warnings == []
+
+    def test_second_run_does_not_duplicate_the_entry(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        writer = ClaudeCodeWriter()
+
+        writer.write(recs, proj, dry_run=False)
+        writer.write(recs, proj, dry_run=False)
+
+        assert _exclude(proj).read_text().count("CLAUDE.local.md") == 1
+
+    def test_existing_gitignore_rule_is_left_alone(self, tmp_path):
+        proj = _git_project(tmp_path)
+        (proj.project_path / ".gitignore").write_text("CLAUDE.local.md\n")
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_tracked_file_warns_instead_of_excluding(self, tmp_path):
+        proj = _git_project(tmp_path)
+        local = proj.project_path / "CLAUDE.local.md"
+        local.write_text("# prior\n")
+        subprocess.run(["git", "add", "CLAUDE.local.md"], cwd=proj.project_path, check=True)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        # An ignore rule does nothing for a tracked file, so say so rather than
+        # staging a deletion in the user's repo on their behalf.
+        assert len(result.warnings) == 1
+        assert "git rm --cached CLAUDE.local.md" in result.warnings[0]
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_dry_run_does_not_touch_exclude(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter().write(recs, proj, dry_run=True)
+
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_explicit_shared_target_is_never_excluded(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter(context_target="CLAUDE.md").write(recs, proj, dry_run=False)
+
+        # --target CLAUDE.md is a deliberate opt-in to the team-shared file.
+        assert not _is_ignored(proj, "CLAUDE.md")
+
+    def test_outside_a_git_repo_is_a_no_op(self, tmp_path):
+        proj = _project(tmp_path)  # no git init
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert (proj.project_path / "CLAUDE.local.md").exists()
+        assert result.warnings == []
