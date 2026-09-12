@@ -145,7 +145,7 @@ def test_parse_lines_marks_new_flavor_openers() -> None:
 
 
 def test_go_dump_collapses_runtime_frames_keeps_panic_and_app_frame() -> None:
-    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False))
+    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, collapse_runtime_frames=True))
     content = go_panic_dump()
     result = compressor.compress(content)
     assert result.compressed_line_count < result.original_line_count
@@ -157,7 +157,13 @@ def test_go_dump_collapses_runtime_frames_keeps_panic_and_app_frame() -> None:
 
 
 def test_java_chain_heads_survive_collapse() -> None:
-    compressor = LogCompressor(LogCompressorConfig(enable_ccr=False, min_lines_for_ccr=10))
+    compressor = LogCompressor(
+        LogCompressorConfig(
+            enable_ccr=False,
+            min_lines_for_ccr=10,
+            collapse_runtime_frames=True,
+        )
+    )
     result = compressor.compress(java_chained_trace())
     assert "Caused by: java.io.IOException" in result.compressed
     assert "com.example.Disk.read" in result.compressed
@@ -171,10 +177,23 @@ def test_collapse_can_be_disabled() -> None:
     assert "frames collapsed]" not in result.compressed
 
 
+def test_collapse_default_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("HEADROOM_STACK_TRACE_COLLAPSE", raising=False)
+    assert LogCompressorConfig().collapse_runtime_frames is False
+
+    monkeypatch.setenv("HEADROOM_STACK_TRACE_COLLAPSE", "1")
+    assert LogCompressorConfig().collapse_runtime_frames is True
+
+
 def test_collapse_config_plumbs_through() -> None:
     # Constructor accepts the new knobs and forwards them to Rust without error.
     compressor = LogCompressor(
-        LogCompressorConfig(trace_head_frames=1, trace_app_frames=2, enable_ccr=False)
+        LogCompressorConfig(
+            trace_head_frames=1,
+            trace_app_frames=2,
+            enable_ccr=False,
+            collapse_runtime_frames=True,
+        )
     )
     result = compressor.compress(go_panic_dump())
     assert result.compressed  # smoke: no TypeError from the PyO3 signature

@@ -710,6 +710,7 @@ def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
     upstream AND be credited, while the thinking block goes out untouched.
     """
     monkeypatch.delenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", raising=False)
+    monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
     config = ProxyConfig(
         optimize=True,
         cache_enabled=False,
