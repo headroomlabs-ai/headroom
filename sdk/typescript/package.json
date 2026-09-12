@@ -93,7 +93,7 @@
     }
   },
   "devDependencies": {
-    "@ai-sdk/anthropic": "^3.0.64",
+    "@ai-sdk/anthropic": "^4.0.49",
     "@ai-sdk/openai": "^4.0.60",
     "@ai-sdk/provider": "^1.0.0",
     "@anthropic-ai/sdk": "^0.124.0",
