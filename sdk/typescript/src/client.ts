@@ -19,7 +19,7 @@ import type {
 import { mapProxyError, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError } from "./errors.js";
 import { deepCamelCase, deepSnakeCase } from "./utils/case.js";
 import { parseSSE } from "./utils/stream.js";
-import type { HeadroomConfig, HeadroomMode } from "./types/config.js";
+import type { CompressRequestConfig, HeadroomMode } from "./types/config.js";
 import type {
   SimulationResult,
   RequestMetrics,
@@ -191,7 +191,7 @@ class Messages {
 export interface ExtendedClientOptions extends HeadroomClientOptions {
   providerApiKey?: string;
   defaultMode?: HeadroomMode;
-  config?: HeadroomConfig;
+  config?: CompressRequestConfig;
 }
 
 export class HeadroomClient implements HeadroomClientInterface {
@@ -200,7 +200,7 @@ export class HeadroomClient implements HeadroomClientInterface {
   private timeout: number;
   private fallback: boolean;
   private retries: number;
-  private config: HeadroomConfig | undefined;
+  private config: CompressRequestConfig | undefined;
   private stack: string | undefined;
 
   /** @internal */ providerApiKey: string | undefined;
@@ -234,7 +234,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   async compress(
     messages: OpenAIMessage[],
-    options: { model?: string; tokenBudget?: number } = {},
+    options: { model?: string; tokenBudget?: number; config?: CompressRequestConfig } = {},
   ): Promise<CompressResult> {
     const model = options.model ?? "gpt-4o";
 
@@ -243,7 +243,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        return await this._doCompress(messages, model, options.tokenBudget);
+        return await this._doCompress(messages, model, options.tokenBudget, options.config);
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
@@ -602,13 +602,15 @@ export class HeadroomClient implements HeadroomClientInterface {
     messages: OpenAIMessage[],
     model: string,
     tokenBudget?: number,
+    config?: CompressRequestConfig,
   ): Promise<CompressResult> {
     const body: Record<string, unknown> = { messages, model };
     if (tokenBudget) {
       body.token_budget = tokenBudget;
     }
-    if (this.config) {
-      body.config = deepSnakeCase(this.config);
+    const mergedConfig = { ...this.config, ...config };
+    if (Object.keys(mergedConfig).length > 0) {
+      body.config = deepSnakeCase(mergedConfig);
     }
 
     const response = await this._fetch("/v1/compress", {
