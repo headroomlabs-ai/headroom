@@ -423,6 +423,20 @@ class LangConfig:
     uses_colon_after_signature: bool  # Python: True, C-family: False
     package_node: str | None = None  # e.g. "package_clause" for Go
 
+    # Statement-retention node families
+    terminal_nodes: frozenset[str] = frozenset()
+    raise_nodes: frozenset[str] = frozenset()
+    yield_nodes: frozenset[str] = frozenset()
+    assignment_nodes: frozenset[str] = frozenset()
+    call_nodes: frozenset[str] = frozenset()
+    identifier_nodes: frozenset[str] = frozenset()
+    call_target_nodes: frozenset[str] = frozenset()
+    guard_statement_nodes: frozenset[str] = frozenset()
+    else_clause_nodes: frozenset[str] = frozenset()
+    member_access_nodes: frozenset[str] = frozenset()
+    mutation_receiver_nodes: frozenset[str] = frozenset()
+    effect_boundary_nodes: frozenset[str] = frozenset()
+
     # Quick pre-filter hints for language detection (substrings to check)
     detection_hints: tuple[str, ...] = ()
     # Optional override for node types that contain class/impl members.
@@ -450,6 +464,18 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node="decorated_definition",
         comment_prefix="#",
         uses_colon_after_signature=True,
+        terminal_nodes=frozenset({"return_statement", "raise_statement", "yield_statement"}),
+        raise_nodes=frozenset({"raise_statement"}),
+        yield_nodes=frozenset({"yield_statement", "yield_expression"}),
+        assignment_nodes=frozenset({"assignment", "augmented_assignment"}),
+        call_nodes=frozenset({"call"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "attribute", "property_identifier"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset({"attribute", "subscript"}),
+        mutation_receiver_nodes=frozenset({"attribute", "subscript"}),
+        effect_boundary_nodes=frozenset({"raise_statement", "try_statement", "with_statement"}),
         detection_hints=("def ", "import ", "from ", "class ", "async def"),
     ),
     CodeLanguage.JAVASCRIPT: LangConfig(
@@ -461,6 +487,20 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset(
+            {"assignment_expression", "lexical_declaration", "variable_declaration"}
+        ),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier"}),
+        call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
+        mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("function ", "const ", "let ", "var ", "export ", "require("),
         class_body_node_types=frozenset({"class_body"}),
     ),
@@ -473,6 +513,20 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset(
+            {"assignment_expression", "lexical_declaration", "variable_declaration"}
+        ),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "property_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "property_identifier", "member_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset({"member_expression", "subscript_expression"}),
+        mutation_receiver_nodes=frozenset({"member_expression", "subscript_expression"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("interface ", "type ", ": string", ": number", ": boolean"),
         class_body_node_types=frozenset({"class_body"}),
     ),
@@ -486,6 +540,18 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         package_node="package_clause",
+        terminal_nodes=frozenset({"return_statement"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset({"short_var_declaration", "assignment_statement"}),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "selector_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset({"selector_expression", "index_expression"}),
+        mutation_receiver_nodes=frozenset({"selector_expression", "index_expression"}),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("func ", "package ", "struct {"),
     ),
     CodeLanguage.RUST: LangConfig(
@@ -497,6 +563,18 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_expression"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset({"let_declaration", "assignment_expression"}),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression"}),
+        guard_statement_nodes=frozenset({"if_expression"}),
+        else_clause_nodes=frozenset(),
+        member_access_nodes=frozenset({"field_expression", "index_expression"}),
+        mutation_receiver_nodes=frozenset({"field_expression", "index_expression"}),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("fn ", "struct ", "impl ", "mod ", "use "),
         class_body_node_types=frozenset({"declaration_list"}),
     ),
@@ -510,6 +588,18 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         comment_prefix="//",
         uses_colon_after_signature=False,
         package_node="package_declaration",
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset({"assignment_expression", "local_variable_declaration"}),
+        call_nodes=frozenset({"method_invocation", "object_creation_expression"}),
+        identifier_nodes=frozenset({"identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_access"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset({"field_access", "array_access"}),
+        mutation_receiver_nodes=frozenset({"field_access", "array_access"}),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("public ", "private ", "protected ", "class ", "interface "),
         class_body_node_types=frozenset({"class_body"}),
     ),
@@ -522,6 +612,22 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement"}),
+        raise_nodes=frozenset(),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset({"assignment_expression", "declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        mutation_receiver_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        effect_boundary_nodes=frozenset(),
         detection_hints=("#include", "typedef ", "int main("),
     ),
     CodeLanguage.CPP: LangConfig(
@@ -533,6 +639,22 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         decorator_node=None,
         comment_prefix="//",
         uses_colon_after_signature=False,
+        terminal_nodes=frozenset({"return_statement", "throw_statement"}),
+        raise_nodes=frozenset({"throw_statement"}),
+        yield_nodes=frozenset(),
+        assignment_nodes=frozenset({"assignment_expression", "declaration"}),
+        call_nodes=frozenset({"call_expression"}),
+        identifier_nodes=frozenset({"identifier", "field_identifier", "type_identifier"}),
+        call_target_nodes=frozenset({"identifier", "field_expression", "pointer_expression"}),
+        guard_statement_nodes=frozenset({"if_statement"}),
+        else_clause_nodes=frozenset({"else_clause"}),
+        member_access_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        mutation_receiver_nodes=frozenset(
+            {"field_expression", "subscript_expression", "pointer_expression"}
+        ),
+        effect_boundary_nodes=frozenset({"throw_statement", "try_statement"}),
         detection_hints=("#include", "namespace ", "class ", "::"),
         class_body_node_types=frozenset({"field_declaration_list"}),
     ),
@@ -987,6 +1109,47 @@ class _SymbolAnalysis:
     ref_counts: dict[str, int] = field(default_factory=dict)
     body_line_counts: dict[str, int] = field(default_factory=dict)
     bare_names: dict[str, str] = field(default_factory=dict)  # qname -> short_name
+
+
+class _StatementKind(Enum):
+    """Lightweight statement categories for function-body selection."""
+
+    RETURN = "return"
+    RAISE = "raise"
+    YIELD = "yield"
+    IF = "if"
+    FOR = "for"
+    WHILE = "while"
+    TRY = "try"
+    WITH = "with"
+    ASSIGN = "assign"
+    CALL = "call"
+    ASSERT = "assert"
+    EXPR = "expr"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class _StatementUnit:
+    """A top-level function-body statement plus lightweight semantic signals."""
+
+    idx: int
+    node: Any
+    text_lines: list[str]
+    start_row: int
+    end_row: int
+    line_count: int
+    kind: _StatementKind
+    defined_names: set[str] = field(default_factory=set)
+    referenced_names: set[str] = field(default_factory=set)
+    called_names: set[str] = field(default_factory=set)
+    has_return: bool = False
+    has_raise: bool = False
+    has_yield: bool = False
+    has_side_effect: bool = False
+    is_guard_clause: bool = False
+    context_hit: bool = False
+    importance_score: float = 0.0
 
 
 class CodeAwareCompressor(Transform):
@@ -1594,6 +1757,7 @@ class CodeAwareCompressor(Transform):
                 lang_config,
                 body_limits,
                 analysis,
+                context,
                 candidate_validator=candidate_validator,
             )
         else:
@@ -1624,6 +1788,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        context: str,
         candidate_validator: Callable[[Any, str], str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
@@ -1669,7 +1834,7 @@ class CodeAwareCompressor(Transform):
                     ):
                         has_func_or_class = True
                         compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, context
                         )
                         # Reconstruct export with compressed inner definition
                         export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
@@ -1697,11 +1862,11 @@ class CodeAwareCompressor(Transform):
                         decorator_text.append(_get_node_text(child, code))
                     elif child.type in lang_config.function_nodes:
                         definition_compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, context
                         )
                     elif child.type in lang_config.class_nodes:
                         definition_compressed = self._compress_class_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, context
                         )
                 if decorator_text and definition_compressed:
                     full_def = _validated_candidate(
@@ -1726,7 +1891,7 @@ class CodeAwareCompressor(Transform):
             if node_type in lang_config.function_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_function_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, context
                 )
                 structure.function_signatures.append(
                     leading + _validated_candidate(node, compressed)
@@ -1736,7 +1901,7 @@ class CodeAwareCompressor(Transform):
 
             if lang_config.container_node_types and node_type in lang_config.container_node_types:
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, context
                 )
                 structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1746,7 +1911,7 @@ class CodeAwareCompressor(Transform):
             if node_type in lang_config.class_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, context
                 )
                 structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1828,6 +1993,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        context: str = "",
     ) -> str:
         """Compress a function/class/impl block using AST body detection.
 
@@ -1842,7 +2008,6 @@ class CodeAwareCompressor(Transform):
         # preserve indentation. This is critical for nested definitions
         # (methods inside classes).
         code_lines = code.split("\n")
-        start_row = node.start_point[0]
         node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
@@ -1913,7 +2078,7 @@ class CodeAwareCompressor(Transform):
 
         # Handle Python docstrings via AST
         docstring_text = ""
-        ds_skip_lines = 0
+        ds_end_row = body_node.start_point[0] - 1
         if language == CodeLanguage.PYTHON and body_node.child_count > 0:
             first_child = body_node.children[0]
             # tree-sitter Python may represent docstrings as:
@@ -1986,7 +2151,7 @@ class CodeAwareCompressor(Transform):
                             else:
                                 docstring_text = first_ds_line
                 # elif REMOVE: docstring_text stays empty
-                ds_skip_lines = ds_start_rel + ds_lines_count
+                ds_end_row = ds_node.end_point[0]
 
         # --- Statement-based body truncation (never cuts mid-expression) ---
         #
@@ -1999,58 +2164,30 @@ class CodeAwareCompressor(Transform):
         indent = _detect_indent(body_lines) if body_lines else "    "
 
         # Collect non-docstring body statements from the AST
-        body_stmts: list[tuple[int, int]] = []  # (start_row, end_row) absolute
-        ds_end_row = -1
-        if ds_skip_lines > 0 and body_node.child_count > 0:
-            # The docstring node occupies the first ds_skip_lines lines
-            ds_end_row = body_node.start_point[0] + ds_skip_lines - 1
+        statement_units = _extract_statement_units(
+            body_node,
+            code_lines,
+            ds_end_row,
+            context,
+            analysis,
+            func_name,
+            language,
+            lang_config,
+        )
+        total_body_lines_count = sum(unit.line_count for unit in statement_units)
 
-        # Punctuation tokens to skip (brace-language body delimiters, semicolons)
-        _SKIP_TYPES = frozenset({"{", "}", ";", ",", "comment", "line_comment", "block_comment"})
+        if not statement_units:
+            kept_lines: list[str] = []
+            kept_line_count = 0
+        else:
+            selected_units = _select_statement_units(statement_units, body_limit)
+            kept_lines = []
+            kept_line_count = 0
+            for unit in selected_units:
+                kept_lines.extend(unit.text_lines)
+                kept_line_count += unit.line_count
 
-        for child in body_node.children:
-            # Skip docstring node (already handled separately)
-            if child.start_point[0] <= ds_end_row:
-                continue
-            # Skip punctuation and comment nodes
-            if child.type in _SKIP_TYPES:
-                continue
-            # Skip unnamed tokens (tree-sitter anonymous nodes like braces)
-            if not child.is_named:
-                continue
-            # Some grammars (e.g. Go) wrap all body statements in one generic
-            # list node instead of exposing them as direct siblings of the
-            # block. Treating that wrapper as a single statement makes its
-            # row range swallow the block's own closing brace line, causing
-            # a duplicated `}` later. Unwrap it into its real statements.
-            if child.type == "statement_list":
-                for inner in child.children:
-                    if inner.type in _SKIP_TYPES or not inner.is_named:
-                        continue
-                    body_stmts.append((inner.start_point[0], inner.end_point[0]))
-                continue
-            body_stmts.append((child.start_point[0], child.end_point[0]))
-
-        # Calculate lines per statement and keep whole statements until budget
-        kept_lines: list[str] = []
-        kept_line_count = 0
-        stmts_kept = 0
-        total_body_lines_count = sum(end - start + 1 for start, end in body_stmts)
-
-        for start_row, end_row in body_stmts:
-            stmt_lines = code_lines[start_row : end_row + 1]
-            stmt_line_count = len(stmt_lines)
-
-            # If adding this statement would exceed budget and we already have
-            # at least one statement, stop here
-            if kept_line_count + stmt_line_count > body_limit and stmts_kept > 0:
-                break
-
-            kept_lines.extend(stmt_lines)
-            kept_line_count += stmt_line_count
-            stmts_kept += 1
-
-        omitted_lines = total_body_lines_count - kept_line_count
+        omitted_lines = max(0, total_body_lines_count - kept_line_count)
 
         # Build compressed output preserving original indentation
         result_parts: list[str] = []
@@ -2098,6 +2235,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        context: str = "",
     ) -> str:
         """Compress a class by individually compressing each method.
 
@@ -2153,7 +2291,7 @@ class CodeAwareCompressor(Transform):
             # Methods/functions inside the class — compress individually
             if child.type in lang_config.function_nodes:
                 compressed = self._compress_function_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, lang_config, body_limits, analysis, context
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -2168,7 +2306,13 @@ class CodeAwareCompressor(Transform):
                         decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
-                            deco_child, code, language, lang_config, body_limits, analysis
+                            deco_child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            context,
                         )
                 if decorator_lines and method_compressed:
                     body_parts.append("\n".join(decorator_lines) + "\n" + method_compressed)
@@ -2182,7 +2326,7 @@ class CodeAwareCompressor(Transform):
                 lang_config.container_node_types and child.type in lang_config.container_node_types
             ):
                 compressed = self._compress_class_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, lang_config, body_limits, analysis, context
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -2501,6 +2645,35 @@ class CodeAwareCompressor(Transform):
 # =========================================================================
 
 
+def _iter_descendants(node: Any) -> Any:
+    """Yield a node and all descendants depth-first."""
+    yield node
+    for child in getattr(node, "children", []):
+        yield from _iter_descendants(child)
+
+
+_STATEMENT_KIND_MAP: dict[str, _StatementKind] = {
+    "return_statement": _StatementKind.RETURN,
+    "raise_statement": _StatementKind.RAISE,
+    "yield_statement": _StatementKind.YIELD,
+    "yield_expression": _StatementKind.YIELD,
+    "if_statement": _StatementKind.IF,
+    "for_statement": _StatementKind.FOR,
+    "for_in_statement": _StatementKind.FOR,
+    "while_statement": _StatementKind.WHILE,
+    "try_statement": _StatementKind.TRY,
+    "with_statement": _StatementKind.WITH,
+    "assignment": _StatementKind.ASSIGN,
+    "assignment_expression": _StatementKind.ASSIGN,
+    "augmented_assignment": _StatementKind.ASSIGN,
+    "lexical_declaration": _StatementKind.ASSIGN,
+    "variable_declaration": _StatementKind.ASSIGN,
+    "expression_statement": _StatementKind.EXPR,
+    "assert_statement": _StatementKind.ASSERT,
+    "throw_statement": _StatementKind.RAISE,
+}
+
+
 def _slice_code_bytes(code: str, start_byte: int, end_byte: int) -> str:
     """Extract source text using tree-sitter UTF-8 byte offsets."""
     return code.encode("utf-8")[start_byte:end_byte].decode("utf-8")
@@ -2573,6 +2746,334 @@ def _get_same_line_trailing_semicolon(node: Any) -> Any | None:
     ):
         return next_sibling
     return None
+
+
+def _classify_statement_kind(node: Any, lang_config: LangConfig) -> _StatementKind:
+    """Map a tree-sitter node to a lightweight statement kind."""
+    node_type = getattr(node, "type", "")
+    if node_type in lang_config.raise_nodes:
+        return _StatementKind.RAISE
+    if node_type in lang_config.yield_nodes:
+        return _StatementKind.YIELD
+    if node_type in lang_config.terminal_nodes:
+        return _StatementKind.RETURN
+    if node_type in lang_config.assignment_nodes:
+        return _StatementKind.ASSIGN
+    if node_type in lang_config.call_nodes:
+        return _StatementKind.CALL
+    return _STATEMENT_KIND_MAP.get(node_type, _StatementKind.UNKNOWN)
+
+
+def _collect_statement_symbols(
+    node: Any,
+    lang_config: LangConfig,
+) -> tuple[set[str], set[str], set[str]]:
+    """Collect simple def/use/call signals for a statement node."""
+    defined: set[str] = set()
+    referenced: set[str] = set()
+    called: set[str] = set()
+
+    def record_text(n: Any) -> str | None:
+        text = getattr(n, "text", None)
+        if text is None:
+            return None
+        return text.decode("utf-8") if isinstance(text, bytes) else str(text)
+
+    def add_identifiers(target: set[str], subtree: Any) -> None:
+        for desc in _iter_descendants(subtree):
+            if getattr(desc, "type", "") in lang_config.identifier_nodes:
+                name = record_text(desc)
+                if name:
+                    target.add(name)
+
+    # Definition heuristics: look at the left-hand side / declaration target only.
+    assignment_nodes: list[Any] = []
+    if getattr(node, "type", "") in lang_config.assignment_nodes:
+        assignment_nodes.append(node)
+    assignment_nodes.extend(
+        child
+        for child in getattr(node, "children", [])
+        if getattr(child, "type", "") in lang_config.assignment_nodes
+    )
+    for assignment in assignment_nodes:
+        assignment_children = getattr(assignment, "children", [])
+        first_named = next((c for c in assignment_children if getattr(c, "is_named", False)), None)
+        if first_named is not None:
+            add_identifiers(defined, first_named)
+        else:
+            add_identifiers(defined, assignment)
+
+    # Reference / call heuristics from descendants.
+    for desc in _iter_descendants(node):
+        node_type = getattr(desc, "type", "")
+        if node_type in lang_config.identifier_nodes:
+            name = record_text(desc)
+            if name:
+                referenced.add(name)
+
+        if node_type in lang_config.call_nodes:
+            for call_child in getattr(desc, "children", []):
+                child_type = getattr(call_child, "type", "")
+                if (
+                    child_type
+                    in lang_config.call_target_nodes
+                    | lang_config.identifier_nodes
+                    | lang_config.member_access_nodes
+                ):
+                    name = record_text(call_child)
+                    if name:
+                        called.add(name.split(".")[-1])
+                    break
+
+    referenced -= defined
+    return defined, referenced, called
+
+
+def _detect_guard_clause(node: Any, lang_config: LangConfig) -> bool:
+    """Detect simple early-return / early-raise guard clauses from AST structure."""
+    if getattr(node, "type", "") not in lang_config.guard_statement_nodes:
+        return False
+
+    named_children = [c for c in getattr(node, "children", []) if getattr(c, "is_named", False)]
+    if len(named_children) < 2:
+        return False
+
+    consequence = named_children[1]
+    if consequence is None:
+        return False
+
+    terminal_count = 0
+    named_descendants = 0
+    for desc in _iter_descendants(consequence):
+        if not getattr(desc, "is_named", False):
+            continue
+        named_descendants += 1
+        if getattr(desc, "type", "") in lang_config.terminal_nodes:
+            terminal_count += 1
+
+    has_else = any(
+        getattr(child, "type", "") in lang_config.else_clause_nodes for child in named_children[2:]
+    )
+    return terminal_count > 0 and named_descendants <= 12 and not has_else
+
+
+def _detect_side_effect(unit: _StatementUnit, lang_config: LangConfig) -> bool:
+    """Detect likely side effects from AST structure rather than source-text keywords."""
+    node_type = getattr(unit.node, "type", "")
+    if node_type in lang_config.effect_boundary_nodes or unit.kind in {
+        _StatementKind.RAISE,
+        _StatementKind.TRY,
+        _StatementKind.WITH,
+    }:
+        return True
+
+    assignment_nodes = [
+        desc
+        for desc in _iter_descendants(unit.node)
+        if getattr(desc, "type", "") in lang_config.assignment_nodes
+    ]
+    for assignment in assignment_nodes:
+        lhs = getattr(assignment, "children", [])[:1]
+        for child in lhs:
+            if getattr(child, "type", "") in lang_config.mutation_receiver_nodes:
+                return True
+
+    if unit.kind in {_StatementKind.EXPR, _StatementKind.CALL} and unit.called_names:
+        call_like = [
+            desc
+            for desc in _iter_descendants(unit.node)
+            if getattr(desc, "type", "") in lang_config.call_nodes
+        ]
+        if call_like:
+            return True
+
+    return False
+
+
+def _context_words(context: str) -> set[str]:
+    return {w for w in re.split(r"[\s,;:.()\[\]{}\"']+", context.lower()) if len(w) > 2}
+
+
+def _score_statement_unit(
+    unit: _StatementUnit,
+    analysis: _SymbolAnalysis,
+    context_terms: set[str],
+) -> float:
+    """Compute a deterministic importance score for a statement."""
+    score = 0.0
+
+    if unit.has_return:
+        score += 3.0
+    if unit.has_raise:
+        score += 2.5
+    if unit.has_yield:
+        score += 2.0
+    if unit.is_guard_clause:
+        score += 2.5
+    if unit.has_side_effect:
+        score += 1.8
+    if unit.kind in {
+        _StatementKind.IF,
+        _StatementKind.FOR,
+        _StatementKind.WHILE,
+        _StatementKind.TRY,
+    }:
+        score += 0.8
+
+    for called in unit.called_names:
+        for qname, short in analysis.bare_names.items():
+            if short == called:
+                score += analysis.scores.get(qname, 0.0) * 1.5
+                break
+
+    if context_terms:
+        symbol_terms = {
+            name.lower()
+            for name in (unit.defined_names | unit.referenced_names | unit.called_names)
+        }
+        hits = sum(1 for term in context_terms if term in symbol_terms)
+        if hits:
+            score += min(2.0, hits * 0.75)
+            unit.context_hit = True
+
+    score -= min(0.75, max(0, unit.line_count - 1) * 0.08)
+    return round(score, 3)
+
+
+def _nearest_definitions(
+    selected: list[_StatementUnit], units: list[_StatementUnit]
+) -> list[_StatementUnit]:
+    """Add one backward definition layer for referenced local names."""
+    selected_ids = {unit.idx for unit in selected}
+    ordered = sorted(selected, key=lambda u: u.idx)
+    for unit in list(ordered):
+        needed = {name for name in unit.referenced_names if name and not name.startswith("__")}
+        for name in needed:
+            for candidate in reversed(units[: unit.idx]):
+                if name in candidate.defined_names and candidate.idx not in selected_ids:
+                    selected_ids.add(candidate.idx)
+                    ordered.append(candidate)
+                    break
+    ordered.sort(key=lambda u: u.idx)
+    return ordered
+
+
+def _select_statement_units(units: list[_StatementUnit], body_limit: int) -> list[_StatementUnit]:
+    """Select statements within a body budget using must-keep + scoring."""
+    if not units:
+        return []
+
+    must_keep: list[_StatementUnit] = []
+    must_keep.extend(unit for unit in units if unit.is_guard_clause)
+    terminal_candidates = [u for u in units if u.has_return or u.has_raise or u.has_yield]
+    if terminal_candidates:
+        must_keep.append(terminal_candidates[-1])
+    must_keep.extend(unit for unit in units if unit.context_hit)
+
+    # Preserve likely side effects before low-value setup statements. This lets
+    # calls/member mutations compete with the first statement instead of being
+    # starved when a tiny budget is already consumed by first+terminal.
+    side_effects = [unit for unit in units if unit.has_side_effect]
+    if side_effects:
+        side_effects.sort(key=lambda u: (-u.importance_score, u.idx))
+        must_keep.append(side_effects[0])
+
+    dedup: dict[int, _StatementUnit] = {u.idx: u for u in must_keep}
+    selected = sorted(dedup.values(), key=lambda u: u.idx)
+    selected = _nearest_definitions(selected, units)
+    selected_ids = {u.idx for u in selected}
+    used = sum(u.line_count for u in selected)
+
+    candidates = [u for u in units if u.idx not in selected_ids]
+    candidates.sort(key=lambda u: (-u.importance_score, u.idx))
+
+    # Keep the first statement when it fits or when nothing stronger was selected,
+    # but do not let a low-value first assignment crowd out terminal/guard/effect
+    # statements under very small budgets.
+    if units[0].idx not in selected_ids and (
+        used + units[0].line_count <= body_limit or not selected
+    ):
+        selected.append(units[0])
+        selected_ids.add(units[0].idx)
+        used += units[0].line_count
+
+    for unit in candidates:
+        if unit.idx in selected_ids:
+            continue
+        if used + unit.line_count <= body_limit:
+            selected.append(unit)
+            selected_ids.add(unit.idx)
+            used += unit.line_count
+
+    if not selected:
+        selected = [units[0]]
+    elif len(selected) == 1 and selected[0].line_count > body_limit and body_limit > 0:
+        selected = [selected[0]]
+
+    # If no extra scored statements fit, still prefer a single high-value unit
+    if len(selected) == 1 and body_limit > selected[0].line_count:
+        for unit in candidates:
+            selected.append(unit)
+            break
+
+    selected.sort(key=lambda u: u.idx)
+    return selected
+
+
+def _extract_statement_units(
+    body_node: Any,
+    code_lines: list[str],
+    ds_end_row: int,
+    context: str,
+    analysis: _SymbolAnalysis,
+    func_name: str | None,
+    language: CodeLanguage,
+    lang_config: LangConfig,
+) -> list[_StatementUnit]:
+    """Extract top-level function-body statements with lightweight semantic signals."""
+    del func_name  # reserved for future use
+    context_terms = _context_words(context)
+    skip_types = frozenset({"{", "}", ";", ",", "comment", "line_comment", "block_comment"})
+    units: list[_StatementUnit] = []
+
+    children: list[Any] = []
+    for child in getattr(body_node, "children", []):
+        if getattr(child, "type", "") == "statement_list":
+            children.extend(getattr(child, "children", []))
+        else:
+            children.append(child)
+
+    for child in children:
+        if child.start_point[0] <= ds_end_row:
+            continue
+        if child.type in skip_types or not getattr(child, "is_named", False):
+            continue
+        start_row = child.start_point[0]
+        end_row = child.end_point[0]
+        text_lines = code_lines[start_row : end_row + 1]
+        kind = _classify_statement_kind(child, lang_config)
+        defined, referenced, called = _collect_statement_symbols(child, lang_config)
+        unit = _StatementUnit(
+            idx=len(units),
+            node=child,
+            text_lines=text_lines,
+            start_row=start_row,
+            end_row=end_row,
+            line_count=len(text_lines),
+            kind=kind,
+            defined_names=defined,
+            referenced_names=referenced,
+            called_names=called,
+            has_return=kind == _StatementKind.RETURN,
+            has_raise=kind == _StatementKind.RAISE,
+            has_yield=kind == _StatementKind.YIELD,
+        )
+        unit.is_guard_clause = _detect_guard_clause(child, lang_config)
+        unit.has_side_effect = _detect_side_effect(unit, lang_config)
+        unit.importance_score = _score_statement_unit(unit, analysis, context_terms)
+        units.append(unit)
+
+    return units
 
 
 def _get_definition_name(node: Any) -> str | None:
