@@ -434,7 +434,7 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -467,7 +467,7 @@ def test_start_proxy_clears_inherited_vertex_target_env(
     captured: dict[str, Any] = {}
 
     monkeypatch.setenv("VERTEX_TARGET_API_URL", "http://127.0.0.1:8787")
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -497,7 +497,7 @@ def test_start_proxy_sets_pythonsafepath_to_avoid_cwd_shadow(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
