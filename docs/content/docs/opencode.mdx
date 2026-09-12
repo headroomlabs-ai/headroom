@@ -41,6 +41,7 @@ headroom wrap opencode \
   --no-serena \
   --code-graph \
   --no-proxy \
+  --openai-api-url https://api.deepseek.com/v1 \
   --learn \
   --memory \
   --backend anthropic \
@@ -48,6 +49,32 @@ headroom wrap opencode \
   --region ... \
   -- <opencode args>
 ```
+
+Pass `--openai-api-url` when OpenCode should route through a third-party
+OpenAI-compatible provider instead of OpenAI itself — DeepSeek, Together,
+OpenRouter, or a self-hosted gateway. Without it, OpenAI-compatible traffic is
+forwarded to the default upstream (`https://api.openai.com/v1`), so a
+non-OpenAI key is rejected with `401 Incorrect API key provided`. Setting
+`OPENAI_TARGET_API_URL` before wrapping has the same effect. See
+[OpenCode + DeepSeek](/docs/opencode-deepseek) for a full walkthrough.
+
+The flag means the same thing whether or not wrap starts the proxy:
+
+```bash
+# wrap starts the proxy and points it at DeepSeek
+headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+
+# reuse a proxy you started yourself — it must already target that upstream
+headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
+headroom wrap opencode --no-proxy --openai-api-url https://api.deepseek.com/v1
+```
+
+With `--no-proxy`, wrap never starts or re-points a proxy. It checks the one
+listening on `--port` and exits with an error — before it rewrites
+`opencode.json` — if nothing is listening, the listener is not a Headroom
+proxy, or it forwards OpenAI-compatible traffic to a different upstream. Start
+the proxy with the upstream you want, or drop `--no-proxy` and let wrap start
+it.
 
 ## Provider Model Mapping
 
@@ -69,6 +96,7 @@ The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` 
 |---|---|
 | `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
 | `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
+| `OPENAI_TARGET_API_URL` | Upstream for OpenAI-compatible traffic when `--openai-api-url` is not passed; defaults to `https://api.openai.com/v1` |
 
 ## Failure Learning
 
