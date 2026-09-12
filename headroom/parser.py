@@ -180,7 +180,9 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
     if ws_matches:
         # Count tokens that could be saved by normalizing whitespace to single spaces
         ws_text = "".join(ws_matches)
-        normalized_text = " ".join(ws_matches)
+        # Each matched run (4+ spaces/tabs or 3+ newlines) collapses to a
+        # single space, so the normalized form is one space per run.
+        normalized_text = " " * len(ws_matches)
         signals.whitespace_tokens = max(
             0, tokenizer.count_text(ws_text) - tokenizer.count_text(normalized_text)
         )
