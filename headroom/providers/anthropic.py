@@ -653,12 +653,16 @@ class AnthropicProvider(Provider):
 
         # Load from config file and env var
         custom_config = _load_custom_model_config()
+        # Capture operator-declared limits BEFORE they merge into the inference
+        # table so their provenance remains distinguishable (#2649).
+        self._operator_context_limits: dict[str, int] = dict(custom_config["context_limits"])
         self._context_limits.update(custom_config["context_limits"])
         self._pricing.update(custom_config["pricing"])
 
-        # Explicit overrides take precedence
+        # Explicit overrides take precedence, and are operator-supplied too.
         if context_limits:
             self._context_limits.update(context_limits)
+            self._operator_context_limits.update(context_limits)
 
     @property
     def name(self) -> str:
@@ -749,6 +753,32 @@ class AnthropicProvider(Provider):
         self._warn_unknown_model(model, limit, "unknown provider, using conservative default")
         self._context_limits[model] = limit
         return limit
+
+    def get_operator_context_limit(self, model: str) -> int | None:
+        """Return the operator-declared context limit for *model*, or None.
+
+        Exact-match only: tries the raw model id first, then the sanitized id.
+        Returns None when the operator declared nothing for this model — never
+        falls back to inferred or default values.  No caching side effects.
+        """
+        if model in self._operator_context_limits:
+            return self._operator_context_limits[model]
+        sanitized = sanitize_anthropic_model_id(model)
+        if sanitized in self._operator_context_limits:
+            return self._operator_context_limits[sanitized]
+        return None
+
+    def has_raw_operator_context_limit(self, model: str) -> bool:
+        """Whether the operator declared a limit against this exact, unsanitized id.
+
+        `wrap --1m` appends a ``[1m]`` suffix so Claude Code emits the
+        ``context-1m`` beta, and :func:`sanitize_anthropic_model_id` strips it.
+        A caller deciding whether the declared window covers the 1M variant
+        needs to know the declaration matched the suffixed id itself, which
+        :meth:`get_operator_context_limit` cannot express because it falls back
+        to the sanitized id.
+        """
+        return model in self._operator_context_limits
 
     def _warn_unknown_model(self, model: str, limit: int, reason: str) -> None:
         """Warn about unknown model (once per model)."""

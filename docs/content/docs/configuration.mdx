@@ -334,6 +334,8 @@ headroom proxy --learn --min-evidence 3
 | `HEADROOM_TELEMETRY` | Set to `on` for **local-only** usage stats (powers your own `/stats` and dashboard; nothing is sent externally) | `off` |
 | `HEADROOM_STATELESS` | Set to `true` to disable filesystem writes | `false` |
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | -- |
+| `HEADROOM_CONTEXT_LIMIT_MODE` | Context budget guard mode. `observe` (default) logs over-limit finalized requests and forwards them; `reject` returns a local 400 before any upstream attempt. Effective only when a model limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`. | `observe` |
+| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count. The reserve is the larger of this value and `max_tokens`. A non-negative integer. | `0` |
 | `HEADROOM_LOSSLESS_COMPACTION` | Set to `0` to disable the byte-reversible lossless folds (grep heading, log run-collapse, diff/config folds) while leaving the rest of the compression pipeline active. Read per request, so the proxy's `/admin/runtime-env` hot-sync applies without a restart. | `1` |
 | `HEADROOM_BASE_URL` | Base URL of the Headroom proxy (TypeScript SDK) | `http://localhost:8787` |
 | `HEADROOM_API_KEY` | Optional API key for authenticated Headroom endpoints (TypeScript SDK) | -- |
@@ -528,6 +530,19 @@ Settings are resolved in this order (later overrides earlier):
    is absent
 3. `HEADROOM_MODEL_LIMITS` environment variable
 4. SDK constructor arguments
+
+### Context budget guard
+
+When a model's context limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`, the proxy evaluates every finalized Anthropic `/v1/messages` request against that limit before forwarding. The threshold is `declared_limit - max(HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN, max_tokens)`.
+
+In the default `observe` mode the proxy logs an over-limit request at WARNING and forwards it unchanged. Set `HEADROOM_CONTEXT_LIMIT_MODE=reject` to have the proxy return a local 400 before any upstream attempt, which stops the provider's own 400 from triggering a client retry storm. Unconfigured installs are unaffected; the guard is a no-op when no limit is declared for the model.
+
+```bash
+export HEADROOM_MODEL_LIMITS='{"context_limits":{"step-router-v1":262144}}'
+export HEADROOM_CONTEXT_LIMIT_MODE=reject
+export HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN=4096
+headroom proxy
+```
 
 ### Pattern-Based Inference
 
