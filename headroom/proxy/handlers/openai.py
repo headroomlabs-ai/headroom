@@ -3673,6 +3673,20 @@ class OpenAIHandlerMixin:
             openai_session_id, "openai", messages=original_client_messages
         )
 
+        # Circuit breaker check for runaway tool repetition loops
+        _cb = getattr(self, "tool_loop_circuit_breaker", None)
+        if _cb is not None and getattr(self.config, "circuit_breaker", "warn") != "off":
+            from headroom.proxy.circuit_breaker import execute_circuit_breaker_policy
+
+            await execute_circuit_breaker_policy(
+                circuit_breaker=_cb,
+                mode=self.config.circuit_breaker,
+                session_id=openai_session_id,
+                messages=original_client_messages,
+                request_id=request_id,
+                metrics=getattr(self, "metrics", None),
+            )
+
         # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
         # Same pattern as anthropic.py — read client value, union with
         # session-seen tokens, update tracker. WS auto-injection of
@@ -5570,6 +5584,23 @@ class OpenAIHandlerMixin:
         _responses_session_id = self.session_tracker_store.compute_session_id(
             request, model, messages
         )
+
+        # Circuit breaker check for runaway tool repetition loops
+        _cb = getattr(self, "tool_loop_circuit_breaker", None)
+        if _cb is not None and getattr(self.config, "circuit_breaker", "warn") != "off":
+            from headroom.proxy.circuit_breaker import execute_circuit_breaker_policy
+
+            await execute_circuit_breaker_policy(
+                circuit_breaker=_cb,
+                mode=self.config.circuit_breaker,
+                session_id=_responses_session_id,
+                messages=_responses_input_to_learner_messages(
+                    body.get("instructions"),
+                    input_data,
+                ),
+                request_id=request_id,
+                metrics=getattr(self, "metrics", None),
+            )
         from headroom.proxy.helpers import (
             get_session_beta_tracker as _get_session_beta_tracker_resp,
         )

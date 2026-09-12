@@ -101,6 +101,7 @@ class PrometheusMetrics:
         self.requests_cached = 0
         self.requests_rate_limited = 0
         self.requests_failed = 0
+        self.tool_loops_detected = 0
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -422,6 +423,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self.tool_loops_detected = 0
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
@@ -1077,6 +1079,16 @@ class PrometheusMetrics:
         self.savings_tracker.record_lifetime_cache_bust(tokens_lost=tokens_lost)
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
 
+    async def record_tool_loop_detected(
+        self,
+        tool: str | None = None,
+        period: int = 1,
+    ) -> None:
+        """Record a detected runaway tool repetition loop."""
+        async with self._lock:
+            self.tool_loops_detected += 1
+        self._get_otel_metrics().record_tool_loop_detected(tool=tool, period=period)
+
     async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
         """Record why a turn that expected a prompt-cache hit missed instead.
 
@@ -1184,6 +1196,13 @@ class PrometheusMetrics:
                 metric_type="counter",
                 help_text="Failed requests",
                 value=self.requests_failed,
+            )
+            _append_metric(
+                lines,
+                name="headroom_tool_loop_detected_total",
+                metric_type="counter",
+                help_text="Runaway tool repetition loops detected",
+                value=self.tool_loops_detected,
             )
             _append_metric(
                 lines,
