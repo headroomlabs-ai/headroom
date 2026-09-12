@@ -7,6 +7,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      - id: headroom-guardrails
+        name: Headroom architectural guardrails
+        entry: python3 scripts/headroom_guardrails.py
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: verify-ruff-version
         name: Verify Ruff version alignment
         entry: python3 scripts/verify-ruff-version.py
