@@ -828,6 +828,15 @@ class CostTracker:
         # Cost tracking - using deque for efficient left-side removal
         self._costs: deque[CostEntry] = deque(maxlen=self.MAX_COST_ENTRIES)
         self._last_prune_time: datetime = datetime.now()
+        # Current budget-window ledger and O(1) aggregates. ``_costs`` retains
+        # the reporting history, while this deque evicts entries as soon as the
+        # configured hourly/daily/monthly window advances. Each entry is added
+        # and removed once, making expiry amortized O(1) instead of rescanning
+        # up to MAX_COST_ENTRIES before every request (#3367).
+        self._budget_costs: deque[CostEntry] = deque()
+        self._budget_measured_usd = 0.0
+        self._budget_estimated_usd = 0.0
+        self._budget_estimated_records = 0
 
         # Token savings per model (exact, no dollar estimation)
         self._tokens_saved_by_model: dict[str, int] = {}
@@ -873,6 +882,10 @@ class CostTracker:
         """Reset in-memory cost/token counters for local test/debug use."""
         self._costs.clear()
         self._last_prune_time = datetime.now()
+        self._budget_costs.clear()
+        self._budget_measured_usd = 0.0
+        self._budget_estimated_usd = 0.0
+        self._budget_estimated_records = 0
         self._tokens_saved_by_model.clear()
         self._saved_write_by_tier.clear()
         self._saved_list_by_tier.clear()
@@ -1125,12 +1138,14 @@ class CostTracker:
             cache_write_tokens=effective_cache_write,
         )
         if cost is not None:
-            self._costs.append(CostEntry(datetime.now(), cost, basis))
+            entry = CostEntry(datetime.now(), cost, basis)
+            self._costs.append(entry)
+            self._record_budget_cost(entry)
             self._prune_old_costs()
 
-    def _period_cutoff(self) -> datetime:
+    def _period_cutoff(self, now: datetime | None = None) -> datetime:
         """Start of the current budget period."""
-        now = datetime.now()
+        now = now or datetime.now()
 
         if self.budget_period == "hourly":
             return now - timedelta(hours=1)
@@ -1139,6 +1154,37 @@ class CostTracker:
         # monthly
         return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+    def _subtract_budget_cost(self, entry: CostEntry) -> None:
+        if entry.basis == COST_BASIS_ESTIMATED:
+            self._budget_estimated_usd -= entry.cost_usd
+            self._budget_estimated_records -= 1
+        else:
+            self._budget_measured_usd -= entry.cost_usd
+
+    def _refresh_budget_window(self, now: datetime | None = None) -> None:
+        """Evict expired current-period entries, each exactly once."""
+        cutoff = self._period_cutoff(now)
+        while self._budget_costs and self._budget_costs[0].timestamp < cutoff:
+            self._subtract_budget_cost(self._budget_costs.popleft())
+
+        # Repeated floating-point additions/subtractions can leave a tiny
+        # negative residue after a complete window rollover.
+        self._budget_measured_usd = max(0.0, self._budget_measured_usd)
+        self._budget_estimated_usd = max(0.0, self._budget_estimated_usd)
+        self._budget_estimated_records = max(0, self._budget_estimated_records)
+
+    def _record_budget_cost(self, entry: CostEntry) -> None:
+        """Add one entry to the current-period aggregate in amortized O(1)."""
+        self._refresh_budget_window(entry.timestamp)
+        if len(self._budget_costs) >= self.MAX_COST_ENTRIES:
+            self._subtract_budget_cost(self._budget_costs.popleft())
+        self._budget_costs.append(entry)
+        if entry.basis == COST_BASIS_ESTIMATED:
+            self._budget_estimated_usd += entry.cost_usd
+            self._budget_estimated_records += 1
+        else:
+            self._budget_measured_usd += entry.cost_usd
+
     def get_period_cost(self, basis: str | None = None) -> float:
         """Get cost for current budget period.
 
@@ -1146,12 +1192,14 @@ class CostTracker:
         regardless of how each record's input count was derived. Pass a basis
         (``"measured"`` / ``"estimated"``) to get just that slice.
         """
-        cutoff = self._period_cutoff()
-        return sum(
-            entry.cost_usd
-            for entry in self._costs
-            if entry.timestamp >= cutoff and (basis is None or entry.basis == basis)
-        )
+        breakdown = self.period_cost_breakdown()
+        if basis == COST_BASIS_MEASURED:
+            return float(breakdown["measured_usd"])
+        if basis == COST_BASIS_ESTIMATED:
+            return float(breakdown["estimated_usd"])
+        if basis is not None:
+            return 0.0
+        return float(breakdown["total_usd"])
 
     def period_cost_breakdown(self) -> dict[str, Any]:
         """Split the period's booked spend by how its input count was derived.
@@ -1161,20 +1209,11 @@ class CostTracker:
         it separable is the point: a budget refusal driven by a guess should be
         distinguishable from one driven by provider-reported usage (#2713).
         """
-        cutoff = self._period_cutoff()
-        measured_usd = 0.0
-        estimated_usd = 0.0
-        records = 0
-        estimated_records = 0
-        for entry in self._costs:
-            if entry.timestamp < cutoff:
-                continue
-            records += 1
-            if entry.basis == COST_BASIS_ESTIMATED:
-                estimated_usd += entry.cost_usd
-                estimated_records += 1
-            else:
-                measured_usd += entry.cost_usd
+        self._refresh_budget_window()
+        measured_usd = self._budget_measured_usd
+        estimated_usd = self._budget_estimated_usd
+        records = len(self._budget_costs)
+        estimated_records = self._budget_estimated_records
 
         total_usd = measured_usd + estimated_usd
         return {
