@@ -276,3 +276,58 @@ class TestHNSWVectorIndex:
         assert index2._max_entries == 50
         assert index2._eviction_batch_size == 10
         assert index2.size == 5
+
+
+class _StubHnswIndex:
+    """Minimal stand-in for the hnswlib index used by _evict_entries."""
+
+    def __init__(self) -> None:
+        self.deleted: list[int] = []
+
+    def mark_deleted(self, hnsw_id: int) -> None:
+        self.deleted.append(hnsw_id)
+
+
+def test_evict_entries_selects_lowest_importance_then_oldest() -> None:
+    """_evict_entries must remove the `count` lowest-importance (then oldest)
+    entries. This drives the selection logic directly (no hnswlib), locking in
+    the contract preserved when the full sort was replaced with heapq.nsmallest.
+    """
+    import types
+    from dataclasses import dataclass
+
+    from headroom.memory.adapters.hnsw import HNSWVectorIndex
+
+    @dataclass
+    class _Meta:
+        importance: float
+        created_at: float
+
+    # ids a..f: importance ascending; two ties (0.5) broken by created_at.
+    meta = {
+        "a": _Meta(0.1, 100.0),
+        "b": _Meta(0.2, 100.0),
+        "c": _Meta(0.5, 100.0),  # older of the 0.5 tie
+        "d": _Meta(0.5, 200.0),  # newer of the 0.5 tie
+        "e": _Meta(0.9, 100.0),
+        "f": _Meta(0.95, 100.0),
+    }
+    self = types.SimpleNamespace(
+        _metadata=dict(meta),
+        _memory_to_hnsw={k: i for i, k in enumerate(meta)},
+        _hnsw_to_memory=dict(enumerate(meta)),
+        _embeddings=dict.fromkeys(meta),
+        _index=_StubHnswIndex(),
+        _eviction_count=0,
+    )
+
+    evicted = HNSWVectorIndex._evict_entries(self, 3)
+
+    assert evicted == 3
+    # The three lowest by (importance, created_at): a, b, then c (older tie).
+    assert set(meta) - set(self._metadata) == {"a", "b", "c"}
+    assert "d" in self._metadata  # newer of the 0.5 tie survives
+    # Mappings and embeddings for evicted ids are cleaned up too.
+    assert "a" not in self._memory_to_hnsw
+    assert "a" not in self._embeddings
+    assert self._eviction_count == 3
