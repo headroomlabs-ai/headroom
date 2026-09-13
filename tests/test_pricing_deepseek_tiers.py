@@ -116,9 +116,28 @@ class TestBeijingPeakWindows:
     def test_post_rule_weekends_are_all_day_off_peak(self, day, hour):
         assert is_peak(utc(day, hour)) is False
 
+    # Every peak case above uses 2026-08-17, which is *before*
+    # WEEKEND_OFF_PEAK_FROM, so none of them pins the weekday arm of the weekend
+    # gate. Without the cases below, a mutant that made the gate unconditional
+    # ("no peak pricing ever again" from 2026-08-23) would pass the whole file.
+    @pytest.mark.parametrize("hour", [2, 7])
+    def test_post_rule_weekday_peak_windows_still_apply(self, hour):
+        # 2026-08-24 is a Monday: 02:00 and 07:00 UTC are 10:00 and 15:00 Beijing.
+        assert is_peak(utc(24, hour)) is True
+
+    def test_post_rule_weekday_evening_is_off_peak(self):
+        # 12:00 UTC on that same Monday is 20:00 Beijing, outside both windows.
+        assert is_peak(utc(24, 12)) is False
+
     def test_the_effective_instant_itself_is_off_peak(self):
         assert WEEKEND_OFF_PEAK_FROM == utc(22, 16)
         assert is_peak(WEEKEND_OFF_PEAK_FROM) is False
+        # The instant above is Beijing Sunday 00:00, outside both windows, so it
+        # is off-peak with or without the weekend rule. This boundary is the
+        # informative one: Saturday 09:00 Beijing is inside a window but only
+        # just before the gate, so peak here means the gate did not apply early.
+        assert WEEKEND_OFF_PEAK_FROM > utc(22, 1)
+        assert is_peak(utc(22, 1)) is True
 
     def test_naive_instants_are_read_as_utc(self):
         assert is_peak(datetime(2026, 8, 17, 2, 0)) is True
@@ -149,11 +168,25 @@ class TestRatesFor:
         assert rates.tier == "off_peak"
         assert rates.input_per_1m == off.input_per_1m
 
-    def test_default_instant_reads_the_wall_clock(self):
-        rates = rates_for("deepseek-flash")
+    def test_post_rule_weekday_instant_selects_the_peak_tier(self):
+        # The live regime: past WEEKEND_OFF_PEAK_FROM, a Monday mid-morning must
+        # still bill peak, through the seam the cost paths actually call.
+        rates = rates_for("deepseek-flash", utc(24, 2))
         assert rates is not None
-        expected = "peak" if is_peak(datetime.now(timezone.utc)) else "off_peak"
-        assert rates.tier == expected
+        assert rates.tier == "peak"
+        assert rates.input_per_1m == 0.30
+
+    def test_default_instant_reads_the_wall_clock(self):
+        before = datetime.now(timezone.utc)
+        rates = rates_for("deepseek-flash")
+        after = datetime.now(timezone.utc)
+        assert rates is not None
+        # The default read is its own clock read, so it can land on either side of
+        # a window boundary. Bracket it and accept either bracket's tier.
+        assert rates.tier in {
+            "peak" if is_peak(before) else "off_peak",
+            "peak" if is_peak(after) else "off_peak",
+        }
 
     def test_naive_instant_selects_the_same_tier_as_the_aware_one(self):
         aware = rates_for("deepseek-flash", utc(17, 2))
