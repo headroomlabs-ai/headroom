@@ -436,7 +436,10 @@ _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
 # Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
 _QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
 _QUIET_CLI_FALSY = {"0", "false", "no", "off"}
-# name -> value, injected only when the user has not already set it.
+# name -> value, injected only when the user has not already set it. Every entry
+# here suppresses ONLY zero-signal chatter — telemetry pings, version nags,
+# funding/first-run banners, progress bars, pager framing — never diffs, errors,
+# summaries, or search results.
 _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
     "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
@@ -444,6 +447,20 @@ _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "npm_config_fund": "false",  # drop the funding banner
     "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
     "npm_config_progress": "false",  # drop the install progress bar
+    "npm_config_update_notifier": "false",  # drop the boxed "update available" notice
+    # Cross-tool telemetry opt-out standard (consoledonottrack.com), honored by
+    # turbo, netlify, gatsby, and many others to drop telemetry pings/banners.
+    "DO_NOT_TRACK": "1",
+    # .NET SDK: telemetry ping + the "Welcome to .NET" logo/copyright banner.
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    # JS framework telemetry banners printed on build/dev.
+    "NEXT_TELEMETRY_DISABLED": "1",
+    "GATSBY_TELEMETRY_DISABLED": "1",
+    "ASTRO_TELEMETRY_DISABLED": "1",
+    "NG_CLI_ANALYTICS": "false",  # Angular CLI analytics ping + first-run prompt
+    # Homebrew's "==> ... hints" chatter (not warnings/errors).
+    "HOMEBREW_NO_ENV_HINTS": "1",
 }
 
 

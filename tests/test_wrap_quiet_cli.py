@@ -21,6 +21,28 @@ def test_defaults_injected_into_empty_env(monkeypatch) -> None:
     assert "GIT_PAGER" in written and "PYTEST_ADDOPTS" in written
 
 
+def test_telemetry_and_nag_suppressors_injected(monkeypatch) -> None:
+    # Telemetry pings, version nags, and first-run/logo banners are zero-signal
+    # tokens; the SAFE reduce-at-source set suppresses them across common tools.
+    monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
+    env: dict[str, str] = {}
+    written = _configure_quiet_cli_env(env)
+    expected = {
+        "npm_config_update_notifier": "false",
+        "DO_NOT_TRACK": "1",
+        "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+        "DOTNET_NOLOGO": "1",
+        "NEXT_TELEMETRY_DISABLED": "1",
+        "GATSBY_TELEMETRY_DISABLED": "1",
+        "ASTRO_TELEMETRY_DISABLED": "1",
+        "NG_CLI_ANALYTICS": "false",
+        "HOMEBREW_NO_ENV_HINTS": "1",
+    }
+    for name, value in expected.items():
+        assert env[name] == value
+        assert name in written
+
+
 def test_user_value_always_wins(monkeypatch) -> None:
     monkeypatch.delenv("HEADROOM_WRAP_QUIET", raising=False)
     env = {"GIT_PAGER": "less -R", "PIP_QUIET": "0"}
