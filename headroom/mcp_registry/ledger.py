@@ -127,6 +127,16 @@ def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
         return {}
     if for_mutation:
         for section in ("agents",):
+            # An *absent* section is a valid empty ledger, not a malformed one.
+            # ``clear_install`` pops ``agents`` once its last entry is removed, so
+            # a fully-unwrapped ledger is exactly ``{}`` — and ``record_install``
+            # likewise treats a missing ``agents`` as empty. Rejecting it here made
+            # the very next mutation (e.g. ``headroom mcp adopt``) fail with a
+            # bogus "malformed" error after an ordinary unwrap. A section that is
+            # *present* but not a dict (e.g. ``{"agents": null}``) is still
+            # malformed — so key-absence, not a ``None`` value, is what is skipped.
+            if section not in data:
+                continue
             section_data = data.get(section)
             if not isinstance(section_data, dict) or any(
                 not isinstance(agent_entry, dict)
