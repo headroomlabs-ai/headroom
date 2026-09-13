@@ -156,6 +156,20 @@ def _deserialize_pattern_key(serialized: str) -> PatternKey:
     return (DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, serialized)
 
 
+def pattern_key_sig_hash(serialized: str) -> str:
+    """Extract the tool-signature hash from a serialized aggregation key.
+
+    The aggregation key is encoded as ``"auth_mode|model_family|sig_hash"``
+    (see `_serialize_pattern_key`); only the third component is the tool
+    signature hash. Callers that identify or address a pattern by its
+    signature — e.g. the `/v1/toin/patterns` diagnostic endpoints — must use
+    this component, not a prefix of the whole composite key, which would
+    collide across every pattern sharing an auth mode and model family.
+    Legacy bare-hash keys are handled by `_deserialize_pattern_key`.
+    """
+    return _deserialize_pattern_key(serialized)[2]
+
+
 def get_default_toin_storage_path() -> str:
     """Get the default TOIN storage path.
 
