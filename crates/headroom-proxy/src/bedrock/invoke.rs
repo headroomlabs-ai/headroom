@@ -51,10 +51,12 @@ use url::Url;
 
 use crate::bedrock::envelope::BedrockEnvelope;
 use crate::bedrock::sigv4::{sign_request, SigningInputs};
+use crate::bedrock::CompressionStats;
 use crate::compression::{
     compress_anthropic_request, Outcome as AnthropicOutcome, PassthroughReason,
 };
 use crate::headers::filter_response_headers;
+use crate::observability::{capture, ledger};
 use crate::observability::{observe_bedrock_invoke_latency, record_bedrock_invoke};
 use crate::proxy::AppState;
 // Phase F PR-F1 + PR-D3: the bedrock auth-mode layer
@@ -173,8 +175,17 @@ pub async fn handle_invoke(
         "bedrock invoke route received request"
     );
 
+    // Savings ledger: constructed at handler ENTRY so every exit —
+    // including proxy-side rejections (bad action path, missing
+    // credentials, SigV4 failure) — produces exactly one record. A
+    // credentials outage must show in /stats as a failure spike,
+    // not as zero traffic. `forward_http` gives its 413 rejections
+    // the same treatment.
+    let mut pending_stats =
+        capture::start_pending(&state, ledger::provider::BEDROCK, &model_id, &request_id);
+
     let is_anthropic = is_anthropic_model_id(&model_id);
-    let outbound_body: Bytes = if is_anthropic {
+    let (outbound_body, compression_stats): (Bytes, CompressionStats) = if is_anthropic {
         run_anthropic_compression(&body, &state, auth_mode, &request_id)
     } else {
         tracing::info!(
@@ -184,8 +195,15 @@ pub async fn handle_invoke(
             reason = "non_anthropic_vendor",
             "bedrock invoke: skipping live-zone compression for non-anthropic vendor"
         );
-        body.clone()
+        (body.clone(), CompressionStats::default())
     };
+    if let Some(p) = pending_stats.as_mut() {
+        p.set_compression(
+            compression_stats.tokens_before,
+            compression_stats.tokens_after,
+            compression_stats.transforms,
+        );
+    }
 
     // Resolve the Bedrock action from the inbound path so `/converse`
     // forwards to the upstream Converse endpoint instead of `/invoke`.
@@ -200,6 +218,7 @@ pub async fn handle_invoke(
                 path = %uri.path(),
                 "bedrock invoke: unrecognized action path"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "bedrock_invoke_action_invalid",
@@ -219,6 +238,7 @@ pub async fn handle_invoke(
                 error = %msg,
                 "bedrock invoke: failed to construct upstream URL"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_endpoint_invalid",
@@ -237,6 +257,7 @@ pub async fn handle_invoke(
                 model_id = %model_id,
                 "bedrock invoke: refusing to forward without AWS credentials"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_credentials_missing",
@@ -272,6 +293,7 @@ pub async fn handle_invoke(
                 error = %e,
                 "bedrock invoke: SigV4 signing failed; refusing to forward"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "bedrock_sigv4_failed",
@@ -313,6 +335,7 @@ pub async fn handle_invoke(
                 error = %e,
                 "bedrock invoke: invalid HTTP method"
             );
+            capture::finalize_rejected(pending_stats.take());
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "bedrock_invalid_method",
@@ -332,6 +355,9 @@ pub async fn handle_invoke(
     let upstream_resp = match upstream_resp {
         Ok(r) => r,
         Err(e) => {
+            if let Some(p) = pending_stats.take() {
+                p.finalize_failed();
+            }
             tracing::warn!(
                 event = "bedrock_upstream_error",
                 request_id = %request_id,
@@ -349,6 +375,11 @@ pub async fn handle_invoke(
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     tracing::info!(
@@ -360,10 +391,23 @@ pub async fn handle_invoke(
         "bedrock invoke: response forwarded"
     );
 
-    // Stream the response body back without buffering.
-    let stream = upstream_resp
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
+    // Stream the response body back without buffering. When the
+    // savings ledger is recording, tee the bytes into a bounded
+    // capture task that parses the sync response's usage block
+    // (InvokeModel snake_case / Converse camelCase) at body end —
+    // best-effort, never blocking the client byte path.
+    let capture_tx = pending_stats
+        .take()
+        .map(|p| capture::spawn_json_usage_capture(capture::ResponseShape::Bedrock, p));
+    let stream = upstream_resp.bytes_stream().map(move |r| match r {
+        Ok(b) => {
+            if let Some(tx) = &capture_tx {
+                let _ = tx.try_send(b.clone());
+            }
+            Ok(b)
+        }
+        Err(e) => Err(std::io::Error::other(e)),
+    });
     let body_out = Body::from_stream(stream);
 
     let mut builder = Response::builder().status(status);
@@ -401,7 +445,7 @@ fn run_anthropic_compression(
     state: &AppState,
     _auth_mode: AuthMode,
     request_id: &str,
-) -> Bytes {
+) -> (Bytes, CompressionStats) {
     // Detect envelope shape. A parseable InvokeModel envelope takes the
     // re-emit path below (anthropic_version pinned first); a non-envelope
     // body (e.g. a Converse-shaped payload) still runs through the
@@ -437,7 +481,7 @@ fn run_anthropic_compression(
         request_id,
     );
     match outcome {
-        AnthropicOutcome::NoCompression => body.clone(),
+        AnthropicOutcome::NoCompression => (body.clone(), CompressionStats::default()),
         AnthropicOutcome::Passthrough { reason } => {
             tracing::info!(
                 event = "bedrock_compression_passthrough",
@@ -448,15 +492,26 @@ fn run_anthropic_compression(
             // The compressor's passthrough variants all leave bytes
             // unchanged. Forward the original.
             let _ = (PassthroughReason::ModeOff, PassthroughReason::NoMessages); // pin types
-            body.clone()
+            (body.clone(), CompressionStats::default())
         }
-        AnthropicOutcome::Compressed { body: new_body, .. } => {
+        AnthropicOutcome::Compressed {
+            body: new_body,
+            tokens_before,
+            tokens_after,
+            strategies_applied,
+            ..
+        } => {
+            let stats = CompressionStats {
+                tokens_before: tokens_before as u64,
+                tokens_after: tokens_after as u64,
+                transforms: strategies_applied.iter().map(|s| s.to_string()).collect(),
+            };
             if parsed_envelope {
                 // Defence-in-depth: re-emit so anthropic_version is the
                 // first key. With preserve_order this is a no-op on the
                 // happy path.
                 match BedrockEnvelope::ensure_anthropic_version_first(&new_body) {
-                    Ok(b) => b,
+                    Ok(b) => (b, stats),
                     Err(e) => {
                         tracing::error!(
                             event = "bedrock_envelope_reemit_failed",
@@ -464,11 +519,13 @@ fn run_anthropic_compression(
                             error = %e,
                             "bedrock invoke: failed to re-emit envelope; falling back to original body"
                         );
-                        body.clone()
+                        // Original bytes forwarded ⇒ no compression
+                        // happened as far as the wire is concerned.
+                        (body.clone(), CompressionStats::default())
                     }
                 }
             } else {
-                new_body
+                (new_body, stats)
             }
         }
     }
@@ -619,6 +676,7 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            stats: std::sync::Arc::new(ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/converse"
             .parse()
@@ -657,6 +715,7 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            stats: std::sync::Arc::new(ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()
@@ -693,6 +752,7 @@ mod tests {
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
+            stats: std::sync::Arc::new(ledger::Ledger::in_memory()),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()

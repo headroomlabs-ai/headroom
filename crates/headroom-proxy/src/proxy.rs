@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{healthz, healthz_upstream, rollout_status};
+use crate::observability::{capture, ledger};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -80,6 +81,13 @@ pub struct AppState {
     /// route hits `bearer()`. Tests override via
     /// [`AppState::with_token_source`].
     pub vertex_token_source: Arc<dyn crate::vertex::TokenSource>,
+    /// Native savings ledger (one per process). Loaded from
+    /// `Config::stats_path` when persistence is configured, else
+    /// in-memory. Handlers record into it after each finished
+    /// request; `/stats*` and `/dashboard` read from it. Recording
+    /// call sites gate on `Config::stats` — when stats are disabled
+    /// this is an inert in-memory ledger.
+    pub stats: Arc<ledger::Ledger>,
 }
 
 /// PR-E6: maximum number of sessions tracked by the drift detector
@@ -114,6 +122,15 @@ impl AppState {
         let vertex_token_source: Arc<dyn crate::vertex::TokenSource> =
             Arc::new(crate::vertex::adc::GcpAdcTokenSource::new());
 
+        let stats = if config.stats {
+            match config.stats_path.clone() {
+                Some(path) => Arc::new(ledger::Ledger::load(path)),
+                None => Arc::new(ledger::Ledger::in_memory()),
+            }
+        } else {
+            Arc::new(ledger::Ledger::in_memory())
+        };
+
         Ok(Self {
             config: Arc::new(config),
             client,
@@ -123,6 +140,7 @@ impl AppState {
                 cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
             ),
             vertex_token_source,
+            stats,
         })
     }
 
@@ -165,7 +183,39 @@ pub fn build_app(state: AppState) -> Router {
         // Mounted unconditionally because it has no dependencies on
         // any feature flag; an operator who doesn't want it scraped
         // simply firewalls the path.
-        .route("/metrics", get(crate::observability::handle_metrics))
+        .route("/metrics", get(crate::observability::handle_metrics));
+
+    // Native savings stats + dashboard. Served locally (never
+    // tunnelled upstream) so the Rust proxy is self-sufficient for
+    // savings observability. Gated on `--stats` so an operator can
+    // restore pure-passthrough behaviour for these paths.
+    if state.config.stats {
+        router = router
+            .route(
+                "/stats",
+                get(crate::observability::stats_http::handle_stats),
+            )
+            .route(
+                "/stats/timeseries",
+                get(crate::observability::stats_http::handle_timeseries),
+            )
+            .route(
+                "/stats/events",
+                get(crate::observability::stats_http::handle_events),
+            )
+            .route(
+                "/dashboard",
+                get(crate::observability::stats_http::handle_dashboard),
+            );
+    } else {
+        tracing::warn!(
+            event = "stats_disabled",
+            "native savings stats disabled by --stats=false; \
+             /stats*, /dashboard fall through to the upstream forwarder \
+             and no request telemetry is recorded"
+        );
+    }
+    router = router
         // PR-C2: explicit POST route for /v1/chat/completions. The
         // handler buffers the body and re-injects it into
         // `forward_http`, which runs the OpenAI live-zone gate
@@ -568,10 +618,10 @@ pub(crate) async fn forward_http(
     // controls what the buffered branch does (currently both `Off`
     // and `LiveZone` passthrough); Phase B will branch on it inside
     // `compress_anthropic_request`.
-    let should_intercept = state.config.compression
-        && method == axum::http::Method::POST
+    let is_llm_json_post = method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
+    let should_intercept = state.config.compression && is_llm_json_post;
 
     // PR-E6: capture a header snapshot BEFORE the body is consumed so
     // the drift detector can derive a per-session key from
@@ -588,6 +638,33 @@ pub(crate) async fn forward_http(
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
+
+    // Savings ledger. Deliberately NOT gated on `should_intercept`:
+    // spend/caching stats are worth answering on a pure passthrough
+    // deployment too (compression savings are truthfully 0 there),
+    // so the gate is the LLM-endpoint shape alone and the model id
+    // is learned from the response when the request didn't carry it.
+    // Finalized exactly once, when the response is fully observed.
+    let should_record = state.config.stats && is_llm_json_post;
+    let mut pending_stats = should_record
+        .then(|| compression::classify_compressible_path(uri.path()))
+        .flatten()
+        .map(|endpoint| {
+            let provider = match endpoint {
+                compression::CompressibleEndpoint::AnthropicMessages => ledger::provider::ANTHROPIC,
+                compression::CompressibleEndpoint::OpenAiChatCompletions => {
+                    ledger::provider::OPENAI_CHAT
+                }
+                compression::CompressibleEndpoint::OpenAiResponses => {
+                    ledger::provider::OPENAI_RESPONSES
+                }
+            };
+            capture::PendingRecord::new(
+                state.stats.clone(),
+                ledger::RequestEvent::new(provider, "", &request_id),
+                start,
+            )
+        });
 
     let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
@@ -614,6 +691,9 @@ pub(crate) async fn forward_http(
                     "compression: Content-Length exceeds buffer limit; \
                      returning 413 without consuming body"
                 );
+                // A proxy-side rejection is still an outcome:
+                // record it as failed rather than dropping it.
+                capture::finalize_rejected(pending_stats.take());
                 return Err(ProxyError::PayloadTooLarge(format!(
                     "request Content-Length {len} exceeds compression \
                      buffer limit ({max} bytes)"
@@ -631,6 +711,7 @@ pub(crate) async fn forward_http(
                     "compression: body exceeds buffer limit; failing loudly (cannot \
                      resume streaming once the body has been partially consumed)"
                 );
+                capture::finalize_rejected(pending_stats.take());
                 return Err(ProxyError::PayloadTooLarge(format!(
                     "request body exceeds compression buffer limit ({max} bytes): {e}"
                 )));
@@ -689,7 +770,14 @@ pub(crate) async fn forward_http(
         // enough that a canonical-bytes hash would compare apples
         // to oranges. The volatile detector handles its own
         // shape-dispatch via `ApiKind::from_endpoint`.
+        let mut stats_model: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+            // Model id for the savings ledger — read from the same
+            // sanitized bytes the dispatcher compresses.
+            stats_model = parsed
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_owned);
             // PR-E5: volatile-content detector. Emits one WARN per
             // finding (capped at 10) for content that busts cache
             // (timestamps, UUIDs, ID-named fields).
@@ -761,6 +849,10 @@ pub(crate) async fn forward_http(
                 }
             }
         }
+        // Compression-side numbers for the savings ledger, captured
+        // out of the Compressed arm below (the outcome is consumed
+        // by the body-selection match).
+        let mut stats_compression: (u64, u64, Vec<String>) = (0, 0, Vec::new());
         let outcome = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
                 // PR-E3: thread the F1-classified auth_mode into the
@@ -846,6 +938,11 @@ pub(crate) async fn forward_http(
                 markers_inserted,
                 per_strategy_tokens,
             } => {
+                stats_compression = (
+                    tokens_before as u64,
+                    tokens_after as u64,
+                    strategies_applied.iter().map(|s| s.to_string()).collect(),
+                );
                 tracing::info!(
                     request_id = %request_id,
                     path = %path_for_log,
@@ -966,33 +1063,70 @@ pub(crate) async fn forward_http(
             compression::CompressibleEndpoint::AnthropicMessages => body_to_send,
         };
 
+        if let Some(p) = pending_stats.as_mut() {
+            // Request-side model (already `[1m]`-sanitized above, so
+            // it matches what upstream bills) wins over the response
+            // echo; the compression numbers are only knowable here.
+            if let Some(m) = stats_model.as_deref() {
+                p.set_model(m);
+            }
+            let (before, after, transforms) = stats_compression;
+            p.set_compression(before, after, transforms);
+        }
+
         // Forward the (Phase A: identical) buffered bytes. reqwest
         // sets its own Content-Length from the body bytes — the
         // existing `build_forward_request_headers` already strips
         // the client-supplied Content-Length for us.
-        state
+        match state
             .client
             .request(reqwest_method, upstream_url.clone())
             .headers(outgoing_headers)
             .body(body_to_send)
             .send()
-            .await?
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Transport/connect failures are request outcomes
+                // too — record them so outages are visible in /stats.
+                capture::finalize_rejected(pending_stats.take());
+                return Err(e.into());
+            }
+        }
     } else {
         // Pure streaming path — the original passthrough behaviour.
         let body_stream =
             TryStreamExt::map_err(req.into_body().into_data_stream(), std::io::Error::other);
         let reqwest_body = reqwest::Body::wrap_stream(body_stream);
-        state
+        match state
             .client
             .request(reqwest_method, upstream_url.clone())
             .headers(outgoing_headers)
             .body(reqwest_body)
             .send()
-            .await?
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Same contract as the buffered arm.
+                capture::finalize_rejected(pending_stats.take());
+                return Err(e.into());
+            }
+        }
     };
 
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    // Savings honesty rule: a non-2xx upstream is a failed request —
+    // it counts, but accrues no savings (the ledger enforces this on
+    // the failed flag).
+    if !upstream_status.is_success() {
+        if let Some(p) = pending_stats.as_mut() {
+            p.mark_failed();
+        }
+    }
 
     // PR-A8 / P5-57: capture the upstream request id BEFORE we move
     // `upstream_resp.headers()` into the response filter. Anthropic
@@ -1109,8 +1243,32 @@ pub(crate) async fn forward_http(
     let parser_tx = if !matches!(sse_kind, SseStreamKind::None) {
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(SSE_PARSER_QUEUE_DEPTH);
         let rid_for_parser = request_id.clone();
-        tokio::spawn(run_sse_state_machine(sse_kind, rx, rid_for_parser));
+        // Deferred recording: the pending stats event rides into the
+        // state machine and is finalized when the stream closes, so
+        // output/cache token counts come from the real SSE usage
+        // frames instead of recording zero at header time.
+        tokio::spawn(run_sse_state_machine(
+            sse_kind,
+            rx,
+            rid_for_parser,
+            pending_stats.take(),
+        ));
         Some(tx)
+    } else if let Some(p) = pending_stats.take() {
+        // Non-SSE response on a recorded LLM path: tee the JSON body
+        // into a bounded buffer and parse usage when it completes.
+        let shape = match SseStreamKind::for_request_path(&path_for_log) {
+            SseStreamKind::OpenAiChat => capture::ResponseShape::OpenAiChat,
+            SseStreamKind::OpenAiResponses => capture::ResponseShape::OpenAiResponses,
+            // Anthropic (/v1/messages). Note: /v1/responses with the
+            // streaming state machine disabled still matches the
+            // OpenAiResponses arm above — for_request_path classifies
+            // by path, independent of the enable flag. An SSE body
+            // teed here simply fails the JSON parse and records
+            // compression-side numbers alone.
+            _ => capture::ResponseShape::Anthropic,
+        };
+        Some(capture::spawn_json_usage_capture(shape, p))
     } else {
         None
     };
@@ -1175,11 +1333,9 @@ pub(crate) async fn forward_http(
 }
 
 /// Bound on the in-flight queue between the byte-passthrough and the
-/// SSE state-machine task. Picked so that under steady-state streaming
-/// load (~5 events/100ms typical) the parser is never blocked on
-/// queue space, yet a stalled parser can't grow memory unboundedly.
-/// Tunable via `proxy.toml` if a deployment finds this insufficient.
-const SSE_PARSER_QUEUE_DEPTH: usize = 256;
+/// SSE state-machine task — see [`TEE_QUEUE_DEPTH`] for the sizing
+/// rationale it shares with every other telemetry tee.
+use crate::observability::capture::TEE_QUEUE_DEPTH as SSE_PARSER_QUEUE_DEPTH;
 
 /// Which provider's state machine should run on this stream. Picked
 /// from the *request* path because the response content-type
@@ -1335,10 +1491,15 @@ fn maybe_inject_openai_prompt_cache_key(
 
 /// Drive the per-provider state machine over a stream of byte chunks.
 /// Lives in its own task; the byte path never waits on it.
+///
+/// `pending_stats` (when the savings ledger is recording this
+/// request) is finalized here — after the stream closes — with the
+/// usage the state machine accumulated.
 async fn run_sse_state_machine(
     kind: SseStreamKind,
     mut rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     request_id: String,
+    pending_stats: Option<capture::PendingRecord>,
 ) {
     use crate::sse::framing::SseFramer;
 
@@ -1409,6 +1570,20 @@ async fn run_sse_state_machine(
                 blocks = state.blocks.len(),
                 "sse stream closed"
             );
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                // A 200 OK stream can still fail in-band: Anthropic
+                // emits `{"type":"error"}` mid-stream (e.g. overloaded
+                // during generation) and the state machine lands in
+                // `Errored`. That is not a billable success — record
+                // it as failed so retries can't inflate savings.
+                if matches!(state.status, crate::sse::anthropic::StreamStatus::Errored) {
+                    p.mark_failed();
+                }
+                p.finalize(capture::usage_from_anthropic_state(&state));
+            }
         }
         SseStreamKind::OpenAiChat => {
             let mut state = crate::sse::openai_chat::ChunkState::new();
@@ -1512,6 +1687,19 @@ async fn run_sse_state_machine(
                 has_usage = state.usage.is_some(),
                 "sse stream closed"
             );
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                let usage = state
+                    .usage
+                    .as_ref()
+                    .and_then(|u| {
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiChat, u)
+                    })
+                    .unwrap_or_default();
+                p.finalize(usage);
+            }
         }
         SseStreamKind::OpenAiResponses => {
             let mut state = crate::sse::openai_responses::ResponseState::new();
@@ -1643,8 +1831,33 @@ async fn run_sse_state_machine(
                 incomplete_reason = state.incomplete_reason.as_deref().unwrap_or(""),
                 "sse stream closed"
             );
+            if let Some(mut p) = pending_stats {
+                if let Some(model) = state.model.as_deref() {
+                    p.set_model_if_unknown(model);
+                }
+                // `response.failed` / `response.incomplete` are not
+                // billable successes — count them as failures even
+                // though the HTTP status was 2xx.
+                if matches!(state.terminal_status(), Some("failed") | Some("incomplete")) {
+                    p.mark_failed();
+                }
+                let usage = state
+                    .usage
+                    .as_ref()
+                    .and_then(|u| {
+                        capture::usage_from_usage_block(capture::ResponseShape::OpenAiResponses, u)
+                    })
+                    .unwrap_or_default();
+                p.finalize(usage);
+            }
         }
-        SseStreamKind::None => {}
+        SseStreamKind::None => {
+            if let Some(p) = pending_stats {
+                // No parser for this stream — record what the
+                // request side knew (compression estimates only).
+                p.finalize(ledger::Usage::default());
+            }
+        }
     }
 }
 

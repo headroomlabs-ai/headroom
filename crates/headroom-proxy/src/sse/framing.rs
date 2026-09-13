@@ -124,6 +124,35 @@ impl SseFramer {
         if chunk.is_empty() {
             return;
         }
+        // Cap the accumulator: a stream that never emits a blank-line
+        // terminator (a non-SSE body routed here, or a hostile
+        // upstream) would otherwise grow this buffer for the life of
+        // the stream. A real SSE event is a few KB; 4 MiB is orders
+        // of magnitude past any legitimate frame.
+        //
+        // On overflow we drop the buffer and the triggering chunk, so
+        // parsing resumes mid-stream at an arbitrary byte offset.
+        // Usually that garbage forms a prefix-less line the parser
+        // ignores; it CAN also resume on a syntactically valid
+        // `data:` line and yield one truncated event. That is
+        // acceptable only because every consumer is a telemetry tee
+        // off the byte path (`SseFramer` is never on the client
+        // path — see the three callers), so the worst case is a wrong
+        // usage number for one stream, bounded further by the
+        // ledger's own per-event token ceiling. Client bytes are
+        // never touched. Revisit this cap before framing anything
+        // client-facing with it.
+        const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
+        if self.buf.len() + chunk.len() > MAX_BUFFERED_BYTES {
+            tracing::warn!(
+                event = "sse_framer_buffer_overflow",
+                buffered = self.buf.len(),
+                "no event terminator within 4 MiB; discarding buffered \
+                 bytes (telemetry-only consumer — client stream unaffected)"
+            );
+            self.buf.clear();
+            return;
+        }
         self.buf.extend_from_slice(chunk);
     }
 

@@ -53,6 +53,14 @@ aws-smithy-runtime-api = { workspace = true }
 # transitively pulled in by `aws-smithy-*` (so this is not an
 # additional cold dep — promoting to a direct one for clarity).
 crc32fast = "1"
+# Native savings stats: Bedrock InvokeModel EventStream chunks wrap
+# their Anthropic SSE payloads in base64 (`{"bytes": "<b64>"}`);
+# the usage-capture tee decodes them. Already in the tree via the
+# HTTP stack (reqwest/axum/hyper-util/gcp_auth all pull base64
+# 0.22) — promoted to direct for the explicit use, so no new
+# major-version bucket. (The AWS crates use `base64-simd`, a
+# different crate — this is not that one.)
+base64 = "0.22"
 # Phase D PR-D3: Prometheus metrics for Bedrock observability. The
 # `prometheus` crate's default-features pull in `protobuf`, which we
 # don't need (we serve text-format scrapes only), so we disable
