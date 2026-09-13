@@ -76,15 +76,15 @@ class DeepSeekRates:
 def bare_model(model: str) -> str:
     """Return ``model`` without a ``provider/`` prefix, lowercased.
 
+    A tag suffix after ``:`` (``deepseek/deepseek-v4-pro:free``) is not stripped: such an id
+    falls out of tier scope and is priced from the flat tables instead.
+
     Args:
         model: A model id, optionally prefixed the way a gateway writes it
             (``deepseek/deepseek-v4-pro``).
 
     Returns:
         The bare, lowercased id used to key the tier table.
-
-    A tag suffix after ``:`` (``deepseek/deepseek-v4-pro:free``) is not stripped: such an id
-    falls out of tier scope and is priced from the flat tables instead.
     """
     return model.rsplit("/", 1)[-1].strip().lower()
 
@@ -141,9 +141,8 @@ def is_peak(now: datetime) -> bool:
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
-    now = now.astimezone(timezone.utc)
     beijing = now.astimezone(BEIJING_TZ)
-    if now >= WEEKEND_OFF_PEAK_FROM and beijing.weekday() >= 5:
+    if now >= WEEKEND_OFF_PEAK_FROM and beijing.weekday() >= 5:  # 5 = Saturday
         return False
     wall = beijing.time()
     return any(start <= wall < end for start, end in PEAK_WINDOWS_BEIJING)
