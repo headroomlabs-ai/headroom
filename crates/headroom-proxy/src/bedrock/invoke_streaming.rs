@@ -74,7 +74,7 @@ use crate::proxy::AppState;
 // `Extension<AuthMode>` extractor.
 use headroom_core::auth_mode::AuthMode;
 
-use crate::bedrock::vendor::is_anthropic_model_id;
+use crate::bedrock::vendor::{is_anthropic_model_id, is_safe_model_id};
 
 /// AWS Bedrock Runtime DNS template.
 const BEDROCK_RUNTIME_HOST_TEMPLATE: &str = "bedrock-runtime.{region}.amazonaws.com";
@@ -150,6 +150,29 @@ pub async fn handle_invoke_streaming(
         body_bytes = body.len(),
         "bedrock invoke-with-response-stream route received request"
     );
+
+    // Security: validate model_id to prevent path traversal attacks.
+    // Same check as the non-streaming handler — see invoke.rs for rationale.
+    if !is_safe_model_id(&model_id) {
+        tracing::warn!(
+            event = "bedrock_model_id_invalid",
+            request_id = %request_id,
+            model_id = %model_id,
+            "bedrock invoke-streaming: model_id contains path traversal characters; rejecting"
+        );
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "type": "bedrock_model_id_invalid",
+                        "message": "model_id contains invalid path traversal characters",
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("static");
+    }
 
     // 1. Live-zone compression for Anthropic-shape bodies (same as D1).
     let is_anthropic = is_anthropic_model_id(&model_id);
