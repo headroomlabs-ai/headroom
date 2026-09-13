@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -46,6 +47,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -1706,6 +1708,47 @@ class ContentRouterConfig:
     search_group_by_file: bool = False
 
 
+@dataclass
+class _PerRequestRuntimeState:
+    """Per-``apply()``-call state, isolated across concurrent requests (#3486).
+
+    ``ContentRouter`` is instantiated once at proxy startup and shared, as a
+    single Python object, across every concurrent request — ``apply()`` calls
+    are dispatched onto a real ``ThreadPoolExecutor`` (see
+    ``headroom/proxy/server.py``). Before this fix, ``apply()`` stashed this
+    exact state (compression policy, runtime overrides, tool-call maps) as
+    plain, unsynchronized attributes directly on ``self``, so one request's
+    ``apply()`` call could read a *different, concurrently-running* request's
+    values — a cross-tenant data leak (e.g. a Subscription-mode request
+    incorrectly writing its content into the shared, cross-user TOIN
+    learning pool because a concurrent PAYG request overwrote the policy
+    field mid-flight).
+
+    Every field here previously lived directly on ``ContentRouter`` as
+    ``self._runtime_*`` / ``self._tool_call_*``. They're bundled into one
+    dataclass so ``apply()`` can bind a brand-new, request-exclusive instance
+    of it into a ``ContextVar`` (see ``ContentRouter._runtime_state_var``)
+    instead of mutating shared instance state. ``ContextVar`` values are
+    Context-local per OS thread by default (no propagation across threads
+    unless explicitly copied), which is exactly the isolation two concurrent
+    ``ThreadPoolExecutor`` workers need.
+    """
+
+    compression_policy: Any = None
+    target_ratio: float | None = None
+    force_kompress: bool = False
+    skip_kompress: bool = False
+    kompress_model: str | None = None
+    tool_call_args: dict[str, str] = field(default_factory=dict)
+    tool_call_commands: dict[str, str] = field(default_factory=dict)
+
+
+# Monotonic counter so each ContentRouter instance gets a uniquely named
+# ContextVar (names only matter for repr/debugging; uniqueness avoids any
+# confusion when introspecting multiple router instances in one process).
+_runtime_state_var_ids = itertools.count()
+
+
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -1851,10 +1894,21 @@ class ContentRouter(Transform):
         # invocation. See `_lossless_provider_result`.
         self._lossless_provider_memo: dict[tuple[int, int, int], tuple[str, str] | None] = {}
 
-        # tool_call_id → compact args text, populated by _build_tool_name_map.
-        self._tool_call_args: dict[str, str] = {}
-        # tool_call_id → raw shell command (bash-search fold), same population.
-        self._tool_call_commands: dict[str, str] = {}
+        # #3486: per-request runtime state (compression policy, runtime
+        # overrides, tool-call maps — see `_PerRequestRuntimeState`) lives in
+        # a ContextVar, not on `self`, so concurrent `apply()` calls on this
+        # shared singleton can't observe or clobber each other's values.
+        # `apply()` binds a fresh `_PerRequestRuntimeState()` at the top of
+        # every call. The default below only matters for callers that use
+        # `self._tool_call_args` / `self.compress()` / `_record_to_toin()`
+        # directly, without going through `apply()` — same pre-#3486
+        # behaviour those callers already relied on (a single, instance-
+        # scoped default they can read and mutate).
+        self._default_runtime_state = _PerRequestRuntimeState()
+        self._runtime_state_var: ContextVar[_PerRequestRuntimeState] = ContextVar(
+            f"headroom_content_router_runtime_state_{next(_runtime_state_var_ids)}",
+            default=self._default_runtime_state,
+        )
 
         # Phase 0 (#1171): cap the input size handed to kompress (ModernBERT
         # ONNX). Its inference scales O(tokens) and runs synchronously on the
@@ -1922,12 +1976,11 @@ class ContentRouter(Transform):
         # ``kwargs["compression_policy"]`` at the start of ``apply()``
         # and read by ``_record_to_toin`` to gate TOIN writes when
         # ``policy.toin_read_only`` is true (Subscription mode).
-        # Defaults to ``None`` so direct ``compress()`` callers (e.g.
-        # tests, hand-written pipelines that don't go through the
-        # proxy) keep pre-F2.2 behaviour: TOIN writes are not gated.
-        # Same pattern the existing ``_runtime_target_ratio`` /
-        # ``_runtime_kompress_model`` fields below use.
-        self._runtime_compression_policy: Any = None
+        # Defaults to ``None`` (see ``_PerRequestRuntimeState``) so direct
+        # ``compress()`` callers (e.g. tests, hand-written pipelines that
+        # don't go through the proxy) keep pre-F2.2 behaviour: TOIN writes
+        # are not gated. Now backed by the #3486 ContextVar state — see
+        # the ``_runtime_compression_policy`` property below.
 
         self._cache = CompressionCache()
 
@@ -1971,6 +2024,91 @@ class ContentRouter(Transform):
         # cache. Counting pins isolates the freeze's attributable payoff.
         self._freeze_pin_hits = 0
         self._freeze_pin_chars = 0
+
+    # ── #3486: per-request runtime state accessors ──────────────────────
+    #
+    # These properties proxy every read/write of what used to be plain
+    # ``self._runtime_*`` / ``self._tool_call_*`` instance attributes onto
+    # the ContextVar-backed ``_PerRequestRuntimeState`` for the CURRENT
+    # thread's Context. Existing call sites throughout this file (both
+    # ``self._runtime_compression_policy = ...`` and
+    # ``getattr(self, "_runtime_target_ratio", None)``) work completely
+    # unchanged — the property intercepts attribute access exactly like a
+    # plain instance attribute would, so no other call site needed to
+    # change. ``apply()`` is the only place that binds a *fresh* state
+    # object (at the very top of the method); every other read/write here
+    # just goes through whatever object is ambient for the calling thread.
+    def _get_local_runtime_state(self) -> _PerRequestRuntimeState:
+        """Return the calling thread's per-request state, creating a
+        thread-local copy on first WRITE so direct callers (tests, or any
+        caller of ``compress()`` / ``_build_tool_name_map()`` /
+        ``_record_to_toin()`` that never calls ``apply()``) never mutate
+        the shared default in place — that default is one object shared by
+        every Context that hasn't called ``apply()`` yet, so mutating it
+        directly would leak across threads exactly like the bug this fix
+        removes.
+        """
+        state = self._runtime_state_var.get()
+        if state is self._default_runtime_state:
+            state = _PerRequestRuntimeState()
+            self._runtime_state_var.set(state)
+        return state
+
+    @property
+    def _runtime_compression_policy(self) -> Any:
+        return self._runtime_state_var.get().compression_policy
+
+    @_runtime_compression_policy.setter
+    def _runtime_compression_policy(self, value: Any) -> None:
+        self._get_local_runtime_state().compression_policy = value
+
+    @property
+    def _runtime_target_ratio(self) -> float | None:
+        return self._runtime_state_var.get().target_ratio
+
+    @_runtime_target_ratio.setter
+    def _runtime_target_ratio(self, value: float | None) -> None:
+        self._get_local_runtime_state().target_ratio = value
+
+    @property
+    def _runtime_force_kompress(self) -> bool:
+        return self._runtime_state_var.get().force_kompress
+
+    @_runtime_force_kompress.setter
+    def _runtime_force_kompress(self, value: bool) -> None:
+        self._get_local_runtime_state().force_kompress = value
+
+    @property
+    def _runtime_skip_kompress(self) -> bool:
+        return self._runtime_state_var.get().skip_kompress
+
+    @_runtime_skip_kompress.setter
+    def _runtime_skip_kompress(self, value: bool) -> None:
+        self._get_local_runtime_state().skip_kompress = value
+
+    @property
+    def _runtime_kompress_model(self) -> str | None:
+        return self._runtime_state_var.get().kompress_model
+
+    @_runtime_kompress_model.setter
+    def _runtime_kompress_model(self, value: str | None) -> None:
+        self._get_local_runtime_state().kompress_model = value
+
+    @property
+    def _tool_call_args(self) -> dict[str, str]:
+        return self._runtime_state_var.get().tool_call_args
+
+    @_tool_call_args.setter
+    def _tool_call_args(self, value: dict[str, str]) -> None:
+        self._get_local_runtime_state().tool_call_args = value
+
+    @property
+    def _tool_call_commands(self) -> dict[str, str]:
+        return self._runtime_state_var.get().tool_call_commands
+
+    @_tool_call_commands.setter
+    def _tool_call_commands(self, value: dict[str, str]) -> None:
+        self._get_local_runtime_state().tool_call_commands = value
 
     def _record_freeze_pin(self, content: str, cached_ratio: float) -> None:
         """Count one freeze divergence (thread-safe) and log it.
@@ -4762,6 +4900,21 @@ class ContentRouter(Transform):
         Returns:
             TransformResult with routed and compressed messages.
         """
+        # #3486: bind a brand-new, request-exclusive `_PerRequestRuntimeState`
+        # as this call's ContextVar value BEFORE anything else runs. This
+        # `ContentRouter` is a shared singleton dispatched onto a
+        # ThreadPoolExecutor by the proxy — without this, two concurrent
+        # `apply()` calls on different worker threads would clobber each
+        # other's `_runtime_compression_policy` / `_runtime_target_ratio` /
+        # tool-call maps via plain shared instance attributes. ContextVars
+        # are Context-local per OS thread by default (no cross-thread
+        # propagation), so each worker thread gets its own isolated object
+        # here regardless of what any other concurrently-running `apply()`
+        # call does. No `reset()` is needed: every `apply()` call installs
+        # its own fresh object up front, so the next call on a reused worker
+        # thread simply overwrites the ambient value before reading it.
+        self._runtime_state_var.set(_PerRequestRuntimeState())
+
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
             from .read_lifecycle import ReadLifecycleManager
