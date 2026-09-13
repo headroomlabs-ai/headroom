@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _OPENAI_STANDARD_PARAMS = (
     "max_tokens",
+    "max_completion_tokens",
     "temperature",
     "top_p",
     "stop",
