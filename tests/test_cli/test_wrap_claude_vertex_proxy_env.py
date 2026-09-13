@@ -38,6 +38,7 @@ def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "ANTHROPIC_FOUNDRY_RESOURCE",
+        "HEADROOM_CLAUDE_PROJECT_SETTINGS",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
         "VERTEX_TARGET_API_URL",
@@ -267,10 +268,10 @@ def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     assert "on-demand tool loading kept on" in output
     assert "keeps it on for this session" in output
     assert "DISABLED per your setting" not in output
-    assert _captured["write_tool_search_value"] == "true"
+    assert "write_tool_search_value" not in _captured
 
 
-def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
+def test_wrap_claude_foundry_keeps_disabled_tool_search_process_local_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured, output = _invoke_wrap_claude(
@@ -283,8 +284,24 @@ def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
     )
 
     assert captured["child_env"]["ENABLE_TOOL_SEARCH"] == "false"
-    assert captured["write_tool_search_value"] == "false"
+    assert "write_tool_search_value" not in captured
     assert "on-demand tool loading DISABLED" in output
+
+
+def test_wrap_claude_foundry_project_settings_opt_in_persists_disabled_tool_search(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _output = _invoke_wrap_claude(
+        runner,
+        monkeypatch,
+        env={
+            "CLAUDE_CODE_USE_FOUNDRY": "1",
+            "ANTHROPIC_FOUNDRY_BASE_URL": "https://tenant.services.ai.azure.com/anthropic",
+        },
+        extra_args=("--project-settings",),
+    )
+
+    assert captured["write_tool_search_value"] == "false"
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(
@@ -307,13 +324,11 @@ def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirec
 
     ensure_kwargs = captured["ensure_kwargs"]
     child_env = captured["child_env"]
-    write_kwargs = captured["write_base_url_kwargs"]
     assert ensure_kwargs["vertex_api_url"] == custom_vertex_url
     assert ensure_kwargs["clear_vertex_api_url"] is False
     assert ensure_kwargs["anthropic_api_url"] is None
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
-    assert write_kwargs["vertex_mode"] is True
-    assert write_kwargs["foundry_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_wrap_claude_vertex_target_env_beats_anthropic_vertex_base_url(
@@ -366,7 +381,7 @@ def test_wrap_claude_vertex_default_or_absent_base_url_does_not_force_vertex_tar
     assert child_env["ANTHROPIC_VERTEX_BASE_URL"] == "http://127.0.0.1:8787"
 
 
-def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
+def test_wrap_claude_foundry_proxy_env_uses_process_environment_only_by_default(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     foundry_url = "https://my-resource.services.ai.azure.com/anthropic"
@@ -389,8 +404,7 @@ def test_wrap_claude_foundry_proxy_env_behavior_is_unchanged(
     assert ensure_kwargs["anthropic_api_url"] == foundry_url
     assert ensure_kwargs["vertex_api_url"] is None
     assert child_env["ANTHROPIC_FOUNDRY_BASE_URL"] == "http://127.0.0.1:8787/anthropic"
-    assert captured["write_base_url_kwargs"]["foundry_mode"] is True
-    assert captured["write_base_url_kwargs"]["vertex_mode"] is False
+    assert "write_base_url_kwargs" not in captured
 
 
 def test_write_vertex_mode_sets_vertex_key(tmp_path: Path) -> None:
