@@ -46,6 +46,33 @@ def test_extract_user_query_and_message_hashes() -> None:
     assert utils.extract_user_query(messages) == "latest question"
     assert utils.extract_user_query([{"role": "assistant", "content": "skip"}]) == ""
 
+
+def test_extract_user_query_latest_user_turn_only() -> None:
+    """The flag stops at the newest user turn instead of resurrecting an older one."""
+    # A tool_result continuation: the newest user turn carries no text at all.
+    messages = [
+        {"role": "user", "content": "the original question"},
+        {"role": "assistant", "content": "calling a tool"},
+        {"role": "user", "content": [{"type": "tool_result", "content": "output"}]},
+    ]
+
+    # Default walks back and finds the older turn's question.
+    assert utils.extract_user_query(messages) == "the original question"
+    # Scoped to this turn, there is no question to score against.
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+def test_extract_user_query_latest_turn_only_agrees_on_normal_turns() -> None:
+    """With text present on the newest user turn, the flag changes nothing."""
+    messages = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": [{"type": "text", "text": " newest question "}]},
+    ]
+
+    assert utils.extract_user_query(messages) == "newest question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == "newest question"
+
     hash_one = utils.compute_messages_hash(messages)
     hash_two = utils.compute_messages_hash(list(messages))
     assert hash_one == hash_two
