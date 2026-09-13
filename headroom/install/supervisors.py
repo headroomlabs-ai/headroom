@@ -337,7 +337,7 @@ def _register_windows_task(name: str, xml: str) -> None:
             pass
 
 
-def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
+def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> list[ArtifactRecord]:
     """Install service/task artifacts for the deployment."""
 
     records = render_runner_scripts(manifest)
@@ -414,7 +414,8 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        _bootstrap_with_retry(bootstrap_domain, plist_path)
+        if start:
+            _bootstrap_with_retry(bootstrap_domain, plist_path)
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
@@ -518,6 +519,8 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.NONE.value:
         return
     if sys.platform.startswith("linux"):
+        if manifest.supervisor_kind == SupervisorKind.TASK.value:
+            return
         flags = [] if manifest.scope == "system" else ["--user"]
         subprocess.run(["systemctl", *flags, "stop", manifest.service_name], check=True)
         return
@@ -558,19 +561,21 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
     if sys.platform.startswith("linux"):
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             flags = [] if manifest.scope == "system" else ["--user"]
-            run(
+            result = run(
                 ["systemctl", *flags, "disable", "--now", manifest.service_name],
                 capture_output=True,
                 text=True,
             )
+            _require_removal_success(result, "systemctl disable --now", absent_text="not loaded")
             unit_path, _ = _linux_service_unit(manifest, unix_run_script_path(manifest.profile))
             if unit_path.exists():
                 unit_path.unlink()
-            run(
+            result = run(
                 ["systemctl", *flags, "daemon-reload"],
                 capture_output=True,
                 text=True,
             )
+            _require_removal_success(result, "systemctl daemon-reload")
             return
         cron_path, _ = _linux_task_spec(manifest, unix_ensure_script_path(manifest.profile))
         if cron_path and cron_path.exists():
@@ -582,17 +587,20 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             text=True,
         )
         if current.returncode != 0:
+            if "no crontab for" not in _result_text(current).lower():
+                raise click.ClickException(f"crontab -l failed: {_result_text(current)}")
             return
         marker_start = f"# >>> headroom {manifest.profile} >>>"
         marker_end = f"# <<< headroom {manifest.profile} <<<"
         pattern = re.compile(re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL)
         content = pattern.sub("", current.stdout).strip()
-        run(
+        result = run(
             ["crontab", "-"],
             input=(content + "\n") if content else "",
             text=True,
             check=True,
         )
+        _require_removal_success(result, "crontab update")
         return
 
     if sys.platform == "darwin":
@@ -610,35 +618,64 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        run(
+        result = run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             capture_output=True,
             text=True,
         )
+        _require_removal_success(result, "launchctl bootout", absent_codes={_LAUNCHCTL_ESRCH})
         if plist_path.exists():
             plist_path.unlink()
         return
 
     if _is_windows():
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            run(
+            result = run(
                 ["sc.exe", "stop", manifest.service_name],
                 capture_output=True,
                 text=True,
             )
-            run(
+            _require_removal_success(result, "sc.exe stop", absent_text="does not exist")
+            result = run(
                 ["sc.exe", "delete", manifest.service_name],
                 capture_output=True,
                 text=True,
             )
+            _require_removal_success(result, "sc.exe delete", absent_text="does not exist")
             return
-        run(
+        result = run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
             capture_output=True,
             text=True,
         )
-        run(
+        _require_removal_success(result, "schtasks startup delete", absent_text="does not exist")
+        result = run(
             ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
             capture_output=True,
             text=True,
         )
+        _require_removal_success(result, "schtasks health delete", absent_text="does not exist")
+
+
+def _result_text(result: object) -> str:
+    return str(
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+    ).strip()
+
+
+def _require_removal_success(
+    result: object,
+    operation: str,
+    *,
+    absent_codes: set[int] | None = None,
+    absent_text: str | None = None,
+) -> None:
+    returncode = int(getattr(result, "returncode", 0))
+    detail = _result_text(result)
+    if returncode == 0:
+        return
+    if absent_codes and returncode in absent_codes:
+        return
+    if absent_text and absent_text in detail.lower():
+        return
+    raise click.ClickException(f"{operation} failed: {detail}")

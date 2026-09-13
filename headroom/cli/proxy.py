@@ -223,6 +223,18 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
