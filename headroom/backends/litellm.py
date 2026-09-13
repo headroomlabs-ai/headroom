@@ -1580,6 +1580,15 @@ class LiteLLMBackend(Backend):
 
             async for chunk in response:
                 chunk_dict = chunk.model_dump(exclude_none=True, exclude_unset=True)
+                # Report the model the client requested, not the LiteLLM-mapped
+                # provider slug (e.g. "openrouter/qwen3",
+                # "bedrock/us.anthropic.claude-..."). send_openai_message already
+                # rewrites the model to original_model on the non-streaming path;
+                # without this the streaming and non-streaming responses disagree
+                # and OpenAI clients that key cost/telemetry on the model field
+                # see an unrecognized name for every streamed request.
+                if "model" in chunk_dict:
+                    chunk_dict["model"] = original_model
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
             yield "data: [DONE]\n\n"
