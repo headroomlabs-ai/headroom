@@ -317,6 +317,7 @@ class TransformPipeline:
             all_markers: list[str] = []
             all_warnings: list[str] = []
             all_timing: dict[str, float] = {}  # transform_name → ms
+            all_message_decisions: list[Any] = []
 
             # Track transform diffs if enabled
             transform_diffs: list[TransformDiff] = []
@@ -401,6 +402,8 @@ class TransformPipeline:
                     all_markers.extend(result.markers_inserted)
                     all_warnings.extend(result.warnings)
                     all_timing[transform.name] = duration_ms
+                    if result.message_decisions:
+                        all_message_decisions.extend(result.message_decisions)
 
                     # Merge sub-transform timing (e.g. ContentRouter's per-compressor breakdown)
                     if result.timing:
@@ -543,6 +546,7 @@ class TransformPipeline:
             diff_artifact=diff_artifact,
             timing=all_timing,
             waste_signals=waste_signals,
+            message_decisions=all_message_decisions,
         )
 
     def simulate(
