@@ -19,6 +19,7 @@ from headroom.perf.analyzer import (
     TransformRecord,
     build_overhead_summary,
     build_perf_summary,
+    build_savings_audit,
     perf_records_as_dicts,
 )
 
@@ -97,6 +98,8 @@ def test_build_perf_summary_totals_and_pct():
     assert summary["cache_write_tokens"] == 200
     assert summary["cache_hit_pct"] == 83.3
     assert summary["window_hours"] == 24.0
+    assert summary["savings_audit"]["prompt_reduction_tokens"] == 1000
+    assert summary["savings_audit"]["accounting_delta_tokens"] == 0
 
 
 def test_build_perf_summary_by_model_and_transform():
@@ -162,6 +165,40 @@ def test_build_overhead_summary_attributes_slow_stages():
     assert overhead["stage_breakdown"][0]["total_ms"] == 650.0
     assert overhead["top_slow_requests"][0]["request_id"] == "slow"
     assert overhead["top_slow_requests"][0]["slowest_stage"] == "kompress"
+
+
+def test_build_savings_audit_surfaces_accounting_deltas():
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="hr_bad",
+                model="gpt-5",
+                tokens_before=100,
+                tokens_after=90,
+                tokens_saved=250,
+            ),
+            PerfRecord(
+                timestamp="2026-06-05 10:01:00,000",
+                request_id="hr_growth",
+                model="gpt-5",
+                tokens_before=100,
+                tokens_after=120,
+                tokens_saved=1,
+            ),
+        ]
+    )
+
+    audit = build_savings_audit(report)
+
+    assert audit["logged_tokens_saved"] == 251
+    assert audit["prompt_reduction_tokens"] == 10
+    assert audit["accounting_delta_tokens"] == 241
+    assert audit["record_counts"]["with_accounting_delta"] == 2
+    assert audit["record_counts"]["logged_saved_gt_tokens_before"] == 1
+    assert audit["record_counts"]["prompt_grew_but_logged_savings_positive"] == 1
+    assert audit["suspicious_records"][0]["request_id"] == "hr_bad"
+    assert "logged_saved_gt_tokens_before" in audit["suspicious_records"][0]["reasons"]
 
 
 def test_perf_records_as_dicts_roundtrips_fields():
@@ -304,6 +341,8 @@ def test_perf_csv_by_model(runner, monkeypatch):
     assert {r["model"] for r in rows} == {"claude-sonnet-4.5", "claude-opus-4-8"}
     sonnet = next(r for r in rows if r["model"] == "claude-sonnet-4.5")
     assert sonnet["tokens_saved"] == "600"
+    assert sonnet["prompt_reduction_tokens"] == "600"
+    assert sonnet["accounting_delta_tokens"] == "0"
 
 
 def test_perf_csv_raw_per_record(runner, monkeypatch):
