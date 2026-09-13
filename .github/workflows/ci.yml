@@ -47,6 +47,7 @@ jobs:
       dashboard: ${{ steps.filter.outputs.dashboard }}
       packaging: ${{ steps.filter.outputs.packaging }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      env_docs: ${{ steps.filter.outputs.env_docs }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -99,6 +100,27 @@ jobs:
               - '.github/workflows/**'
             workflows:
               - '.github/workflows/**'
+            env_docs:
+              - 'headroom/**'
+              - 'crates/**'
+              - 'sdk/**'
+              - 'plugins/**'
+              - 'deploy/**'
+              - 'docker/**'
+              - 'scripts/**'
+
+  env-doc-consistency:
+    needs: changes
+    if: needs.changes.outputs.env_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Verify documented environment variables
+        run: python scripts/ci/verify_documented_env_vars.py
 
   lint:
     needs: changes
