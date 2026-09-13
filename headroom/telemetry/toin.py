@@ -460,6 +460,13 @@ class ToolIntelligenceNetwork:
         # Storage backend
         if backend is not None:
             self._backend = backend
+        elif toin_backend_disabled():
+            # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win
+            # over storage_path. Deciding this from the factory's return value
+            # cannot work: it returns None both for "no backend configured" and
+            # for "explicitly disabled", and the default storage_path is never
+            # empty, so "none" silently reinstated the filesystem backend.
+            self._backend = None
         elif self._config.storage_path:
             self._backend = FileSystemTOINBackend(
                 self._config.storage_path,
@@ -1605,6 +1612,17 @@ _toin_lock = threading.Lock()
 TOIN_BACKEND_ENV_VAR = "HEADROOM_TOIN_BACKEND"
 
 
+def toin_backend_disabled() -> bool:
+    """True when ``HEADROOM_TOIN_BACKEND=none`` asks for in-memory-only TOIN.
+
+    Kept separate from :func:`_create_default_toin_backend` because that
+    function communicates only through its return value, and ``None`` there
+    already means "no explicit backend, fall back to the default". The two
+    cases need to be distinguishable.
+    """
+    return (os.environ.get(TOIN_BACKEND_ENV_VAR) or "").strip().lower() == "none"
+
+
 def _create_default_toin_backend() -> Any:
     """Create a TOIN backend from env (e.g. HEADROOM_TOIN_BACKEND=redis).
 
@@ -1615,7 +1633,9 @@ def _create_default_toin_backend() -> Any:
     if not backend_type or backend_type == "filesystem":
         return None
     if backend_type == "none":
-        return None  # Explicit in-memory-only (e.g. --stateless mode)
+        # Handled by toin_backend_disabled() in ToolIntelligenceNetwork.__init__,
+        # which is the only place that can tell "disabled" from "use the default".
+        return None
     try:
         from importlib.metadata import entry_points
 
