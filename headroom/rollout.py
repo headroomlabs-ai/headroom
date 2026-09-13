@@ -104,9 +104,14 @@ FEATURES: dict[str, FeatureSpec] = {
     ),
     "proxy_output_shaper": FeatureSpec(
         name="proxy_output_shaper",
-        available_in=RolloutChannel.BETA,
+        available_in=RolloutChannel.STABLE,
+        # Deliberately NOT default-enabled. Steering appends a block to the
+        # system prompt, and at L3 that is a visible behaviour change ("give
+        # conclusions only") -- a user who did not ask for it would read the
+        # terseness as the model getting worse. Available in every channel, so
+        # HEADROOM_OUTPUT_SHAPER=1 is all it takes to turn on.
         legacy_env=("HEADROOM_OUTPUT_SHAPER",),
-        description="Proxy output-shaping path for response-side experiments.",
+        description="Output-token shaping: verbosity steering (opt-in).",
     ),
     "read_maturation": FeatureSpec(
         name="read_maturation",

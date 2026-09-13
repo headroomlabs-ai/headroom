@@ -351,3 +351,81 @@ class TestBreakpointRelocation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestFirstAppearanceAccounting:
+    """A matured Read's savings must book once, on the turn it matures.
+
+    The client re-sends the raw conversation every turn, so a plain
+    original-vs-optimized token diff re-counts the same removal on every
+    later request. ``replayed_token_debt`` measures that from the
+    request's own endpoints — raw client snapshot vs forwarded messages —
+    rather than from what ``apply`` replaced, because after maturation
+    the marker normally reaches the wire through the cached-prefix replay
+    and ``apply`` replaces nothing at all.
+    """
+
+    def _matured(self):
+        """Returns (manager, raw client messages, forwarded messages)."""
+        m = manager(quiesce_turns=5)
+        raw = [*base_conv(), *quiet(5)]
+        res = m.apply(raw)
+        assert res.newly_matured == 1
+        return m, raw, res.messages
+
+    @staticmethod
+    def _marker(sent):
+        return sent[2]["content"][0]["content"]
+
+    def test_first_appearance_books_in_full(self):
+        m, raw, sent = self._matured()
+        assert m.replayed_token_debt(raw, sent, len) == 0
+
+    def test_later_request_is_charged_even_without_a_replacement(self):
+        # The second call passes the same forwarded form WITHOUT running
+        # apply again: that is the cached-prefix replay, the path that
+        # actually re-books the removal in production.
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
+        expected = len(CONTENT) - len(self._marker(sent))
+        assert m.replayed_token_debt(raw, sent, len) == expected
+
+    def test_marker_echo_is_not_a_replay(self):
+        # The client echoes the marker form back: nothing was removed this
+        # request, so there is nothing to un-book.
+        m, _, sent = self._matured()
+        assert m.replayed_token_debt(sent, sent, len) == 0
+
+    def test_unchanged_wire_form_is_not_a_replay(self):
+        # Forwarded verbatim (maturation state lost, hold re-established):
+        # no removal on the wire, no debt.
+        m, raw, _ = self._matured()
+        assert m.replayed_token_debt(raw, raw, len) == 0
+
+    def test_delta_is_tokenized_once_per_tool_call(self):
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
+        calls = []
+
+        def count(text: str) -> int:
+            calls.append(text)
+            return len(text)
+
+        expected = len(CONTENT) - len(self._marker(sent))
+        assert m.replayed_token_debt(raw, sent, count) == expected
+        assert len(calls) == 2  # content + marker, once
+        assert m.replayed_token_debt(raw, sent, count) == expected
+        assert len(calls) == 2  # cached for the session
+
+    def test_replay_request_nets_zero_savings(self):
+        # With a compositional counter the diff on a replay request equals
+        # exactly the debt, so first-appearance accounting books nothing new.
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
+        diff = len(CONTENT) - len(self._marker(sent))
+        assert max(0, diff - m.replayed_token_debt(raw, sent, len)) == 0
+
+    def test_nothing_matured_has_zero_debt(self):
+        m = manager()
+        res = m.apply(base_conv())
+        assert m.replayed_token_debt(base_conv(), res.messages, len) == 0

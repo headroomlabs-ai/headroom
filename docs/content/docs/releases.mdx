@@ -67,13 +67,19 @@ The release PR is the place where version and changelog changes are reviewed bef
 The `release.yml` workflow runs when a GitHub Release is published, which normally happens when the release-please PR is merged. It also supports manual `workflow_dispatch` and PR dry-runs for release-critical workflow/package changes.
 
 ```
-detect-version → build → build-wheels → collect-dist → smoke-import-wheels
-                                      ↘ publish-pypi
-                                      ↘ publish-npm
-                                      ↘ publish-github-packages
-                                      ↘ publish-docker
-                                        → create-release
+detect-version → build → build-wheels ─┬→ collect-dist ─┐
+                       │               └→ smoke-import-wheels ─┬→ publish-pypi ─┐
+                       ├──────────────────────────────────────┼→ publish-docker ┤
+                       ├→ publish-npm ──────────────────────────────────────────┤
+                       └→ publish-github-packages ──────────────────────────────┴→ create-release
 ```
+
+`build-wheels` fans out to `collect-dist` and `smoke-import-wheels` in
+parallel (both only need the wheel artifacts, not each other).
+`publish-npm` and `publish-github-packages` only need `detect-version` +
+`build` -- they do not wait on the wheel matrix at all. `publish-pypi` and
+`publish-docker` both gate on `smoke-import-wheels`. `create-release` is the
+only job that waits on everything (`.github/workflows/release.yml:78-1004`).
 
 The workflow never commits back to the repo.
 
@@ -88,7 +94,7 @@ Resolves the release version from the trigger. On `release: published`, it uses 
 5. Uploads release asset artifacts for downstream publish jobs
 
 ### build-wheels
-Builds the Python wheel matrix for Linux x86_64, Linux arm64, and Apple Silicon macOS, plus one source distribution. Linux wheels are audited for glibc symbol compatibility.
+Builds the Python wheel matrix for Linux x86_64, Linux arm64, Apple Silicon macOS, Intel macOS, and Windows x86_64, plus one source distribution (`.github/workflows/release.yml:214-264`). Linux wheels are audited for glibc symbol compatibility.
 
 ### collect-dist
 Collects the wheel matrix, source distribution, and npm tarballs into the canonical artifacts used by publishing and GitHub Release asset upload.
@@ -97,7 +103,7 @@ Collects the wheel matrix, source distribution, and npm tarballs into the canoni
 Installs the built wheels into representative customer environments and imports `headroom._core`. This blocks publishing if a wheel builds successfully but cannot import on its promised platform floor.
 
 ### publish-pypi
-Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1` (trusted publisher).
+Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@v1.13.0` (trusted publisher).
 
 ### publish-npm
 Publishes all npm packages to npmjs.org:
@@ -138,10 +144,10 @@ To rename a package, update the corresponding constant — all references throug
 
 ## Safety Gates
 
-Each publish job requires **both** of the following to be false:
+Each publish job requires all of the following to be true (`.github/workflows/release.yml:768`, PyPI shown; npm/GitHub Packages mirror it with their own skip variable):
 
 ```yaml
-if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
 ```
 
 To skip a publish target, set the corresponding GitHub Actions variable:
@@ -213,10 +219,11 @@ on:
 ### Prerequisites
 
 ```bash
-# Install act
-winget install act
+# macOS
+brew install act actionlint
 
-# Optional: install actionlint for schema validation
+# Windows
+winget install act
 winget install actionlint
 ```
 

@@ -205,7 +205,7 @@ The proxy compresses all traffic at the HTTP level (before the LLM sees content)
 
 **"Proxy not running"** -- Start the proxy with `headroom proxy` in another terminal. Only needed for proxy-backed retrieval.
 
-**"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 5 minutes.
+**"Entry not found or expired"** -- Local content expires after 1 hour, proxy content after 30 minutes (configurable via `HEADROOM_CCR_TTL_SECONDS`).
 
 **Claude doesn't see headroom tools** -- Run `headroom mcp status`, restart Claude Code, and verify with `/mcp` inside Claude Code.
 

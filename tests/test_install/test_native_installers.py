@@ -647,6 +647,61 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
             _restore_user_path_entry(before)
 
 
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_mcp_wrapper_keeps_stdin_attached_for_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    """Piped MCP stdio must still pass -i to Docker even when input is redirected."""
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        wrapper = home / ".local" / "bin" / "headroom.ps1"
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "mcp",
+                "serve",
+            ],
+            env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.returncode == 0
+        mcp_call = next(call for call in _read_fake_docker_log(env) if call[:2] == ["run", "--rm"])
+        assert "-i" in mcp_call
+        assert "-t" not in mcp_call
+    finally:
+        _cleanup_fake_docker(env)
+
+
 # AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
 # a given HEADROOM_INSTALL_PATH_SCOPE, so the scope allow-list is exercised
 # without running the whole installer. Parsing via the PowerShell AST (not a

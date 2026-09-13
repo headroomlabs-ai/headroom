@@ -1561,37 +1561,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -3014,7 +3041,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 
@@ -3258,17 +3285,38 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+# Stand-in for a tool-search block the outbound tools array cannot support. Text
+# so it is inert to every validator, short so it costs ~10 tokens, and constant so
+# the repaired prefix stays byte-stable across turns (the provider cache needs the
+# same bytes every time).
+_TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
+    "type": "text",
+    "text": "[tool search omitted: unavailable in this request]",
+}
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
-    """Drop tool-search blocks this request's ``tools`` array cannot support.
+    """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
     A block pair is unsupportable when the request carries no ``tool_search_tool_*``
     tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
     shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    ``server_tool_use`` are handled (an orphan of either 400s on its own).
 
-    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
-    when nothing was removed — callers rely on identity to skip the write-back.
+    Replace in place rather than remove (#3456). The block indexes of a message
+    are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
+    by ``(message_index, block_index)``, so deleting a block that sits BEFORE a
+    thinking block in the same message — or deleting a whole message ahead of one —
+    moves that block, ``thinking_blocks_survived_mutation`` reports False, and
+    ``select_outbound_body`` then forwards the client's ORIGINAL bytes and discards
+    every mutation, this repair included. The request that needed repairing is
+    exactly the one that loses it, and upstream 400s on the reference we had
+    already found. Swapping each block for a short text block keeps every thinking
+    block at its original coordinates, so the repair survives to the wire. Same
+    reasoning as the CCR sibling below.
+
+    Returns ``(messages, blocks_repaired)``, and the ORIGINAL ``messages`` object
+    when nothing changed — callers rely on identity to skip the write-back.
     """
     if not isinstance(messages, list):
         return messages, 0
@@ -3301,7 +3349,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             out.append(message)
             continue
 
-        drop_indexes: set[int] = set()
+        neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
         for index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
@@ -3309,7 +3357,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
                 continue
-            drop_indexes.add(index)
+            neutralize_indexes.add(index)
             use_id = block.get("tool_use_id")
             if use_id:
                 orphaned_ids.add(str(use_id))
@@ -3321,19 +3369,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                 continue
             is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
-                drop_indexes.add(index)
+                neutralize_indexes.add(index)
 
-        if not drop_indexes:
+        if not neutralize_indexes:
             out.append(message)
             continue
 
         changed = True
-        removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
-        if not kept:
-            continue  # the whole turn was tool-search bookkeeping
+        removed += len(neutralize_indexes)
         repaired = dict(message)
-        repaired["content"] = kept
+        repaired["content"] = [
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            for index, block in enumerate(content)
+        ]
         out.append(repaired)
 
     return (out, removed) if changed else (messages, 0)
