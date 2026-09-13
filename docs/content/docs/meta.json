@@ -61,6 +61,8 @@
     "runtime-rollouts",
     "benchmarks",
     "limitations",
+    "---Security---",
+    "security-model",
     "---Help---",
     "errors",
     "troubleshooting"
