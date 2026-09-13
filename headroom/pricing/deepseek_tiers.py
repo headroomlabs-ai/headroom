@@ -68,6 +68,7 @@ class DeepSeekRates:
     cache_hit_per_1m: float
     input_per_1m: float
     output_per_1m: float
+    #: DeepSeek bills no cache-write surcharge; write tokens bill as cache-miss input.
     cache_write_per_1m: float
     tier: Literal["peak", "off_peak"]
 
@@ -81,6 +82,9 @@ def bare_model(model: str) -> str:
 
     Returns:
         The bare, lowercased id used to key the tier table.
+
+    A tag suffix after ``:`` (``deepseek/deepseek-v4-pro:free``) is not stripped: such an id
+    falls out of tier scope and is priced from the flat tables instead.
     """
     return model.rsplit("/", 1)[-1].strip().lower()
 
@@ -122,3 +126,46 @@ def off_peak_rates(model: str) -> DeepSeekRates | None:
         the flash/pro rate card.
     """
     return _tier_rates(_canonical(model), "off_peak")
+
+
+def is_peak(now: datetime) -> bool:
+    """Return whether ``now`` falls in a Beijing peak window.
+
+    Args:
+        now: The instant to test. A naive value is read as UTC.
+
+    Returns:
+        ``True`` during Beijing 09:00-12:00 or 14:00-18:00 on a day the published
+        windows apply; weekends are all-day off-peak once
+        :data:`WEEKEND_OFF_PEAK_FROM` is in force.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    beijing = now.astimezone(BEIJING_TZ)
+    if now >= WEEKEND_OFF_PEAK_FROM and beijing.weekday() >= 5:
+        return False
+    wall = beijing.time()
+    return any(start <= wall < end for start, end in PEAK_WINDOWS_BEIJING)
+
+
+def rates_for(model: str, now: datetime | None = None) -> DeepSeekRates | None:
+    """Return the tier that prices ``model`` at ``now``.
+
+    This is the seam every cost path uses. A caller with a request instant passes
+    it, so tests and replays stay deterministic; a caller without one gets the
+    wall clock.
+
+    Args:
+        model: Model id, with or without a ``provider/`` prefix, current or retired.
+        now: The request instant, or ``None`` to read the clock.
+
+    Returns:
+        The applicable :class:`DeepSeekRates`, or ``None`` for any model outside
+        the flash/pro rate card - the caller's cue to use its generic path.
+    """
+    canonical = _canonical(model)
+    if canonical not in OFF_PEAK_RATES_PER_1M:
+        return None
+    instant = now if now is not None else datetime.now(timezone.utc)
+    return _tier_rates(canonical, "peak" if is_peak(instant) else "off_peak")
