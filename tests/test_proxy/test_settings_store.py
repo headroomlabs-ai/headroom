@@ -109,6 +109,16 @@ class TestValidation:
             settings_store.save({"savings_profile": "nonsense"})
         assert "savings_profile" in exc.value.field_errors
 
+    def test_memory_backend_accepts_only_supported_backends(self):
+        assert settings_store.validate({"memory_backend": "local"}) == {"memory_backend": "local"}
+        assert settings_store.validate({"memory_backend": "qdrant-neo4j"}) == {
+            "memory_backend": "qdrant-neo4j"
+        }
+
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.validate({"memory_backend": "unsupported"})
+        assert "memory_backend" in exc.value.field_errors
+
     def test_save_rejects_non_numeric(self, workspace):
         with pytest.raises(settings_store.SettingsValidationError) as exc:
             settings_store.save({"rpm": "abc"})
@@ -329,3 +339,12 @@ class TestRegistryDriftAgainstClick:
             f"{sorted(missing)}. Add a SettingField for each, or document why it's "
             "deliberately excluded (e.g. a secret)."
         )
+
+    def test_memory_backend_registry_matches_click_option(self):
+        field = next(
+            field for field in settings_store.SETTINGS if field.env == "HEADROOM_MEMORY_BACKEND"
+        )
+
+        assert field.key == "memory_backend"
+        assert field.default == "local"
+        assert field.choices == ("local", "qdrant-neo4j")

@@ -620,6 +620,17 @@ SETTINGS: tuple[SettingField, ...] = (
     ),
     # --- Memory ---
     SettingField(
+        "HEADROOM_MEMORY_BACKEND",
+        "memory_backend",
+        "Memory backend",
+        "Memory",
+        "enum",
+        default="local",
+        choices=("local", "qdrant-neo4j"),
+        help="Storage backend for agent memory. qdrant-neo4j requires the [memory-stack] extra.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_MEMORY_DB_PATH",
         "memory_db_path",
         "Memory DB path",
