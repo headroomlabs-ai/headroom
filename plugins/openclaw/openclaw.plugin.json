@@ -26,6 +26,10 @@
       "label": "Compression Request Timeout",
       "help": "Maximum milliseconds to wait for one compression request before returning the original messages."
     },
+    "minContextChars": {
+      "label": "Minimum Context Size",
+      "help": "Skip the proxy for smaller contexts that cannot produce meaningful savings. Set to 0 to disable."
+    },
     "circuitBreakerThreshold": {
       "label": "Circuit Breaker Threshold",
       "help": "Consecutive compression failures before temporarily bypassing Headroom."
@@ -84,7 +88,12 @@
       "requestTimeoutMs": {
         "type": "integer",
         "minimum": 1,
-        "default": 30000
+        "default": 2000
+      },
+      "minContextChars": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 800
       },
       "circuitBreakerThreshold": {
         "type": "integer",
