@@ -8027,6 +8027,12 @@ def dsh(
 
     registrar = DshRegistrar()
     registrar.ensure_home()
+    # The proxy compresses tool results and emits `[Retrieve more: hash=…]`
+    # markers, so dsh needs the headroom MCP entry to resolve them — every other
+    # wrapped agent registers it here. force=True for the same reason codex uses
+    # it: dsh starts a long-lived MCP subprocess, so a previous wrap on another
+    # port would otherwise leave retrieval pointed at the wrong proxy.
+    _setup_headroom_mcp(registrar, port, verbose=verbose, force=True)
     _setup_coding_compressor(registrar, serena_context="agent", verbose=verbose)
 
     _launch_tool(

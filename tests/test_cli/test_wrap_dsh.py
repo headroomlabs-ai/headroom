@@ -164,5 +164,10 @@ def test_wrap_dsh_establishes_managed_entry_before_launch_without_home(
     text = patch.read_text(encoding="utf-8")
     assert "@deepseek-ai/dsh-mcp-client" in text
     assert "serverName: serena" in text
+    # The proxy emits `[Retrieve more: hash=…]` markers, so the headroom MCP
+    # entry must land too — without it dsh has no headroom_retrieve tool to
+    # resolve them. Every other wrapped agent registers it; dsh did not.
+    assert "serverName: headroom" in text
+    assert "mcp-headroom" in text
     assert captured["agent_type"] == "dsh"
     assert launch_saw_entry == [True]
