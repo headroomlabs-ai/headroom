@@ -311,7 +311,9 @@ def estimate_cost_from_tokens(
 
     Returns ``None`` when LiteLLM is unavailable (the dependency is gated
     ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
-    to fall back to its own table.
+    to fall back to its own table. The DeepSeek flash/pro ids priced by the tier
+    branch above are the exception: they never reach LiteLLM, so they are priced
+    the same way whether or not it is installed.
     """
     # DeepSeek flash/pro are priced from the vendor's peak/off-peak card, which
     # litellm cannot express: model_cost holds one flat rate per model. The tier

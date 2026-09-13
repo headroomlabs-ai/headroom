@@ -201,7 +201,9 @@ class TestDeepSeekAnthropicProviderFallback:
         provider = AnthropicProvider()
         legacy = provider._get_pricing("deepseek-v4-flash")
         current = provider._get_pricing("deepseek-flash")
+        assert current is not None
         assert legacy == current
+        assert provider._get_pricing("deepseek-v4-flash-vision-exp") == current
 
     def test_deepseek_unknown_model_returns_none(self):
         from headroom.providers.anthropic import AnthropicProvider
@@ -318,13 +320,17 @@ class TestDeepSeekTieredCost:
         from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 
         canonical = "deepseek-v4-pro" if model.endswith("v4-pro") else "deepseek-flash"
-        assert estimate_cost_from_tokens(
+        alias_cost = estimate_cost_from_tokens(
             model, input_tokens=1_000_000, output_tokens=0, now=OFF_PEAK
-        ) == pytest.approx(
-            estimate_cost_from_tokens(
-                canonical, input_tokens=1_000_000, output_tokens=0, now=OFF_PEAK
-            )
         )
+        canonical_cost = estimate_cost_from_tokens(
+            canonical, input_tokens=1_000_000, output_tokens=0, now=OFF_PEAK
+        )
+        # Both must be real numbers first: ``None == pytest.approx(None)`` is True,
+        # so comparing unbound results would pass even if both fell out of scope.
+        assert alias_cost is not None
+        assert canonical_cost is not None
+        assert alias_cost == pytest.approx(canonical_cost)
 
     def test_non_deepseek_models_still_take_the_litellm_path(self):
         from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, estimate_cost_from_tokens
@@ -336,8 +342,10 @@ class TestDeepSeekTieredCost:
         assert cost > 0.0
 
     def test_deepseek_models_outside_the_rate_card_take_the_litellm_path(self):
-        from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
+        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, estimate_cost_from_tokens
 
+        if not LITELLM_AVAILABLE:
+            pytest.skip("litellm not available")
         # deepseek-chat is not on the flash/pro card, so the tier branch must not
         # claim it; litellm prices it (0.28/0.42 per 1M). The provider prefix is
         # required: litellm.cost_per_token refuses a bare "deepseek-chat".
