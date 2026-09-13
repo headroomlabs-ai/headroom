@@ -224,7 +224,11 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
             "HEADROOM_DISABLE_FEATURES": "read_maturation",
         }
     )
-    original = ProxyConfig(rollout=rollout, worker_processes=2)
+    original = ProxyConfig(
+        rollout=rollout,
+        worker_processes=2,
+        profile_seeded_env_keys=frozenset({"HEADROOM_MODE", "HEADROOM_LOSSLESS"}),
+    )
     monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(_proxy_config_payload(original)))
 
     restored = _proxy_config_from_env()
@@ -234,6 +238,7 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
     assert restored.rollout.is_enabled("proxy_output_shaper") is True
     assert restored.rollout.is_enabled("read_maturation") is False
     assert restored.worker_processes == 2
+    assert restored.profile_seeded_env_keys == frozenset({"HEADROOM_MODE", "HEADROOM_LOSSLESS"})
 
 
 def test_documented_proxy_json_without_internal_snapshot_is_preserved(monkeypatch) -> None:
