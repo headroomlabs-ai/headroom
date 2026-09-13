@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 try:
@@ -294,7 +294,7 @@ class HeadroomToolWrapper(BaseTool):  # type: ignore[misc]
 
         metric = ToolCompressionMetrics(
             tool_name=self.name,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             chars_before=chars_before,
             chars_after=chars_after,
             chars_saved=max(0, chars_saved),
