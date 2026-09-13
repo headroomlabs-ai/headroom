@@ -103,12 +103,35 @@ ANTHROPIC_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 )
 
 
+def _wrap_registry_chat_routes() -> tuple[ProviderHandlerRoute, ...]:
+    """Chat routes declared by wrap-registry targets (e.g. IBM Bob's
+    ``/inference/v1/chat/completions``). Tools that post OpenAI-shaped chat
+    completions under a nonstandard prefix declare it in their WrapTarget;
+    without a real route the traffic matches only the catch-all and is
+    forwarded uncompressed."""
+    # Local import: wrap_registry pulls in provider runtime modules, which this
+    # module must not require at import time for non-registry consumers.
+    # Resolved registry (not the code built-ins) so extra_chat_routes overrides
+    # from wrap_targets.json reach the proxy's route table.
+    from headroom.providers.wrap_registry import resolved_wrap_targets
+
+    seen: set[str] = set()
+    routes: list[ProviderHandlerRoute] = []
+    for target in resolved_wrap_targets().values():
+        for path in target.extra_chat_routes:
+            if path in seen:
+                continue
+            seen.add(path)
+            routes.append(ProviderHandlerRoute("POST", path, "handle_openai_chat"))
+    return tuple(routes)
+
+
 OPENAI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
     ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
     # Copilot Chat derives this unprefixed path from overrideCapiUrl. Route it
     # through the real handler; the generic catch-all would bypass compression.
     ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
-)
+) + _wrap_registry_chat_routes()
 
 
 OPENAI_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
