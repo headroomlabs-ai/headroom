@@ -16,6 +16,7 @@ from headroom.providers.registry import (
     resolve_api_targets,
     resolve_extra_headers,
 )
+from headroom.proxy.model_router import ModelRouterConfig
 from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 
 from .main import main
@@ -1338,6 +1339,13 @@ def proxy(
         else frozenset(),
         tool_profiles=_parse_tool_profiles([]) or None,
         smart_crusher_with_compaction=_get_env_bool_optional("HEADROOM_SMART_CRUSHER_COMPACTION"),
+        # Cost-aware model routing (#1706) is configured purely by env, and this
+        # is the entrypoint `headroom proxy` uses, so it has to read it here —
+        # `_proxy_config_from_env()` only runs on the multi-worker/factory path.
+        model_router=ModelRouterConfig.from_env(
+            os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
+            os.environ.get("HEADROOM_MODEL_ROUTES"),
+        ),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         target_ratio=target_ratio,
         compress_system_messages=_get_env_bool_optional("HEADROOM_COMPRESS_SYSTEM_MESSAGES"),
