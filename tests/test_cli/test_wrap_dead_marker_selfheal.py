@@ -221,6 +221,75 @@ def test_wrap_selfheal_hook_install_is_idempotent(tmp_path: Path) -> None:
     assert len(marked) == 1
 
 
+def test_wrap_selfheal_hook_overwrites_drifted_command(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|resume",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": f"/usr/bin/claude wrap selfheal --marker {_HOOK_MARKER}",
+                                    "timeout": 10,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wrap_cli._ensure_claude_wrap_selfheal_hook(path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = payload["hooks"]["SessionStart"]
+    assert len(entries) == 1
+    command = entries[0]["hooks"][0]["command"]
+    assert "/usr/bin/claude" not in command
+    assert "wrap selfheal" in command
+    assert _HOOK_MARKER in command
+
+
+def test_wrap_selfheal_hook_skips_malformed_sessionstart_entries(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        "not-a-dict",
+                        {"matcher": "startup", "hooks": "not-a-list"},
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wrap_cli._ensure_claude_wrap_selfheal_hook(path)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = payload["hooks"]["SessionStart"]
+    assert entries[0] == "not-a-dict"
+    assert entries[1] == {"matcher": "startup", "hooks": "not-a-list"}
+    marked = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and isinstance(entry.get("hooks"), list)
+        and any(_HOOK_MARKER in h.get("command", "") for h in entry["hooks"])
+    ]
+    assert len(marked) == 1
+
+
 def test_wrap_selfheal_hook_preserves_existing_hooks(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     path.parent.mkdir(parents=True)
