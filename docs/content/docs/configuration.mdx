@@ -508,8 +508,11 @@ Configure context limits and pricing for new or custom models:
   },
   "openai": {
     "context_limits": {
-      "gpt-5": 256000,
-      "ft:gpt-4o:my-org": 128000
+      "ft:gpt-4o:my-org": 128000,
+      "my-private-deployment": 200000
+    },
+    "pricing": {
+      "my-private-deployment": [5.00, 15.00]
     }
   }
 }
@@ -520,18 +523,61 @@ Save as `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
 JSON string or file path. Installs that still have
 `~/.headroom/models.json` (the legacy location) continue to work.
 
-Settings are resolved in this order (later overrides earlier):
+<Callout type="info">
+  Configure **models Headroom can't already look up** — fine-tunes, private
+  deployments, gateway aliases. Public models are resolved from LiteLLM (see
+  below), so pinning one here means maintaining a number yourself that would
+  otherwise stay current on its own.
+</Callout>
 
-1. Built-in defaults
-2. `${HEADROOM_CONFIG_DIR}/models.json` (new canonical location); falls
-   back to `~/.headroom/models.json` (legacy) when the canonical file
-   is absent
-3. `HEADROOM_MODEL_LIMITS` environment variable
-4. SDK constructor arguments
+### Where limits and prices come from
+
+Headroom consults the **installed LiteLLM model database** (`litellm.model_cost`)
+for public model metadata. That data ships with the LiteLLM package rather than
+being fetched at runtime, so it is as current as your installed LiteLLM version
+and refreshes when you upgrade it. Nothing here makes a network call.
+
+Limits and prices do **not** use the same precedence. Both are first-match-wins:
+
+**Context limits**
+
+1. **Explicit configuration and the built-in table**, checked together — they are
+   merged into one mapping, so an exact match in either returns immediately, then
+   partial/prefix matches.
+2. **LiteLLM** (`max_input_tokens`) — reached only for models the previous step
+   didn't match.
+3. **Pattern inference**, then a generic default.
+
+**Pricing**
+
+1. **Explicit configuration** — a value you configured is a decision, so it beats
+   everything below.
+2. **LiteLLM.**
+3. **Built-in table**, then pattern inference, then a generic default.
+
+<Callout type="warn">
+  The asymmetry is deliberate, not an oversight. For limits, a built-in entry
+  outranks LiteLLM because LiteLLM reports a model's maximum *capability* while
+  Headroom needs its *effective default*. `claude-sonnet-4-20250514` is the
+  concrete case: LiteLLM reports 1,000,000, but that window is an opt-in beta, so
+  the built-in 200,000 is the safe assumption for a client that has not enabled
+  it. Pricing has no equivalent capability-vs-default split, so there LiteLLM
+  wins outright.
+</Callout>
+
+Limits are an **input** budget (`max_input_tokens`), not the total window: `gpt-5`
+resolves to 272K input, not the 400K total (272K in + 128K out).
+
+LiteLLM also resolves gateway-routed names — `azure/...`, `bedrock/...`,
+`vertex_ai/...`, `groq/...` — which the built-in tables never covered.
+
+The built-in tables additionally cover installs where LiteLLM is unavailable: the
+dependency is gated `python_version < '3.14'`.
 
 ### Pattern-Based Inference
 
-Unknown models are automatically inferred from naming patterns:
+Models that reach step 3 and match no table entry are inferred from naming
+patterns:
 
 | Pattern | Inferred Settings |
 |---------|-------------------|
@@ -539,7 +585,12 @@ Unknown models are automatically inferred from naming patterns:
 | `*sonnet*` | 200K context, Sonnet-tier pricing |
 | `*haiku*` | 200K context, Haiku-tier pricing |
 | `gpt-4o*` | 128K context, GPT-4o pricing |
-| `o1*`, `o3*` | 200K context, reasoning model pricing |
+| `gpt-4.1*` | ~1M context, GPT-4.1 pricing |
+| `gpt-5*` | 272K input, GPT-5 pricing |
+| `o1*`, `o3*`, `o4*` | 200K context, reasoning model pricing |
+
+Matching prefers the **most specific** prefix, so `gpt-4.1` is not treated as
+`gpt-4` (which would give it an 8K limit and legacy `gpt-4` pricing).
 
 ## Provider-Specific Settings
 
