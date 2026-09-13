@@ -91,6 +91,7 @@ class TestOpenAICompatibleProvider:
         assert provider.get_context_limit("deepseek-v3.2") == 128000
         assert provider.get_context_limit("deepseek-v4-pro") == 1_000_000
         assert provider.get_context_limit("deepseek-v4-flash") == 1_000_000
+        assert provider.get_context_limit("deepseek-flash") == 1_000_000
         assert provider.get_context_limit("deepseek-r1") == 131072
         assert provider.get_context_limit("deepseek-coder-v2") == 128000
 
