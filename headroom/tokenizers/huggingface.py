@@ -81,6 +81,7 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
     "deepseek-r1-0528": "deepseek-ai/DeepSeek-R1-0528",
     "deepseek-reasoner": "deepseek-ai/DeepSeek-R1",
     # DeepSeek V4 family (2025-2026)
+    "deepseek-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
     "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
     "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
     # DeepSeek API aliases (routed through the proxy)

@@ -98,6 +98,7 @@ _DEFAULT_CONTEXT_LIMITS: dict[str, int] = {
     "deepseek-r1-0528": 131072,
     "deepseek-reasoner": 131072,
     "deepseek-v4": 1048576,
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-chat": 131072,
