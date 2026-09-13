@@ -17,7 +17,11 @@ from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
-from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
+from headroom.tokenizers.base import (
+    TokenCountCache,
+    coerce_countable_text,
+    count_content_blocks,
+)
 
 from .base import Provider, TokenCounter
 
@@ -365,11 +369,26 @@ class OpenAITokenCounter:
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
         self._encoding = _get_encoding(encoding_name)
+        # count_text is a pure function of its text, and this counter is a
+        # per-model singleton reused across requests (OpenAIProvider caches it),
+        # so a stable prefix/system prompt or a repeated tool result is otherwise
+        # re-encoded on every turn. Cache the count like AnthropicTokenCounter
+        # already does (the cache only admits large strings, so tiny/rare ones
+        # pay nothing).
+        self._count_cache = TokenCountCache()
 
     def count_text(self, text: str) -> int:
         """Count tokens in text."""
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self._encoding.encode(text))
         except ValueError:
