@@ -8258,14 +8258,14 @@ def omp(
     """Launch Oh My Pi (omp) through Headroom proxy.
 
     \b
-    Points omp's built-in `anthropic` provider at Headroom by injecting a
-    marker-fenced `providers.anthropic.baseUrl` override into
-    ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo with
-    `headroom unwrap omp`). omp resolves its Anthropic chat endpoint from
-    models.yml — ANTHROPIC_BASE_URL only affects its web-search helper — and a
-    same-ID override keeps omp's bundled model catalog and stored credentials.
-    omp's other providers (OpenAI-direct, Gemini, ...) keep their normal
-    endpoints; route those via your own custom provider in models.yml.
+    Points omp's built-in `anthropic`, `openai` (API-key), and `openai-codex`
+    (OAuth) providers at Headroom by injecting marker-fenced base-URL overrides
+    into ~/.omp/agent/models.yml (pre-wrap file backed up byte-for-byte; undo
+    with `headroom unwrap omp`). omp resolves these endpoints from models.yml —
+    ANTHROPIC_BASE_URL only affects its web-search helper — and same-ID
+    overrides keep omp's bundled model catalog and stored credentials. OMP
+    Codex appends `/codex/responses`, which Headroom already aliases. Gemini
+    and other providers keep their normal endpoints.
 
     \b
     Examples:
