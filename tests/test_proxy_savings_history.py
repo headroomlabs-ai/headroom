@@ -315,6 +315,9 @@ def test_savings_tracker_save_fsyncs_parent_directory(tmp_path, monkeypatch):
     # The file fsync persists contents, but the rename isn't durable until the
     # parent directory is fsynced too — without it a crash can drop the last
     # save. Assert a directory fd is fsynced on save. (FP4b)
+    if os.name == "nt":
+        pytest.skip("directory fsync is POSIX-specific")
+
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 
