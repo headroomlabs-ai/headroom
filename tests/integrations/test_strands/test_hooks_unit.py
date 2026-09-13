@@ -50,7 +50,6 @@ class TestHeadroomHookProviderInit:
 
         config = HeadroomConfig()
         config.smart_crusher.min_tokens_to_crush = 200
-        config.smart_crusher.max_items_after_crush = 20
 
         hook = HeadroomHookProvider(
             compress_tool_outputs=False,

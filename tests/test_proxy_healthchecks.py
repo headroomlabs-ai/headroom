@@ -85,7 +85,6 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     assert config["code_graph"] is False
     assert config["savings_profile"] is None
     assert config["target_ratio"] is None
-    assert config["max_items_after_crush"] == 50
     assert config["smart_crusher_with_compaction"] is None
     assert isinstance(config["pid"], int)
 
@@ -103,7 +102,6 @@ def test_health_reports_agent_savings_config():
         protect_recent=2,
         protect_analysis_context=True,
         min_tokens_to_crush=120,
-        max_items_after_crush=8,
         smart_crusher_with_compaction=False,
         accuracy_guard="strict",
     )
@@ -121,7 +119,6 @@ def test_health_reports_agent_savings_config():
     assert reported["protect_recent"] == 2
     assert reported["protect_analysis_context"] is True
     assert reported["min_tokens_to_crush"] == 120
-    assert reported["max_items_after_crush"] == 8
     assert reported["smart_crusher_with_compaction"] is False
     assert reported["accuracy_guard"] == "strict"
 

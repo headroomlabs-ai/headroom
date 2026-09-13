@@ -137,7 +137,7 @@ config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
 ```python
 # 1. Keep more items
 config = HeadroomConfig()
-config.smart_crusher.max_items_after_crush = 50  # Default: 15
+config.smart_crusher.min_tokens_to_crush = 2000  # Default: 200 — compress less
 
 # 2. Skip compression for specific tools
 response = client.chat.completions.create(

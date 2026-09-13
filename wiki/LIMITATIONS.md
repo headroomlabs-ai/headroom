@@ -129,7 +129,6 @@ The Tool Output Intelligence Network (TOIN) learns compression patterns from usa
 |---|---|---|
 | `min_items_to_analyze` | 5 | Arrays below this pass through |
 | `min_tokens_to_crush` | 200 | Content below this passes through |
-| `max_items_after_crush` | 15 | Upper bound on retained items |
 | `variance_threshold` | 2.0 | Std devs for anomaly detection (lower = more preserved) |
 | `first_fraction` | 0.3 | Fraction of K allocated to array start |
 | `last_fraction` | 0.15 | Fraction of K allocated to array end |

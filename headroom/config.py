@@ -576,7 +576,7 @@ class SmartCrusherConfig:
       (may not be true for all APIs)
 
     SAFER SETTINGS:
-    - Increase max_items_after_crush for critical data
+    - Use a conservative CompressionProfile bias for critical data
     - Set variance_threshold lower (1.5) to catch more change points
     """
 
@@ -586,7 +586,6 @@ class SmartCrusherConfig:
     variance_threshold: float = 2.0  # Std devs for change point detection
     uniqueness_threshold: float = 0.1  # Below this = nearly constant
     similarity_threshold: float = 0.8  # For clustering similar strings
-    max_items_after_crush: int = 15  # Target max items in output
     preserve_change_points: bool = True
     factor_out_constants: bool = False  # Disabled - preserves original schema
     include_summaries: bool = False  # Disabled - no generated text

@@ -19,7 +19,7 @@ When the lossy keep/drop path runs, SmartCrusher doesn't blindly truncate arrays
 4. **Relevant items** -- Matches to the user's query via BM25/embeddings
 5. **Change points** -- Significant transitions in data
 
-On that path, the target size is `max_items_after_crush` (15 by default): a 1,000-item array becomes ~15 items with all the information the LLM actually needs (measured: a 1,000-item array with `with_compaction=False` compressed to 16 items).
+How many items survive is derived from the content, not from a fixed target. The adaptive sizer finds the point of information saturation (Kneedle on unique bigram coverage) and keeps items up to it, so a repetitive array collapses further than a varied one of the same length. A `CompressionProfile` bias leans the result conservative or aggressive.
 
 ## What Gets Preserved
 
@@ -96,7 +96,6 @@ from headroom import SmartCrusher, SmartCrusherConfig
 
 config = SmartCrusherConfig(
     min_tokens_to_crush=200,      # Only compress if > 200 tokens
-    max_items_after_crush=15,     # Keep at most 15 items (lossy path only)
     first_fraction=0.3,           # Keep first 30% of items
     last_fraction=0.15,           # Keep last 15% of items
     variance_threshold=2.0,       # Statistical variance threshold
@@ -115,7 +114,6 @@ result = crusher.crush(tool_output, query="find payment failures")
 |---|---|---|
 | `min_tokens_to_crush` | `200` | Only compress arrays with more than this many tokens |
 | `min_items_to_analyze` | `5` | Minimum items before analyzing for compression |
-| `max_items_after_crush` | `15` | Maximum items to keep after compression |
 | `variance_threshold` | `2.0` | Statistical variance threshold for analysis |
 | `uniqueness_threshold` | `0.1` | Uniqueness threshold for deduplication |
 | `similarity_threshold` | `0.8` | Similarity threshold for grouping |

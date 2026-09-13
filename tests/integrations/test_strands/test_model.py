@@ -487,7 +487,6 @@ class TestHeadroomStrandsModelReal:
 
         custom_config = HeadroomConfig()
         custom_config.smart_crusher.min_tokens_to_crush = 50
-        custom_config.smart_crusher.max_items_after_crush = 10
 
         wrapped = HeadroomStrandsModel(
             wrapped_model=base_bedrock_model,

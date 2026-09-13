@@ -249,7 +249,6 @@ def test_feature_facets_configure_authoritative_scenario_surfaces() -> None:
             lossless=True,
             compressors=["smart_crusher", "log", "diff"],
             min_tokens=25,
-            max_items=9,
             savings_profile="coding",
         )
         .WithCCR(
@@ -281,10 +280,8 @@ def test_feature_facets_configure_authoritative_scenario_surfaces() -> None:
     assert scenario.proxy_config.lossless is True
     assert scenario.proxy_config.compressors == {"smart_crusher", "log", "diff"}
     assert scenario.proxy_config.min_tokens_to_crush == 25
-    assert scenario.proxy_config.max_items_after_crush == 9
     assert scenario.headroom_config.smart_crusher.lossless_only is True
     assert scenario.headroom_config.smart_crusher.min_tokens_to_crush == 25
-    assert scenario.headroom_config.smart_crusher.max_items_after_crush == 9
     assert scenario.proxy_config.ccr_inject_tool is False
     assert scenario.proxy_config.ccr_inject_marker is True
     assert scenario.proxy_config.ccr_proactive_expansion is False
