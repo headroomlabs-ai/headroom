@@ -26,7 +26,11 @@ def test_wrap_goose_sets_provider_envs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OPENAI_BASE_URL, OPENAI_API_BASE, ANTHROPIC_BASE_URL are set on launch."""
+    """OPENAI_BASE_URL, OPENAI_API_BASE, ANTHROPIC_BASE_URL, ANTHROPIC_HOST are set.
+
+    Goose's Anthropic provider reads ANTHROPIC_HOST rather than
+    ANTHROPIC_BASE_URL, so the value is asserted rather than mere presence.
+    """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
@@ -45,6 +49,7 @@ def test_wrap_goose_sets_provider_envs(
     assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9000/v1"
     assert env["OPENAI_API_BASE"] == "http://127.0.0.1:9000/v1"
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:9000"
+    assert env["ANTHROPIC_HOST"] == "http://127.0.0.1:9000"
     assert captured["tool_label"] == "GOOSE"
     assert captured["agent_type"] == "goose"
     assert captured["args"] == ("session",)
