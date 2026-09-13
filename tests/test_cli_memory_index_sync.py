@@ -506,3 +506,154 @@ def test_purge_command_exits_nonzero_when_index_sync_fails(tmp_path, monkeypatch
     assert result.exit_code == 1
     assert asyncio.run(store.get(memory.id)) is None
     assert "index sync incomplete" in result.output
+
+
+# ---------------------------------------------------------------------------
+# reindex batching
+# ---------------------------------------------------------------------------
+
+
+def _always_raises(message: str):
+    async def _raise(*_args, **_kwargs):
+        raise RuntimeError(message)
+
+    return _raise
+
+
+def _fts_rows(db_path: Path) -> dict[str, tuple[str, str, str, str]]:
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT memory_id, content, user_id, session_id, category FROM memory_fts"
+        ).fetchall()
+    return {r[0]: (r[1], r[2], r[3], r[4]) for r in rows}
+
+
+def _seeded_store(db_path: Path, count: int) -> list[Memory]:
+    store = SQLiteMemoryStore(str(db_path))
+    memories = []
+    for i in range(count):
+        mem = _make_memory(f"id-{i}", f"content {i}")
+        mem.session_id = f"session-{i % 3}"
+        memories.append(mem)
+        asyncio.run(store.save(mem))
+    return memories
+
+
+def test_reindex_batches_pages_instead_of_indexing_record_by_record(tmp_path, monkeypatch):
+    """The batch API does the work; the per-record path is only a fallback."""
+    db_path = tmp_path / "memory.db"
+    _seeded_store(db_path, 5)
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 2)
+
+    batch_sizes: list[int] = []
+    real_batch = FTS5TextIndex.index_batch_memories
+
+    async def spy_batch(self, memories):
+        batch_sizes.append(len(memories))
+        return await real_batch(self, memories)
+
+    monkeypatch.setattr(FTS5TextIndex, "index_batch_memories", spy_batch)
+    monkeypatch.setattr(
+        FTS5TextIndex,
+        "index_memory",
+        lambda *_a, **_k: pytest.fail("reindex fell back to per-record indexing"),
+    )
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert batch_sizes == [2, 2, 1]
+    assert "Re-indexed 5/5 memories" in result.output
+
+
+def test_reindex_batched_output_matches_per_record_output(tmp_path, monkeypatch):
+    """Every indexed field and FTS query result is identical either way."""
+    batched_db = tmp_path / "batched.db"
+    per_record_db = tmp_path / "per_record.db"
+    for db_path in (batched_db, per_record_db):
+        _seeded_store(db_path, 7)
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 3)
+
+    batched = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(batched_db)])
+    assert batched.exit_code == 0, batched.output
+
+    # Force the per-record path by making every batch fail.
+    monkeypatch.setattr(
+        FTS5TextIndex,
+        "index_batch_memories",
+        _always_raises("batching disabled for parity check"),
+    )
+    per_record = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(per_record_db)])
+    assert per_record.exit_code == 0, per_record.output
+
+    assert _fts_rows(batched_db) == _fts_rows(per_record_db)
+    batched_hits = FTS5TextIndex(db_path=str(batched_db)).search("content", k=10)
+    per_record_hits = FTS5TextIndex(db_path=str(per_record_db)).search("content", k=10)
+    assert [h.memory_id for h in batched_hits] == [h.memory_id for h in per_record_hits]
+
+
+def test_reindex_empty_store_indexes_nothing_and_succeeds(tmp_path):
+    db_path = tmp_path / "memory.db"
+    SQLiteMemoryStore(str(db_path))
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert _fts_ids(db_path) == set()
+    assert "Re-indexed 0/0 memories" in result.output
+
+
+def test_reindex_indexes_more_records_than_one_page(tmp_path, monkeypatch):
+    db_path = tmp_path / "memory.db"
+    memories = _seeded_store(db_path, 7)
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 3)
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert _fts_ids(db_path) == {m.id for m in memories}
+    assert "Re-indexed 7/7 memories" in result.output
+
+
+def test_reindex_failed_batch_still_indexes_valid_records_in_that_page(tmp_path, monkeypatch):
+    """A rolled-back page must not leave a hole: valid records still land."""
+    db_path = tmp_path / "memory.db"
+    memories = _seeded_store(db_path, 4)
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 4)
+    monkeypatch.setattr(
+        FTS5TextIndex, "index_batch_memories", _always_raises("simulated batch failure")
+    )
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert _fts_ids(db_path) == {m.id for m in memories}
+    assert "batch failed" in result.output
+    assert "Re-indexed 4/4 memories" in result.output
+
+
+def test_reindex_failed_record_is_named_and_exits_nonzero(tmp_path, monkeypatch):
+    """Per-record diagnosability survives batching."""
+    db_path = tmp_path / "memory.db"
+    memories = _seeded_store(db_path, 3)
+    monkeypatch.setattr(memory_cli, "_REINDEX_PAGE_SIZE", 3)
+    monkeypatch.setattr(
+        FTS5TextIndex, "index_batch_memories", _always_raises("simulated batch failure")
+    )
+
+    broken = memories[1].id
+    real_index_memory = FTS5TextIndex.index_memory
+
+    async def index_or_fail(self, memory):
+        if memory.id == broken:
+            raise RuntimeError("simulated record failure")
+        await real_index_memory(self, memory)
+
+    monkeypatch.setattr(FTS5TextIndex, "index_memory", index_or_fail)
+
+    result = CliRunner().invoke(main, ["memory", "reindex", "--db-path", str(db_path)])
+
+    assert result.exit_code == 1
+    assert f"failed to index {broken[:8]}" in result.output
+    assert _fts_ids(db_path) == {memories[0].id, memories[2].id}
+    assert "Re-indexed 2/3 memories" in result.output
