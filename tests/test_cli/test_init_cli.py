@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
 import sys
 import types
 from contextlib import contextmanager
@@ -316,11 +317,17 @@ def test_detect_init_targets_respects_scope(monkeypatch) -> None:
     monkeypatch.setattr(
         init_cli.shutil,
         "which",
-        lambda name: name if name in {"claude", "copilot", "codex", "openclaw"} else None,
+        lambda name: name if name in {"claude", "copilot", "codex", "openclaw", "agy"} else None,
     )
 
     assert init_cli.detect_init_targets(False) == ["claude", "codex"]
-    assert init_cli.detect_init_targets(True) == ["claude", "copilot", "codex", "openclaw"]
+    assert init_cli.detect_init_targets(True) == [
+        "claude",
+        "copilot",
+        "codex",
+        "openclaw",
+        "agy",
+    ]
 
 
 def test_marketplace_source_prefers_env_override(monkeypatch) -> None:
@@ -1554,3 +1561,136 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+def test_init_agy_requires_global(monkeypatch) -> None:
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    runner = CliRunner()
+    monkeypatch.setattr(init_cli, "_ensure_runtime_manifest", lambda **kwargs: "init-local-test")
+
+    result = runner.invoke(fake_main, ["init", "agy"])
+
+    assert result.exit_code != 0
+    assert "requires -g" in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell integration")
+def test_init_agy_global_writes_hooks_and_env(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    captured_env: dict[str, str] = {}
+    ensured: list[str] = []
+    hooks_path = tmp_path / "hooks.json"
+    monkeypatch.setattr(init_cli, "_agy_hooks_path", lambda: hooks_path)
+    monkeypatch.setattr(init_cli, "unix_user_env_targets", lambda: [tmp_path / ".profile"])
+    monkeypatch.setattr(init_cli, "_apply_user_env", lambda values: captured_env.update(values))
+    monkeypatch.setattr(
+        init_cli, "_ensure_profile_running", lambda profile: ensured.append(profile)
+    )
+
+    init_cli._init_agy(global_scope=True, profile="init-user", port=9007)
+
+    payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+    entries = payload["headroom-init-agy"]["PreInvocation"]
+    assert len(entries) == 1
+    assert "--profile init-user" in entries[0]["command"]
+    assert entries[0]["command"].endswith("--marker headroom-init-agy")
+    assert captured_env == {"CLOUD_CODE_URL": "http://127.0.0.1:9007"}
+    # agy checks eligibility before any hook can run, so init starts the proxy.
+    assert ensured == ["init-user"]
+
+
+def test_ensure_agy_hooks_preserves_user_hooks(monkeypatch, tmp_path: Path) -> None:
+    """Antigravity keys hooks.json by hook name: only Headroom's key may change."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    hooks_path = tmp_path / "hooks.json"
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "my-linter": {"PostToolUse": [{"matcher": "*", "hooks": [{"command": "lint.sh"}]}]},
+                "headroom-init-agy": {
+                    "PreInvocation": [{"type": "command", "command": "stale --profile old"}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_agy_hooks(hooks_path, "init-user")
+
+    payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert payload["my-linter"]["PostToolUse"][0]["hooks"][0]["command"] == "lint.sh"
+    assert payload["headroom-init-agy"] == {
+        "PreInvocation": [
+            {
+                "type": "command",
+                "command": "headroom init hook ensure --marker headroom-init-agy",
+                "timeout": 15,
+            }
+        ]
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell launcher")
+def test_agy_launcher_preserves_arguments_exit_status_and_user_config(monkeypatch, tmp_path):
+    init_cli, _ = _load_init_module(monkeypatch)
+    shell_profile = tmp_path / ".profile"
+    shell_profile.write_text("export USER_SETTING=kept\n")
+    launcher = tmp_path / "headroom with spaces"
+    launcher.write_text('#!/bin/sh\nprintf \'%s\\n\' "$USER_SETTING" "$@"\nexit 23\n')
+    launcher.chmod(0o755)
+    monkeypatch.setattr(init_cli, "unix_user_env_targets", lambda: [shell_profile])
+    monkeypatch.setattr(init_cli, "resolve_headroom_command", lambda: [str(launcher)])
+    init_cli._ensure_agy_launcher("init-user")
+    init_cli._ensure_agy_launcher("init-user")
+
+    result = subprocess.run(
+        ["sh", "-c", '. "$1"; agy -p "hello world" --model test', "sh", str(shell_profile)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 23
+    assert result.stdout.splitlines() == [
+        "kept",
+        "init",
+        "launch-agy",
+        "--profile",
+        "init-user",
+        "--",
+        "-p",
+        "hello world",
+        "--model",
+        "test",
+    ]
+    assert shell_profile.read_text().count("agy()") == 1
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_agy_launch_requires_ready_proxy_before_executing_client(monkeypatch, ready):
+    init_cli, fake_main = _load_init_module(monkeypatch)
+    manifest = SimpleNamespace(port=9007)
+    events = []
+    monkeypatch.setattr(init_cli, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: "/bin/agy")
+    monkeypatch.setattr(
+        init_cli, "_ensure_profile_running", lambda profile: events.append("ensure")
+    )
+
+    def wait(manifest, **kwargs):
+        events.append("ready")
+        return ready
+
+    def execute(binary, args, env):
+        events.append("execute")
+        assert args == ["/bin/agy", "-p", "hello world"]
+        assert env["CLOUD_CODE_URL"] == "http://127.0.0.1:9007"
+
+    monkeypatch.setattr(init_cli, "wait_ready", wait)
+    monkeypatch.setattr(init_cli.os, "execvpe", execute)
+    result = CliRunner().invoke(
+        fake_main, ["init", "launch-agy", "--profile", "init-user", "--", "-p", "hello world"]
+    )
+    assert result.exit_code == (0 if ready else 1), result.output
+    assert events == (["ensure", "ready", "execute"] if ready else ["ensure", "ready"])
