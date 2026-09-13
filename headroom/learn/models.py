@@ -163,6 +163,18 @@ class Recommendation:
     # above one-off rules because their waste scales with repetition.
     is_loop_guardrail: bool = False
     loop_occurrences: int = 0  # Repetitions of the loop this rule guards against
+    # Preserve prior markdown-list items in the same section. This is opt-in
+    # because most analyzers treat a re-surfaced section as authoritative.
+    preserve_prior_items: bool = False
+    # Authoritative lifecycle signal for `preserve_prior_items`: the pattern
+    # ids the producing learner still considers active, including the ones
+    # left out of this batch by ranking or top-N capping. A prior item
+    # survives only while its id is in this set, which is what makes deletion
+    # possible — expired, tombstoned, or disproven items drop out of the set
+    # and are then removed from the file. `None` means the producer has no
+    # lifecycle signal at all; preservation then falls back to a plain union
+    # of new and prior items.
+    active_item_ids: frozenset[str] | None = None
 
 
 @dataclass

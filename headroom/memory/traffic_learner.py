@@ -1748,6 +1748,14 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
     """
     from headroom.learn.models import Recommendation, RecommendationTarget
 
+    # Authoritative lifecycle signal for the item-level merge in the writer:
+    # every pattern the learner still holds for this project, captured before
+    # any per-category ranking or capping so that an item omitted from a
+    # rendered section is not mistaken for an expired one. `_collect_all_patterns`
+    # already dropped rows that no longer exist in memory.db, so an id missing
+    # here means the pattern is gone, not merely unrendered.
+    active_item_ids = frozenset(p.content_hash for p in patterns if p.content_hash)
+
     by_category: dict[PatternCategory, list[ExtractedPattern]] = {}
     for p in patterns:
         by_category.setdefault(p.category, []).append(p)
@@ -1769,7 +1777,15 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             items.sort(key=lambda p: p.evidence_count, reverse=True)
         if not items:
             continue
-        bullets = "\n".join(f"- {p.content}" for p in items)
+        preserve_prior_items = category is not PatternCategory.ERROR_RECOVERY
+        bullets = "\n".join(
+            (
+                f"- {p.content} <!-- headroom:pattern-id:{p.content_hash} -->"
+                if preserve_prior_items
+                else f"- {p.content}"
+            )
+            for p in items
+        )
         recs.append(
             Recommendation(
                 target=target,
@@ -1777,6 +1793,12 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
                 content=bullets,
                 confidence=max((p.importance for p in items), default=0.5),
                 evidence_count=sum(p.evidence_count for p in items),
+                preserve_prior_items=preserve_prior_items,
+                # error_recovery is rebuilt from scratch on every render and
+                # `_refine_error_recovery` deliberately drops rows, so the
+                # pre-refine set above is not its lifecycle signal; it must
+                # stay unset while that section replaces rather than merges.
+                active_item_ids=active_item_ids if preserve_prior_items else None,
             )
         )
     return recs
