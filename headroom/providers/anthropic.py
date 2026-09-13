@@ -21,9 +21,11 @@ import logging
 import os
 import re
 import warnings
+from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.deepseek_tiers import off_peak_rates
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -222,10 +224,32 @@ _UNKNOWN_CLAUDE_DEFAULT = {
 }
 
 
+def _deepseek_fallback_row(model_id: str) -> dict[str, float]:
+    """Off-peak fallback rates for ``model_id``, from the shared tier table.
+
+    This table has no request instant, so it carries the cheaper published tier;
+    per-request costing applies the peak window in
+    :func:`headroom.pricing.litellm_pricing.estimate_cost_from_tokens`.
+    """
+    rates = off_peak_rates(model_id)
+    if rates is None:  # pragma: no cover - the ids below are all in the tier table
+        raise ValueError(f"no DeepSeek tier for {model_id!r}")
+    return {
+        "input": rates.input_per_1m,
+        "output": rates.output_per_1m,
+        "cached_input": rates.cache_hit_per_1m,
+    }
+
+
 # DeepSeek fallback pricing for --anthropic-api-url deepseek routing
 _DEEPSEEK_FALLBACK_PRICING: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"input": 0.14, "output": 0.28, "cached_input": 0.0028},
-    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cached_input": 0.003625},
+    model_id: _deepseek_fallback_row(model_id)
+    for model_id in (
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4-pro",
+    )
 }
 
 
@@ -775,6 +799,7 @@ class AnthropicProvider(Provider):
         output_tokens: int,
         model: str,
         cached_tokens: int = 0,
+        now: datetime | None = None,
     ) -> float | None:
         """Estimate cost for a request.
 
@@ -782,6 +807,9 @@ class AnthropicProvider(Provider):
         Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
         family a prompt over 200K re-prices the whole request (see
         ``_LONG_CONTEXT_PREMIUM``).
+
+        ``now`` selects a DeepSeek peak/off-peak tier (see
+        :mod:`headroom.pricing.deepseek_tiers`); ``None`` reads the wall clock.
         """
         model = sanitize_anthropic_model_id(model)
         # LiteLLM knows per-model cache and long-context rates, so let it price
@@ -791,6 +819,7 @@ class AnthropicProvider(Provider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            now=now,
         )
         if cost is not None:
             return cost
