@@ -746,6 +746,29 @@ class LiteLLMBackend(Backend):
             return True
         return "claude" in model.lower() or model in self._model_map
 
+    @staticmethod
+    def _convert_system_for_litellm(system: str | list[Any]) -> str | list[dict[str, Any]]:
+        if isinstance(system, str):
+            return system
+
+        blocks: list[dict[str, Any]] = []
+        plain_parts: list[str] = []
+        for item in system:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = str(item.get("text", ""))
+                plain_parts.append(text)
+                blocks.append(
+                    {k: v for k, v in item.items() if k in ("type", "text", "cache_control")}
+                )
+            else:
+                text = str(item)
+                plain_parts.append(text)
+                blocks.append({"type": "text", "text": text})
+
+        if any("cache_control" in block for block in blocks):
+            return blocks
+        return " ".join(plain_parts)
+
     def _convert_messages_for_litellm(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert Anthropic message format to LiteLLM/OpenAI format.
 
@@ -834,9 +857,32 @@ class LiteLLMBackend(Backend):
                     converted.append(assistant_msg)
                     continue
 
-                # Simple text only
+                # Simple text only.
+                # Preserve cache_control blocks so LiteLLM's Bedrock converse
+                # transformation can inject cachePoint markers (#1345). Only
+                # keep blocks as a list when cache_control is present; otherwise
+                # join to a plain string (backward-compatible for other providers).
                 if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
+                    text_blocks = [
+                        b for b in content if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    has_cache_control = any("cache_control" in b for b in text_blocks)
+                    if has_cache_control:
+                        converted.append(
+                            {
+                                "role": role,
+                                "content": [
+                                    {
+                                        k: v
+                                        for k, v in b.items()
+                                        if k in ("type", "text", "cache_control")
+                                    }
+                                    for b in text_blocks
+                                ],
+                            }
+                        )
+                    else:
+                        converted.append({"role": role, "content": "\n".join(text_parts)})
                 else:
                     converted.append({"role": role, "content": ""})
 
@@ -989,7 +1035,15 @@ class LiteLLMBackend(Backend):
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
-                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
+                system = body["system"]
+                if isinstance(system, str | list):
+                    kwargs["messages"].insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": self._convert_system_for_litellm(system),
+                        },
+                    )
 
             # Provider-specific region config
             if self.region:
@@ -1101,7 +1155,15 @@ class LiteLLMBackend(Backend):
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
             if "system" in body:
-                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
+                system = body["system"]
+                if isinstance(system, str | list):
+                    kwargs["messages"].insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": self._convert_system_for_litellm(system),
+                        },
+                    )
 
             # Provider-specific region config
             if self.region:
