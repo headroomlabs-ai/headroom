@@ -123,6 +123,7 @@ config.smart_crusher.min_tokens_to_crush = 100  # Default is 200
 ```
 
 **Why It Might Be 0**:
+
 - Mode is "audit" (observation only)
 - Messages don't contain tool outputs
 - Tool outputs are below the token threshold
@@ -459,10 +460,15 @@ export HEADROOM_REQUIRE_RUST_CORE=false
 
 ---
 
+## Pi / Oh My Pi
+
+See [Pi/OMP local fleet runbook](pi-omp-runbook.md) for `/headroom status`,
+`headroom doctor`, `/metrics` scrape failures, and exact-pin rollback.
+
 ## Error Reference
 
 | Exception | Meaning | Solution |
-|-----------|---------|----------|
+| ----------- | --------- | ---------- |
 | `ConfigurationError` | Invalid config values | Check config parameters |
 | `ProviderError` | Provider issue (unknown model, etc.) | Set model_context_limits |
 | `StorageError` | Database issue | Check path/permissions |
@@ -500,9 +506,10 @@ except HeadroomError as e:
 1. **Enable debug logging** and check the output
 2. **Use simulate()** to see what transforms would apply
 3. **Check validate_setup()** for configuration issues
-4. **File an issue** at https://github.com/headroom-sdk/headroom/issues
+4. **File an issue** at <https://github.com/headroom-sdk/headroom/issues>
 
 When filing an issue, include:
+
 - Headroom version (`pip show headroom`)
 - Python version
 - Provider (OpenAI/Anthropic)

@@ -19,6 +19,19 @@ def probe_json(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def probe_text(url: str, timeout: float = 2.0) -> tuple[int, str] | None:
+    """Return HTTP status and body when the URL is reachable."""
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return int(response.status), response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        return int(exc.code), body
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+
+
 def probe_ready(url: str, timeout: float = 2.0) -> bool:
     """Return True when the ready endpoint reports readiness."""
 

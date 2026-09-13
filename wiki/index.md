@@ -102,6 +102,8 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
     headroom wrap aider        # Aider
     headroom wrap cursor       # Cursor
     headroom wrap openclaw     # OpenClaw plugin bootstrap
+    headroom wrap pi           # Pi + headroom-pi extension
+    headroom wrap omp          # Oh My Pi + headroom-pi extension
     ```
 
     Starts the proxy, points your tool at it, compresses everything automatically.
@@ -260,7 +262,7 @@ graph LR
 **Stage 2: ContentRouter** — Auto-detects content type (JSON, code, logs, search results, diffs, HTML, plain text) and routes each to the optimal compressor:
 
 | Content Type | Compressor | How It Works |
-|-------------|-----------|-------------|
+| ------------- | ----------- | ------------- |
 | JSON arrays | **SmartCrusher** | Statistical analysis: keeps errors, anomalies, boundaries. No hardcoded rules. |
 | Source code | **CodeCompressor** | AST-aware (tree-sitter). Preserves function signatures, collapses bodies. |
 | Plain text | **Kompress** | ModernBERT token classification. Removes redundant tokens while preserving meaning. |
@@ -291,7 +293,7 @@ Context management is handled automatically inside the pipeline (live-zone-only 
 ### Real Workloads
 
 | Scenario | Before | After | Savings |
-|----------|--------|-------|---------|
+| ---------- | -------- | ------- | --------- |
 | Code search (100 results) | 17,765 | 1,408 | **92%** |
 | SRE incident debugging | 65,694 | 5,118 | **92%** |
 | Codebase exploration | 78,502 | 41,254 | **47%** |
@@ -300,7 +302,7 @@ Context management is handled automatically inside the pipeline (live-zone-only 
 ### Accuracy Benchmarks
 
 | Benchmark | Category | N | Accuracy | Compression |
-|-----------|----------|---|----------|-------------|
+| ----------- | ---------- | --- | ---------- | ------------- |
 | GSM8K | Math | 100 | 0.870 | 0.000 delta |
 | TruthfulQA | Factual | 100 | 0.560 | +0.030 delta |
 | SQuAD v2 | QA | 100 | **97%** | 19% reduction |

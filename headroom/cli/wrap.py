@@ -4713,6 +4713,7 @@ def _launch_tool(
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
+    launch_message: str = "API routed through Headroom",
     configure_launch: Callable[
         [int, tuple, dict[str, str], list[str]],
         tuple[tuple, dict[str, str], list[str]],
@@ -4771,7 +4772,7 @@ def _launch_tool(
         _quiet_written = _configure_quiet_cli_env(env)
 
         click.echo()
-        click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
+        click.echo(f"  Launching {tool_label} ({launch_message})...")
         for var in env_vars_display:
             click.echo(f"  {var}")
         if _quiet_written:
@@ -8225,6 +8226,70 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 
 # =============================================================================
+# Pi
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+    pi_args: tuple,
+) -> None:
+    """Start Headroom and launch Pi with the Headroom extension endpoint.
+
+    Install ``headroom-pi`` with ``pi install`` first.
+    The extension compresses provider-independent tool-result context; model
+    inference continues to use Pi's selected provider directly.
+
+    \b
+    Examples:
+        headroom wrap pi                       # Start proxy + Pi
+        headroom wrap pi -- -p "fix the bug"   # Pi print mode
+    """
+    del verbose
+    if prepare_only:
+        return
+
+    pi_bin = shutil.which("pi")
+    if not pi_bin:
+        click.echo("Error: 'pi' not found in PATH.")
+        click.echo("Install Pi: npm install -g @earendil-works/pi-coding-agent")
+        raise SystemExit(1)
+
+    env = os.environ.copy()
+    base_url = f"http://127.0.0.1:{port}"
+    env["HEADROOM_PI_BASE_URL"] = base_url
+    _launch_tool(
+        binary=pi_bin,
+        args=pi_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="PI",
+        env_vars_display=[f"HEADROOM_PI_BASE_URL={base_url}"],
+        learn=learn,
+        memory=memory,
+        agent_type="pi",
+        launch_message="Headroom extension connected",
+    )
+
+
+# =============================================================================
 # Oh My Pi (omp)
 # =============================================================================
 
@@ -8284,15 +8349,20 @@ def omp(
         click.echo("Install Oh My Pi: npm install -g @oh-my-pi/pi-coding-agent")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_omp_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_omp_launch_env(port, os.environ, project=project)
 
-    # Durable endpoint redirect (survives omp-spawned child sessions, which
-    # re-read models.yml rather than inheriting a parent env) — same durable
-    # wrap + backup + unwrap contract as the Codex config.toml injection.
-    models_file, _ = _inject_omp_models_override(port, _project_name_from_cwd())
-    click.echo(f"  models.yml override written: {models_file}")
+    def configure_omp_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_env, current_display
+        models_file, _ = _inject_omp_models_override(actual_port, project)
+        click.echo(f"  models.yml override written: {models_file}")
+        actual_env, actual_display = _build_omp_launch_env(actual_port, os.environ, project=project)
+        return current_args, actual_env, actual_display
 
     _launch_tool(
         binary=omp_bin,
@@ -8306,6 +8376,8 @@ def omp(
         memory=memory,
         agent_type="omp",
         code_graph=code_graph,
+        launch_message="Headroom inference route + extension connected",
+        configure_launch=configure_omp_launch,
     )
 
 

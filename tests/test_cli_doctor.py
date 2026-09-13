@@ -1,10 +1,13 @@
 """Tests for `headroom doctor`."""
+# mypy: disable-error-code="no-untyped-def"
 
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -20,6 +23,7 @@ from headroom.cli.doctor import (
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_metrics,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
@@ -27,6 +31,7 @@ from headroom.cli.doctor import (
 )
 from headroom.cli.main import main
 from headroom.providers.claude.runtime import remote_control_gate_message
+from headroom.providers.pi_extension import PackageState
 
 LIVEZ_OK = {
     "service": "headroom-proxy",
@@ -591,6 +596,106 @@ class TestCodexRouting:
         assert check_codex_routing(path, 8787).status == PASS
 
 
+def test_native_extension_check_reports_exact_installed_version(monkeypatch) -> None:
+    monkeypatch.setattr(
+        doctor_mod,
+        "inspect_host_package",
+        lambda host, binary: PackageState(version="0.34.0", source="npm"),
+    )
+
+    result = doctor_mod.check_native_extension("pi", "/bin/pi", "0.34.0")
+
+    assert result.status == PASS
+    assert "0.34.0" in result.summary
+
+
+def test_native_extension_check_fails_on_version_drift(monkeypatch) -> None:
+    monkeypatch.setattr(
+        doctor_mod,
+        "inspect_host_package",
+        lambda host, binary: PackageState(version="0.33.0", source="npm"),
+    )
+
+    result = doctor_mod.check_native_extension("omp", "/bin/omp", "0.34.0")
+
+    assert result.status == FAIL
+    assert "headroom init -g omp" in (result.hint or "")
+
+
+def test_native_extension_check_skips_missing_binary() -> None:
+    result = doctor_mod.check_native_extension("pi", None, "0.34.0")
+
+    assert result.status == SKIP
+
+
+def test_native_extension_check_fails_missing_package(monkeypatch) -> None:
+    monkeypatch.setattr(doctor_mod, "inspect_host_package", lambda host, binary: None)
+
+    result = doctor_mod.check_native_extension("pi", "/bin/pi", "0.34.0")
+
+    assert result.status == FAIL
+    assert "headroom init -g pi" in (result.hint or "")
+
+
+def test_native_extension_check_fails_disabled_omp_package(monkeypatch) -> None:
+    monkeypatch.setattr(doctor_mod, "inspect_host_package", lambda host, binary: None)
+
+    result = doctor_mod.check_native_extension("omp", "/bin/omp", "0.34.0")
+
+    assert result.status == FAIL
+
+
+def test_native_extension_check_warns_when_inspection_fails(monkeypatch) -> None:
+    monkeypatch.setattr(
+        doctor_mod,
+        "inspect_host_package",
+        lambda host, binary: (_ for _ in ()).throw(click.ClickException("bad host state")),
+    )
+
+    result = doctor_mod.check_native_extension("pi", "/bin/pi", "0.34.0")
+
+    assert result.status == WARN
+    assert "bad host state" in result.summary
+
+
+def test_native_extension_config_warns_on_malformed_json(tmp_path) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_text("{broken", encoding="utf-8")
+
+    result = doctor_mod.check_native_extension_config(path, 8787)
+
+    assert result.status == WARN
+
+
+def test_metrics_check_fails_on_scrape_error() -> None:
+    result = check_metrics(
+        (500, "# scrape_error RuntimeError: savings snapshot exploded\n"),
+        "http://127.0.0.1:8787",
+    )
+
+    assert result.status == FAIL
+    assert "savings snapshot exploded" in result.summary
+
+
+def test_metrics_check_passes_on_core_counter() -> None:
+    result = check_metrics(
+        (200, "# TYPE headroom_requests_total counter\nheadroom_requests_total 1\n"),
+        "http://127.0.0.1:8787",
+    )
+
+    assert result.status == PASS
+
+
+def test_native_extension_config_fails_wrong_port(tmp_path) -> None:
+    path = tmp_path / "pi-extension.json"
+    path.write_text(json.dumps({"baseUrl": "http://127.0.0.1:9999"}), encoding="utf-8")
+
+    result = doctor_mod.check_native_extension_config(path, 8787)
+
+    assert result.status == FAIL
+    assert "9999" in result.summary
+
+
 class TestShellEnv:
     def test_unset_warns(self):
         result = check_shell_env({}, 8787)
@@ -764,7 +869,16 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
+        monkeypatch.setattr(
+            doctor_mod, "extension_config_path", lambda: tmp_path / "pi-extension.json"
+        )
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
+        original_which = shutil.which
+        monkeypatch.setattr(
+            doctor_mod.shutil,
+            "which",
+            lambda name: None if name in {"pi", "omp"} else original_which(name),
+        )
         for var in (
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
@@ -787,6 +901,13 @@ class TestDoctorCommand:
             return None
 
         return fake_probe
+
+    def _healthy_metrics(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            doctor_mod,
+            "probe_text",
+            lambda url, timeout=2.0: (200, "headroom_requests_total 1\n"),
+        )
 
     def test_proxy_down_exits_2(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(None, None))
@@ -813,6 +934,7 @@ class TestDoctorCommand:
 
     def test_warnings_only_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
         # proxy healthy, but clients unwrapped + shell env unset -> warns
         result = runner.invoke(main, ["doctor"])
@@ -820,6 +942,7 @@ class TestDoctorCommand:
 
     def test_remote_control_warning_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
         monkeypatch.setattr(doctor_mod, "detect_claude_code_version", lambda: None)
         (isolated / "settings.json").write_text(
@@ -838,10 +961,19 @@ class TestDoctorCommand:
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        self._healthy_metrics(monkeypatch)
         result = runner.invoke(main, ["doctor", "--json"])
         payload = json.loads(result.output)
         assert payload["port"] == 8787
-        assert {c["name"] for c in payload["checks"]} >= {"proxy", "version", "budget"}
+        assert {c["name"] for c in payload["checks"]} >= {
+            "proxy",
+            "metrics",
+            "version",
+            "budget",
+            "pi extension",
+            "omp extension",
+            "pi extension config",
+        }
         assert all(c["status"] in ("pass", "warn", "fail", "skip") for c in payload["checks"])
 
     def test_port_option_changes_probe_url(self, runner, isolated, monkeypatch):

@@ -74,6 +74,10 @@ ANTHROPIC_BASE_URL=http://localhost:8787 claude
 # GitHub Copilot CLI (default Anthropic-style proxy route)
 headroom wrap copilot -- --model claude-sonnet-4-20250514
 
+# Pi / Oh My Pi (install headroom-pi first)
+headroom wrap pi
+headroom wrap omp
+
 # OpenAI-compatible clients
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ```

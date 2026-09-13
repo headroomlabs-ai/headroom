@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 
 try:
-    import tomllib
+    import tomllib  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - Python 3.10 fallback
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 ROOT = Path(__file__).parent.parent
 
@@ -15,6 +15,15 @@ ROOT = Path(__file__).parent.parent
 def _read_json_version(path: Path) -> str:
     with open(path, encoding="utf-8") as f:
         return str(json.load(f)["version"])
+
+
+def _read_package_lock_versions(path: Path) -> dict[str, str]:
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    return {
+        "plugins/pi/package-lock.json": str(payload["version"]),
+        'plugins/pi/package-lock.json:packages[""]': str(payload["packages"][""]["version"]),
+    }
 
 
 def _read_marketplace_versions(path: Path) -> dict[str, str]:
@@ -42,6 +51,7 @@ def main() -> None:
         "plugins/openclaw/package.json": _read_json_version(ROOT / "plugins/openclaw/package.json"),
         "plugins/opencode/package.json": _read_json_version(ROOT / "plugins/opencode/package.json"),
         "sdk/typescript/package.json": _read_json_version(ROOT / "sdk/typescript/package.json"),
+        "plugins/pi/package.json": _read_json_version(ROOT / "plugins/pi/package.json"),
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.claude-plugin/plugin.json"
         ),
@@ -49,6 +59,7 @@ def main() -> None:
             ROOT / "plugins/headroom-agent-hooks/.github/plugin/plugin.json"
         ),
     }
+    versions.update(_read_package_lock_versions(ROOT / "plugins/pi/package-lock.json"))
     versions.update(_read_marketplace_versions(ROOT / ".claude-plugin/marketplace.json"))
     versions.update(_read_marketplace_versions(ROOT / ".github/plugin/marketplace.json"))
 

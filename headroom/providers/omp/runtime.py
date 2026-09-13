@@ -155,12 +155,12 @@ def build_launch_env(
     environ: Mapping[str, str] | None = None,
     project: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build the launch environment and display lines for the omp wrap.
-
-    The endpoint redirect itself lives in ``models.yml`` (see module
-    docstring), so the environment passes through unchanged; the display
-    lines surface where the override went.
-    """
+    """Build inference and extension endpoints for the omp wrap."""
     env = dict(environ or os.environ)
     base_url = proxy_anthropic_base_url(port, project)
-    return env, [f"models.yml: providers.anthropic.baseUrl={base_url}"]
+    extension_url = f"http://127.0.0.1:{port}"
+    env["HEADROOM_PI_BASE_URL"] = extension_url
+    return env, [
+        f"models.yml: providers.anthropic.baseUrl={base_url}",
+        f"HEADROOM_PI_BASE_URL={extension_url}",
+    ]

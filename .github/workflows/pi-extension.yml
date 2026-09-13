@@ -1,0 +1,122 @@
+name: Pi and OMP Extension
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "plugins/pi/**"
+      - "headroom/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/pi-extension.yml"
+  push:
+    branches: [main]
+    paths:
+      - "plugins/pi/**"
+      - "headroom/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/pi-extension.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pi-extension-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  EXTENSION_DIRECTORY: plugins/pi
+  HEADROOM_LIVE_BASE_URL: http://127.0.0.1:8787
+
+jobs:
+  package:
+    name: unit + typecheck + build + pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: plugins/pi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: plugins/pi/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm pack --dry-run
+
+  live-contract-and-hosts:
+    name: live + Pi ${{ matrix.pi-version }} / OMP 17.1.8
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pi-version: ["0.80.10", "0.82.1", "0.84.1"]
+    defaults:
+      run:
+        working-directory: plugins/pi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: plugins/pi/package-lock.json
+      - uses: oven-sh/setup-bun@v2
+      - name: Install Headroom
+        working-directory: .
+        run: uv sync --frozen --extra proxy
+      - run: npm ci
+      - name: Install tested Pi and OMP versions
+        run: |
+          npm install --global @earendil-works/pi-coding-agent@${{ matrix.pi-version }}
+          bun install --global @oh-my-pi/pi-coding-agent@17.1.8
+          echo "PI_BIN=$(command -v pi)" >> "$GITHUB_ENV"
+          echo "OMP_BIN=$(command -v omp)" >> "$GITHUB_ENV"
+          pi --version
+          omp --version
+      - name: Start canonical Headroom proxy
+        working-directory: .
+        run: |
+          uv run headroom proxy --port 8787 --stateless --no-embedding-server > /tmp/headroom-proxy.log 2>&1 &
+          echo $! > /tmp/headroom-proxy.pid
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          deadline = time.monotonic() + 120
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8787/readyz", timeout=2) as response:
+                      if response.status == 200 and json.load(response).get("ready") is True:
+                          break
+              except Exception:
+                  time.sleep(0.5)
+          else:
+              raise SystemExit("Headroom proxy did not become ready within 120 seconds")
+          PY
+      - run: npm run test:live
+      - run: npm run benchmark:live
+      - run: npm run test:hosts
+      - name: Show proxy log after failure
+        if: failure()
+        working-directory: .
+        run: cat /tmp/headroom-proxy.log
+      - name: Stop proxy
+        if: always()
+        working-directory: .
+        run: kill "$(cat /tmp/headroom-proxy.pid)" || true

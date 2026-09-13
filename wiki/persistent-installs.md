@@ -7,7 +7,7 @@ Use the Python-native `headroom install` CLI when you want supported tools to ke
 ## Runtime matrix
 
 | Mode | What stays running | Primary entrypoint |
-|---|---|---|
+| --- | --- | --- |
 | Persistent Service | Native background service | `headroom install apply --preset persistent-service` |
 | Persistent Task | Scheduled watchdog + on-demand runner | `headroom install apply --preset persistent-task` |
 | Persistent Docker | Restartable Docker container | `headroom install apply --preset persistent-docker` |
@@ -15,6 +15,31 @@ Use the Python-native `headroom install` CLI when you want supported tools to ke
 | On-Demand CLI (Docker) | Nothing after container exits | Docker-native wrapper / compose CLI |
 | Wrapped (Python) | Proxy lasts for wrapped session | `headroom wrap ...` |
 | Wrapped (Docker) | Containerized proxy + host tool session | Docker-native wrapper |
+
+## Durable Pi and OMP integrations
+
+Native Pi and OMP extensions share the `init-user` persistent-task profile:
+
+```bash
+headroom init -g pi
+headroom init -g omp
+headroom init -g remove pi
+headroom init -g remove omp
+headroom install status --profile init-user
+```
+
+Both targets can coexist. Removing one keeps the shared configuration, task,
+and runtime while the other remains. Removing the last native target removes
+the task and shared config; if no other target remains, removal also stops the
+runtime and deletes the profile. Persistent-task profiles do not expose manual
+`headroom install stop`; native-target removal owns teardown.
+
+`headroom wrap ...` remains transient and does not claim extension package
+ownership. Durable OMP init is provider-independent and never edits
+`models.yml`; `headroom unwrap omp` only removes wrapper inference routing.
+For rollback, reinstall an older Headroom release and rerun the corresponding
+init command to install its matching `headroom-pi` version. Diagnose local
+fleet failures with [Pi/OMP local fleet runbook](pi-omp-runbook.md).
 
 ## Quick examples
 
@@ -76,7 +101,7 @@ For `persistent-docker`, the runtime is always Docker.
 ## Configuration scopes
 
 | Scope | What changes |
-|---|---|
+| --- | --- |
 | `provider` | Tool-specific config surfaces where Headroom can make a precise reversible edit |
 | `user` | User-level shell or environment surfaces |
 | `system` | Machine-wide shell or environment surfaces |
@@ -94,7 +119,7 @@ For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user`
 ## Provider selection
 
 | Option | Meaning |
-|---|---|
+| --- | --- |
 | `--providers auto` | Detect supported tools on the host and configure the best available defaults |
 | `--providers all` | Configure all known targets |
 | `--providers manual --target ...` | Configure only the named tools |

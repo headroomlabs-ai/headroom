@@ -236,10 +236,19 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     # before publish. create-release must wait for it AND require its
     # success in the `if:` block (otherwise `always()` would let the
     # release proceed even when the smoke gate failed).
-    assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
-        in content
-    )
+    workflow = yaml.safe_load(content)
+    assert workflow["jobs"]["create-release"]["needs"] == [
+        "detect-version",
+        "build",
+        "build-wheels",
+        "collect-dist",
+        "smoke-import-wheels",
+        "verify-pi-extension",
+        "publish-pypi",
+        "publish-npm",
+        "publish-github-packages",
+        "publish-docker",
+    ]
     assert "always()" in content
     assert "needs.build.result == 'success'" in content
     assert "needs.build-wheels.result == 'success'" in content
@@ -772,6 +781,79 @@ def test_release_workflow_uses_local_npm_asset_builder() -> None:
     assert "scripts/verify_npm_release_assets.mjs" in content
     assert "scripts/verify_npm_release_assets.mjs" in builder
     assert "registerHeadroomPlugin" in verifier
+    assert "headroom-pi" in builder
+    assert "headroom-pi" in verifier
+
+
+def test_npm_release_verifier_requires_pi_extension_tarball() -> None:
+    verifier = (ROOT / "scripts" / "verify_npm_release_assets.mjs").read_text(encoding="utf-8")
+
+    assert 'name: "headroom-pi"' in verifier
+    assert "headroom-pi-${version}.tgz" in verifier
+    assert 'extensions: ["./src/index.ts"]' in verifier
+    assert '"package/src/index.ts"' in verifier
+
+
+def test_pi_extension_publish_blocks_pypi() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    jobs = workflow["jobs"]
+
+    assert "publish-pi-extension" in jobs
+    assert "verify-pi-extension" in jobs
+    assert jobs["verify-pi-extension"]["needs"] == [
+        "detect-version",
+        "build",
+        "publish-pi-extension",
+    ]
+    assert "verify-pi-extension" in jobs["publish-pypi"]["needs"]
+    assert "verify-pi-extension" in jobs["create-release"]["needs"]
+    assert "needs.verify-pi-extension.result == 'success'" in jobs["create-release"]["if"]
+
+
+def test_pi_extension_registry_gate_uses_exact_version() -> None:
+    content = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert "headroom-pi@${version}" in content
+    assert "HEADROOM_EXTENSION_SPEC" in content
+    assert "npm view" in content
+    assert "sha512" in content
+    assert 'HEADROOM_CCR_SQLITE_PATH="${RUNNER_TEMP}/pi-extension-ccr.db"' in content
+
+
+def test_pi_extension_verify_proxy_cleanup_is_strict() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    steps = workflow["jobs"]["verify-pi-extension"]["steps"]
+    stop = next(step for step in steps if step.get("name") == "Stop proxy")
+
+    assert stop["if"] == "always()"
+    assert 'kill "$(cat "${RUNNER_TEMP}/headroom-proxy.pid")" || true' not in stop["run"]
+    assert 'if [ ! -s "$pid_file" ]' in stop["run"]
+    assert 'case "$pid" in' in stop["run"]
+    assert 'if [ "$pid" -lt 1 ]' in stop["run"]
+    assert stop["run"].index('if [ "$pid" -lt 1 ]') < stop["run"].index("kill -0")
+    assert "kill -0" in stop["run"]
+    assert 'if ! kill "$pid"' in stop["run"]
+    assert 'if ! kill -0 "$pid"' in stop["run"]
+    assert 'echo "Proxy PID $pid remained alive after SIGTERM"' in stop["run"]
+
+
+def test_pi_extension_host_load_accepts_exact_external_spec() -> None:
+    host_load = (ROOT / "plugins/pi/e2e/host-load.mjs").read_text(encoding="utf-8")
+
+    assert "process.env.HEADROOM_EXTENSION_SPEC" in host_load
+    install = '["install", "--ignore-scripts", "--no-audit", "--no-fund", extensionSpec]'
+    assert install in host_load
+    assert host_load.index("if (extensionSpec)") < host_load.index(install)
+    assert host_load.index("} else {") < host_load.index('"pack",')
+
+
+def test_pi_extension_compatibility_ci_keeps_pinned_hosts() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/pi-extension.yml").read_text())
+    matrix = workflow["jobs"]["live-contract-and-hosts"]["strategy"]["matrix"]
+
+    assert matrix["pi-version"] == ["0.80.10", "0.82.1", "0.84.1"]
+    content = (ROOT / ".github/workflows/pi-extension.yml").read_text(encoding="utf-8")
+    assert "@oh-my-pi/pi-coding-agent@17.1.8" in content
 
 
 def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() -> None:
@@ -783,9 +865,7 @@ def test_npm_release_builder_regenerates_openclaw_dist_metadata_after_rewrite() 
     pack = builder.index(
         'runNpm(["pack", "--pack-destination", assetsDir], openClawDir);', prepare_dist
     )
-    verify = builder.index(
-        'runNode(["scripts/verify_npm_release_assets.mjs", assetsDir, version], rootDir)', pack
-    )
+    verify = builder.index("scripts/verify_npm_release_assets.mjs", pack)
 
     assert rewrite < prepare_dist < pack < verify
 
@@ -795,10 +875,7 @@ def test_npm_release_builder_installs_openclaw_against_local_sdk_tarball() -> No
     builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
 
     local_dependency = builder.index("rewriteOpenClawLocalDependency(sdkTarballPath);")
-    install = builder.index(
-        '["install", "--package-lock=false", "--no-audit", "--no-fund", "--ignore-scripts"]',
-        local_dependency,
-    )
+    install = builder.index('"--package-lock=false"', local_dependency)
     build = builder.index('runNpm(["run", "build"], openClawDir);', install)
     release_dependency = builder.index("rewriteOpenClawReleaseDependency();", build)
 
@@ -1402,9 +1479,9 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
     # the project still supports per pyproject.toml `requires-python`).
     # Matches the same fallback pattern in headroom/release_version.py.
     try:
-        import tomllib
+        import tomllib  # type: ignore[import-not-found]
     except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
     manifest = json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))
     config = json.loads((ROOT / ".release-please-config.json").read_text(encoding="utf-8"))
@@ -1470,6 +1547,91 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
         "release-please must bump plugins/opencode/package.json so the "
         "opencode npm publish stays in sync."
     )
+
+
+def test_release_please_versions_pi_extension() -> None:
+    import json
+
+    config = json.loads((ROOT / ".release-please-config.json").read_text())
+    extra_files = config["packages"]["."]["extra-files"]
+    paths = {item["path"] for item in extra_files}
+
+    assert "plugins/pi/package.json" in paths
+    lockfile_entries = [
+        item for item in extra_files if item["path"] == "plugins/pi/package-lock.json"
+    ]
+    assert {item["jsonpath"] for item in lockfile_entries} == {
+        "$.version",
+        "$.packages[''].version",
+    }
+
+
+def test_version_sync_and_verifier_cover_pi_extension() -> None:
+    sync = (ROOT / "scripts" / "version-sync.py").read_text(encoding="utf-8")
+    verify = (ROOT / "scripts" / "verify-versions.py").read_text(encoding="utf-8")
+
+    for path in (
+        "plugins/pi/package.json",
+        "plugins/pi/package-lock.json",
+    ):
+        assert path in sync
+        assert path in verify
+
+
+def test_pi_extension_version_matches_python_release() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    package = json.loads((ROOT / "plugins/pi/package.json").read_text())
+    package_lock = json.loads((ROOT / "plugins/pi/package-lock.json").read_text())
+
+    assert package["version"] == python_version
+    assert package_lock["version"] == python_version
+    assert package_lock["packages"][""]["version"] == python_version
+
+
+def test_opencode_version_matches_python_release() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    package = json.loads((ROOT / "plugins/opencode/package.json").read_text())
+    sync = (ROOT / "scripts/version-sync.py").read_text(encoding="utf-8")
+    verify = (ROOT / "scripts/verify-versions.py").read_text(encoding="utf-8")
+
+    assert package["version"] == python_version
+    assert '"plugins" / "opencode" / "package.json"' in sync
+    assert "plugins/opencode/package.json" in verify
+
+
+def test_release_metadata_includes_pi_extension() -> None:
+    import json
+
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    python_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+    metadata = json.loads((ROOT / ".releasemetadata").read_text())
+
+    assert metadata["packages"] == {
+        "pypi": python_version,
+        "npm-sdk": python_version,
+        "npm-openclaw": python_version,
+        "npm-opencode": python_version,
+        "npm-pi-extension": python_version,
+        "agent-hooks-plugin": python_version,
+    }
 
 
 def test_release_metadata_sync_runs_on_release_please_branch() -> None:

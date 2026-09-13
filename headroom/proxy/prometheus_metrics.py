@@ -101,6 +101,7 @@ class PrometheusMetrics:
         self.requests_cached = 0
         self.requests_rate_limited = 0
         self.requests_failed = 0
+        self.scrape_errors_total = 0
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -1143,6 +1144,11 @@ class PrometheusMetrics:
         self.savings_tracker.record_lifetime_failed(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_failed(provider=provider, model=model)
 
+    def record_scrape_error(self) -> int:
+        """Count a failed /metrics scrape."""
+        self.scrape_errors_total += 1
+        return self.scrape_errors_total
+
     async def export(self) -> str:
         """Export metrics in Prometheus format."""
         # Snapshot stage-timing dicts under the tiny synchronous lock so
@@ -1184,6 +1190,13 @@ class PrometheusMetrics:
                 metric_type="counter",
                 help_text="Failed requests",
                 value=self.requests_failed,
+            )
+            _append_metric(
+                lines,
+                name="headroom_metrics_scrape_errors_total",
+                metric_type="counter",
+                help_text="Failed Prometheus /metrics scrapes",
+                value=self.scrape_errors_total,
             )
             _append_metric(
                 lines,

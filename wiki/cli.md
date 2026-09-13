@@ -23,7 +23,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 ### Global options
 
 | Option | Scope | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--help`, `-?` | root, groups, commands | Show help and exit |
 | `--version`, `-v` | root only | Show the Headroom version and exit |
 
@@ -32,7 +32,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 ## Command index
 
 | Command | Purpose | Docker-native parity |
-|---|---|---|
+| --- | --- | --- |
 | `headroom install ...` | Install and manage persistent deployments | **python-native; Docker-native wrapper supports `persistent-docker` lifecycle subset** |
 | `headroom proxy` | Run the Headroom proxy server | **native in container** |
 | `headroom learn` | Learn from past tool-call failures | **native in container** |
@@ -47,6 +47,8 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
 | `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
 | `headroom wrap openclaw` | Install and configure the OpenClaw plugin | **host-bridged** |
+| `headroom wrap pi` | Start proxy and launch Pi with `headroom-pi` | **host-bridged** |
+| `headroom wrap omp` | Start proxy and launch Oh My Pi with `headroom-pi` | **host-bridged** |
 | `headroom unwrap openclaw` | Disable the Headroom OpenClaw plugin | **host-bridged** |
 
 ## Captured `--help` output
@@ -274,7 +276,7 @@ headroom proxy --mode cache
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--host` | `127.0.0.1` | Host interface to bind |
 | `--port`, `-p` | `8787` | Port to bind |
 | `--mode` | runtime default | Optimization mode: `token`, `cache`, `token_mode`, `cache_mode`, `token_savings`, `cost_savings`, `token_headroom` |
@@ -333,7 +335,7 @@ headroom learn --agent codex --all
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--project` | current project resolution | Target project path |
 | `--all` | off | Analyze all discovered projects |
 | `--apply` | off | Write recommendations instead of dry-run output |
@@ -359,7 +361,7 @@ headroom perf --raw
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--hours` | `168.0` | Time window in hours |
 | `--raw` | off | Print raw PERF records instead of the summarized report |
 
@@ -383,7 +385,7 @@ headroom inspect --format json   # raw feed for piping into another tool
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port` / `-p` | `8787` | Proxy port to query (env: `HEADROOM_PORT`) |
 | `--last` | `1` | Number of most-recent requests to show |
 | `--format` | `text` | `text` renders a highlighted diff; `json` emits the raw feed |
@@ -407,7 +409,7 @@ headroom evals memory --answer-model gpt-4o --llm-judge
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--n-conversations`, `-n` | all available | Number of conversations to evaluate |
 | `--categories` | benchmark default | Comma-separated categories |
 | `--include-adversarial` | off | Include category 5 / unanswerable questions |
@@ -434,7 +436,7 @@ headroom evals memory-v2 --save-model gpt-4o-mini --llm-judge
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--n-conversations`, `-n` | all available | Number of conversations to evaluate |
 | `--categories` | benchmark default | Comma-separated categories |
 | `--include-adversarial` | off | Include adversarial questions |
@@ -469,7 +471,7 @@ headroom memory list -q "budget"
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--limit`, `-n` | `50` | Maximum memories to show |
 | `--session`, `-s` | unset | Filter by session ID |
@@ -485,7 +487,7 @@ headroom memory show 1234abcd --json
 ```
 
 | Argument / option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `memory_id` | required | Full or partial memory ID |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--json` | off | Emit raw JSON |
@@ -508,7 +510,7 @@ headroom memory edit 1234abcd --importance 0.9
 ```
 
 | Argument / option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `memory_id` | required | Full or partial memory ID |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--content`, `-c` | unset | New memory content |
@@ -524,7 +526,7 @@ headroom memory delete 1234abcd --force
 ```
 
 | Argument / option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `memory_ids...` | required | One or more memory IDs |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
@@ -537,7 +539,7 @@ headroom memory prune --scope SESSION --force
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--older-than` | unset | Age threshold |
 | `--scope` | unset | Scope filter: `USER`, `SESSION`, `AGENT`, `TURN` |
@@ -555,7 +557,7 @@ headroom memory purge --confirm
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--confirm` | off | Required confirmation flag |
 
@@ -567,7 +569,7 @@ headroom memory export --output export.json
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--output`, `-o` | stdout | Output path |
 
@@ -579,7 +581,7 @@ headroom memory import export.json --force
 ```
 
 | Argument / option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `file` | required | JSON file containing exported memories |
 | `--db-path` | `./.headroom/memory.db` if present, else `~/.headroom/memory.db` | Memory database path |
 | `--force`, `-f` | off | Skip confirmation |
@@ -598,7 +600,7 @@ headroom mcp install --proxy-url http://127.0.0.1:9000
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--proxy-url` | `http://127.0.0.1:8787` | Proxy URL written into MCP config |
 | `--force` | off | Overwrite an existing Headroom MCP config |
 
@@ -626,7 +628,7 @@ headroom mcp serve --proxy-url http://127.0.0.1:9000 --debug
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--proxy-url` | `http://127.0.0.1:8787` | Proxy URL (also reads `HEADROOM_PROXY_URL`) |
 | `--direct` | off | Disable stdio transport wrapping |
 | `--debug` | off | Enable debug logging |
@@ -634,6 +636,29 @@ headroom mcp serve --proxy-url http://127.0.0.1:9000 --debug
 `serve` is part of the public CLI, but it is usually consumed by MCP host tooling rather than by humans directly.
 
 See also: [MCP Tools](mcp.md)
+
+## `headroom init`
+
+Install or remove durable current-user Pi/OMP integrations backed by the shared
+`init-user` persistent-task profile:
+
+```bash
+headroom init -g pi
+headroom init -g omp
+headroom init -g remove pi
+headroom init -g remove omp
+headroom install status --profile init-user
+```
+
+Pi and OMP can coexist on the shared runtime. Removing one preserves the shared
+configuration, task, and runtime while the other remains. Removing the last
+native target removes the task and configuration; it stops and deletes the
+profile only when no other target remains. Persistent-task profiles do not
+expose manual `headroom install stop`; native-target removal owns teardown.
+
+Durable OMP init is provider-independent and does not edit `models.yml`.
+`headroom unwrap omp` only removes wrapper inference routing. Reinstall an older
+Headroom release and rerun init for the supported extension downgrade/rollback.
 
 ## `headroom install`
 
@@ -688,7 +713,7 @@ headroom install apply --preset persistent-docker --scope user
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--preset` | `persistent-service` | Lifecycle preset: `persistent-service`, `persistent-task`, or `persistent-docker` |
 | `--runtime` | `python` | Runtime used for service/task installs: `python` or `docker` |
 | `--scope` | `user` | Config scope: `provider`, `user`, or `system` |
@@ -762,6 +787,7 @@ Wrap external coding tools so their traffic flows through Headroom.
 
 ### Shared semantics
 
+- `wrap` is transient and does not claim package ownership
 - `--port`, when available, defaults to `8787`
 - `--no-proxy` skips proxy startup and assumes an existing proxy
 - `--learn` enables live traffic learning
@@ -777,7 +803,7 @@ headroom wrap claude --port 9999
 ```
 
 | Option / arg | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port`, `-p` | `8787` | Proxy port |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
@@ -795,7 +821,7 @@ headroom wrap codex --backend anyllm --anyllm-provider groq
 ```
 
 | Option / arg | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port`, `-p` | `8787` | Proxy port |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
@@ -815,7 +841,7 @@ headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
 ```
 
 | Option / arg | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port`, `-p` | `8787` | Proxy port |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
@@ -838,7 +864,7 @@ headroom wrap aider --backend litellm-vertex --region us-central1
 ```
 
 | Option / arg | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port`, `-p` | `8787` | Proxy port |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
@@ -858,7 +884,7 @@ headroom wrap cursor --port 9999
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--port`, `-p` | `8787` | Proxy port |
 | `--no-proxy` | off | Reuse an existing proxy |
 | `--learn` | off | Enable live traffic learning |
@@ -874,7 +900,7 @@ headroom wrap openclaw --plugin-path ./plugins/openclaw
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--plugin-path` | unset | Local plugin source directory |
 | `--plugin-spec` | `headroom-ai/openclaw` | NPM plugin spec |
 | `--skip-build` | off | Skip local `npm install` / build steps |
@@ -889,6 +915,24 @@ headroom wrap openclaw --plugin-path ./plugins/openclaw
 
 Requires the `openclaw` binary on the host, and local-source mode may also require `npm`. In Docker-native mode, the installed host wrapper drives the host `openclaw` CLI while the plugin auto-starts the host `headroom` wrapper from `PATH`.
 
+### `headroom wrap pi`
+
+```bash
+headroom wrap pi
+headroom wrap pi -- -p "fix the bug"
+```
+
+Starts or reuses the loopback proxy and sets `HEADROOM_PI_BASE_URL`. Install `headroom-pi` first (`pi install ./plugins/pi` from a checkout, or `pi install npm:headroom-pi@<version>` after publish). Pi inference stays on the selected provider.
+
+### `headroom wrap omp`
+
+```bash
+headroom wrap omp
+headroom wrap omp -- -p "fix the bug"
+```
+
+Same extension endpoint as `wrap pi`, plus the existing Anthropic `models.yml` inference route. Durable `headroom init -g omp` never edits `models.yml`.
+
 ## `headroom unwrap`
 
 Undo durable wrapping for supported tools.
@@ -901,7 +945,7 @@ headroom unwrap openclaw --no-restart
 ```
 
 | Option | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `--no-restart` | off | Do not restart the OpenClaw gateway |
 | `--verbose`, `-v` | off | Verbose output |
 
@@ -917,7 +961,7 @@ Legend:
 - **host-bridged** — Headroom runs in Docker, but the wrapped external tool still runs on the host
 
 | Command path | Python CLI | Docker-native wrapper | Parity |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `headroom proxy` | native | native in container | full |
 | `headroom learn` | native | native in container | full |
 | `headroom perf` | native | native in container | full |
@@ -928,13 +972,15 @@ Legend:
 | `headroom mcp uninstall` | native | native in container | full |
 | `headroom mcp status` | native | native in container | full |
 | `headroom mcp serve` | native | native in container | full |
-| `headroom install apply|status|start|stop|restart|remove` | native | Docker-native wrapper for `persistent-docker`; compose remains an alternative | partial |
+| `headroom install apply | status | start | stop | restart | remove` | native | Docker-native wrapper for `persistent-docker`; compose remains an alternative | partial |
 | `headroom wrap claude` | native | host-bridged | partial |
 | `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
 | `headroom wrap codex` | native | host-bridged | partial |
 | `headroom wrap aider` | native | host-bridged | partial |
 | `headroom wrap cursor` | native | host-bridged | partial |
 | `headroom wrap openclaw` | native | host-bridged | partial |
+| `headroom wrap pi` | native | not implemented in Docker-native wrapper | none |
+| `headroom wrap omp` | native | not implemented in Docker-native wrapper | none |
 | `headroom unwrap openclaw` | native | host-bridged | partial |
 
 For the Docker-native execution model itself, see [Docker-Native Install](docker-install.md). For persistent service/task/docker lifecycle management, see [Persistent Installs](persistent-installs.md).
