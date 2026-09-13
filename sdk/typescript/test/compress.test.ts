@@ -80,6 +80,42 @@ describe("compress()", () => {
     expect(mockFetch).not.toHaveBeenCalled(); // no HTTP call
   });
 
+  it("passes hook-computed biases to the client", async () => {
+    const mockClient = {
+      compress: vi.fn().mockResolvedValue({
+        messages: [],
+        tokensBefore: 0,
+        tokensAfter: 0,
+        tokensSaved: 0,
+        compressionRatio: 1.0,
+        transformsApplied: [],
+        ccrHashes: [],
+        compressed: false,
+      }),
+    };
+    const hooks = {
+      preCompress: vi.fn((messages) => messages),
+      computeBiases: vi.fn(() => ({ 0: 2.0, 1: 0.5 })),
+      postCompress: vi.fn(),
+    };
+    const messages: OpenAIMessage[] = [
+      { role: "system", content: "Keep these instructions" },
+      { role: "user", content: "Compress this aggressively" },
+    ];
+
+    await compress(messages, {
+      client: mockClient,
+      model: "gpt-4o",
+      hooks,
+    });
+
+    expect(mockClient.compress).toHaveBeenCalledWith(messages, {
+      model: "gpt-4o",
+      tokenBudget: undefined,
+      biases: { 0: 2.0, 1: 0.5 },
+    });
+  });
+
   it("handles multi-turn conversation with tool calls", async () => {
     mockFetch.mockResolvedValueOnce(okResponse());
 
