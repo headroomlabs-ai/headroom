@@ -61,19 +61,46 @@ class TestDeepSeekPricingModule:
 
     def test_deepseek_registry_estimate_cost(self):
         registry = get_deepseek_registry()
-        cost = registry.estimate_cost("deepseek-v4-flash", input_tokens=1_000_000)
-        assert cost.cost_usd == 0.14
+        cost = registry.estimate_cost("deepseek-flash", input_tokens=1_000_000, now=OFF_PEAK)
+        assert cost.cost_usd == pytest.approx(0.15)
         assert "input" in cost.breakdown
         assert cost.pricing_date is not None
 
     def test_deepseek_registry_estimate_cost_with_cached(self):
         registry = get_deepseek_registry()
         cost = registry.estimate_cost(
-            "deepseek-v4-flash",
+            "deepseek-flash",
             input_tokens=1_000_000,
             cached_input_tokens=1_000_000,
+            now=OFF_PEAK,
         )
-        assert cost.cost_usd == 0.14 + 0.0028
+        assert cost.cost_usd == pytest.approx(0.15 + 0.003)
+
+    def test_registry_prices_the_peak_tier_at_a_peak_instant(self):
+        registry = get_deepseek_registry()
+        peak = registry.estimate_cost("deepseek-flash", input_tokens=1_000_000, now=PEAK)
+        off = registry.estimate_cost("deepseek-flash", input_tokens=1_000_000, now=OFF_PEAK)
+        assert off.cost_usd == pytest.approx(0.15)
+        assert peak.cost_usd == pytest.approx(0.30)
+        assert peak.breakdown["tier"] == "peak"
+        assert off.breakdown["tier"] == "off_peak"
+        assert peak.breakdown["input"]["rate_per_1m"] == pytest.approx(0.30)
+        assert off.breakdown["input"]["rate_per_1m"] == pytest.approx(0.15)
+
+    def test_registry_cached_bucket_uses_the_tier_cache_hit_rate(self):
+        registry = get_deepseek_registry()
+        cost = registry.estimate_cost(
+            "deepseek-flash",
+            cached_input_tokens=1_000_000,
+            now=OFF_PEAK,
+        )
+        assert cost.cost_usd == pytest.approx(0.003)
+        assert cost.breakdown["cached_input"]["rate_per_1m"] == pytest.approx(0.003)
+
+    def test_registry_rejects_batch_tokens_for_deepseek(self):
+        registry = get_deepseek_registry()
+        with pytest.raises(ValueError, match="batch input pricing"):
+            registry.estimate_cost("deepseek-flash", batch_input_tokens=1, now=OFF_PEAK)
 
 
 class TestDeepSeekLiteLLMInjection:
