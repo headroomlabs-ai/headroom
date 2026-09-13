@@ -25,7 +25,11 @@ from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
-from headroom.pricing.deepseek_tiers import off_peak_rates
+from headroom.pricing.deepseek_tiers import (
+    LEGACY_MODEL_IDS,
+    OFF_PEAK_RATES_PER_1M,
+    off_peak_rates,
+)
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -244,12 +248,7 @@ def _deepseek_fallback_row(model_id: str) -> dict[str, float]:
 # DeepSeek fallback pricing for --anthropic-api-url deepseek routing
 _DEEPSEEK_FALLBACK_PRICING: dict[str, dict[str, float]] = {
     model_id: _deepseek_fallback_row(model_id)
-    for model_id in (
-        "deepseek-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-flash-vision-exp",
-        "deepseek-v4-pro",
-    )
+    for model_id in (*OFF_PEAK_RATES_PER_1M, *LEGACY_MODEL_IDS)
 }
 
 
