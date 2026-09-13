@@ -18,33 +18,52 @@ OFF_PEAK = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
 class TestDeepSeekPricingModule:
     """Tests for the DeepSeek pricing data module."""
 
-    def test_deepseek_pricing_contains_v4_models(self):
-        assert "deepseek-v4-flash" in DEEPSEEK_PRICES
+    def test_deepseek_pricing_contains_every_current_id(self):
+        assert "deepseek-flash" in DEEPSEEK_PRICES
         assert "deepseek-v4-pro" in DEEPSEEK_PRICES
-        assert len(DEEPSEEK_PRICES) == 2
+        assert "deepseek-v4-flash" in DEEPSEEK_PRICES
+        assert "deepseek-v4-flash-vision-exp" in DEEPSEEK_PRICES
+        assert len(DEEPSEEK_PRICES) == 4
 
-    def test_deepseek_v4_flash_pricing(self):
-        pricing = DEEPSEEK_PRICES["deepseek-v4-flash"]
-        assert pricing.input_per_1m == 0.14
-        assert pricing.output_per_1m == 0.28
-        assert pricing.cached_input_per_1m == 0.0028
+    def test_deepseek_flash_pricing_is_the_off_peak_tier(self):
+        pricing = DEEPSEEK_PRICES["deepseek-flash"]
+        assert pricing.input_per_1m == 0.15
+        assert pricing.output_per_1m == 0.60
+        assert pricing.cached_input_per_1m == 0.003
         assert pricing.context_window == 1_000_000
         assert pricing.provider == "deepseek"
         assert pricing.notes is not None
 
-    def test_deepseek_v4_pro_pricing(self):
+    def test_deepseek_v4_pro_pricing_is_the_off_peak_tier(self):
         pricing = DEEPSEEK_PRICES["deepseek-v4-pro"]
-        assert pricing.input_per_1m == 0.435
-        assert pricing.output_per_1m == 0.87
-        assert pricing.cached_input_per_1m == 0.003625
+        assert pricing.input_per_1m == 0.66
+        assert pricing.output_per_1m == 1.98
+        assert pricing.cached_input_per_1m == 0.022
         assert pricing.context_window == 1_000_000
         assert pricing.provider == "deepseek"
         assert pricing.notes is not None
+
+    def test_legacy_flash_ids_carry_the_flash_rates(self):
+        flash = DEEPSEEK_PRICES["deepseek-flash"]
+        for alias in ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
+            row = DEEPSEEK_PRICES[alias]
+            assert row.model == alias
+            assert (
+                row.input_per_1m,
+                row.output_per_1m,
+                row.cached_input_per_1m,
+            ) == (
+                flash.input_per_1m,
+                flash.output_per_1m,
+                flash.cached_input_per_1m,
+            )
 
     def test_get_deepseek_registry(self):
         registry = get_deepseek_registry()
         assert isinstance(registry, PricingRegistry)
+        assert registry.get_price("deepseek-flash") is not None
         assert registry.get_price("deepseek-v4-flash") is not None
+        assert registry.get_price("deepseek-v4-flash-vision-exp") is not None
         assert registry.get_price("deepseek-v4-pro") is not None
         assert registry.get_price("nonexistent") is None
 
@@ -145,45 +164,48 @@ class TestDeepSeekPricingModule:
 
 
 class TestDeepSeekLiteLLMInjection:
-    """Tests for DeepSeek V4 pricing injection into litellm."""
+    """Tests for DeepSeek pricing injection into litellm."""
 
-    def test_deepseek_v4_models_in_litellm_model_cost(self):
+    def test_deepseek_ids_in_litellm_model_cost(self):
         from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
-        assert "deepseek-v4-flash" in litellm.model_cost
-        assert "deepseek-v4-pro" in litellm.model_cost
+        for model in (
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek-v4-pro",
+        ):
+            assert model in litellm.model_cost
+            assert f"deepseek/{model}" in litellm.model_cost
 
-    def test_deepseek_v4_prefixed_models_in_litellm_model_cost(self):
+    def test_deepseek_flash_litellm_rows_are_off_peak(self):
         from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
-        assert "deepseek/deepseek-v4-flash" in litellm.model_cost
-        assert "deepseek/deepseek-v4-pro" in litellm.model_cost
+        for key in ("deepseek-flash", "deepseek/deepseek-flash"):
+            row = litellm.model_cost[key]
+            assert row["input_cost_per_token"] == 0.15 / 1_000_000
+            assert row["output_cost_per_token"] == 0.60 / 1_000_000
+            assert row["cache_read_input_token_cost"] == 0.003 / 1_000_000
+            assert row["litellm_provider"] == "deepseek"
+            assert row["max_input_tokens"] == 1_000_000
+            assert row["max_output_tokens"] == 393_216
 
-    def test_deepseek_v4_flash_litellm_pricing(self):
+    def test_deepseek_v4_pro_litellm_rows_are_off_peak(self):
         from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
-        flash = litellm.model_cost["deepseek-v4-flash"]
-        assert flash["input_cost_per_token"] > 0
-        assert flash["output_cost_per_token"] > 0
-        assert flash["litellm_provider"] == "deepseek"
+        row = litellm.model_cost["deepseek-v4-pro"]
+        assert row["input_cost_per_token"] == 0.66 / 1_000_000
+        assert row["output_cost_per_token"] == 1.98 / 1_000_000
+        assert row["cache_read_input_token_cost"] == 0.022 / 1_000_000
+        assert row["litellm_provider"] == "deepseek"
 
-    def test_deepseek_v4_pro_litellm_pricing(self):
-        from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
-
-        if not LITELLM_AVAILABLE:
-            pytest.skip("litellm not available")
-        pro = litellm.model_cost["deepseek-v4-pro"]
-        assert pro["input_cost_per_token"] > 0
-        assert pro["output_cost_per_token"] > 0
-        assert pro["litellm_provider"] == "deepseek"
-
-    def test_cost_per_token_resolves_deepseek_v4_flash(self):
+    def test_cost_per_token_resolves_deepseek_flash(self):
         from headroom.pricing.litellm_pricing import (
             LITELLM_AVAILABLE,
             litellm,
@@ -196,50 +218,37 @@ class TestDeepSeekLiteLLMInjection:
         # litellm.cost_per_token can determine the provider via
         # get_llm_provider(). Bare model names without a provider prefix
         # would fail with BadRequestError.
-        resolved = resolve_litellm_model("deepseek-v4-flash")
+        resolved = resolve_litellm_model("deepseek-flash")
         input_cost, output_cost = litellm.cost_per_token(
             model=resolved,
             prompt_tokens=1_000_000,
             completion_tokens=1_000_000,
         )
-        active_pricing = litellm.model_cost["deepseek-v4-flash"]
-        assert input_cost == pytest.approx(
-            active_pricing["input_cost_per_token"] * 1_000_000,
-        )
-        assert output_cost == pytest.approx(
-            active_pricing["output_cost_per_token"] * 1_000_000,
-        )
+        assert input_cost == pytest.approx(0.15, rel=0.01)
+        assert output_cost == pytest.approx(0.60, rel=0.01)
 
     def test_resolve_litellm_model_prefixes_deepseek(self):
         from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-        resolved = resolve_litellm_model("deepseek-v4-flash")
-        assert resolved == "deepseek/deepseek-v4-flash"
+        assert resolve_litellm_model("deepseek-flash") == "deepseek/deepseek-flash"
+        assert resolve_litellm_model("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
 
-    def test_injection_does_not_overwrite_existing_upstream_entries(self):
-        """If litellm upstream already has these, our injection is a no-op."""
+    def test_injection_overrides_upstream_peak_rows(self):
+        """Upstream litellm ships these ids at peak; the flat figure stays off-peak."""
         from headroom.pricing.litellm_pricing import LITELLM_AVAILABLE, litellm
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
-        # Force-inject with wrong value, then verify the injection guard
-        litellm.model_cost["deepseek-v4-flash"] = {"input_cost_per_token": 999}
-        # Reimport to trigger _inject_deepseek_pricing — but it should NOT overwrite
-        import importlib
 
         import headroom.pricing.litellm_pricing as lp
 
-        importlib.reload(lp)
-        assert litellm.model_cost["deepseek-v4-flash"]["input_cost_per_token"] == 999
-        # Reset to correct value
-        litellm.model_cost["deepseek-v4-flash"] = {
-            "input_cost_per_token": 0.14 / 1_000_000,
-            "output_cost_per_token": 0.28 / 1_000_000,
-            "cache_read_input_token_cost": 0.0028 / 1_000_000,
-            "litellm_provider": "deepseek",
-            "max_tokens": 384_000,
-            "max_input_tokens": 1_000_000,
-        }
+        saved = dict(litellm.model_cost["deepseek-flash"])
+        try:
+            litellm.model_cost["deepseek-flash"] = {"input_cost_per_token": 0.30 / 1_000_000}
+            lp._inject_deepseek_pricing()
+            assert litellm.model_cost["deepseek-flash"]["input_cost_per_token"] == 0.15 / 1_000_000
+        finally:
+            litellm.model_cost["deepseek-flash"] = saved
 
 
 class TestDeepSeekAnthropicProviderFallback:

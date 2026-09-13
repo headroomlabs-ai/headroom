@@ -25,11 +25,17 @@ Consumers that need one flat number for a model take :func:`off_peak_rates`
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 
 #: Peak is exactly this multiple of every off-peak rate.
 PEAK_MULTIPLIER: float = 2.0
+
+#: Last date the vendor's USD rate card below was verified.
+LAST_UPDATED = date(2026, 9, 13)
+
+#: Official pricing page these rates come from.
+SOURCE_URL = "https://api-docs.deepseek.com/quick_start/pricing"
 
 #: Off-peak ``(cache-hit input, cache-miss input, output)`` USD per 1M tokens.
 #:
