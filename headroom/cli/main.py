@@ -75,6 +75,7 @@ def _register_commands() -> None:
         output_savings,  # noqa: F401
         perf,  # noqa: F401
         proxy,  # noqa: F401
+        proxy_benchmark,  # noqa: F401
         recover,  # noqa: F401
         rollout,  # noqa: F401
         savings,  # noqa: F401
