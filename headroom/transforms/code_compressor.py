@@ -1133,7 +1133,6 @@ class CodeAwareCompressor(Transform):
 
         def collect_calls_in_function(func_node: Any, func_qname: str) -> None:
             func_short = bare_names[func_qname]
-            defined_short_names = set(bare_names.values())
             calls: set[str] = set()
 
             def walk(node: Any) -> None:
@@ -1154,14 +1153,21 @@ class CodeAwareCompressor(Transform):
         if not definitions:
             return _SymbolAnalysis()
 
+        # bare_names is fixed after Pass 1, so the set of defined short names is
+        # invariant across Pass 3: build it once here, not per symbol.
+        defined_short_names = set(bare_names.values())
+
         # Pass 2: Collect all identifiers
         collect_identifiers(root)
 
         # Pass 3: Collect call relationships and body sizes
         body_line_counts: dict[str, int] = {}
+        # Encode the source once: slicing pre-encoded bytes avoids re-encoding the
+        # whole file per symbol (_slice_code_bytes re-encodes on every call).
+        code_bytes = code.encode("utf-8")
         for qname, node in definitions.items():
             collect_calls_in_function(node, qname)
-            node_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
+            node_text = code_bytes[node.start_byte : node.end_byte].decode("utf-8")
             body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
 
         # Reference counts: subtract definition occurrences
