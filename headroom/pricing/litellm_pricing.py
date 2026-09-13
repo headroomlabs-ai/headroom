@@ -12,8 +12,10 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from headroom.pricing.deepseek_tiers import rates_for as _deepseek_rates_for
 from headroom.pricing.litellm_model_resolution import (
     pricing_lookup_candidates,
     resolve_litellm_model_name,
@@ -287,6 +289,7 @@ def estimate_cost_from_tokens(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cached_tokens: int = 0,
+    now: datetime | None = None,
 ) -> float | None:
     """Cost for one request from token counts, using LiteLLM's own cost model.
 
@@ -295,6 +298,11 @@ def estimate_cost_from_tokens(
     express either: cache reads bill at their own rate, and on Anthropic's
     Sonnet 4 / 4.5 family a prompt over 200K re-prices the *whole* request --
     input, output and cache alike. ``litellm.cost_per_token`` applies both.
+
+    DeepSeek flash/pro do not go through litellm at all: the vendor prices them
+    on Beijing peak/off-peak tiers (see
+    :mod:`headroom.pricing.deepseek_tiers`), and ``now`` selects the tier. A
+    ``now`` of ``None`` reads the wall clock, which is what live traffic wants.
 
     ``input_tokens`` is the TOTAL prompt, ``cached_tokens`` included. LiteLLM
     subtracts the cached portion itself and tests the long-context threshold
@@ -305,6 +313,19 @@ def estimate_cost_from_tokens(
     ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
     to fall back to its own table.
     """
+    # DeepSeek flash/pro are priced from the vendor's peak/off-peak card, which
+    # litellm cannot express: model_cost holds one flat rate per model. The tier
+    # is selected from the request instant, so this runs before - and without -
+    # litellm.
+    tier = _deepseek_rates_for(model, now)
+    if tier is not None:
+        uncached = max(input_tokens - cached_tokens, 0)
+        return (
+            (uncached / 1_000_000) * tier.input_per_1m
+            + (cached_tokens / 1_000_000) * tier.cache_hit_per_1m
+            + (output_tokens / 1_000_000) * tier.output_per_1m
+        )
+
     if not LITELLM_AVAILABLE:
         return None
     candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
