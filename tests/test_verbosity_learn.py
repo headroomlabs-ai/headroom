@@ -356,3 +356,156 @@ class TestWindowsEncoding:
         assert loaded is not None
         assert loaded.rationale == prof.rationale
         assert loaded.project_path == prof.project_path
+
+
+def _grok_update(session_update: str, *, ts: float, **update_fields: object) -> dict:
+    update = {"sessionUpdate": session_update, **update_fields}
+    return {
+        "timestamp": ts,
+        "method": "session/update",
+        "params": {"sessionId": "test", "update": update},
+    }
+
+
+def _write_grok_session(tmp_path: Path, name: str, lines: list[dict]) -> Path:
+    session_dir = tmp_path / name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    p = session_dir / "updates.jsonl"
+    p.write_text("\n".join(json.dumps(line) for line in lines))
+    return p
+
+
+class TestGrokSignalExtraction:
+    def test_coalesces_agent_chunks_and_fast_skip(self, tmp_path):
+        # 400-word answer needs ~96s to read; reply after 5s = fast skip.
+        long = " ".join(["word"] * 400)
+        # Stream as three chunks to prove coalescing.
+        n = len(long) // 3
+        p = _write_grok_session(
+            tmp_path,
+            "sess1",
+            [
+                _grok_update(
+                    "user_message_chunk",
+                    ts=1_700_000_000,
+                    content={"type": "text", "text": "explain"},
+                    _meta={"modelId": "deepseek/deepseek-v4-flash"},
+                ),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=1_700_000_001,
+                    content={"type": "text", "text": long[:n]},
+                ),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=1_700_000_002,
+                    content={"type": "text", "text": long[n : 2 * n]},
+                ),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=1_700_000_003,
+                    content={"type": "text", "text": long[2 * n :]},
+                ),
+                _grok_update(
+                    "turn_completed",
+                    ts=1_700_000_004,
+                    usage={
+                        "inputTokens": 5000,
+                        "outputTokens": 800,
+                        "modelUsage": {
+                            "deepseek/deepseek-v4-flash": {
+                                "inputTokens": 5000,
+                                "outputTokens": 800,
+                            }
+                        },
+                    },
+                ),
+                _grok_update(
+                    "user_message_chunk",
+                    ts=1_700_000_009,  # +5s after first agent chunk start
+                    content={"type": "text", "text": "ok next"},
+                ),
+            ],
+        )
+        responses, humans, has_tools = _parse_session(p)
+        assert has_tools is False
+        assert len(humans) == 2
+        assert len(responses) == 1
+        assert responses[0].words == 400
+        assert responses[0].output_tokens == 800
+        assert responses[0].model == "deepseek/deepseek-v4-flash"
+
+        sig, baseline = extract_signals([p])
+        assert sig.sessions == 1
+        assert sig.asst_responses == 1
+        assert sig.skip_eligible == 1
+        assert sig.fast_skips == 1
+        # Baseline stratified under deepseek, not "other"
+        assert any(k.startswith("deepseek|") for k in baseline.strata)
+
+    def test_tool_calls_set_has_tools(self, tmp_path):
+        p = _write_grok_session(
+            tmp_path,
+            "sess2",
+            [
+                _grok_update(
+                    "user_message_chunk",
+                    ts=100.0,
+                    content={"type": "text", "text": "run it"},
+                    _meta={"modelId": "grok-composer-2.5-fast"},
+                ),
+                _grok_update("tool_call", ts=101.0, toolCallId="c1", title="Bash"),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=102.0,
+                    content={"type": "text", "text": " ".join(["done"] * 20)},
+                ),
+                _grok_update(
+                    "turn_completed",
+                    ts=103.0,
+                    usage={"inputTokens": 100, "outputTokens": 20},
+                ),
+            ],
+        )
+        responses, _, has_tools = _parse_session(p)
+        assert has_tools is True
+        assert len(responses) == 1
+        assert responses[0].has_tools is True
+        assert responses[0].model == "grok-composer-2.5-fast"
+
+
+    def test_turn_completed_backfills_tokens_after_user_flush(self, tmp_path):
+        """If usage lands after the next user turn started, still attach tokens."""
+        long = " ".join(["word"] * 50)
+        p = _write_grok_session(
+            tmp_path,
+            "sess3",
+            [
+                _grok_update(
+                    "user_message_chunk",
+                    ts=1.0,
+                    content={"type": "text", "text": "ask"},
+                    _meta={"modelId": "deepseek/deepseek-v4-flash"},
+                ),
+                _grok_update(
+                    "agent_message_chunk",
+                    ts=2.0,
+                    content={"type": "text", "text": long},
+                ),
+                # Next user arrives before turn_completed (unusual but possible).
+                _grok_update(
+                    "user_message_chunk",
+                    ts=3.0,
+                    content={"type": "text", "text": "next"},
+                ),
+                _grok_update(
+                    "turn_completed",
+                    ts=4.0,
+                    usage={"inputTokens": 1000, "outputTokens": 42},
+                ),
+            ],
+        )
+        responses, _, _ = _parse_session(p)
+        assert len(responses) == 1
+        assert responses[0].output_tokens == 42
+        assert responses[0].input_tokens == 1000
