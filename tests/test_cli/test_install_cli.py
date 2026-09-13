@@ -458,6 +458,42 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     assert "Backend:    anthropic" in result.output
 
 
+def test_install_status_treats_ready_proxy_as_running(monkeypatch) -> None:
+    """Health wins when PID/container bookkeeping incorrectly says stopped.
+
+    Regression for #3072 bug 2: status previously printed the contradictory
+    pair ``Status: stopped`` and ``Healthy: yes`` while doctor correctly
+    reported the same proxy as running.
+    """
+    manifest = _status_manifest("default")
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(inst, "probe_json", lambda url: None)
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+    monkeypatch.setattr(inst, "runtime_status", lambda deployment: "stopped")
+
+    result = CliRunner().invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Status:     running" in result.output
+    assert "Healthy:    yes" in result.output
+    assert "Status:     stopped" not in result.output
+
+
+def test_install_status_keeps_runtime_status_when_not_ready(monkeypatch) -> None:
+    """An unhealthy live process remains distinguishable from a stopped one."""
+    manifest = _status_manifest("default")
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: manifest)
+    monkeypatch.setattr(inst, "probe_json", lambda url: None)
+    monkeypatch.setattr(inst, "probe_ready", lambda url: False)
+    monkeypatch.setattr(inst, "runtime_status", lambda deployment: "running")
+
+    result = CliRunner().invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Status:     running" in result.output
+    assert "Healthy:    no" in result.output
+
+
 def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     """A health payload whose `config` is a non-dict (e.g. a different service
     answering on the port returns config: null) must not crash the command."""
