@@ -84,6 +84,7 @@ curl -si http://127.0.0.1:8787/v1/models
 | Flag | Env var | Default | Notes |
 | --- | --- | --- | --- |
 | `--listen` | `HEADROOM_PROXY_LISTEN` | `0.0.0.0:8787` | bind address |
+| `--metrics-require-loopback` | `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK` | `false` | when set, `/metrics` is served only to loopback peers (403 otherwise); recommended on non-loopback binds |
 | `--upstream` | `HEADROOM_PROXY_UPSTREAM` | (required) | base URL the proxy forwards to |
 | `--upstream-timeout` |  | `600s` | end-to-end request timeout (long for streams) |
 | `--upstream-connect-timeout` |  | `10s` | TCP/TLS connect timeout |
