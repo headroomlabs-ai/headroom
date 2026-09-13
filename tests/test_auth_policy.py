@@ -50,6 +50,17 @@ def test_grok_build_user_agent_is_subscription_client() -> None:
     assert classify_client_signals(signals) == "grok_build"
 
 
+def test_grok_shell_user_agent_maps_to_grok_build_but_not_subscription() -> None:
+    # Current Grok Build releases send grok-shell/<version> (grok 0.2.112).
+    # Client classification must recognize it; auth mode deliberately stays
+    # key-driven (API-key grok is pay-per-token and should keep the
+    # aggressive policy), so grok-shell/ is NOT a subscription UA prefix.
+    signals = AuthSignals(user_agent="grok-shell/0.2.112 (macos; aarch64)")
+
+    assert classify_client_signals(signals) == "grok_build"
+    assert classify_auth_signals(signals) is not AuthMode.SUBSCRIPTION
+
+
 def test_codex_stamp_only_for_unidentified_responses_callers() -> None:
     assert should_stamp_codex_client_signals("/v1/responses", AuthSignals()) is True
     assert (
