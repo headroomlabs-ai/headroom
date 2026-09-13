@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,6 +92,63 @@ def test_read_cached_oauth_token_prefers_headroom_login(
     copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
 
     assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+
+
+def test_saved_oauth_token_file_content_roundtrips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token still writes and reads back after the private-write change."""
+    copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
+    assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+    # Re-saving over an existing file rotates the token cleanly.
+    copilot_auth.save_headroom_copilot_oauth_token("gho-rotated")
+    assert copilot_auth.read_cached_oauth_token() == "gho-rotated"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_saved_oauth_token_file_is_private_under_permissive_umask() -> None:
+    """The token file must be 0o600 even under a permissive umask.
+
+    The atomic writer creates the file via ``tempfile.mkstemp`` (always 0o600,
+    umask-independent) and ``os.replace``s it into place, so the destination is
+    private from birth with no world-readable window. Forcing ``umask(0o022)``
+    (which would make a plain ``write_text`` land 0o644) confirms the mode does
+    not depend on umask.
+    """
+    old_umask = os.umask(0o022)
+    try:
+        path = Path(copilot_auth.save_headroom_copilot_oauth_token("gho-headroom"))
+    finally:
+        os.umask(old_umask)
+
+    assert path.exists()
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_token_write_failure_preserves_existing_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed write must fail CLOSED: the old token survives, no secret leaks.
+
+    The write goes to a private temp file and is atomically renamed in, so a
+    failure at the rename never truncates or replaces the existing file (unlike
+    the earlier create-or-narrow-in-place approach, which opened the destination
+    ``O_TRUNC`` before writing). The temp file is cleaned up so no secret is left
+    behind in a stray path.
+    """
+    copilot_auth.save_headroom_copilot_oauth_token("gho-original")
+    path = copilot_auth.headroom_copilot_auth_path()
+    before = set(os.listdir(path.parent))
+
+    monkeypatch.setattr(copilot_auth.os, "replace", _boom)
+    with pytest.raises(OSError):
+        copilot_auth.save_headroom_copilot_oauth_token("gho-should-not-land")
+
+    # Old token intact; no partial/temp file left behind.
+    assert copilot_auth.read_cached_oauth_token() == "gho-original"
+    assert set(os.listdir(path.parent)) == before
+
+
+def _boom(*_args: object, **_kwargs: object) -> None:
+    raise OSError("simulated write failure")
 
 
 def test_default_oauth_domain_uses_enterprise_url_host(monkeypatch: pytest.MonkeyPatch) -> None:
