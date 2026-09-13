@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import ssl
 
 import pytest
@@ -22,6 +23,7 @@ from headroom.proxy.ssl_context import (
     apply_global_tls_relaxation,
     build_httpx_verify,
     find_ca_bundle,
+    find_system_proxy,
     tls_strict_disabled,
 )
 
@@ -310,3 +312,70 @@ class TestApplyGlobalTlsRelaxation:
             assert getattr(u3ssl.create_urllib3_context, "_headroom_strict_relaxed", False)
         finally:
             u3ssl.create_urllib3_context = original
+
+
+_PROXY_ENV_VARS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+
+
+def _clean_proxy_env(monkeypatch):
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+class TestFindSystemProxy:
+    """find_system_proxy: env-proxy precedence, redaction, malformed input."""
+
+    @pytest.mark.parametrize("var", _PROXY_ENV_VARS)
+    def test_env_proxy_suppresses_system_proxy_injection(self, monkeypatch, var):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setenv(var, "http://env-proxy.example:9999")
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "http://system-proxy.example:3128"},
+        )
+        assert find_system_proxy() is None
+
+    def test_falls_back_to_system_proxy_when_no_env_proxy_set(self, monkeypatch):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "http://system-proxy.example:3128"},
+        )
+        assert find_system_proxy() == "http://system-proxy.example:3128"
+
+    def test_logged_proxy_url_redacts_userinfo(self, monkeypatch, caplog):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "http://corpuser:s3cr3t@system-proxy.example:3128"},
+        )
+        with caplog.at_level(logging.INFO, logger="headroom.proxy"):
+            url = find_system_proxy()
+        assert url == "http://corpuser:s3cr3t@system-proxy.example:3128"
+        logged = "\n".join(caplog.messages)
+        assert "corpuser" not in logged
+        assert "s3cr3t" not in logged
+        assert "system-proxy.example:3128" in logged
+
+    def test_hostless_url_does_not_raise(self, monkeypatch, caplog):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "not-a-valid-url"},
+        )
+        with caplog.at_level(logging.INFO, logger="headroom.proxy"):
+            url = find_system_proxy()
+        assert url == "not-a-valid-url"
+
+    def test_malformed_port_does_not_raise(self, monkeypatch, caplog):
+        _clean_proxy_env(monkeypatch)
+        monkeypatch.setattr(
+            "urllib.request.getproxies",
+            lambda: {"https": "http://proxy.example:notaport"},
+        )
+        with caplog.at_level(logging.INFO, logger="headroom.proxy"):
+            url = find_system_proxy()
+        assert url == "http://proxy.example:notaport"
+        logged = "\n".join(caplog.messages)
+        assert "proxy.example" in logged
+        assert "notaport" not in logged
