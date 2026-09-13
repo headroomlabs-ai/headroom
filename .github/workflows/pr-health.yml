@@ -162,7 +162,7 @@ jobs:
           gh label create "status: needs rebase" \
             --repo "$REPO" \
             --color "fbca04" \
-            --description "Pull request branch is behind the base branch" \
+            --description "Pull request branch is behind the base branch on files it also changes" \
             --force
           gh label create "status: has conflicts" \
             --repo "$REPO" \
@@ -197,16 +197,47 @@ jobs:
 
           for pr in $pr_numbers; do
             data="$(gh pr view "$pr" --repo "$REPO" \
-              --json isDraft,labels,mergeStateStatus,reviewDecision,statusCheckRollup)"
+              --json baseRefName,files,headRefOid,isDraft,labels,mergeStateStatus,reviewDecision,statusCheckRollup)"
 
             merge_state="$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$data")"
             check_state="$(python3 .github/scripts/pr-health-labels.py --state-json "$data")"
             is_draft="$(jq -r '.isDraft' <<<"$data")"
             review_decision="$(jq -r '.reviewDecision // ""' <<<"$data")"
+            base_ref="$(jq -r '.baseRefName // ""' <<<"$data")"
+            head_oid="$(jq -r '.headRefOid // ""' <<<"$data")"
 
-            if [[ "$merge_state" == "BEHIND" ]]; then
+            # `mergeStateStatus` only reports BEHIND when the base branch requires
+            # branches to be up to date, so compare the refs directly instead.
+            head_compare='{}'
+            if [[ -n "$base_ref" && -n "$head_oid" ]]; then
+              head_compare="$(gh api "repos/$REPO/compare/$base_ref...$head_oid" \
+                --jq '{behind_by: .behind_by, merge_base: .merge_base_commit.sha}' \
+                2>/dev/null || echo '{}')"
+            fi
+            behind_by="$(jq -r '.behind_by // ""' <<<"$head_compare")"
+            merge_base="$(jq -r '.merge_base // ""' <<<"$head_compare")"
+
+            # Files the base branch changed since this pull request forked off it.
+            # An empty string means the comparison never produced an answer; it must
+            # not read as "the base moved nothing", which would clear a correct label.
+            base_files='[]'
+            if [[ -n "$behind_by" && "$behind_by" != "0" ]]; then
+              base_files=''
+              if [[ -n "$merge_base" ]]; then
+                base_files="$(gh api "repos/$REPO/compare/$merge_base...$base_ref" \
+                  --jq '[.files[]? | .filename]' 2>/dev/null)" || base_files=''
+              fi
+            fi
+
+            drift="$(python3 .github/scripts/pr-health-labels.py \
+              --state-json "$data" \
+              --field drift \
+              --behind-by "$behind_by" \
+              --base-files "$base_files")"
+
+            if [[ "$drift" == "stale" ]]; then
               gh pr edit "$pr" --repo "$REPO" --add-label "status: needs rebase"
-            elif [[ "$merge_state" != "UNKNOWN" ]]; then
+            elif [[ "$drift" == "current" ]]; then
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: needs rebase" || true
             fi
 
@@ -222,7 +253,7 @@ jobs:
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: ci failing" || true
             fi
 
-            if [[ "$merge_state" == "BEHIND" || "$merge_state" == "DIRTY" || "$check_state" == "failing" || "$is_draft" == "true" || "$review_decision" == "CHANGES_REQUESTED" ]]; then
+            if [[ "$drift" == "stale" || "$merge_state" == "DIRTY" || "$check_state" == "failing" || "$is_draft" == "true" || "$review_decision" == "CHANGES_REQUESTED" ]]; then
               gh pr edit "$pr" --repo "$REPO" --remove-label "status: ready for review" || true
             fi
           done
