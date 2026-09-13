@@ -282,6 +282,11 @@ jobs:
         run: |
           python scripts/verify-versions.py
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
