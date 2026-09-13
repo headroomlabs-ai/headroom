@@ -83,7 +83,8 @@ def bare_model(model: str) -> str:
     """Return ``model`` without a ``provider/`` prefix, lowercased.
 
     A tag suffix after ``:`` (``deepseek/deepseek-v4-pro:free``) is not stripped: such an id
-    falls out of tier scope and is priced from the flat tables instead.
+    falls out of tier scope, and it is priced only if a flat table happens to carry that exact
+    key - otherwise the caller's cost is unknown rather than approximated.
 
     Args:
         model: A model id, optionally prefixed the way a gateway writes it

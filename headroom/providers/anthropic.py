@@ -245,7 +245,13 @@ def _deepseek_fallback_row(model_id: str) -> dict[str, float]:
     }
 
 
-# DeepSeek fallback pricing for --anthropic-api-url deepseek routing
+# DeepSeek fallback pricing for --anthropic-api-url deepseek routing.
+#
+# While the tier seam in ``headroom.pricing.litellm_pricing`` claims these four
+# ids first, ``estimate_cost`` never reaches this table on a live request: it is a
+# safety net for the flat-consumer invariant (anything without a request instant
+# carries the off-peak figure) and the only pricing left if that seam is ever
+# bypassed. ``_get_pricing`` therefore reaches it only when called directly.
 _DEEPSEEK_FALLBACK_PRICING: dict[str, dict[str, float]] = {
     model_id: _deepseek_fallback_row(model_id)
     for model_id in (*OFF_PEAK_RATES_PER_1M, *LEGACY_MODEL_IDS)
