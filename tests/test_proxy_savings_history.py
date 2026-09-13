@@ -1348,6 +1348,16 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         assert "Weekly Savings" in html
         assert "Monthly Savings" in html
         assert "Per-Model Breakdown" in html
+        breakdown_html = html.split("Per-Model Breakdown", 1)[1].split("Historical Summary", 1)[0]
+        assert "Compression saved" in breakdown_html
+        assert "Cache saved" in breakdown_html
+        assert "Total saved" in breakdown_html
+        assert "row.cache_savings_usd" in breakdown_html
+        assert "row.total_savings_usd" in breakdown_html
+        assert "overflow-x-auto" not in breakdown_html
+        assert 'class="w-full table-fixed text-xs"' in breakdown_html
+        assert "row.cache_savings_usd += entry.cache_savings_usd_delta || 0;" in html
+        assert "row.compression_savings_usd + row.cache_savings_usd" in html
         assert "historyChartModeOptions" in html
         assert "Expected cost (without Headroom)" in html
         assert "toggleHistoryModel" in html
@@ -1478,6 +1488,9 @@ def test_cache_read_savings_accumulate_and_survive_restart(tmp_path, monkeypatch
     assert reloaded.snapshot()["lifetime"]["cache_savings_usd"] == pytest.approx(1.6)
     assert reloaded.stats_preview()["lifetime"]["cache_read_tokens"] == 1_600_000
     assert reloaded.history_response()["lifetime"]["cache_read_tokens"] == 1_600_000
+    daily = reloaded.history_response()["series"]["daily"]
+    assert daily[0]["cache_savings_usd_delta"] == pytest.approx(1.6)
+    assert daily[0]["by_model"]["claude-opus-4-8"]["cache_savings_usd_delta"] == pytest.approx(1.6)
 
 
 def test_by_model_savings_accumulate_and_survive_restart(tmp_path):
