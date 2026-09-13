@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from collections.abc import Mapping
 from typing import Any
+
+from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
+from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 
 logger = logging.getLogger("headroom.providers.hermes")
 
@@ -20,6 +25,21 @@ _CLAUDE_TEXT_PART_TYPES = frozenset({"text"})
 _RESPONSES_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _CODEX_RESPONSES_SUFFIX = "/v1/responses"
 _CLAUDE_MESSAGES_SUFFIX = "/v1/messages"
+
+
+def build_launch_env(
+    port: int, environ: Mapping[str, str] | None = None
+) -> tuple[dict[str, str], list[str]]:
+    """Build the environment used to route the Hermes CLI through Headroom."""
+    env = dict(environ or os.environ)
+    openai_base_url = codex_proxy_base_url(port)
+    anthropic_base_url = claude_proxy_base_url(port)
+    env["OPENAI_BASE_URL"] = openai_base_url
+    env["ANTHROPIC_BASE_URL"] = anthropic_base_url
+    return env, [
+        f"OPENAI_BASE_URL={openai_base_url}",
+        f"ANTHROPIC_BASE_URL={anthropic_base_url}",
+    ]
 
 
 def is_scoped_coding_agent_path(path: str) -> bool:
