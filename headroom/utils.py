@@ -100,9 +100,19 @@ def compute_prefix_hash(messages: list[dict[str, Any]], prefix_count: int | None
 
 
 def format_timestamp(dt: datetime | None = None) -> str:
-    """Format datetime as ISO8601 string."""
+    """Format a datetime as an ISO 8601 UTC string with a ``Z`` suffix.
+
+    A timezone-aware ``dt`` is converted to UTC first; a naive ``dt`` is assumed
+    to already be UTC. This keeps the output valid: appending ``Z`` to an aware
+    datetime's ``isoformat()`` would emit ``...+00:00Z`` (which even
+    ``datetime.fromisoformat`` rejects), and for a non-UTC offset it would label
+    the wrong instant as UTC. Shipped integrations pass
+    ``datetime.now(timezone.utc)`` (aware), so this path is live.
+    """
     if dt is None:
-        dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.isoformat() + "Z"
 
 
