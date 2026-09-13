@@ -1,4 +1,13 @@
 //! Error types for the proxy.
+//!
+//! # Security policy
+//!
+//! Error messages returned to clients MUST NOT contain internal topology
+//! information (upstream URLs, IPs, ports, DNS names). The full error
+//! detail is logged at `warn` level for operators; clients receive only
+//! a generic status-appropriate message. This prevents reconnaissance
+//! of the upstream infrastructure via crafted requests that trigger
+//! error responses.
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -41,29 +50,65 @@ pub enum ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
+        // Internal detail for operator logs — never sent to client.
+        let internal_detail = self.to_string();
+
+        // Client-facing message: generic, status-appropriate text that
+        // does NOT leak upstream URLs, IPs, ports, or DNS names.
+        let (status, client_msg) = match &self {
             ProxyError::Upstream(e) if e.is_timeout() => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("upstream timeout: {e}"),
+                "upstream request timed out".to_string(),
             ),
             ProxyError::Upstream(e) if e.is_connect() => (
                 StatusCode::BAD_GATEWAY,
-                format!("upstream connect error: {e}"),
+                "failed to connect to upstream".to_string(),
             ),
-            ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::InvalidUpstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::InvalidHeader(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ProxyError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
-            ProxyError::WebSocket(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            ProxyError::Upstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream request failed".to_string(),
+            ),
+            ProxyError::InvalidUpstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "invalid upstream configuration".to_string(),
+            ),
+            // InvalidHeader is a client-caused error; safe to echo
+            // the detail since it describes the client's own input.
+            ProxyError::InvalidHeader(detail) => (
+                StatusCode::BAD_REQUEST,
+                format!("invalid header: {detail}"),
+            ),
+            // PayloadTooLarge is client-caused; the configured limit
+            // is not sensitive (it's a public contract), so the
+            // message from the variant is safe to return.
+            ProxyError::PayloadTooLarge(detail) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                detail.clone(),
+            ),
+            ProxyError::WebSocket(_) => (
+                StatusCode::BAD_GATEWAY,
+                "websocket upstream error".to_string(),
+            ),
+            ProxyError::Io(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
             // CompressionStartup is a startup-time error, not a
             // per-request one — but if it ever surfaces in the
             // handler path, surface as 500 rather than panic.
-            ProxyError::CompressionStartup(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-            }
+            ProxyError::CompressionStartup(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
         };
-        tracing::warn!(error = %msg, "proxy error");
-        (status, msg).into_response()
+
+        // Log the FULL internal detail for operators (never sent to client).
+        tracing::warn!(
+            error = %internal_detail,
+            status = status.as_u16(),
+            "proxy error"
+        );
+
+        (status, client_msg).into_response()
     }
 }
