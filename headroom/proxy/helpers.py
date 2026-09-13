@@ -917,7 +917,9 @@ def relocate_system_messages_to_top_level(
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
-    is dropped.
+    is dropped. Only text-shaped content moves: non-text blocks (images,
+    documents) stay in a mid-conversation system section at their original
+    position, because top-level `system` accepts text blocks only (issue #3552).
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -979,14 +981,48 @@ def relocate_system_messages_to_top_level(
         return messages, system, False
 
     relocated_blocks: list[Any] = []
+    retained: dict[int, dict[str, Any]] = {}
     for i in sorted(system_indices):
-        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
-
-    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+        message = messages[i]
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            # Only text-shaped content may move into the top-level ``system``
+            # parameter (text blocks and bare strings). Non-text blocks such as
+            # images or documents stay in place so nothing is dropped and
+            # upstreams that reject non-text system blocks keep working
+            # (issue #3552).
+            hoisted_from_list: list[Any] = []
+            leftovers: list[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
+                    hoisted_from_list.append(block)
+                elif isinstance(block, str) and block:
+                    hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+                else:
+                    leftovers.append(block)
+            relocated_blocks.extend(hoisted_from_list)
+            if leftovers:
+                retained[i] = {**message, "content": leftovers}
+        else:
+            # String (and other) content converts losslessly to text blocks.
+            relocated_blocks.extend(_system_message_to_blocks(message))
 
     if not relocated_blocks:
+        if retained:
+            # Nothing text-shaped to relocate: the sections stay as they are.
+            return messages, system, False
         # System message(s) carried no content — drop the empty entries only.
+        clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
         return clean_messages, system, True
+
+    clean_messages = []
+    for i, message in enumerate(messages):
+        if i in system_indices:
+            trimmed = retained.get(i)
+            if trimmed is not None:
+                clean_messages.append(trimmed)
+            continue
+        clean_messages.append(message)
 
     if system is None or system == "" or system == []:
         new_system: Any = relocated_blocks

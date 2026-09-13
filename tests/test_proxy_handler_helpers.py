@@ -404,6 +404,91 @@ def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> N
     assert system == [{"type": "text", "text": "mid-turn instruction"}]
 
 
+def test_relocate_system_messages_keeps_image_blocks_out_of_top_level_system() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look at this"}]},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "<system-reminder>image attached</system-reminder>"},
+                image_block,
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ]
+    system = [{"type": "text", "text": "You are Claude Code."}]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is True
+    assert isinstance(new_system, list)
+    assert all(not isinstance(block, dict) or block.get("type") == "text" for block in new_system)
+    retained = [
+        message.get("content")
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert any(image_block in (content or []) for content in retained)
+
+
+def test_relocate_system_messages_hoists_only_text_from_mixed_sections() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "system",
+            "content": [
+                "plain string section",
+                {"type": "text", "text": "structured note"},
+                {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            ],
+        },
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, None, None)
+
+    assert changed is True
+    assert new_system == [
+        {"type": "text", "text": "plain string section"},
+        {"type": "text", "text": "structured note"},
+    ]
+    retained = [
+        message
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert retained == [
+        {
+            "role": "system",
+            "content": [{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}],
+        }
+    ]
+
+
+def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": [image_block]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    system = "base"
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is False
+    assert clean == messages
+    assert new_system == system
+
+
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
     assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
