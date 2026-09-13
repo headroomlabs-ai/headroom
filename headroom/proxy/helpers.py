@@ -2363,7 +2363,7 @@ def has_new_ccr_markers(
     *,
     current_detected_hashes: list[str],
     previous_forwarded_messages: list[dict[str, Any]] | None,
-    provider: Literal["anthropic", "openai", "google"],
+    provider: Literal["anthropic", "openai", "openai_responses", "google"],
 ) -> bool:
     """Whether the about-to-forward content carries CCR markers NOT already forwarded.
 
@@ -2425,7 +2425,7 @@ def history_references_ccr_tool(messages: Any) -> bool:
 
 def apply_session_sticky_ccr_tool(
     *,
-    provider: Literal["anthropic", "openai", "google"],
+    provider: Literal["anthropic", "openai", "openai_responses", "google"],
     session_id: str | None,
     request_id: str | None,
     existing_tools: list[dict[str, Any]] | None,
@@ -2458,7 +2458,7 @@ def apply_session_sticky_ccr_tool(
     """
     from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
-    if provider not in ("anthropic", "openai", "google"):
+    if provider not in ("anthropic", "openai", "openai_responses", "google"):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []

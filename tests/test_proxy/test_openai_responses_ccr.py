@@ -24,8 +24,14 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.requests import Request  # noqa: E402
 
-from headroom.cache.compression_store import reset_compression_store  # noqa: E402
-from headroom.ccr.tool_injection import CCR_TOOL_NAME  # noqa: E402
+from headroom.cache.compression_store import (  # noqa: E402
+    get_compression_store,
+    reset_compression_store,
+)
+from headroom.ccr.tool_injection import (  # noqa: E402
+    CCR_TOOL_NAME,
+    create_ccr_tool_definition,
+)
 from headroom.proxy.loopback_guard import require_loopback  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
@@ -39,6 +45,105 @@ _RETRIEVE_TOOL = {
         "required": ["hash"],
     },
 }
+
+
+def test_responses_ccr_tool_uses_flat_function_schema():
+    """Responses clients need the flat tool schema used by Copilot."""
+    tool = create_ccr_tool_definition("openai_responses")
+
+    assert tool["type"] == "function"
+    assert tool["name"] == CCR_TOOL_NAME
+    assert "function" not in tool
+
+
+async def test_responses_compression_injects_retrieve_tool():
+    app = _make_app()
+    hash_key = "abc123def456abc123def456"
+    get_compression_store().store(
+        original="full Jira description",
+        compressed="<<ccr:abc123def456abc123def456,string,1.9KB>>",
+        explicit_hash=hash_key,
+    )
+
+    server = app.state.proxy
+    server.config.optimize = True
+    server.config.ccr_inject_tool = True
+    calls = _install_two_call_retry(app, hash_key)
+
+    async def fake_compress(body, **kwargs):  # noqa: ANN001, ARG001
+        compressed = dict(body)
+        compressed["input"] = [{"role": "tool", "content": f"<<ccr:{hash_key},string,1.9KB>>"}]
+        return compressed, True, 10, ["fake:ccr"], None, 100, 50, 20, {}
+
+    server._compress_openai_responses_payload_in_executor = fake_compress
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.6-luna", "input": "read the Jira issue", "stream": False},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert calls[0]["body"]["tools"][0]["name"] == CCR_TOOL_NAME
+    assert "function" not in calls[0]["body"]["tools"][0]
+
+
+def test_responses_ccr_tool_replays_on_marker_free_turn():
+    app = _make_app()
+    hash_key = "abc123def456abc123def456"
+    get_compression_store().store(
+        original="full Jira description",
+        compressed="<<ccr:abc123def456abc123def456,string,1.9KB>>",
+        explicit_hash=hash_key,
+    )
+    server = app.state.proxy
+    server.config.optimize = True
+    server.config.ccr_inject_tool = True
+    server.session_tracker_store.compute_session_id = lambda *args: "responses-session"
+    calls: list[dict] = []
+    compression_calls = 0
+
+    async def fake_compress(body, **kwargs):  # noqa: ANN001, ARG001
+        nonlocal compression_calls
+        compression_calls += 1
+        compressed = dict(body)
+        if compression_calls == 1:
+            compressed["input"] = [{"role": "tool", "content": f"<<ccr:{hash_key},string,1.9KB>>"}]
+            return compressed, True, 10, ["fake:ccr"], None, 100, 50, 20, {}
+        return compressed, False, 0, [], "unchanged", 50, 50, 0, {}
+
+    async def fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+        calls.append(body)
+        return _final_response(url)
+
+    server._compress_openai_responses_payload_in_executor = fake_compress
+    server._retry_request = fake_retry
+
+    client_tools = [{"type": "function", "name": "client_tool"}]
+    with TestClient(app) as client:
+        for prompt in ("first turn", "marker-free follow-up"):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "gpt-5.6-luna",
+                    "input": prompt,
+                    "tools": client_tools,
+                    "stream": False,
+                },
+                headers={
+                    "Authorization": "Bearer sk-test",
+                    "x-headroom-session-id": "responses-session",
+                },
+            )
+            assert response.status_code == 200, response.text
+
+    assert len(calls) == 2
+    for body in calls:
+        names = {tool["name"] for tool in body["tools"]}
+        assert names == {"client_tool", CCR_TOOL_NAME}
+        ccr_tool = next(tool for tool in body["tools"] if tool["name"] == CCR_TOOL_NAME)
+        assert "function" not in ccr_tool
 
 
 @pytest.fixture(autouse=True)
