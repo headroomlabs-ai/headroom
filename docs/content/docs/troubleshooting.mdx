@@ -443,7 +443,49 @@ uv cache clean litellm
 If the failure is specifically for `ast-grep-cli==0.44.1`, that release is already excluded by Headroom's dependency pin (`ast-grep-cli>=0.30.0,!=0.44.1`) due to a compromised supply-chain build ([ast-grep/ast-grep#2799](https://github.com/ast-grep/ast-grep/issues/2799)) — `uv cache clean` and a plain reinstall should pick up a safe version automatically.
 
 ## Provider-Specific Issues
+### Windows: `headroom` command not found
 
+If Headroom installs successfully but running:
+
+```bash
+headroom --help
+```
+
+or
+
+```bash
+headroom wrap claude
+```
+
+returns:
+
+```text
+'headroom' is not recognized as an internal or external command
+```
+
+the CLI may have been installed successfully but Python's **Scripts** directory is not available on your `PATH`.
+
+You can verify that the executable exists with:
+
+```powershell
+python -m pip show -f headroom-ai
+```
+
+If `headroom.exe` appears in the output, add your Python Scripts directory to your `PATH`.
+
+For example:
+
+```text
+C:\Users\<username>\AppData\Local\Programs\Python\Python312\Scripts
+```
+
+After updating your `PATH`, restart your terminal and run:
+
+```bash
+headroom --help
+```
+
+to confirm the CLI is available.
 ### OpenAI: Invalid API key
 
 ```python
