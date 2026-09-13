@@ -682,6 +682,18 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Minimum times a pattern must be observed before it is persisted to memory. Default: 5.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_EMBEDDING_SERVER_THREADS",
+        "embedding_server_threads",
+        "Embedding server threads",
+        "Memory",
+        "int",
+        default=4,
+        minimum=1,
+        maximum=32,
+        help="ONNX worker threads used by the embedding sidecar.",
+        tier="advanced",
+    ),
     # --- Endpoints (custom Anthropic/OpenAI upstream) ---
     SettingField(
         "ANTHROPIC_TARGET_API_URL",
