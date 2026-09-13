@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from headroom.pricing.deepseek_tiers import (
     PEAK_MULTIPLIER,
+    WEEKEND_OFF_PEAK_FROM,
     bare_model,
+    is_peak,
     off_peak_rates,
+    rates_for,
 )
 
 
@@ -84,3 +89,94 @@ class TestOffPeakRates:
         assert rates is not None
         with pytest.raises(AttributeError):
             rates.input_per_1m = 1.0  # type: ignore[misc]
+
+
+def utc(day: int, hour: int, minute: int = 0) -> datetime:
+    """UTC instant in August 2026; day 17 is a Monday, 22/29 Saturdays, 23 Sunday."""
+    return datetime(2026, 8, day, hour, minute, tzinfo=timezone.utc)
+
+
+class TestBeijingPeakWindows:
+    @pytest.mark.parametrize("hour,minute", [(1, 0), (3, 59), (6, 0), (9, 59)])
+    def test_weekday_peak_windows(self, hour, minute):
+        # 01:00-04:00 and 06:00-10:00 UTC are 09:00-12:00 and 14:00-18:00 Beijing.
+        assert is_peak(utc(17, hour, minute)) is True
+
+    @pytest.mark.parametrize("hour,minute", [(4, 0), (10, 0), (0, 0), (12, 0), (23, 59)])
+    def test_weekday_off_peak(self, hour, minute):
+        assert is_peak(utc(17, hour, minute)) is False
+
+    def test_pre_rule_saturday_keeps_the_weekday_windows(self):
+        # 2026-08-22 02:00 UTC is Saturday 10:00 Beijing, before the rule takes
+        # effect, so it is still peak.
+        assert WEEKEND_OFF_PEAK_FROM > utc(22, 2)
+        assert is_peak(utc(22, 2)) is True
+
+    @pytest.mark.parametrize("day,hour", [(23, 2), (23, 7), (29, 2), (29, 7)])
+    def test_post_rule_weekends_are_all_day_off_peak(self, day, hour):
+        assert is_peak(utc(day, hour)) is False
+
+    def test_the_effective_instant_itself_is_off_peak(self):
+        assert WEEKEND_OFF_PEAK_FROM == utc(22, 16)
+        assert is_peak(WEEKEND_OFF_PEAK_FROM) is False
+
+    def test_naive_instants_are_read_as_utc(self):
+        assert is_peak(datetime(2026, 8, 17, 2, 0)) is True
+        assert is_peak(datetime(2026, 8, 17, 12, 0)) is False
+
+
+class TestRatesFor:
+    def test_peak_instant_selects_the_peak_tier(self):
+        off = off_peak_rates("deepseek-flash")
+        rates = rates_for("deepseek-flash", utc(17, 2))
+        assert off is not None
+        assert rates is not None
+        assert rates.tier == "peak"
+        # Literal vendor peak rates, not just the product of the off-peak row and
+        # PEAK_MULTIPLIER: re-deriving from the same constant cannot catch a wrong
+        # multiplier or a field that should not have been multiplied.
+        assert rates.cache_hit_per_1m == 0.006
+        assert rates.input_per_1m == 0.30
+        assert rates.output_per_1m == 1.20
+        assert rates.cache_write_per_1m == 0.0
+        assert rates.input_per_1m == off.input_per_1m * PEAK_MULTIPLIER
+
+    def test_off_peak_instant_selects_the_off_peak_tier(self):
+        off = off_peak_rates("deepseek-v4-pro")
+        rates = rates_for("deepseek-v4-pro", utc(17, 12))
+        assert off is not None
+        assert rates is not None
+        assert rates.tier == "off_peak"
+        assert rates.input_per_1m == off.input_per_1m
+
+    def test_default_instant_reads_the_wall_clock(self):
+        rates = rates_for("deepseek-flash")
+        assert rates is not None
+        expected = "peak" if is_peak(datetime.now(timezone.utc)) else "off_peak"
+        assert rates.tier == expected
+
+    def test_naive_instant_selects_the_same_tier_as_the_aware_one(self):
+        aware = rates_for("deepseek-flash", utc(17, 2))
+        naive = rates_for("deepseek-flash", datetime(2026, 8, 17, 2))
+        assert aware is not None
+        assert naive is not None
+        assert (naive.tier, naive.input_per_1m) == (aware.tier, aware.input_per_1m)
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek/deepseek-v4-pro",
+        ],
+    )
+    def test_aliases_and_prefixed_ids_are_tiered(self, model):
+        # Compare against the bare id rather than asserting non-None: a prefix bug
+        # that resolved the prefixed id to the wrong model's row would still be
+        # non-None.
+        bare = model.rsplit("/", 1)[-1]
+        assert rates_for(model, utc(17, 2)) == rates_for(bare, utc(17, 2))
+
+    @pytest.mark.parametrize("model", ["deepseek-chat", "gpt-4o", ""])
+    def test_out_of_scope_models_return_none(self, model):
+        assert rates_for(model, utc(17, 2)) is None
