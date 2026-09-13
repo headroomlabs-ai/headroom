@@ -100,19 +100,33 @@ def test_subscription_rejects_generic_token_and_accepts_api_token(
     )
     # A generic GitHub token is present but cannot be exchanged for a Copilot
     # API token; a valid Copilot API token is discoverable behind it.
+    non_platform_candidates = [
+        copilot_auth.CopilotTokenCandidate(
+            token="ghp-generic-pat",
+            source="env:GITHUB_TOKEN",
+            confidence="generic-github",
+        )
+    ]
+    platform_candidates = [
+        copilot_auth.CopilotTokenCandidate(
+            token="tid_real_copilot",
+            source="macos-keychain:copilot-cli",
+            confidence="high",
+        )
+    ]
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
-        lambda: [
-            copilot_auth.CopilotTokenCandidate(
-                token="ghp-generic-pat", source="env:GITHUB_TOKEN", confidence="generic-github"
-            ),
-            copilot_auth.CopilotTokenCandidate(
-                token="tid_real_copilot",
-                source="macos-keychain:copilot-cli",
-                confidence="high",
-            ),
-        ],
+        lambda *, include_platform_secret_stores=True: (
+            platform_candidates + non_platform_candidates
+            if include_platform_secret_stores
+            else non_platform_candidates
+        ),
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "_platform_secret_store_oauth_token_candidates",
+        lambda: platform_candidates,
     )
     monkeypatch.setattr(
         copilot_auth,

@@ -195,7 +195,11 @@ def test_read_cached_oauth_token_prefers_copilot_cli_before_generic_github_token
     monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
     monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp-generic")
-    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: None,
+    )
     monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-keychain")
     monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
 
@@ -233,7 +237,7 @@ def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
-        lambda: [
+        lambda **_kwargs: [
             copilot_auth.CopilotTokenCandidate(
                 token="ghp-generic",
                 source="env:GITHUB_TOKEN",
@@ -259,6 +263,30 @@ def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
     assert copilot_auth.resolve_subscription_bearer_token() == "tid_copilot"
 
 
+def test_resolve_subscription_candidates_skips_unvalidated_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda candidate: pytest.fail(f"must not exchange {candidate.source}"),
+    )
+
+    assert (
+        copilot_auth._resolve_subscription_oauth_token_candidates(
+            [
+                copilot_auth.CopilotTokenCandidate(
+                    token="gho-unvalidated",
+                    source="untrusted",
+                    confidence="low",
+                    validate_for_subscription=False,
+                )
+            ]
+        )
+        is None
+    )
+
+
 def test_resolve_subscription_bearer_token_does_not_fallback_to_unexchanged_oauth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -270,7 +298,7 @@ def test_resolve_subscription_bearer_token_does_not_fallback_to_unexchanged_oaut
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
-        lambda: [
+        lambda **_kwargs: [
             copilot_auth.CopilotTokenCandidate(
                 token="gho-copilot",
                 source="macos-keychain:copilot-cli",
@@ -291,6 +319,126 @@ def test_resolve_subscription_bearer_token_does_not_fallback_to_unexchanged_oaut
     assert copilot_auth.resolve_subscription_bearer_token() is None
 
 
+def test_resolve_subscription_bearer_token_defers_keychain_when_saved_token_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copilot_auth.save_headroom_copilot_oauth_token("gho-saved")
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_macos_keychain_oauth_token",
+        lambda: pytest.fail("Keychain must not be read when saved OAuth resolves"),
+    )
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda candidate: (
+            copilot_auth._subscription_resolution(
+                token="copilot-api",
+                source=f"{candidate.source}:token-exchange",
+                confidence="copilot-token-exchange",
+                api_url=copilot_auth.DEFAULT_API_URL,
+                refresh_oauth_token=candidate.token,
+            )
+            if candidate.token == "gho-saved"
+            else None
+        ),
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() == "copilot-api"
+
+
+def test_resolve_subscription_bearer_token_reads_keychain_after_noninteractive_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copilot_auth.save_headroom_copilot_oauth_token("gho-rejected")
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_macos_keychain_oauth_token",
+        lambda: "gho-keychain",
+    )
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda candidate: (
+            copilot_auth._subscription_resolution(
+                token="copilot-api",
+                source=f"{candidate.source}:token-exchange",
+                confidence="copilot-token-exchange",
+                api_url=copilot_auth.DEFAULT_API_URL,
+                refresh_oauth_token=candidate.token,
+            )
+            if candidate.token == "gho-keychain"
+            else None
+        ),
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() == "copilot-api"
+
+
+def test_resolve_subscription_bearer_token_reads_windows_store_after_noninteractive_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copilot_auth.save_headroom_copilot_oauth_token("gho-rejected")
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: "gho-windows",
+    )
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda candidate: (
+            copilot_auth._subscription_resolution(
+                token="copilot-api",
+                source=f"{candidate.source}:token-exchange",
+                confidence="copilot-token-exchange",
+                api_url=copilot_auth.DEFAULT_API_URL,
+                refresh_oauth_token=candidate.token,
+            )
+            if candidate.token == "gho-windows"
+            else None
+        ),
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() == "copilot-api"
+
+
+def test_resolve_subscription_bearer_token_skips_duplicate_keychain_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    copilot_auth.save_headroom_copilot_oauth_token("gho-duplicate")
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_macos_keychain_oauth_token",
+        lambda: "gho-duplicate",
+    )
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+    attempted_tokens: list[str] = []
+    monkeypatch.setattr(
+        copilot_auth,
+        "_subscription_resolution_from_token_exchange",
+        lambda candidate: attempted_tokens.append(candidate.token) or None,
+    )
+
+    assert copilot_auth.resolve_subscription_bearer_token() is None
+    assert attempted_tokens == ["gho-duplicate"]
+
+
 def test_subscription_enterprise_host_repro(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -305,7 +453,7 @@ def test_subscription_enterprise_host_repro(
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
-        lambda: [
+        lambda **_kwargs: [
             copilot_auth.CopilotTokenCandidate(
                 token="gho-oauth",
                 source="headroom-copilot-auth:/tmp/copilot_auth.json",
@@ -361,7 +509,7 @@ def test_resolve_subscription_exchange_uses_cloud_enterprise_advertised_api(
     monkeypatch.setattr(
         copilot_auth,
         "iter_oauth_token_candidates",
-        lambda: [
+        lambda **_kwargs: [
             copilot_auth.CopilotTokenCandidate(
                 token="gho-oauth",
                 source="env:GITHUB_COPILOT_TOKEN",
@@ -428,7 +576,7 @@ def _resolve_subscription_producer_path(
             patch.setattr(
                 copilot_auth,
                 "iter_oauth_token_candidates",
-                lambda: [
+                lambda **_kwargs: [
                     copilot_auth.CopilotTokenCandidate(
                         token="gho-oauth", source="test", confidence="test"
                     )
@@ -446,7 +594,7 @@ def _resolve_subscription_producer_path(
             patch.setattr(
                 copilot_auth,
                 "iter_oauth_token_candidates",
-                lambda: [
+                lambda **_kwargs: [
                     copilot_auth.CopilotTokenCandidate(
                         token="tid_api", source="test", confidence="test"
                     )
@@ -1649,3 +1797,90 @@ def test_exchange_token_sync_uses_configured_corporate_tls_context(
 
     assert result == payload
     assert captured["context"] is tls_context
+
+
+def test_iter_oauth_token_candidates_includes_linux_secret_service_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: "gho-linux")
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    candidates = copilot_auth.iter_oauth_token_candidates()
+
+    assert [(candidate.source, candidate.token) for candidate in candidates] == [
+        ("linux-secret-service:copilot-cli", "gho-linux"),
+    ]
+
+
+def test_iter_oauth_token_candidates_skips_platform_secret_stores_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_TOKEN", raising=False)
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: pytest.fail("Windows Credential Manager should not be read"),
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "_platform_secret_store_oauth_token_candidates",
+        lambda: pytest.fail("platform secret stores should not be read"),
+    )
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    assert copilot_auth.iter_oauth_token_candidates(include_platform_secret_stores=False) == []
+
+
+def test_iter_oauth_token_candidates_reads_windows_store_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for env_var in (
+        "GITHUB_COPILOT_GITHUB_TOKEN",
+        "GITHUB_COPILOT_TOKEN",
+        "COPILOT_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setattr(
+        copilot_auth,
+        "_read_windows_copilot_cli_oauth_token",
+        lambda: "gho-windows",
+    )
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_file_oauth_token_candidates", lambda: [])
+    monkeypatch.setattr(copilot_auth, "_read_gh_cli_oauth_token", lambda: None)
+
+    candidates = copilot_auth.iter_oauth_token_candidates()
+
+    assert [(candidate.source, candidate.token) for candidate in candidates] == [
+        ("windows-credential-manager:copilot-cli", "gho-windows"),
+    ]
+
+
+def test_platform_secret_store_candidates_include_macos_keychain_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(copilot_auth, "_read_windows_copilot_cli_oauth_token", lambda: None)
+    monkeypatch.setattr(copilot_auth, "_read_macos_keychain_oauth_token", lambda: "gho-macos")
+    monkeypatch.setattr(copilot_auth, "_read_linux_secret_oauth_token", lambda: None)
+
+    candidates = copilot_auth._platform_secret_store_oauth_token_candidates()
+
+    assert [(candidate.source, candidate.token) for candidate in candidates] == [
+        ("macos-keychain:copilot-cli", "gho-macos"),
+    ]
