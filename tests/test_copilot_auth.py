@@ -927,6 +927,16 @@ def test_build_copilot_upstream_url_strips_v1_only_for_copilot_hosts() -> None:
     )
 
 
+def test_build_copilot_upstream_url_avoids_duplicate_v1_for_custom_base() -> None:
+    assert (
+        copilot_auth.build_copilot_upstream_url(
+            "https://gateway.example/api/v1",
+            "/v1/responses",
+        )
+        == "https://gateway.example/api/v1/responses"
+    )
+
+
 def test_build_copilot_upstream_url_preserves_v1_messages_for_copilot() -> None:
     # Copilot's Anthropic surface for Claude models is /v1/messages (with the
     # /v1); stripping it forwarded /messages and Copilot 404'd (#2409).
