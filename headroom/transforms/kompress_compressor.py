@@ -23,6 +23,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
@@ -484,6 +485,7 @@ def _kompress_content_signature(content: str) -> Any:
     )
 
 
+@lru_cache(maxsize=1)
 def _is_onnx_available() -> bool:
     """Check if ONNX Runtime is available (lightweight, no torch needed)."""
     try:
@@ -491,10 +493,13 @@ def _is_onnx_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # OSError: the package is installed but its native library will not
+        # load. See _is_pytorch_available for the full case.
         return False
 
 
+@lru_cache(maxsize=1)
 def _is_pytorch_available() -> bool:
     """Check if full PyTorch stack is available (requires [ml] extra)."""
     try:
@@ -503,7 +508,14 @@ def _is_pytorch_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # An installed-but-unloadable native dependency raises OSError, not
+        # ImportError: on Windows without the MSVC redistributable, importing
+        # torch fails with WinError 126 loading c10.dll. Catching only
+        # ImportError let that escape a probe whose contract is to return a
+        # bool, and callers guard the call with `except ImportError` too, so it
+        # propagated into the request path instead of degrading to "no
+        # kompress".
         return False
 
 
