@@ -7,6 +7,7 @@ and Unicode tokenization for high-quality search results.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -17,7 +18,7 @@ from ..models import Memory
 from ..ports import TextFilter, TextSearchResult
 
 if TYPE_CHECKING:
-    pass
+    from collections.abc import Iterator
 
 
 @dataclass
@@ -67,15 +68,20 @@ class FTS5TextIndex:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the FTS5 virtual table schema."""
