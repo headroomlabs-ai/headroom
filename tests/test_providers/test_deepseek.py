@@ -8,7 +8,7 @@ from headroom.pricing.deepseek_prices import (
     DEEPSEEK_PRICES,
     get_deepseek_registry,
 )
-from headroom.pricing.registry import PricingRegistry
+from headroom.pricing.registry import ModelPricing, PricingRegistry
 
 # Monday 2026-08-17: 02:00 UTC = 10:00 Beijing (peak), 12:00 UTC = 20:00 Beijing (off-peak).
 PEAK = datetime(2026, 8, 17, 2, 0, tzinfo=timezone.utc)
@@ -97,10 +97,51 @@ class TestDeepSeekPricingModule:
         assert cost.cost_usd == pytest.approx(0.003)
         assert cost.breakdown["cached_input"]["rate_per_1m"] == pytest.approx(0.003)
 
-    def test_registry_rejects_batch_tokens_for_deepseek(self):
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"batch_input_tokens": 1}, "batch input pricing"),
+            ({"batch_output_tokens": 1}, "batch output pricing"),
+        ],
+    )
+    def test_registry_rejects_batch_tokens_for_deepseek(self, kwargs, match):
         registry = get_deepseek_registry()
-        with pytest.raises(ValueError, match="batch input pricing"):
-            registry.estimate_cost("deepseek-flash", batch_input_tokens=1, now=OFF_PEAK)
+        with pytest.raises(ValueError, match=match):
+            registry.estimate_cost("deepseek-flash", now=OFF_PEAK, **kwargs)
+
+    def test_tiered_and_flat_paths_carry_the_same_estimate_metadata(self):
+        # A tagged id is out of tier scope, so it is priced by the flat body; the
+        # two paths must not drift on how they build the CostEstimate.
+        registry = get_deepseek_registry()
+        registry.prices["deepseek/deepseek-v4-pro:free"] = DEEPSEEK_PRICES["deepseek-v4-pro"]
+
+        tiered = registry.estimate_cost("deepseek-flash", input_tokens=1_000_000, now=OFF_PEAK)
+        flat = registry.estimate_cost(
+            "deepseek/deepseek-v4-pro:free", input_tokens=1_000_000, now=OFF_PEAK
+        )
+        assert (tiered.pricing_date, tiered.is_stale, tiered.warning) == (
+            flat.pricing_date,
+            flat.is_stale,
+            flat.warning,
+        )
+
+    def test_registry_ignores_a_flat_row_for_a_tiered_id(self):
+        # The tier table is authoritative for flash/pro, so a stale or custom flat
+        # row for one of those ids must not be able to reprice it (the documented
+        # contract on estimate_cost).
+        registry = get_deepseek_registry()
+        registry.prices["deepseek-flash"] = ModelPricing(
+            model="deepseek-flash",
+            provider="deepseek",
+            input_per_1m=999.0,
+            output_per_1m=999.0,
+        )
+
+        cost = registry.estimate_cost("deepseek-flash", input_tokens=1_000_000, now=OFF_PEAK)
+
+        assert cost.cost_usd == pytest.approx(0.15)
+        assert cost.breakdown["input"]["rate_per_1m"] == pytest.approx(0.15)
+        assert cost.breakdown["tier"] == "off_peak"
 
 
 class TestDeepSeekLiteLLMInjection:

@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from .deepseek_tiers import DeepSeekRates
 from .deepseek_tiers import rates_for as _deepseek_rates_for
 
 
@@ -121,24 +120,32 @@ class PricingRegistry:
 
         Raises:
             ValueError: If model is not found in registry.
+
+        Note:
+            DeepSeek flash/pro ids are priced from the peak/off-peak tier table
+            even when absent from ``self.prices``, and a flat row for such an id
+            is deliberately ignored in favour of the tier.
         """
         tier = _deepseek_rates_for(model, now)
-        if tier is not None:
-            return self._tiered_estimate(
-                model,
-                tier,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
-                batch_input_tokens=batch_input_tokens,
-                batch_output_tokens=batch_output_tokens,
+        # The synthesized row deliberately leaves the batch rates ``None``, so
+        # the flat body's own guards raise the same messages DeepSeek's flat
+        # rows would. Tier and flat pricing share one arithmetic body, so the
+        # two cannot drift.
+        pricing = (
+            self.get_price(model)
+            if tier is None
+            else ModelPricing(
+                model=model,
+                provider="deepseek",
+                input_per_1m=tier.input_per_1m,
+                output_per_1m=tier.output_per_1m,
+                cached_input_per_1m=tier.cache_hit_per_1m,
             )
-
-        pricing = self.get_price(model)
+        )
         if pricing is None:
             raise ValueError(f"Model '{model}' not found in registry")
 
-        breakdown = {}
+        breakdown: dict = {"tier": tier.tier} if tier is not None else {}
         total_cost = 0.0
 
         # Regular input tokens
@@ -196,66 +203,6 @@ class PricingRegistry:
                 "cost_usd": batch_output_cost,
             }
             total_cost += batch_output_cost
-
-        return CostEstimate(
-            cost_usd=total_cost,
-            breakdown=breakdown,
-            pricing_date=self.last_updated,
-            is_stale=self.is_stale(),
-            warning=self.staleness_warning(),
-        )
-
-    def _tiered_estimate(
-        self,
-        model: str,
-        tier: DeepSeekRates,
-        *,
-        input_tokens: int,
-        output_tokens: int,
-        cached_input_tokens: int,
-        batch_input_tokens: int,
-        batch_output_tokens: int,
-    ) -> CostEstimate:
-        """Price a DeepSeek request from its peak/off-peak tier.
-
-        Input and cached-input tokens are separate additive buckets, exactly as
-        in the flat path. DeepSeek publishes no batch tier, so batch tokens keep
-        raising rather than being priced from the wrong rate.
-        """
-        if batch_input_tokens > 0:
-            raise ValueError(f"Model '{model}' does not have batch input pricing")
-        if batch_output_tokens > 0:
-            raise ValueError(f"Model '{model}' does not have batch output pricing")
-
-        breakdown: dict = {"tier": tier.tier}
-        total_cost = 0.0
-
-        if input_tokens > 0:
-            input_cost = (input_tokens / 1_000_000) * tier.input_per_1m
-            breakdown["input"] = {
-                "tokens": input_tokens,
-                "rate_per_1m": tier.input_per_1m,
-                "cost_usd": input_cost,
-            }
-            total_cost += input_cost
-
-        if output_tokens > 0:
-            output_cost = (output_tokens / 1_000_000) * tier.output_per_1m
-            breakdown["output"] = {
-                "tokens": output_tokens,
-                "rate_per_1m": tier.output_per_1m,
-                "cost_usd": output_cost,
-            }
-            total_cost += output_cost
-
-        if cached_input_tokens > 0:
-            cached_cost = (cached_input_tokens / 1_000_000) * tier.cache_hit_per_1m
-            breakdown["cached_input"] = {
-                "tokens": cached_input_tokens,
-                "rate_per_1m": tier.cache_hit_per_1m,
-                "cost_usd": cached_cost,
-            }
-            total_cost += cached_cost
 
         return CostEstimate(
             cost_usd=total_cost,
