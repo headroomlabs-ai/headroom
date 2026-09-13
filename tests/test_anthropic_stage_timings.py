@@ -257,6 +257,37 @@ def test_anthropic_http_happy_path_emits_stage_timings(stage_log_capture):
     assert "total_pre_upstream" in emitted
 
 
+def test_subscription_contribution_receives_request_savings_usd(monkeypatch):
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer oauth-test"},
+    )
+    handler = _DummyAnthropicHandler()
+    captured: dict[str, object] = {}
+    tracker = SimpleNamespace(
+        notify_active=lambda token: None,
+        update_contribution=lambda **kwargs: captured.update(kwargs),
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+    monkeypatch.setattr(
+        "headroom.subscription.tracker.get_subscription_tracker",
+        lambda: tracker,
+    )
+    monkeypatch.setattr(
+        "headroom.proxy.savings_tracker.estimate_request_savings_usd",
+        lambda model, **kwargs: {"compression": 1.25, "provider_cache": 2.5},
+    )
+
+    anyio.run(handler.handle_anthropic_messages, request)
+
+    assert captured["compression_savings_usd"] == 1.25
+    assert captured["cache_savings_usd"] == 2.5
+
+
 def test_anthropic_no_optimize_preserves_client_tool_order():
     tools = [
         {
