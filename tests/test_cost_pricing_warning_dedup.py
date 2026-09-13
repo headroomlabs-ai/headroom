@@ -63,3 +63,31 @@ def test_litellm_unavailable_warns_once_per_model(monkeypatch, caplog):
 
     unavailable = [r for r in caplog.records if "LiteLLM not available" in r.getMessage()]
     assert len(unavailable) == 1
+
+
+def test_passthrough_model_skips_pricing_without_warning(monkeypatch, caplog):
+    import headroom.proxy.cost as cost_mod
+
+    class _FakeLiteLLM:
+        @staticmethod
+        def cost_per_token(**_kwargs):
+            raise AssertionError("cost_per_token must not be called")
+
+    monkeypatch.setattr(cost_mod, "_get_litellm_module", lambda: _FakeLiteLLM())
+    tracker = cost_mod.CostTracker()
+
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        assert tracker.estimate_cost("passthrough:count_tokens", 100, 50) is None
+
+    assert not caplog.records
+
+
+def test_stats_omit_passthrough_models(cost_tracker):
+    cost_tracker.record_tokens("passthrough:count_tokens", 10, 90)
+    cost_tracker.record_tokens("glm-5.2", 20, 80)
+
+    stats = cost_tracker.stats()
+
+    assert set(stats["per_model"]) == {"glm-5.2"}
+    assert stats["total_tokens_saved"] == 20
+    assert stats["total_input_tokens"] == 80
