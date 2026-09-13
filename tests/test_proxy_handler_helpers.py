@@ -1097,6 +1097,32 @@ def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
     assert label is None
 
 
+class TestImageOptimizerDisableEnv:
+    """HEADROOM_DISABLE_IMAGE_OPTIMIZER gives an operator a zero-code opt-out."""
+
+    def test_image_optimizer_disabled_reads_env(self, monkeypatch):
+        from headroom.proxy.helpers import image_optimizer_disabled
+
+        monkeypatch.delenv("HEADROOM_DISABLE_IMAGE_OPTIMIZER", raising=False)
+        assert image_optimizer_disabled() is False
+
+        for truthy in ("1", "true", "TRUE", "yes", "on"):
+            monkeypatch.setenv("HEADROOM_DISABLE_IMAGE_OPTIMIZER", truthy)
+            assert image_optimizer_disabled() is True
+
+        for falsy in ("0", "false", "no", "off", ""):
+            monkeypatch.setenv("HEADROOM_DISABLE_IMAGE_OPTIMIZER", falsy)
+            assert image_optimizer_disabled() is False
+
+    def test_get_image_compressor_returns_none_when_disabled(self, monkeypatch):
+        from headroom.proxy import helpers
+
+        monkeypatch.setenv("HEADROOM_DISABLE_IMAGE_OPTIMIZER", "1")
+        # Even if the stack is importable, the env opt-out short-circuits first.
+        monkeypatch.setattr(helpers, "_image_compressor_available", None, raising=False)
+        assert helpers._get_image_compressor() is None
+
+
 class TestHasNewCcrMarkers:
     """#1850: replayed (overlay) markers must not count as new-this-turn.
 

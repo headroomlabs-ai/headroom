@@ -312,6 +312,39 @@ class MLModelRegistry:
             return result
 
     # =========================================================================
+    # ONNX Technique Router (no PyTorch)
+    # =========================================================================
+
+    @classmethod
+    def get_onnx_technique_router(cls, use_siglip: bool = True) -> Any:
+        """Get the shared ONNX technique router instance.
+
+        Unlike :meth:`get_technique_router` (PyTorch), this caches the
+        ``OnnxTechniqueRouter`` itself; its ONNX ``InferenceSession`` objects
+        are built lazily inside the instance and persist with it. Sharing the
+        instance avoids rebuilding the classifier + SigLIP sessions on every
+        image request — the root cause of the multi-second per-image latency.
+
+        Args:
+            use_siglip: Whether the router should load the SigLIP encoder.
+
+        Returns:
+            A shared ``OnnxTechniqueRouter`` instance.
+        """
+        instance = cls.get()
+        key = f"onnx_technique_router:{use_siglip}"
+
+        with instance._model_lock:
+            if key not in instance._models:
+                from headroom.image.onnx_router import OnnxTechniqueRouter
+
+                logger.info(f"Loading ONNX technique router (use_siglip={use_siglip})")
+                instance._models[key] = OnnxTechniqueRouter(use_siglip=use_siglip)
+
+            router: Any = instance._models[key]
+            return router
+
+    # =========================================================================
     # Utility Methods
     # =========================================================================
 
