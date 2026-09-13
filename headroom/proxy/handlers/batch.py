@@ -281,6 +281,7 @@ class BatchHandlerMixin:
                 )
                 # Pass through unchanged on failure — count original as optimized
                 compressed_requests.append(batch_req)
+                total_original_tokens += original_tokens  # keep denominator aligned
                 total_optimized_tokens += original_tokens  # 0 if pipeline never ran
 
         # Update body with compressed requests

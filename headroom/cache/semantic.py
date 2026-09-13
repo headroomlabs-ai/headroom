@@ -74,6 +74,11 @@ class CacheEntry:
     # Hash of the full messages for exact matching
     messages_hash: str = ""
 
+    # Hash of the conversation preceding the final user turn. Semantic matches
+    # are only valid within the same prior context — otherwise a paraphrased
+    # final query in a different conversation returns the wrong response.
+    context_hash: str = ""
+
 
 @dataclass
 class SemanticCacheConfig:
@@ -134,6 +139,7 @@ class SemanticCache:
         self,
         query: str,
         messages_hash: str | None = None,
+        context_hash: str | None = None,
     ) -> CacheEntry | None:
         """
         Look up a cached entry.
@@ -141,6 +147,9 @@ class SemanticCache:
         Args:
             query: Query text to search for
             messages_hash: Optional exact hash for fast lookup
+            context_hash: Optional hash of the conversation preceding the final
+                user turn. When provided, semantic matches are restricted to
+                entries sharing the same prior context.
 
         Returns:
             CacheEntry if found, None otherwise
@@ -173,9 +182,9 @@ class SemanticCache:
         # messages_hash above, which is context-complete and safe.
         if self._embedding_fn and query.strip():
             query_embedding = self._embedding_fn(query)
-            best_match, best_similarity = self._find_similar(query_embedding)
+            best_match, best_similarity = self._find_similar(query_embedding, context_hash)
 
-            if best_similarity >= self.config.similarity_threshold:
+            if best_match and best_similarity >= self.config.similarity_threshold:
                 self._touch(best_match)
                 self._hits += 1
                 return self._cache[best_match]
@@ -188,6 +197,7 @@ class SemanticCache:
         query: str,
         response: Any,
         messages_hash: str | None = None,
+        context_hash: str | None = None,
     ) -> str:
         """
         Store a response in the cache.
@@ -196,6 +206,8 @@ class SemanticCache:
             query: Query text
             response: Response to cache
             messages_hash: Optional exact hash for fast lookup
+            context_hash: Optional hash of the conversation preceding the final
+                user turn, used to scope semantic matches.
 
         Returns:
             Cache key for the entry
@@ -235,6 +247,7 @@ class SemanticCache:
             created_at=now,
             last_accessed=now,
             messages_hash=messages_hash or "",
+            context_hash=context_hash or "",
         )
 
         self._cache[key] = entry
@@ -276,13 +289,19 @@ class SemanticCache:
     def _find_similar(
         self,
         query_embedding: list[float],
+        context_hash: str | None = None,
     ) -> tuple[str, float]:
-        """Find the most similar cached entry."""
+        """Find the most similar cached entry within the same prior context."""
         best_key = ""
         best_similarity = -1.0
 
         for key, entry in self._cache.items():
             if not entry.embedding:
+                continue
+
+            # Only match within the same conversation context. A None
+            # context_hash means the caller has no context to enforce.
+            if context_hash is not None and entry.context_hash != context_hash:
                 continue
 
             similarity = self._cosine_similarity(query_embedding, entry.embedding)
@@ -405,9 +424,10 @@ class SemanticCacheLayer:
         # Extract query for semantic matching
         query = context.query or self._extract_query(messages)
         messages_hash = self._compute_messages_hash(messages)
+        context_hash = self._compute_context_hash(messages)
 
         # Check semantic cache
-        cached = self.cache.get(query, messages_hash)
+        cached = self.cache.get(query, messages_hash, context_hash)
         if cached:
             return CacheResult(
                 messages=messages,
@@ -447,8 +467,9 @@ class SemanticCacheLayer:
         """
         query = (context.query if context else None) or self._extract_query(messages)
         messages_hash = self._compute_messages_hash(messages)
+        context_hash = self._compute_context_hash(messages)
 
-        return self.cache.put(query, response, messages_hash)
+        return self.cache.put(query, response, messages_hash, context_hash)
 
     def get_stats(self) -> dict[str, Any]:
         """Get combined statistics."""
@@ -477,6 +498,27 @@ class SemanticCacheLayer:
 
         try:
             content = json.dumps(messages, sort_keys=True)
+            return hashlib.sha256(content.encode()).hexdigest()[:24]
+        except (TypeError, ValueError):
+            return ""
+
+    def _compute_context_hash(self, messages: list[dict[str, Any]]) -> str:
+        """Hash the conversation preceding the final user turn.
+
+        The final user message is the semantic query; everything before it is
+        the context that must match for a semantic hit to be valid.
+        """
+        import json
+
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        prior = messages[:last_user_idx] if last_user_idx is not None else messages
+        try:
+            content = json.dumps(prior, sort_keys=True)
             return hashlib.sha256(content.encode()).hexdigest()[:24]
         except (TypeError, ValueError):
             return ""
