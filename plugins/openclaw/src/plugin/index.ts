@@ -21,6 +21,7 @@ import {
   resolveGatewayProviderIds,
 } from "../gateway-config.js";
 import { normalizeAndValidateProxyUrl, probeHeadroomProxy } from "../proxy-manager.js";
+import { readProviderSessionHeaders } from "../session-headers.js";
 import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 
 /**
@@ -57,7 +58,16 @@ export function registerHeadroomPlugin(api: any) {
     }
 
     try {
-      const changed = applyGatewayProviderBaseUrlsInPlace(api.config, activeProxyUrl, gatewayProviderIds);
+      const overrides = {
+        providerUpstreams: readProviderUpstreams(api.config),
+        providerSessionHeaders: readProviderSessionHeaders(api.config),
+      };
+      const changed = applyGatewayProviderBaseUrlsInPlace(
+        api.config,
+        activeProxyUrl,
+        gatewayProviderIds,
+        overrides,
+      );
 
       if (changed) {
         logger.info(
@@ -72,6 +82,21 @@ export function registerHeadroomPlugin(api: any) {
       logger.warn(`[headroom] Failed to configure upstream gateway routing: ${error}`);
     }
   };
+
+  // Read the optional `providerUpstreams` map from the plugin config. Each
+  // entry maps a provider id (e.g. "openrouter", "opencode-go") to the
+  // absolute upstream URL the proxy should forward to when contacted via
+  // the rewritten base URL. Empty (or absent) means: no per-provider
+  // override, the proxy falls back to its configured default upstream.
+  function readProviderUpstreams(apiConfig: any): Record<string, string> {
+    const configured = apiConfig?.plugins?.entries?.headroom?.config?.providerUpstreams;
+    if (!configured || typeof configured !== "object") return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(configured)) {
+      if (typeof v === "string" && v.trim().length > 0) out[k] = v.trim();
+    }
+    return out;
+  }
 
   const getConfiguredRoutingProxyUrl = async (): Promise<string | null> => {
     if (!proxyUrl) {

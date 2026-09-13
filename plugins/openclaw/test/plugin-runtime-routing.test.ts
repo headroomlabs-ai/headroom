@@ -149,12 +149,12 @@ describe("headroomPlugin runtime routing", () => {
     await proxyReadyListeners[0]?.("http://127.0.0.1:8787");
 
     expect(api.config.models.providers["openai-codex"]).toEqual({
-      baseUrl: "http://127.0.0.1:8787/backend-api",
+      baseUrl: "http://127.0.0.1:8787/v1",
       models: [],
     });
     expect(api.config.models.providers.anthropic).toEqual({
       api: "anthropic-messages",
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/v1",
       models: [],
     });
     expect(api.config.models.providers["github-copilot"]).toEqual({
@@ -166,7 +166,7 @@ describe("headroomPlugin runtime routing", () => {
       models: [],
     });
     expect(api.config.models.providers.openrouter).toEqual({
-      baseUrl: "http://127.0.0.1:8787/api/v1",
+      baseUrl: "http://127.0.0.1:8787/v1",
       models: [],
     });
 
@@ -259,7 +259,7 @@ describe("headroomPlugin runtime routing", () => {
     expect(mocked.ensureProxyUrl).not.toHaveBeenCalled();
     expect(api.config.models.providers.anthropic).toEqual({
       api: "anthropic-messages",
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/v1",
       models: [],
     });
   });

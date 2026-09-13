@@ -80,6 +80,42 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
 Default `proxyPort` is `8787`. Auto-start is opt-in; in production, prefer an externally
 managed proxy such as systemd with `proxyUrl` set and `autoStart: false`.
 
+### Persistent compaction mode
+
+Headroom always compresses **per-turn model input** via `assemble()`. Durable transcript compaction (`/compact`, overflow recovery) is configurable:
+
+| `persistentCompaction` | `/compact` behavior | LLM cost |
+|---|---|---|
+| `"openclaw"` (default) | OpenClaw native compaction only (`ownsCompaction: false`) | Config-dependent |
+| `"hybrid"` | Headroom replace pre-pass, then OpenClaw LLM compact | Config-dependent |
+| `"headroom"` | Headroom `/v1/compress` rewrites SQLite | Zero |
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "headroom": {
+        "config": {
+          "persistentCompaction": "hybrid",
+          "transcriptHygiene": {
+            "enabled": true,
+            "softThresholdTokens": 400000
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Hybrid (opt-in, for large tool-heavy sessions):** Headroom algorithmically shrinks tool blobs in SQLite (replace-only, no truncate) on turn-end and before `/compact`, then OpenClaw safeguard summarization handles the big history prune. OpenClaw owns durable compaction (`ownsCompaction: false`), avoiding mid-turn transcript ownership errors.
+
+After hygiene rewrites, the plugin waits for OpenClaw's SQLite transcript projection to settle (configurable via `transcriptProjectionWaitMs`, default 120s). Turn-end hygiene is debounced per session (`transcriptHygiene.debounceMs`, default 30s) so a `/compact` immediately after a turn does not stack two rewrites.
+
+**OpenClaw host setting (recommended for hybrid):** set `agents.defaults.compaction.postIndexSync` to `"await"` so durable compaction and index rebuild finish before the next turn starts. Async post-index sync plus hybrid hygiene was a common trigger for `Session transcript projection is rebuilding` errors on large sessions.
+
+Default `"openclaw"` matches upstream Headroom `main` delegation after #2304. Use `"hybrid"` when you want Headroom replace hygiene plus OpenClaw LLM compact (recommended for large tool-heavy deployments). Use `"headroom"` for zero-LLM durable compaction only.
+
 ### Upstream gateway routing
 
 By default, the plugin also rewrites the built-in `openai-codex` provider base URL to a verified active Headroom proxy at runtime. That means Codex provider traffic flows through Headroom, so `/stats` can observe real upstream request and cache activity instead of only local context compression.
@@ -210,15 +246,57 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next request re-probes the proxy via `/health`. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
+| `transcriptProjectionWaitMs` | `120000` | Max wait after hygiene rewrites for OpenClaw transcript projection rebuild to settle. `0` disables waiting. |
+| `transcriptHygiene.debounceMs` | `30000` | Per-session debounce window for turn-end hygiene and hybrid compact pre-passes. Prevents stacked SQLite rewrites within seconds. |
+| `assembleCompressConfig` | `{ protect_recent: 2 }` | Per-turn `/v1/compress` config for `assemble()`. Default protects the last two messages from aggressive inline compression. |
+| `assembleSkipBudgetRatio` | `0.7` | `assemble()` skips proxy compression while the history's rough token estimate is below `(tokenBudget − assembleReserveTokens) × ratio`. Range (0, 1]. |
+| `assembleReserveTokens` | `20000` | Subtracted from `tokenBudget` before the ratio. OpenClaw passes the full model window as `tokenBudget`, but its prompt also carries the system prompt, tool schemas and a ≥ 20k compaction reserve, and its overflow precheck counts all of them. Agents with large system prompts (memory, skills, many tools) should set this to roughly `reserve + system prompt tokens` (e.g. `60000`) so Headroom compresses before native compaction kicks in. |
+| `protectToolResults` | `[]` | Tool names (or `*` globs) whose results are restored verbatim after every `/v1/compress` round trip (assemble and durable compaction), whatever the proxy returned. Deferred `tool_call` wrappers (OpenClaw Tool Search / MCP, Hermes) are resolved to the real tool first, so an MCP tool can be named as `analyze_video`, `<server>__analyze_video` or `mcp__<server>__analyze_video`. The resolved name is also what goes on the wire, so the proxy's own `HEADROOM_PROTECT_TOOL_RESULTS` can match MCP tools instead of seeing `tool_call` for all of them. Use for tools whose prose output must not be paraphrased (vision/video analysis, structured reports). |
+| `skipAssembleWhenGatewayRouted` | `false` | When `true`, skip `assemble()` compression for models whose provider is in `gatewayProviderIds` (their live requests already pass through the proxy — prevents double compression). Providers that are not routed still get `assemble()` compression. If the provider is unknown the skip applies. |
+
+### Proxy env mitigations (operator config)
+
+These are set on the **Headroom proxy process**, not in OpenClaw. They complement the plugin conversion fixes by telling the proxy to protect OpenClaw tool outputs during compression:
+
+| Env var | Purpose |
+|---------|---------|
+| `HEADROOM_EXCLUDE_TOOLS` | Comma-separated tool names to skip compression entirely (e.g. `view_image,browser,read`). Use OpenClaw tool names as emitted in compress request bodies — the plugin now sets `name` on OpenAI `tool` messages so the proxy can match them. |
+| `HEADROOM_PROTECT_TOOL_RESULTS` | When set (e.g. `1` or `true`), enables stronger read/tool-result protection in the ContentRouter. Useful for vision and browser-heavy agents. |
+
+Example (systemd drop-in or shell before starting the proxy):
+
+```bash
+export HEADROOM_EXCLUDE_TOOLS="view_image,browser,read,exec"
+export HEADROOM_PROTECT_TOOL_RESULTS=1
+headroom proxy --port 8787
+```
+
+No Headroom Python source edits are required — these are documented operator mitigations.
 
 ## Comparison with lossless-claw
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
-| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
+| Compaction method | LLM summarization (DAG) | Configurable: OpenClaw native (`"openclaw"`, default), hybrid (`"hybrid"`), or Headroom durable (`"headroom"`) |
+| Cost of compaction | Tokens (LLM calls) | Headroom mode: zero LLM; OpenClaw mode: config-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
+
+## Tool-call preservation
+
+OpenClaw agents can lose tool payloads (especially `view_image`, `browser`, multimodal tool results) when messages pass through `assemble()` conversion. The plugin now:
+
+- Keeps non-text blocks (images, tool envelopes, thinking) **off the wire**: the proxy sees only text plus a short `[headroom-omitted image image/png N bytes]` placeholder, so base64 is never tokenized or compressed
+- Restores images, tool call blocks, thinking blocks, `toolName`, `isError` and timestamps from the **locally held originals** after compression (`openAIToAgent(compressed, { originals })`) — tool results are matched by `tool_call_id`, other messages by position. Restoration does not depend on the proxy echoing `_headroomMeta`
+- Sets OpenAI `tool.name` from `toolName` so proxy protect/exclude lists can match OpenClaw tools
+- Gates misleading `headroom_retrieve` hints on actual CCR hashes
+- Passes `protect_recent: 2` to per-turn and durable compress requests by default
+- Skips durable rewrite of messages with protected tool/image payloads
+- Optional: `skipAssembleWhenGatewayRouted: true` skips per-turn compression only for the provider actually routed through the proxy (`runtimeSettings.model.provider` ∈ `gatewayProviderIds`); direct providers keep compressing
+
+Full investigation, reproduction steps, and staging checklist: **[docs/tool-call-preservation.md](./docs/tool-call-preservation.md)**
+
+Do not re-enable `transcriptHygiene` or `persistentCompaction: "hybrid"` in production until you have validated these fixes in staging.
 
 ## License
 

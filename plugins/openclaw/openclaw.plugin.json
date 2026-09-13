@@ -41,6 +41,50 @@
     "gatewayProviderIds": {
       "label": "Gateway Provider IDs",
       "help": "Optional list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases codex, claude, copilot, and gemini are also accepted. When set, this overrides the default openai-codex-only routing."
+    },
+    "providerUpstreams": {
+      "label": "Provider Upstream Overrides",
+      "help": "Optional map from OpenClaw provider id to absolute upstream URL. When the headroom plugin rewrites a provider's base URL, it also injects an x-headroom-base-url header so the proxy can forward to the listed upstream (for OpenAI-compatible providers such as OpenRouter or opencode-go whose URLs are not /v1-rooted). URLs must NOT include a trailing /v1 — the proxy appends the request path itself. Requires HEADROOM_UPSTREAM_ALLOWED_HOSTS on the proxy to whitelist the upstream host."
+    },
+    "providerSessionHeaders": {
+      "label": "Provider Session Headers",
+      "help": "Optional map from OpenClaw provider id to a header name. The headroom plugin generates a per-process UUID and injects it under that header on requests to the provider, so OpenAI-compatible third-party APIs that route via a server-side session/accounting layer (e.g. opencode-go's x-opencode-session) can identify the session without the caller having to thread a session id through every chat-completions call."
+    },
+    "persistentCompaction": {
+      "label": "Persistent Compaction Mode",
+      "help": "How /compact and overflow recovery rewrite the SQLite transcript. \"openclaw\" (default): OpenClaw native compaction only — matches upstream delegation (ownsCompaction=false). \"hybrid\": Headroom replace pre-pass, then OpenClaw LLM compaction. \"headroom\": algorithmic durable compaction via Headroom /v1/compress (zero LLM). Per-turn assemble() always uses Headroom."
+    },
+    "transcriptHygiene": {
+      "label": "Transcript Hygiene",
+      "help": "Turn-end in-place Headroom replace on tool-heavy messages (no truncate). Enabled by default in hybrid mode. Object form: { enabled, softThresholdTokens, debounceMs }."
+    },
+    "transcriptProjectionWaitMs": {
+      "label": "Transcript Projection Wait",
+      "help": "Milliseconds to wait for OpenClaw SQLite transcript projection to settle after hygiene rewrites. Set 0 to disable. Default: 120000."
+    },
+    "durableCompaction": {
+      "label": "Durable Compaction (deprecated)",
+      "help": "Deprecated alias for persistentCompaction. true = headroom, false = openclaw."
+    },
+    "assembleCompressConfig": {
+      "label": "Assemble Compress Config",
+      "help": "Optional /v1/compress config for per-turn assemble() compression. Default includes protect_recent: 2 so recent tool turns are preserved. Passed to the Headroom proxy via the headroom-ai SDK."
+    },
+    "assembleSkipBudgetRatio": {
+      "label": "Assemble Skip Budget Ratio",
+      "help": "assemble() skips proxy compression while the history's rough token estimate is below tokenBudget × this ratio. Default 0.7 so compression runs before OpenClaw's native overflow compaction (which triggers near budget − reserve − system prompt) on ~200k windows, while 100–200k sessions in 1M windows are left untouched. Range (0, 1]."
+    },
+    "assembleReserveTokens": {
+      "label": "Assemble Reserve Tokens",
+      "help": "Tokens subtracted from tokenBudget before the skip ratio is applied. OpenClaw passes the full model window as tokenBudget but its prompt also carries the system prompt, tool schemas and a compaction reserve (≥ 20000). Set to roughly reserve + system prompt tokens so compression starts before native overflow compaction. Default 20000."
+    },
+    "protectToolResults": {
+      "label": "Protect Tool Results",
+      "help": "Tool names (or * globs) whose results are restored verbatim after every /v1/compress round trip (assemble and durable compaction). Deferred tool_call wrappers are resolved to the real tool first, so an MCP tool can be named as analyze_video, <server>__analyze_video or mcp__<server>__analyze_video. The resolved name is also what the proxy sees, so its own --protect-tool-results list can match MCP tools. Default: none."
+    },
+    "skipAssembleWhenGatewayRouted": {
+      "label": "Skip Assemble When Gateway Routed",
+      "help": "When true and gatewayProviderIds is non-empty, skip assemble() compression because live provider traffic already passes through the Headroom proxy (avoids double compression). Default: false."
     }
   },
   "configSchema": {
@@ -106,6 +150,79 @@
           "type": "string"
         },
         "default": []
+      },
+      "providerUpstreams": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "pattern": "^https?://.+(:\\d+)?/?$"
+        },
+        "default": {}
+      },
+      "providerSessionHeaders": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+$"
+        },
+        "default": {}
+      },
+      "persistentCompaction": {
+        "type": "string",
+        "enum": ["hybrid", "headroom", "openclaw"],
+        "default": "openclaw"
+      },
+      "transcriptHygiene": {
+        "oneOf": [
+          { "type": "boolean" },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "softThresholdTokens": { "type": "integer", "minimum": 1 },
+              "debounceMs": { "type": "integer", "minimum": 0, "default": 30000 }
+            }
+          }
+        ]
+      },
+      "transcriptProjectionWaitMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 120000
+      },
+      "durableCompaction": {
+        "type": "boolean"
+      },
+      "assembleCompressConfig": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "protect_recent": { "type": "integer", "minimum": 0 },
+          "mode": { "type": "string" },
+          "compress_user_messages": { "type": "boolean" },
+          "frozen_message_count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "assembleSkipBudgetRatio": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 1,
+        "default": 0.7
+      },
+      "assembleReserveTokens": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 20000
+      },
+      "protectToolResults": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "default": []
+      },
+      "skipAssembleWhenGatewayRouted": {
+        "type": "boolean",
+        "default": false
       }
     }
   },
