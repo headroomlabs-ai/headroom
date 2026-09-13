@@ -1,4 +1,4 @@
-FROM rust:1.96-slim AS build
+FROM rust:1.98.1-slim AS build
 WORKDIR /workspace
 COPY . .
 RUN cargo build --release -p headroom-simulators

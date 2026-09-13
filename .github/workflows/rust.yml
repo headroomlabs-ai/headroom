@@ -193,6 +193,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
         uses: PyO3/maturin-action@v1
         # Maturin reads `[tool.maturin]` from the root `pyproject.toml`
