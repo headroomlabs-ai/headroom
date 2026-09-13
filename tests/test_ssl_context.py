@@ -21,6 +21,7 @@ from headroom.proxy import ssl_context
 from headroom.proxy.ssl_context import (
     apply_global_tls_relaxation,
     build_httpx_verify,
+    build_urlopen_context,
     find_ca_bundle,
     tls_strict_disabled,
 )
@@ -284,6 +285,43 @@ class TestBuildHttpxVerify:
         assert isinstance(ctx, ssl.SSLContext)
         # Replacement bundle → only the single test CA is trusted.
         assert ctx.cert_store_stats()["x509_ca"] == 1
+
+
+class TestBuildUrlopenContext:
+    def test_custom_ca_context_only_offers_http_1_1(self, monkeypatch, ca_pem_file):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        created_context = FakeSSLContext()
+
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == ca_pem_file
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
+
+    def test_default_returns_none(self, monkeypatch):
+        """No CA bundle, strict on → build_httpx_verify() is True, nothing to restrict."""
+        _clean_env(monkeypatch)
+        assert build_urlopen_context() is None
+
+    def test_toggle_off_context_only_offers_http_1_1(self, monkeypatch):
+        """No CA bundle, strict OFF → still a real context, still restricted to http/1.1."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        created_context = FakeSSLContext()
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", lambda: created_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
 
 
 class TestApplyGlobalTlsRelaxation:
