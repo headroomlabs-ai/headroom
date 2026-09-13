@@ -199,11 +199,33 @@ class TestDeepSeekLiteLLMInjection:
 
         if not LITELLM_AVAILABLE:
             pytest.skip("litellm not available")
-        row = litellm.model_cost["deepseek-v4-pro"]
-        assert row["input_cost_per_token"] == 0.66 / 1_000_000
-        assert row["output_cost_per_token"] == 1.98 / 1_000_000
-        assert row["cache_read_input_token_cost"] == 0.022 / 1_000_000
-        assert row["litellm_provider"] == "deepseek"
+        for key in ("deepseek-v4-pro", "deepseek/deepseek-v4-pro"):
+            row = litellm.model_cost[key]
+            assert row["input_cost_per_token"] == 0.66 / 1_000_000
+            assert row["output_cost_per_token"] == 1.98 / 1_000_000
+            assert row["cache_read_input_token_cost"] == 0.022 / 1_000_000
+            assert row["litellm_provider"] == "deepseek"
+            assert row["max_input_tokens"] == 1_000_000
+            assert row["max_output_tokens"] == 393_216
+
+    def test_injected_rows_track_the_tier_table(self):
+        """Injected rows are the tier module's off-peak figures, not a copy."""
+        from headroom.pricing.deepseek_tiers import OFF_PEAK_RATES_PER_1M
+        from headroom.pricing.litellm_pricing import (
+            _DEEPSEEK_LITELLM_IDS,
+            LITELLM_AVAILABLE,
+            litellm,
+        )
+
+        if not LITELLM_AVAILABLE:
+            pytest.skip("litellm not available")
+        for model_id, canonical in _DEEPSEEK_LITELLM_IDS.items():
+            cache_hit, miss, out = OFF_PEAK_RATES_PER_1M[canonical]
+            for key in (model_id, f"deepseek/{model_id}"):
+                row = litellm.model_cost[key]
+                assert row["input_cost_per_token"] == miss / 1e6
+                assert row["output_cost_per_token"] == out / 1e6
+                assert row["cache_read_input_token_cost"] == cache_hit / 1e6
 
     def test_cost_per_token_resolves_deepseek_flash(self):
         from headroom.pricing.litellm_pricing import (
