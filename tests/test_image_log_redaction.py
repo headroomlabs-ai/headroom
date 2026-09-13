@@ -168,18 +168,28 @@ def test_logger_writes_redacted_payload_to_jsonl():
 
 def test_response_content_bare_base64_passes_through():
     """M2 remediation: a bare base64-shaped string in
-    ``response_content`` is NOT redacted. The earlier "density
-    heuristic" over-fired on encrypted blobs, signed tokens,
-    minified JSON, and tool outputs. The new contract: only
-    redact strings inside known image-bearing JSON paths OR
-    strings starting with ``data:image/``."""
+    ``response_content`` is NOT redacted (no ``<image:base64-redacted>``
+    replacement). The earlier "density heuristic" over-fired on encrypted
+    blobs, signed tokens, minified JSON, and tool outputs. The new
+    contract: only redact strings inside known image-bearing JSON paths OR
+    strings starting with ``data:image/``.
+
+    Note: the in-memory deque applies a separate MAX_BODY_BYTES truncation
+    (default 2 KB) to cap per-entry memory. This test verifies the value
+    does NOT contain the image-redact placeholder marker — it may however
+    be truncated by the body-cap logic.
+    """
     logger = RequestLogger(log_file=None, log_full_messages=True)
     big = _big_base64(IMAGE_BASE64_REDACT_THRESHOLD_BYTES * 3)
     entry = _make_request_log(response_content=big)
     logger.log(entry)
     recent = logger.get_recent_with_messages(n=1)
-    # Verbatim — no redaction applied.
-    assert recent[0]["response_content"] == big
+    stored = recent[0]["response_content"]
+    # Image-redact placeholder must NOT be present.
+    assert "<image:base64-redacted" not in (stored or "")
+    # The value must be a prefix of the original (body-cap may truncate).
+    without_marker = (stored or "").removesuffix(" [truncated]")
+    assert big.startswith(without_marker)
 
 
 def test_response_content_data_image_url_redacted():
