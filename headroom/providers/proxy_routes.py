@@ -14,6 +14,7 @@ from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
     CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
@@ -212,6 +213,25 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
 
 def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
     for path in CODEX_LIVE_ROUTE_PATHS:
+
+        async def codex_live_http(request: Request, route_path: str = path):
+            response = await handle_codex_live_http(
+                request,
+                proxy.http_client,
+                _api_target(proxy, "openai"),
+                route_path,
+            )
+            if response is not None:
+                return response
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "openai"),
+                route_path,
+                "openai",
+            )
+
+        codex_live_http.__name__ = path.strip("/").replace("/", "_") + "_live_http"
+        app.post(path)(codex_live_http)
 
         def register_websocket_route(route_path: str) -> None:
             async def codex_live_websocket(websocket: WebSocket):
