@@ -1,6 +1,7 @@
 """Tests for universal provider support.
 
-Tests OpenAICompatibleProvider, GoogleProvider, and LiteLLMProvider.
+Tests OpenAICompatibleProvider, OpenAIProvider, GoogleProvider, and
+LiteLLMProvider.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from headroom.providers import (
     LiteLLMProvider,
     ModelCapabilities,
     OpenAICompatibleProvider,
+    OpenAIProvider,
     create_anyscale_provider,
     create_fireworks_provider,
     create_groq_provider,
@@ -90,8 +92,13 @@ class TestOpenAICompatibleProvider:
         assert provider.get_context_limit("deepseek-v2") == 128000
         assert provider.get_context_limit("deepseek-v3.2") == 128000
         assert provider.get_context_limit("deepseek-v4-pro") == 1_000_000
-        assert provider.get_context_limit("deepseek-v4-flash") == 1_000_000
-        assert provider.get_context_limit("deepseek-flash") == 1_000_000
+        # All three flash-family ids — the current one plus the two retired
+        # aliases DeepSeek still accepts — are served by V4.1-Flash at 1M on
+        # both providers that carry a DeepSeek row.
+        for p in (provider, OpenAIProvider()):
+            assert p.get_context_limit("deepseek-flash") == 1_000_000
+            assert p.get_context_limit("deepseek-v4-flash") == 1_000_000
+            assert p.get_context_limit("deepseek-v4-flash-vision-exp") == 1_000_000
         assert provider.get_context_limit("deepseek-r1") == 131072
         assert provider.get_context_limit("deepseek-coder-v2") == 128000
 

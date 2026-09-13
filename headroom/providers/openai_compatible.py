@@ -314,10 +314,13 @@ class OpenAICompatibleProvider(Provider):
         if model_lower in _DEFAULT_CONTEXT_LIMITS:
             return _DEFAULT_CONTEXT_LIMITS[model_lower]
 
-        # Prefix match
-        for prefix, limit in _DEFAULT_CONTEXT_LIMITS.items():
+        # Prefix match, longest prefix first. Plain dict order let a shorter
+        # family shadow a longer one: "deepseek-v4-flash-vision-exp" hit the
+        # "deepseek-v4" entry and got 1_048_576 instead of the 1_000_000 the
+        # model registry, the OpenAI provider and the pricing tables agree on.
+        for prefix in sorted(_DEFAULT_CONTEXT_LIMITS, key=len, reverse=True):
             if model_lower.startswith(prefix):
-                return limit
+                return _DEFAULT_CONTEXT_LIMITS[prefix]
 
         # Default to 128K for modern models
         return 128000
