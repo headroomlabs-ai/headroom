@@ -498,6 +498,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   /**
    * Raw fetch with proxy base URL, auth, and timeout.
+   * A string body is sent as-is; anything else is JSON-serialized.
    * @internal
    */
   async rawFetch(
@@ -524,7 +525,12 @@ export class HeadroomClient implements HeadroomClientInterface {
       response = await fetch(url, {
         method: options.method,
         headers,
-        body: options.body ? JSON.stringify(options.body) : undefined,
+        body:
+          typeof options.body === "string"
+            ? options.body
+            : options.body
+              ? JSON.stringify(options.body)
+              : undefined,
         signal: AbortSignal.timeout(this.timeout),
       });
     } catch (error) {
@@ -550,52 +556,12 @@ export class HeadroomClient implements HeadroomClientInterface {
     return response;
   }
 
-  /** @internal */
-  private async _fetch(
+  /** Proxy-only endpoints, whose bodies are already serialized. @internal */
+  private _fetch(
     path: string,
-    init: { method: string; body?: string; headers?: Record<string, string> },
+    init: { method: string; body?: string },
   ): Promise<Response> {
-    const url = `${this.baseUrl}${path}`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...init.headers,
-    };
-    if (this.apiKey) {
-      headers["Authorization"] = `Bearer ${this.apiKey}`;
-    }
-    if (this.stack && !headers["X-Headroom-Stack"]) {
-      headers["X-Headroom-Stack"] = this.stack;
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: init.method,
-        headers,
-        body: init.body,
-        signal: AbortSignal.timeout(this.timeout),
-      });
-    } catch (error) {
-      throw new HeadroomConnectionError(
-        `Failed to connect to Headroom at ${this.baseUrl}: ${error}`,
-      );
-    }
-
-    if (!response.ok) {
-      let errorBody: ProxyErrorResponse | undefined;
-      try {
-        errorBody = (await response.json()) as ProxyErrorResponse;
-      } catch {
-        // ignore
-      }
-      throw mapProxyError(
-        response.status,
-        errorBody?.error?.type ?? "unknown",
-        errorBody?.error?.message ?? `HTTP ${response.status}`,
-      );
-    }
-
-    return response;
+    return this.rawFetch(path, init);
   }
 
   private async _doCompress(
