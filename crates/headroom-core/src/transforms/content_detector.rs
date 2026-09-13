@@ -41,6 +41,25 @@ pub enum ContentType {
 }
 
 impl ContentType {
+    /// Every variant, in declaration order.
+    ///
+    /// Rust has no stable reflection over enum variants, so callers that
+    /// need to enumerate the set (operator-facing name tables, exhaustive
+    /// round-trip tests) would otherwise hand-maintain their own copy and
+    /// silently miss a variant added later. Adding a variant without
+    /// extending this array is caught by the length annotation, and the
+    /// exhaustive `match` in [`ContentType::as_str`] forces the author
+    /// into this file in the first place.
+    pub const ALL: [ContentType; 7] = [
+        ContentType::JsonArray,
+        ContentType::SourceCode,
+        ContentType::SearchResults,
+        ContentType::BuildOutput,
+        ContentType::GitDiff,
+        ContentType::Html,
+        ContentType::PlainText,
+    ];
+
     /// Stable string tag — matches Python's `ContentType.<NAME>.value`.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -52,6 +71,46 @@ impl ContentType {
             ContentType::Html => "html",
             ContentType::PlainText => "text",
         }
+    }
+
+    /// Operator-facing spelling of this variant: the name a human writes
+    /// in configuration. Equal to [`ContentType::as_str`] except where
+    /// that tag is abbreviated for Python parity (`search`, `build`,
+    /// `diff`, `text`), which are the spellings least likely to be
+    /// guessed correctly. Both forms parse — see the `FromStr` impl.
+    pub fn natural_name(&self) -> &'static str {
+        match self {
+            ContentType::JsonArray => "json_array",
+            ContentType::SourceCode => "source_code",
+            ContentType::SearchResults => "search_results",
+            ContentType::BuildOutput => "build_output",
+            ContentType::GitDiff => "git_diff",
+            ContentType::Html => "html",
+            ContentType::PlainText => "plain_text",
+        }
+    }
+}
+
+/// Error returned when a string names no [`ContentType`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown content type {0:?}")]
+pub struct ParseContentTypeError(String);
+
+/// Parse a [`ContentType`] from either its [`as_str`](ContentType::as_str)
+/// tag or its [`natural_name`](ContentType::natural_name).
+///
+/// Accepting both matters for operator-facing configuration: the
+/// abbreviated Python-parity tags (`text`, `search`, `build`, `diff`) are
+/// not what a human writes, so a config naming `plain_text` would
+/// otherwise parse as nothing and silently do nothing.
+impl std::str::FromStr for ContentType {
+    type Err = ParseContentTypeError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|ct| ct.as_str() == name || ct.natural_name() == name)
+            .ok_or_else(|| ParseContentTypeError(name.to_owned()))
     }
 }
 
