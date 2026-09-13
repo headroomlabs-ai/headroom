@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from headroom.copilot_auth import (
+    copilot_bearer_upstream,
     copilot_completions_base_url,
     is_copilot_completions_host,
     is_copilot_completions_path,
@@ -61,6 +62,15 @@ def select_passthrough_base_url(
             logger.warning("ignoring unsafe x-headroom-base-url override: %r", azure_base)
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
     target = api_target(proxy, provider_name)
+    if provider_name == "openai":
+        # Copilot's ancillary CAPI calls (`/models`, `/models/session`, `/auto`,
+        # `/agents/*`, `/embeddings`) land here with GitHub's own bearer token
+        # and no provider header. On a shared proxy whose OpenAI target is the
+        # stock host that token cannot succeed, so route it to Copilot — the
+        # same rule the chat and responses handlers apply.
+        copilot_target = copilot_bearer_upstream(headers, target)
+        if copilot_target is not None:
+            target = copilot_target
     if (
         path is not None
         and provider_name == "openai"

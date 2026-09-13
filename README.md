@@ -277,6 +277,20 @@ export GITHUB_COPILOT_ENTERPRISE_DOMAIN=ghe.example.com
 export GITHUB_COPILOT_ENTERPRISE_URL=https://ghe.example.com
 ```
 
+Business and Enterprise accounts are advertised a per-plan host
+(`api.business.githubcopilot.com` / `api.enterprise.githubcopilot.com`). Headroom
+routes them through the generic host by default; `--subscription`, `--native`
+and `wrap vscode` print the advertised host at launch when they override it. If
+your network uses GitHub's subscription-based network routing,
+which blocks the generic host, set `GITHUB_COPILOT_USE_ADVERTISED_HOST=1` or pin
+`GITHUB_COPILOT_API_URL` to the advertised host. Data-residency hosts
+(`copilot-api.<tenant>.ghe.com`) are always honored.
+
+`headroom wrap copilot` refuses to launch when `~/.copilot/settings.json` (or
+`$COPILOT_HOME`) pins a different `copilotUrl`: the CLI ranks that setting above
+`COPILOT_API_URL`, so the session would silently bypass the proxy. The wrapper
+also exempts `127.0.0.1` from any `HTTP_PROXY`/`HTTPS_PROXY` in effect.
+
 For GitHub.com Enterprise Cloud URLs such as
 `github.com/enterprises/your-enterprise`, set neither — Headroom uses GitHub's
 normal token-exchange endpoint and the Copilot API endpoint advertised for the
