@@ -19,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import errno
 import importlib.util
 import io
@@ -2142,43 +2143,49 @@ def _serena_project_skip_reason(root: Path) -> str | None:
     return None
 
 
-#: Upper bound on the synchronous pre-index. The agent does not launch until
-#: this call returns, so the number is a stall budget, not just a safety net.
-_SERENA_INDEX_TIMEOUT = 300
+#: Env knob for the launch-blocking pre-index. Unset (the default) means the
+#: wrap does not wait at all: ``serena project index`` runs in the background
+#: while the agent starts (#3436). A positive integer restores the pre-#3436
+#: behaviour of blocking the launch for at most that many seconds.
 _SERENA_INDEX_TIMEOUT_ENV = "HEADROOM_SERENA_INDEX_TIMEOUT"
 
 
-def _resolve_serena_index_timeout_seconds() -> int:
-    """Resolve the Serena pre-index stall budget from env, else the default.
+def _resolve_serena_index_wait_seconds() -> int:
+    """Seconds the launch may block on the pre-index (0 = do not wait).
 
-    A wrap launched from a directory Serena has already claimed re-indexes the
-    whole tree on every run, and 300s of that is time the agent is not running
-    (#3093). The budget is therefore tunable per environment, which also keeps
-    it reachable from ``wrap ... -- agents`` sessions that take no flags.
+    The pre-index used to be synchronous, so this knob sized a stall budget
+    (#3093). On a directory holding several repositories no budget is big
+    enough — the index cannot finish, so every launch waited the whole budget
+    out and then threw the partial work away (#3436). The default is therefore
+    now 0: the index runs in the background and the agent starts immediately.
 
-    Unlike :func:`_resolve_wrap_proxy_timeout_seconds`, a bad value is not
-    fatal here: the pre-index is best-effort, so an unusable setting falls back
-    to the default rather than aborting a launch that would otherwise succeed.
-    It is reported unconditionally, because a knob that looks applied but is
-    not is the failure this issue is about.
+    Setting the variable to a positive integer opts back into a blocking
+    pre-index with that budget, which is the escape hatch for anyone who wants
+    a warm cache before the first prompt (and the way to get the old behaviour
+    back).
+
+    A bad value is not fatal: the pre-index is best-effort, so an unusable
+    setting falls back to the background default rather than aborting a launch
+    that would otherwise succeed. It is reported unconditionally, because a
+    knob that looks applied but is not is the failure #3093 was about.
     """
     raw = os.environ.get(_SERENA_INDEX_TIMEOUT_ENV, "").strip()
     if not raw:
-        return _SERENA_INDEX_TIMEOUT
+        return 0
 
-    timeout_seconds: int | None
+    wait_seconds: int | None
     try:
-        timeout_seconds = int(raw)
+        wait_seconds = int(raw)
     except ValueError:
-        timeout_seconds = None
-    if timeout_seconds is None or timeout_seconds <= 0:
+        wait_seconds = None
+    if wait_seconds is None or wait_seconds <= 0:
         click.echo(
             f"  Serena: ignoring {_SERENA_INDEX_TIMEOUT_ENV}={raw!r} "
             f"(want a positive integer number of seconds) "
-            f"— using {_SERENA_INDEX_TIMEOUT}s"
+            "— indexing in the background instead"
         )
-        return _SERENA_INDEX_TIMEOUT
-    return timeout_seconds
+        return 0
+    return wait_seconds
 
 
 def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
@@ -2229,6 +2236,38 @@ def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+#: Handle on the background ``serena project index`` child, so the wrap can
+#: stop it when the session ends instead of leaving it to grind on unowned.
+_SERENA_INDEX_PROC: subprocess.Popen | None = None
+
+
+def _stop_background_serena_index() -> None:
+    """Stop the background pre-index when the wrap exits (best-effort).
+
+    Registered with :mod:`atexit` rather than plumbed into ``_launch_tool``'s
+    cleanup: the wrap stays alive as the agent's parent for the whole session,
+    Ctrl-C is swallowed by ``_ignore_child_sigint``, and SIGTERM/SIGHUP raise
+    ``SystemExit`` through ``_exit_on_signal`` (#3205), so every ordinary exit
+    path unwinds normally and runs this.
+
+    Killing a half-finished index is cheap: ``serena project index`` flushes
+    its caches every 30s while it runs, and ``request_document_symbols`` skips
+    files whose content hash it has already cached, so the next wrap resumes
+    roughly where this one stopped instead of starting over.
+    """
+    global _SERENA_INDEX_PROC
+
+    proc, _SERENA_INDEX_PROC = _SERENA_INDEX_PROC, None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:  # already finished — nothing to kill
+            return
+    except Exception:
+        return
+    _kill_serena_index_tree(proc)
+
+
 def _index_serena_project(*, verbose: bool = False) -> None:
     """Warm Serena's symbol cache for the current project (non-fatal).
 
@@ -2237,36 +2276,45 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     query is not paying for a cold index. Serena also indexes lazily on demand,
     so any failure here is survivable.
 
-    This runs on the launch path, synchronously: the agent starts only once it
-    returns, so the timeout below is time the user spends staring at nothing —
-    ``HEADROOM_SERENA_INDEX_TIMEOUT`` resizes that budget (#3093). Two guards
-    keep it bounded (#2938):
+    This does **not** block the launch (#3436). The index used to run
+    synchronously, which meant a directory holding several repositories waited
+    out the whole stall budget on every single launch and then threw the
+    partial work away — no budget is large enough there, because the per-file
+    cost is a language server rebuilding its workspace view for a root it
+    cannot resolve. The child is started and left to run alongside the agent;
+    Serena's MCP server serves symbol queries from whatever is cached, and
+    indexes the rest on demand, while it warms.
+    ``HEADROOM_SERENA_INDEX_TIMEOUT`` opts back into a bounded blocking wait.
+
+    Three guards keep the child harmless:
 
     * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
-      ``project.yml``, and because stdout is captured the question never
-      reaches the terminal — an inherited stdin turned that into a silent,
-      full-timeout hang. EOF makes it fail in about a second instead.
+      ``project.yml``, and because its output is redirected the question never
+      reaches the terminal — an inherited stdin turned that into a silent hang
+      (#2938). EOF makes it fail in about a second instead.
       ``_serena_project_skip_reason`` already keeps us out of that state; this
       is the belt-and-braces half, and it covers any future Serena prompt too.
-    * The child gets its own process group so ``_kill_serena_index_tree`` can
-      take out the ``uvx`` grandchild on timeout rather than orphaning it.
+    * ``stdout``/``stderr`` are ``DEVNULL`` rather than pipes. Nothing drains
+      them once the wrap stops waiting, and the indexer writes a progress line
+      per file, so a pipe would fill its buffer and wedge the child for good.
+      Serena records its own failures in ``.serena/logs/indexing.txt``.
+    * The child gets its own process group, both so a terminal Ctrl-C aimed at
+      the agent does not reach it and so ``_kill_serena_index_tree`` can take
+      out the ``uvx`` grandchild rather than orphaning it (#2938).
     """
+    global _SERENA_INDEX_PROC
+
     if shutil.which("uvx") is None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
 
-    timeout_seconds = _resolve_serena_index_timeout_seconds()
+    wait_seconds = _resolve_serena_index_wait_seconds()
 
     popen_kwargs: dict[str, Any] = {
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
         "stdin": subprocess.DEVNULL,
-        "text": True,
-        # ``subprocess.Popen`` directly, so the encoding defaults that
-        # ``headroom._subprocess.run`` applies have to be repeated here.
-        "encoding": "utf-8",
-        "errors": "replace",
         "cwd": str(Path.cwd()),
     }
     if sys.platform == "win32":
@@ -2293,11 +2341,18 @@ def _index_serena_project(*, verbose: bool = False) -> None:
             click.echo(f"  Serena: pre-index skipped ({e})")
         return
 
-    # Announce the wait. Indexing a large repo legitimately takes minutes and
-    # the output is captured, so without this line the wrap looks hung.
-    click.echo("  Serena: pre-indexing project (first run can take a while)…")
+    if wait_seconds <= 0:
+        _SERENA_INDEX_PROC = proc
+        atexit.register(_stop_background_serena_index)
+        click.echo("  Serena: indexing project in the background (symbol tools work meanwhile)")
+        return
+
+    # Opted back into a blocking pre-index. Announce the wait: indexing a large
+    # repo legitimately takes minutes and the output is redirected, so without
+    # this line the wrap looks hung.
+    click.echo(f"  Serena: pre-indexing project (waiting up to {wait_seconds}s)…")
     try:
-        _stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        proc.wait(timeout=wait_seconds)
     except subprocess.TimeoutExpired:
         _kill_serena_index_tree(proc)
         click.echo("  Serena: pre-index timed out (will index on demand)")
@@ -2311,7 +2366,10 @@ def _index_serena_project(*, verbose: bool = False) -> None:
     if proc.returncode == 0:
         click.echo("  Serena: project pre-indexed (symbol cache warmed)")
     elif verbose:
-        click.echo(f"  Serena: pre-index failed ({(stderr or '')[:100]})")
+        click.echo(
+            f"  Serena: pre-index failed (exit {proc.returncode}; "
+            f"see .serena/logs/ for Serena's own log)"
+        )
 
 
 def _setup_serena_mcp(
@@ -2385,9 +2443,9 @@ def _setup_serena_mcp(
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
     # the agent toward symbol-level tools, then warm the symbol cache. Both are
-    # best-effort and non-fatal, but the pre-index is *synchronous* — the agent
-    # does not launch until it returns or hits ``_SERENA_INDEX_TIMEOUT``. See
-    # ``_index_serena_project`` for how that wait is kept bounded and visible.
+    # best-effort and non-fatal, and neither blocks the launch: the pre-index
+    # runs alongside the agent and is stopped when the wrap exits (#3436). See
+    # ``_index_serena_project`` for the guards on that child process.
     #
     # Headroom no longer writes ``.serena/project.yml`` language scoping. Serena
     # determines the project's languages itself during
