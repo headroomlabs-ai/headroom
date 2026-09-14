@@ -32,12 +32,42 @@ from typing import Literal
 PEAK_MULTIPLIER: float = 2.0
 
 #: Last date the vendor's USD rate card below was verified.
-LAST_UPDATED = date(2026, 9, 13)
+LAST_UPDATED = date(2026, 9, 14)
 
 #: Official pricing page these rates come from.
 SOURCE_URL = "https://api-docs.deepseek.com/quick_start/pricing"
 
+#: The vendor's published card, as fetched, so the numbers below can be checked
+#: without trusting prose. Values are quoted from the page, not re-derived.
+#:
+#: Source: :data:`SOURCE_URL`, fetched 2026-09-14 and re-verified 2026-09-15 in
+#: both locales with a cache-busting query. Footnote (1) verbatim: "Use
+#: ``deepseek-flash`` as the model name. The legacy names ``deepseek-v4-flash``
+#: and ``deepseek-v4-flash-vision-exp`` are still accepted, but the corresponding
+#: models have been retired, their requests are served by the DeepSeek-V4.1-Flash
+#: model and billed at the Flash price."
+VENDOR_CARD: dict[str, dict[str, object]] = {
+    "deepseek-flash": {
+        "model_version": "DeepSeek-V4.1-Flash",
+        "off_peak": (0.003, 0.15, 0.60),
+        "peak": (0.006, 0.30, 1.20),
+        "max_output": "384K; upstream LiteLLM encodes it as 393216 = 384 x 1024",
+        "vision": True,
+        "legacy_ids": ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
+    },
+    "deepseek-v4-pro": {
+        "model_version": "DeepSeek-V4-Pro-0813",
+        "off_peak": (0.022, 0.66, 1.98),
+        "peak": (0.044, 1.32, 3.96),
+        "max_output": "384K",
+        "vision": False,
+        "legacy_ids": (),
+    },
+}
+
 #: Off-peak ``(cache-hit input, cache-miss input, output)`` USD per 1M tokens.
+#: These are the ``off_peak`` tuples of :data:`VENDOR_CARD`; the assertions in
+#: ``tests/test_pricing_deepseek_tiers.py`` keep the two in step.
 #:
 #: ``deepseek-flash`` is the current id for DeepSeek-V4.1-Flash. The vendor still
 #: accepts the retired ``deepseek-v4-flash`` and ``deepseek-v4-flash-vision-exp``
