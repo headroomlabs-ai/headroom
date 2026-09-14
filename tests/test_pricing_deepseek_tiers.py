@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 import pytest
 
 from headroom.pricing.deepseek_tiers import (
+    LEGACY_MODEL_IDS,
+    OFF_PEAK_RATES_PER_1M,
     PEAK_MULTIPLIER,
+    VENDOR_CARD,
     WEEKEND_OFF_PEAK_FROM,
     bare_model,
     is_peak,
@@ -187,6 +190,35 @@ class TestRatesFor:
             "peak" if is_peak(before) else "off_peak",
             "peak" if is_peak(after) else "off_peak",
         }
+
+
+class TestVendoredCard:
+    """The shipping tables must equal the vendored vendor card.
+
+    The card exists so a reviewer can check the published numbers inside the repo
+    instead of trusting the PR description, and so editing a rate without its
+    source fails the suite.
+    """
+
+    def test_shipping_tables_match_the_vendored_card(self):
+        assert set(VENDOR_CARD) == set(OFF_PEAK_RATES_PER_1M)
+        for model, row in VENDOR_CARD.items():
+            assert OFF_PEAK_RATES_PER_1M[model] == row["off_peak"]
+            # Monday 2026-08-17 02:00 UTC = 10:00 Beijing = peak.
+            peak = rates_for(model, utc(17, 2))
+            assert peak is not None
+            assert (
+                peak.cache_hit_per_1m,
+                peak.input_per_1m,
+                peak.output_per_1m,
+            ) == row["peak"]
+            assert row["peak"] == tuple(rate * PEAK_MULTIPLIER for rate in row["off_peak"])
+
+    def test_vendored_legacy_ids_match_the_alias_table(self):
+        vendored = {legacy for row in VENDOR_CARD.values() for legacy in row["legacy_ids"]}
+        assert vendored == set(LEGACY_MODEL_IDS)
+        for legacy in vendored:
+            assert off_peak_rates(legacy) == off_peak_rates("deepseek-flash")
 
     def test_naive_instant_selects_the_same_tier_as_the_aware_one(self):
         aware = rates_for("deepseek-flash", utc(17, 2))
