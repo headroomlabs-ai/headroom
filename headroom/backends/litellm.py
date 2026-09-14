@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _OPENAI_STANDARD_PARAMS = (
     "max_tokens",
+    "max_completion_tokens",
     "temperature",
     "top_p",
     "stop",
@@ -58,6 +59,7 @@ try:
     _env_snapshot = set(_os.environ)
     import litellm
     from litellm import acompletion
+    from litellm.utils import supports_prompt_caching
 
     for _leaked_key in set(_os.environ) - _env_snapshot:
         del _os.environ[_leaked_key]
@@ -68,6 +70,7 @@ except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore
     acompletion = None  # type: ignore
+    supports_prompt_caching = None  # type: ignore
 
 
 # =============================================================================
@@ -170,6 +173,65 @@ def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         and not key.startswith("x-headroom-")
         and not key.startswith("x_headroom_")
     }
+
+
+def _bedrock_openai_caching_eligible(litellm_model: str) -> bool:
+    """Whether Bedrock prompt caching applies to this mapped litellm model.
+
+    ``litellm.get_supported_openai_params`` never reports ``cache_control``
+    for Bedrock models, so it cannot gate this; ``supports_prompt_caching``
+    is the API that knows (#3554). The *mapped* model (``bedrock/...``) must
+    be checked: a client alias such as ``claude-sonnet-4-20250514`` alone
+    resolves to False in litellm's registry. Never raises -- an undecidable
+    model simply gets no injected breakpoint.
+    """
+    if supports_prompt_caching is None:
+        return False
+    try:
+        return bool(supports_prompt_caching(model=litellm_model))
+    except Exception as e:  # noqa: BLE001 - unknown model, forward verbatim
+        logger.debug(f"supports_prompt_caching undecidable for {litellm_model}: {e}")
+        return False
+
+
+def _place_system_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``messages`` with an ephemeral cache breakpoint on the first system message.
+
+    litellm turns the marker into a Bedrock Converse ``cachePoint``. The
+    client keeps ownership of breakpoint placement: when it already put
+    ``cache_control`` anywhere, messages are returned unchanged. Never mutates
+    the input: the proxy re-reads ``body["messages"]`` after the send.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if "cache_control" in message or (
+            isinstance(content, list)
+            and any(isinstance(block, dict) and "cache_control" in block for block in content)
+        ):
+            return messages
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            marked = {**message, "cache_control": {"type": "ephemeral"}}
+        elif isinstance(content, list):
+            # litellm only reads block-level markers off list content.
+            blocks = list(content)
+            for block_index in range(len(blocks) - 1, -1, -1):
+                block = blocks[block_index]
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    blocks[block_index] = {**block, "cache_control": {"type": "ephemeral"}}
+                    break
+            else:
+                continue
+            marked = {**message, "content": blocks}
+        else:
+            continue
+        return [*messages[:index], marked, *messages[index + 1 :]]
+    return messages
 
 
 def _fetch_bedrock_inference_profiles(
@@ -1363,6 +1425,13 @@ class LiteLLMBackend(Backend):
             if extra_body:
                 kwargs["extra_body"] = extra_body
 
+            # Bedrock prompt caching (#3554): OpenAI-compat clients never send
+            # cache_control themselves, so mark the system prompt when the
+            # mapped model supports caching. Non-Bedrock providers and
+            # undecidable models are untouched.
+            if self.provider == "bedrock" and _bedrock_openai_caching_eligible(litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
+
             # Provider-specific region config
             if self.region:
                 if self.provider == "bedrock":
@@ -1547,6 +1616,10 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            # Bedrock prompt caching (#3554): same gate as send_openai_message.
+            if self.provider == "bedrock" and _bedrock_openai_caching_eligible(litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
