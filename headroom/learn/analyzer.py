@@ -602,6 +602,28 @@ def _strip_fenced_json(raw: str) -> dict:
     return result
 
 
+def _output_snippet(text: str, limit: int = _MAX_SNIPPET_LEN) -> str:
+    """Bounded excerpt of CLI output showing BOTH ends.
+
+    A head-only excerpt cannot diagnose the failure it is attached to. When a
+    model's JSON answer does not parse, the head is valid-looking JSON in every
+    case: what tells a payload truncated mid-value from one with trailing prose
+    after the closing fence is the END of it. Same reasoning as
+    :func:`_failure_detail` tailing stdout -- CLI backends put the interesting
+    part last -- except a parse failure needs the head too, because that is
+    where a wrapper (a fence, a preamble) shows up.
+
+    Returns *text* unchanged when it already fits, so short output -- the common
+    case -- reads exactly as before.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    omitted = len(text) - limit
+    return f"{text[:head]}\n...[{omitted} chars omitted]...\n{text[-tail:]}"
+
+
 def _failure_detail(
     stderr: str | None, stdout: str | None, *, result_text: str | None = None
 ) -> str:
@@ -725,10 +747,10 @@ def _call_cli_llm(
     try:
         return _strip_fenced_json(result.stdout)
     except json.JSONDecodeError as exc:
-        stdout_snippet = (result.stdout or "")[:_MAX_SNIPPET_LEN]
+        stdout_snippet = _output_snippet(result.stdout or "")
         raise RuntimeError(
             f"`{' '.join(cmd)}` returned unparseable output. "
-            f"First {_MAX_SNIPPET_LEN} chars:\n{stdout_snippet}"
+            f"Head and tail of the output:\n{stdout_snippet}"
         ) from exc
 
 
@@ -894,19 +916,19 @@ def _call_claude_cli_streaming(
         logger.debug("CLI stderr (exit 0): %s", stderr_blob[:_MAX_SNIPPET_LEN])
 
     if final_result is None:
-        stdout_snippet = "".join(stdout_lines)[:_MAX_SNIPPET_LEN]
+        stdout_snippet = _output_snippet("".join(stdout_lines))
         raise RuntimeError(
             f"`{' '.join(cmd)}` did not emit a final `result` event. "
-            f"First {_MAX_SNIPPET_LEN} chars of stdout:\n{stdout_snippet}"
+            f"Head and tail of stdout:\n{stdout_snippet}"
         )
 
     try:
         return _strip_fenced_json(final_result)
     except json.JSONDecodeError as exc:
-        snippet = final_result[:_MAX_SNIPPET_LEN]
+        snippet = _output_snippet(final_result)
         raise RuntimeError(
             f"`{' '.join(cmd)}` returned unparseable output. "
-            f"First {_MAX_SNIPPET_LEN} chars:\n{snippet}"
+            f"Head and tail of the output:\n{snippet}"
         ) from exc
 
 

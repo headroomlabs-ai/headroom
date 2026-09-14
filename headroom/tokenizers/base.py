@@ -328,6 +328,23 @@ class BaseTokenizer(ABC):
                         total += frames * 1000
                     else:
                         total += 3200
+                elif part_type == "thinking":
+                    # Anthropic extended thinking replayed by the client. The
+                    # ``signature`` is the encrypted full reasoning: on the
+                    # keep-all-turns models (Opus 4.5+, Sonnet 4.6+, the 5.x
+                    # line) the server decrypts it into the prompt and bills
+                    # it as input, and under ``display: "omitted"`` (the 5.x
+                    # default) the ``thinking`` text is empty, so text alone
+                    # is not the input. Nor is the base64: the JSON catch-all
+                    # below priced it as prose at ~3 chars/token, and on a
+                    # 369-message Claude Code session 99 signatures counted
+                    # 256K of 414K tokens against ~313K provider-reported.
+                    # Price the text plus the decoded signature bytes at
+                    # ~4 bytes/token (len * 3/4 / 4), which lands that session
+                    # near the provider figure and never prices an omitted
+                    # block at zero.
+                    total += self.count_text(part.get("thinking", "") or "")
+                    total += len(part.get("signature") or "") * 3 // 16
                 else:
                     # Unknown type - estimate from JSON
                     total += self._count_serialized(part)
