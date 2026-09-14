@@ -61,3 +61,41 @@ def test_extract_json_block_ignores_delimiters_inside_strings():
 
     assert end_line == 3
     assert block == "\n".join(lines)
+
+
+def test_split_into_sections_keeps_grep_context_lines_in_search_section():
+    """Regression (#3580): `-A/-B/-C` context lines belong to SEARCH sections.
+
+    Before the fix the `-`-separated context line fell into the PLAIN_TEXT
+    accumulator (fused with the `--` separator), routing code to Kompress.
+    """
+    content = "\n".join(
+        [
+            "src/app.py:10:def handler():",
+            "src/app.py-11-    first = compute()",
+            "src/app.py-12-    return first",
+            "--",
+            "src/app.py:20:def other():",
+        ]
+    )
+
+    sections = split_into_sections(content)
+
+    # The `--` group separator is not a search line, so it stays a PLAIN_TEXT
+    # section boundary; what matters is that both `-` context lines ride with
+    # the match lines in SEARCH_RESULTS sections instead of fusing with `--`
+    # into a Kompress-bound PLAIN_TEXT section.
+    assert [section.content_type for section in sections] == [
+        ContentType.SEARCH_RESULTS,
+        ContentType.PLAIN_TEXT,
+        ContentType.SEARCH_RESULTS,
+    ]
+    assert sections[0].content.split("\n") == [
+        "src/app.py:10:def handler():",
+        "src/app.py-11-    first = compute()",
+        "src/app.py-12-    return first",
+    ]
+    assert sections[0].start_line == 0
+    assert sections[0].end_line == 2
+    assert sections[1].content == "--"
+    assert sections[2].start_line == 4
