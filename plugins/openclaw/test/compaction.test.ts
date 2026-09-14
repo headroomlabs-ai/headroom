@@ -35,6 +35,7 @@ import {
   planHeadroomCompaction,
   type BranchMessageEntry,
 } from "../src/compaction.js";
+import { estimateRoughTokens } from "../src/convert.js";
 
 beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
@@ -820,6 +821,85 @@ describe("truncate turn-boundary selection", () => {
     const kept = plan.appendMessages as Array<Record<string, unknown>>;
     expect(kept[0]).toMatchObject({ role: "user", content: "user-0" });
     expect(kept.some((m) => m.role === "toolResult")).toBe(false);
+  });
+
+  it("accounts for messages restored when the safe boundary is before the proxy cut", async () => {
+    // Proxy cut lands on the trailing assistant/toolResult turn (no turn start at
+    // or after the cut) → selectTruncateStart walks backward to the preceding
+    // user. That user was not in the proxy window, so tokensAfter must include it.
+    const ASSISTANT = {
+      api: "anthropic-messages",
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      stopReason: "toolUse",
+    };
+    const messages: unknown[] = [
+      ...Array.from({ length: 20 }, (_, index) => ({
+        role: "user",
+        content: `user-${index}-${"x".repeat(40)}`,
+        timestamp: index,
+      })),
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "end-call", name: "read", arguments: { path: "z" } }],
+        ...ASSISTANT,
+        timestamp: 20,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "end-call",
+        toolName: "read",
+        content: [{ type: "text", text: "end body" }],
+        isError: false,
+        timestamp: 21,
+      },
+    ];
+    const branchMessages: BranchMessageEntry[] = messages.map((message, index) => ({
+      entryId: `entry-${index}`,
+      parentId: index === 0 ? null : `entry-${index - 1}`,
+      message,
+    }));
+
+    const restoredUser = branchMessages[19]!.message;
+    const proxyTokensAfter = 8_000;
+    mockCompressResponse({
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "end-call",
+              type: "function",
+              function: { name: "read", arguments: "{\"path\":\"z\"}" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "end-call", name: "read", content: "end body" },
+      ],
+      tokens_before: 50_000,
+      tokens_after: proxyTokensAfter,
+      tokens_saved: 42_000,
+    });
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+    });
+
+    expect(plan.mode).toBe("truncate");
+    const kept = plan.appendMessages as Array<Record<string, unknown>>;
+    expect(kept[0]).toMatchObject({ role: "user", content: restoredUser.content });
+    expect(kept).toHaveLength(3);
+    expect(kept.some((m) => m.role === "assistant")).toBe(true);
+    expect(kept.some((m) => m.role === "toolResult")).toBe(true);
+
+    const restoredTokens = estimateRoughTokens([restoredUser]);
+    expect(plan.tokensAfter).toBe(proxyTokensAfter + restoredTokens);
+    expect(plan.tokensAfter).toBeGreaterThan(proxyTokensAfter);
+    expect(plan.tokensAfter).toBeLessThanOrEqual(plan.tokensBefore);
   });
 
   it("refuses to truncate when the transcript has no turn boundary", async () => {

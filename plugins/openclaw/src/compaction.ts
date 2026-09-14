@@ -6,7 +6,7 @@
 
 import { resolveDurableCompressConfig } from "./compress-request-config.js";
 import { messageHasProtectedToolPayload } from "./content-blocks.js";
-import { agentToOpenAI, openAIToAgent } from "./convert.js";
+import { agentToOpenAI, estimateRoughTokens, openAIToAgent } from "./convert.js";
 import { dropOrphanToolResults, selectTruncateStart } from "./truncate-boundary.js";
 
 type SessionManagerLike = {
@@ -198,6 +198,34 @@ interface DurableCompressResult {
   compressed: boolean;
 }
 
+/**
+ * Proxy `tokens_after` only counts the compressed window. Boundary realignment
+ * can restore verbatim pre-cut messages or drop extra compressed ones — adjust
+ * so reported tokensAfter tracks what we actually keep.
+ */
+export function adjustTokensAfterForBoundaryAlignment(options: {
+  tokensBefore: number;
+  proxyTokensAfter: number;
+  restoredPrefix: readonly unknown[];
+  removedFromCompressed: readonly unknown[];
+}): number {
+  const restoredTokens =
+    options.restoredPrefix.length > 0
+      ? estimateRoughTokens(options.restoredPrefix as any[])
+      : 0;
+  const removedTokens =
+    options.removedFromCompressed.length > 0
+      ? estimateRoughTokens(options.removedFromCompressed as any[])
+      : 0;
+  return Math.max(
+    1,
+    Math.min(
+      options.tokensBefore,
+      options.proxyTokensAfter + restoredTokens - removedTokens,
+    ),
+  );
+}
+
 async function compressDurableTranscript(
   messages: ReturnType<typeof agentToOpenAI>,
   options: {
@@ -292,17 +320,33 @@ function buildCompactionPlanFromCompressResult(options: {
     // boundary so the durable tail never starts mid-turn or at an orphan
     // toolResult; messages between the aligned start and the proxy's cut are
     // kept verbatim from the originals.
+    //
+    // tokens_after from the proxy only covers what it returned. If we restore a
+    // pre-cut prefix (backward alignment) or drop extra compressed messages
+    // (forward alignment), recompute a conservative tokensAfter so compact /
+    // hygiene accounting and downstream estimatedTokens match the retained
+    // transcript — understating here would make OpenClaw think the session is
+    // smaller than it is.
     const dropped = originals.length - compressedAgent.length;
     const selection = selectTruncateStart(originals, dropped);
     if (!selection || selection.startIndex === 0) {
       return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
     }
     const { startIndex } = selection;
-    const tail =
+    const restoredPrefix =
+      startIndex < dropped ? originals.slice(startIndex, dropped) : [];
+    const compressedTail =
       startIndex >= dropped
         ? compressedAgent.slice(startIndex - dropped)
-        : [...originals.slice(startIndex, dropped), ...compressedAgent];
-    const appendMessages = dropOrphanToolResults(tail);
+        : compressedAgent;
+    const removedFromCompressed =
+      startIndex > dropped
+        ? compressedAgent.slice(0, startIndex - dropped)
+        : [];
+    const appendMessages = dropOrphanToolResults([
+      ...restoredPrefix,
+      ...compressedTail,
+    ]);
     if (appendMessages.length === 0) {
       return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
     }
@@ -310,7 +354,12 @@ function buildCompactionPlanFromCompressResult(options: {
     return {
       mode: "truncate",
       tokensBefore,
-      tokensAfter,
+      tokensAfter: adjustTokensAfterForBoundaryAlignment({
+        tokensBefore,
+        proxyTokensAfter: tokensAfter,
+        restoredPrefix,
+        removedFromCompressed,
+      }),
       truncateParentId: branchMessages[startIndex]!.parentId,
       appendMessages,
     };
