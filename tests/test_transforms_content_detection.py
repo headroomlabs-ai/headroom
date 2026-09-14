@@ -309,3 +309,113 @@ def test_error_detection_keywords_patterns_and_indicator_helper() -> None:
 
     assert content_has_error_indicators("TRACEBACK: Fatal crash in worker") is True
     assert content_has_error_indicators("Everything completed successfully") is False
+
+
+_ISSUE_3580_SRC = [
+    'env = payload.get("env")',
+    "env_map = dict(env) if isinstance(env, dict) else {}",
+    "previous = {name: env_map.get(name) for name in values}",
+    'payload["env"] = env_map',
+    'path.write_text(json.dumps(payload, indent=2), encoding="utf-8")',
+]
+_ISSUE_3580_FILE = "./headroom/providers/claude/install.py"
+
+
+def _issue_3580_build(first_sep: str, second_sep: str) -> str:
+    """70-line grep-shaped payload from the issue's reproducer (14 repeats)."""
+    return "\n".join(
+        f"{_ISSUE_3580_FILE}{first_sep}{40 + i}{second_sep}{line}"
+        for _ in range(14)
+        for i, line in enumerate(_ISSUE_3580_SRC)
+    )
+
+
+def test_search_detection_recognizes_grep_context_lines() -> None:
+    """Regression (#3580): `-`-separated grep context lines are search output.
+
+    GNU grep -A/-B/-C (and ripgrep / `git grep -A`) emit context lines as
+    ``path-NN-content``. They must route to the lossless search fold, never
+    to the word-dropping Kompress prose path.
+    """
+    payload = _issue_3580_build("-", "-")  # real `grep -A` emission shape
+    result = _try_detect_search(payload)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+    assert result.metadata == {"matching_lines": 70, "total_lines": 70}
+    assert detect_content_type(payload).content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_rejects_colon_dash_mix() -> None:
+    """The synthetic `path:NN-content` mix is NOT a real grep emission.
+
+    Real grep uses `-` for both separators on context lines
+    (``path-NN-content``) and `:` for both on match lines; the colon-dash mix
+    only occurs in the issue's reproducer script. Accepting it would newly
+    claim changelog/log shorthand such as `notes.txt:3-updated`, so it stays
+    PLAIN_TEXT by design (solution review for #3580).
+    """
+    payload = _issue_3580_build(":", "-")
+    assert _try_detect_search(payload) is None
+    assert detect_content_type(payload).content_type is ContentType.PLAIN_TEXT
+
+
+def test_search_detection_recognizes_dashed_file_names_in_context_lines() -> None:
+    """Context lines keep working when the file name itself contains dashes."""
+    payload = "\n".join(f"my-file.py-{40 + i}-    value = {i}" for i in range(8))
+    result = _try_detect_search(payload)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+    assert detect_content_type(payload).content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_mixed_match_and_context_lines() -> None:
+    """Realistic `rg -A2` block: match lines, context lines, `--` separators.
+
+    With match lines alone the ratio is 14/56 = 0.25 < 0.3, so the payload
+    misdetected as PLAIN_TEXT before the fix; counting context lines gives
+    42/56 = 0.75.
+    """
+    block: list[str] = []
+    for rep in range(14):
+        block.append(f"src/app.py:{10 + rep}:def handler_{rep}():")
+        block.append(f"src/app.py-{11 + rep}-    first = compute()")
+        block.append(f"src/app.py-{12 + rep}-    return first")
+        block.append("--")
+    payload = "\n".join(block)
+    result = _try_detect_search(payload)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+    assert result.metadata == {"matching_lines": 42, "total_lines": 56}
+    assert detect_content_type(payload).content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_context_lines_require_path_shape() -> None:
+    """The `-` branch must not claim dated logs or dashed prose (#3580).
+
+    `2026-09-14` and `version-2-release` both fit `word-digits-dash`, but
+    their prefixes are not file paths (no `/` or `.`), so they stay out.
+    """
+    dated = "\n".join(f"2026-09-14 worker heartbeat ok cycle {i}" for i in range(8))
+    assert _try_detect_search(dated) is None
+    assert detect_content_type(dated).content_type is not ContentType.SEARCH_RESULTS
+
+    prose = "\n".join(
+        [
+            "version-2-release notes for the quarterly update",
+            "well-42-known edge cases in the migration guide",
+            "follow the step-1-setup instructions carefully",
+            "see the self-9-reported issues in the tracker",
+        ]
+    )
+    assert _try_detect_search(prose) is None
+
+    # The `<`/`>`/`=` prefix exclusions apply to the `-` branch unchanged.
+    key_value = "\n".join(f"timeout={30 + i}-12-retried" for i in range(4))
+    assert _try_detect_search(key_value) is None
+    markup = "\n".join(f'<log-{i}-started id="{i}">' for i in range(4))
+    assert _try_detect_search(markup) is None
+
+
+def test_search_detection_single_context_line_does_not_classify() -> None:
+    """The two-line floor applies to context lines exactly as to matches."""
+    assert _try_detect_search("src/main.py-42-def process():") is None

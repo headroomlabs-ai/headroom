@@ -50,6 +50,15 @@ _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
 
+# Grep context lines (`grep -A/-B/-C`, ripgrep, `git grep -A`): `path-NN-code`
+# with `-` as BOTH separators. Real grep never emits the `path:NN-code`
+# colon-dash mix, so only dash-dash is accepted here — the mix would newly
+# claim changelog/log shorthand such as `notes.txt:3-updated` (#3580). The
+# path segment admits `-` (dashed file names) exactly like the match-line
+# pattern; the `/`-or-`.` path-shape requirement in `_is_grep_context_line`
+# is what keeps dates (`2026-09-14`) and dashed prose (`version-2-x`) out.
+_GREP_CONTEXT_PATTERN = re.compile(r"^([^\s:]+)-(?:\d+)-")
+
 # A markdown table separator row, e.g. "| --- | :--: |" or "---|---".
 # Every cell must be dashes with optional alignment colons.
 _MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
@@ -467,11 +476,38 @@ def _is_search_result_line(line: str) -> bool:
     deleting the rest. So the pre-colon segment must additionally look like
     a file path: no angle brackets and no ``=`` (rules out markup tags and
     ``key=value:12:`` log lines).
+
+    ``grep -A/-B/-C`` context lines (``path-NN-content``) are accepted via
+    `_is_grep_context_line` below.
     """
-    if not _SEARCH_RESULT_PATTERN.match(line):
+    if _SEARCH_RESULT_PATTERN.match(line):
+        prefix = line.split(":", 1)[0]
+        return "<" not in prefix and ">" not in prefix and "=" not in prefix
+    return _is_grep_context_line(line)
+
+
+def _is_grep_context_line(line: str) -> bool:
+    """True when a line looks like ``path-NN-content`` grep context output.
+
+    Context lines produced by ``grep -A/-B/-C`` (and ripgrep / ``git grep``)
+    use ``-`` for both separators, where match lines use ``:``. Only the
+    dash-dash shape is accepted: the ``path:NN-content`` colon-dash mix is
+    not a real grep emission and would claim changelog/log shorthand such
+    as ``notes.txt:3-updated`` (#3580).
+
+    The ``<``/``>``/``=`` prefix exclusions mirror `_is_search_result_line`
+    (markup tags, ``key=value`` log lines). The path-shape requirement (a
+    directory separator or an extension dot in the prefix) is what keeps
+    dates (``2026-09-14``) and dashed prose (``version-2-release``) out;
+    bare extensionless names (``Makefile-12-x``) stay unclaimed by design.
+    """
+    match = _GREP_CONTEXT_PATTERN.match(line)
+    if not match:
         return False
-    prefix = line.split(":", 1)[0]
-    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+    prefix = match.group(1)
+    if "<" in prefix or ">" in prefix or "=" in prefix:
+        return False
+    return "/" in prefix or "." in prefix
 
 
 def _try_detect_search(content: str) -> DetectionResult | None:
