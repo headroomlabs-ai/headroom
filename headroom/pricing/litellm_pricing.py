@@ -389,6 +389,7 @@ def _deepseek_flat_row(canonical: str) -> dict[str, float | str | int]:
         "litellm_provider": "deepseek",
         "max_tokens": 393_216,
         "max_input_tokens": 1_000_000,
+        # 393_216 = 384 x 1024; the vendor page states the same cap as "384K".
         "max_output_tokens": 393_216,
     }
 
