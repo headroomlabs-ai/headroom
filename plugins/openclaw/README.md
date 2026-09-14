@@ -108,7 +108,7 @@ Headroom always compresses **per-turn model input** via `assemble()`. Durable tr
 }
 ```
 
-**Hybrid (opt-in, for large tool-heavy sessions):** Headroom algorithmically shrinks tool blobs in SQLite (replace-only, no truncate) on turn-end and before `/compact`, then OpenClaw safeguard summarization handles the big history prune. OpenClaw owns durable compaction (`ownsCompaction: false`), avoiding mid-turn transcript ownership errors.
+Stock installs need no compaction config — the default is `"openclaw"`. The JSON above is an **opt-in** hybrid example for large tool-heavy sessions.
 
 After hygiene rewrites, the plugin waits for OpenClaw's SQLite transcript projection to settle (configurable via `transcriptProjectionWaitMs`, default 120s). Turn-end hygiene is debounced per session (`transcriptHygiene.debounceMs`, default 30s) so a `/compact` immediately after a turn does not stack two rewrites.
 

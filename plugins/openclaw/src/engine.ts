@@ -382,9 +382,12 @@ export class HeadroomContextEngine {
   /**
    * Durable compaction (`/compact`, overflow recovery).
    *
-   * - `persistentCompaction: "hybrid"` (default): Headroom replace pre-pass, then OpenClaw LLM compact.
-   * - `persistentCompaction: "headroom"`: rewrite SQLite via Headroom `/v1/compress` (zero LLM).
-   * - `persistentCompaction: "openclaw"`: delegate to OpenClaw native compaction only.
+   * - `persistentCompaction: "openclaw"` (default): delegate to OpenClaw native
+   *   compaction only — matches upstream `main` after #2304 (`ownsCompaction: false`).
+   * - `persistentCompaction: "hybrid"`: Headroom replace pre-pass (when hygiene is
+   *   enabled), then OpenClaw LLM compact.
+   * - `persistentCompaction: "headroom"`: rewrite SQLite via Headroom `/v1/compress`
+   *   (zero LLM). Opt-in; not the stock default.
    */
   async compact(params: OpenClawCompactParams): Promise<OpenClawCompactResult> {
     params.abortSignal?.throwIfAborted();
