@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
@@ -197,6 +199,148 @@ def test_openai_tool_schema_compaction_is_deterministic() -> None:
     assert prop["description"] == "Name path to match. Keeps full semantics."
     assert prop["type"] == "string"
     assert "examples" not in prop
+
+
+def _verbose_tool_payload() -> dict[str, Any]:
+    verbose = " ".join(["Use this tool to read a file from the workspace."] * 20)
+    return {
+        "model": "gpt-4o-mini",
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "title": "Read File",
+                "description": verbose,
+                "parameters": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "ReadFileParameters",
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "title": "Path",
+                            "type": "string",
+                            "description": verbose,
+                            "examples": ["src/main.py"],
+                        }
+                    },
+                    "required": ["path"],
+                },
+            }
+        ],
+        "input": [{"type": "message", "role": "user", "content": "hello"}],
+    }
+
+
+def test_responses_tool_schema_compaction_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_TOOL_SCHEMA_COMPACTION", raising=False)
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+
+    updated, _modified, _saved, transforms, _reason, _before, _after, _attempted = (
+        handler._compress_openai_responses_payload(
+            _verbose_tool_payload(),
+            model="gpt-4o-mini",
+            request_id="hr_schema_default_off",
+        )
+    )
+
+    assert "openai:responses:tool_schema_compaction" not in transforms
+    tool = updated["tools"][0]
+    assert tool["title"] == "Read File"
+    assert tool["parameters"]["$schema"].startswith("https://json-schema.org/")
+    assert tool["parameters"]["properties"]["path"]["examples"] == ["src/main.py"]
+
+
+def test_responses_tool_schema_compaction_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_TOOL_SCHEMA_COMPACTION", "1")
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+
+    updated, _modified, _saved, transforms, _reason, _before, _after, _attempted = (
+        handler._compress_openai_responses_payload(
+            _verbose_tool_payload(),
+            model="gpt-4o-mini",
+            request_id="hr_schema_opt_in",
+        )
+    )
+
+    assert "openai:responses:tool_schema_compaction" in transforms
+    tool = updated["tools"][0]
+    assert "title" not in tool
+    assert "$schema" not in tool["parameters"]
+    assert "examples" not in tool["parameters"]["properties"]["path"]
+
+
+def _tool_search_payload() -> dict[str, Any]:
+    tools = [
+        {"type": "function", "name": name, "parameters": {"type": "object"}}
+        for name in ("bash", "read", "write", "edit", "grep", "glob")
+    ]
+    tools += [
+        {"type": "function", "name": f"slack_{idx}", "parameters": {"type": "object"}}
+        for idx in range(10)
+    ]
+    return {
+        "model": "gpt-5.5",
+        "tools": tools,
+        "input": [{"type": "message", "role": "user", "content": "hello"}],
+    }
+
+
+def test_responses_tool_search_deferral_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_OPENAI_TOOL_SEARCH", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", raising=False)
+    monkeypatch.delenv("HEADROOM_TOOL_SCHEMA_COMPACTION", raising=False)
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+
+    updated, _modified, _saved, transforms, _reason, _before, _after, _attempted = (
+        handler._compress_openai_responses_payload(
+            _tool_search_payload(),
+            model="gpt-5.5",
+            request_id="hr_tool_search_default_off",
+        )
+    )
+
+    assert "openai:responses:tool_search_deferral" not in transforms
+    assert not any(tool.get("type") == "tool_search" for tool in updated["tools"])
+    assert not any(tool.get("defer_loading") for tool in updated["tools"])
+
+
+def test_responses_tool_search_deferral_requires_explicit_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
+    monkeypatch.delenv("HEADROOM_TOOL_SCHEMA_COMPACTION", raising=False)
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+
+    updated, _modified, _saved, transforms, _reason, _before, _after, _attempted = (
+        handler._compress_openai_responses_payload(
+            _tool_search_payload(),
+            model="gpt-5.5",
+            request_id="hr_tool_search_opt_in",
+        )
+    )
+
+    assert "openai:responses:tool_search_deferral" in transforms
+    assert updated["tools"][0] == {"type": "tool_search"}
+    assert (
+        next(tool for tool in updated["tools"] if tool.get("name") == "slack_0").get(
+            "defer_loading"
+        )
+        is True
+    )
+    assert (
+        next(tool for tool in updated["tools"] if tool.get("name") == "bash").get("defer_loading")
+        is None
+    )
 
 
 class _StubTokenizer:
