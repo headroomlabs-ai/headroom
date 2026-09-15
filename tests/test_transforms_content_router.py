@@ -876,6 +876,57 @@ def test_source_code_code_aware_enabled_uses_code_aware(
     assert strategy is CompressionStrategy.CODE_AWARE
 
 
+def test_ruby_source_code_routes_to_code_aware_compressor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_code_aware=True,
+            prefer_code_aware_for_code=True,
+        )
+    )
+    ruby = "class Worker\n  def run\n    first = 1\n    second = first + 1\n    third = second + 1\n  end\nend\n"
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: False)
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(
+            ContentType.SOURCE_CODE,
+            1.0,
+            {"language": "ruby"},
+        ),
+    )
+
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeRubyCompressor:
+        def compress(self, content: str, language: str | None = None, context: str = ""):
+            calls.append((content, language))
+            return SimpleNamespace(compressed=content.replace("first = 1", "# omitted"))
+
+    monkeypatch.setattr(router, "_get_code_compressor", lambda: FakeRubyCompressor())
+    monkeypatch.setattr(
+        router,
+        "_try_ml_compressor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Ruby CODE_AWARE route unexpectedly fell back to Kompress")
+        ),
+    )
+
+    assert router._determine_strategy(ruby) is CompressionStrategy.CODE_AWARE
+    compressed, _tokens, chain = router._apply_strategy_to_content(
+        ruby,
+        CompressionStrategy.CODE_AWARE,
+        context="",
+        language="ruby",
+    )
+
+    assert calls == [(ruby, "ruby")]
+    assert compressed.startswith("class Worker")
+    assert "# omitted" in compressed
+    assert chain == [CompressionStrategy.CODE_AWARE.value]
+
+
 def test_source_code_passthrough_does_not_invoke_kompress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

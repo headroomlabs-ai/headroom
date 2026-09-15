@@ -14,10 +14,10 @@
 //! grammars; this port uses the per-language `tree-sitter-<lang>` crates.
 //! Byte-parity requires node-for-node identical ASTs (same node `kind`
 //! strings, same tree shape, same `start_point`/`end_point` rows). The
-//! Cargo pins (`tree-sitter-python = "=0.25.0"`, …) match the exact PyPI
-//! wheel versions the fixtures were recorded against; a canary over 9
-//! samples × 8 languages confirmed 100% identical node-type + line-span
-//! trees. See `crates/headroom-core/Cargo.toml` for the full pin table.
+//! Cargo pins (`tree-sitter-python = "=0.25.0"`, …) are intended to match
+//! the PyPI wheel versions used by the fixture recorder. The cross-runtime
+//! AST canary is a separate validation step and is not run by this module.
+//! See `crates/headroom-core/Cargo.toml` for the full pin table.
 //!
 //! # Parity scope
 //!
@@ -38,6 +38,7 @@
 //! convention via the dispatcher. Parity fixtures are recorded with
 //! `enable_ccr=False` so the output is deterministic and store-independent.
 
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
 use tree_sitter::{Language, Node, Parser, Tree};
@@ -56,6 +57,7 @@ pub enum CodeLanguage {
     Java,
     C,
     Cpp,
+    Ruby,
     Unknown,
 }
 
@@ -70,6 +72,7 @@ impl CodeLanguage {
             CodeLanguage::Java => "java",
             CodeLanguage::C => "c",
             CodeLanguage::Cpp => "cpp",
+            CodeLanguage::Ruby => "ruby",
             CodeLanguage::Unknown => "unknown",
         }
     }
@@ -87,6 +90,7 @@ impl CodeLanguage {
             "java" => CodeLanguage::Java,
             "c" => CodeLanguage::C,
             "cpp" => CodeLanguage::Cpp,
+            "ruby" | "rb" => CodeLanguage::Ruby,
             "unknown" => CodeLanguage::Unknown,
             _ => return None,
         })
@@ -103,6 +107,7 @@ impl CodeLanguage {
             CodeLanguage::Java => tree_sitter_java::LANGUAGE.into(),
             CodeLanguage::C => tree_sitter_c::LANGUAGE.into(),
             CodeLanguage::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            CodeLanguage::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             CodeLanguage::Unknown => return None,
         })
     }
@@ -153,6 +158,16 @@ struct LangConfig {
     comment_prefix: &'static str,
     uses_colon_after_signature: bool,
     package_node: Option<&'static str>,
+    reconstruction_mode: ReconstructionMode,
+    source_edit_node_types: &'static [&'static str],
+    source_edit_opaque_ancestors: &'static [&'static str],
+    loader_names: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconstructionMode {
+    Assemble,
+    SourceEdits,
 }
 
 impl LangConfig {
@@ -171,6 +186,18 @@ impl LangConfig {
     fn is_body(&self, k: &str) -> bool {
         self.body_node_types.contains(&k)
     }
+
+    fn is_source_edit_node(&self, k: &str) -> bool {
+        self.source_edit_node_types.contains(&k)
+    }
+
+    fn is_source_edit_opaque_ancestor(&self, k: &str) -> bool {
+        self.source_edit_opaque_ancestors.contains(&k)
+    }
+
+    fn is_loader(&self, k: &str) -> bool {
+        self.loader_names.contains(&k)
+    }
 }
 
 /// Returns the `LangConfig` for a language, or `None` for `Unknown`
@@ -187,6 +214,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "#",
             uses_colon_after_signature: true,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Javascript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -198,6 +229,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Typescript => LangConfig {
             import_nodes: &["import_statement", "import_declaration"],
@@ -209,6 +244,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Go => LangConfig {
             import_nodes: &["import_declaration"],
@@ -220,6 +259,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_clause"),
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Rust => LangConfig {
             import_nodes: &["use_declaration"],
@@ -231,6 +274,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Java => LangConfig {
             import_nodes: &["import_declaration"],
@@ -242,6 +289,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: Some("package_declaration"),
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::C => LangConfig {
             import_nodes: &["preproc_include"],
@@ -253,6 +304,10 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Cpp => LangConfig {
             import_nodes: &["preproc_include"],
@@ -264,8 +319,27 @@ fn lang_config(language: CodeLanguage) -> Option<LangConfig> {
             comment_prefix: "//",
             uses_colon_after_signature: false,
             package_node: None,
+            reconstruction_mode: ReconstructionMode::Assemble,
+            source_edit_node_types: &[],
+            source_edit_opaque_ancestors: &[],
+            loader_names: &[],
         },
         CodeLanguage::Unknown => return None,
+        CodeLanguage::Ruby => LangConfig {
+            import_nodes: &[],
+            function_nodes: &["method", "singleton_method"],
+            class_nodes: &["class", "module", "singleton_class"],
+            type_nodes: &[],
+            body_node_types: &["body_statement"],
+            decorator_node: None,
+            comment_prefix: "#",
+            uses_colon_after_signature: false,
+            package_node: None,
+            reconstruction_mode: ReconstructionMode::SourceEdits,
+            source_edit_node_types: &["method", "singleton_method"],
+            source_edit_opaque_ancestors: &["call"],
+            loader_names: &["require", "require_relative", "load", "autoload"],
+        },
     })
 }
 
@@ -358,14 +432,205 @@ impl CodeCompressionResult {
 /// `(compressed, structure, symbol_scores)` — the result of an AST pass.
 type AstCompression = (String, CodeStructure, Vec<(String, f64)>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceEdit {
+    start_byte: usize,
+    end_byte: usize,
+    replacement: String,
+}
+
+fn apply_source_edits(source: &str, edits: &[SourceEdit]) -> Option<String> {
+    let mut ordered = edits.to_vec();
+    ordered.sort_by_key(|edit| (edit.start_byte, edit.end_byte));
+    let mut previous = 0;
+    let mut previous_range: Option<(usize, usize)> = None;
+    for edit in &ordered {
+        if edit.start_byte > edit.end_byte
+            || edit.end_byte > source.len()
+            || edit.start_byte < previous
+            || previous_range == Some((edit.start_byte, edit.end_byte))
+            || !source.is_char_boundary(edit.start_byte)
+            || !source.is_char_boundary(edit.end_byte)
+        {
+            return None;
+        }
+        previous = edit.end_byte;
+        previous_range = Some((edit.start_byte, edit.end_byte));
+    }
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for edit in ordered {
+        output.push_str(&source[cursor..edit.start_byte]);
+        output.push_str(&edit.replacement);
+        cursor = edit.end_byte;
+    }
+    output.push_str(&source[cursor..]);
+    Some(output)
+}
+
+fn compress_ruby_source_edits(
+    code: &str,
+    root: Node,
+    max_body_lines: i64,
+    lang: &LangConfig,
+) -> AstCompression {
+    fn contains_method(node: Node, lang: &LangConfig) -> bool {
+        if lang.is_source_edit_node(node.kind()) {
+            return true;
+        }
+        node.named_children(&mut node.walk())
+            .any(|child| contains_method(child, lang))
+    }
+
+    fn contains_opaque_call(node: Node, lang: &LangConfig) -> bool {
+        if lang.is_source_edit_opaque_ancestor(node.kind()) && contains_method(node, lang) {
+            return true;
+        }
+        node.named_children(&mut node.walk())
+            .any(|child| contains_opaque_call(child, lang))
+    }
+
+    fn contains_heredoc(node: Node) -> bool {
+        matches!(node.kind(), "heredoc_beginning" | "heredoc_body")
+            || node.named_children(&mut node.walk()).any(contains_heredoc)
+    }
+
+    fn contains_control_clause(node: Node) -> bool {
+        matches!(node.kind(), "rescue" | "else" | "ensure")
+            || node
+                .named_children(&mut node.walk())
+                .any(contains_control_clause)
+    }
+
+    fn walk(
+        node: Node,
+        code: &str,
+        max_body_lines: usize,
+        edits: &mut Vec<SourceEdit>,
+        bodies: &mut Vec<(String, String, i64)>,
+        imports: &mut usize,
+        lang: &LangConfig,
+    ) {
+        if lang.is_source_edit_node(node.kind()) {
+            if node.start_position().row == node.end_position().row {
+                return;
+            }
+            let Some(body) = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "body_statement")
+            else {
+                return;
+            };
+            let statements: Vec<Node> = body
+                .named_children(&mut body.walk())
+                .filter(|child| {
+                    !matches!(child.kind(), "comment" | "heredoc_body")
+                        && !lang.is_source_edit_node(child.kind())
+                        && !contains_opaque_call(*child, lang)
+                        && !contains_heredoc(*child)
+                        && !contains_control_clause(*child)
+                })
+                .collect();
+            if statements.len() <= max_body_lines {
+                return;
+            }
+            let mut kept_lines = 0;
+            let mut omitted = Vec::new();
+            for statement in statements {
+                let lines = statement.end_position().row - statement.start_position().row + 1;
+                if kept_lines + lines <= max_body_lines {
+                    kept_lines += lines;
+                } else {
+                    omitted.push((statement, lines));
+                }
+            }
+            if omitted.is_empty() {
+                return;
+            }
+            let omitted_lines: usize = omitted.iter().map(|(_, lines)| *lines).sum();
+            let name = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "identifier")
+                .map(|child| node_text(child, code).to_string())
+                .unwrap_or_default();
+            let signature = code[node.start_byte()..body.start_byte()]
+                .trim_end()
+                .to_string();
+            let empty_analysis = SymbolAnalysis::default();
+            for (index, (statement, _)) in omitted.into_iter().enumerate() {
+                let mut replacement = if index == 0 {
+                    make_omitted_comment(
+                        (!name.is_empty()).then_some(name.as_str()),
+                        omitted_lines as i64,
+                        "",
+                        lang.comment_prefix,
+                        &empty_analysis,
+                    )
+                } else {
+                    String::new()
+                };
+                let line_end = code[statement.end_byte()..]
+                    .find('\n')
+                    .map(|offset| statement.end_byte() + offset)
+                    .unwrap_or(code.len());
+                if index == 0 && !code[statement.end_byte()..line_end].trim().is_empty() {
+                    replacement.push_str(if code.contains("\r\n") { "\r\n" } else { "\n" });
+                }
+                edits.push(SourceEdit {
+                    start_byte: statement.start_byte(),
+                    end_byte: statement.end_byte(),
+                    replacement,
+                });
+            }
+            bodies.push((signature, String::new(), node.start_position().row as i64));
+            return;
+        }
+        if node.kind() == "call" {
+            if let Some(method) = node.child_by_field_name("method") {
+                let name = node_text(method, code);
+                if lang.is_loader(name) {
+                    *imports += 1;
+                }
+            }
+            return;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            walk(child, code, max_body_lines, edits, bodies, imports, lang);
+        }
+    }
+
+    let mut edits = Vec::new();
+    let mut function_bodies = Vec::new();
+    let mut import_count = 0;
+    walk(
+        root,
+        code,
+        max_body_lines.max(0) as usize,
+        &mut edits,
+        &mut function_bodies,
+        &mut import_count,
+        lang,
+    );
+    let compressed = apply_source_edits(code, &edits).unwrap_or_else(|| code.to_string());
+    let imports = (0..import_count).map(|_| String::new()).collect();
+    (
+        compressed,
+        CodeStructure {
+            imports,
+            function_bodies,
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+}
+
 #[derive(Default)]
 struct CodeStructure {
     imports: Vec<String>,
     type_definitions: Vec<String>,
     class_definitions: Vec<String>,
     function_signatures: Vec<String>,
-    /// (signature, body, line) — never populated by the current paths, so
-    /// `compressed_bodies` is always 0 (mirrors the reference).
+    /// (signature, body, line) for compressed bodies used by CCR summaries.
     function_bodies: Vec<(String, String, i64)>,
     top_level_code: Vec<String>,
     other: Vec<String>,
@@ -689,6 +954,14 @@ mod prefilter {
                         c(r"(?m)::\w+"),
                     ],
                 ),
+                (
+                    CodeLanguage::Ruby,
+                    vec![
+                        c(r"(?m)^\s*(class|module|def)\s+[\w:!?=]+"),
+                        c(r#"(?m)^\s*(require|require_relative|load|autoload)\s+['\"]"#),
+                        c(r"(?m)^\s*@[A-Za-z_]\w*"),
+                    ],
+                ),
             ]
         })
     }
@@ -766,6 +1039,9 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
             continue;
         };
         let root = tree.root_node();
+        if *lang == CodeLanguage::Ruby && !ruby_structural_evidence(root) {
+            continue;
+        }
         let error_count = count_error_nodes(root);
         let node_count = root.child_count() as i64;
         if error_count < min_errors || (error_count == min_errors && node_count > best_node_count) {
@@ -795,6 +1071,38 @@ pub fn detect_language(code: &str) -> (CodeLanguage, f64) {
     }
     let confidence = (0.3 + best.1 as f64 * 0.1).min(1.0);
     (best.0, confidence)
+}
+
+fn ruby_structural_evidence(node: Node) -> bool {
+    if matches!(
+        node.kind(),
+        "class" | "module" | "method" | "singleton_method"
+    ) {
+        return true;
+    }
+    node.named_children(&mut node.walk())
+        .any(ruby_structural_evidence)
+}
+
+thread_local! {
+    static RUBY_DETECTION_PARSER: RefCell<Parser> = RefCell::new(Parser::new());
+}
+
+/// Shared Ruby structural probe for content detection, using the same
+/// thread-local parser ownership as the compressor's Ruby evidence path.
+pub(crate) fn ruby_structural_evidence_for_detection(content: &str) -> bool {
+    RUBY_DETECTION_PARSER.with(|parser| {
+        let mut parser = parser.borrow_mut();
+        if parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .is_err()
+        {
+            return false;
+        }
+        parser
+            .parse(content, None)
+            .is_some_and(|tree| ruby_structural_evidence(tree.root_node()))
+    })
 }
 
 // ─── Compressor ─────────────────────────────────────────────────────────
@@ -850,14 +1158,22 @@ impl CodeAwareCompressor {
 
         // Detect or use specified language.
         let (detected_lang, confidence) = if let Some(lang) = language {
-            match CodeLanguage::from_name(&lang.to_lowercase()) {
-                Some(l) => (l, 1.0),
-                None => (CodeLanguage::Unknown, 1.0),
+            let normalized = lang.trim().to_lowercase();
+            if matches!(normalized.as_str(), "erb" | "rake" | "gemspec") {
+                (CodeLanguage::Unknown, 0.0)
+            } else if let Some(l) = CodeLanguage::from_name(&normalized) {
+                (l, 1.0)
+            } else {
+                detect_language(code)
             }
         } else if let Some(hint) = &self.config.language_hint {
-            match CodeLanguage::from_name(&hint.to_lowercase()) {
-                Some(l) => (l, 1.0),
-                None => (CodeLanguage::Unknown, 1.0),
+            let normalized = hint.trim().to_lowercase();
+            if matches!(normalized.as_str(), "erb" | "rake" | "gemspec") {
+                (CodeLanguage::Unknown, 0.0)
+            } else if let Some(l) = CodeLanguage::from_name(&normalized) {
+                (l, 1.0)
+            } else {
+                detect_language(code)
             }
         } else {
             detect_language(code)
@@ -877,6 +1193,9 @@ impl CodeAwareCompressor {
         }
 
         // Parse + compress (tree-sitter always available here).
+        if detected_lang == CodeLanguage::Ruby && !self.verify_syntax(code, detected_lang) {
+            return passthrough_result(code, original_tokens, detected_lang, confidence);
+        }
         let Some((compressed, structure, symbol_scores)) =
             self.compress_with_ast(code, detected_lang, context)
         else {
@@ -895,7 +1214,7 @@ impl CodeAwareCompressor {
         let ratio = compressed_tokens as f64 / original_tokens.max(1) as f64;
 
         // Guard against over-aggressive compression (data loss).
-        if ratio < 0.05 {
+        if ratio < 0.05 || (detected_lang == CodeLanguage::Ruby && ratio >= 1.0) {
             return passthrough_result(code, original_tokens, detected_lang, confidence);
         }
 
@@ -931,12 +1250,21 @@ impl CodeAwareCompressor {
     ) -> Option<AstCompression> {
         let tree = parse_code(code, language)?;
         let root = tree.root_node();
+        let lang = lang_config(language)?;
+
+        if lang.reconstruction_mode == ReconstructionMode::SourceEdits {
+            return Some(compress_ruby_source_edits(
+                code,
+                root,
+                self.config.max_body_lines,
+                &lang,
+            ));
+        }
 
         let analysis = self.analyze_symbol_importance(root, code, language, context);
         let body_limits = self.allocate_body_budget(&analysis, code);
 
-        let lang = lang_config(language);
-        let (structure, symbol_scores) = if let Some(lang) = lang {
+        let (structure, symbol_scores) = {
             let code_lines: Vec<&str> = code.split('\n').collect();
             let ctx = Ctx {
                 code,
@@ -965,8 +1293,6 @@ impl CodeAwareCompressor {
                 }
             }
             (structure, symbol_scores)
-        } else {
-            (extract_generic_structure(code), Vec::new())
         };
 
         let compressed = assemble_compressed(&structure);
@@ -1004,13 +1330,6 @@ fn passthrough_result(
         syntax_valid: true,
         cache_key: None,
         symbol_scores: Vec::new(),
-    }
-}
-
-fn extract_generic_structure(code: &str) -> CodeStructure {
-    CodeStructure {
-        other: code.split('\n').map(|s| s.to_string()).collect(),
-        ..Default::default()
     }
 }
 
@@ -1910,6 +2229,15 @@ mod tests {
         assert_eq!(lang, CodeLanguage::Unknown);
     }
 
+    #[test]
+    fn ruby_parser_evidence_beats_inline_perl_sigil_overlap() {
+        let source = "class Account\n  def total\n    return @value0 + @value1 + @value2 + @value3 + @value4 + @value5 + @value6 + @value7 + @value8 + @value9 + @value10 + @value11 + @value12 + @value13 + @value14 + @value15 + @value16 + @value17 + @value18 + @value19\n  end\nend\n";
+        let (lang, confidence) = detect_language(source);
+
+        assert_eq!(lang, CodeLanguage::Ruby);
+        assert!(confidence > 0.0);
+    }
+
     // CJK-aware relevance-query matching. Mirrors
     // tests/test_transforms/test_code_compressor_cjk.py (Python reference).
 
@@ -2023,5 +2351,256 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
         assert_eq!(r.compressed, "def f(): pass"); // < min_tokens → passthrough
         assert_eq!(r.compression_ratio, 1.0);
         assert_eq!(r.language, CodeLanguage::Unknown);
+    }
+
+    #[test]
+    fn source_edits_preserve_gaps_and_allow_adjacency() {
+        let source = "a\r\nbc\n";
+        let edits = vec![
+            SourceEdit {
+                start_byte: 0,
+                end_byte: 1,
+                replacement: "A".to_string(),
+            },
+            SourceEdit {
+                start_byte: 3,
+                end_byte: 5,
+                replacement: "BC".to_string(),
+            },
+        ];
+        assert_eq!(
+            apply_source_edits(source, &edits).as_deref(),
+            Some("A\r\nBC\n")
+        );
+        assert_eq!(
+            apply_source_edits("unchanged", &[]).as_deref(),
+            Some("unchanged")
+        );
+        let unsorted = vec![
+            SourceEdit {
+                start_byte: 3,
+                end_byte: 4,
+                replacement: "D".to_string(),
+            },
+            SourceEdit {
+                start_byte: 0,
+                end_byte: 1,
+                replacement: "A".to_string(),
+            },
+        ];
+        assert_eq!(
+            apply_source_edits("abcdef", &unsorted).as_deref(),
+            Some("AbcDef")
+        );
+    }
+
+    #[test]
+    fn source_edits_reject_invalid_ranges_and_unicode_splits() {
+        let source = "éclair";
+        let invalid = [
+            vec![SourceEdit {
+                start_byte: 2,
+                end_byte: 1,
+                replacement: String::new(),
+            }],
+            vec![
+                SourceEdit {
+                    start_byte: 0,
+                    end_byte: 2,
+                    replacement: String::new(),
+                },
+                SourceEdit {
+                    start_byte: 1,
+                    end_byte: 3,
+                    replacement: String::new(),
+                },
+            ],
+            vec![
+                SourceEdit {
+                    start_byte: 0,
+                    end_byte: 1,
+                    replacement: String::new(),
+                },
+                SourceEdit {
+                    start_byte: 0,
+                    end_byte: 1,
+                    replacement: String::new(),
+                },
+            ],
+            vec![SourceEdit {
+                start_byte: 1,
+                end_byte: 2,
+                replacement: String::new(),
+            }],
+            vec![SourceEdit {
+                start_byte: 0,
+                end_byte: 99,
+                replacement: String::new(),
+            }],
+        ];
+        for edits in invalid {
+            assert!(apply_source_edits(source, &edits).is_none());
+        }
+        assert_eq!(
+            apply_source_edits(
+                "éclair",
+                &[SourceEdit {
+                    start_byte: 2,
+                    end_byte: 3,
+                    replacement: "X".to_string(),
+                }],
+            )
+            .as_deref(),
+            Some("éXlair")
+        );
+    }
+
+    #[test]
+    fn ruby_source_edits_change_only_complete_statements() {
+        let source = "class Worker\n  def run\n    first = 1\n    second = first + 1\n    third = second + 1\n    fourth = third + 1\n    fifth = fourth + 1\n    sixth = fifth + 1\n    sixth\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+        assert_eq!(result.language, CodeLanguage::Ruby);
+        assert!(result.compressed.contains("# ["));
+        assert_eq!(result.compressed.matches("# [").count(), 1);
+        assert!(result.compressed.contains("class Worker\n  def run"));
+        assert!(result.syntax_valid);
+    }
+
+    #[test]
+    fn ruby_loader_metadata_excludes_non_loader_calls() {
+        let source = "require 'json'\nrequire_relative 'local'\nload 'extra'\nautoload :Thing, 'thing'\nputs 'runtime call'\nclass X\n  def run\n    first = 1\n    second = first + 1\n    third = second + 1\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+        assert_eq!(result.preserved_imports, 4);
+        assert!(result.compressed.contains("puts 'runtime call'"));
+        assert!(result.compressed.contains("# ["));
+    }
+
+    #[test]
+    fn ruby_no_benefit_is_exact_passthrough() {
+        let source = "class X\n  def run\n    a0 = 0\n    a1 = 1\n    a2 = 2\n    a3 = 3\n    a4 = 4\n    a5 = 5\n    a6 = 6\n    a7 = 7\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 5,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+        assert_eq!(result.compressed, source);
+        assert_eq!(result.compression_ratio, 1.0);
+    }
+
+    #[test]
+    fn ruby_same_line_kept_statement_stays_live_after_marker() {
+        let source = "class X\n  def run\n    a = 1\n    b = 2\n    c = 3\n    if c\n      x = 4\n    end; d = 5\n    e = 6\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 5,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("d = 5"));
+        assert!(result.compressed.contains("\n; d = 5"));
+    }
+
+    #[test]
+    fn unknown_hint_keeps_content_detection_fallback() {
+        let source = "def run(value):\n    first = value\n    second = first + 1\n    third = second + 1\n    return third\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("kotlin"), "");
+        assert_eq!(result.language, CodeLanguage::Python);
+    }
+
+    #[test]
+    fn ruby_heredoc_body_is_preserved_when_other_statements_are_omitted() {
+        let source = "class X\n  def run\n    first = 1\n    query = <<~SQL\n      SELECT 1\n    SQL\n    second = 2\n    third = 3\n    fourth = 4\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("query = <<~SQL"));
+        assert!(result.compressed.contains("SELECT 1"));
+        assert!(result.compressed.contains("SQL"));
+    }
+
+    #[test]
+    fn ruby_rescue_else_ensure_bodies_are_preserved() {
+        let source = "def run(value)\n  first = 1\n  begin\n    risky = value.call\n  rescue StandardError => error\n    fallback = error.message\n  else\n    success = true\n  ensure\n    cleanup = true\n  end\n  second = 2\n  third = 3\n  fourth = 4\n  fifth = 5\n  sixth = 6\n  seventh = 7\n  eighth = 8\n  ninth = 9\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("rescue StandardError => error"));
+        assert!(result.compressed.contains("fallback = error.message"));
+        assert!(result.compressed.contains("else\n    success = true"));
+        assert!(result.compressed.contains("ensure\n    cleanup = true"));
+        assert_eq!(result.compressed.matches("# [").count(), 1);
+    }
+
+    #[test]
+    fn ruby_nested_method_definition_is_not_an_omittable_statement() {
+        let source = "class Outer\n  def outer\n    def inner\n      inner_value = 1\n      inner_value\n    end\n    first = 1\n    second = 2\n    third = 3\n    fourth = 4\n    fifth = 5\n    sixth = 6\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 5,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("def inner"));
+        assert!(result.compressed.contains("inner_value = 1"));
+    }
+
+    #[test]
+    fn ruby_same_line_marker_preserves_crlf_line_endings() {
+        let source = "class X\r\n  def run\r\n    a = 1\r\n    b = 2\r\n    c = 3\r\n    d = 4\r\n    e = 5\r\n    f = 6\r\n  end\r\nend\r\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("# ["));
+        assert!(!result.compressed.replace("\r\n", "").contains('\n'));
     }
 }
