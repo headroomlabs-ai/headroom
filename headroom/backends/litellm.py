@@ -1174,6 +1174,14 @@ class LiteLLMBackend(Backend):
             final_input_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
+            # Real output-token count from the trailing usage chunk. The
+            # ``output_tokens`` counter incremented per content_block_delta below
+            # is only a delta *count* (one per SSE chunk), which undercounts the
+            # true token total several-fold. Prefer the provider's
+            # completion_tokens when the usage chunk carries it, exactly like the
+            # non-streaming path (_anthropic_usage_from_litellm), and fall back to
+            # the delta count only when no usage chunk arrives.
+            final_output_tokens = 0
 
             async for chunk in response:
                 if hasattr(chunk, "usage") and chunk.usage:
@@ -1183,6 +1191,7 @@ class LiteLLMBackend(Backend):
                     final_cache_write_tokens = int(
                         getattr(cu, "cache_creation_input_tokens", 0) or 0
                     )
+                    final_output_tokens = int(getattr(cu, "completion_tokens", 0) or 0)
 
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
@@ -1289,9 +1298,21 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
-            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            delta_usage: dict[str, Any] = {"output_tokens": final_output_tokens or output_tokens}
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
-                delta_usage["input_tokens"] = final_input_tokens
+                # LiteLLM's prompt_tokens is the *total* prompt size, inclusive
+                # of the cache-read and cache-write tokens (Bedrock reports raw
+                # inputTokens and LiteLLM's AmazonConverseConfig._transform_usage
+                # adds cacheReadInputTokens + cacheWriteInputTokens onto it).
+                # Anthropic's input_tokens must exclude both, since the cache
+                # fields below report them separately and clients treat the three
+                # buckets as disjoint. Without the subtraction a cached streaming
+                # turn double-counts the cached prefix in input_tokens at the full
+                # input rate. Mirrors the non-streaming path in
+                # _anthropic_usage_from_litellm (#1345 / #1848).
+                delta_usage["input_tokens"] = max(
+                    final_input_tokens - final_cache_read_tokens - final_cache_write_tokens, 0
+                )
                 if final_cache_read_tokens:
                     delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
                 if final_cache_write_tokens:
