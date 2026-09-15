@@ -210,6 +210,11 @@ def install_id() -> str:
     with _identity_lock:
         if _install_id is not None:
             return _install_id
+        from headroom import paths
+
+        if paths.process_is_stateless():
+            _install_id = uuid.uuid4().hex
+            return _install_id
         path = _install_id_path()
         try:
             existing = path.read_text().strip()
