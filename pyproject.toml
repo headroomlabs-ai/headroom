@@ -84,6 +84,7 @@ proxy = [
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
+    "python-socks[asyncio]>=2.7.1",  # SOCKS support when websockets discovers a system proxy
     # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
     # returning an initialization error; 1.24+ no longer ships Python 3.10
     # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
