@@ -53,8 +53,10 @@ import inspect
 import logging
 import os
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any
 
 from headroom.memory import qdrant_env
@@ -62,6 +64,9 @@ from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
 
 logger = logging.getLogger(__name__)
+
+_MAX_TASK_RESULTS = 1000
+_TASK_RESULT_TTL_SECONDS = 60 * 60
 
 
 def _utcnow() -> datetime:
@@ -158,10 +163,11 @@ class DirectMem0Adapter:
         self._neo4j_driver: Any = None
         self._qdrant_client: Any = None
         self._initialized = False
+        self._closing = False
 
         # Background task tracking
-        self._background_tasks: dict[str, asyncio.Task] = {}
-        self._task_results: dict[str, dict[str, Any]] = {}
+        self._background_tasks: dict[str, asyncio.Task[Memory]] = {}
+        self._task_results: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._close_lock = asyncio.Lock()
 
     async def _ensure_initialized(self) -> None:
@@ -339,6 +345,49 @@ class DirectMem0Adapter:
         """Generate a unique task ID for background processing."""
         return f"task_{uuid.uuid4().hex[:12]}"
 
+    def _prune_task_results(self, now: float | None = None) -> None:
+        """Expire old outcomes and keep completed-task retention bounded."""
+        current_time = monotonic() if now is None else now
+        while self._task_results:
+            _task_id, (completed_at, _result) = next(iter(self._task_results.items()))
+            if completed_at + _TASK_RESULT_TTL_SECONDS > current_time:
+                break
+            self._task_results.popitem(last=False)
+        while len(self._task_results) > _MAX_TASK_RESULTS:
+            self._task_results.popitem(last=False)
+
+    def _store_task_result(self, task_id: str, result: dict[str, Any]) -> None:
+        completed_at = monotonic()
+        self._prune_task_results(completed_at)
+        self._task_results[task_id] = (completed_at, result)
+        self._prune_task_results(completed_at)
+
+    def _handle_background_task_done(
+        self,
+        task_id: str,
+        task: asyncio.Future[Memory],
+    ) -> None:
+        """Capture an outcome immediately and release the completed task."""
+        if self._background_tasks.get(task_id) is not task:
+            return
+        del self._background_tasks[task_id]
+        if task.cancelled():
+            self._store_task_result(task_id, {"status": "cancelled"})
+            return
+        try:
+            result = task.result()
+        except Exception as error:
+            logger.warning("DirectMem0 background save failed task_id=%s: %s", task_id, error)
+            self._store_task_result(task_id, {"status": "failed", "error": str(error)})
+        else:
+            self._store_task_result(task_id, {"status": "completed", "result": result})
+
+    def _track_background_task(self, task_id: str, task: asyncio.Task[Memory]) -> None:
+        self._background_tasks[task_id] = task
+        task.add_done_callback(
+            lambda completed_task: self._handle_background_task_done(task_id, completed_task)
+        )
+
     def get_task_status(self, task_id: str) -> dict[str, Any]:
         """Get the status of a background save task.
 
@@ -348,34 +397,28 @@ class DirectMem0Adapter:
         Returns:
             Dict with status and result if completed.
         """
-        if task_id in self._task_results:
-            return self._task_results[task_id]
+        self._prune_task_results()
+        retained_result = self._task_results.get(task_id)
+        if retained_result is not None:
+            return retained_result[1]
 
         if task_id in self._background_tasks:
             task = self._background_tasks[task_id]
             if task.done():
-                try:
-                    result = task.result()
-                    self._task_results[task_id] = {
-                        "status": "completed",
-                        "result": result,
-                    }
-                    del self._background_tasks[task_id]
-                    return self._task_results[task_id]
-                except Exception as e:
-                    self._task_results[task_id] = {
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                    del self._background_tasks[task_id]
-                    return self._task_results[task_id]
-            else:
-                return {"status": "processing", "task_id": task_id}
+                self._handle_background_task_done(task_id, task)
+                retained_result = self._task_results.get(task_id)
+                if retained_result is not None:
+                    return retained_result[1]
+                return {"status": "not_found", "task_id": task_id}
+            return {"status": "processing", "task_id": task_id}
 
         return {"status": "not_found", "task_id": task_id}
 
     def get_pending_tasks(self) -> list[str]:
         """Get list of pending background task IDs."""
+        for task_id, task in list(self._background_tasks.items()):
+            if task.done():
+                self._handle_background_task_done(task_id, task)
         return list(self._background_tasks.keys())
 
     async def wait_for_task(self, task_id: str, timeout: float = 30.0) -> dict[str, Any]:
@@ -400,6 +443,8 @@ class DirectMem0Adapter:
             return self.get_task_status(task_id)
         except asyncio.TimeoutError:
             return {"status": "timeout", "task_id": task_id}
+        except Exception:
+            return self.get_task_status(task_id)
 
     async def flush_pending(self, timeout: float = 60.0) -> dict[str, Any]:
         """Wait for all pending background tasks to complete.
@@ -581,6 +626,8 @@ class DirectMem0Adapter:
         Returns:
             Memory object if sync, or dict with task_id if async/background.
         """
+        if self._closing:
+            raise RuntimeError("DirectMem0 adapter is closing")
         await self._ensure_initialized()
 
         # Determine if we should run in background
@@ -606,7 +653,7 @@ class DirectMem0Adapter:
                     extracted_relationships=extracted_relationships,
                 )
             )
-            self._background_tasks[task_id] = task
+            self._track_background_task(task_id, task)
 
             # Return immediately with task info
             primary_id = self._generate_id(facts[0] if facts else content, user_id)
@@ -971,56 +1018,50 @@ class DirectMem0Adapter:
         # In particular, a second caller must not detach resources while the
         # first is still waiting for executor-backed writes to quiesce.
         async with self._close_lock:
-            if self._background_tasks:
-                task_items = list(self._background_tasks.items())
-                tasks = [task for _, task in task_items]
-                _, pending = await asyncio.wait(tasks, timeout=timeout)
+            self._closing = True
+            try:
+                if self._background_tasks:
+                    task_items = list(self._background_tasks.items())
+                    tasks = [task for _, task in task_items]
+                    _, pending = await asyncio.wait(tasks, timeout=timeout)
 
-                if pending:
-                    pending_ids = [task_id for task_id, task in task_items if task in pending]
-                    raise TimeoutError(
-                        "Timed out waiting for DirectMem0 background writes: "
-                        + ", ".join(pending_ids)
-                    )
+                    if pending:
+                        pending_ids = [task_id for task_id, task in task_items if task in pending]
+                        raise TimeoutError(
+                            "Timed out waiting for DirectMem0 background writes: "
+                            + ", ".join(pending_ids)
+                        )
 
-                for task_id, task in task_items:
+                    for task_id, task in task_items:
+                        self._handle_background_task_done(task_id, task)
+
+                resources = [
+                    ("Mem0 client", self._mem0_client),
+                    ("OpenAI client", self._openai_client),
+                    ("Qdrant client", self._qdrant_client),
+                    ("Neo4j driver", self._neo4j_driver),
+                    ("embedder", self._embedder),
+                    ("Neo4j graph", self._neo4j_graph),
+                ]
+                self._mem0_client = None
+                self._openai_client = None
+                self._qdrant_client = None
+                self._neo4j_driver = None
+                self._embedder = None
+                self._neo4j_graph = None
+                self._initialized = False
+
+                for name, resource in resources:
+                    if resource is None:
+                        continue
+                    close = getattr(resource, "close", None) or getattr(resource, "aclose", None)
+                    if close is None:
+                        continue
                     try:
-                        self._task_results[task_id] = {
-                            "status": "completed",
-                            "result": task.result(),
-                        }
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
                     except Exception as e:
-                        self._task_results[task_id] = {
-                            "status": "failed",
-                            "error": str(e),
-                        }
-                self._background_tasks.clear()
-
-            resources = [
-                ("Mem0 client", self._mem0_client),
-                ("OpenAI client", self._openai_client),
-                ("Qdrant client", self._qdrant_client),
-                ("Neo4j driver", self._neo4j_driver),
-                ("embedder", self._embedder),
-                ("Neo4j graph", self._neo4j_graph),
-            ]
-            self._mem0_client = None
-            self._openai_client = None
-            self._qdrant_client = None
-            self._neo4j_driver = None
-            self._embedder = None
-            self._neo4j_graph = None
-            self._initialized = False
-
-            for name, resource in resources:
-                if resource is None:
-                    continue
-                close = getattr(resource, "close", None) or getattr(resource, "aclose", None)
-                if close is None:
-                    continue
-                try:
-                    result = close()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception as e:
-                    logger.warning("Failed to close %s: %s", name, e)
+                        logger.warning("Failed to close %s: %s", name, e)
+            finally:
+                self._closing = False
