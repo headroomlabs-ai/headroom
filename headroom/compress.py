@@ -57,6 +57,7 @@ Examples:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -146,6 +147,13 @@ class CompressConfig:
     savings_profile: str | None = None
     """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
+    semantic_score: bool = False
+    """Compute semantic preservation score after compression.
+    Measures how well compression preserved meaning via embedding similarity.
+    Requires the optional relevance dependencies and is disabled by default so
+    compression never loads an embedding model solely for diagnostics.
+    Env var: HEADROOM_SEMANTIC_SCORE_ENABLED (true/false)."""
+
 
 @dataclass
 class CompressResult:
@@ -158,6 +166,8 @@ class CompressResult:
         tokens_saved: Tokens removed by compression.
         compression_ratio: Ratio of tokens saved (0.0 = no savings, 1.0 = 100% removed).
         transforms_applied: List of transforms that were applied.
+        semantic_score: Semantic preservation score (0.0 = different meaning,
+            1.0 = identical meaning). None if scoring is unavailable or disabled.
     """
 
     messages: list[dict[str, Any]]
@@ -166,6 +176,7 @@ class CompressResult:
     tokens_saved: int = 0
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
+    semantic_score: float | None = None
 
 
 def compress(
@@ -322,6 +333,30 @@ def compress(
         tokens_saved = tokens_before - tokens_after
         ratio = tokens_saved / tokens_before if tokens_before > 0 else 0.0
 
+        # Semantic preservation scoring (opt-in via config or env var)
+        semantic_score_value: float | None = None
+        _env_semantic = os.environ.get("HEADROOM_SEMANTIC_SCORE_ENABLED")
+        if _env_semantic is not None:
+            # Env var overrides config when set
+            _score_enabled = _env_semantic.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            _score_enabled = cfg.semantic_score
+
+        if _score_enabled and tokens_saved > 0:
+            try:
+                from headroom.transforms.semantic_scorer import score_messages
+
+                semantic_score_value = score_messages(messages, compressed_messages)
+                if semantic_score_value is not None:
+                    logger.debug(
+                        "Semantic preservation score: %.3f (input=%d tokens, output=%d tokens)",
+                        semantic_score_value,
+                        tokens_before,
+                        tokens_after,
+                    )
+            except Exception as exc:
+                logger.debug("Semantic scoring skipped: %s", exc)
+
         # Post-compress hook
         if hooks and tokens_saved > 0:
             from headroom.hooks import CompressEvent
@@ -344,6 +379,7 @@ def compress(
             tokens_saved=tokens_saved,
             compression_ratio=ratio,
             transforms_applied=result.transforms_applied,
+            semantic_score=semantic_score_value,
         )
 
     except Exception as e:

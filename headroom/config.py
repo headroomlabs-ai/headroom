@@ -768,6 +768,12 @@ class HeadroomConfig:
     # The legacy env alias and this typed request still obey the canary rollout gate.
     intercept_tool_results: bool = False
 
+    # Minimum input token count for compression to kick in. Short inputs
+    # (< threshold) expand rather than shrink because transform overhead
+    # exceeds the savings. Disabled by default; operators opt in with a
+    # positive value or HEADROOM_MIN_INPUT_TOKENS.
+    min_input_tokens: int = 0
+
     # Immutable runtime rollout state. ``None`` is resolved once here so every
     # pipeline built from this config observes the same decisions even if the
     # process environment later changes.
@@ -781,6 +787,31 @@ class HeadroomConfig:
     discover_pipeline_extensions: bool = True
 
     def __post_init__(self, content_router_enabled: bool | None = None) -> None:
+        """Validate configuration fields after initialization.
+
+        Args:
+            content_router_enabled: Deprecated InitVar field (ignored, kept for
+                backward compatibility with dataclass __init__).
+
+        Production: negative values are clamped to 0 (guard disabled) with a
+        warning, and min_input_tokens=0 logs an informational note so operators
+        know the guard is off. No exception is raised — bad config degrades
+        gracefully.
+        """
+        import logging as _logging
+
+        _log = _logging.getLogger(__name__)
+        if self.min_input_tokens < 0:
+            _log.warning(
+                "min_input_tokens=%d is negative; clamping to 0 (guard disabled)",
+                self.min_input_tokens,
+            )
+            self.min_input_tokens = 0
+        elif self.min_input_tokens == 0:
+            _log.info(
+                "min_input_tokens=0: compression guard is disabled; "
+                "all inputs will be compressed regardless of size"
+            )
         if self.rollout is None:
             requested = ("tool_result_interceptors",) if self.intercept_tool_results else ()
             self.rollout = resolve_rollout(requested=requested)
