@@ -46,6 +46,18 @@ SOURCE_URL = "https://api-docs.deepseek.com/quick_start/pricing"
 #: and ``deepseek-v4-flash-vision-exp`` are still accepted, but the corresponding
 #: models have been retired, their requests are served by the DeepSeek-V4.1-Flash
 #: model and billed at the Flash price."
+#:
+#: Footnote (2) verbatim: "In response to user demand, we have decided to continue
+#: providing API services for DeepSeek V4 Pro after September 14, 2026, with the
+#: billing method remaining unchanged. We will provide further notice should there
+#: be any changes." (ZH: 为响应广大用户的需求，我们决定在 2026 年 9 月 14 日之后继续提供
+#: DeepSeek V4 Pro 的 API 调用服务，计费方式保持不变；如有变动，我们将另行通知。)
+#:
+#: No V4 Pro cutover instant is documented for this fetch, so the Pro row above is
+#: the operative rule for every current request. Should the vendor publish one, the
+#: shape already exists in this module: :data:`WEEKEND_OFF_PEAK_FROM` gates a pricing
+#: rule on an effective instant, and a Pro->Flash transition would use the same
+#: pattern plus boundary tests either side of its instant.
 VENDOR_CARD: dict[str, dict[str, object]] = {
     "deepseek-flash": {
         "model_version": "DeepSeek-V4.1-Flash",
