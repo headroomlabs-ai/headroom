@@ -305,10 +305,11 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     assert "--userns=keep-id" not in command
 
 
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
 @pytest.mark.parametrize("uid,gid", [(1000, 1001), (1007, 1013)])
 @pytest.mark.parametrize("image", ["ghcr.io/headroomlabs-ai/headroom:latest", "custom:nonroot"])
 def test_build_runtime_command_podman_preserves_host_identity(
-    monkeypatch, tmp_path: Path, uid: int, gid: int, image: str
+    monkeypatch, tmp_path: Path, uid: int, gid: int, image: str, platform: str
 ) -> None:
     """keep-id needs an explicit process user when the image declares USER root.
 
@@ -316,7 +317,7 @@ def test_build_runtime_command_podman_preserves_host_identity(
     subordinate-ID mapping caused by --user alone (#2804, #3569).
     """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", platform)
     monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: uid, raising=False)
     monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: gid, raising=False)
     monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "podman")
@@ -336,10 +337,13 @@ def test_build_runtime_command_podman_preserves_host_identity(
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
     command = build_runtime_command(manifest)
-    assert "--userns=keep-id" in command
-    assert command[command.index("--user") + 1] == f"{uid}:{gid}"
+    assert ("--userns=keep-id" in command) == (platform != "win32")
     assert image in command
-    assert command.index("--user") < command.index(image)
+    if platform == "linux":
+        assert command[command.index("--user") + 1] == f"{uid}:{gid}"
+        assert command.index("--user") < command.index(image)
+    else:
+        assert "--user" not in command
 
 
 def test_read_pid_handles_invalid_content(monkeypatch, tmp_path: Path) -> None:

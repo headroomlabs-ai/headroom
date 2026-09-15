@@ -66,7 +66,7 @@ For the Python-native `persistent-docker` preset, if `docker` is a Podman wrappe
 script rather than a symlink, set `HEADROOM_CONTAINER_RUNTIME=podman` in the
 installer/runtime environment so it selects the Podman path.
 
-On non-Windows hosts the Podman command combines `--userns=keep-id` with an
+On Linux the Podman command combines `--userns=keep-id` with an
 explicit `--user` using the invoking user's UID and GID. Both are needed on
 Podman versions that honor the image's `USER root` even with `keep-id`: the
 namespace preserves the host mapping, and the process user keeps newly created
