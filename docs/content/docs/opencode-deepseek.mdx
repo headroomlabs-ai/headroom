@@ -195,9 +195,52 @@ API key to the proxy, and the proxy forwards it to DeepSeek. Make sure
 
 ### Models appear but requests fail
 
-You ran `headroom wrap opencode`. That command replaces your config with Claude
-and GPT models. **Do not use `headroom wrap`.** Configure OpenCode manually as
-shown above, and launch OpenCode directly with `opencode`.
+You ran `headroom wrap opencode` without telling it about DeepSeek. Wrap
+rewrites the `headroom` provider block in your OpenCode config on every run, so
+the manual `apiKey` / `models` entries from step 4 are replaced. Either launch
+OpenCode directly with `opencode` after configuring it manually as shown above,
+or use wrap with an explicit upstream — see the next section.
+
+### I used `headroom wrap opencode` and get "Incorrect API key provided"
+
+```
+Incorrect API key provided: sk-13005***********************898d.
+You can find your API key at https://platform.openai.com/account/api-keys.
+```
+
+That 401 comes from **OpenAI**, not DeepSeek. `headroom wrap opencode` starts
+the proxy for you, and unless it is told otherwise the proxy forwards
+OpenAI-compatible traffic to its default upstream, `https://api.openai.com/v1`.
+Your DeepSeek key is then presented to OpenAI, which rejects it and points you
+at a dashboard for a key you never had.
+
+Pass the upstream to wrap, exactly like `headroom proxy --openai-api-url`:
+
+```bash
+headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+```
+
+The equivalent environment variable also works, and is honored by both
+commands:
+
+```bash
+OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode
+```
+
+If a proxy is already running on the port with a different upstream, stop it
+first (`headroom unwrap opencode`) — wrap will not silently re-point a proxy
+that other clients may be sharing.
+
+### When is `headroom wrap opencode` safe?
+
+- **Safe as-is** when your traffic goes to the default upstreams — OpenAI
+  (`api.openai.com`) or Anthropic (`api.anthropic.com`).
+- **Needs `--openai-api-url`** (or `OPENAI_TARGET_API_URL`) for any third-party
+  OpenAI-compatible provider: DeepSeek, Together, OpenRouter, Groq, a
+  self-hosted gateway, and so on.
+- **Use the manual setup in this guide** when you want to pin specific model
+  IDs, context limits, or display names in `opencode.json`, since wrap
+  regenerates the `headroom` provider block each time it runs.
 
 ### "headroom" command not found
 
@@ -225,7 +268,11 @@ shaper is active immediately — the numbers just need calibration.
 ## What's NOT in this guide
 
 - **Claude or GPT models** — this setup uses DeepSeek exclusively
-- **`headroom wrap`** — do not use it; it overrides the config
+- **`headroom wrap` with a custom model list** — wrap regenerates the
+  `headroom` provider block on every run, so the model entries below are lost.
+  If you prefer wrap, run
+  `headroom wrap opencode --openai-api-url https://api.deepseek.com/v1` and skip
+  the manual config
 - **Deprecated model names** — `deepseek-chat` and `deepseek-reasoner` are
   compatibility aliases slated for removal; use `deepseek-v4-pro` and
   `deepseek-v4-flash` instead

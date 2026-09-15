@@ -235,7 +235,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Copilot CLI | ✅ | starts proxy + launches |
 | VS Code Copilot | ✅ | transparent proxy; keeps the selected model |
 | OpenClaw | ✅ | installs as a ContextEngine plugin |
-| OpenCode | ✅ | injects config · starts proxy + launches |
+| OpenCode | ✅ | injects config · starts proxy + launches [^third-party-upstream] |
 | Cline | ✅ | starts proxy + injects config |
 | Continue | ✅ | starts proxy + injects config |
 | Goose | ✅ | starts proxy + launches |
@@ -245,6 +245,8 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
+
+[^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](docs/content/docs/opencode-deepseek.mdx).
 
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
