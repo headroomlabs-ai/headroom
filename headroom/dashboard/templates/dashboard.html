@@ -225,19 +225,21 @@
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
                         <div class="flex items-baseline gap-2">
                             <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
-                            <!-- Active compression ratio: savings as a fraction of tokens we
-                                 *attempted* to compress (extracted units + tool schema). When
-                                 the attempted denominator is missing (backend-routed paths
-                                 that don't yet wire per-message live-zone tracking), fall back
-                                 to the whole-request ratio so the headline doesn't collapse to
-                                 0% while compression is happening (issue #455). -->
+                            <!-- Headline ratio: whole wire, savings as a fraction of ALL
+                                 forwarded input (#1653). That is the honest answer to "what
+                                 share of my billed input did Headroom remove", because
+                                 without Headroom the session's cached history would have
+                                 been billed too (as cache reads) and so belongs in the
+                                 denominator. The new-input basis, which is what compression
+                                 can actually touch, sits on the line below; it reads much
+                                 higher on long sessions and must not take this slot. -->
                             <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                             <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                         </div>
-                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
-                            <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed" x-show="(stats.tokens?.new_input_tokens || 0) > 0">
+                            <span x-text="'Of new input: ' + (stats.tokens?.new_input_savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of the tokens that newly entered context (uncached + cache write), which is what compression can touch. The headline above recounts the session's cached history on every turn, so it reads low on a long session even when compression is working."></span>
                         </div>
                         <div class="mt-2 h-8">
                             <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
@@ -2831,7 +2833,7 @@
                 },
 
                 get headlineSavingsTitle() {
-                    return 'Of total wire input tokens';
+                    return 'Of total wire input tokens: all forwarded input, cached history included';
                 },
 
                 // --- Expandable Rows ---
