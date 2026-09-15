@@ -348,6 +348,17 @@ def dashboard(port: int, no_open: bool) -> None:
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
 @click.option(
+    "--circuit-breaker",
+    type=click.Choice(["warn", "enforce", "off"], case_sensitive=False),
+    default="warn",
+    show_default=True,
+    envvar="HEADROOM_CIRCUIT_BREAKER",
+    help=(
+        "Tool call repetition circuit breaker policy: warn (log warning & record metrics, "
+        "default), enforce (reject with 429), or off (disabled). Env: HEADROOM_CIRCUIT_BREAKER."
+    ),
+)
+@click.option(
     "--protect-tool-results",
     default=None,
     envvar="HEADROOM_PROTECT_TOOL_RESULTS",
@@ -1039,6 +1050,7 @@ def proxy(
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    circuit_breaker: str,
     protect_tool_results: str | None,
     rpm: int | None,
     tpm: int | None,
@@ -1323,6 +1335,7 @@ def proxy(
         optimize=not no_optimize,
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
+        circuit_breaker=circuit_breaker,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),

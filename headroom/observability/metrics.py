@@ -215,6 +215,11 @@ class HeadroomOtelMetrics:
             description="Proxy requests rejected by rate limiting.",
             unit="1",
         )
+        self._tool_loop_detected = self._meter.create_counter(
+            "headroom.proxy.tool_loop_detected",
+            description="Runaway tool repetition loops detected.",
+            unit="1",
+        )
         self._proxy_input_tokens = self._meter.create_counter(
             "headroom.proxy.tokens.input",
             description="Input tokens received by the proxy.",
@@ -542,6 +547,14 @@ class HeadroomOtelMetrics:
         model: str | None = None,
     ) -> None:
         self._proxy_rate_limited_requests.add(1, self._attrs(provider=provider, model=model))
+
+    def record_tool_loop_detected(
+        self,
+        *,
+        tool: str | None = None,
+        period: int = 1,
+    ) -> None:
+        self._tool_loop_detected.add(1, self._attrs(tool=tool, period=str(period)))
 
     def record_proxy_cache_bust(self, *, tokens_lost: int) -> None:
         self._proxy_cache_busts.add(1)
