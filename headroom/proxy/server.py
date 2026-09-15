@@ -183,7 +183,7 @@ from headroom.subscription.tracker import (
     get_subscription_tracker,
 )
 from headroom.telemetry import get_telemetry_collector
-from headroom.telemetry.beacon import is_telemetry_enabled
+from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
@@ -2120,9 +2120,13 @@ class HeadroomProxy(
             )
 
         # Log local telemetry status so operators can see it in the log stream.
-        # Nothing is sent externally — telemetry is collected locally only (the
-        # anonymous telemetry beacon was removed); operational metrics export
-        # only to your own OTEL collector via HEADROOM_OTEL_METRICS_*.
+        # This is HEADROOM_TELEMETRY only (local aggregate stats; nothing
+        # sent externally). It is NOT a statement about the anonymous upload
+        # beacon (HEADROOM_BEACON), which is a separate, ON-by-default switch
+        # (telemetry/beacon.py) still present in this codebase — the previous
+        # wording here ("the anonymous telemetry beacon was removed") was
+        # false and predates this fix. See is_beacon_enabled() below for the
+        # accurate beacon-shipping status.
         if is_telemetry_enabled():
             logger.info(
                 "Local telemetry: ENABLED (aggregate stats, local only — nothing sent "
@@ -2133,6 +2137,13 @@ class HeadroomProxy(
                 "Local telemetry: DISABLED (off by default — opt in: "
                 "HEADROOM_TELEMETRY=on or --telemetry)"
             )
+        if is_beacon_enabled():
+            logger.info(
+                "Anonymous upload beacon: ENABLED (default — session summaries are sent to "
+                "Headroom Labs). Opt out: HEADROOM_BEACON=off or DO_NOT_TRACK=1"
+            )
+        else:
+            logger.info("Anonymous upload beacon: DISABLED")
 
         self.pipeline_extensions.emit(
             PipelineStage.POST_START,
@@ -4692,9 +4703,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # Per-language AST compression pauses. Empty on a healthy install;
             # non-empty is the explanation for a savings drop in one language.
             "code_syntax_breaker": _code_syntax_breaker_status(),
-            # Always False: the anonymous telemetry beacon was removed, so no
-            # telemetry is ever shipped externally (local collection only).
-            "anon_telemetry_shipping": False,
+            # Reflects the actual live state of the anonymous upload beacon
+            # (HEADROOM_BEACON, on by default — see telemetry/beacon.py).
+            # This field previously hardcoded False on the incorrect premise
+            # that the beacon had been removed from the codebase; it had not,
+            # so an operator polling /stats to confirm nothing ships
+            # externally was given a false assurance regardless of their
+            # actual HEADROOM_BEACON setting.
+            "anon_telemetry_shipping": is_beacon_enabled(),
             "telemetry": {
                 "enabled": telemetry_stats.get("enabled", False),
                 "total_compressions": telemetry_stats.get("total_compressions", 0),
