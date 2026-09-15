@@ -576,6 +576,31 @@ def test_handle_openai_responses_api_auth_store_false_injects_stateless_memory_t
     assert memory_handler.compute_calls == 1
 
 
+def test_handle_openai_responses_api_auth_keeps_memory_tools(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "store": True},
+        {"Authorization": "Bearer sk-test", "x-headroom-user-id": "user-1"},
+    )
+    handler = _DummyOpenAIHandler()
+    memory_handler = _MemoryToolsOnlyHandler()
+    handler.memory_handler = memory_handler
+    handler.session_tracker_store = SimpleNamespace(
+        compute_session_id=lambda *a, **k: "sess-api-memory-tools",
+    )
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, _, body = handler.captured_request
+    assert url == "https://api.openai.com/v1/responses"
+    assert body["store"] is True
+    assert body["tools"][0]["name"] == "memory_search"
+    assert memory_handler.compute_calls == 1
+
+
 @pytest.mark.parametrize("store", [pytest.param(None, id="omitted"), True, False])
 @pytest.mark.parametrize(
     "include",
