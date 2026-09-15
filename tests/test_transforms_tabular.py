@@ -26,12 +26,18 @@ from headroom.transforms.content_router import (
     ContentRouterConfig,
 )
 from headroom.transforms.tabular_ingest import (
+    Segment,
     TabularCompressionResult,
     TabularCompressor,
     parse_csv,
+    parse_csv_tables,
     parse_fixed_width,
+    parse_markdown_segments,
     parse_markdown_table,
     parse_tabular,
+    segments_to_document,
+    split_csv_blocks,
+    split_markdown_segments,
     to_records,
 )
 
@@ -399,3 +405,145 @@ def test_load_spreadsheet_missing_file(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         load_spreadsheet(tmp_path / "nope.xlsx")
+
+
+# Multi-table markdown -------------------------------------------------------
+
+
+def _multi_table_doc(rows: int = 30) -> str:
+    """Two headed tables with prose between them, big enough to compress."""
+    team = "\n".join(f"| Person {i} | Role number {i} |" for i in range(rows))
+    voice = "\n".join(f"| Audience {i} | Tone descriptor {i} |" for i in range(rows))
+    return (
+        "## Team\n\n| Name | Role |\n| --- | --- |\n" + team + "\n\n"
+        "## Voice\n\n| Audience | Tone |\n| --- | --- |\n" + voice + "\n"
+    )
+
+
+def test_split_markdown_segments_separates_tables_from_prose() -> None:
+    kinds = [kind for kind, _ in split_markdown_segments(_multi_table_doc(2))]
+    assert kinds == ["text", "table", "text", "table"]
+
+
+def test_parse_markdown_segments_keeps_each_header_row() -> None:
+    segments = parse_markdown_segments(_multi_table_doc(2))
+    tables = [seg.table for seg in segments if seg.table is not None]
+    assert [headers for headers, _ in tables] == [["Name", "Role"], ["Audience", "Tone"]]
+    # The second table's header must not appear as a row of the first.
+    assert ["Audience", "Tone"] not in tables[0][1]
+
+
+def test_parse_markdown_segments_demotes_ragged_block_to_text() -> None:
+    # A pipe inside prose is not a table; keep it verbatim rather than guess.
+    segments = parse_markdown_segments("a sentence with a | pipe in it")
+    assert segments == [Segment(text="a sentence with a | pipe in it")]
+
+
+def test_compress_gives_each_table_its_own_schema() -> None:
+    result = TabularCompressor().compress(_multi_table_doc())
+    assert result.was_modified
+    assert result.tables == 2
+    # One schema per table, and no header row smuggled in as data.
+    assert result.compressed.count("[30]{") == 2
+    assert "Audience,Tone" not in result.compressed
+
+
+def test_compress_preserves_prose_between_tables() -> None:
+    result = TabularCompressor().compress(_multi_table_doc())
+    assert "## Team" in result.compressed
+    assert "## Voice" in result.compressed
+
+
+def test_compress_multi_table_keeps_every_cell() -> None:
+    doc = _multi_table_doc()
+    result = TabularCompressor().compress(doc)
+    cells = [
+        cell.strip()
+        for line in doc.split("\n")
+        if "|" in line and "---" not in line
+        for cell in line.strip().strip("|").split("|")
+    ]
+    missing = [c for c in cells if c and c not in result.compressed]
+    assert missing == []
+
+
+def test_segments_to_document_disambiguates_repeated_first_column() -> None:
+    table = (["Name", "Role"], [["Ann", "COO"]])
+    document = segments_to_document([Segment(table=table), Segment(table=table)])
+    assert list(document) == ["Name", "Name_2"]
+
+
+def test_compress_single_table_without_prose_is_unchanged_path() -> None:
+    # A lone table with no surrounding text keeps the original record-array
+    # path, so existing single-table output stays byte-identical.
+    result = TabularCompressor().compress(_verbose_markdown(40))
+    assert result.was_modified
+    assert result.tables == 1
+    assert not result.compressed.startswith("{")
+
+
+# Multi-table CSV ------------------------------------------------------------
+
+
+def _multi_table_csv(rows: int = 40) -> str:
+    team = "\n".join(f"Person{i},Role number {i}" for i in range(rows))
+    voice = "\n".join(f"Audience{i},Tone descriptor {i}" for i in range(rows))
+    return "Name,Role\n" + team + "\n\nAudience,Tone\n" + voice
+
+
+def test_split_csv_blocks_breaks_on_blank_lines() -> None:
+    blocks = split_csv_blocks("a,b\n1,2\n\nc,d\n3,4")
+    assert blocks == [[["a", "b"], ["1", "2"]], [["c", "d"], ["3", "4"]]]
+
+
+def test_split_csv_blocks_keeps_blank_line_inside_quoted_field() -> None:
+    # A blank line within a quoted cell is part of the value, not a boundary.
+    blocks = split_csv_blocks('a,b\n1,"line one\n\nline two"')
+    assert len(blocks) == 1
+    assert blocks[0][1][1] == "line one\n\nline two"
+
+
+def test_parse_csv_tables_splits_each_block() -> None:
+    tables = parse_csv_tables(_multi_table_csv(2))
+    assert tables is not None
+    assert [headers for headers, _ in tables] == [["Name", "Role"], ["Audience", "Tone"]]
+
+
+def test_parse_csv_tables_rejects_header_only_block() -> None:
+    # Dropping a header with no rows would lose content; pass through instead.
+    assert parse_csv_tables("a,b\n1,2\n\nc,d") is None
+
+
+def test_parse_csv_tables_rejects_ragged_block() -> None:
+    assert parse_csv_tables("a,b\n1,2\n\nc,d\n3,4,5") is None
+
+
+def test_compress_csv_gives_each_table_its_own_schema() -> None:
+    result = TabularCompressor().compress(_multi_table_csv())
+    if result.was_modified:
+        assert result.tables == 2
+        assert "\nAudience,Tone\n" not in result.compressed
+    else:
+        # Already-compact CSV may not beat its own source; passthrough is
+        # correct, but it must still have seen two tables, not one merged one.
+        assert result.tables == 2
+
+
+@pytest.mark.parametrize("tables", [1, 2, 3])
+@pytest.mark.parametrize("rows", [3, 60])
+def test_compress_never_drops_a_cell(tables: int, rows: int) -> None:
+    blocks = []
+    for t in range(tables):
+        body = "\n".join(f"| v{t}_{i}_x | v{t}_{i}_y |" for i in range(rows))
+        blocks.append(f"## Section {t}\n\n| H{t}a | H{t}b |\n| --- | --- |\n{body}")
+    doc = "\n\n".join(blocks)
+
+    result = TabularCompressor().compress(doc)
+    cells = [
+        cell.strip()
+        for line in doc.split("\n")
+        if "|" in line and "---" not in line
+        for cell in line.strip().strip("|").split("|")
+    ]
+    assert [c for c in cells if c and c not in result.compressed] == []
+    assert all(f"## Section {t}" in result.compressed for t in range(tables))
