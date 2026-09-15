@@ -71,6 +71,15 @@ updates:
           - "minor"
           - "patch"
 
+  # Go SDK module updates
+  - package-ecosystem: gomod
+    directory: "/sdk/golang"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 5
+
   # tsup still needs the legacy TypeScript compiler API for declarations.
   # TypeScript 7's default export has no `sys`; SDK/plugin declaration builds
   # fail with useCaseSensitiveFileNames (e.g. GH #3528). Docs use a compatible
