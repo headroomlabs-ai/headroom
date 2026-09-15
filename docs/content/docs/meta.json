@@ -42,6 +42,7 @@
     "opencode",
     "opencode-deepseek",
     "grok-build",
+    "oauth2-upstream",
     "mcp",
     "---Configuration---",
     "configuration",
