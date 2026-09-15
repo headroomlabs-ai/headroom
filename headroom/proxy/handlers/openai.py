@@ -4481,7 +4481,10 @@ class OpenAIHandlerMixin:
 
         _normalize_openai_max_tokens(
             body,
-            backend_owns_translation=resolver_for(self).for_request(request) is not None,
+            backend_owns_translation=resolver_for(self).for_request(
+                request, native_providers=("openai",)
+            )
+            is not None,
         )
 
         # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
@@ -4550,9 +4553,13 @@ class OpenAIHandlerMixin:
 
         # Route through LiteLLM/any-llm backend if configured -- or through a
         # per-request one an extension asked for (see proxy/route_advice.py).
-        # No advice resolves to `self.anthropic_backend`, so this is the same
-        # condition it has always been.
-        request_backend = resolver_for(self).for_request(request, body=body)
+        # anthropic is NOT native to this OpenAI-shape handler, so cross-family
+        # advice (e.g. Codex routed to a Claude model) resolves to a translating
+        # litellm backend; same-family (openai) advice still resolves to
+        # `self.anthropic_backend`, unchanged.
+        request_backend = resolver_for(self).for_request(
+            request, body=body, native_providers=("openai",)
+        )
         if request_backend is not None:
             try:
                 if stream:
