@@ -18,12 +18,13 @@ from ..config import (
     TransformResult,
     WasteSignals,
 )
+from ..ignore import IgnorePolicy
 from ..observability import get_headroom_tracer, get_otel_metrics
 from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform
 from .cache_aligner import CacheAligner
-from .content_router import ContentRouter
+from .content_router import ContentRouter, ContentRouterConfig
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -158,13 +159,24 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
-        # observer: the proxy passes PrometheusMetrics; this bare pipeline is
-        # used by the library/adapter paths, which would otherwise report
-        # tokens.saved with an empty by_strategy. Imported here rather than at
-        # module scope — transforms sits below telemetry in the import graph.
+        #
+        # Wire HeadroomConfig.ignore (+ any .headroomignore at cwd) into the
+        # Read-lifecycle stale/superseded replacement — the one place in the
+        # compression path where a real file path is known (issue #1150).
+        # Root is the process cwd: TransformPipeline has no separate notion
+        # of "project root" today, matching the convention used by
+        # `headroom doctor` / the code-graph watcher.
+        from pathlib import Path as _Path
+
         from headroom.telemetry.session import BeaconCompressionObserver
 
-        transforms.append(ContentRouter(observer=BeaconCompressionObserver()))
+        ignore_policy = IgnorePolicy.load(_Path.cwd(), getattr(self.config, "ignore", None))
+        transforms.append(
+            ContentRouter(
+                ContentRouterConfig(ignore_policy=ignore_policy),
+                observer=BeaconCompressionObserver(),
+            )
+        )
         logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
 
         return transforms

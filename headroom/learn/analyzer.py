@@ -25,6 +25,7 @@ import time
 import typing
 
 from headroom._subprocess import Popen, run
+from headroom.ignore import IgnorePolicy
 
 from .loops import LoopPattern, apply_loop_weighting, detect_loops, format_loops_for_digest
 from .models import (
@@ -185,8 +186,14 @@ class SessionAnalyzer:
     Auto-detects the best available model from environment API keys.
     """
 
-    def __init__(self, model: str | None = None):
+    def __init__(self, model: str | None = None, config: object | None = None):
         self.model = model
+        # Optional HeadroomConfig (or any object with an `ignore` attribute)
+        # so `ignore.learn` config rules are enforced here too, not just
+        # `.headroomignore` (issue #1150). `headroom learn` (the CLI) has no
+        # config-file loader today, so it constructs a SessionAnalyzer
+        # without one and only `.headroomignore` applies.
+        self.config = config
 
     def analyze(
         self,
@@ -225,7 +232,13 @@ class SessionAnalyzer:
         budget = _MAX_DIGEST_TOKENS
         while True:
             # Build compact digest of all sessions, leading with detected loops.
-            digest = _build_digest(project, sessions, loops=loops, max_tokens=budget)
+            digest = _build_digest(
+                project,
+                sessions,
+                loops=loops,
+                config=self.config,
+                max_tokens=budget,
+            )
             try:
                 raw = _call_llm(digest, model, on_progress=on_progress)
                 result.recommendations = _parse_llm_response(raw)
@@ -253,7 +266,7 @@ class SessionAnalyzer:
 # =============================================================================
 
 
-def _build_prior_patterns_section(project: ProjectInfo) -> str:
+def _build_prior_patterns_section(project: ProjectInfo, config: object | None = None) -> str:
     """Format the current marker blocks from CLAUDE.md / MEMORY.md for the LLM.
 
     Returns "" when neither file exists nor contains a marker block. When at
@@ -266,8 +279,16 @@ def _build_prior_patterns_section(project: ProjectInfo) -> str:
         ("CLAUDE.md (CONTEXT_FILE, project-level stable facts)", project.context_file),
         ("MEMORY.md (MEMORY_FILE, session-level evolving preferences)", project.memory_file),
     )
+    ignore_config = getattr(config, "ignore", None) if config is not None else None
+    policy = IgnorePolicy.load(project.project_path, ignore_config)
     for label, path in candidates:
         if path is None or not path.exists():
+            continue
+        if policy.is_ignored(path, "learn"):
+            # Ignored for learning — e.g. a generated agent-harness file
+            # projected from a canonical source (issue #1150). Treating it
+            # as a baseline would let Headroom "learn" content it didn't
+            # write and that will be overwritten by the owning tool anyway.
             continue
         block = extract_marker_block(path.read_text(encoding="utf-8", errors="replace"))
         if block:
@@ -317,6 +338,7 @@ def _build_digest(
     project: ProjectInfo,
     sessions: list[SessionData],
     loops: list[LoopPattern] | None = None,
+    config: object | None = None,
     max_tokens: int = _MAX_DIGEST_TOKENS,
 ) -> str:
     """Build a token-efficient text digest of all session events.
@@ -361,7 +383,7 @@ def _build_digest(
 
     # Prior learned patterns (if any) — gives the LLM the current baseline so
     # it can produce complete updated sections instead of condensed deltas.
-    prior_section = _build_prior_patterns_section(project)
+    prior_section = _build_prior_patterns_section(project, config)
     if prior_section:
         lines.append(prior_section)
 

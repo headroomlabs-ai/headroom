@@ -12,6 +12,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from headroom.config import IgnoreConfig
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
@@ -260,6 +261,13 @@ class ProxyConfig:
 
     # Code graph live watcher (triggers incremental reindex on file changes)
     code_graph_watcher: bool = False
+
+    # Path/glob ignore rules (compress/learn/mutate/memory) — see
+    # headroom.ignore / headroom.config.IgnoreConfig. Merged with any
+    # `.headroomignore` file at the process cwd. Not exposed via CLI flags
+    # today; construct a `ProxyConfig(ignore=IgnoreConfig(...))` directly
+    # (e.g. from an embedding application) to set it programmatically.
+    ignore: IgnoreConfig = field(default_factory=IgnoreConfig)
 
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None

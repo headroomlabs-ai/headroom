@@ -1682,6 +1682,14 @@ class ContentRouterConfig:
     # Read lifecycle management (stale/superseded detection)
     read_lifecycle: ReadLifecycleConfig = field(default_factory=ReadLifecycleConfig)
 
+    # Central compress-ignore policy (issue #1150): a `headroom.ignore.IgnorePolicy`
+    # built by the caller (SDK `TransformPipeline` from `HeadroomConfig.ignore` /
+    # `.headroomignore`, or the proxy from `ProxyConfig.ignore`). When set, Read
+    # lifecycle management never marks an ignored path stale/superseded, so its
+    # content is never replaced/compressed. None (default) preserves prior
+    # behavior — no path is exempt from compression.
+    ignore_policy: Any | None = None
+
     # Per-tool compression profiles (tool_name → CompressionProfile)
     # Set to None to use DEFAULT_TOOL_PROFILES from config
     tool_profiles: dict[str, Any] | None = None
@@ -4780,6 +4788,7 @@ class ContentRouter(Transform):
             lifecycle_mgr = ReadLifecycleManager(
                 self.config.read_lifecycle,
                 compression_store=injected_store,
+                ignore_policy=self.config.ignore_policy,
             )
             lifecycle_result = lifecycle_mgr.apply(
                 messages,
