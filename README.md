@@ -241,7 +241,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Goose | ✅ | starts proxy + launches |
 | OpenHands | ✅ | starts proxy + launches |
 | Mistral Vibe | ✅ | starts proxy + launches |
-| Oh My Pi | ✅ | injects config · starts proxy + launches |
+| Oh My Pi | ✅ | Anthropic + OpenAI/Codex · injects config · starts proxy + launches |
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
