@@ -443,18 +443,31 @@ def test_claude_build_install_env_returns_proxy_base_url() -> None:
     }
 
 
-def test_copilot_build_install_env_uses_provider_type_specific_proxy_urls() -> None:
-    anthropic_env = build_copilot_install_env(port=8787, backend="anthropic")
-    openai_env = build_copilot_install_env(port=8787, backend="anyllm")
+def test_copilot_build_install_env_defaults_to_native_lane() -> None:
+    """An installed Copilot CLI keeps GitHub's model picker and Auto mode.
 
-    assert anthropic_env == {
-        "COPILOT_PROVIDER_TYPE": "anthropic",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:8787",
-    }
+    The BYOK variables pin one model and reject ``auto``; the native hook only
+    redirects the CLI's own GitHub-authenticated traffic through the proxy.
+    """
+    native_env = build_copilot_install_env(port=8787, backend="anthropic", environ={})
+
+    assert native_env == {"COPILOT_API_URL": "http://127.0.0.1:8787"}
+
+
+def test_copilot_build_install_env_keeps_byok_for_translated_backends_and_explicit_keys() -> None:
+    openai_env = build_copilot_install_env(port=8787, backend="anyllm", environ={})
+    explicit_byok = build_copilot_install_env(
+        port=8787, backend="anthropic", environ={"COPILOT_PROVIDER_API_KEY": "sk-test"}
+    )
+
     assert openai_env == {
         "COPILOT_PROVIDER_TYPE": "openai",
         "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:8787/v1",
         "COPILOT_PROVIDER_WIRE_API": "completions",
+    }
+    assert explicit_byok == {
+        "COPILOT_PROVIDER_TYPE": "anthropic",
+        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:8787",
     }
 
 

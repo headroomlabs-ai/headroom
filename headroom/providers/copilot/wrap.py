@@ -2,16 +2,151 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import click
 
 from headroom.proxy.project_context import with_project_prefix
+
+#: Hosts a corporate HTTP(S) proxy must never be asked to reach on our behalf.
+#: The Copilot CLI honours ``HTTP_PROXY``/``HTTPS_PROXY`` (and applies its own
+#: ``proxyUrl`` setting to those variables), so without an explicit exemption a
+#: fleet-wide proxy setting sends the loopback hop to the corporate proxy, which
+#: cannot connect to ``127.0.0.1`` on the developer's machine.
+LOOPBACK_NO_PROXY_HOSTS: tuple[str, ...] = ("127.0.0.1", "localhost", "::1")
+
+
+def ensure_loopback_no_proxy(env: dict[str, str]) -> dict[str, str]:
+    """Exempt the loopback proxy hop from any HTTP(S) proxy configuration.
+
+    Idempotent: hosts already listed are not duplicated. ``NO_PROXY`` is always
+    written; a pre-existing lowercase ``no_proxy`` is kept in sync. Readers
+    disagree on which spelling wins (undici prefers lowercase, reqwest and Go
+    prefer uppercase), so both are seeded from the union of the two — writing a
+    fresh ``NO_PROXY`` that lacked the entries of an existing ``no_proxy`` would
+    silently drop the corporate exemptions for anything the CLI spawns. Mutates
+    and returns ``env`` for call-site convenience.
+    """
+    entries: list[str] = []
+    for variable in ("NO_PROXY", "no_proxy"):
+        for entry in (env.get(variable) or "").split(","):
+            entry = entry.strip()
+            if entry and entry not in entries:
+                entries.append(entry)
+    for host in LOOPBACK_NO_PROXY_HOSTS:
+        if host not in entries:
+            entries.append(host)
+    merged = ",".join(entries)
+    env["NO_PROXY"] = merged
+    if "no_proxy" in env:
+        env["no_proxy"] = merged
+    return env
+
+
+def copilot_home(environ: Mapping[str, str] | None = None, *, windows: bool | None = None) -> Path:
+    """Return the Copilot CLI config directory (``$COPILOT_HOME`` or ``~/.copilot``).
+
+    Matches Node's ``os.homedir()``, which the CLI uses: ``USERPROFILE`` on
+    Windows (``HOME`` is ignored there, even when Git-for-Windows sets it),
+    ``HOME`` elsewhere. ``windows`` defaults to the running platform.
+    """
+    env = environ if environ is not None else os.environ
+    configured = (env.get("COPILOT_HOME") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    on_windows = os.name == "nt" if windows is None else windows
+    home = env.get("USERPROFILE") if on_windows else env.get("HOME")
+    return (Path(home) if home else Path.home()) / ".copilot"
+
+
+#: Settings key the CLI consults for its Copilot API host. Undocumented, but the
+#: 1.0.8x bundle resolves ``settings.copilotUrl || COPILOT_API_URL ||
+#: token.endpoints.api`` — the file beats the environment variable Headroom sets.
+COPILOT_URL_SETTING_KEY = "copilotUrl"
+
+
+def read_copilot_url_settings(environ: Mapping[str, str] | None = None) -> list[tuple[Path, str]]:
+    """Return every ``(file, value)`` pin of the CLI's Copilot API host.
+
+    Both ``settings.json`` (the current user-settings file) and the legacy
+    ``config.json`` are consulted: the CLI migrates keys from the latter at
+    startup but still reports a legacy value as shadowing the new one when both
+    exist, so a pin in either file can be the effective one. Unreadable or
+    malformed files contribute nothing — the CLI would ignore them too, so they
+    cannot redirect its traffic.
+    """
+    home = copilot_home(environ)
+    pins: list[tuple[Path, str]] = []
+    for name in ("settings.json", "config.json"):
+        path = home / name
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get(COPILOT_URL_SETTING_KEY)
+        if isinstance(value, str) and value.strip():
+            pins.append((path, value.strip()))
+    return pins
+
+
+def read_copilot_url_setting(environ: Mapping[str, str] | None = None) -> tuple[Path, str] | None:
+    """Return the first ``copilotUrl`` pin (``settings.json`` before ``config.json``), if any."""
+    pins = read_copilot_url_settings(environ)
+    return pins[0] if pins else None
+
+
+def _origin(url: str) -> str:
+    """Return ``scheme://host[:port]`` lowercased, so two spellings of one proxy compare equal."""
+    parsed = urllib.parse.urlsplit(url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return url.strip().rstrip("/").lower()
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def check_copilot_url_setting(base_url: str, *, environ: Mapping[str, str] | None = None) -> None:
+    """Refuse a native launch that the CLI's own ``copilotUrl`` setting would bypass.
+
+    Headroom points the CLI at itself through ``COPILOT_API_URL``. The CLI ranks
+    the ``copilotUrl`` settings key above that variable, so a pre-existing pin
+    makes the wrapper print a successful launch while every request goes
+    straight to the pinned host. Fail closed on any pin whose origin is not this
+    proxy. A pin on the same origin but a different path (a durable install that
+    wrote the bare proxy URL, without this launch's ``/p/<project>`` prefix)
+    still routes through Headroom; it is accepted with a note, because only the
+    per-project attribution differs.
+    """
+    proxy_origin = _origin(base_url)
+    foreign: list[tuple[Path, str]] = []
+    same_origin_other_path: list[tuple[Path, str]] = []
+    for path, value in read_copilot_url_settings(environ):
+        if _origin(value) != proxy_origin:
+            foreign.append((path, value))
+        elif value.rstrip("/").lower() != base_url.rstrip("/").lower():
+            same_origin_other_path.append((path, value))
+    if foreign:
+        described = "; ".join(
+            f"{path} sets {COPILOT_URL_SETTING_KEY}={value!r}" for path, value in foreign
+        )
+        raise click.ClickException(
+            f"{described}. The Copilot CLI prefers that setting over COPILOT_API_URL, so this "
+            f"launch would bypass Headroom. Remove the key, or set it to {proxy_origin!r} to "
+            "route every project through this proxy."
+        )
+    for path, value in same_origin_other_path:
+        click.echo(
+            f"  Note: {path} pins {COPILOT_URL_SETTING_KEY}={value!r}; the CLI will use that URL "
+            f"instead of {base_url!r}, so per-project savings attribution follows the pinned path."
+        )
 
 
 def resolve_provider_type(
@@ -189,20 +324,99 @@ def build_native_launch_env(
     env[COPILOT_NATIVE_API_URL_ENV] = base_url
     for variable in COPILOT_BYOK_ENV_VARS:
         env.pop(variable, None)
+    ensure_loopback_no_proxy(env)
     return env, [
         f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
         "COPILOT_AUTH_MODE=github-native",
     ]
 
 
-def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
-    """Best-effort tri-state probe for the CLI's native API URL override."""
+def _copilot_bundle_candidates(copilot_bin: str | None) -> list[str]:
+    """Return ``app.js`` paths that belong to the CLI binary actually on PATH.
+
+    The CLI stopped being a single ``app.js`` under a ``pkg`` directory: since
+    the 1.0.8x line ``@github/copilot`` is an npm shim (``npm-loader.js``) that
+    spawns a per-platform package (``@github/copilot-<os>-<arch>``) holding a
+    native ``copilot`` binary next to the JavaScript ``app.js`` it embeds. Both
+    layouts are covered by looking beside the resolved binary and in sibling
+    ``copilot-*`` packages of the directory it lives in.
+    """
+    if not copilot_bin:
+        return []
+    try:
+        resolved = os.path.realpath(copilot_bin)
+    except OSError:
+        return []
+    bin_dir = os.path.dirname(resolved)
+    parent = os.path.dirname(bin_dir)
+    candidates: list[str] = [
+        # A native platform binary sits next to its own bundle.
+        os.path.join(bin_dir, "app.js"),
+        # `npm-loader.js` (resolved through the `bin/copilot` symlink) lives in
+        # the shim package; the platform packages are its siblings under the
+        # same `@github/` scope directory.
+        *sorted(glob.glob(os.path.join(parent, "copilot-*", "app.js"))),
+        # Windows npm shims (`copilot.cmd`, `copilot.ps1`) are scripts in the
+        # npm prefix, not symlinks, so the packages hang off that directory.
+        *sorted(glob.glob(os.path.join(bin_dir, "node_modules", "@github", "copilot-*", "app.js"))),
+    ]
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in candidates:
+        if path not in seen and os.path.isfile(path):
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def _bundle_mentions_native_api_url(path: str) -> bool | None:
+    """Return True/False for a readable bundle, None when it cannot be read.
+
+    Reads in chunks, carrying the tail of each chunk into the next so a match
+    that straddles a chunk boundary is not missed — a miss here now refuses the
+    launch rather than merely leaving the verdict unknown.
+    """
+    needle = COPILOT_NATIVE_API_URL_ENV
+    carry = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as bundle:
+            while chunk := bundle.read(1 << 20):
+                window = carry + chunk
+                if needle in window:
+                    return True
+                carry = window[-(len(needle) - 1) :]
+    except OSError:
+        return None
+    return False
+
+
+def native_api_url_supported(
+    *, environ: Mapping[str, str] | None = None, copilot_bin: str | None = None
+) -> bool | None:
+    """Best-effort tri-state probe for the CLI's native API URL override.
+
+    Returns True when a bundle references ``COPILOT_API_URL``, False when at
+    least one bundle was read and none did, and None when no bundle could be
+    located — the caller then proceeds but cannot promise the redirect took.
+    ``copilot_bin`` (the binary about to be launched) decides on its own when its
+    bundle can be read: a stale installer copy under the legacy ``pkg`` roots
+    must not vouch for a build that dropped the hook. Those roots are consulted
+    only when no readable bundle sits beside the launched binary.
+    """
     env = environ if environ is not None else os.environ
-    local = env.get("LOCALAPPDATA") or env.get("HOME") or os.path.expanduser("~")
+    home = env.get("HOME") or os.path.expanduser("~")
+    local = env.get("LOCALAPPDATA") or home
     roots = (
         os.path.join(local, "copilot", "pkg"),
-        os.path.join(os.path.expanduser("~"), ".local", "share", "copilot", "pkg"),
+        os.path.join(home, ".local", "share", "copilot", "pkg"),
     )
+    launched_verdicts = [
+        _bundle_mentions_native_api_url(path) for path in _copilot_bundle_candidates(copilot_bin)
+    ]
+    if True in launched_verdicts:
+        return True
+    if False in launched_verdicts:
+        return False
     found_bundle = False
     for root in roots:
         if not os.path.isdir(root):
@@ -211,15 +425,8 @@ def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> boo
             if "app.js" not in filenames:
                 continue
             found_bundle = True
-            try:
-                with open(
-                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
-                ) as bundle:
-                    while chunk := bundle.read(1 << 20):
-                        if COPILOT_NATIVE_API_URL_ENV in chunk:
-                            return True
-            except OSError:
-                continue
+            if _bundle_mentions_native_api_url(os.path.join(dirpath, "app.js")):
+                return True
     return False if found_bundle else None
 
 
@@ -233,6 +440,11 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build the Copilot BYOK environment for the selected provider type.
 
+    A durable ``headroom install`` exports ``COPILOT_API_URL`` into the shell so
+    the native lane works everywhere; this lane routes chat through the BYOK
+    variables instead and drops that hook, so the CLI's ancillary CAPI calls
+    are not sent to a proxy that may not be running.
+
     ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
     base-URL prefix because the Copilot CLI cannot send custom headers; the
     proxy strips it and attributes savings per project.
@@ -242,8 +454,10 @@ def build_launch_env(
     # charge of which keys to seed). The previous `environ or os.environ`
     # collapsed those two cases because `bool({}) is False`.
     env = dict(environ if environ is not None else os.environ)
+    env.pop(COPILOT_NATIVE_API_URL_ENV, None)
     env["COPILOT_PROVIDER_TYPE"] = provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
+    ensure_loopback_no_proxy(env)
 
     if not env.get("COPILOT_PROVIDER_API_KEY"):
         key = env.get(provider_key_source(provider_type), "")

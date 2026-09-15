@@ -9,14 +9,18 @@ from .vscode import (
 )
 from .wrap import (
     build_launch_env,
+    check_copilot_url_setting,
     copilot_model_from_args,
     default_wire_api_for_model,
     detect_running_proxy_backend,
+    ensure_loopback_no_proxy,
     is_auto_model,
     model_configured,
     model_prefers_responses_api,
     provider_key_source,
     query_proxy_config,
+    read_copilot_url_setting,
+    read_copilot_url_settings,
     resolve_provider_type,
     strip_auto_model_args,
     validate_configuration,
@@ -24,6 +28,10 @@ from .wrap import (
 
 __all__ = [
     "build_launch_env",
+    "check_copilot_url_setting",
+    "ensure_loopback_no_proxy",
+    "read_copilot_url_setting",
+    "read_copilot_url_settings",
     "copilot_model_from_args",
     "default_wire_api_for_model",
     "detect_running_proxy_backend",
