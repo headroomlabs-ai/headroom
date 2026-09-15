@@ -280,6 +280,25 @@ pub struct CliArgs {
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
 
+    /// Restrict the Prometheus `/metrics` scrape endpoint to loopback
+    /// clients. Default `false` to preserve existing behaviour (the
+    /// endpoint is reachable from wherever the proxy is bound). Set to
+    /// `true` — recommended whenever `--listen` binds a non-loopback
+    /// address — so `/metrics` (token counts, per-session cache-hit
+    /// rates, rate-limit gauges) is served only to `127.0.0.1` / `::1`
+    /// and returns 403 otherwise. This is defense-in-depth alongside
+    /// firewalling the path.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK`
+    /// env var → default (`false`).
+    #[arg(
+        long = "metrics-require-loopback",
+        env = "HEADROOM_PROXY_METRICS_REQUIRE_LOOPBACK",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub metrics_require_loopback: bool,
+
     /// Upstream base URL the proxy forwards to (e.g. http://127.0.0.1:8788).
     /// REQUIRED — there is no default; we want operators to be explicit.
     #[arg(long, env = "HEADROOM_PROXY_UPSTREAM")]
@@ -623,6 +642,9 @@ pub struct Config {
     /// Runtime rollout state resolved from CLI/env.
     pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
+    /// Gate the Prometheus `/metrics` endpoint to loopback clients.
+    /// Default `false`; recommend `true` when `listen` is non-loopback.
+    pub metrics_require_loopback: bool,
     pub upstream: Url,
     pub upstream_timeout: Duration,
     pub upstream_connect_timeout: Duration,
@@ -731,6 +753,7 @@ impl Config {
         Self {
             rollout: rollout.clone(),
             listen: args.listen,
+            metrics_require_loopback: args.metrics_require_loopback,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
             upstream_connect_timeout: args.upstream_connect_timeout,
@@ -767,6 +790,11 @@ impl Config {
         Self {
             rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
+            // Off by default in tests: the metrics integration tests
+            // scrape `/metrics` and assert 200, and oneshot-style tests
+            // carry no `ConnectInfo`. Tests that exercise the gate set
+            // this to `true` explicitly.
+            metrics_require_loopback: false,
             upstream,
             upstream_timeout: Duration::from_secs(60),
             upstream_connect_timeout: Duration::from_secs(5),
