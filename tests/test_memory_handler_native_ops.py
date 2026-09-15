@@ -245,11 +245,11 @@ async def test_execute_native_memory_tool_dispatches_and_wraps_errors(
     async def fake_ensure_initialized() -> None:
         return None
 
-    async def fake_view(input_data, user_id):  # noqa: ANN001
+    async def fake_view(input_data, user_id, backend=None):  # noqa: ANN001
         called.append(("view", input_data, user_id))
         return "viewed"
 
-    async def fake_create(input_data, user_id):  # noqa: ANN001
+    async def fake_create(input_data, user_id, backend=None):  # noqa: ANN001
         called.append(("create", input_data, user_id))
         return "created"
 
@@ -264,7 +264,7 @@ async def test_execute_native_memory_tool_dispatches_and_wraps_errors(
         == "Error: Unknown command 'bad'"
     )
 
-    async def boom(input_data, user_id):  # noqa: ANN001
+    async def boom(input_data, user_id, backend=None):  # noqa: ANN001
         raise RuntimeError("oops")
 
     monkeypatch.setattr(handler, "_native_view_semantic", boom)
@@ -335,19 +335,19 @@ async def test_native_view_semantic_routes_paths(
 ) -> None:
     seen: list[tuple[str, object]] = []
 
-    async def fake_search(query, user_id, top_k=5):  # noqa: ANN001
+    async def fake_search(query, user_id, *, backend=None, top_k=5):  # noqa: ANN001
         seen.append(("search", query))
         return "search-result"
 
-    async def fake_recent(user_id, limit=10):  # noqa: ANN001
+    async def fake_recent(user_id, *, backend=None, limit=10):  # noqa: ANN001
         seen.append(("recent", limit))
         return "recent-result"
 
-    async def fake_all(user_id, limit=20):  # noqa: ANN001
+    async def fake_all(user_id, *, backend=None, limit=20):  # noqa: ANN001
         seen.append(("all", limit))
         return "all-result"
 
-    async def fake_overview(user_id):  # noqa: ANN001
+    async def fake_overview(user_id, *, backend=None):  # noqa: ANN001
         seen.append(("overview", user_id))
         return "overview-result"
 
@@ -1004,7 +1004,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
     ):  # noqa: ANN001
         return f"ran:{tool_name}:{user_id}:{provider}:{input_data}"
 
-    async def fake_execute_native(input_data, user_id):  # noqa: ANN001
+    async def fake_execute_native(input_data, user_id, *, request_context=None):  # noqa: ANN001
         return f"native:{user_id}:{input_data}"
 
     monkeypatch.setattr(handler, "_ensure_initialized", fake_ensure_initialized)

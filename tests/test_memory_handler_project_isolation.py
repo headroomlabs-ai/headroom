@@ -40,6 +40,7 @@ class _FakeBackend:
 
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
+        self.initialize_calls = 0
         self.saved_contents: list[str] = []
         self.search_results: list[Any] = []
         # Tag the backend with its db_path so tests can assert on it.
@@ -47,7 +48,7 @@ class _FakeBackend:
         _FakeBackend.instances.append(self)
 
     async def _ensure_initialized(self) -> None:
-        return None
+        self.initialize_calls += 1
 
     async def search_memories(self, **kwargs: Any) -> list[Any]:
         return list(self.search_results)
@@ -282,8 +283,6 @@ def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
     handler = MemoryHandler(cfg, agent_type="test")
 
     async def run() -> None:
-        await handler._ensure_initialized()
-
         # Request with NO project-resolution signal: no header, no cwd,
         # no parseable system-prompt cwd: line.
         ctx_unresolved = sr_mod.RequestContext(
@@ -313,6 +312,194 @@ def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
             "Unresolved project in PROJECT mode must skip injection — "
             "incident on 2026-05-26 (TAM-550) was caused by the GLOBAL "
             "fallback pooling prior-session content into a fresh thread."
+        )
+        assert _FakeBackend.instances == []
+
+    asyncio.run(run())
+
+
+def test_all_unresolved_tools_skip_without_backend_or_file_side_effects(
+    tmp_path: Path,
+) -> None:
+    """Every custom/native operation returns the same fail-closed result."""
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="local",
+            db_path=str(tmp_path / "global-memory.db"),
+            storage_mode=sr_mod.MemoryStorageMode.PROJECT,
+            use_native_tool=True,
+            native_memory_dir=str(tmp_path / "native"),
+        ),
+        agent_type="test",
+    )
+    unresolved = sr_mod.RequestContext(
+        headers={},
+        system_prompt="You are helpful.",
+        base_user_id="alice",
+    )
+    custom_inputs = {
+        "memory_save": {"content": "canary"},
+        "memory_search": {"query": "canary"},
+        "memory_update": {"memory_id": "canary", "new_content": "changed"},
+        "memory_delete": {"memory_id": "canary"},
+        "memory_list": {},
+    }
+    native_inputs = {
+        "view": {"path": "/memories/canary.txt"},
+        "create": {"path": "/memories/canary.txt", "file_text": "canary"},
+        "str_replace": {
+            "path": "/memories/canary.txt",
+            "old_str": "canary",
+            "new_str": "changed",
+        },
+        "insert": {
+            "path": "/memories/canary.txt",
+            "insert_line": 0,
+            "insert_text": "changed",
+        },
+        "delete": {"path": "/memories/canary.txt"},
+        "rename": {
+            "old_path": "/memories/canary.txt",
+            "new_path": "/memories/renamed.txt",
+        },
+    }
+    content = [
+        {
+            "type": "tool_use",
+            "id": name,
+            "name": name,
+            "input": input_data,
+        }
+        for name, input_data in custom_inputs.items()
+    ]
+    content += [
+        {
+            "type": "tool_use",
+            "id": f"native-{command}",
+            "name": "memory",
+            "input": {"command": command, **input_data},
+        }
+        for command, input_data in native_inputs.items()
+    ]
+    native_before = sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*"))
+
+    results = asyncio.run(
+        handler.handle_memory_tool_calls(
+            {"content": content},
+            "alice",
+            "anthropic",
+            request_context=unresolved,
+        )
+    )
+
+    assert len(results) == len(content)
+    assert all(
+        result["content"] == '{"status": "skipped", "reason": "project_unresolved"}'
+        for result in results
+    )
+    assert _FakeBackend.instances == []
+    assert sorted(path.relative_to(tmp_path) for path in tmp_path.rglob("*")) == native_before
+
+
+def test_resolved_native_create_uses_project_backend(tmp_path: Path) -> None:
+    """Native translation writes only to the resolved project backend."""
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="local",
+            db_path=str(tmp_path / "global-memory.db"),
+            storage_mode=sr_mod.MemoryStorageMode.PROJECT,
+            use_native_tool=True,
+            native_memory_dir=str(tmp_path / "native"),
+        ),
+        agent_type="test",
+    )
+
+    results = asyncio.run(
+        handler.handle_memory_tool_calls(
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "native-create",
+                        "name": "memory",
+                        "input": {
+                            "command": "create",
+                            "path": "/memories/project.txt",
+                            "file_text": "PROJECT_NATIVE_CANARY",
+                        },
+                    }
+                ]
+            },
+            "alice",
+            "anthropic",
+            request_context=_ctx_for_cwd("/tmp/project-native"),
+        )
+    )
+
+    assert results[0]["content"] == "File created successfully at: /memories/project.txt"
+    writers = [backend for backend in _FakeBackend.instances if backend.saved_contents]
+    assert len(writers) == 1
+    assert writers[0].saved_contents == ["PROJECT_NATIVE_CANARY"]
+    assert "projects" in Path(writers[0].db_path).parts
+
+
+def test_unresolved_native_create_has_no_backend_side_effect(tmp_path: Path) -> None:
+    """Native memory create must fail closed before touching the global backend."""
+    handler = MemoryHandler(
+        MemoryConfig(
+            enabled=True,
+            backend="local",
+            db_path=str(tmp_path / "global-memory.db"),
+            storage_mode=sr_mod.MemoryStorageMode.PROJECT,
+            use_native_tool=True,
+            native_memory_dir=str(tmp_path / "native"),
+        ),
+        agent_type="test",
+    )
+    unresolved = sr_mod.RequestContext(
+        headers={},
+        system_prompt="You are helpful.",
+        base_user_id="alice",
+    )
+
+    async def run() -> None:
+        results = await handler.handle_memory_tool_calls(
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "native-create",
+                        "name": "memory",
+                        "input": {
+                            "command": "create",
+                            "path": "/memories/canary.txt",
+                            "file_text": "UNRESOLVED_NATIVE_CANARY",
+                        },
+                    }
+                ]
+            },
+            "alice",
+            "anthropic",
+            request_context=unresolved,
+        )
+        direct_result = await handler._execute_native_memory_tool(
+            {
+                "command": "create",
+                "path": "/memories/direct-canary.txt",
+                "file_text": "UNRESOLVED_DIRECT_NATIVE_CANARY",
+            },
+            "alice",
+            request_context=unresolved,
+        )
+
+        assert '"reason": "project_unresolved"' in results[0]["content"]
+        assert direct_result == '{"status": "skipped", "reason": "project_unresolved"}'
+        assert not any(backend.initialize_calls for backend in _FakeBackend.instances)
+        assert all(
+            "UNRESOLVED_NATIVE_CANARY" not in backend.saved_contents
+            for backend in _FakeBackend.instances
         )
 
     asyncio.run(run())
