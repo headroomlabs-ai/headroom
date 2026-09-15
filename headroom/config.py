@@ -697,10 +697,11 @@ class CCRConfig:
     # Session-scale TTL. The original 5-minute default predates agentic
     # sessions that routinely run 30+ minutes; an expired entry silently
     # converts "lossless with retrieval" into "lossy", so the TTL is the
-    # weakest link in the no-accuracy-loss guarantee. Kept in lockstep
-    # with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs) and
-    # DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
-    store_ttl_seconds: int = 1800  # Cache TTL (30 minutes)
+    # weakest link in the no-accuracy-loss guarantee. In the Python store
+    # this is an *idle* window (restarted on every retrieval, #2604). Kept
+    # in lockstep with Rust DEFAULT_TTL (crates/headroom-core/src/ccr/mod.rs)
+    # and DEFAULT_CCR_TTL_SECONDS (cache/compression_store.py).
+    store_ttl_seconds: int = 3600  # Cache TTL (60 minutes)
     inject_retrieval_marker: bool = True  # Add retrieval hint to compressed output
     feedback_enabled: bool = True  # Track retrieval events for learning
     min_items_to_cache: int = 20  # Only cache if original had >= N items
