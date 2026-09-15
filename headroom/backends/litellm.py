@@ -550,8 +550,8 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def _convert_tool_choice(choice: Any) -> Any:
     """Convert Anthropic tool_choice to OpenAI format.
 
-    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "tool", "name": "..."}
-    OpenAI:    "auto", "required", {"type": "function", "function": {"name": "..."}}
+    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
+    OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
     """
     if isinstance(choice, str):
         return choice
@@ -561,6 +561,13 @@ def _convert_tool_choice(choice: Any) -> Any:
             return "auto"
         if choice_type == "any":
             return "required"
+        if choice_type == "none":
+            # Anthropic's {"type": "none"} means "do not use any tool this turn".
+            # Without this branch it fell through to the "auto" default below,
+            # inverting the instruction into "you may use tools" — the model
+            # could then call a tool the client explicitly forbade. OpenAI's
+            # equivalent is the string "none".
+            return "none"
         if choice_type == "tool":
             return {"type": "function", "function": {"name": choice.get("name", "")}}
     return "auto"
