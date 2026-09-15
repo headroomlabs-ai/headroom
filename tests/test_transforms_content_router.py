@@ -418,6 +418,72 @@ def test_normal_compress_path_still_uses_content_detection(
     assert calls["detect"] > 0
 
 
+@pytest.mark.parametrize(
+    ("content_type", "multiplier"),
+    [
+        (ContentType.BUILD_OUTPUT, 0.50),
+        (ContentType.SOURCE_CODE, 0.50),
+        (ContentType.SEARCH_RESULTS, 0.70),
+        (ContentType.PLAIN_TEXT, 1.00),
+    ],
+)
+def test_domain_routing_scales_detected_content_bias(
+    monkeypatch: pytest.MonkeyPatch,
+    content_type: ContentType,
+    multiplier: float,
+) -> None:
+    router = ContentRouter()
+    observed: dict[str, float] = {}
+
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda _content: False)
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda _content: DetectionResult(content_type, 1.0, {}),
+    )
+    monkeypatch.setattr(
+        router,
+        "_determine_strategy",
+        lambda _content, **_kwargs: CompressionStrategy.KOMPRESS,
+    )
+
+    def _capture_pure(*args, **kwargs) -> RouterCompressionResult:
+        observed["bias"] = kwargs["bias"]
+        return RouterCompressionResult(
+            compressed="compressed",
+            original="payload",
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    monkeypatch.setattr(router, "_compress_pure", _capture_pure)
+
+    router.compress("payload", bias=1.6)
+
+    assert observed["bias"] == pytest.approx(1.6 * multiplier)
+
+
+def test_domain_routing_does_not_change_forced_kompress_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    router._runtime_force_kompress = True
+    observed: dict[str, float] = {}
+
+    def _capture_pure(*args, **kwargs) -> RouterCompressionResult:
+        observed["bias"] = kwargs["bias"]
+        return RouterCompressionResult(
+            compressed="compressed",
+            original="payload",
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    monkeypatch.setattr(router, "_compress_pure", _capture_pure)
+
+    router.compress("payload", bias=1.6)
+
+    assert observed["bias"] == pytest.approx(1.6)
+
+
 def test_force_kompress_apply_uses_lightweight_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
