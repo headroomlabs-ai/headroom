@@ -89,6 +89,8 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 
 `headroom wrap` registers **[Serena](https://github.com/oraios/serena)** as the code-memory MCP for semantic, symbol-level code navigation. Serena runs on demand via `uvx` — Headroom downloads and executes no binary of its own — and indexes the current project locally. Pass `--code-memory none` to register no code-memory MCP.
 
+For Claude Code, the entry is written at `local` scope, which means it applies to the directory you wrapped and nothing else. That keeps a Serena that cannot start from breaking Claude Code sessions in unrelated projects. Pass `--code-memory-scope user` (or set `HEADROOM_CODE_MEMORY_SCOPE=user`) to register it machine-wide instead, which is how releases before this change behaved. If an earlier version already registered Serena machine-wide, the next `headroom wrap claude` moves it into the project scope for you — but only when Headroom installed that entry itself; a Serena you registered by hand is left alone.
+
 > **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired in favour of Serena. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed and switches you to Serena — nothing to migrate, since both are just indexes rebuilt from your source. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
 
 By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.

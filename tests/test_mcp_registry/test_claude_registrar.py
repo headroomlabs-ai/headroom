@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from headroom.mcp_registry.base import RegisterStatus, ServerSpec
-from headroom.mcp_registry.claude import ClaudeRegistrar
+from headroom.mcp_registry.claude import SCOPE_LOCAL, SCOPE_USER, ClaudeRegistrar
 from headroom.mcp_registry.install import build_headroom_spec
 
 _RESOLVED_COMMAND = ("/usr/bin/python", "-m", "headroom.cli")
@@ -509,3 +509,256 @@ def test_register_via_file_merges_into_existing_valid_config(tmp_path: Path) -> 
     assert data["projects"] == {"/x": {"y": 1}}
     assert data["oauthAccount"] == {"id": "abc"}
     assert "headroom" in data["mcpServers"]
+
+
+# ----------------------------------------------------------------------
+# Project ("local") scope — issue #2787
+#
+# A server registered at user scope loads in every Claude Code session on the
+# machine, so one that fails to start breaks unrelated projects. Project scope
+# confines it to the directory that was wrapped.
+# ----------------------------------------------------------------------
+
+_SERENA_ARGS = ["serena", "start-mcp-server"]
+
+
+def _local_registrar(
+    tmp_path: Path,
+    *,
+    cli: str | None = None,
+    project_dir: Path | None = None,
+) -> ClaudeRegistrar:
+    """Registrar writing project scope, pointed at ``tmp_path`` as $HOME."""
+    return ClaudeRegistrar(
+        claude_cli=cli,
+        home_dir=tmp_path,
+        scope=SCOPE_LOCAL,
+        project_dir=project_dir if project_dir is not None else tmp_path / "proj",
+    )
+
+
+def _serena_spec(command: str = "uvx") -> ServerSpec:
+    return ServerSpec(name="serena", command=command, args=tuple(_SERENA_ARGS))
+
+
+def test_rejects_unknown_scope(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        ClaudeRegistrar(claude_cli=None, home_dir=tmp_path, scope="global")
+
+
+def test_register_local_scope_writes_project_map_not_user_map(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+    # The machine-wide map is what breaks unrelated sessions — stay out of it.
+    assert "mcpServers" not in data
+
+
+def test_register_local_scope_reuses_existing_project_key(tmp_path: Path) -> None:
+    """Claude Code keys ``projects`` by the session's cwd string (forward slashes
+    even on Windows). A second key naming the same directory would leave an entry
+    Claude Code never reads."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    existing_key = project.as_posix() + "/"  # same directory, different spelling
+    cfg.write_text(
+        json.dumps({"projects": {existing_key: {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.register_server(_serena_spec()).status == RegisterStatus.REGISTERED
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert list(data["projects"]) == [existing_key]
+    assert "serena" in data["projects"][existing_key]["mcpServers"]
+    assert data["projects"][existing_key]["hasTrustDialogAccepted"] is True
+
+
+def test_register_local_scope_writes_even_when_user_entry_matches(tmp_path: Path) -> None:
+    """A leftover user-scope copy must not make the project-scope registration
+    look like a no-op — that would leave the machine-wide entry as the only one."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps({"mcpServers": {"serena": {"command": "uvx", "args": _SERENA_ARGS}}}),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+    # Retiring the global copy is wrap's job (ledger-gated), not the registrar's.
+    assert "serena" in data["mcpServers"]
+
+
+def test_register_local_scope_never_writes_legacy_config(tmp_path: Path) -> None:
+    """``~/.claude/mcp.json`` has no projects map, so project scope always goes to
+    the modern config even when only the legacy file exists."""
+    legacy = tmp_path / ".claude" / "mcp.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.register_server(_serena_spec()).status == RegisterStatus.REGISTERED
+
+    assert json.loads(legacy.read_text(encoding="utf-8"))["mcpServers"] == {}
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+
+
+def test_register_via_cli_passes_local_scope_and_project_cwd(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    reg = _local_registrar(tmp_path, cli="/usr/local/bin/claude", project_dir=project)
+    ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", return_value=ok) as run_mock:
+        result = reg.register_server(_serena_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    add_call = run_mock.call_args
+    assert add_call is not None
+    assert add_call.args[0][:6] == [
+        "/usr/local/bin/claude",
+        "mcp",
+        "add",
+        "serena",
+        "-s",
+        "local",
+    ]
+    # `claude mcp add -s local` keys the entry by the CLI process's own cwd.
+    assert add_call.kwargs["cwd"] == str(project)
+
+
+def test_get_server_prefers_project_entry_over_user_entry(tmp_path: Path) -> None:
+    """Claude Code resolves project scope first, so our reads must too."""
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "global-uvx"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    unscoped = reg.get_server("serena")
+    assert unscoped is not None and unscoped.command == "uvx"
+
+    scoped_user = reg.get_server("serena", scope=SCOPE_USER)
+    assert scoped_user is not None and scoped_user.command == "global-uvx"
+
+    scoped_local = reg.get_server("serena", scope=SCOPE_LOCAL)
+    assert scoped_local is not None and scoped_local.command == "uvx"
+
+
+def test_get_server_scoped_read_ignores_other_projects(tmp_path: Path) -> None:
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {"projects": {(tmp_path / "elsewhere").as_posix(): {"mcpServers": {"serena": {}}}}}
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=tmp_path / "proj")
+
+    assert reg.get_server("serena", scope=SCOPE_LOCAL) is None
+
+
+def test_force_register_local_scope_leaves_user_entry(tmp_path: Path) -> None:
+    """force=True replaces the entry in the target scope only.
+
+    Overwriting this project's Serena must not delete a machine-wide one the
+    user registered themselves.
+    """
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "user-managed-serena"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "old"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    result = reg.register_server(_serena_spec(), force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["projects"][project.as_posix()]["mcpServers"]["serena"]["command"] == "uvx"
+    assert data["mcpServers"]["serena"]["command"] == "user-managed-serena"
+
+
+def test_unregister_removes_both_scopes_by_default(tmp_path: Path) -> None:
+    """unwrap must clean up regardless of which scope installed the entry."""
+    project = tmp_path / "proj"
+    other = tmp_path / "other"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "uvx"}},
+                "projects": {
+                    project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}},
+                    other.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.unregister_server("serena") is True
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["mcpServers"] == {}
+    assert data["projects"][project.as_posix()]["mcpServers"] == {}
+    # Other projects were wrapped separately; unwrapping here must not touch them.
+    assert "serena" in data["projects"][other.as_posix()]["mcpServers"]
+
+
+def test_unregister_user_scope_leaves_project_entry(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"serena": {"command": "uvx"}},
+                "projects": {project.as_posix(): {"mcpServers": {"serena": {"command": "uvx"}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    reg = _local_registrar(tmp_path, project_dir=project)
+
+    assert reg.unregister_server("serena", scope=SCOPE_USER) is True
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["mcpServers"] == {}
+    assert "serena" in data["projects"][project.as_posix()]["mcpServers"]
+
+
+def test_default_scope_is_user_so_existing_callers_are_unchanged(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path, cli=None)
+    assert reg.scope == SCOPE_USER
+
+    assert reg.register_server(_spec()).status == RegisterStatus.REGISTERED
+
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "headroom" in data["mcpServers"]
+    assert "projects" not in data
