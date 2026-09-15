@@ -64,6 +64,11 @@ class ClaudeRegistrar(MCPRegistrar):
         self._isolated_cli_env = home_dir is not None or config_dir is not None
         self._modern_config = modern_dir / ".claude.json"
         self._legacy_config = self._claude_dir / "mcp.json"
+        # Unlike the legacy file, plugin state and settings.json do move with
+        # CLAUDE_CONFIG_DIR; without the override they live under ``~/.claude``.
+        state_dir = modern_dir if modern_dir != home else self._claude_dir
+        self._settings = state_dir / "settings.json"
+        self._installed_plugins = state_dir / "plugins" / "installed_plugins.json"
         if claude_cli is ...:
             self._claude_cli = shutil.which("claude")
         else:
@@ -87,6 +92,37 @@ class ClaudeRegistrar(MCPRegistrar):
             if entry is not None:
                 return entry
         return None
+
+    def get_plugin_servers(self, server_name: str) -> list[tuple[str, ServerSpec]]:
+        """Return ``(plugin_id, spec)`` for each enabled plugin bundling ``server_name``.
+
+        Claude Code also launches MCP servers declared in an installed
+        plugin's ``.mcp.json`` (``claude mcp list`` shows them as
+        ``plugin:<plugin>:<server>``). They never appear under ``mcpServers``,
+        so :meth:`get_server` cannot see them and Headroom cannot tell that a
+        plugin duplicates an entry it manages (#3570). Read-only.
+
+        Whether Claude launches a plugin is decided by ``enabledPlugins`` as
+        resolved for the current working directory, not by the install
+        record's scope or ``projectPath``; see :func:`_enabled_plugins`.
+        """
+        installed = _read_json(self._installed_plugins).get("plugins")
+        if not isinstance(installed, dict):
+            return []
+        enabled = _enabled_plugins(Path.cwd(), self._settings)
+        found: list[tuple[str, ServerSpec]] = []
+        for plugin_id, records in installed.items():
+            if enabled.get(plugin_id) is not True or not isinstance(records, list):
+                continue
+            for record in records:
+                install_path = record.get("installPath") if isinstance(record, dict) else None
+                if not isinstance(install_path, str) or not install_path:
+                    continue
+                entry = _read_plugin_mcp_entry(Path(install_path) / ".mcp.json", server_name)
+                if entry is not None:
+                    found.append((plugin_id, _entry_to_spec(server_name, entry)))
+                    break
+        return found
 
     def validate_configs_for_mutation(self) -> None:
         """Validate every Claude config root before an explicit mutation."""
@@ -299,6 +335,43 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _enabled_plugins(project_dir: Path, user_settings: Path) -> dict[str, Any]:
+    """Merge ``enabledPlugins`` the way Claude Code resolves it for ``project_dir``.
+
+    Verified against Claude Code 2.1.238: the most specific scope wins
+    (``.claude/settings.local.json`` over ``.claude/settings.json`` in the
+    working directory, over the user ``settings.json``), a plugin with no
+    entry anywhere stays off even when installed, and a subdirectory only
+    counts through its own ``.claude`` settings. ``claude plugin disable``
+    writes ``false`` to one of these files and keeps the install record, so
+    reading all three is what makes that remedy reliably clear a warning.
+    """
+    merged: dict[str, Any] = {}
+    for path in (
+        user_settings,
+        project_dir / ".claude" / "settings.json",
+        project_dir / ".claude" / "settings.local.json",
+    ):
+        flags = _read_json(path).get("enabledPlugins")
+        if isinstance(flags, dict):
+            merged.update(flags)
+    return merged
+
+
+def _read_plugin_mcp_entry(path: Path, server_name: str) -> dict[str, Any] | None:
+    """Look up ``server_name`` in a plugin's ``.mcp.json``.
+
+    Plugins in the official marketplace use both documented shapes: a
+    top-level ``mcpServers`` object and a flat ``{name: entry}`` map.
+    """
+    config = _read_json(path)
+    servers = config.get("mcpServers", config)
+    if not isinstance(servers, dict):
+        return None
+    entry = servers.get(server_name)
+    return entry if isinstance(entry, dict) else None
 
 
 class _MalformedConfigError(Exception):
