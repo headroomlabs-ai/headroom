@@ -84,9 +84,7 @@ class _FakeKompress:
 
     def compress(self, content: str, **kwargs):
         compressed = " ".join(content.split()[:20]) + " Retrieve more: hash=deadbeef"
-        return SimpleNamespace(
-            compressed=compressed, compressed_tokens=len(compressed.split())
-        )
+        return SimpleNamespace(compressed=compressed, compressed_tokens=len(compressed.split()))
 
 
 def _kompress_forcing_tool_message() -> list[dict]:
@@ -324,7 +322,9 @@ def test_parallel_fanout_workers_lose_this_requests_runtime_state(tokenizer, mon
             "thread returned the default _PerRequestRuntimeState instead of "
             "the state apply() bound on the calling thread"
         )
-        assert target_ratio == 0.33, f"fan-out worker thread {ident} saw target_ratio={target_ratio!r}"
+        assert target_ratio == 0.33, (
+            f"fan-out worker thread {ident} saw target_ratio={target_ratio!r}"
+        )
         assert kompress_model == "req-model-A", (
             f"fan-out worker thread {ident} saw kompress_model={kompress_model!r}"
         )
@@ -391,7 +391,9 @@ def test_single_pending_task_watchdog_thread_loses_this_requests_runtime_state(
         "of this request's True"
     )
     assert target_ratio == 0.21, f"watchdog thread {ident} saw target_ratio={target_ratio!r}"
-    assert kompress_model == "req-model-B", f"watchdog thread {ident} saw kompress_model={kompress_model!r}"
+    assert kompress_model == "req-model-B", (
+        f"watchdog thread {ident} saw kompress_model={kompress_model!r}"
+    )
 
 
 # =============================================================================
@@ -426,9 +428,7 @@ def _read_protected_tool_messages(tool_use_id: str, command: str, body: str) -> 
         },
         {
             "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": tool_use_id, "content": body}
-            ],
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": body}],
         },
     ]
 
@@ -441,9 +441,7 @@ def _protectable_file_body(tag: str) -> str:
     )
 
 
-def test_concurrent_apply_calls_leak_read_protection_state_across_requests(
-    tokenizer, monkeypatch
-):
+def test_concurrent_apply_calls_leak_read_protection_state_across_requests(tokenizer, monkeypatch):
     """New gotcha (found in review, not in the original #3486 report):
     ``_protect_read_tool_ids`` was never migrated into the ContextVar-backed
     ``_PerRequestRuntimeState`` this PR introduces, so it's still vulnerable
@@ -496,9 +494,7 @@ def test_concurrent_apply_calls_leak_read_protection_state_across_requests(
                 raise TimeoutError("Thread B did not signal proceed in time")
         return original_process_content_blocks(self, *args, **kwargs)
 
-    monkeypatch.setattr(
-        ContentRouter, "_process_content_blocks", patched_process_content_blocks
-    )
+    monkeypatch.setattr(ContentRouter, "_process_content_blocks", patched_process_content_blocks)
 
     errors: list[BaseException] = []
     result_a: dict[str, Any] = {}
@@ -656,7 +652,7 @@ def test_concurrent_apply_calls_with_internal_fanout_do_not_cross_contaminate(
     assert len(reqA_obs) >= 2, f"expected reqA's fan-out to reach compress() twice, got {observed}"
     assert len(reqB_obs) >= 2, f"expected reqB's fan-out to reach compress() twice, got {observed}"
 
-    for tag, force_kompress, target_ratio, kompress_model in reqA_obs:
+    for _tag, force_kompress, target_ratio, kompress_model in reqA_obs:
         assert force_kompress is True, f"reqA worker saw force_kompress={force_kompress!r}"
         assert target_ratio == 0.11, (
             f"reqA fan-out worker saw target_ratio={target_ratio!r} instead of reqA's own "
@@ -667,7 +663,7 @@ def test_concurrent_apply_calls_with_internal_fanout_do_not_cross_contaminate(
             "reqA's own 'model-A' -- cross-request contamination from reqB"
         )
 
-    for tag, force_kompress, target_ratio, kompress_model in reqB_obs:
+    for _tag, force_kompress, target_ratio, kompress_model in reqB_obs:
         assert force_kompress is True, f"reqB worker saw force_kompress={force_kompress!r}"
         assert target_ratio == 0.77, (
             f"reqB fan-out worker saw target_ratio={target_ratio!r} instead of reqB's own "
