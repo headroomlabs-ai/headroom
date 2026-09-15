@@ -90,6 +90,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use std::net::SocketAddr;
 
+use crate::observability::{capture, ledger};
 use crate::proxy::AppState;
 
 /// Single axum handler mounted at the
@@ -130,6 +131,15 @@ pub async fn handle_vertex_predict_dispatch(
                 segment = %model_action,
                 "vertex path final segment missing `:verb` separator"
             );
+            // A proxy-side rejection is still an outcome for this
+            // request. The model id is whatever the caller sent (it
+            // is what failed to parse); the ledger clamps it.
+            capture::finalize_rejected(capture::start_pending(
+                &state,
+                ledger::provider::VERTEX,
+                &model_action,
+                &request_id,
+            ));
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex path: bad model_action"))
@@ -146,6 +156,12 @@ pub async fn handle_vertex_predict_dispatch(
                 verb = %verb_str,
                 "vertex path verb not recognized; only rawPredict / streamRawPredict are supported"
             );
+            capture::finalize_rejected(capture::start_pending(
+                &state,
+                ledger::provider::VERTEX,
+                model_id,
+                &request_id,
+            ));
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex: unknown verb"))
