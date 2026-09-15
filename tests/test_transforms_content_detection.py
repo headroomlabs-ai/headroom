@@ -261,6 +261,50 @@ def test_code_detection_identifies_language_and_thresholds() -> None:
     assert _try_detect_code("\n\n") is None
 
 
+def test_code_detection_routes_elixir_away_from_python() -> None:
+    """Elixir `def foo(...)` heads match the Python pattern too. A module with
+    more public functions than attributes used to be tagged `python` and handed
+    to a parser that cannot read it, so it compressed by nothing. Two
+    Elixir-exclusive markers settle the language and the Python score, which is
+    really those Elixir `def` lines, is folded in."""
+    elixir_code = "\n".join(
+        [
+            "defmodule MyApp.Accounts do",
+            '  @moduledoc "Accounts."',
+            "  alias MyApp.Repo",
+            "",
+            "  def list_users(params) do",
+            "    Repo.all(User)",
+            "  end",
+            "",
+            "  def get_user!(id) do",
+            "    Repo.get!(User, id)",
+            "  end",
+            "end",
+        ]
+    )
+    result = _try_detect_code(elixir_code)
+    assert result is not None
+    assert result.content_type is ContentType.SOURCE_CODE
+    assert result.metadata["language"] == "elixir"
+    assert detect_content_type(elixir_code).content_type is ContentType.SOURCE_CODE
+
+    # A single stray marker must not steal Python's files.
+    python_code = "\n".join(
+        [
+            "import os",
+            "from pathlib import Path",
+            "",
+            "def main():",
+            "    defn = 1",
+            "    return defn",
+            "def other():",
+            "    return 2",
+        ]
+    )
+    assert _try_detect_code(python_code).metadata["language"] == "python"
+
+
 def test_detect_content_type_respects_priority_order() -> None:
     diff_like_search = "\n".join(
         [

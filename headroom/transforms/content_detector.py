@@ -111,6 +111,17 @@ _CODE_PATTERNS = {
         ),
         re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
     ],
+    "elixir": [
+        # Elixir-only definition macros: bare `def` is shared with Python, so
+        # it is deliberately not matched here.
+        re.compile(
+            r"^\s*def(module|p|macro|macrop|guard|guardp|delegate|struct|exception"
+            r"|impl|protocol|n|np)\b"
+        ),
+        re.compile(r"^\s*@(moduledoc|doc|spec|type|typep|opaque|behaviour|impl|callback)\b"),
+        re.compile(r"\|>\s*\w"),  # pipe operator
+        re.compile(r"^\s*(alias|require|use)\s+[A-Z][\w.]*"),
+    ],
     "php": [
         re.compile(r"<\?php\b"),
         re.compile(r"^\s*namespace\s+[\w\\]+\s*;"),
@@ -792,6 +803,16 @@ def _try_detect_code(content: str) -> DetectionResult | None:
 
     if not language_scores:
         return None
+
+    # Disambiguation: Elixir's `def foo(...)` heads also match the Python
+    # pattern, so a module with more public functions than attributes would be
+    # tagged `python` and handed to a parser that cannot read it — the file
+    # then fails validation and compresses by nothing. The Elixir patterns are
+    # deliberately exclusive (`defmodule`, `defp`, `@moduledoc`, `|>` have no
+    # Python spelling), so two of them settle the language; the Python score is
+    # folded in rather than dropped because those are Elixir `def` lines.
+    if language_scores.get("elixir", 0) >= 2 and "python" in language_scores:
+        language_scores["elixir"] += language_scores.pop("python")
 
     # Find best matching language
     best_lang = max(language_scores, key=lambda k: language_scores[k])

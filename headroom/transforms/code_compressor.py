@@ -16,7 +16,8 @@ Supported Languages (Tier 1):
 - Python, JavaScript, TypeScript
 
 Supported Languages (Tier 2):
-- Go, Rust, Java, C, C++
+- Go, Rust, Java, C, C++, C#, PHP
+- Elixir (macro-call dispatch; see LangConfig.call_node_type)
 - Bash (validated and preserved losslessly)
 
 Compression Strategy:
@@ -274,7 +275,8 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, php, bash. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, "
+                f"csharp, php, elixir, bash. "
                 f"Error: {e}"
             ) from e
 
@@ -331,6 +333,7 @@ class CodeLanguage(Enum):
     PERL = "perl"
     CSHARP = "csharp"
     PHP = "php"
+    ELIXIR = "elixir"
     BASH = "bash"
     SHELL = "bash"  # Alias: tree-sitter-language-pack exposes the Bash grammar.
     UNKNOWN = "unknown"
@@ -361,6 +364,9 @@ _LANGUAGE_ALIASES: dict[str, CodeLanguage] = {
     "php5": CodeLanguage.PHP,
     "php7": CodeLanguage.PHP,
     "php8": CodeLanguage.PHP,
+    "ex": CodeLanguage.ELIXIR,
+    "exs": CodeLanguage.ELIXIR,
+    "iex": CodeLanguage.ELIXIR,
     "shell": CodeLanguage.BASH,
     "sh": CodeLanguage.BASH,
     "zsh": CodeLanguage.BASH,
@@ -401,6 +407,15 @@ class DocstringMode(Enum):
 # =========================================================================
 
 
+# Dispatch sentinels for macro-call languages (see LangConfig below). They
+# stand in for grammar node types that Elixir does not have, so they must not
+# collide with any real tree-sitter node type.
+_CALL_ROLE_FUNCTION = "__call_function__"
+_CALL_ROLE_CLASS = "__call_class__"
+_CALL_ROLE_IMPORT = "__call_import__"
+_CALL_ROLE_TYPE = "__call_type__"
+
+
 @dataclass(frozen=True)
 class LangConfig:
     """Data-driven configuration for a programming language.
@@ -436,6 +451,28 @@ class LangConfig:
     # descendants individually while the top-level pass re-emits the whole
     # wrapper verbatim, duplicating content. Prefer the false negative.
     opaque_node_types: frozenset[str] | None = None
+
+    # --- Macro-call languages (Elixir) -----------------------------------
+    #
+    # Elixir has no `function_definition` node: `def`, `defp`, `defmodule` and
+    # `alias` are macros, so every one of them parses as a generic `call` whose
+    # first child is the macro's `identifier`. Dispatching on `node.type` alone
+    # would either match nothing or match every function call in the file.
+    # When `call_node_type` is set, `_effective_type` resolves such a node to
+    # one of the `_CALL_ROLE_*` sentinels by looking up that identifier in the
+    # target sets below; the sentinels are what the language's
+    # `function_nodes`/`class_nodes`/`import_nodes`/`type_nodes` contain, so
+    # every existing dispatch site keeps working unchanged.
+    call_node_type: str | None = None
+    call_function_targets: frozenset[str] = frozenset()
+    call_class_targets: frozenset[str] = frozenset()
+    call_import_targets: frozenset[str] = frozenset()
+    call_type_targets: frozenset[str] = frozenset()
+
+    # Block delimiters for languages whose signature and body share a line.
+    # Brace languages use `{`/`}`; Elixir uses the `do`/`end` keywords.
+    body_open_token: str = "{"
+    body_close_token: str = "}"
 
 
 _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
@@ -595,6 +632,82 @@ _LANG_CONFIGS: dict[CodeLanguage, LangConfig] = {
         package_node="namespace_definition",
         detection_hints=("<?php", "function ", "namespace ", "->", "$this"),
         class_body_node_types=frozenset({"declaration_list"}),
+    ),
+    CodeLanguage.ELIXIR: LangConfig(
+        # Every entry below is a `_CALL_ROLE_*` sentinel rather than a real
+        # grammar node type. tree-sitter-elixir emits `call` for `def`,
+        # `defmodule`, `alias` and friends alike, so dispatch runs on the macro
+        # name via `call_*_targets` (see LangConfig).
+        import_nodes=frozenset({_CALL_ROLE_IMPORT}),
+        function_nodes=frozenset({_CALL_ROLE_FUNCTION}),
+        class_nodes=frozenset({_CALL_ROLE_CLASS}),
+        type_nodes=frozenset({_CALL_ROLE_TYPE}),
+        body_node_types=frozenset({"do_block"}),
+        decorator_node=None,
+        comment_prefix="#",
+        # `def foo(x) do` opens its body on the signature line, like a K&R
+        # brace — the same same-line branch handles both.
+        uses_colon_after_signature=False,
+        detection_hints=("defmodule ", "defp ", "@moduledoc", "|>", " do\n"),
+        call_node_type="call",
+        # The three target sets below partition the 15 definition macros the
+        # grammar itself recognises — `queries/highlights.scm` in
+        # elixir-lang/tree-sitter-elixir, `#any-of? @keyword "def" ...`. The
+        # function set is that file's own function-definition subset verbatim;
+        # the rest are split by whether the macro owns a member list
+        # (container) or declares shape (verbatim). Re-check against upstream
+        # when the pinned grammar version moves.
+        call_function_targets=frozenset(
+            {
+                "def",
+                "defp",
+                "defmacro",
+                "defmacrop",
+                "defguard",
+                "defguardp",
+                "defdelegate",
+                "defn",
+                "defnp",
+                # ExUnit block macros: not definitions, but they wrap a `do`
+                # block of statements that compresses the same way and
+                # dominates test files.
+                "test",
+                "setup",
+                "setup_all",
+            }
+        ),
+        # `describe` groups `test` blocks the way a class groups methods, so it
+        # takes the class path: its children compress individually instead of
+        # the whole group being truncated at the first test.
+        call_class_targets=frozenset({"defmodule", "defprotocol", "defimpl", "describe"}),
+        call_import_targets=frozenset({"import", "alias", "require", "use"}),
+        # Structure declarations, kept verbatim: they are the module's shape,
+        # not its behaviour, and `schema`/`embedded_schema` field lists are
+        # exactly what a reader of compressed Ecto code needs.
+        call_type_targets=frozenset(
+            {
+                "defstruct",
+                "defexception",
+                # Declares which generated functions may be replaced; carries no
+                # body of its own.
+                "defoverridable",
+                "schema",
+                "embedded_schema",
+            }
+        ),
+        # Anything at the top level that is not itself a definition is opaque:
+        # emitted verbatim, never recursed into. Elixir wraps declarations in
+        # ordinary macros (`for encoder <- [...] do defimpl ... end end`), and
+        # capturing the inner `defimpl` while the uncaptured wrapper is
+        # re-emitted verbatim duplicates the whole file (observed at 1.9x input
+        # on ecto/lib/ecto/json.ex). Definition roles are dispatched before
+        # this check, so `defmodule`/`def`/`alias` are unaffected; declarations
+        # nested inside a wrapper stay verbatim, which is the false negative we
+        # want. Module bodies do not take this path — `_compress_class_ast`
+        # walks them directly.
+        opaque_node_types=frozenset({"call", "binary_operator", "unary_operator"}),
+        body_open_token="do",
+        body_close_token="end",
     ),
     CodeLanguage.BASH: LangConfig(
         # Shell control-flow nodes are opaque: their `then`/`fi`, `do`/`done`,
@@ -838,6 +951,21 @@ _LANGUAGE_PREFILTER: dict[CodeLanguage, list[re.Pattern[str]]] = {
             re.MULTILINE,
         ),
         re.compile(r"\$this->|->\w+\s*\(", re.MULTILINE),
+    ],
+    CodeLanguage.ELIXIR: [
+        # `def` alone is shared with Python; only the Elixir-only definition
+        # macros are matched so Python source cannot score here.
+        re.compile(
+            r"^\s*def(module|p|macro|macrop|guard|guardp|delegate|struct|exception"
+            r"|impl|protocol|n|np)\b",
+            re.MULTILINE,
+        ),
+        re.compile(
+            r"^\s*@(moduledoc|doc|spec|type|typep|opaque|behaviour|impl|callback)\b",
+            re.MULTILINE,
+        ),
+        re.compile(r"\|>\s*\w", re.MULTILINE),
+        re.compile(r"^\s*(alias|require|use)\s+[A-Z][\w.]*", re.MULTILINE),
     ],
     CodeLanguage.BASH: [
         re.compile(r"^\s*#!.*\b(?:bash|sh|zsh)\b", re.MULTILINE),
@@ -1099,8 +1227,8 @@ class CodeAwareCompressor(Transform):
         function_calls: dict[str, set[str]] = {}
 
         def collect_definitions(node: Any, parent_name: str = "") -> None:
-            if node.type in all_definition_types:
-                short_name = _get_definition_name(node)
+            if _effective_type(node, lang_config) in all_definition_types:
+                short_name = _get_definition_name(node, lang_config)
                 if short_name:
                     qualified = f"{parent_name}.{short_name}" if parent_name else short_name
                     definitions[qualified] = node
@@ -1111,8 +1239,8 @@ class CodeAwareCompressor(Transform):
             # Also check for decorated definitions
             if lang_config.decorator_node and node.type == lang_config.decorator_node:
                 for child in node.children:
-                    if child.type in all_definition_types:
-                        short_name = _get_definition_name(child)
+                    if _effective_type(child, lang_config) in all_definition_types:
+                        short_name = _get_definition_name(child, lang_config)
                         if short_name:
                             qualified = f"{parent_name}.{short_name}" if parent_name else short_name
                             definitions[qualified] = child
@@ -1640,7 +1768,7 @@ class CodeAwareCompressor(Transform):
             return candidate_validator(node, compressed)
 
         def visit(node: Any) -> None:
-            node_type = node.type
+            node_type = _effective_type(node, lang_config)
 
             # Package declarations (Go, Java)
             if lang_config.package_node and node_type == lang_config.package_node:
@@ -1663,9 +1791,10 @@ class CodeAwareCompressor(Transform):
                 # Check if this export wraps a function or class
                 has_func_or_class = False
                 for child in node.children:
+                    child_type = _effective_type(child, lang_config)
                     if (
-                        child.type in lang_config.function_nodes
-                        or child.type in lang_config.class_nodes
+                        child_type in lang_config.function_nodes
+                        or child_type in lang_config.class_nodes
                     ):
                         has_func_or_class = True
                         compressed = self._compress_function_ast(
@@ -1773,7 +1902,7 @@ class CodeAwareCompressor(Transform):
             # declarations, so appending them as trailing top-level code would
             # produce invalid output (and fall back to no compression).
             if lang_config.opaque_node_types and node_type in lang_config.opaque_node_types:
-                child_types = [child.type for child in node.named_children]
+                child_types = [_effective_type(child, lang_config) for child in node.named_children]
                 has_import = any(t in lang_config.import_nodes for t in child_types)
                 has_declaration = any(
                     t in lang_config.class_nodes
@@ -1846,7 +1975,7 @@ class CodeAwareCompressor(Transform):
         node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
 
-        func_name = _get_definition_name(node)
+        func_name = _get_definition_name(node, lang_config)
         body_limit = _get_body_limit(func_name, body_limits, self.config.max_body_lines)
 
         # Small enough to keep as-is
@@ -1900,14 +2029,14 @@ class CodeAwareCompressor(Transform):
             if _brace_in_signature:
                 # Opening brace already in signature line — just find closing
                 pass
-            elif body_lines and body_lines[0].strip().endswith("{"):
+            elif body_lines and body_lines[0].strip().endswith(lang_config.body_open_token):
                 # Matches both a bare `{` line and a multi-line signature's
                 # closing line (e.g. Go's `) error {`), where the brace
                 # shares a line with the closing paren/return type rather
                 # than starting one of its own.
                 opening_brace_line = body_lines[0]
                 body_lines = body_lines[1:]
-            if body_lines and body_lines[-1].strip().endswith("}"):
+            if body_lines and body_lines[-1].strip().endswith(lang_config.body_close_token):
                 closing_brace_line = body_lines[-1]
                 body_lines = body_lines[:-1]
 
@@ -2143,6 +2272,8 @@ class CodeAwareCompressor(Transform):
             if not child.is_named:
                 continue
 
+            child_type = _effective_type(child, lang_config)
+
             # Use line-based extraction for children too
             child_start = child.start_point[0]
             child_end = child.end_point[0]
@@ -2151,14 +2282,14 @@ class CodeAwareCompressor(Transform):
             child_text = "\n".join(code_lines[child_start : child_end + 1])
 
             # Methods/functions inside the class — compress individually
-            if child.type in lang_config.function_nodes:
+            if child_type in lang_config.function_nodes:
                 compressed = self._compress_function_ast(
                     child, code, language, lang_config, body_limits, analysis
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
             # Decorated methods
-            elif lang_config.decorator_node and child.type == lang_config.decorator_node:
+            elif lang_config.decorator_node and child_type == lang_config.decorator_node:
                 decorator_lines = []
                 method_compressed = None
                 for deco_child in child.children:
@@ -2178,8 +2309,8 @@ class CodeAwareCompressor(Transform):
                     body_parts.append(child_text)
                 processed_ranges.append((child.start_byte, child.end_byte))
             # Nested classes / containers (e.g. nested namespaces) — recurse
-            elif child.type in lang_config.class_nodes or (
-                lang_config.container_node_types and child.type in lang_config.container_node_types
+            elif child_type in lang_config.class_nodes or (
+                lang_config.container_node_types and child_type in lang_config.container_node_types
             ):
                 compressed = self._compress_class_ast(
                     child, code, language, lang_config, body_limits, analysis
@@ -2575,12 +2706,88 @@ def _get_same_line_trailing_semicolon(node: Any) -> Any | None:
     return None
 
 
-def _get_definition_name(node: Any) -> str | None:
+def _node_identifier_text(node: Any) -> str:
+    """Decode an AST node's source text (tree-sitter returns bytes)."""
+    text = node.text
+    return text.decode("utf-8") if isinstance(text, bytes) else str(text)
+
+
+def _effective_type(node: Any, lang_config: LangConfig) -> str:
+    """Node type to dispatch on, resolving macro calls to role sentinels.
+
+    Identity for every grammar that names its definitions (`function_item`,
+    `class_declaration`, ...). For Elixir, where `def`/`defmodule`/`alias` all
+    parse as `call`, the macro's target identifier selects a `_CALL_ROLE_*`
+    sentinel instead. A call whose target is not a bare identifier — `dot`, as
+    in `Repo.all(query)` — is never a definition and keeps its own type, so
+    ordinary remote calls fall through untouched.
+    """
+    node_type: str = node.type
+    if lang_config.call_node_type is None or node_type != lang_config.call_node_type:
+        return node_type
+    target = node.children[0] if node.child_count else None
+    if target is None or target.type != "identifier":
+        return node_type
+    name = _node_identifier_text(target)
+    if name in lang_config.call_function_targets:
+        return _CALL_ROLE_FUNCTION
+    if name in lang_config.call_class_targets:
+        return _CALL_ROLE_CLASS
+    if name in lang_config.call_import_targets:
+        return _CALL_ROLE_IMPORT
+    if name in lang_config.call_type_targets:
+        return _CALL_ROLE_TYPE
+    return node_type
+
+
+# Depth cap for the leftmost-head walk below: real Elixir heads are two or
+# three levels deep (`when` guard -> call -> identifier); anything deeper is
+# a shape we do not model, and returning None there costs only the per-symbol
+# body budget, never correctness.
+_CALL_HEAD_MAX_DEPTH = 8
+
+
+def _get_call_definition_name(node: Any) -> str | None:
+    """Name defined by a macro call, e.g. Elixir `def foo(a) when ... do`.
+
+    The call's own target identifier is the macro (`def`), not the name being
+    defined; the name is the head of its first argument. That head may be a
+    bare identifier (`def foo do`), a nested call (`def foo(a)`), the left side
+    of a `when` guard (`def foo(a) when is_map(a)`), or a module alias
+    (`defmodule MyApp.Accounts`), so walk leftmost until one of those lands.
+    """
+    args = None
+    for child in node.children:
+        if child.type == "arguments":
+            args = child
+            break
+    if args is None or not args.named_child_count:
+        return None
+
+    current: Any | None = args.named_children[0]
+    for _ in range(_CALL_HEAD_MAX_DEPTH):
+        if current is None:
+            return None
+        if current.type in ("identifier", "alias"):
+            return _node_identifier_text(current)
+        if current.type in ("call", "binary_operator", "unary_operator", "dot"):
+            current = current.named_children[0] if current.named_child_count else None
+            continue
+        return None
+    return None
+
+
+def _get_definition_name(node: Any, lang_config: LangConfig | None = None) -> str | None:
     """Extract the name identifier from a definition AST node."""
+    if (
+        lang_config is not None
+        and lang_config.call_node_type is not None
+        and node.type == lang_config.call_node_type
+    ):
+        return _get_call_definition_name(node)
     for child in node.children:
         if child.type in ("identifier", "name", "type_identifier", "property_identifier"):
-            text = child.text
-            return text.decode("utf-8") if isinstance(text, bytes) else str(text)
+            return _node_identifier_text(child)
     return None
 
 
