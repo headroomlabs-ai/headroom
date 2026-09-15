@@ -205,6 +205,10 @@ class ProxyConfig:
 
     # CCR Response Handling
     ccr_handle_responses: bool = True
+    # Internal rollback/qualification switch. Production uses bounded
+    # event-level interception; the merged buffered implementation remains
+    # available as an explicitly tested fallback while rollout qualifies.
+    ccr_event_streaming: bool = True
     ccr_max_retrieval_rounds: int = 3
 
     # CCR Context Tracking
