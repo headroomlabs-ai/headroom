@@ -84,6 +84,7 @@ require_cmd() {
 
 ensure_host_dirs() {
   mkdir -p \
+    "${HEADROOM_HOST_HOME}/.config" \
     "${HEADROOM_HOST_HOME}/.headroom" \
     "${HEADROOM_HOST_HOME}/.claude" \
     "${HEADROOM_HOST_HOME}/.codex" \
@@ -119,6 +120,7 @@ append_common_container_args() {
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
   ref+=(-v "${HEADROOM_HOST_HOME}/.codex:${HEADROOM_CONTAINER_HOME}/.codex")
   ref+=(-v "${HEADROOM_HOST_HOME}/.gemini:${HEADROOM_CONTAINER_HOME}/.gemini")
+  ref+=(-v "${HEADROOM_HOST_HOME}/.config:${HEADROOM_CONTAINER_HOME}/.config")
 
   if command -v id >/dev/null 2>&1; then
     ref+=(--user "$(id -u):$(id -g)")
@@ -616,6 +618,7 @@ Supported commands:
   aider
   cursor
   openclaw
+  opencode
 
 Notes:
   - GitHub Copilot CLI wrapping is not supported by the Docker-native wrapper.
@@ -1471,11 +1474,13 @@ main() {
         proxy_args+=(--region "${region}")
       fi
 
-      local container_name=""
+      # Keep this in the wrapper's global scope so the EXIT trap can still
+      # stop the proxy after main returns.
+      container_name=""
       if [[ "${no_proxy}" -eq 0 ]]; then
         container_name="$(start_proxy_container "${port}" "${proxy_args[@]}")"
       fi
-      trap 'stop_proxy_container "${container_name}"' EXIT INT TERM
+      trap 'stop_proxy_container "${container_name:-}"' EXIT INT TERM
 
       local prep_args=("${known_args[@]}")
       if [[ "${no_proxy}" -eq 0 ]]; then
@@ -1507,6 +1512,15 @@ EOF
           while true; do
             sleep 1
           done
+          ;;
+        opencode)
+          local opencode_config_file="${HEADROOM_HOST_HOME}/.config/opencode/opencode.json"
+          if [[ -f "${opencode_config_file}" ]]; then
+            OPENCODE_CONFIG_CONTENT="$(<"${opencode_config_file}")" \
+              run_host_tool opencode "${host_args[@]}"
+          else
+            run_host_tool opencode "${host_args[@]}"
+          fi
           ;;
       esac
       ;;
