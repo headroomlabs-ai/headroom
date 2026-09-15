@@ -55,6 +55,81 @@ class TestOpenAITokenCounting:
         count = openai_tokenizer.count_message(msg)
         assert count >= 4
 
+    def test_count_message_counts_anthropic_tool_result_block(self, openai_tokenizer):
+        """Anthropic-style tool_result content blocks (Claude Code / aider /
+        cursor in Anthropic mode) must be counted, not treated as 0 tokens.
+
+        Regression: the list-content branch handled only type=="text" and
+        "image_url", so a tool_result block — where the bulk of a coding-agent
+        conversation lives — contributed nothing. Request-level token savings on
+        the OpenAI path (POST /v1/compress tokens_before/after) therefore read
+        ~0 even when the block was heavily compressed. Mirrors
+        AnthropicTokenCounter, which counts these correctly.
+        """
+        payload = "row data: " + ", ".join(f"item_{i}=value_{i}" for i in range(400))
+        msg = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}],
+        }
+        # The block's payload must dominate the count, not the ~4-token overhead.
+        assert openai_tokenizer.count_message(msg) > openai_tokenizer.count_text(payload)
+
+    def test_count_message_counts_anthropic_tool_use_block(self, openai_tokenizer):
+        """tool_use blocks (name + input) must be counted too."""
+        args = {"query": "search " * 200}
+        msg = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "search", "input": args}],
+        }
+        assert openai_tokenizer.count_message(msg) > openai_tokenizer.count_text(str(args))
+
+    def test_tool_result_compression_is_reflected_in_count(self, openai_tokenizer):
+        """The whole point of the counter for /v1/compress: compressing a
+        tool_result block must make the recount drop. Before the fix, both
+        sides counted 0, so the delta was 0 regardless of real compression.
+        """
+        big = "row data: " + ", ".join(f"item_{i}=value_{i}" for i in range(400))
+        small = "row data: item_0=value_0 [398 items compressed. hash=abc123]"
+        before = [{"role": "user", "content": [{"type": "tool_result", "content": big}]}]
+        after = [{"role": "user", "content": [{"type": "tool_result", "content": small}]}]
+        assert openai_tokenizer.count_messages(before) > openai_tokenizer.count_messages(after)
+
+    def test_nested_tool_result_image_count_stays_bounded(self, openai_tokenizer):
+        """Nested binary media gets a bounded image estimate, not base64 text tokens."""
+        text = "command output " * 200
+        msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "data": "A" * 1_000_000},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        count = openai_tokenizer.count_message(msg)
+        assert count > openai_tokenizer.count_text(text)
+        assert count < openai_tokenizer.count_text(text) + 5_000
+
+    def test_tool_use_input_serialization_is_deterministic(self, openai_tokenizer):
+        """Equivalent mappings must have a stable wire-shaped token estimate."""
+        first = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "search", "input": {"a": 1, "b": 2}}],
+        }
+        second = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "name": "search", "input": {"b": 2, "a": 1}}],
+        }
+
+        assert openai_tokenizer.count_message(first) == openai_tokenizer.count_message(second)
+
 
 class TestOpenAIModelLimits:
     def test_get_context_limit_gpt4o(self, openai_provider):
