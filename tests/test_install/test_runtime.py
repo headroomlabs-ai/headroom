@@ -305,14 +305,21 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     assert "--userns=keep-id" not in command
 
 
-def test_build_runtime_command_podman_uses_keep_id_not_user(monkeypatch, tmp_path: Path) -> None:
-    """Under rootless Podman, --user <host-uid>:<host-gid> selects a subordinate
-    UID that owns none of the bind mounts, so writes into ~/.headroom fail. The
-    command must use --userns=keep-id and drop --user instead (#2804)."""
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+@pytest.mark.parametrize("uid,gid", [(1000, 1001), (1007, 1013)])
+@pytest.mark.parametrize("image", ["ghcr.io/headroomlabs-ai/headroom:latest", "custom:nonroot"])
+def test_build_runtime_command_podman_preserves_host_identity(
+    monkeypatch, tmp_path: Path, uid: int, gid: int, image: str, platform: str
+) -> None:
+    """keep-id needs an explicit process user when the image declares USER root.
+
+    Together the flags select the host identity, without reverting to the
+    subordinate-ID mapping caused by --user alone (#2804, #3569).
+    """
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
-    monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: 1000, raising=False)
-    monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: 1001, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", platform)
+    monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: uid, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: gid, raising=False)
     monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "podman")
     manifest = DeploymentManifest(
         profile="default",
@@ -325,14 +332,18 @@ def test_build_runtime_command_podman_uses_keep_id_not_user(monkeypatch, tmp_pat
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        image=image,
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
     command = build_runtime_command(manifest)
-    assert "--userns=keep-id" in command
-    assert "--user" not in command
-    assert "1000:1001" not in command
+    assert ("--userns=keep-id" in command) == (platform != "win32")
+    assert image in command
+    if platform == "linux":
+        assert command[command.index("--user") + 1] == f"{uid}:{gid}"
+        assert command.index("--user") < command.index(image)
+    else:
+        assert "--user" not in command
 
 
 def test_read_pid_handles_invalid_content(monkeypatch, tmp_path: Path) -> None:
