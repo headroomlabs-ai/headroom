@@ -84,6 +84,7 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -134,6 +135,9 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == [
@@ -149,6 +153,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "total_input_cost_usd": 0.0,
             "output_tokens_saved": 0,
             "output_savings_usd": 0.0,
+            "total_output_cost_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -173,6 +178,9 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == []
@@ -1301,7 +1309,8 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
             "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
             "total_input_cost_usd_delta,total_input_cost_usd,"
-            "output_tokens_saved_delta,output_savings_usd_delta"
+            "output_tokens_saved_delta,output_savings_usd_delta,"
+            "total_output_cost_usd_delta"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
