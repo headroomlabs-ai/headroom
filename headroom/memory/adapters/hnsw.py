@@ -614,6 +614,15 @@ class HNSWVectorIndex:
                 current_size,  # But not more than we have
             )
 
+            # hnswlib requires the query-time ef to be >= k, otherwise
+            # knn_query raises "Cannot return the results in a contigious 2D
+            # array. Probably ef or M is too small". With the default
+            # ef_search=50 and top_k=10, k_with_buffer reaches 100, so any index
+            # with more than ~50 entries would fail. Set ef to cover the
+            # candidate count for this query, keeping the configured value as a
+            # floor (a larger ef only improves recall).
+            self._index.set_ef(max(self._ef_search, k_with_buffer))
+
             # Query HNSW index
             # Returns (labels, distances) where labels are hnsw_ids
             labels, distances = self._index.knn_query(
