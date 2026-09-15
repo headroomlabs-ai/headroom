@@ -808,6 +808,8 @@ class TestPatternsToRecommendations:
         assert len(recs) == 1
         assert recs[0].target == RecommendationTarget.MEMORY_FILE
         assert "User prefers terse output" in recs[0].content
+        assert "<!-- headroom:pattern-id:" in recs[0].content
+        assert recs[0].preserve_prior_items is True
 
     def test_routes_environment_to_context_file(self):
         from headroom.learn.models import RecommendationTarget
@@ -846,6 +848,77 @@ class TestPatternsToRecommendations:
         assert lines[0] == "- B"
         assert lines[1] == "- A"
         assert recs[0].evidence_count == 7
+        assert recs[0].preserve_prior_items is False
+
+    def test_active_item_ids_span_every_live_pattern(self):
+        """The lifecycle signal covers the whole live set, not just rendered bullets."""
+        preference = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        environment = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="Use uv run python",
+            importance=0.7,
+            evidence_count=4,
+        )
+
+        recs = _patterns_to_recommendations([preference, environment])
+
+        assert len(recs) == 2
+        expected = frozenset({preference.content_hash, environment.content_hash})
+        for rec in recs:
+            # Each section renders one bullet but claims both ids as active, so
+            # a prior item this batch left out is not read as expired.
+            assert len(rec.content.splitlines()) == 1
+            assert rec.active_item_ids == expected
+
+    def test_error_recovery_carries_no_active_item_ids(self):
+        """error_recovery replaces its section, so it exposes no preservation signal."""
+        recs = _patterns_to_recommendations(
+            [
+                ExtractedPattern(
+                    category=PatternCategory.ERROR_RECOVERY,
+                    content="A",
+                    importance=0.5,
+                    evidence_count=2,
+                ),
+            ]
+        )
+
+        assert len(recs) == 1
+        assert recs[0].active_item_ids is None
+
+    def test_pattern_dropped_from_live_set_is_removed_from_the_file(self, tmp_path):
+        """End-to-end removal invariant: an expired pattern leaves the memory file."""
+        from headroom.learn.writer import _merge_into_file
+
+        keep = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        expired = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers the legacy migration script",
+            importance=0.8,
+            evidence_count=3,
+        )
+        memory_file = tmp_path / "MEMORY.md"
+        memory_file.write_text(
+            _merge_into_file(memory_file, _patterns_to_recommendations([keep, expired])),
+            encoding="utf-8",
+        )
+        assert "User prefers the legacy migration script" in memory_file.read_text()
+
+        # Next render: the learner no longer holds the expired pattern.
+        final = _merge_into_file(memory_file, _patterns_to_recommendations([keep]))
+
+        assert "User prefers terse output" in final
+        assert "User prefers the legacy migration script" not in final
 
 
 # =============================================================================
