@@ -1822,6 +1822,22 @@ def test_cache_only_request_still_appends_a_history_point(tmp_path):
     assert len(tracker.snapshot()["history"]) == 1
 
 
+def test_metrics_scrape_survives_export_failure(monkeypatch) -> None:
+    config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
+
+    with TestClient(create_app(config)) as client:
+
+        async def boom() -> str:
+            raise RuntimeError("savings snapshot exploded")
+
+        monkeypatch.setattr(client.app.state.proxy.metrics, "export", boom)
+        response = client.get("/metrics")
+
+    assert response.status_code == 500
+    assert "savings snapshot exploded" in response.text
+    assert "headroom_metrics_scrape_errors_total" in response.text
+
+
 def test_normalize_history_entry_defaults_missing_cache_fields(tmp_path):
     # Regression: history points written before cache-savings tracking existed
     # have no cache_read_tokens/cache_savings_usd keys at all. Loading them

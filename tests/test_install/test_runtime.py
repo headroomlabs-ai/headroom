@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def"
 from __future__ import annotations
 
 import os
@@ -6,6 +7,8 @@ import subprocess
 import sys
 import types
 from pathlib import Path
+from threading import Thread
+from typing import IO, cast
 
 import pytest
 
@@ -500,7 +503,7 @@ def test_start_detached_agent_closes_parent_log_fd(monkeypatch, tmp_path: Path) 
 
     start_detached_agent("demo")
 
-    log_handle = captured["stdout"]
+    log_handle = cast(IO[str], captured["stdout"])
     # Same handle is passed to both streams, and the parent closed it.
     assert captured["stderr"] is log_handle
     assert log_handle.closed is True
@@ -523,15 +526,17 @@ def test_start_detached_agent_closes_log_fd_when_popen_raises(monkeypatch, tmp_p
     with pytest.raises(OSError, match="spawn failed"):
         start_detached_agent("demo")
 
-    assert captured["stdout"].closed is True
+    assert cast(IO[str], captured["stdout"]).closed is True
 
 
 def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        "headroom.install.runtime.subprocess.run",
-        lambda command, **kwargs: calls.append(command) or type("Result", (), {"stdout": ""})(),
-    )
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.run", fake_run)
     monkeypatch.setattr(
         "headroom.install.runtime.build_runtime_command",
         lambda manifest: [
@@ -594,6 +599,7 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
     )
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
     stop_runtime(python_manifest)
     assert killed == [(123, signal.SIGTERM)]
     assert _read_pid("default") is None
@@ -634,6 +640,107 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
     _write_pid("default", 125)
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
     assert runtime_status(python_manifest) == "stopped"
+
+
+def test_stop_runtime_does_not_clear_replacement_pid(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="task",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    _write_pid("default", 123)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+
+    def replaced_process_is_dead(pid: int) -> bool:
+        _write_pid("default", 456)
+        return False
+
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", replaced_process_is_dead)
+
+    stop_runtime(manifest)
+
+    assert _read_pid("default") == 456
+
+
+def test_stop_runtime_waits_for_live_process_before_clearing_pid(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="task",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,sys,time\n"
+            "def stop(*args):\n"
+            "    time.sleep(0.2)\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "ready"
+    waiter = Thread(target=process.wait)
+    waiter.start()
+    _write_pid(manifest.profile, process.pid)
+
+    try:
+        stop_runtime(manifest)
+
+        assert process.returncode == 0
+        assert _read_pid(manifest.profile) is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        waiter.join(timeout=5)
+
+
+def test_stop_runtime_keeps_pid_when_process_does_not_exit(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="task",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    _write_pid(manifest.profile, 123)
+    monkeypatch.setattr("headroom.install.runtime.os.kill", lambda pid, sig: None)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: True)
+    monkeypatch.setattr("headroom.install.runtime.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        stop_runtime(manifest)
+
+    assert _read_pid(manifest.profile) == 123
 
 
 def test_stop_runtime_for_docker_stops_and_removes_container(monkeypatch) -> None:

@@ -9,9 +9,9 @@ import re
 from pathlib import Path
 
 try:
-    import tomllib
+    import tomllib  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - Python 3.10 fallback
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 
 def get_version_from_pyproject(root: Path) -> str:
@@ -19,7 +19,7 @@ def get_version_from_pyproject(root: Path) -> str:
     pyproject_path = root / "pyproject.toml"
     with open(pyproject_path, "rb") as f:
         data = tomllib.load(f)
-    return data["project"]["version"]
+    return str(data["project"]["version"])
 
 
 def bump_version(version: str, bump_type: str) -> str:
@@ -42,6 +42,18 @@ def update_package_json(file_path: Path, version: str) -> None:
     with open(file_path, encoding="utf-8") as f:
         data = json.load(f)
     data["version"] = version
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def update_package_lock(file_path: Path, version: str) -> None:
+    with open(file_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["version"] = version
+    root_package = data.get("packages", {}).get("")
+    if isinstance(root_package, dict):
+        root_package["version"] = version
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -161,6 +173,7 @@ def write_release_metadata(root: Path, version: str) -> None:
             "npm-sdk": version,
             "npm-openclaw": version,
             "npm-opencode": version,
+            "npm-pi-extension": version,
             "agent-hooks-plugin": version,
         },
     }
@@ -210,6 +223,8 @@ def main() -> None:
     update_openclaw_package_json(args.root / "plugins" / "openclaw" / "package.json", version)
     update_opencode_package_json(args.root / "plugins" / "opencode" / "package.json", version)
     update_package_json(args.root / "sdk" / "typescript" / "package.json", version)
+    update_package_json(args.root / "plugins/pi/package.json", version)
+    update_package_lock(args.root / "plugins/pi/package-lock.json", version)
     update_plugin_versions(args.root, version)
     update_server_json(args.root / "server.json", version)
     write_release_metadata(args.root, version)

@@ -1,0 +1,69 @@
+{
+  "name": "headroom-pi",
+  "version": "0.37.0",
+  "description": "Provider-independent Headroom context compression for Pi and Oh My Pi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/headroomlabs-ai/headroom.git",
+    "directory": "plugins/pi"
+  },
+  "homepage": "https://github.com/headroomlabs-ai/headroom/tree/main/plugins/pi#readme",
+  "bugs": {
+    "url": "https://github.com/headroomlabs-ai/headroom/issues"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "banner.png"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:live": "vitest run --config vitest.e2e.config.ts e2e/live-contract.test.ts",
+    "benchmark:live": "vitest run --config vitest.e2e.config.ts e2e/live-benchmark.test.ts --reporter=dot",
+    "test:hosts": "node e2e/host-load.mjs",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "omp",
+    "context-compression",
+    "headroom"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0 <1",
+    "@earendil-works/pi-coding-agent": ">=0.80.0 <1",
+    "typebox": ">=1.1.0 <2"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.7",
+    "@earendil-works/pi-coding-agent": "^0.80.7",
+    "@types/node": "^24.0.0",
+    "tsup": "^8.0.0",
+    "typebox": "^1.1.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.5"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/plugins/pi/banner.png"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "Apache-2.0"
+}

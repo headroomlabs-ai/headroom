@@ -165,6 +165,10 @@ CSV exports are available for `history`, `hourly`, `daily`, `weekly`, and
 
 ### Prometheus Metrics
 
+A failed scrape returns HTTP 500 with `headroom_metrics_scrape_errors_total`
+and a `# scrape_error` comment instead of a bare Internal Server Error.
+`headroom doctor` checks this endpoint.
+
 ```bash
 curl http://localhost:8787/metrics
 ```
@@ -244,7 +248,7 @@ Headroom's managed OTEL exporters are intentionally scoped to Headroom's own ins
 ### OTEL Environment Variables
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| ---------- | --------- | ------------- |
 | `HEADROOM_OTEL_METRICS_ENABLED` | `0` | Enables Headroom-managed OTEL metric export |
 | `HEADROOM_OTEL_METRICS_EXPORTER` | `otlp_http` | Exporter type: `otlp_http` or `console` |
 | `HEADROOM_OTEL_METRICS_ENDPOINT` | unset | OTLP HTTP metrics endpoint |
@@ -467,6 +471,7 @@ headroom proxy --budget 10.00
 ```
 
 When the budget is exceeded:
+
 - Requests return a budget exceeded error
 - The `/stats` endpoint shows budget status
 - Logs indicate budget state
@@ -489,7 +494,7 @@ else:
 ## Key Metrics to Monitor
 
 | Metric | What It Tells You | Target |
-|--------|------------------|--------|
+| -------- | ------------------ | -------- |
 | `tokens_saved_total` | Total cost savings | Higher is better |
 | `compression_ratio_avg` | Efficiency | 0.7-0.9 typical |
 | `cache_hit_rate` | Cache effectiveness | >20% is good |

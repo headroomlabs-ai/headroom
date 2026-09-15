@@ -4947,10 +4947,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.get("/metrics")
     async def metrics():
         """Prometheus metrics endpoint."""
-        return PlainTextResponse(
-            await proxy.metrics.export(),
-            media_type="text/plain; version=0.0.4",
-        )
+        try:
+            return PlainTextResponse(
+                await proxy.metrics.export(),
+                media_type="text/plain; version=0.0.4",
+            )
+        except Exception as exc:
+            count = proxy.metrics.record_scrape_error()
+            body = (
+                "# HELP headroom_metrics_scrape_errors_total "
+                "Failed Prometheus /metrics scrapes\n"
+                "# TYPE headroom_metrics_scrape_errors_total counter\n"
+                f"headroom_metrics_scrape_errors_total {count}\n"
+                f"# scrape_error {type(exc).__name__}: {exc}\n"
+            )
+            return PlainTextResponse(
+                body,
+                status_code=500,
+                media_type="text/plain; version=0.0.4",
+            )
 
     # Debug endpoints
     @app.get("/debug/memory", dependencies=[Depends(_require_loopback)])
