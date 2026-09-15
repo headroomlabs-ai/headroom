@@ -4,6 +4,7 @@
  */
 
 import type { CompressionHooks } from "./hooks.js";
+import type { CompressRequestConfig } from "./types/config.js";
 
 // --- Message types (OpenAI chat format) ---
 
@@ -69,6 +70,9 @@ export interface CompressOptions {
   hooks?: CompressionHooks;
   /** Integration slug sent as X-Headroom-Stack (e.g. "adapter_ts_openai"). */
   stack?: string;
+  /** Per-call /v1/compress config, merged over the client-level config
+   *  (per-call keys override at the top level). */
+  config?: CompressRequestConfig;
 }
 
 export interface CompressResult {
@@ -98,7 +102,7 @@ export interface HeadroomClientOptions {
 export interface HeadroomClientInterface {
   compress(
     messages: OpenAIMessage[],
-    options?: { model?: string; tokenBudget?: number },
+    options?: { model?: string; tokenBudget?: number; config?: CompressRequestConfig },
   ): Promise<CompressResult>;
 }
 
