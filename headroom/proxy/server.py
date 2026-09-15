@@ -102,6 +102,7 @@ from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
     DEFAULT_ANTHROPIC_API_URL,
     DEFAULT_CLOUDCODE_API_URL,
+    DEFAULT_DEEPSEEK_API_URL,
     DEFAULT_GEMINI_API_URL,
     DEFAULT_OPENAI_API_URL,
     DEFAULT_VERTEX_API_URL,
@@ -831,6 +832,7 @@ class HeadroomProxy(
 
     ANTHROPIC_API_URL = DEFAULT_ANTHROPIC_API_URL
     OPENAI_API_URL = DEFAULT_OPENAI_API_URL
+    DEEPSEEK_API_URL = DEFAULT_DEEPSEEK_API_URL
     GEMINI_API_URL = DEFAULT_GEMINI_API_URL
     CLOUDCODE_API_URL = DEFAULT_CLOUDCODE_API_URL
     VERTEX_API_URL = DEFAULT_VERTEX_API_URL
@@ -865,6 +867,7 @@ class HeadroomProxy(
         HeadroomProxy.GEMINI_API_URL = api_targets.gemini
         HeadroomProxy.CLOUDCODE_API_URL = api_targets.cloudcode
         HeadroomProxy.VERTEX_API_URL = api_targets.vertex
+        HeadroomProxy.DEEPSEEK_API_URL = api_targets.deepseek
         self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
         self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
@@ -5566,6 +5569,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
+        deepseek_api_url=os.environ.get("DEEPSEEK_TARGET_API_URL"),
         anthropic_api_url=os.environ.get("ANTHROPIC_TARGET_API_URL"),
         anthropic_buffered_request_timeout_seconds=_get_env_int(
             "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
@@ -5737,6 +5741,7 @@ def run_server(
 ║    Gemini:     {api_targets.gemini:<57}║
 ║    Cloud Code: {api_targets.cloudcode:<57}║
 ║    Vertex AI:  {api_targets.vertex:<57}║
+║    DeepSeek:   {api_targets.deepseek:<57}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  FEATURES:                                                           ║
 ║    Optimization:    {"ENABLED " if config.optimize else "DISABLED"}                                       ║

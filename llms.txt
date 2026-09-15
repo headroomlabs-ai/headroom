@@ -21,13 +21,14 @@ The canonical, always-current documentation index lives at the docs site below. 
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
 - Docker: `docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
-- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
+- Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `dsh`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
 
 ## Entry points
 
 - [Quickstart](https://docs.headroomlabs.ai/docs/quickstart): 5-minute end-to-end (install → compress → call the model).
 - [Installation](https://docs.headroomlabs.ai/docs/installation): All install paths, extras, Docker tags, env vars.
 - [Proxy server](https://docs.headroomlabs.ai/docs/proxy): Run as a local HTTP proxy in front of OpenAI / Anthropic / Gemini.
+- [DeepSeek Harness (dsh)](wiki/dsh.md): `headroom wrap dsh` / `unwrap dsh` — route DeepSeek Harness chat traffic through the compression proxy.
 - [MCP server](https://docs.headroomlabs.ai/docs/mcp): `headroom_compress`, `headroom_retrieve`, `headroom_stats` for Claude Code / Cursor / any MCP host.
 - [API reference](https://docs.headroomlabs.ai/docs/api-reference): Python + TypeScript `compress()` API.
 
