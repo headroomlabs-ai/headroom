@@ -1017,8 +1017,8 @@ def test_anthropic_assistant_message_helper_requires_assistant_role() -> None:
 # anthropic handler uses to scope the proactive-expansion cache by
 # project identity. The resolver shares its tier order with the memory
 # subsystem's ProjectResolver: x-headroom-project-id → x-headroom-cwd →
-# system-prompt `cwd:` line. Returns `("", None)` on no signal — the
-# fail-closed signal that callers gate on.
+# x-headroom-project → system-prompt `cwd:` line. Returns `("", None)` on
+# no signal — the fail-closed signal that callers gate on.
 # ============================================================================
 
 

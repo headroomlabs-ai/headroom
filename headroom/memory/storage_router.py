@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
@@ -177,13 +178,23 @@ class ProjectResolver:
             if ident is not None:
                 return ident
 
-        # Tier 3: CLI-level override of the project root.
+        # Tier 3: the project attribution header emitted by `headroom wrap`.
+        # This keeps memory and CCR routing aligned with the savings tracker.
+        project_header = self._first_nonempty_header(ctx.headers, "x-headroom-project")
+        if project_header:
+            display = unquote(project_header)
+            safe = self._sanitize_basename(project_header)
+            if safe:
+                digest = hashlib.sha256(display.encode("utf-8")).hexdigest()[:16]
+                return f"{safe}-{digest}", display
+
+        # Tier 4: CLI-level override of the project root.
         if ctx.project_root_override:
             ident = self._identity_from_cwd(ctx.project_root_override)
             if ident is not None:
                 return ident
 
-        # Tier 4: parse the system prompt for a ``<env>`` cwd line.
+        # Tier 5: parse the system prompt for a ``<env>`` cwd line.
         sys_cwd = self._extract_cwd_from_system_prompt(ctx.system_prompt)
         if sys_cwd:
             ident = self._identity_from_cwd(sys_cwd)
@@ -333,7 +344,8 @@ class BackendRouter:
                 # command).
                 logger.warning(
                     "event=memory_project_unresolved behavior=empty user_id=%s "
-                    "hint='set x-headroom-project-id or x-headroom-cwd header, "
+                    "hint='set x-headroom-project-id, x-headroom-cwd, or "
+                    "x-headroom-project header, "
                     "or set memory.unresolved_project_fallback=global to opt-in "
                     "to legacy cross-project GLOBAL pooling (cross-project leak risk).'",
                     ctx.base_user_id,

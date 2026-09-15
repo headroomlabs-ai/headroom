@@ -18,6 +18,7 @@ import os
 import signal
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import click
@@ -27,6 +28,7 @@ from click.testing import CliRunner
 from headroom import paths as paths_mod
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 
 # ---------------------------------------------------------------------------
 # _print_wrap_banner — centering math + box drawing.
@@ -378,6 +380,29 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Project: my-project"
+
+    def test_wrap_project_header_resolves_ccr_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+        headers = {
+            name.strip().lower(): value.strip()
+            for name, value in (
+                line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+            )
+        }
+
+        key, label = AnthropicHandlerMixin._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers), {}
+        )
+
+        assert key.startswith("my-project-")
+        assert label == "my-project"
 
     def test_appends_to_existing_custom_headers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
