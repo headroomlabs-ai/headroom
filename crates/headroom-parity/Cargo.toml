@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Rust-vs-Python parity harness for the Headroom port."
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 
