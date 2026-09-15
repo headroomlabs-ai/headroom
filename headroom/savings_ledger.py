@@ -134,6 +134,9 @@ def record_savings_event(
     model + tokens saved when not supplied by the caller.
     """
 
+    if _paths.process_is_stateless():
+        return False
+
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)
