@@ -154,7 +154,11 @@ def build_manifest(
     if sys.platform.startswith("win") and preset == InstallPreset.PERSISTENT_SERVICE.value:
         effective_preset = InstallPreset.PERSISTENT_TASK.value
 
-    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+    if runtime_kind == RuntimeKind.DOCKER.value:
+        # Docker owns its container lifecycle; never install a native service
+        # or task alongside it when callers combine runtime and preset flags.
+        supervisor_kind = SupervisorKind.NONE.value
+    elif effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
         supervisor_kind = SupervisorKind.SERVICE.value
     elif effective_preset == InstallPreset.PERSISTENT_TASK.value:
         supervisor_kind = SupervisorKind.TASK.value
@@ -221,6 +225,10 @@ def build_manifest(
         "127.0.0.1",
         "--port",
         str(port),
+        "--headroom-deployment-profile",
+        normalized_profile,
+        "--headroom-deployment-runtime",
+        runtime_kind,
         "--mode",
         proxy_mode,
         "--backend",
