@@ -36,6 +36,12 @@ The install id is a random UUID generated on first run and stored in your config
 
 Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--offline` (which also disables update checks and license reporting).
 
+For read-only, container, CI, serverless, or load-balanced deployments, use [Detached Mode](/docs/detached-mode) to make local-state degradation explicit:
+
+```bash
+headroom proxy --stateless --detached-profile lenient
+```
+
 ## CLI options
 
 ### Core
@@ -65,6 +71,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 | `--telemetry` | `false` | Enable local, in-process usage stats (for your own `/stats` and dashboard; nothing leaves the machine) |
 | `--no-telemetry` | `false` | Force local telemetry off (already the default) |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
+| `--detached-profile` | `lenient` | Capability policy for detached/stateless deployments: `strict`, `lenient`, or `silent` |
 
 Use `--http-proxy` or `HEADROOM_HTTP_PROXY` when only provider API traffic should go through a proxy:
 
@@ -350,6 +357,14 @@ Live session statistics plus durable `persistent_savings` totals. Stored at `~/.
 
 ```bash
 curl http://localhost:8787/stats
+```
+
+### `GET /capabilities`
+
+Resolved detached-mode capability matrix for operators and deployment automation.
+
+```bash
+curl http://localhost:8787/capabilities
 ```
 
 ### `GET /stats-history`
