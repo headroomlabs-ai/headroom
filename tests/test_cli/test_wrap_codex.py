@@ -283,6 +283,47 @@ class TestInjectAndRestoreRoundTrip:
         assert not config_file.exists()
         assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
 
+    def test_wrap_unwrap_removes_generated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        helper = config_dir / ".headroom-codex-auth.py"
+        assert helper.exists()
+        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+        assert config["model_providers"]["headroom"]["auth"]["args"] == [str(helper.resolve())]
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "removed"
+        assert not helper.exists()
+
+    def test_wrap_unwrap_preserves_preexisting_unrelated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text('model = "gpt-5"\n', encoding="utf-8")
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+        helper = config_dir / ".headroom-codex-auth.py"
+        helper.write_text("user content", encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert helper.read_text(encoding="utf-8") == "user content"
+
     def test_wrap_unwrap_respects_codex_home(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
