@@ -3370,6 +3370,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
+                "factory_api_url": config.factory_api_url,
                 "savings_profile": config.savings_profile,
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (
@@ -5586,6 +5587,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
         bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         disable_kompress_fallback=_get_env_bool("HEADROOM_DISABLE_KOMPRESS_FALLBACK", False),
@@ -6049,6 +6051,15 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--factory-api-url",
+        help=(
+            "Custom Factory upstream for the Droid passthrough. When set, the "
+            "Anthropic-shaped /api/llm/a/v1/messages route is compressed and all "
+            "other Factory REST paths are forwarded here verbatim "
+            "(env: FACTORY_TARGET_API_URL)"
+        ),
+    )
+    parser.add_argument(
         "--openrouter-api-key",
         help="OpenRouter API key (or set OPENROUTER_API_KEY env var)",
     )
@@ -6340,6 +6351,7 @@ if __name__ == "__main__":
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
         bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
+        factory_api_url=_get_env_str("FACTORY_TARGET_API_URL", args.factory_api_url),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),

@@ -43,6 +43,12 @@ def select_passthrough_base_url(
     proxy: Any, headers: Mapping[str, str], path: str | None = None
 ) -> str:
     """Resolve the upstream base URL for catch-all proxy passthrough requests."""
+    # Factory Droid mode: this proxy instance is dedicated to one Droid session
+    # and every non-LLM Factory REST call (whoami, sessions, feature-flags, ...)
+    # must reach Factory. Only set for `headroom wrap droid`.
+    factory_api_url = getattr(getattr(proxy, "config", None), "factory_api_url", None)
+    if factory_api_url:
+        return str(factory_api_url).rstrip("/")
     routing = resolve_codex_routing(headers)
     if routing.is_chatgpt_auth:
         return CHATGPT_BACKEND_API_URL

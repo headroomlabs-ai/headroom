@@ -169,6 +169,14 @@ class ProxyConfig:
     # SigV4 signature. Leave unset (default) to keep `--backend bedrock`'s
     # direct-to-AWS, re-signing behavior unchanged.
     bedrock_api_url: str | None = None
+    # Custom upstream for the Factory Droid passthrough. When set, the proxy
+    # registers the Anthropic-shaped `/api/llm/a/v1/messages` inference route
+    # (compressing the request body) and forwards every other Factory REST path
+    # verbatim to this base. `headroom wrap droid` points Droid here via
+    # `FACTORY_API_BASE_URL`, so Droid's subscription traffic (any model,
+    # including Droid Core) is compressed. Inbound auth is passed through
+    # untouched. (env: FACTORY_TARGET_API_URL)
+    factory_api_url: str | None = None
     anyllm_provider: str = "openai"
 
     # Optimization mode: "token" (rewrite for max compression) or

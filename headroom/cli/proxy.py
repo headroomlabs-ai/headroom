@@ -974,6 +974,16 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--factory-api-url",
+    default=None,
+    help=(
+        "Custom Factory upstream for the Droid passthrough. When set, the "
+        "Anthropic-shaped /api/llm/a/v1/messages route is compressed and every "
+        "other Factory REST path is forwarded here verbatim. "
+        "(env: FACTORY_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
@@ -1107,6 +1117,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    factory_api_url: str | None,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1459,6 +1470,7 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
@@ -1524,6 +1536,16 @@ IMPORTANT for {provider_config.display_name} users:
         if provider_config.model_format_hint:
             backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
         backend_section += "\n"
+
+    # Factory Droid passthrough (only when an upstream is configured). Mirrors
+    # the routing lines above so `headroom proxy --factory-api-url ...` and
+    # `headroom wrap droid` visibly confirm the Factory route is active.
+    factory_route_line = ""
+    if config.factory_api_url:
+        factory_route_line = (
+            f"\n  /api/llm/a/v1/messages          → "
+            f"{config.factory_api_url.rstrip('/')}  (Factory Droid)"
+        )
 
     # Build memory section if enabled
     memory_section = ""
@@ -1653,7 +1675,7 @@ Routing:
   /v1/chat/completions            → {openai_url}
   /v1/responses                   → {openai_url}  (HTTP + WebSocket)
   /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
+  /v1/projects/.../publishers/... → {vertex_url}{factory_route_line}
 
 Usage:
   Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
