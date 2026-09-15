@@ -6,7 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from .content_detector import ContentType
+from .content_detector import ContentType, _is_search_result_line
 
 
 @dataclass
@@ -34,6 +34,19 @@ _SEARCH_RESULT_PATTERN = re.compile(r"^\S+:\d+:", re.MULTILINE)
 _PROSE_PATTERN = re.compile(r"[A-Z][a-z]+\s+\w+\s+\w+")
 
 
+def _is_search_line(line: str) -> bool:
+    """True for grep match lines and ``-A``/``-B``/``-C`` context lines.
+
+    Unions the legacy splitter pattern (kept so every previously carved line
+    still carves) with the detector's predicate, which additionally claims
+    both context-line shapes (``path-NN-content`` and ``path:NN-content``).
+    Sharing it keeps the splitter carving the same lines the detector claims
+    (#3580); otherwise code in context lines would strand in PLAIN_TEXT
+    sections and reach the prose compressor.
+    """
+    return bool(_SEARCH_RESULT_PATTERN.match(line)) or _is_search_result_line(line)
+
+
 def is_mixed_content(content: str) -> bool:
     """Detect if content contains multiple distinct content types."""
     return sum(mixed_content_indicators(content).values()) >= 2
@@ -46,7 +59,8 @@ def mixed_content_indicators(content: str) -> dict[str, bool]:
         "has_json_blocks": bool(_JSON_BLOCK_START.search(content)),
         "has_embedded_json_with_text": _has_valid_json_block_with_text(content),
         "has_prose": len(_PROSE_PATTERN.findall(content)) > 5,
-        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content)),
+        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content))
+        or any(_is_search_result_line(line) for line in content.split("\n")),
     }
 
 
@@ -189,10 +203,10 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
                 i = end_i + 1
                 continue
 
-        if _SEARCH_RESULT_PATTERN.match(line):
+        if _is_search_line(line):
             search_lines = []
             start_line = i
-            while i < len(lines) and _SEARCH_RESULT_PATTERN.match(lines[i]):
+            while i < len(lines) and _is_search_line(lines[i]):
                 search_lines.append(lines[i])
                 i += 1
             sections.append(
@@ -214,7 +228,7 @@ def split_into_sections(content: str, *, isolate: tuple[str, ...] = ()) -> list[
             if (
                 _CODE_FENCE_PATTERN.match(next_line)
                 or next_line.strip().startswith(("[", "{"))
-                or _SEARCH_RESULT_PATTERN.match(next_line)
+                or _is_search_line(next_line)
                 or (isolate and _carries_isolate(next_line))
             ):
                 break

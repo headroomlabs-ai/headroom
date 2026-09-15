@@ -50,6 +50,16 @@ _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
 
+# ``path-NN-content`` shape of grep -A/-B/-C context lines (#3580). The path
+# group is non-greedy so the earliest ``-digits-`` marker wins, mirroring the
+# search parser that anchors on the first line-number marker in the line.
+_GREP_CONTEXT_PATTERN = re.compile(r"^(?P<path>[^\s:]+?)-(?P<line>\d+)-")
+
+# Same idea with the path/line separator left as ``:``: ``path:NN-content``.
+# Real GNU grep emits dashes in both positions, but the reported repro builds
+# context lines this way, so both shapes must route identically.
+_GREP_COLON_DASH_PATTERN = re.compile(r"^(?P<path>[^\s:]+):(?P<line>\d+)-")
+
 # A markdown table separator row, e.g. "| --- | :--: |" or "---|---".
 # Every cell must be dashes with optional alignment colons.
 _MD_SEP_CELL = re.compile(r"^:?-{2,}:?$")
@@ -457,6 +467,37 @@ def _try_detect_html(content: str) -> DetectionResult | None:
     )
 
 
+def _prefix_looks_like_path(prefix: str) -> bool:
+    """Shared path-shape guard for every grep-line shape.
+
+    Rules out markup tags and ``key=value`` log prefixes; a single helper so
+    the three shapes cannot drift apart.
+    """
+    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+
+
+def _is_grep_context_line(line: str) -> bool:
+    """True when a line looks like ``path-NN-content`` grep context output.
+
+    GNU grep (and ripgrep / git grep) separate ``-A``/``-B``/``-C`` context
+    lines with ``-`` where match lines use ``:``. Without this branch those
+    lines read as prose, and code in them reaches the word-dropping Kompress
+    compressor (#3580). The colon branch runs first; this is tried after.
+
+    The prefix must additionally look like a file path: the same ``</>=``
+    exclusions as the colon branch, plus it must contain ``/`` or ``.`` —
+    which keeps dates (``2026-09-14``) and dashed prose (``version-2-release``)
+    out while accepting real paths, including dashed names (``my-file.py``).
+    """
+    match = _GREP_CONTEXT_PATTERN.match(line)
+    if not match:
+        return False
+    prefix = match.group("path")
+    if not _prefix_looks_like_path(prefix):
+        return False
+    return "/" in prefix or "." in prefix
+
+
 def _is_search_result_line(line: str) -> bool:
     """True when a line looks like ``path:line:content`` grep output.
 
@@ -467,11 +508,15 @@ def _is_search_result_line(line: str) -> bool:
     deleting the rest. So the pre-colon segment must additionally look like
     a file path: no angle brackets and no ``=`` (rules out markup tags and
     ``key=value:12:`` log lines).
+
+    ``grep -A``/``-B``/``-C`` context lines — both the real GNU shape
+    (``path-NN-content``) and the reported ``path:NN-content`` shape — are
+    accepted via the context predicates so code in them routes to the search
+    compressor instead of the prose path (#3580).
     """
-    if not _SEARCH_RESULT_PATTERN.match(line):
-        return False
-    prefix = line.split(":", 1)[0]
-    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+    if _SEARCH_RESULT_PATTERN.match(line) or _GREP_COLON_DASH_PATTERN.match(line):
+        return _prefix_looks_like_path(line.split(":", 1)[0])
+    return _is_grep_context_line(line)
 
 
 def _try_detect_search(content: str) -> DetectionResult | None:
