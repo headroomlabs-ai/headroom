@@ -670,7 +670,13 @@ config = HeadroomConfig(
         # to a .headroomignore entry.
         paths=[".github/carl/**"],
         # Or scope to a single behavior:
-        mutate=[".github/copilot-instructions.md", "CLAUDE.md", "AGENTS.md", ".cursorrules", "ANTIGRAVITY.md"],
+        mutate=[
+            ".github/copilot-instructions.md",
+            "CLAUDE.md",
+            "AGENTS.md",
+            ".cursorrules",
+            "ANTIGRAVITY.md",
+        ],
     )
 )
 ```
