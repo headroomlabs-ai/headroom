@@ -951,3 +951,71 @@ def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) 
 
     assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
     assert entered is False
+
+
+# ---------------------------------------------------------------------------
+# _launch_tool — the wrapped agent inherits the *real* proxy port via
+# HEADROOM_PORT, so `headroom dashboard` run inside that session lands on the
+# right proxy even when wrap fell back off the requested port.
+# ---------------------------------------------------------------------------
+
+
+def _launch_tool_capturing_env(
+    monkeypatch: pytest.MonkeyPatch, *, requested_port: int, actual_port: int
+) -> dict[str, str]:
+    """Drive `_launch_tool` with everything external stubbed, return the child env."""
+    captured: dict[str, dict[str, str]] = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, env=None, **kwargs):  # type: ignore[no-untyped-def]
+        captured["env"] = dict(env or {})
+        return _Result()
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (None, actual_port))
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_unregister_proxy_client", lambda port: None)
+    monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda port, no_proxy: None)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: lambda *a, **kw: None)
+    monkeypatch.setattr(wrap_mod, "_configure_quiet_cli_env", lambda env: [])
+    monkeypatch.setattr(wrap_mod, "_print_telemetry_notice", lambda: None)
+    monkeypatch.setattr(wrap_mod.signal, "signal", lambda *a, **kw: None)
+    monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._launch_tool(
+            binary="fake-agent",
+            args=(),
+            env={"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{requested_port}"},
+            port=requested_port,
+            no_proxy=False,
+            tool_label="FAKE",
+            env_vars_display=[],
+        )
+
+    result = runner.invoke(_cmd)
+    assert result.exit_code == 0, result.output
+    return captured["env"]
+
+
+def test_launch_tool_exports_headroom_port_to_child() -> None:
+    """The wrapped agent must see HEADROOM_PORT even with no port fallback."""
+    with pytest.MonkeyPatch.context() as mp:
+        env = _launch_tool_capturing_env(mp, requested_port=8787, actual_port=8787)
+
+    assert env["HEADROOM_PORT"] == "8787"
+
+
+def test_launch_tool_exports_actual_port_after_fallback() -> None:
+    """Regression: wrap bumped to 8788 (e.g. copilot-subscription proxy), so the
+    child env must advertise 8788 — not the 8787 that was merely requested."""
+    with pytest.MonkeyPatch.context() as mp:
+        env = _launch_tool_capturing_env(mp, requested_port=8787, actual_port=8788)
+
+    assert env["HEADROOM_PORT"] == "8788"
+    # The existing URL-rewrite behaviour must keep working alongside it.
+    assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8788"
