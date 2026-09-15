@@ -34,6 +34,9 @@ def test_input_bucket_and_model_family_are_coarse() -> None:
     ]
     assert model_family("claude-sonnet-4-6") == "sonnet"
     assert model_family("unknown-model") == "other"
+    assert model_family("deepseek/deepseek-v4-flash") == "deepseek"
+    assert model_family("grok-composer-2.5-fast") == "composer"
+    assert model_family("grok-2-vision-1212") == "grok"
 
 
 def test_assign_arm_is_stable_and_respects_extreme_holdouts() -> None:
