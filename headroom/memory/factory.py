@@ -7,6 +7,7 @@ and proper wiring between components.
 
 from __future__ import annotations
 
+import logging
 import threading
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -23,6 +24,8 @@ from headroom.memory.config import (
 if TYPE_CHECKING:
     from headroom.memory.ports import Embedder, MemoryCache, MemoryStore, TextIndex, VectorIndex
 
+
+logger = logging.getLogger(__name__)
 
 # Extension groups for memory backends registered via setuptools entry points.
 _MEMORY_STORE_GROUP = "headroom.memory_store"
@@ -307,7 +310,7 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
         if config.db_path:
             hnsw_save_path = config.db_path.parent / f"{config.db_path.stem}_hnsw"
 
-        return HNSWVectorIndex(
+        index = HNSWVectorIndex(
             dimension=config.vector_dimension,
             ef_construction=config.hnsw_ef_construction,
             m=config.hnsw_m,
@@ -316,6 +319,31 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
             save_path=hnsw_save_path,
             auto_save=True,
         )
+
+        # auto_save=True persists this index on every mutation, but nothing
+        # ever loaded it back: every fresh process started empty, vector
+        # search returned nothing until rows were re-indexed, and the first
+        # write from the empty process overwrote the persisted artifacts.
+        # Reload the existing index when the artifacts are present; on
+        # mismatch or corruption, warn and start fresh instead of crashing.
+        if hnsw_save_path is not None:
+            try:
+                index.load_index(hnsw_save_path)
+                logger.info(
+                    "Memory: loaded persisted HNSW index from %s (%d entries)",
+                    hnsw_save_path,
+                    index.size,
+                )
+            except FileNotFoundError:
+                pass  # first run: nothing persisted yet
+            except Exception as exc:
+                logger.warning(
+                    "Memory: could not load persisted HNSW index at %s (%s); "
+                    "starting with an empty index",
+                    hnsw_save_path,
+                    exc,
+                )
+        return index
 
     raise ValueError(f"Unknown vector backend: {config.vector_backend}")
 
