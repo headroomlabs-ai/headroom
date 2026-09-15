@@ -97,6 +97,9 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
         )
         self.openai_provider = SimpleNamespace(get_context_limit=lambda model: 8192)
         self.openai_pipeline = SimpleNamespace(apply=lambda **kwargs: None)
+        # Mirror of HeadroomProxy.usage_reporter (server.py), which is always
+        # set, None when no licensing system is configured.
+        self.usage_reporter = None
         self._request_counter = 0
         self._retry_response = FakeResponse()
 
@@ -665,6 +668,8 @@ async def test_compress_batch_jsonl_without_optimization_handles_invalid_lines(
         "total_tokens_saved": 0,
         "savings_percent": 0.0,
         "errors": 1,
+        # No reporter configured, so the license half fails open — no reason to tag.
+        "passthrough_reason": None,
     }
 
 
@@ -1450,6 +1455,7 @@ async def test_handle_google_batch_create_preserves_functioncall_response_order(
                 optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
             )
             self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.usage_reporter = None
             # No-op pipeline: return the messages unchanged, no token inflation.
             self.openai_pipeline = SimpleNamespace(
                 apply=lambda **kw: SimpleNamespace(
@@ -1539,6 +1545,7 @@ async def test_handle_google_batch_create_preserves_sibling_tools(
                 optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
             )
             self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.usage_reporter = None
             self.openai_pipeline = SimpleNamespace(
                 apply=lambda **kw: SimpleNamespace(
                     messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
@@ -1750,3 +1757,592 @@ async def test_compress_batch_jsonl_skips_blank_lines_and_preserves_tools_when_n
     assert body["tools"] == [{"name": "orig"}]
     assert stats["total_requests"] == 1
     assert stats["errors"] == 0
+
+
+# ── x-headroom-bypass: the client's "don't touch my bytes" contract ──────
+# batch.py was never migrated onto CompressionDecision (see that module's
+# docstring: the same omission on the Gemini paths was "a real bug"), so
+# these lock the contract in on both batch surfaces.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bypass_headers",
+    [
+        {"x-headroom-bypass": "true"},
+        {"x-headroom-mode": "passthrough"},
+    ],
+)
+async def test_handle_batch_create_bypass_skips_compression_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+    bypass_headers: dict[str, str],
+) -> None:
+    """Bypass must reach the byte-faithful passthrough without rewriting the file.
+
+    Compressing would re-serialize every JSONL line and upload a NEW file id,
+    so "skip compression" is not enough — the download/upload pair must not run.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    called: list[str] = []
+
+    async def fail_download(file_id, headers):  # noqa: ANN001
+        called.append("download")
+        return "downloaded"
+
+    async def fail_upload(content, filename, headers):  # noqa: ANN001
+        called.append("upload")
+        return "file-2"
+
+    # Records rather than raising. handle_batch_create wraps its whole body in
+    # `except Exception`, which swallows an AssertionError and books a 500 — so
+    # that message never reached anyone, and `called` below is the real guard.
+    # The zero-request stats short-circuit the reverted path at the
+    # total_requests==0 check, before it can reach the upload.
+    async def fail_compress(content, request_id):  # noqa: ANN001
+        called.append("compress")
+        return [], {"total_requests": 0}
+
+    monkeypatch.setattr(handler, "_download_openai_file", fail_download)
+    monkeypatch.setattr(handler, "_upload_openai_file", fail_upload)
+    monkeypatch.setattr(handler, "_compress_batch_jsonl", fail_compress)
+
+    passthrough_response = SimpleNamespace(marker="passthrough")
+
+    # Accepts the reason but does not assert on it: handle_batch_create wraps its
+    # body in `except Exception`, so a raise here would be swallowed. The
+    # dedicated *_tags_the_outcome_with_its_reason tests cover the value.
+    async def fake_passthrough(request, body, passthrough_reason=None):  # noqa: ANN001
+        called.append("passthrough")
+        return passthrough_response
+
+    monkeypatch.setattr(handler, "_batch_passthrough", fake_passthrough)
+
+    response = await handler.handle_batch_create(FakeRequest("{}", headers=bypass_headers))
+
+    assert response is passthrough_response
+    assert called == ["passthrough"]
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_bypass_skips_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same contract on the Google inline-batch path (batch.py's other gate)."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    install_batch_support_modules(monkeypatch)
+
+    async def request_payload(request):  # noqa: ANN001
+        return {
+            "batch": {
+                "input_config": {
+                    "requests": {
+                        "requests": [
+                            {
+                                "request": {"contents": [{"parts": [{"text": "hello"}]}]},
+                                "metadata": {"key": "request-1"},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    # Count invocations rather than raising: the Google compression loop
+    # swallows exceptions per request, so a raise here would be masked.
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+            timing={},
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    passthrough_response = SimpleNamespace(marker="google-passthrough")
+    called: list[str] = []
+
+    async def fake_passthrough(request, model, body=None, passthrough_reason=None):  # noqa: ANN001
+        called.append("passthrough")
+        return passthrough_response
+
+    monkeypatch.setattr(handler, "_google_batch_passthrough", fake_passthrough)
+
+    response = await handler.handle_google_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert response is passthrough_response
+    assert called == ["passthrough"]
+    assert applied == []
+
+
+@pytest.mark.asyncio
+async def test_handle_batch_create_without_bypass_still_compresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bypass guard must not misfire on an ordinary request.
+
+    Gating the handler on ``CompressionDecision.decide(messages=None)`` looks
+    right and is wrong: ``None`` hits the ``no_messages`` precedence step and
+    returns ``should_compress=False``, sending every batch to passthrough.
+    This test turns red on that shortcut.
+
+    Scope: the handler-level guard only. ``_compress_batch_jsonl`` is stubbed
+    here, so the same mistake made *inside* that method would sail past this
+    test. ``test_compress_batch_jsonl_*`` cover the per-line gates.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    async def fake_download(file_id, headers):  # noqa: ANN001
+        return "downloaded"
+
+    compressed_calls: list[str] = []
+
+    async def fake_compress(content, request_id):  # noqa: ANN001
+        compressed_calls.append(content)
+        return ['{"body":{}}'], {
+            "total_requests": 1,
+            "total_original_tokens": 20,
+            "total_compressed_tokens": 10,
+            "total_tokens_saved": 10,
+            "savings_percent": 50.0,
+            "errors": 0,
+        }
+
+    async def fake_upload(content, filename, headers):  # noqa: ANN001
+        return "file-compressed"
+
+    monkeypatch.setattr(handler, "_download_openai_file", fake_download)
+    monkeypatch.setattr(handler, "_compress_batch_jsonl", fake_compress)
+    monkeypatch.setattr(handler, "_upload_openai_file", fake_upload)
+
+    handler.http_client.post_response = FakeResponse(content=b'{"id":"batch_123","object":"batch"}')
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"authorization": "Bearer test"})
+    )
+
+    assert response.status_code == 200
+    assert compressed_calls == ["downloaded"]
+    assert dict(response.headers)["x-headroom-tokens-saved"] == "10"
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_skips_when_license_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """License denial gates compression, the other half of the conjunction.
+
+    Unlike bypass this is not a byte-fidelity contract, so it gates the
+    pipeline in place rather than rerouting to the passthrough forwarder.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    install_batch_support_modules(monkeypatch, tokenizer_count=7)
+
+    # Count invocations rather than raising: _compress_batch_jsonl wraps the
+    # pipeline call in `except Exception`, which would swallow an AssertionError
+    # and let this pass via the fallback path even with the gate removed.
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    line = json.dumps(
+        {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}
+    )
+    lines, stats = await handler._compress_batch_jsonl(line, "req-license")
+
+    assert applied == []
+    assert stats["total_requests"] == 1
+    assert stats["total_tokens_saved"] == 0
+    assert json.loads(lines[0])["body"]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_compresses_when_no_usage_reporter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails open: no reporter configured means compress, not passthrough."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    install_batch_support_modules(monkeypatch)
+
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    assert handler.usage_reporter is None
+
+    line = json.dumps(
+        {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}
+    )
+    _lines, stats = await handler._compress_batch_jsonl(line, "req-nolicense")
+
+    assert len(applied) == 1
+    assert stats["total_tokens_saved"] == 40
+
+
+@pytest.mark.asyncio
+async def test_batch_passthrough_records_request_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bypassed batch create must still reach the funnel.
+
+    Routing bypass to the passthrough forwarder would otherwise drop the
+    request from dashboards entirely — the compressed path records at the
+    end of handle_batch_create, and _google_batch_passthrough records too.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true", "x-headroom-client": "test"})
+    )
+
+    assert response.status_code == 200
+    assert len(handler.metrics.record_calls) == 1
+    recorded = handler.metrics.record_calls[0]
+    assert recorded["provider"] == "openai"
+    assert recorded["tokens_saved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_google_batch_bypass_forwards_original_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypass on the Google path must forward the wire bytes untouched.
+
+    The sibling bypass test stubs _google_batch_passthrough, so it proves
+    routing but not the contract. This one lets the real helper run: handing
+    it the parsed dict re-serializes canonically (dropping the client's
+    whitespace) and logs body_mutated=True, which is what bypass forbids.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(content=b"ok")
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hi"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}},  "spaced":  true}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert handler.http_client.posts[-1]["content"] == raw.encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_batch_passthrough_records_upstream_failure_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 5xx on a bypassed batch create must not land in the success funnel.
+
+    RequestOutcome.status_code defaults to 200, and emit_request_outcome only
+    diverts to record_failed at >= 500, so omitting it books a failed upstream
+    call as a success and inflates the save-rate.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(status_code=503, content=b'{"error":"busy"}')
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_batch_create(
+        FakeRequest("{}", headers={"x-headroom-bypass": "true"})
+    )
+
+    assert response.status_code == 503
+    assert handler.metrics.record_calls == []
+    assert len(handler.metrics.failed_calls) == 1
+    assert handler.metrics.failed_calls[0]["provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_passthrough_records_upstream_failure_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same 5xx contract as the OpenAI passthrough, on the Google path.
+
+    The bypass guard routes traffic into this helper, so an omitted
+    status_code books a failed Gemini call as a served request.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(status_code=503, content=b'{"error":"busy"}')
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hi"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    response = await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert response.status_code == 503
+    assert handler.metrics.record_calls == []
+    assert len(handler.metrics.failed_calls) == 1
+    assert handler.metrics.failed_calls[0]["provider"] == "google"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_create_skips_compression_when_license_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The license gate's third disjunct at the Google per-item guard.
+
+    Arc coverage marks that line hit via the other two disjuncts, so
+    without this the `not license_ok` branch never actually decides.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    install_batch_support_modules(monkeypatch)
+
+    applied: list[dict] = []
+
+    def apply(**kwargs):  # noqa: ANN003
+        applied.append(kwargs)
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": "hi"}],
+            tokens_before=50,
+            tokens_after=10,
+            timing={},
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+    handler.http_client.post_response = FakeResponse(content=b'{"name":"batches/b1"}')
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hello"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(FakeRequest(raw), "gemini-2.0-flash")
+
+    assert applied == []
+    assert handler.metrics.record_calls[-1]["tokens_saved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_google_batch_bypass_beats_the_empty_requests_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bypass must be checked above the empty-`requests` early return.
+
+    A file-input batch carries no inline `requests`, so it takes that return —
+    which hands `_google_batch_passthrough` the parsed dict and re-serializes
+    canonically, dropping the client's whitespace. Below the return, bypass
+    silently mutated exactly the bodies it promised not to touch.
+    """
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(content=b"ok")
+
+    # No inline requests (file input), and deliberately non-canonical spacing:
+    # a canonical re-serialize collapses it, so the byte compare catches it.
+    raw = '{"batch": {"input_config": {"file_name":  "files/abc"}},  "spaced":  true}'
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert handler.http_client.posts[-1]["content"] == raw.encode("utf-8")
+
+
+# ── passthrough_reason: the slice label apply_to_tags gives every other handler ──
+# batch.py calls apply_to_tags zero times (the non-batch handlers call it at nine
+# sites), so a bypassed or license-denied batch reached the funnel indistinguishable
+# from an ordinary zero-savings one. Tags only reach RequestLog, not record_request,
+# so these assert through a logger double.
+
+
+def _tag_recorder(handler: DummyBatchHandler) -> list[dict]:
+    """Attach a logger double and return the list its RequestLog tags land in."""
+    seen: list[dict] = []
+    handler.logger = SimpleNamespace(log=lambda entry: seen.append(dict(entry.tags)))
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_batch_bypass_tags_the_outcome_with_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bypassed OpenAI batch must be sliceable as bypass_header, not just zero-savings."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    tags_seen = _tag_recorder(handler)
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_batch_create(FakeRequest("{}", headers={"x-headroom-bypass": "true"}))
+
+    assert tags_seen[-1]["passthrough_reason"] == "bypass_header"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_bypass_tags_the_outcome_with_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same slice label on the Google bypass path."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.http_client.post_response = FakeResponse(content=b"ok")
+    tags_seen = _tag_recorder(handler)
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hi"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(
+        FakeRequest(raw, headers={"x-headroom-bypass": "true"}),
+        "gemini-2.0-flash",
+    )
+
+    assert tags_seen[-1]["passthrough_reason"] == "bypass_header"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_license_denied_tags_the_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """License denial is the other cause this PR introduced — tag it too."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    handler.http_client.post_response = FakeResponse(content=b'{"name":"batches/b1"}')
+    install_batch_support_modules(monkeypatch)
+    tags_seen = _tag_recorder(handler)
+
+    raw = (
+        '{"batch": {"input_config": {"requests": {"requests": '
+        '[{"request": {"contents": [{"parts": [{"text": "hello"}]}]}, '
+        '"metadata": {"key": "r1"}}]}}}}'
+    )
+
+    async def request_payload(request):  # noqa: ANN001
+        return json.loads(raw)
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+
+    await handler.handle_google_batch_create(FakeRequest(raw), "gemini-2.0-flash")
+
+    assert tags_seen[-1]["passthrough_reason"] == "license_denied"
+
+
+@pytest.mark.asyncio
+async def test_batch_license_denied_tags_the_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenAI license gate lives inside _compress_batch_jsonl, which holds no
+    tags — so the reason rides back on its stats dict. Runs the real method rather
+    than stubbing it, or the assertion would only be testing the stub."""
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.usage_reporter = SimpleNamespace(should_compress=False)
+    handler.http_client.post_response = FakeResponse(content=b'{"id":"batch_123","object":"batch"}')
+    install_batch_support_modules(monkeypatch, tokenizer_count=7)
+    tags_seen = _tag_recorder(handler)
+
+    async def request_payload(request):  # noqa: ANN001
+        return {"input_file_id": "file-1", "endpoint": "/v1/chat/completions"}
+
+    async def fake_download(file_id, headers):  # noqa: ANN001
+        return json.dumps(
+            {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]}}
+        )
+
+    async def fake_upload(content, filename, headers):  # noqa: ANN001
+        return "file-2"
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", request_payload)
+    monkeypatch.setattr(handler, "_download_openai_file", fake_download)
+    monkeypatch.setattr(handler, "_upload_openai_file", fake_upload)
+
+    await handler.handle_batch_create(FakeRequest("{}", headers={"authorization": "Bearer t"}))
+
+    assert tags_seen[-1]["passthrough_reason"] == "license_denied"
