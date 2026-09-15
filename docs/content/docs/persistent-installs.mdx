@@ -60,6 +60,23 @@ This uses Docker's restart policy instead of an OS supervisor.
 
 If you are using the Docker-native host wrapper instead of a Python install, you can use `headroom install apply|status|start|stop|restart|remove` for the `persistent-docker` preset directly from the installed wrapper. Service/task installs and provider/user/system mutation flows still belong to the Python-native CLI.
 
+### Rootless Podman file ownership
+
+For the Python-native `persistent-docker` preset, if `docker` is a Podman wrapper
+script rather than a symlink, set `HEADROOM_CONTAINER_RUNTIME=podman` in the
+installer/runtime environment so it selects the Podman path.
+
+On non-Windows hosts the Podman command combines `--userns=keep-id` with an
+explicit `--user` using the invoking user's UID and GID. Both are needed on
+Podman versions that honor the image's `USER root` even with `keep-id`: the
+namespace preserves the host mapping, and the process user keeps newly created
+files owned by the host user. The configured image is not changed.
+
+Restart the deployment with the updated installer to use these flags. This
+prevents new ownership mismatches; it does not repair files created by an older
+container. Inspect and restore ownership of affected files separately before
+restarting if the host user can no longer read them.
+
 ## Command surface
 
 ```text

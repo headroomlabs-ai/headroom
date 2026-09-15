@@ -163,17 +163,16 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         command.extend(["--gpus", docker_gpus])
     if not _is_windows():
         if _container_runtime_is_podman():
-            # Rootless Podman maps the host user to container UID 0, so --user
-            # would map to a subordinate UID that owns none of the bind mounts and
-            # every write into ~/.headroom fails (#2804). keep-id maps the host
-            # user to the same UID inside the container, keeping the mounts
-            # writable. Docker maps UIDs 1:1, so --user stays correct there.
+            # keep-id maps the host UID/GID to the same IDs in the container;
+            # --user alone would select subordinate host IDs (#2804). Also set
+            # the process user below: Podman versions such as 5.4.2 otherwise
+            # honor USER root from the image, creating files as a subordinate
+            # host UID even with keep-id (#3569). Docker already maps IDs 1:1.
             command.append("--userns=keep-id")
-        else:
-            getuid = getattr(os, "getuid", None)
-            getgid = getattr(os, "getgid", None)
-            if callable(getuid) and callable(getgid):
-                command.extend(["--user", f"{getuid()}:{getgid()}"])
+        getuid = getattr(os, "getuid", None)
+        getgid = getattr(os, "getgid", None)
+        if callable(getuid) and callable(getgid):
+            command.extend(["--user", f"{getuid()}:{getgid()}"])
     runtime_env = {**manifest.base_env, **_deployment_env(manifest)}
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
