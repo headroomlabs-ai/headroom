@@ -40,7 +40,7 @@ def replay_golden_ccr_tool_definition(golden_tool_bytes: bytes) -> CcrToolDefini
 
 
 def create_fresh_ccr_tool_definition(
-    provider: Literal["anthropic", "openai", "google"],
+    provider: Literal["anthropic", "openai", "openai_responses", "google"],
 ) -> CcrToolDefinitionReplay:
     """Create and canonicalize a fresh CCR tool definition for ``provider``."""
 

@@ -94,6 +94,32 @@ def test_tool_registered_on_every_request_after_first_ccr():
     assert _has_ccr_tool(tools_3)
 
 
+def test_responses_session_injects_flat_retrieve_tool():
+    tools, injected = apply_session_sticky_ccr_tool(
+        provider="openai_responses",
+        session_id="responses-session",
+        request_id="req-1",
+        existing_tools=None,
+        has_compressed_content_this_turn=True,
+    )
+
+    assert injected is True
+    assert tools[0]["name"] == CCR_TOOL_NAME
+    assert "function" not in tools[0]
+
+    replayed_tools, replayed = apply_session_sticky_ccr_tool(
+        provider="openai_responses",
+        session_id="responses-session",
+        request_id="req-2",
+        existing_tools=None,
+        has_compressed_content_this_turn=False,
+    )
+
+    assert replayed is True
+    assert replayed_tools[0]["name"] == CCR_TOOL_NAME
+    assert "function" not in replayed_tools[0]
+
+
 def test_tool_not_registered_if_session_never_did_ccr():
     """A session that never produced CCR markers gets no tool injection."""
     session_id = "fresh-session-no-ccr"

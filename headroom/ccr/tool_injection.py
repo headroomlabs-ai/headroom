@@ -44,7 +44,7 @@ def create_ccr_tool_definition(
     uncompressed content.
 
     Args:
-        provider: The provider type ("anthropic", "openai", "google").
+            provider: The provider type ("anthropic", "openai", "openai_responses", "google").
                   Affects the tool definition format.
 
     Returns:
@@ -75,6 +75,14 @@ def create_ccr_tool_definition(
 
     if provider == "openai":
         return openai_definition
+
+    elif provider == "openai_responses":
+        return {
+            "type": "function",
+            "name": CCR_TOOL_NAME,
+            "description": openai_definition["function"]["description"],
+            "parameters": openai_definition["function"]["parameters"],
+        }
 
     elif provider == "anthropic":
         # Anthropic uses a slightly different format

@@ -55,6 +55,15 @@ class TestCCRToolDefinition:
         assert "parameters" in tool
         assert tool["parameters"]["required"] == ["hash"]
 
+    def test_openai_responses_format(self):
+        """Responses API tool definition uses its flat function format."""
+        tool = create_ccr_tool_definition("openai_responses")
+
+        assert tool["type"] == "function"
+        assert tool["name"] == CCR_TOOL_NAME
+        assert "function" not in tool
+        assert tool["parameters"]["required"] == ["hash"]
+
 
 class TestCCRToolInjector:
     """Test CCRToolInjector functionality."""
