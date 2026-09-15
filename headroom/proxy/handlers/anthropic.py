@@ -891,6 +891,7 @@ class AnthropicHandlerMixin:
 
         from fastapi import HTTPException
         from fastapi.responses import JSONResponse, Response, StreamingResponse
+        from starlette.requests import ClientDisconnect
 
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
@@ -1049,6 +1050,16 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except ClientDisconnect:
+                # The client (e.g. an interrupted/compacting Claude Code
+                # session) went away mid-read. There is no one left to answer
+                # and nothing to compress — bail out quietly instead of
+                # letting Starlette's own ClientDisconnect propagate up as an
+                # unhandled 500. Mirrors the existing guard on the batch
+                # passthrough path a few hundred lines below.
+                logger.debug("Client disconnected during body read for anthropic messages")
+                await _finalize_pre_upstream()
+                return Response(status_code=204)
             except (json.JSONDecodeError, ValueError) as e:
                 await _finalize_pre_upstream()
                 return JSONResponse(
