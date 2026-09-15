@@ -1432,7 +1432,7 @@ class TestHydrateEdgeCases:
         learner = TrafficLearner(backend=None, min_evidence=1)
         await learner.start()
         try:
-            assert learner._saved_hashes == set()
+            assert not learner._saved_hashes
             assert learner._persisted_ids == {}
         finally:
             await learner.stop()
@@ -1443,7 +1443,7 @@ class TestHydrateEdgeCases:
         backend = _FakeBackend(tmp_path / "not-there.db")
         learner = TrafficLearner(backend=backend, min_evidence=1)
         await learner._hydrate_persisted_state()
-        assert learner._saved_hashes == set()
+        assert not learner._saved_hashes
         assert learner._persisted_ids == {}
 
 
