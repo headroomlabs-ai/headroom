@@ -163,6 +163,10 @@ class FakeRequest:
     async def body(self) -> bytes:
         return self._body
 
+    async def stream(self):
+        # The body reader streams (so it can cap chunked bodies) like Starlette.
+        yield self._body
+
 
 class NativeGeminiHandler(DummyBatchHandler):
     def __init__(self, responses: list[FakeResponse]) -> None:
