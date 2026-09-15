@@ -26,7 +26,12 @@ except ModuleNotFoundError:  # Python < 3.11
 import click
 
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.paths import (
+    claude_settings_path,
+    codebuddy_settings_path,
+    codex_config_path,
+    validate_profile_name,
+)
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
@@ -53,15 +58,16 @@ _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
 _GLOBAL_PROFILE = "init-user"
 _CLAUDE_HOOK_MARKER = "headroom-init-claude"
+_CODEBUDDY_HOOK_MARKER = "headroom-init-codebuddy"
 _COPILOT_HOOK_MARKER = "headroom-init-copilot"
 _CODEX_HOOK_MARKER = "headroom-init-codex"
 _CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
 _CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
 _CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
 _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
-_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
-_LOCAL_TARGETS = {"claude", "codex"}
-_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_SUPPORTED_TARGETS = ("claude", "codebuddy", "copilot", "codex", "openclaw")
+_LOCAL_TARGETS = {"claude", "codebuddy", "codex"}
+_GLOBAL_TARGETS = {"claude", "codebuddy", "copilot", "codex", "openclaw"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
@@ -137,6 +143,12 @@ def _claude_scope_path(global_scope: bool) -> Path:
     if global_scope:
         return claude_settings_path()
     return Path.cwd() / ".claude" / "settings.local.json"
+
+
+def _codebuddy_scope_path(global_scope: bool) -> Path:
+    if global_scope:
+        return codebuddy_settings_path()
+    return Path.cwd() / ".codebuddy" / "settings.local.json"
 
 
 def _codex_scope_path(global_scope: bool) -> Path:
@@ -221,6 +233,54 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
                     {
                         "type": "command",
                         "command": f"{command} --marker {_CLAUDE_HOOK_MARKER}",
+                        "timeout": 15,
+                    }
+                ],
+            }
+        )
+        hooks[event] = retained
+    payload["hooks"] = hooks
+    _write_json(path, payload)
+
+
+def _ensure_codebuddy_hooks(path: Path, profile: str, port: int) -> None:
+    logger.debug("ensure codebuddy hooks: %s (profile=%s, port=%s)", path, profile, port)
+    payload = _json_file(path)
+    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+    env_map["CODEBUDDY_BASE_URL"] = f"http://127.0.0.1:{port}/v2"
+    payload["env"] = env_map
+
+    hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
+    command = _hook_command("--profile", profile)
+    for event, matcher in (
+        ("SessionStart", "startup|resume"),
+        ("PreToolUse", _powershell_matcher()),
+    ):
+        entries = list(hooks.get(event) or []) if isinstance(hooks.get(event), list) else []
+        retained: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                retained.append(entry)
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                retained.append(entry)
+                continue
+            has_headroom = any(
+                isinstance(item, dict)
+                and item.get("command")
+                and _CODEBUDDY_HOOK_MARKER in str(item.get("command"))
+                for item in hook_items
+            )
+            if not has_headroom:
+                retained.append(entry)
+        retained.append(
+            {
+                "matcher": matcher,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{command} --marker {_CODEBUDDY_HOOK_MARKER}",
                         "timeout": 15,
                     }
                 ],
@@ -848,6 +908,12 @@ def _init_claude(*, global_scope: bool, profile: str, port: int) -> None:
     click.echo("Restart Claude Code to activate Headroom hooks and provider routing.")
 
 
+def _init_codebuddy(*, global_scope: bool, profile: str, port: int) -> None:
+    _ensure_codebuddy_hooks(_codebuddy_scope_path(global_scope), profile, port)
+    click.echo(f"Configured CodeBuddy ({'user' if global_scope else 'local'} scope).")
+    click.echo("Restart CodeBuddy to activate Headroom hooks and provider routing.")
+
+
 def _init_copilot(*, global_scope: bool, profile: str, port: int, backend: str) -> None:
     if not global_scope:
         raise click.ClickException(
@@ -917,6 +983,8 @@ def _run_init_targets(
         logger.debug("run_init_targets: dispatching -> %s", target)
         if target == "claude":
             _init_claude(global_scope=global_scope, profile=profile, port=port)
+        elif target == "codebuddy":
+            _init_codebuddy(global_scope=global_scope, profile=profile, port=port)
         elif target == "copilot":
             _init_copilot(global_scope=global_scope, profile=profile, port=port, backend=backend)
         elif target == "codex":
@@ -1039,6 +1107,21 @@ def init_claude(ctx: click.Context) -> None:
     """Install Claude Code durable hooks and provider routing."""
     _run_init_targets(
         targets=["claude"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("codebuddy")
+@click.pass_context
+def init_codebuddy(ctx: click.Context) -> None:
+    """Install CodeBuddy durable hooks and provider routing."""
+    _run_init_targets(
+        targets=["codebuddy"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),

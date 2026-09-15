@@ -496,7 +496,17 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "targets",
     multiple=True,
     type=click.Choice(
-        ["claude", "copilot", "codex", "aider", "cursor", "grok_build", "openclaw", "opencode"]
+        [
+            "claude",
+            "codebuddy",
+            "copilot",
+            "codex",
+            "aider",
+            "cursor",
+            "grok_build",
+            "openclaw",
+            "opencode",
+        ]
     ),
     help="Tool target to configure when --providers manual is used.",
 )
@@ -629,6 +639,23 @@ def install_apply(
 
     if preset == InstallPreset.PERSISTENT_DOCKER.value:
         runtime = RuntimeKind.DOCKER.value
+
+    # When --target is specified without --providers manual, switch to manual mode
+    # so the user's target selection is respected instead of ignored.
+    if targets and provider_mode != ProviderSelectionMode.MANUAL.value:
+        provider_mode = ProviderSelectionMode.MANUAL.value
+
+    # CodeBuddy's target also selects its Tencent upstream when the caller did
+    # not explicitly choose another backend. Other tool targets (Cursor,
+    # Codex, etc.) are not backend names and must leave the default unchanged.
+    _DEFAULT_BACKEND = "anthropic"
+    backend_source = click.get_current_context().get_parameter_source("backend")
+    if (
+        backend == _DEFAULT_BACKEND
+        and backend_source is click.core.ParameterSource.DEFAULT
+        and targets == ("codebuddy",)
+    ):
+        backend = "codebuddy"
 
     parsed_env: dict[str, str] = {}
     for item in extra_env:

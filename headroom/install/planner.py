@@ -26,6 +26,7 @@ from .paths import validate_profile_name
 
 SUPPORTED_TARGETS = [
     ToolTarget.CLAUDE,
+    ToolTarget.CODEBUDDY,
     ToolTarget.COPILOT,
     ToolTarget.CODEX,
     ToolTarget.AIDER,
