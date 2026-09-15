@@ -78,6 +78,26 @@ def _migrate_deprecated_image(image: Any) -> Any:
     return image
 
 
+def _migrate_manifest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply safe in-memory migrations for older deployment manifests."""
+
+    if "image" in payload:
+        payload["image"] = _migrate_deprecated_image(payload["image"])
+    # Mode is represented by the proxy argument generated from ``proxy_mode``.
+    # Older manifests also exported it through the supervisor environment,
+    # creating two competing runtime inputs. Remove only the matching derived
+    # copy; a different or mode-less environment value remains an explicit input.
+    base_env = payload.get("base_env")
+    proxy_mode = payload.get("proxy_mode")
+    if (
+        isinstance(base_env, dict)
+        and proxy_mode is not None
+        and base_env.get("HEADROOM_MODE") == proxy_mode
+    ):
+        base_env.pop("HEADROOM_MODE", None)
+    return payload
+
+
 def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     """Load a deployment manifest when present."""
 
@@ -92,9 +112,7 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
         payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-        if "image" in payload:
-            payload["image"] = _migrate_deprecated_image(payload["image"])
-        return DeploymentManifest(**payload)
+        return DeploymentManifest(**_migrate_manifest_payload(payload))
     except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
         raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
 
@@ -114,9 +132,7 @@ def list_manifests() -> list[DeploymentManifest]:
                 ManagedMutation(**item) for item in payload.get("mutations", [])
             ]
             payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
-            if "image" in payload:
-                payload["image"] = _migrate_deprecated_image(payload["image"])
-            manifests.append(DeploymentManifest(**payload))
+            manifests.append(DeploymentManifest(**_migrate_manifest_payload(payload)))
         except (OSError, ValueError, TypeError):
             continue
     return manifests
