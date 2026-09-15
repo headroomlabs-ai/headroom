@@ -54,6 +54,7 @@ from ..config import (
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
+    MessageDecision,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
     TransformResult,
@@ -5032,6 +5033,10 @@ class ContentRouter(Transform):
         }
         compressed_details: list[str] = []  # e.g. ["code_aware:0.72", "kompress:0.65"]
 
+        # Per-message diagnostics (collected only when collect_diagnostics=True)
+        collect_diagnostics = bool(kwargs.get("collect_diagnostics", False))
+        _diag: dict[int, str] = {}  # slot_index → action string
+
         # Check for analysis intent in the most recent user message
         analysis_intent = False
         if self.config.protect_analysis_context:
@@ -5136,6 +5141,8 @@ class ContentRouter(Transform):
                 else:
                     # Frozen — byte-identical to preserve the prefix cache.
                     result_slots[i] = message
+                    if collect_diagnostics:
+                        _diag[i] = "passthrough:frozen"
                     continue
 
             role = message.get("role", "")
@@ -5168,12 +5175,24 @@ class ContentRouter(Transform):
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
+                if collect_diagnostics:
+                    # _process_content_blocks returns the SAME message object
+                    # when it protected/passed through every block, and a NEW
+                    # dict only when at least one block was actually
+                    # compressed -- use that instead of assuming compression.
+                    _diag[i] = (
+                        "compressed:content_blocks"
+                        if transformed_message is not message
+                        else "protected:content_blocks_unchanged"
+                    )
                 continue
 
             # Skip non-string content (other types)
             if not isinstance(content, str):
                 result_slots[i] = message
                 route_counts["non_string"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:non_string"
                 continue
 
             # A headroom_retrieve result IS already-retrieved, original CCR content --
@@ -5193,6 +5212,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:excluded:ccr_retrieve")
                 route_counts["ccr_retrieve"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:ccr_retrieve"
                 continue
 
             # Skip OpenAI-style tool messages for excluded tools
@@ -5205,6 +5226,8 @@ class ContentRouter(Transform):
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
+                        if collect_diagnostics:
+                            _diag[i] = "protected:excluded_tool_verbatim"
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
@@ -5224,11 +5247,15 @@ class ContentRouter(Transform):
                             route_counts["excluded_tool_lossless"] = (
                                 route_counts.get("excluded_tool_lossless", 0) + 1
                             )
+                            if collect_diagnostics:
+                                _diag[i] = f"compressed:lossless_{kind}"
                             continue
                         # Recent — protect as before
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
+                        if collect_diagnostics:
+                            _diag[i] = "protected:excluded_tool_recent"
                         continue
                     # Old excluded-tool output — fall through to compression
                     # (the LLM is unlikely to need exact content from this far back,
@@ -5247,6 +5274,8 @@ class ContentRouter(Transform):
                     route_counts["bash_lossless_search"] = (
                         route_counts.get("bash_lossless_search", 0) + 1
                     )
+                    if collect_diagnostics:
+                        _diag[i] = "compressed:bash_lossless_search"
                     continue
 
             # Read protection (ROLE / SHAPE-AGNOSTIC). An observation produced by
@@ -5274,11 +5303,15 @@ class ContentRouter(Transform):
                         route_counts["read_kompress_exp"] = (
                             route_counts.get("read_kompress_exp", 0) + 1
                         )
+                        if collect_diagnostics:
+                            _diag[i] = "compressed:read_kompress_exp"
                         continue
                     result_slots[i] = message
                     transforms_applied.append("router:read_protected")
                     route_counts.setdefault("read_protected", 0)
                     route_counts["read_protected"] += 1
+                    if collect_diagnostics:
+                        _diag[i] = "protected:read_output"
                     continue
 
             # Protection 1: Never compress user messages (unless overridden)
@@ -5286,6 +5319,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:user_message")
                 route_counts["user_msg"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:user_message"
                 continue
 
             # Protection 1b: Never compress system/developer messages unless
@@ -5295,12 +5330,16 @@ class ContentRouter(Transform):
                 transforms_applied.append(f"router:protected:{role}_message")
                 route_counts.setdefault("system_msg", 0)
                 route_counts["system_msg"] += 1
+                if collect_diagnostics:
+                    _diag[i] = f"protected:{role}_message"
                 continue
 
             if not content or tokenizer.count_text(content) < min_tokens:
                 # Skip small content
                 result_slots[i] = message
                 route_counts["small"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:small"
                 continue
 
             # Protection: failed tool calls / error outputs stay verbatim
@@ -5319,6 +5358,8 @@ class ContentRouter(Transform):
                 transforms_applied.append("router:protected:error_output")
                 route_counts.setdefault("error_protected", 0)
                 route_counts["error_protected"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:error_output"
                 continue
 
             # Detect content type for protection decisions. Even when the
@@ -5337,6 +5378,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:recent_code")
                 route_counts["recent_code"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:recent_code"
                 continue
 
             # Protection 3: Don't compress CODE when analysis intent detected
@@ -5344,6 +5387,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:analysis_context")
                 route_counts["analysis_ctx"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:analysis_context"
                 continue
 
             # Compression pinning: if this message was already compressed
@@ -5354,6 +5399,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 route_counts.setdefault("already_compressed", 0)
                 route_counts["already_compressed"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:already_compressed"
                 continue
 
             # Route and compress based on content detection
@@ -5381,6 +5428,8 @@ class ContentRouter(Transform):
                 route_counts["ratio_too_high"] += 1
                 route_counts.setdefault("cache_hit", 0)
                 route_counts["cache_hit"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:cache_skip"
                 continue
 
             # Tier 2: result cache — reuse compressed output
@@ -5420,10 +5469,14 @@ class ContentRouter(Transform):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
                         result_slots[i] = message
+                        if collect_diagnostics:
+                            _diag[i] = "passthrough:netcost_blocked"
                     else:
                         result_slots[i] = {**message, "content": cached_compressed}
                         transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
                         compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
+                        if collect_diagnostics:
+                            _diag[i] = f"compressed:{cached_strategy}:{cached_ratio:.2f}"
                         # Freeze the "compress" verdict so future turns skip the
                         # min_ratio re-check above and never downgrade it.
                         if freeze_decision:
@@ -5445,6 +5498,8 @@ class ContentRouter(Transform):
                     self._cache.move_to_skip(content_key)
                     result_slots[i] = message
                     route_counts["ratio_too_high"] += 1
+                    if collect_diagnostics:
+                        _diag[i] = "passthrough:ratio_too_high"
                 route_counts.setdefault("cache_hit", 0)
                 route_counts["cache_hit"] += 1
                 continue
@@ -5596,6 +5651,8 @@ class ContentRouter(Transform):
                         route_counts["lossy_unrecoverable_skipped"] = (
                             route_counts.get("lossy_unrecoverable_skipped", 0) + 1
                         )
+                        if collect_diagnostics:
+                            _diag[slot_idx] = "passthrough:lossy_unrecoverable"
                         continue
                     # Compressed — store in result cache. The cache is still
                     # warmed when the net-cost gate blocks the slot: the
@@ -5623,12 +5680,18 @@ class ContentRouter(Transform):
                         write_multiplier=netcost_write_multiplier,
                     ):
                         result_slots[slot_idx] = message
+                        if collect_diagnostics:
+                            _diag[slot_idx] = "passthrough:netcost_blocked"
                         continue
                     result_slots[slot_idx] = {**message, "content": result.compressed}
                     transforms_applied.append(
                         f"router:{result.strategy_used.value}:{accept_ratio:.2f}"
                     )
                     compressed_details.append(f"{result.strategy_used.value}:{accept_ratio:.2f}")
+                    if collect_diagnostics:
+                        _diag[slot_idx] = (
+                            f"compressed:{result.strategy_used.value}:{accept_ratio:.2f}"
+                        )
                     if slot_idx in frozen_unlock_slots:
                         transforms_applied.append("router:netcost_frozen_unlock")
                         route_counts.setdefault("netcost_frozen_unlocked", 0)
@@ -5638,6 +5701,8 @@ class ContentRouter(Transform):
                     self._cache.mark_skip(content_key)
                     result_slots[slot_idx] = message
                     route_counts["ratio_too_high"] += 1
+                    if collect_diagnostics:
+                        _diag[slot_idx] = "passthrough:ratio_too_high"
                     # Caveat (1): only freeze a "skip" verdict when the ML model
                     # is actually ready. A passthrough caused purely by a still-
                     # loading ModernBERT must stay re-evaluable on later turns,
@@ -5750,6 +5815,34 @@ class ContentRouter(Transform):
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("Router observer raised (non-fatal): %s", e)
 
+        # Build per-message diagnostics when collect_diagnostics=True
+        message_decisions: list[MessageDecision] = []
+        if collect_diagnostics:
+            for idx, orig_msg in enumerate(messages):
+                slot = result_slots[idx] if idx < len(result_slots) else None
+                if slot is None:
+                    continue
+                # Delegates to the canonical block-aware counter (also used for
+                # net-cost estimation) so list/block content (Anthropic-style
+                # tool_result/text blocks) gets a real count instead of the 0
+                # a str-only check would give it.
+                tok_before = _netcost_message_tokens(orig_msg, tokenizer)
+                tok_after = _netcost_message_tokens(slot, tokenizer)
+                # "uninstrumented" (never "compressed:...") for any route that
+                # didn't tag `_diag`: claiming a compression that may not have
+                # happened is worse than admitting the diagnostic is incomplete
+                # for that path.
+                action = _diag.get(idx, "uninstrumented")
+                message_decisions.append(
+                    MessageDecision(
+                        message_index=idx,
+                        role=orig_msg.get("role", ""),
+                        tokens_before=tok_before,
+                        tokens_after=tok_after,
+                        action=action,
+                    )
+                )
+
         all_transforms = lifecycle_transforms + transforms_applied
         return TransformResult(
             messages=transformed_messages,
@@ -5759,6 +5852,7 @@ class ContentRouter(Transform):
             markers_inserted=lifecycle_ccr_hashes,
             warnings=warnings,
             timing=compressor_timing,
+            message_decisions=message_decisions,
         )
 
     def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
