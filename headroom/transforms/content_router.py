@@ -47,7 +47,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -1731,7 +1731,25 @@ class _PerRequestRuntimeState:
     instead of mutating shared instance state. ``ContextVar`` values are
     Context-local per OS thread by default (no propagation across threads
     unless explicitly copied), which is exactly the isolation two concurrent
-    ``ThreadPoolExecutor`` workers need.
+    *top-level* ``apply()`` calls need — each one calls ``.set()`` on its own
+    OS thread, so it always gets a fresh ``Context`` regardless of what any
+    other thread is doing.
+
+    CAUTION — this does NOT extend automatically to threads ``apply()``
+    spawns internally (the Pass 2 compression fan-out: the single-task
+    watchdog ``threading.Thread`` and the ``ThreadPoolExecutor`` used when
+    more than one message needs compression). Those threads only ever
+    *read* this state via ``.get()``; they never call ``.set()``, and
+    neither ``threading.Thread`` nor ``ThreadPoolExecutor.submit`` copies
+    the calling thread's ``Context`` for you. Left alone, such a worker
+    observes the ContextVar's *global default* — an empty
+    ``_PerRequestRuntimeState()`` — instead of the state this call bound,
+    silently discarding force_kompress/target_ratio/kompress_model/
+    compression_policy/read-protection for that one compressed block. Both
+    internal spawn sites in ``apply()`` therefore explicitly snapshot
+    ``contextvars.copy_context()`` (a fresh snapshot per task for the
+    thread-pool branch — one ``Context`` object cannot be ``.run()`` by two
+    threads concurrently) and run the worker function via ``ctx.run(...)``.
     """
 
     compression_policy: Any = None
@@ -1741,6 +1759,16 @@ class _PerRequestRuntimeState:
     kompress_model: str | None = None
     tool_call_args: dict[str, str] = field(default_factory=dict)
     tool_call_commands: dict[str, str] = field(default_factory=dict)
+    # Read protection (HEADROOM_PROTECT_READS): which tool_use_ids / message
+    # indices in THIS request's messages are genuine file reads that must
+    # stay byte-exact. Previously plain `self._protect_read_tool_ids` /
+    # `self._protect_read_msg_indices` attributes — same #3486-class leak as
+    # the fields above (one concurrent `apply()` call could overwrite these
+    # before another, still-running call finished checking them), except the
+    # blast radius is a genuine file read losing its protection rather than
+    # a compression-policy misapplication.
+    protect_read_tool_ids: set[str] = field(default_factory=set)
+    protect_read_msg_indices: set[int] = field(default_factory=set)
 
 
 # Monotonic counter so each ContentRouter instance gets a uniquely named
@@ -2109,6 +2137,22 @@ class ContentRouter(Transform):
     @_tool_call_commands.setter
     def _tool_call_commands(self, value: dict[str, str]) -> None:
         self._get_local_runtime_state().tool_call_commands = value
+
+    @property
+    def _protect_read_tool_ids(self) -> set[str]:
+        return self._runtime_state_var.get().protect_read_tool_ids
+
+    @_protect_read_tool_ids.setter
+    def _protect_read_tool_ids(self, value: set[str]) -> None:
+        self._get_local_runtime_state().protect_read_tool_ids = value
+
+    @property
+    def _protect_read_msg_indices(self) -> set[int]:
+        return self._runtime_state_var.get().protect_read_msg_indices
+
+    @_protect_read_msg_indices.setter
+    def _protect_read_msg_indices(self, value: set[int]) -> None:
+        self._get_local_runtime_state().protect_read_msg_indices = value
 
     def _record_freeze_pin(self, content: str, cached_ratio: float) -> None:
         """Count one freeze divergence (thread-safe) and log it.
@@ -5655,8 +5699,22 @@ class ContentRouter(Transform):
                                 _box["error"] = exc
 
                         # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
+                        # #3486/#3556: `threading.Thread` does NOT copy the calling
+                        # thread's `contextvars.Context`, so the watchdog thread
+                        # would otherwise see the ContextVar *default*
+                        # `_PerRequestRuntimeState` instead of the state this
+                        # `apply()` call bound — silently losing force_kompress /
+                        # target_ratio / kompress_model / compression_policy /
+                        # read-protection sets for this request. Snapshot the
+                        # context now and run `_run` inside it on the worker
+                        # thread so it observes exactly what the calling thread
+                        # would have.
+                        _watchdog_ctx = copy_context()
                         worker = threading.Thread(
-                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                            target=_watchdog_ctx.run,
+                            args=(_run,),
+                            name="headroom-single-compress-watchdog",
+                            daemon=True,
                         )
                         worker.start()
                         worker.join(deadline_s)
@@ -5685,12 +5743,23 @@ class ContentRouter(Transform):
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
-                # Parallel compression via thread pool
+                # Parallel compression via thread pool.
+                # #3486/#3556: `ThreadPoolExecutor.submit` does NOT copy the
+                # calling thread's `contextvars.Context` either, so each worker
+                # would otherwise see the ContextVar *default*
+                # `_PerRequestRuntimeState` instead of this request's bound
+                # state. Snapshot a fresh `copy_context()` PER TASK (a single
+                # `Context` object cannot be `.run()` by two threads
+                # concurrently — it raises `RuntimeError` — so the snapshot
+                # must not be shared/reused across submissions) and run
+                # `_timed_compress` inside it on the worker thread.
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
                     for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
+                        _task_ctx_snapshot = copy_context()
                         futures.append(
                             executor.submit(
+                                _task_ctx_snapshot.run,
                                 self._timed_compress,
                                 task_content,
                                 task_ctx,
