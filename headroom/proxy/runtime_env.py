@@ -73,6 +73,17 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "int",
         "Min tool-output chars before the ast-grep read rewrite.",
     ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_ON_DISK",
+        "bool",
+        "Verify ast-grep Read truncation against disk when no client banner is found. "
+        "Always UNKNOWN on Windows (no dir_fd/O_NOFOLLOW support).",
+    ),
+    Knob(
+        "HEADROOM_VERIFY_TRUNCATION_MAX_BYTES",
+        "int",
+        "Max on-disk file size (bytes) the disk-verify fallback will read.",
+    ),
 )
 
 _KNOBS_BY_ENV: dict[str, Knob] = {k.env: k for k in RUNTIME_ENV_KNOBS}
