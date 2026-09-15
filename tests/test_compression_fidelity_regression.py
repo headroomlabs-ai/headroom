@@ -29,7 +29,9 @@ BASELINE: dict = json.loads((FIXTURE_DIR / "baseline.json").read_text())
 def _compress(case: dict) -> tuple[str, str]:
     """Compress a case's tool output via the lossy SmartCrusher path (no model)."""
     original = json.dumps(case["content"])
-    cfg = SmartCrusherConfig(max_items_after_crush=case["compress"]["max_items_after_crush"])
+    # The fixture still records max_items_after_crush; the setting was removed
+    # because it never reached the crusher, so the golden output is unaffected.
+    cfg = SmartCrusherConfig()
     crushed, _modified, _info = smart_crush_tool_output(
         original, cfg, with_compaction=case["compress"]["with_compaction"]
     )
