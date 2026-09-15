@@ -10,13 +10,13 @@ The Headroom proxy server is a production-ready HTTP server that applies context
 # Basic usage
 headroom proxy
 
-# Custom port
-headroom proxy --port 8080
+# Deliberate public access, with the existing token protocol
+HEADROOM_PROXY_TOKEN='replace-with-a-secret' headroom proxy --host 0.0.0.0 --port 8080
+# Send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller.
 
-# With all options
+# With logging and budget
 headroom proxy \
-  --host 0.0.0.0 \
-  --port 8787 \
   --log-file /var/log/headroom.jsonl \
   --budget 100.0
 ```
@@ -415,7 +415,9 @@ headroom_latency_ms_sum
 ## Configuration via Environment
 
 ```bash
+# For deliberate public access, configure the existing token and send it from callers.
 export HEADROOM_HOST=0.0.0.0
+export HEADROOM_PROXY_TOKEN='replace-with-a-secret'
 export HEADROOM_PORT=8787
 export HEADROOM_BUDGET=100.0
 
@@ -443,6 +445,8 @@ gunicorn headroom.proxy.server:create_app \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker \
   --factory
+# Callers must send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret`.
 ```
 
 Or with Docker:
@@ -454,7 +458,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y build-essential && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 EXPOSE 8787
-CMD ["headroom", "proxy", "--host", "0.0.0.0"]
+CMD ["headroom", "proxy", "--host", "0.0.0.0", "--port", "8787"]
 ```
+
+Run this image with an explicit token and a deliberate publication choice:
+
+```bash
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e HEADROOM_PROXY_TOKEN='replace-with-a-secret' \
+  headroom-proxy
+```
+
+Callers must send `Authorization: Bearer replace-with-a-secret` or
+`X-Headroom-Proxy-Token: replace-with-a-secret`. For network access, replace
+the host-side `127.0.0.1` with an intentional public address and keep the
+token configured.
 
 > **Note:** `build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension that must be compiled from source. It is removed after installation to keep the image slim.
