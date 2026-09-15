@@ -768,12 +768,16 @@ def test_ensure_proxy_already_running_prints_dashboard_url(
     wraps (the common case) never told the user where the dashboard lives.
     """
     port = 1234
+    # A compatible running proxy exposes its config; proxies without a config
+    # block are no longer reused (they cannot be compatibility-checked) and
+    # are covered by test_ensure_proxy_never_reuses_configless_proxy.
+    running_config = {"pid": 4321, "backend": "anthropic"}
     monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
     monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
     monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _h: False)
-    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: None)
-    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: None)
+    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: running_config)
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **kw: [])
 
     output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
 
