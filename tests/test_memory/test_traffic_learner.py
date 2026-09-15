@@ -412,6 +412,41 @@ class TestTrafficLearner:
         assert pattern.content_hash not in learner._pattern_counts  # removed on promotion
         assert pattern.content_hash in learner._saved_hashes
 
+    def test_persisted_ids_bounded_in_lockstep_with_saved_hashes(self):
+        """``_persisted_ids`` (content_hash -> memory row id) must not outgrow
+        ``_saved_hashes``. The dedup read only consults ``_persisted_ids`` behind
+        an ``h in _saved_hashes`` guard, so an id whose hash has been evicted from
+        the dedup window is dead weight; previously it accumulated one entry per
+        distinct persisted pattern for the whole process lifetime while
+        ``_saved_hashes`` stayed trimmed to ``dedup_window``.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=1, dedup_window=4)
+
+        async def feed() -> None:
+            for i in range(200):
+                pattern = ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content=f"distinct preference number {i}",
+                    importance=0.5,
+                )
+                await learner._accumulate(pattern)  # first sight -> pending
+                await learner._accumulate(pattern)  # second -> promote to saved
+                # Emulate the async save worker recording the row id, using the
+                # same "still tracked" guard the worker now applies.
+                if pattern.content_hash in learner._saved_hashes:
+                    learner._persisted_ids[pattern.content_hash] = f"mem-{i}"
+
+        asyncio.run(feed())
+
+        # _saved_hashes stays bounded (existing behavior).
+        assert len(learner._saved_hashes) <= 4
+        # _persisted_ids no longer leaks: it never holds an id for a hash that is
+        # no longer in the dedup window, so it stays bounded too.
+        assert set(learner._persisted_ids).issubset(learner._saved_hashes)
+        assert len(learner._persisted_ids) <= 4  # not 200
+
     @pytest.mark.asyncio
     async def test_dedup(self, learner: TrafficLearner):
         """Test that identical patterns are deduplicated."""
