@@ -222,6 +222,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache pip
         uses: actions/cache@v6
@@ -410,7 +411,11 @@ jobs:
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           cp "${SITE}/headroom/"_core*.so headroom/
       - name: Install chromium
-        run: playwright install --with-deps chromium
+        run: |
+          # Playwright downloads its own Chromium. The runner's unrelated
+          # Chrome apt mirror can return inconsistent package indexes.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/google-chrome.sources
+          playwright install --with-deps chromium
       - name: Run dashboard playwright tests
         # Stub-based dashboard tests only (routes fully mocked, no network).
         # tests/test_dashboard/test_live_feed.py needs a live proxy on
