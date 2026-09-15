@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from typing import Any, cast
 
 # Coarse input-token buckets. Coarse on purpose: too many strata make
@@ -68,6 +69,33 @@ def stratum_key(
     )
 
 
+def _absorb(digest: Any, text: str) -> None:
+    """Fold one seed field into ``digest``.
+
+    Incremental so no length cap is needed: the seed is consumed a field at a
+    time instead of being concatenated into one string first. The NUL is the
+    field separator, and feeding it separately is byte-identical to hashing
+    ``"\x00" + text``.
+    """
+    digest.update(b"\x00")
+    digest.update(text.encode("utf-8", "ignore"))
+
+
+def _absorb_text_blocks(digest: Any, blocks: Iterable[str]) -> None:
+    """Fold every text block of one message into ``digest`` as one field.
+
+    Byte-identical to absorbing ``"\x00".join(blocks)``, including the empty
+    case: a message with no text blocks still contributes its separator.
+    """
+    absorbed = False
+    for text in blocks:
+        digest.update(b"\x00")
+        digest.update(text.encode("utf-8", "ignore"))
+        absorbed = True
+    if not absorbed:
+        digest.update(b"\x00")
+
+
 def _unwrap_response_create_body(body: dict[str, Any]) -> dict[str, Any]:
     response = body.get("response")
     if body.get("type") == "response.create" and isinstance(response, dict):
@@ -113,52 +141,87 @@ def _stable_response_identifier(body: dict[str, Any]) -> str:
 
 
 def conversation_key_from_body(body: dict[str, Any]) -> str:
-    """Derive a conversation-stable key for holdout assignment."""
+    """Derive a conversation-stable key for holdout assignment.
+
+    Every text block of the first user message feeds the seed, in full: the
+    digest is built incrementally, field by field, so there is no length cap to
+    collapse behind.
+
+    Seeding on the first 512 characters of the *first* block collapsed whole
+    populations of conversations onto one key, because agent clients open a
+    conversation with injected context -- CLAUDE.md, IDE selection, memory
+    digests -- that is byte-identical for every conversation in a project and
+    far longer than 512 characters. The user's own words, the part that makes
+    one conversation different from the next, sat past the cut.
+
+    One key means one arm, permanently, since the assignment is deterministic:
+    on a real 78k-request ledger that left fable at 22,222 treatment requests
+    against 1 control and sonnet at 15,401 against 0, while opus accumulated
+    3,532 control samples -- a holdout nominally set to 3% that had in fact
+    frozen each client into a single arm. Reading the whole message restores
+    the intended unit of randomization without weakening stability: user turns
+    are never compressed, so the first message is immutable for the life of
+    the conversation.
+    """
     body = _unwrap_response_create_body(body)
-    model = str(body.get("model", ""))
-    seed = model
+    digest = hashlib.sha256()
+    digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
     for msg in body.get("messages", []):
         if isinstance(msg, dict) and msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, str):
-                seed += "\x00" + content[:512]
+                _absorb(digest, content)
             elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        seed += "\x00" + str(block.get("text", ""))[:512]
-                        break
+                _absorb_text_blocks(
+                    digest,
+                    (
+                        str(block.get("text", ""))
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    ),
+                )
             break
     if "input" in body:
         stable_response_key = _stable_response_identifier(body)
         if stable_response_key:
-            seed += "\x00" + stable_response_key
+            _absorb(digest, stable_response_key)
         elif not body.get("messages"):
-            seed += "\x00responses"
-    return hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()
+            _absorb(digest, "responses")
+    return digest.hexdigest()
 
 
 def conversation_key_from_responses_body(body: dict[str, Any]) -> str:
-    """Conversation-stable key for an OpenAI Responses payload."""
+    """Conversation-stable key for an OpenAI Responses payload.
+
+    Same seeding rule as :func:`conversation_key_from_body`, and for the same
+    reason: this path carried the identical 512-character cut, on the first
+    text part alone, so a Codex-style client whose opener begins with injected
+    context keyed every conversation the same way and never left one arm.
+    """
     body = _unwrap_response_create_body(body)
-    model = str(body.get("model", ""))
-    seed = model
+    digest = hashlib.sha256()
+    digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
     input_data = body.get("input")
     if isinstance(input_data, str):
-        seed += "\x00" + input_data[:512]
+        _absorb(digest, input_data)
     elif isinstance(input_data, list):
         for item in input_data:
             if not isinstance(item, dict) or item.get("role") != "user":
                 continue
             content = item.get("content")
             if isinstance(content, str):
-                seed += "\x00" + content[:512]
+                _absorb(digest, content)
             elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        seed += "\x00" + part["text"][:512]
-                        break
+                _absorb_text_blocks(
+                    digest,
+                    (
+                        part["text"]
+                        for part in content
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    ),
+                )
             break
-    return hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()
+    return digest.hexdigest()
 
 
 def assign_arm(conversation_key: str, holdout_fraction: float) -> str:
