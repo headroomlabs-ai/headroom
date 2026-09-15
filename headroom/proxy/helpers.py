@@ -1579,6 +1579,9 @@ def _setup_file_logging(
     Multi-worker callers also pass *process_id* so same-port workers cannot
     race during rollover. When *port* is omitted the legacy shared name is used.
     """
+    if _paths.process_is_stateless():
+        return
+
     from logging.handlers import RotatingFileHandler
 
     try:

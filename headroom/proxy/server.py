@@ -2784,11 +2784,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from headroom.proxy.forwarded_headers import load_trusted_dashboard_client_cidrs
 
-    # Parse once at startup so invalid operator configuration fails loudly.
-    trusted_dashboard_client_cidrs = load_trusted_dashboard_client_cidrs()
-
-    from contextlib import asynccontextmanager
-
     # Resolve config before file logging so the log can be keyed by port
     # (below). Tradeoff: any log record emitted while ``ProxyConfig`` is
     # constructed on the no-config path (e.g. an invalid HEADROOM_QDRANT_PORT
@@ -2796,6 +2791,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # the port must be known first, and it is always present (``port`` defaults
     # to 8787), so this is accepted.
     config = config or ProxyConfig()
+
+    # Record stateless mode before initializing any optional filesystem writer.
+    # HeadroomProxy repeats this defensively for non-create_app entrypoints.
+    from headroom import paths as _hr_paths
+
+    _hr_paths.set_process_stateless(config.stateless)
+
+    # Parse once at startup so invalid operator configuration fails loudly.
+    trusted_dashboard_client_cidrs = load_trusted_dashboard_client_cidrs()
+
+    from contextlib import asynccontextmanager
 
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
