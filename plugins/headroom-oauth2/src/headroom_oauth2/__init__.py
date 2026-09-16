@@ -13,7 +13,7 @@ from typing import Any
 from .middleware import OAuth2Middleware
 from .provider import OAuth2ClientCredentials, OAuth2Error
 
-__all__ = ["install", "OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "parse_headers"]
+__all__ = ["OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "install", "parse_headers"]
 __version__ = "0.1.0"
 log = logging.getLogger("headroom_oauth2")
 
@@ -116,7 +116,13 @@ def install(app: Any, config: Any) -> None:
             os.environ.update(_before)
             litellm.headers = {**(getattr(litellm, "headers", None) or {}), **static}
             log.info("headroom-oauth2: static upstream headers: %s", list(static))
-        except Exception as e:  # pragma: no cover
+        except (
+            ImportError,
+            AttributeError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as e:  # pragma: no cover
             log.warning("headroom-oauth2: could not set litellm.headers: %s", e)
     # The litellm backend auths bedrock/vertex/sagemaker from env and ignores a forwarded
     # bearer, so this extension is a no-op there -- warn loudly rather than silently do nothing.

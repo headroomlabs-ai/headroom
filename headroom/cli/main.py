@@ -76,6 +76,7 @@ def _register_commands() -> None:
         perf,  # noqa: F401
         proxy,  # noqa: F401
         recover,  # noqa: F401
+        rollout,  # noqa: F401
         savings,  # noqa: F401
         tools,  # noqa: F401
         update,  # noqa: F401
@@ -86,6 +87,15 @@ def _register_commands() -> None:
     try:
         from . import memory  # noqa: F401
     except ImportError:
+        pass
+
+    # Third-party subcommands (headroom.cli_extension entry points). Runs last so
+    # built-ins are already attached and a plugin cannot shadow one.
+    try:
+        from .extensions import register_all
+
+        register_all(main)
+    except Exception:  # noqa: BLE001 — extension discovery must never break the CLI
         pass
 
 

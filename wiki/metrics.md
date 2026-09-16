@@ -336,19 +336,19 @@ print(stats)
         "tokens_saved_total": 15000,
         "tokens_output_total": 8000,
         "cache_hits": 3,
-        "compression_ratio_avg": 0.70
+        "compression_ratio_avg": 0.70,
     },
     "config": {
         "mode": "optimize",
         "provider": "openai",
         "cache_optimizer_enabled": True,
-        "semantic_cache_enabled": False
+        "semantic_cache_enabled": False,
     },
     "transforms": {
         "smart_crusher_enabled": True,
         "cache_aligner_enabled": True,
-        "rolling_window_enabled": True
-    }
+        "rolling_window_enabled": True,
+    },
 }
 ```
 

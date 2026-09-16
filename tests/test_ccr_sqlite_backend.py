@@ -86,6 +86,74 @@ class TestSQLiteBackend:
         assert stats["entry_count"] == 2
         assert stats["bytes_used"] > 0
 
+    def test_opening_a_db_with_the_old_index_drops_it_and_keeps_the_rows(self, db_path):
+        # Databases written before idx_ccr_expiry_deadline still carry the
+        # superseded idx_ccr_expiry; opening them must migrate, not fail.
+        seeded = SQLiteBackend(db_path)
+        seeded.set("h1", make_entry("h1"))
+        seeded._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ccr_expiry ON ccr_entries (created_at)"
+        )
+        seeded._conn.commit()
+        seeded._conn.close()
+
+        b = SQLiteBackend(db_path)
+        indexes = {
+            row[0]
+            for row in b._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
+            )
+        }
+        assert indexes == {"idx_ccr_expiry_deadline"}
+        entry = b.get("h1")
+        assert entry is not None
+        assert entry.original_content == make_entry("h1").original_content
+
+    def test_purge_expired_deletes_by_deadline_and_keeps_the_boundary_row(self, db_path):
+        b = SQLiteBackend(db_path)
+        now = time.time()
+        expired = make_entry("expired", ttl=10)
+        expired.created_at = now - 11
+        boundary = make_entry("boundary", ttl=10)
+        boundary.created_at = now - 10
+        live = make_entry("live", ttl=60)
+        live.created_at = now - 11
+
+        # Keep backend.set() from performing its opportunistic purge first.
+        b._last_purge = now
+        for entry in (expired, boundary, live):
+            b.set(entry.hash, entry)
+
+        assert b.purge_expired(now) == 1
+        assert set(b.keys()) == {"boundary", "live"}
+
+    def test_new_insert_purges_expired_sqlite_entry_without_decoding_live_payloads(
+        self, db_path, monkeypatch
+    ):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(max_entries=4, backend=backend, enable_feedback=False)
+        expired_hash = store.store("expired original", "expired compact", ttl=10)
+        live_hash = store.store("live original", "live compact", ttl=60)
+        other_live_hash = store.store("other live original", "other live compact", ttl=60)
+
+        expired = backend.get(expired_hash)
+        assert expired is not None
+        expired.created_at = time.time() - 11
+        backend.set(expired_hash, expired)
+
+        monkeypatch.setattr(
+            backend,
+            "_entry_from_json",
+            lambda _raw: pytest.fail("new insertion decoded existing CCR payloads"),
+        )
+
+        new_hash = store.store("new original", "new compact", ttl=60)
+
+        assert not backend.exists(expired_hash)
+        assert backend.exists(live_hash)
+        assert backend.exists(other_live_hash)
+        assert backend.exists(new_hash)
+
     def test_clear(self, db_path):
         b = SQLiteBackend(db_path)
         b.set("h1", make_entry())

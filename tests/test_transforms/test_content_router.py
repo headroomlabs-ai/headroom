@@ -1699,3 +1699,70 @@ class TestCompressBlockContent:
         assert any("router:tool_result" in t for t in transforms_applied), (
             f"Expected router:tool_result:* in transforms, got: {transforms_applied}"
         )
+
+
+# =============================================================================
+# Mixed content: custom-tag protection (system-reminder mangling regression)
+# =============================================================================
+
+
+class TestMixedContentTagProtection:
+    """_compress_mixed must protect custom-tag blocks BEFORE section split.
+
+    Splitting first lands the open/close tags of a
+    ``<system-reminder>...</system-reminder>`` pair in different sections;
+    per-section protection then sees only unmatched tags (which protect
+    nothing) and the block's content — Claude Code ships CLAUDE.md this way —
+    is lossy-compressed and arrives word-dropped.
+    """
+
+    REMINDER = (
+        "<system-reminder>\n"
+        "Instruction prose that must survive byte-exact.\n\n"
+        "```bash\nrtk gain\n```\n\n"
+        "More instructions after the fence, also byte-exact.\n"
+        "</system-reminder>"
+    )
+
+    @staticmethod
+    def _mangling_router() -> ContentRouter:
+        """Router whose per-section compressor visibly mangles everything."""
+        router = ContentRouter(ContentRouterConfig(min_section_tokens=1))
+
+        def mangle(content, strategy, context, language=None, question=None, bias=1.0):
+            return "MANGLED", 1, None
+
+        router._apply_strategy_to_content = mangle  # type: ignore[method-assign]
+        return router
+
+    def test_reminder_block_survives_mixed_compression_verbatim(self):
+        router = self._mangling_router()
+        content = (
+            "Prose before the reminder that may compress.\n\n"
+            + self.REMINDER
+            + "\n\nProse after the reminder that may compress."
+        )
+
+        result = router._compress_mixed(content, context="")
+
+        # The tag block (fence and all) is byte-exact in the output...
+        assert self.REMINDER in result.compressed
+        # ...while content outside it still went through the compressor.
+        assert "MANGLED" in result.compressed
+
+    def test_reminder_only_content_passes_through(self):
+        router = self._mangling_router()
+
+        result = router._compress_mixed(self.REMINDER, context="")
+
+        assert self.REMINDER in result.compressed
+        assert "MANGLED" not in result.compressed
+
+    def test_untagged_mixed_content_still_compresses(self):
+        router = self._mangling_router()
+        content = "Plain prose section.\n\n```python\nprint('hi')\n```\n\nMore prose."
+
+        result = router._compress_mixed(content, context="")
+
+        assert "MANGLED" in result.compressed
+        assert result.strategy_used == CompressionStrategy.MIXED

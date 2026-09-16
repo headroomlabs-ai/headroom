@@ -284,6 +284,21 @@
                       "value": {
                         "intValue": "2"
                       }
+                    },
+                    {
+                      "key": "failure_statuses",
+                      "value": {
+                        "kvlistValue": {
+                          "values": [
+                            {
+                              "key": "529",
+                              "value": {
+                                "intValue": "2"
+                              }
+                            }
+                          ]
+                        }
+                      }
                     }
                   ]
                 }

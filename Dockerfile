@@ -47,7 +47,10 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
 
-ARG HEADROOM_EXTRAS=proxy,code
+# The standalone Dockerfile must support every backend advertised by
+# `headroom proxy --backend`, including Bedrock temporary/SSO credentials.
+# Those credentials require botocore (GH #1551), supplied by [bedrock].
+ARG HEADROOM_EXTRAS=proxy,code,bedrock
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

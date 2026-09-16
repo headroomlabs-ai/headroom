@@ -22,6 +22,18 @@
       "label": "Connect Timeout Seconds",
       "help": "Optional upstream connection timeout for the auto-started local Headroom proxy. Lower values surface network failures sooner."
     },
+    "requestTimeoutMs": {
+      "label": "Compression Request Timeout",
+      "help": "Maximum milliseconds to wait for one compression request before returning the original messages."
+    },
+    "circuitBreakerThreshold": {
+      "label": "Circuit Breaker Threshold",
+      "help": "Consecutive compression failures before temporarily bypassing Headroom."
+    },
+    "circuitBreakerCooldownMs": {
+      "label": "Circuit Breaker Cooldown",
+      "help": "Milliseconds to bypass compression after the circuit breaker opens."
+    },
     "routeCodexViaProxy": {
       "label": "Route OpenAI Codex Via Headroom",
       "help": "When enabled, OpenClaw will use the active Headroom proxy as the in-memory upstream base URL for the built-in openai-codex provider so provider traffic flows through Headroom."
@@ -68,6 +80,21 @@
       "connectTimeoutSeconds": {
         "type": "integer",
         "minimum": 1
+      },
+      "requestTimeoutMs": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 30000
+      },
+      "circuitBreakerThreshold": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 3
+      },
+      "circuitBreakerCooldownMs": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 60000
       },
       "routeCodexViaProxy": {
         "type": "boolean",

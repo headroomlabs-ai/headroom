@@ -1,7 +1,7 @@
 {
   "extends": ["@commitlint/config-conventional"],
   "rules": {
-    "body-max-line-length": [2, "always", 200],
+    "body-max-line-length": [0],
     "footer-leading-blank": [0],
     "subject-case": [0],
     "type-enum": [
@@ -12,6 +12,7 @@
         "chore",
         "ci",
         "docs",
+        "deps",
         "feat",
         "fix",
         "parity",

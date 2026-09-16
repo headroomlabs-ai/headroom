@@ -399,8 +399,9 @@ pub fn observe_drift(state: &DriftState, session_key: &str, current: StructuralH
 
 /// 16-char hex prefix of SHA-256(session_key). Bounds the log line
 /// width and never reveals the raw key (which may be a bearer token
-/// or API key — see `derive_session_key`).
-fn session_key_log_prefix(session_key: &str) -> String {
+/// or API key — see `derive_session_key`). `pub(crate)` so the
+/// beta-sticky merge site logs the same session identity the same way.
+pub(crate) fn session_key_log_prefix(session_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(session_key.as_bytes());
     let digest = hasher.finalize();

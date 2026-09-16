@@ -3,6 +3,7 @@ from __future__ import annotations
 from headroom.pricing.litellm_model_resolution import (
     MODEL_ALIASES,
     LiteLLMModelPrefixRule,
+    _strip_vertex_version_suffix,
     pricing_lookup_candidates,
     resolution_candidates,
     resolve_litellm_model_name,
@@ -21,11 +22,11 @@ def test_resolution_candidates_try_bare_then_matching_prefix_then_alias() -> Non
     assert resolution_candidates("MiniMax-M3") == ("MiniMax-M3", "minimax/MiniMax-M3")
 
     retired = "claude-3-5-sonnet-20241022"
-    assert resolution_candidates(retired) == (
-        retired,
-        f"anthropic/{retired}",
-        MODEL_ALIASES[retired],
-    )
+    candidates = resolution_candidates(retired)
+    assert candidates[0] == retired
+    assert f"anthropic/{retired}" in candidates
+    assert f"vertex_ai/{retired}" not in candidates  # no @YYYYMMDD suffix = not Vertex
+    assert MODEL_ALIASES[retired] in candidates
 
 
 def test_pricing_lookup_candidates_include_provider_prefixes_and_aliases() -> None:
@@ -59,3 +60,64 @@ def test_resolve_litellm_model_name_returns_first_known_candidate() -> None:
 
 def test_resolve_litellm_model_name_returns_original_when_unknown() -> None:
     assert resolve_litellm_model_name("mystery-model", lambda _: False) == "mystery-model"
+
+
+def test_strip_vertex_version_suffix() -> None:
+    assert _strip_vertex_version_suffix("claude-haiku-4-5@20251001") == "claude-haiku-4-5"
+    assert _strip_vertex_version_suffix("claude-opus-4@20250514") == "claude-opus-4"
+    assert _strip_vertex_version_suffix("claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert _strip_vertex_version_suffix("claude-sonnet-4-20250514") == "claude-sonnet-4-20250514"
+
+
+def test_resolution_candidates_vertex_versioned_models() -> None:
+    # Vertex appends @YYYYMMDD — bare name and vertex_ai/ must be candidates
+    candidates = resolution_candidates("claude-haiku-4-5@20251001")
+    assert "claude-haiku-4-5" in candidates
+    assert "anthropic/claude-haiku-4-5" in candidates
+    assert "vertex_ai/claude-haiku-4-5" in candidates  # vertex_ai/ only for versioned
+
+    candidates = resolution_candidates("claude-opus-4@20250514")
+    assert "claude-opus-4" in candidates
+    assert "anthropic/claude-opus-4" in candidates
+    assert "vertex_ai/claude-opus-4" in candidates
+
+    # Non-versioned names should NOT get vertex_ai/ candidates
+    candidates = resolution_candidates("claude-sonnet-4-6")
+    assert candidates[0] == "claude-sonnet-4-6"
+    assert "vertex_ai/claude-sonnet-4-6" not in candidates
+    assert "anthropic/claude-sonnet-4-6" in candidates
+
+
+def test_pricing_lookup_candidates_vertex_versioned_models() -> None:
+    candidates = pricing_lookup_candidates("claude-haiku-4-5@20251001")
+    # Bare name and vertex_ai/ prefix must both be candidates
+    assert "claude-haiku-4-5" in candidates
+    assert "vertex_ai/claude-haiku-4-5" in candidates
+    assert "anthropic/claude-haiku-4-5" in candidates
+
+    candidates = pricing_lookup_candidates("claude-opus-4@20250514")
+    assert "claude-opus-4" in candidates
+    assert "vertex_ai/claude-opus-4" in candidates
+
+    # Non-versioned names should NOT get vertex_ai/ pricing candidates
+    candidates = pricing_lookup_candidates("claude-sonnet-4-6")
+    assert "vertex_ai/claude-sonnet-4-6" not in candidates
+    assert "anthropic/claude-sonnet-4-6" in candidates
+
+
+def test_vertex_versioned_model_resolves_to_known_key() -> None:
+    # Simulate LiteLLM knowing the bare model name (not the versioned one)
+    known = {"claude-haiku-4-5", "anthropic/claude-sonnet-4-6"}
+    assert (
+        resolve_litellm_model_name("claude-haiku-4-5@20251001", known.__contains__)
+        == "claude-haiku-4-5"
+    )
+    assert (
+        resolve_litellm_model_name("claude-sonnet-4-6", known.__contains__)
+        == "anthropic/claude-sonnet-4-6"
+    )
+    # Unknown versioned model falls back to original
+    assert (
+        resolve_litellm_model_name("claude-unknown@20251001", lambda _: False)
+        == "claude-unknown@20251001"
+    )

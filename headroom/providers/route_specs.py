@@ -105,6 +105,9 @@ ANTHROPIC_BATCH_ROUTES: tuple[ProviderHandlerRoute, ...] = (
 
 OPENAI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
     ProviderHandlerRoute("POST", "/v1/chat/completions", "handle_openai_chat"),
+    # Copilot Chat derives this unprefixed path from overrideCapiUrl. Route it
+    # through the real handler; the generic catch-all would bypass compression.
+    ProviderHandlerRoute("POST", "/chat/completions", "handle_openai_chat"),
 )
 
 

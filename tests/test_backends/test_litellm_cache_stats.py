@@ -215,3 +215,30 @@ async def test_no_cache_fields_means_no_cache_keys_in_usage_block() -> None:
     assert "cache_read_input_tokens" not in body_usage
     assert "cache_creation_input_tokens" not in body_usage
     assert "prompt_tokens_details" not in body_usage
+
+
+async def test_none_core_counts_coerced_to_zero() -> None:
+    """A provider can leave prompt/completion/total token counts None on the
+    Usage object. The OpenAI-shape usage block must emit ints, not None, so the
+    backend-routed OpenAI handler (which reads these straight into arithmetic
+    and RequestOutcome) does not crash with a TypeError."""
+    usage = _FakeUsage(
+        prompt_tokens=None,  # type: ignore[arg-type]
+        completion_tokens=None,  # type: ignore[arg-type]
+        total_tokens=None,  # type: ignore[arg-type]
+    )
+    response = _make_response(usage)
+
+    backend = _make_backend()
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = response
+        result = await backend.send_openai_message(_request_body(), {})
+
+    body_usage = result.body["usage"]
+    assert body_usage["prompt_tokens"] == 0
+    assert body_usage["completion_tokens"] == 0
+    assert body_usage["total_tokens"] == 0
+    assert all(
+        isinstance(body_usage[k], int)
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )

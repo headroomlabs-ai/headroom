@@ -1,0 +1,10 @@
+{
+  "name": "headroom-wrap-e2e-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked CLI dependencies for the Docker wrap E2E harness",
+  "dependencies": {
+    "@openai/codex": "0.153.4",
+    "openclaw": "2026.9.3"
+  }
+}

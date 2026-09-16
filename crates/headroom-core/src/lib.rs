@@ -7,6 +7,7 @@ pub mod compression_policy;
 #[cfg(feature = "ml")]
 mod onnx_cpu;
 pub mod relevance;
+pub mod rollout;
 pub mod signals;
 pub mod tokenizer;
 pub mod transforms;

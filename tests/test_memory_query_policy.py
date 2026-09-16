@@ -69,6 +69,42 @@ def test_extract_sources_captures_anthropic_user_text_blocks() -> None:
     assert user_text == "help me refactor auth"
 
 
+def test_extract_sources_skips_system_reminder_blocks() -> None:
+    """Claude Code appends <system-reminder> harness blocks to the user turn.
+    Concatenated into the embedding input they dilute the real question below the
+    similarity floor so nothing is retrieved (#2195); they must be filtered out."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "how do I add caching to the auth handler?"},
+                {
+                    "type": "text",
+                    "text": "<system-reminder>\nThe user opened file x.\n</system-reminder>",
+                },
+            ],
+        },
+    ]
+
+    user_text, _tool_outputs, _assistant_turns = extract_memory_query_sources(messages)
+
+    assert user_text == "how do I add caching to the auth handler?"
+    assert "system-reminder" not in user_text
+
+
+def test_extract_sources_reminder_only_turn_yields_no_user_text() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "<system-reminder>x</system-reminder>"}],
+        },
+    ]
+
+    user_text, _tool_outputs, _assistant_turns = extract_memory_query_sources(messages)
+
+    assert user_text == ""
+
+
 def test_extract_sources_captures_user_text_alongside_tool_result() -> None:
     """A user turn mixing a tool_result and a text block yields both: the text as
     the user query and the tool output as context."""

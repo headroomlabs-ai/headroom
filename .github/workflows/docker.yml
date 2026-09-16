@@ -94,7 +94,7 @@ jobs:
 
       - name: Set up Python
         if: steps.version.outputs.version != ''
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -204,10 +204,10 @@ jobs:
       - name: Upload digest marker
         uses: actions/upload-artifact@v7
         with:
-          # Variant + arch in the artifact name so the manifest job can
-          # download with `pattern: digests-<variant>-*` to gather all
-          # arches for one variant. `root` substitutes the empty-string
-          # variant since GHA artifact names can't end in a hyphen.
+          # Variant + arch uniquely identify the marker. The manifest job
+          # downloads both architecture artifacts by exact name; a glob such
+          # as `digests-code-*` would also match code-nonroot/code-slim.
+          # `root` substitutes the empty-string variant.
           name: digests-${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
@@ -220,6 +220,7 @@ jobs:
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
     needs: docker-build
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -272,12 +273,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download per-arch digests for this variant
+      - name: Download amd64 digest for this variant
         uses: actions/download-artifact@v8
         with:
-          pattern: digests-${{ matrix.variant.name || 'root' }}-*
+          name: digests-${{ matrix.variant.name || 'root' }}-amd64
           path: ${{ runner.temp }}/digests
-          merge-multiple: true
+
+      - name: Download arm64 digest for this variant
+        uses: actions/download-artifact@v8
+        with:
+          name: digests-${{ matrix.variant.name || 'root' }}-arm64
+          path: ${{ runner.temp }}/digests
 
       # Same tag rules as the pre-fan-out workflow — preserve every
       # tag flavor (semver, ref, sha-prefixed, version-suffixed,
@@ -287,6 +293,18 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
+          # `latest=false` is load-bearing (#3150). The action defaults to
+          # `latest=auto`, which appends a bare `latest` for any semver
+          # release — and it logs `suffixLatest=false`, so the per-tag
+          # `suffix=` below never reaches it. Every one of the 8 variant
+          # cells therefore pushed `ghcr.io/.../headroom:latest`, and the
+          # last cell to finish won. At 0.36.0 that was `code-slim`, so
+          # `:latest` resolved to the distroless build, whose
+          # `import onnxruntime` segfaults on arm64 — `headroom deploy`
+          # crash-looped on Apple Silicon. `:latest` has exactly one
+          # writer: the root-cell promotion step at the end of this job.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
             type=ref,event=pr,enable=${{ inputs.enable_ref_tags != 'false' && github.event_name != 'release' }},suffix=${{ matrix.variant.name != '' && format('-{0}', matrix.variant.name) || '' }}
@@ -305,6 +323,9 @@ jobs:
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           DIGEST_DIR: ${{ runner.temp }}/digests
+          # Read by the bare-`latest` guard below. Via `env:` rather than
+          # inline `${{ }}` so the value is never spliced into the script.
+          VARIANT_NAME: ${{ matrix.variant.name }}
         run: |
           # Reconstruct full image references from the digest marker
           # filenames (each file is named after the bare hex digest
@@ -313,11 +334,26 @@ jobs:
             echo "ERROR: no digests downloaded for variant '${{ matrix.variant.name || 'root' }}'" >&2
             exit 1
           fi
+          digest_count="$(find "${DIGEST_DIR}" -maxdepth 1 -type f | wc -l)"
+          if [ "${digest_count}" -ne 2 ]; then
+            echo "ERROR: expected both architecture digests for variant '${{ matrix.variant.name || 'root' }}', found ${digest_count}" >&2
+            exit 1
+          fi
           digest_refs=()
           for f in "${DIGEST_DIR}"/*; do
             digest="$(basename "$f")"
             digest_refs+=("${IMAGE}@sha256:${digest}")
           done
+
+          # Belt-and-braces for #3150: only the root cell may ever carry a
+          # bare `latest`. A suffixed variant reaching this point with one
+          # means the tag rules regressed, and shipping it would repoint
+          # `:latest` at a non-default image. Fail instead of publishing.
+          if [ -n "${VARIANT_NAME}" ] && jq -e '.tags[]? | select(endswith(":latest"))' \
+               <<< "${DOCKER_METADATA_OUTPUT_JSON}" >/dev/null 2>&1; then
+            echo "::error::variant '${VARIANT_NAME}' would publish a bare :latest tag" >&2
+            exit 1
+          fi
 
           # Build `--tag` args from the metadata-action JSON output.
           # Empty tags array is valid (PR builds without ref-tags
@@ -382,53 +418,13 @@ jobs:
             sleep "$sleep_for"
           done
 
-  promote-latest:
-    # Re-push the :latest tag pointing at the root variant *after* every
-    # variant manifest job has finished, so GHCR's package version
-    # listing (sorted by created_at) shows the root image with :latest
-    # at the top instead of whichever variant happened to finish last.
-    needs: docker-manifest
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Normalize image name
-        id: image-name
-        run: |
-          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          printf 'image_name=%s\n' "$image_name" >> "$GITHUB_OUTPUT"
-
-      - name: Determine image version
-        id: version
-        env:
-          MANUAL_VERSION: ${{ inputs.version || github.event.inputs.version }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          version="${MANUAL_VERSION#v}"
-          if [ -z "$version" ] && [ -n "$RELEASE_TAG" ]; then
-            version="${RELEASE_TAG#v}"
-          fi
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Re-tag root image as :latest
-        if: steps.version.outputs.version != ''
+        if: steps.manifest.outputs.index_digest != '' && matrix.variant.name == '' && steps.version.outputs.version != ''
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Add a unique annotation so the resulting image index manifest gets
-          # a new digest, which makes GHCR record a fresh package version with
-          # current timestamp (otherwise the existing root manifest is reused
-          # and stays where it was in the version listing).
+          # Add a unique annotation so GHCR records a fresh root package version.
           promoted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           docker buildx imagetools create \
             --annotation "index:io.headroom.promoted-at=${promoted_at}" \

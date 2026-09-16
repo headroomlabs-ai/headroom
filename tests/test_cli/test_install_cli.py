@@ -1,9 +1,122 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import click
+import pytest
 from click.testing import CliRunner
 
+from headroom.cli import install as inst
 from headroom.cli.main import main
+
+
+def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
+    """On an init'd machine (one profile, e.g. init-user), a bare lifecycle
+    command whose --profile defaults to 'default' resolves to the single
+    installed deployment instead of dead-ending (#2811)."""
+    only = SimpleNamespace(profile="init-user")
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [only])
+
+    assert inst._require_manifest("default") is only
+
+
+def test_require_manifest_honors_env_profile(monkeypatch):
+    """An explicit HEADROOM_DEPLOYMENT_PROFILE (exported by the runtime) selects
+    the target even when the requested profile is not installed."""
+    target = SimpleNamespace(profile="init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(
+        inst, "load_manifest", lambda profile: target if profile == "init-user" else None
+    )
+    monkeypatch.setattr(inst, "list_manifests", lambda: [target])
+
+    assert inst._require_manifest("default") is target
+
+
+def test_require_manifest_lists_installed_profiles_when_ambiguous(monkeypatch):
+    """With several installed profiles and no signal, the error names them and
+    points at --profile instead of dead-ending on 'default'."""
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(
+        inst,
+        "list_manifests",
+        lambda: [SimpleNamespace(profile="init-user"), SimpleNamespace(profile="ci")],
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._require_manifest("default")
+    msg = str(exc.value)
+    assert "ci" in msg and "init-user" in msg and "--profile" in msg
+
+
+def _status_manifest(profile: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        profile=profile,
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="none",
+        scope="user",
+        port=8787,
+        health_url="http://127.0.0.1:8787/readyz",
+        backend="anthropic",
+    )
+
+
+def test_install_status_explicit_missing_profile_is_not_redirected_to_env(monkeypatch):
+    """An explicit --profile must be honored or rejected verbatim, never
+    redirected to HEADROOM_DEPLOYMENT_PROFILE or a lone installed deployment: a
+    typo must fail even when the env profile exists (#2832 review). Only a
+    CliRunner invocation exercises the default-vs-explicit distinction."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status", "--profile", "typo"])
+
+    assert res.exit_code != 0
+    assert "typo" in res.output
+    # The error names the installed profile, but the command never operated on it.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
+def test_install_status_stale_env_profile_is_not_redirected_to_lone_manifest(monkeypatch):
+    """A non-empty HEADROOM_DEPLOYMENT_PROFILE is an explicit selection: if it
+    names a missing/stale profile the command must fail naming that profile, never
+    silently redirect to a different lone installed deployment (#2832 review)."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "missing")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code != 0
+    assert "missing" in res.output
+    # Never operated on the lone init-user deployment.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
+def test_install_status_omitted_profile_resolves_env_deployment(monkeypatch):
+    """With --profile omitted (Click default), HEADROOM_DEPLOYMENT_PROFILE selects
+    the target so the documented bare command works on an init'd machine."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+    monkeypatch.setattr(inst, "probe_json", lambda url: None)
+    monkeypatch.setattr(inst, "runtime_status", lambda m: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code == 0, res.output
+    assert "Profile:    init-user" in res.output
 
 
 def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
@@ -59,6 +172,44 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     assert calls == ["save", "start_service", "apply", "save"]
 
 
+def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-task"
+        runtime_kind = "python"
+        supervisor_kind = "task"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations: list[object] = []
+        targets: list[str] = []
+        artifacts: list[object] = []
+
+    monkeypatch.setattr("headroom.cli.install._is_windows", lambda: True)
+    monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent", lambda profile: calls.append("start_agent")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+    result = runner.invoke(main, ["install", "apply", "--preset", "persistent-service"])
+
+    assert result.exit_code == 0, result.output
+    assert "Falling back to persistent-task with Task Scheduler" in result.output
+    assert "sc.exe" not in result.output
+    assert calls == ["start_agent"]
+
+
 def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     runner = CliRunner()
     captured: dict[str, object] = {}
@@ -97,6 +248,104 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert captured["no_http2"] is True
+
+
+def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
+    """Stub out the apply side effects and capture ``build_manifest`` kwargs."""
+
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations: list = []
+        artifacts: list = []
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return Manifest()
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+
+def test_install_apply_honors_headroom_port_env(monkeypatch) -> None:
+    """An explicit HEADROOM_PORT must reach build_manifest, like `proxy --port` honors it.
+
+    Regression for #3072 bug 1: `install apply` ignored HEADROOM_PORT and always
+    configured 8787 because the --port option had no envvar binding.
+    """
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
+def test_install_apply_explicit_port_overrides_env(monkeypatch) -> None:
+    """An explicit --port still wins over HEADROOM_PORT (Click precedence)."""
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+
+
+def test_deploy_honors_headroom_port_env(monkeypatch) -> None:
+    """`headroom deploy` must honor HEADROOM_PORT the same way (#3072 bug 1)."""
+    captured: dict[str, object] = {}
+
+    plan = SimpleNamespace(
+        preset="persistent-service",
+        runtime="python",
+        reason="test",
+        supervisor_kind="service",
+        base_env={},
+    )
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        port=0,
+        health_url="http://127.0.0.1:8788/readyz",
+        targets=["claude"],
+    )
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr(
+        "headroom.cli.install._select_turnkey_plan", lambda prefer_docker=True: plan
+    )
+    monkeypatch.setattr("headroom.cli.install._build_deployment_manifest", fake_build)
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install._echo_installed", lambda m, prefix="": None)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["deploy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
 
 
 def test_install_apply_help_lists_no_http2() -> None:

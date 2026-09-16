@@ -98,3 +98,33 @@ class TestProxyPeriodicTOINStatsEnv:
             pass
 
         assert requested is True
+
+    def test_lifespan_cancels_periodic_toin_stats_on_shutdown(self, monkeypatch):
+        """Shutdown cancels and awaits the periodic TOIN stats task."""
+        monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+
+        async def hold_periodic_stats_task():
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "headroom.proxy.server._log_toin_stats_periodically",
+            hold_periodic_stats_task,
+        )
+
+        app = create_app(
+            ProxyConfig(
+                optimize=False,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+                cost_tracking_enabled=False,
+                periodic_toin_stats_enabled=True,
+            )
+        )
+
+        with TestClient(app):
+            task = app.state.periodic_toin_stats_task
+            assert task is not None
+            assert not task.done()
+
+        assert task.cancelled()
+        assert app.state.periodic_toin_stats_task is None

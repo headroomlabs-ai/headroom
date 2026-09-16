@@ -51,6 +51,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import (
+    DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
@@ -65,6 +66,7 @@ from ..tokenizers.base import count_content_blocks
 from ..tokenizers.estimator import EstimatingTokenCounter
 from . import mixed_content as _mixed_content
 from .base import Transform
+from .compression_policy import cache_write_multiplier_for_ttl
 from .compressor_registry import (
     CompressInput,
     CompressorDescriptor,
@@ -98,7 +100,6 @@ split_into_sections = _mixed_content.split_into_sections
 _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
-_detect_native_verified = False  # native detect has returned once -> skip the watchdog
 
 
 # Shared calibrated fallback estimator (tiktoken cl100k_base ~90% accuracy,
@@ -532,6 +533,20 @@ def _tool_call_args_text(raw: Any) -> str:
     return " ".join(text.split())[:300]
 
 
+def read_protection_enabled() -> bool:
+    """True when HEADROOM_PROTECT_READS opts into byte-exact file-read protection.
+
+    Shared by every request path (chat/Anthropic ``ContentRouter.apply`` and the
+    OpenAI Responses units path) so the flag means the same thing everywhere.
+    """
+    return os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
+
+
 def _tool_call_command_text(raw: Any) -> str:
     """Extract the raw shell command from a tool call's args, if present.
 
@@ -917,7 +932,6 @@ def _detect_content(content: str) -> DetectionResult:
     `_strategy_from_detection` keys off that field alone.
     """
     global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
-    global _detect_native_verified
 
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
@@ -940,22 +954,30 @@ def _detect_content(content: str) -> DetectionResult:
         # another stuck daemon thread, so route straight to pure-Python.
         return _regex_detect_content_type(content)
 
+    # fastembed enables ort's API-24 feature. Entering the native initializer
+    # with an older pip ONNX Runtime does not raise: ort recursively re-enters
+    # its OnceLock error path and parks forever (#2960). Preflight before the
+    # extension call so supported Python 3.10 installs degrade immediately.
+    from headroom._ort import rust_ort_runtime_compatible
+
+    if not rust_ort_runtime_compatible():
+        _detect_native_unhealthy = True
+        logger.warning(
+            "Native content detection requires ONNX Runtime 1.24+; "
+            "using pure-Python detection for this process."
+        )
+        return _regex_detect_content_type(content)
+
     from headroom._core import detect_content_type as _rust_detect
 
     try:
-        # The native detector can deadlock on FIRST use (#575 — seen on Windows
-        # and macOS/arm64). Bound it with a watchdog so a hang degrades to the
-        # pure-Python detector; the previous win32-only guard left other
-        # platforms unprotected, so a hung Linux sidecar silently stopped
-        # compressing (every request failed open to passthrough). Watchdog until
-        # the native detector has returned once, then use the direct fast path —
-        # the hang is first-use only, so steady state pays no per-call thread
-        # overhead. win32 keeps watchdogging every call (unchanged).
-        if sys.platform == "win32" or not _detect_native_verified:
-            rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
-        else:
-            rust_result = _rust_detect(content)
-        _detect_native_verified = True  # returned without hanging -> trusted hot path
+        # Native detector state can become wedged after an earlier successful
+        # call (for example when another test or component initializes ORT).
+        # A one-time "verified" fast path therefore turns a later native stall
+        # into an unbounded process hang. Keep every call bounded; on timeout
+        # the process-wide circuit breaker below makes subsequent calls use the
+        # pure-Python detector without spawning more watchdog threads.
+        rust_result = _rust_detect_watchdogged(_rust_detect, content, _detect_timeout_secs())
         # Rust's `content_type` is the lowercase string tag (e.g.
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
@@ -1394,11 +1416,12 @@ class RouterCompressionResult:
             LOG fallback chain it's three. Lets log readers see *how*
             we got to the final compressor without parsing the
             decision_reason string.
-        cache_hit: True when this result came from the router's
-            result_cache (no fresh compression ran). Currently the
-            single-content compress() path doesn't populate the cache,
-            so this is False in practice — placeholder for the
-            cache-wire-up follow-up.
+        cache_hit: True when this result was reused from a cache
+            instead of a fresh compression run. compress() itself
+            never sets this (only apply() has the router-internal
+            two-tier cache); it is set by callers that cache unit
+            results — e.g. the OpenAI Responses handler marks reused
+            units via ``replace(router_result, cache_hit=True)``.
     """
 
     compressed: str
@@ -1520,6 +1543,11 @@ class ContentRouterConfig:
     # Runs in both modes: lossless references verbatim/folded content; CCR mode
     # references the earlier block's kompressed-but-CCR-recoverable form
     # (deterministic content-hash → stable → still cache-safe, no added loss).
+    # Per request the fold is skipped when the caller reports the serving path
+    # cannot resolve the in-context `[↑NL same as msg M]` pointer
+    # (`apply(cross_turn_dedup_recoverable=False)`, e.g. OpenAI chat-completions
+    # streaming, where no CCR retrieval tool can be injected and clients never
+    # show the model numbered messages).
     enable_cross_turn_dedup: bool = False
     # Lossless-then-lossy. In lossy mode (not `lossless`), after a byte/data
     # lossless fold (search/log/text) run the aggressive lossy compressor
@@ -1849,7 +1877,11 @@ class ContentRouter(Transform):
         ).strip().lower() in ("1", "true", "yes", "on")
         self._text_crusher: Any = None
         # Cross-turn dedup: config field OR env HEADROOM_DEDUPE (robust to how the
-        # config was built). Effective only in lossless mode (guarded in apply()).
+        # config was built). Runs in BOTH modes — the call site in ``apply()`` has
+        # no lossless guard, and ``_cross_turn_dedup_messages`` documents working
+        # against lossless folds and CCR-recoverable forms alike. (This comment
+        # previously claimed "lossless mode only", which reads as "inert in your
+        # config" to anyone auditing why dedup never fired.)
         self._cross_turn_dedup_enabled: bool = (
             self.config.enable_cross_turn_dedup
             or os.environ.get("HEADROOM_DEDUPE", "").strip().lower() in ("1", "true", "yes", "on")
@@ -1916,7 +1948,19 @@ class ContentRouter(Transform):
         # we match that posture with a dedicated lock rather than relying on
         # GIL atomicity (which would not protect the read-then-evict sequence).
         self._frozen_verdicts: dict[int, bool] = {}
-        self._frozen_verdicts_max = 4096
+        # The store is process-wide (one router per pipeline, shared by every
+        # session), so the cap must scale with the number of CONCURRENT
+        # sessions, not one user's workload: at org scale (many users behind
+        # one sidecar) 4096 churns in minutes and FIFO eviction lets tightened
+        # thresholds flip a still-cached block's verdict — a prefix bust.
+        # Read at construction so tests and multi-tenant deployments can size
+        # it via HEADROOM_FROZEN_VERDICTS_MAX without a module reload.
+        try:
+            self._frozen_verdicts_max = max(
+                256, int(os.environ.get("HEADROOM_FROZEN_VERDICTS_MAX", "4096"))
+            )
+        except ValueError:
+            self._frozen_verdicts_max = 4096
         self._frozen_lock = threading.Lock()
         # Reset verdicts whenever the shadowed cache is cleared.
         self._cache.register_on_clear(self._clear_frozen_verdicts)
@@ -2118,11 +2162,17 @@ class ContentRouter(Transform):
             logger.debug("TOIN recording failed (non-fatal): %s", e)
 
     def _timed_compress(
-        self, content: str, context: str, bias: float
+        self,
+        content: str,
+        context: str,
+        bias: float,
+        precomputed_detection: DetectionResult | None = None,
     ) -> tuple[RouterCompressionResult, float]:
         """Compress with wall-clock timing.  Used by parallel executor."""
         t0 = time.perf_counter()
-        result = self.compress(content, context=context, bias=bias)
+        result = self.compress(
+            content, context=context, bias=bias, precomputed_detection=precomputed_detection
+        )
         return result, (time.perf_counter() - t0) * 1000
 
     def compress(
@@ -2131,6 +2181,7 @@ class ContentRouter(Transform):
         context: str = "",
         question: str | None = None,
         bias: float = 1.0,
+        precomputed_detection: DetectionResult | None = None,
     ) -> RouterCompressionResult:
         """Compress content using optimal strategy based on content detection.
 
@@ -2140,6 +2191,12 @@ class ContentRouter(Transform):
             question: Optional question for QA-aware compression. When provided,
                 tokens relevant to answering this question are preserved.
             bias: Compression bias multiplier (>1 = keep more, <1 = keep fewer).
+            precomputed_detection: A ``_detect_content(content)`` result the
+                caller already computed for the same content. When supplied, it
+                is reused instead of re-running the native detection chain — the
+                router's hottest per-message cost. ``apply`` computes detection
+                once per message (for its code-protection checks) and passes it
+                here so a cache-miss message is not detected twice.
 
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
@@ -2187,7 +2244,11 @@ class ContentRouter(Transform):
                 strategy = CompressionStrategy.KOMPRESS
             else:
                 mixed = is_mixed_content(content)
-                detection = _detect_content(content)
+                detection = (
+                    precomputed_detection
+                    if precomputed_detection is not None
+                    else _detect_content(content)
+                )
                 strategy = self._determine_strategy(content, mixed=mixed, detection=detection)
             if debug_enabled:
                 _log_router_debug(
@@ -2406,7 +2467,30 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with reassembled content.
         """
-        sections = split_into_sections(content)
+        from .tag_protector import protect_tags, restore_tags
+
+        # Protect custom-tag blocks BEFORE splitting into sections. Section
+        # boundaries (code fences, blank lines) split a
+        # ``<system-reminder>...</system-reminder>`` pair across sections, so
+        # the per-section tag protection inside ``_try_ml_compressor`` never
+        # sees a matched pair (an unmatched tag protects nothing) and
+        # instruction blocks — Claude Code ships CLAUDE.md inside
+        # <system-reminder> — leak into lossy ML compression and arrive
+        # word-dropped. Protecting here keeps the whole block as one
+        # placeholder that spans sections intact.
+        cleaned, protected = protect_tags(
+            content,
+            compress_tagged_content=self.config.compress_tagged_content,
+        )
+        sections_source = cleaned if protected else content
+
+        # Placeholder lines must each be their own section (see the
+        # placeholder passthrough below): a placeholder sharing a section
+        # with prose would drag that prose into verbatim passthrough.
+        sections = split_into_sections(
+            sections_source,
+            isolate=tuple(placeholder for placeholder, _ in protected),
+        )
         if logger.isEnabledFor(logging.DEBUG):
             _log_router_debug(
                 "content_router_mixed_sections",
@@ -2422,10 +2506,32 @@ class ContentRouter(Transform):
                 strategy_used=CompressionStrategy.PASSTHROUGH,
             )
 
+        # Placeholders must survive byte-exact: ``restore_tags`` DISCARDS a
+        # protected block whose placeholder was stripped or rewritten
+        # (Hotfix-A9), so a compressor eating a placeholder would silently
+        # drop the whole tag block — worse than the mangling this fixes.
+        # Any section carrying a placeholder is passed through verbatim
+        # instead of ever entering a compressor.
+        placeholders = [placeholder for placeholder, _ in protected]
+
         compressed_sections: list[str] = []
         routing_log: list[RoutingDecision] = []
 
         for i, section in enumerate(sections):
+            if placeholders and any(ph in section.content for ph in placeholders):
+                section_tokens = _estimate_tokens(section.content)
+                compressed_sections.append(section.content)
+                routing_log.append(
+                    RoutingDecision(
+                        content_type=section.content_type,
+                        strategy=CompressionStrategy.PASSTHROUGH,
+                        original_tokens=section_tokens,
+                        compressed_tokens=section_tokens,
+                        section_index=i,
+                    )
+                )
+                continue
+
             # Get strategy for this section
             strategy = self._strategy_from_detection_type(section.content_type)
 
@@ -2444,6 +2550,24 @@ class ContentRouter(Transform):
             if section.is_code_fence and section.language:
                 compressed_content = f"```{section.language}\n{compressed_content}\n```"
 
+            # A JSON_ARRAY section whose compressed form is a bare JSON
+            # *string* (SmartCrusher's lossless CSV+schema render replaces
+            # the whole array with one string value) must be spliced back
+            # as the raw text it encodes. Left as the JSON literal, the
+            # section lands mid-prose as one quote-wrapped line with `\n`
+            # as two-character escapes — the classic "compression garbled
+            # the output" report. Valid inside a JSON document; unreadable
+            # inside mixed text.
+            if section.content_type is ContentType.JSON_ARRAY and compressed_content.startswith(
+                '"'
+            ):
+                try:
+                    _unwrapped = json.loads(compressed_content)
+                except (TypeError, ValueError):
+                    _unwrapped = None
+                if isinstance(_unwrapped, str):
+                    compressed_content = _unwrapped
+
             compressed_sections.append(compressed_content)
             routing_log.append(
                 RoutingDecision(
@@ -2455,8 +2579,12 @@ class ContentRouter(Transform):
                 )
             )
 
+        compressed = "\n\n".join(compressed_sections)
+        if protected:
+            compressed = restore_tags(compressed, protected)
+
         return RouterCompressionResult(
-            compressed="\n\n".join(compressed_sections),
+            compressed=compressed,
             original=content,
             strategy_used=CompressionStrategy.MIXED,
             routing_log=routing_log,
@@ -4186,10 +4314,41 @@ class ContentRouter(Transform):
             else:
                 status["code_aware"] = "not installed"
 
-        # 4. SmartCrusher (lightweight init, but ensures import + TOIN ready)
+        # 4. SmartCrusher (lightweight init)
         smart_crusher = self._get_smart_crusher()
         if smart_crusher:
             status["smart_crusher"] = "ready"
+
+        # 5. HTML extractor.
+        #
+        # By far the most expensive lazy import in the transform tree: MEASURED
+        # 978ms for trafilatura -> htmldate -> dateparser and its timezone
+        # tables, against 1-20ms for every other compressor module. It fires
+        # from _get_html_extractor() on the first request carrying an HTML-ish
+        # block or mixed-content section, so a real user pays the full second
+        # mid-request. That is the single largest first-request stall in the
+        # pipeline, which is why it is worth a line here.
+        try:
+            if self._get_html_extractor() is not None:
+                status["html_extractor"] = "ready"
+            else:
+                status["html_extractor"] = "not installed"
+        except Exception as e:
+            logger.debug("HTML extractor pre-load skipped: %s", e)
+            status["html_extractor"] = "skipped"
+
+        # 6. TOIN singleton. Constructing it reads the learned-pattern file off
+        # disk (MEASURED ~150ms at 5MB, and it grows with use). SmartCrusher
+        # above does NOT pull it in, despite what a previous comment here
+        # claimed — the first request did.
+        try:
+            from ..telemetry.toin import get_toin
+
+            get_toin()
+            status["toin"] = "ready"
+        except Exception as e:
+            logger.debug("TOIN pre-load skipped: %s", e)
+            status["toin"] = "skipped"
 
         return status
 
@@ -4448,6 +4607,7 @@ class ContentRouter(Transform):
         transforms_applied: list[str],
         batch_state: dict[str, int | None] | None = None,
         p_alive_override: float | None = None,
+        write_multiplier: float | None = None,
     ) -> bool:
         """Break-even gate for one candidate mutation (#856 P2, flag-gated).
 
@@ -4532,7 +4692,15 @@ class ContentRouter(Transform):
                 p_alive = _p_alive
             except ValueError:
                 logger.warning("HEADROOM_NET_COST_P_ALIVE malformed; using 1.0")
-        gain = float(policy.net_mutation_gain(delta_t, suffix, reads, p_alive))
+        gain = float(
+            policy.net_mutation_gain(
+                delta_t,
+                suffix,
+                reads,
+                p_alive,
+                write_multiplier=write_multiplier,
+            )
+        )
         allowed = gain > 0.0
         logger.info(
             "NetCostPolicy slot=%d delta_t=%d suffix=%d reads=%.1f p_alive=%.2f "
@@ -4641,6 +4809,11 @@ class ContentRouter(Transform):
             "compress_assistant_text_blocks",
             self.config.compress_assistant_text_blocks,
         )
+        # Set only by callers that replay last turn's forwarded prefix over
+        # this turn's output (the proxy handlers, via finalize_turn). It
+        # unlocks compression of a cache_control tool_result in the final
+        # message; see contract 1 in _process_content_blocks.
+        prefix_replay_guaranteed = kwargs.get("prefix_replay_guaranteed") is True
         min_chars_for_block_compression = kwargs.get(
             "min_chars_for_block_compression",
             self.config.min_chars_for_block_compression,
@@ -4662,6 +4835,20 @@ class ContentRouter(Transform):
         # pass a policy — ``_record_to_toin`` treats that as "no gate"
         # to preserve pre-F2.2 behaviour for non-proxy callers.
         self._runtime_compression_policy = kwargs.get("compression_policy")
+        # Cross-turn dedup recoverability gate. The fold rewrites a repeated
+        # span to a bare in-context pointer (``[↑NL same as msg M]``) that names
+        # Headroom's internal message index. That reference is only resolvable
+        # where the model can locate the original: on the OpenAI
+        # chat-completions streaming path (e.g. ``wrap copilot``) no CCR
+        # retrieval tool can be injected (the path cannot intercept tool calls)
+        # and the client never shows the model numbered messages, so the
+        # pointer reads as deleted content and the model retry-loops on the
+        # "missing" output. Same recoverability posture as the lossy
+        # ``lossy_unrecoverable_skipped`` guard: when the caller reports the
+        # path cannot resolve in-context pointers, skip the fold and keep the
+        # bytes verbatim. Default True: every path that does not opt out keeps
+        # today's behavior.
+        dedup_pointers_recoverable = bool(kwargs.get("cross_turn_dedup_recoverable", True))
 
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
@@ -4713,12 +4900,7 @@ class ContentRouter(Transform):
         # Type-specific by design: grep/test/ls output stays compressible, so the
         # cache-mode delta still compresses whenever the newest turn is NOT a read.
         self._protect_read_tool_ids = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
-            "0",
-            "",
-            "false",
-            "no",
-        ):
+        if read_protection_enabled():
             # Use _tool_call_commands (the parsed shell command), NOT
             # _tool_call_args (a compact free-text blob that, for OpenAI-style
             # JSON-string args, is the raw ``{"command": ...}`` JSON — on which
@@ -4740,12 +4922,7 @@ class ContentRouter(Transform):
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
         self._protect_read_msg_indices: set[int] = set()
-        if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
-            "0",
-            "",
-            "false",
-            "no",
-        ):
+        if read_protection_enabled():
             for _idx, _m in enumerate(messages):
                 if _m.get("role") != "user":
                     continue
@@ -4895,7 +5072,22 @@ class ContentRouter(Transform):
         # env-constant behaviour. Derived once here (not per slot) — idle is a
         # per-request property, like frozen_message_count.
         netcost_p_alive_override: float | None = None
+        netcost_write_multiplier: float | None = None
         if netcost_enabled:
+            # Prefer the authoritative per-request prompt-cache TTL when the
+            # caller has one; retain the env setting for other providers and
+            # legacy callers.
+            request_ttl = kwargs.get("cache_ttl_seconds")
+            if request_ttl is None:
+                netcost_ttl = _net_cost_cache_ttl_seconds()
+            else:
+                try:
+                    netcost_ttl = float(request_ttl)
+                except (TypeError, ValueError):
+                    netcost_ttl = _net_cost_cache_ttl_seconds()
+                if not math.isfinite(netcost_ttl) or netcost_ttl <= 0.0:
+                    netcost_ttl = _net_cost_cache_ttl_seconds()
+            netcost_write_multiplier = cache_write_multiplier_for_ttl(netcost_ttl)
             netcost_suffix_tokens = [0] * (num_messages + 1)
             for j in range(num_messages - 1, -1, -1):
                 netcost_suffix_tokens[j] = netcost_suffix_tokens[j + 1] + _netcost_message_tokens(
@@ -4908,11 +5100,13 @@ class ContentRouter(Transform):
                 except (TypeError, ValueError):
                     idle_f = None
                 if idle_f is not None and math.isfinite(idle_f) and idle_f >= 0.0:
-                    ttl = _net_cost_cache_ttl_seconds()
-                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / ttl)
+                    netcost_p_alive_override = max(0.0, 1.0 - idle_f / netcost_ttl)
 
-        # Tasks: list of (slot_index, content, context, bias, content_key)
-        _PendingTask = tuple[int, str, str, float, int, bool]
+        # Tasks: list of (slot_index, content, context, bias, content_key,
+        # enforce_reversibility, precomputed_detection). The detection is the one
+        # already computed in the routing loop below, threaded through so a
+        # cache-miss message is not re-detected inside compress().
+        _PendingTask = tuple[int, str, str, float, int, bool, "DetectionResult | None"]
         pending_tasks: list[_PendingTask] = []
 
         # #856 P2b (flag-gated, default off): net-cost frozen-floor unlock.
@@ -4970,6 +5164,7 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    prefix_replay_guaranteed=prefix_replay_guaranteed,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -5013,8 +5208,15 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(content)
+                        # output can still be losslessly compacted, UNLESS this is
+                        # a file read: every fold rewrites the bytes the model
+                        # copies into `Edit(old_string=…)`, and a missed edit costs
+                        # a whole turn (see DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS).
+                        compacted = (
+                            None
+                            if is_tool_excluded(tool_name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS)
+                            else self._lossless_compact_excluded(content)
+                        )
                         if compacted is not None:
                             folded, kind = compacted
                             result_slots[i] = {**message, "content": folded}
@@ -5213,6 +5415,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        write_multiplier=netcost_write_multiplier,
                     ):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
@@ -5246,11 +5449,23 @@ class ContentRouter(Transform):
                 route_counts["cache_hit"] += 1
                 continue
 
-            # Cache miss — defer to parallel compression pass
+            # Cache miss — defer to parallel compression pass. Carry the
+            # detection already computed above so compress() need not re-run the
+            # native detection chain on this same content. Only the full
+            # detection is reused; under force_kompress the loop used the
+            # lightweight regex detector and compress() skips detection entirely.
             route_counts.setdefault("cache_miss", 0)
             route_counts["cache_miss"] += 1
             pending_tasks.append(
-                (i, content, context, msg_bias, content_key, enforce_reversibility)
+                (
+                    i,
+                    content,
+                    context,
+                    msg_bias,
+                    content_key,
+                    enforce_reversibility,
+                    None if force_kompress else detection,
+                )
             )
 
         # --- Pass 2: Parallel compression of all cache-miss messages ---
@@ -5263,7 +5478,7 @@ class ContentRouter(Transform):
             if max_workers <= 1 or len(pending_tasks) == 1:
                 # Single task or parallelism disabled — compress inline
                 task_results = []
-                for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                     t0 = time.perf_counter()
                     deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
                     if deadline_s:
@@ -5274,10 +5489,14 @@ class ContentRouter(Transform):
                             _content: str = task_content,
                             _context: str = task_ctx,
                             _bias: float = task_bias,
+                            _detection: DetectionResult | None = task_detection,
                         ) -> None:
                             try:
                                 _box["result"] = self.compress(
-                                    _content, context=_context, bias=_bias
+                                    _content,
+                                    context=_context,
+                                    bias=_bias,
+                                    precomputed_detection=_detection,
                                 )
                             except BaseException as exc:  # noqa: BLE001
                                 _box["error"] = exc
@@ -5304,16 +5523,27 @@ class ContentRouter(Transform):
                         else:
                             r = box["result"]
                     else:
-                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                        r = self.compress(
+                            task_content,
+                            context=task_ctx,
+                            bias=task_bias,
+                            precomputed_detection=task_detection,
+                        )
                     compress_ms = (time.perf_counter() - t0) * 1000
                     task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = []
-                    for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
+                    for _, task_content, task_ctx, task_bias, _, _, task_detection in pending_tasks:
                         futures.append(
-                            executor.submit(self._timed_compress, task_content, task_ctx, task_bias)
+                            executor.submit(
+                                self._timed_compress,
+                                task_content,
+                                task_ctx,
+                                task_bias,
+                                task_detection,
+                            )
                         )
                     task_results = [f.result() for f in futures]
 
@@ -5321,7 +5551,7 @@ class ContentRouter(Transform):
             compressor_timing["parallel_compress_total"] = parallel_ms
 
             # --- Pass 3: Merge results back (sequential, updates caches) ---
-            for (slot_idx, task_content, _, _, content_key, enforce_rev), (
+            for (slot_idx, task_content, _, _, content_key, enforce_rev, _), (
                 result,
                 compress_ms,
             ) in zip(pending_tasks, task_results):
@@ -5390,6 +5620,7 @@ class ContentRouter(Transform):
                         transforms_applied=transforms_applied,
                         batch_state=netcost_batch_state,
                         p_alive_override=netcost_p_alive_override,
+                        write_multiplier=netcost_write_multiplier,
                     ):
                         result_slots[slot_idx] = message
                         continue
@@ -5427,7 +5658,7 @@ class ContentRouter(Transform):
         # later duplicate would carry the same (recoverable) form anyway; dedup
         # just points to the earlier copy instead of repeating it. Frozen +
         # cache_control blocks are reference targets only (never rewritten).
-        if self._cross_turn_dedup_enabled:
+        if self._cross_turn_dedup_enabled and dedup_pointers_recoverable:
             transformed_messages = self._cross_turn_dedup_messages(
                 transformed_messages, frozen_message_count, transforms_applied, route_counts
             )
@@ -5445,7 +5676,16 @@ class ContentRouter(Transform):
         if route_counts["user_msg"]:
             parts.append(f"{route_counts['user_msg']} skipped (user)")
         if route_counts["small"]:
-            parts.append(f"{route_counts['small']} skipped (<50 words)")
+            # Report the thresholds actually in force, not a literal. This line
+            # used to read "skipped (<50 words)" unconditionally: wrong number
+            # (the message gate is `min_tokens`, which profiles set anywhere from
+            # 10 to 250), wrong unit (tokens and characters, never words), and it
+            # merged two different gates under one label. Operators read it as
+            # evidence of a mis-set threshold and tuned the wrong knob.
+            parts.append(
+                f"{route_counts['small']} skipped "
+                f"(<{min_tokens} tok msg / <{min_chars_for_block_compression} chars block)"
+            )
         if route_counts["recent_code"]:
             parts.append(f"{route_counts['recent_code']} protected (recent code)")
         if route_counts["analysis_ctx"]:
@@ -5534,13 +5774,22 @@ class ContentRouter(Transform):
         * LOG (build/test/app logs) -> ANSI strip + run-collapse. Recoverable
           modulo non-semantic ANSI color (``expand_runs`` restores the lines).
         * JSON -> whitespace-minify. **Data-lossless** (``json.loads`` equals the
-          original object) — same information, fewer tokens. NOT byte-exact, so a
-          read-then-``Edit(old_string=…)`` on the *same* JSON file could miss; the
-          data is fully preserved.
+          original object) — same information, fewer tokens. NOT byte-exact.
+
+        "Information-preserving" is the guarantee, and it is weaker than it looks
+        from in here: recoverability is OURS, but the string the model copies into
+        the next ``Edit(old_string=…)`` is the one we SHOWED it. All three folds
+        show something the file does not contain — minified JSON, ``... (repeated
+        N times)``, a hoisted path heading — so all three break a read-then-edit.
+        Callers must therefore NOT route a file read here: every call site gates
+        on ``DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS`` (and the stricter
+        ``DEFAULT_VERBATIM_EXCLUDE_TOOLS``, which covers Copilot's ``view``) first.
+        This function takes only ``content`` and cannot make that call itself —
+        which is also why the pluggable provider below, being content-only, is
+        never handed a read.
 
         Returns ``(compacted, kind)`` when a recognized shape actually shrinks,
         else ``None``. Source code and glob path-lists match nothing -> verbatim.
-        Always safe to run (information-preserving) so there is no feature gate.
         Never raises.
         """
         if not isinstance(content, str):
@@ -5805,6 +6054,7 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        prefix_replay_guaranteed: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -5814,7 +6064,26 @@ class ContentRouter(Transform):
              the cache key the upstream provider matches against, turning
              a 90% read discount into a 25% write penalty (Anthropic).
              We never modify cache_control'd blocks, regardless of role
-             or block type.
+             or block type -- EXCEPT a tool_result in the request's final
+             user/tool message. That message has never been forwarded, so
+             no provider key exists for it yet; the marker there is the
+             client staking out NEXT turn's breakpoint (Claude Code
+             stamps its newest tool_result every turn). Compressing it
+             now is what the marker gets cached as, and the frozen-prefix
+             guard replays those bytes from the next turn on. Skipping it
+             meant the freshest tool output was protected on the one turn
+             it was fresh (measured 1,229 cache_control_protected visits
+             across 650 Claude Code requests in a day, ~2 per request).
+             The exception is only sound for a caller that replays last
+             turn's FORWARDED bytes over this turn's pipeline output (the
+             proxy's frozen-prefix overlay, session_engine.finalize_turn):
+             next turn the block is no longer final, this contract
+             hard-skips it again, and the router alone would forward the
+             client's original bytes and bust the key it just wrote.
+             Such callers pass ``prefix_replay_guaranteed=True``; every
+             other caller (SDK client, evals, a bare router) keeps the
+             hard skip. Text blocks keep the hard skip everywhere: a
+             marked user prompt is the user's words, not tool output.
           2. Assistant text blocks are echoed back by the client in
              subsequent turns and become part of the upstream provider's
              auto-prefix cache (DeepSeek, OpenAI). Default-skip; opt in
@@ -5869,6 +6138,15 @@ class ContentRouter(Transform):
         else:
             protect_text_blocks = True
 
+        # The final user/tool message is this turn's fresh content: not yet
+        # forwarded, so its cache_control marker names a key the provider has
+        # not written. Everything earlier may already be cached under its
+        # marker and stays byte-exact (contract 1). Only tool_result blocks
+        # are released; a marked text block is the user's prompt.
+        fresh_turn = (
+            prefix_replay_guaranteed and messages_from_end == 1 and role in ("user", "tool")
+        )
+
         for block in content_blocks:
             if not isinstance(block, dict):
                 new_blocks.append(block)
@@ -5878,7 +6156,7 @@ class ContentRouter(Transform):
             # cache breakpoint. Frozen-message-count is a coarse
             # message-level approximation; this is the per-block
             # guarantee that we never bust an explicit cache key.
-            if "cache_control" in block:
+            if "cache_control" in block and not (fresh_turn and block.get("type") == "tool_result"):
                 new_blocks.append(block)
                 if route_counts is not None:
                     route_counts.setdefault("cache_control_protected", 0)
@@ -5948,8 +6226,15 @@ class ContentRouter(Transform):
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
-                        # output can still be losslessly compacted.
-                        compacted = self._lossless_compact_excluded(block.get("content"))
+                        # output can still be losslessly compacted, UNLESS this is
+                        # a file read (see DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS). This
+                        # is the shape Claude Code's own `Read` arrives in, so it
+                        # has to carry the same guard as the OpenAI branch above.
+                        compacted = (
+                            None
+                            if is_tool_excluded(tool_name, DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS)
+                            else self._lossless_compact_excluded(block.get("content"))
+                        )
                         if compacted is not None:
                             folded, kind = compacted
                             new_blocks.append({**block, "content": folded})

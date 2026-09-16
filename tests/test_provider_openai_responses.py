@@ -23,8 +23,15 @@ def test_openai_responses_route_aliases_are_explicit() -> None:
         "/v1/codex/responses",
         "/backend-api/responses",
         "/backend-api/codex/responses",
+        "/responses",
     )
-    assert OPENAI_RESPONSES_WEBSOCKET_PATHS == OPENAI_RESPONSES_ROOT_PATHS
+    assert OPENAI_RESPONSES_WEBSOCKET_PATHS == (
+        "/v1/responses",
+        "/v1/codex/responses",
+        "/backend-api/responses",
+        "/backend-api/codex/responses",
+    )
+    assert "/responses" not in OPENAI_RESPONSES_WEBSOCKET_PATHS
     assert OPENAI_RESPONSES_SUBPATH_ROUTES == (
         OpenAIResponsesSubpathRoute("/v1/responses/{sub_path:path}", ("GET", "POST", "DELETE")),
         OpenAIResponsesSubpathRoute(

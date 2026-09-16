@@ -178,7 +178,7 @@ describe("withHeadroom", () => {
     mockFetch.mockReset();
   });
 
-  it("returns a LanguageModelV3 with correct provider and modelId", () => {
+  it("returns a LanguageModelV4 with correct provider and modelId", () => {
     const fakeModel = {
       specificationVersion: "v3" as const,
       provider: "openai",
@@ -192,7 +192,7 @@ describe("withHeadroom", () => {
       baseUrl: "http://localhost:8787",
     });
 
-    expect(wrapped.specificationVersion).toBe("v3");
+    expect(wrapped.specificationVersion).toBe("v4");
     expect(wrapped.modelId).toBe("gpt-4o");
     expect(wrapped.provider).toBe("openai");
   });

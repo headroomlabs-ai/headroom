@@ -207,6 +207,7 @@ class TestSecretMasking:
         )
         monkeypatch.setattr(settings_store, "SETTINGS", registry)
         monkeypatch.setattr(settings_store, "_BY_KEY", {f.key: f for f in registry})
+        monkeypatch.setattr(settings_store, "_BY_ENV", {f.env: f for f in registry})
         settings_store.save({"log_file": "/tmp/secret.log"})
 
         assert client.get("/settings").json()["log_file"] == settings_store._MASK

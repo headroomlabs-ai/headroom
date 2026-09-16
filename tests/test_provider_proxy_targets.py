@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from headroom.providers.proxy_targets import (
     api_target,
     select_passthrough_base_url,
     vertex_target_for_location,
 )
 from headroom.providers.registry import DEFAULT_VERTEX_API_URL
+from headroom.proxy import upstream_guard
 
 
 def _proxy(**legacy_targets: str):
@@ -56,13 +59,21 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
     assert select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    assert (
-        select_passthrough_base_url(
-            proxy,
-            {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"},
+    # The Azure branch honours the override only after the SSRF guard clears
+    # the destination (CVE-2026-77775), and `azure.example` does not resolve.
+    # Pin a public answer so this stays a test of target *precedence*.
+    with patch.object(
+        upstream_guard.socket,
+        "getaddrinfo",
+        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
+    ):
+        assert (
+            select_passthrough_base_url(
+                proxy,
+                {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"},
+            )
+            == "https://azure.example/base"
         )
-        == "https://azure.example/base"
-    )
     assert select_passthrough_base_url(proxy, {"x-api-key": "anthropic"}) == (
         "https://legacy.anthropic.test"
     )

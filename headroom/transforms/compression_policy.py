@@ -58,19 +58,33 @@ _MAX_LOSSY_RATIO_SUBSCRIPTION: float = 0.25
 #: Anthropic prompt-cache write multiplier: a ``cache_creation`` token
 #: costs 1.25x a plain input token (5-minute TTL tier). Input to the
 #: net-cost mutation formula (#856). Mirrors the Rust ``pub const``.
-#: ponytail: hardcoded to the 5m tier. A client on Anthropic's 1h cache
-#: (ENABLE_PROMPT_CACHING_1H / cache_control.ttl="1h", which Headroom
-#: preserves) writes at 2.0x, so its mutations are gated with a ~40%
-#: under-stated write penalty. Harmless while the net-cost gate stays
-#: default-off (HEADROOM_NET_COST_POLICY); thread the TTL from
-#: cold_prefix.anthropic_cache_ttl_seconds through ContentRouter ->
-#: net_mutation_gain if that gate is ever turned on.
 CACHE_WRITE_MULTIPLIER: float = 1.25
+
+#: Anthropic prompt-cache write multiplier for the 1-hour TTL tier.
+CACHE_WRITE_MULTIPLIER_1H: float = 2.0
 
 #: Anthropic prompt-cache read multiplier: a ``cache_read`` token costs
 #: 0.1x a plain input token. Input to the net-cost mutation formula
 #: (#856). Mirrors the Rust ``pub const``.
 CACHE_READ_MULTIPLIER: float = 0.1
+
+
+def cache_write_multiplier_for_ttl(ttl_seconds: float | int | None) -> float:
+    """Return the cache-write multiplier for a prompt-cache TTL tier.
+
+    The net-cost gate prefers an authoritative request-level TTL and falls
+    back to its environment setting when no request TTL is available.
+    Invalid and non-positive values retain the 5-minute default.
+    """
+    if ttl_seconds is None:
+        return CACHE_WRITE_MULTIPLIER
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return CACHE_WRITE_MULTIPLIER
+    if not math.isfinite(ttl) or ttl <= 0.0:
+        return CACHE_WRITE_MULTIPLIER
+    return CACHE_WRITE_MULTIPLIER_1H if ttl >= 3600.0 else CACHE_WRITE_MULTIPLIER
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +150,8 @@ class CompressionPolicy:
         suffix_tokens: int,
         expected_reads: float,
         p_alive: float,
+        *,
+        write_multiplier: float | None = None,
     ) -> float:
         """Net gain (in plain-input-token cost units) of a mutation that
         removes ``delta_t`` tokens from a message whose cached suffix is
@@ -156,7 +172,7 @@ class CompressionPolicy:
         ``>= 0`` (NaN → 0), ``p_alive`` to ``[0, 1]`` (NaN → 1, the
         conservative full-penalty assumption — same as Rust).
         """
-        w = CACHE_WRITE_MULTIPLIER
+        w = CACHE_WRITE_MULTIPLIER if write_multiplier is None else write_multiplier
         r = CACHE_READ_MULTIPLIER
         dt = max(0, delta_t)
         suffix = max(0, suffix_tokens)
@@ -172,12 +188,29 @@ class CompressionPolicy:
         suffix_tokens: int,
         expected_reads: float,
         p_alive: float,
+        *,
+        write_multiplier: float | None = None,
     ) -> bool:
         """Decision form of :meth:`net_mutation_gain`: mutate iff the
         gain is strictly positive."""
-        return self.net_mutation_gain(delta_t, suffix_tokens, expected_reads, p_alive) > 0.0
+        return (
+            self.net_mutation_gain(
+                delta_t,
+                suffix_tokens,
+                expected_reads,
+                p_alive,
+                write_multiplier=write_multiplier,
+            )
+            > 0.0
+        )
 
-    def break_even_reads(self, delta_t: int, suffix_tokens: int) -> float:
+    def break_even_reads(
+        self,
+        delta_t: int,
+        suffix_tokens: int,
+        *,
+        write_multiplier: float | None = None,
+    ) -> float:
         """Remaining-read count at which a warm-cache (``p_alive=1``)
         mutation breaks even::
 
@@ -192,7 +225,7 @@ class CompressionPolicy:
         """
         if delta_t <= 0:
             return 0.0
-        w = CACHE_WRITE_MULTIPLIER
+        w = CACHE_WRITE_MULTIPLIER if write_multiplier is None else write_multiplier
         r = CACHE_READ_MULTIPLIER
         return ((w - r) / r) * (float(max(0, suffix_tokens)) / float(delta_t))
 

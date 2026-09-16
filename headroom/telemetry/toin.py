@@ -97,6 +97,13 @@ DEFAULT_MODEL_FAMILY: Final[str] = "unknown"
 # environment; this is the production default the Rust proxy expects.
 DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH: Final[int] = 50
 
+# TOIN is a diagnostic learning store, not an archive. Keep its default
+# footprint bounded so a long-lived proxy cannot turn observations into an
+# unbounded memory/disk liability.
+DEFAULT_MAX_PATTERNS: Final[int] = 10_000
+DEFAULT_MAX_STORAGE_BYTES: Final[int] = 128 * 1024 * 1024
+MAX_QUERY_PATTERN_LENGTH: Final[int] = 512
+
 # Aggregation-key serialization separator. Used to encode the
 # `(auth_mode, model_family, sig_hash)` tuple as a string for JSON
 # storage (JSON object keys must be strings) and for cross-instance
@@ -391,6 +398,8 @@ class TOINConfig:
     # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
+    max_patterns: int = DEFAULT_MAX_PATTERNS
+    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
 
     # Network learning thresholds
     min_samples_for_recommendation: int = 10
@@ -452,7 +461,10 @@ class ToolIntelligenceNetwork:
         if backend is not None:
             self._backend = backend
         elif self._config.storage_path:
-            self._backend = FileSystemTOINBackend(self._config.storage_path)
+            self._backend = FileSystemTOINBackend(
+                self._config.storage_path,
+                max_load_bytes=self._config.max_storage_bytes,
+            )
         else:
             self._backend = None
 
@@ -696,6 +708,7 @@ class ToolIntelligenceNetwork:
             pattern.last_updated = time.time()
             pattern.confidence = self._calculate_confidence(pattern)
             self._dirty = True
+            self._prune_patterns_locked()
 
         # Auto-save if needed (outside lock)
         self._maybe_auto_save()
@@ -774,6 +787,59 @@ class ToolIntelligenceNetwork:
                 reverse=True,
             )[:100]
             pattern.field_semantics = dict(sorted_fields)
+
+    def _prune_patterns_locked(self) -> None:
+        """Bound the pattern table, evicting least-useful observations first.
+
+        The lock must be held by the caller. Patterns below the publish
+        threshold are disposable learning noise; within each class, oldest
+        observations are evicted first. If every pattern is mature, oldest
+        wins, keeping the table bounded without silently preferring a tenant.
+        """
+        limit = max(1, self._config.max_patterns)
+        if len(self._patterns) <= limit:
+            return
+
+        excess = len(self._patterns) - limit
+        evict = sorted(
+            self._patterns,
+            key=lambda key: (
+                self._patterns[key].sample_size >= DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH,
+                self._patterns[key].last_updated,
+            ),
+        )[:excess]
+        for key in evict:
+            del self._patterns[key]
+
+        logger.info(
+            "TOIN pattern table pruned",
+            extra={
+                "event": "toin_patterns_pruned",
+                "evicted": excess,
+                "remaining": len(self._patterns),
+            },
+        )
+
+    def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
+        """Remove legacy raw query keys from a loaded pattern."""
+        import re
+
+        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        changed = False
+        frequencies: dict[str, int] = {}
+        for raw_key, count in pattern.query_pattern_frequency.items():
+            if safe_pattern.fullmatch(raw_key) and len(raw_key) <= MAX_QUERY_PATTERN_LENGTH:
+                frequencies[raw_key] = max(0, int(count))
+            else:
+                changed = True
+        if frequencies != pattern.query_pattern_frequency:
+            changed = True
+            pattern.query_pattern_frequency = frequencies
+        safe_common = [key for key in pattern.common_query_patterns if key in frequencies]
+        if safe_common != pattern.common_query_patterns:
+            changed = True
+            pattern.common_query_patterns = safe_common[: self._config.max_query_patterns]
+        return changed
 
     def record_retrieval(
         self,
@@ -949,6 +1015,7 @@ class ToolIntelligenceNetwork:
 
             pattern.last_updated = time.time()
             self._dirty = True
+            self._prune_patterns_locked()
 
         self._maybe_auto_save()
 
@@ -1050,14 +1117,22 @@ class ToolIntelligenceNetwork:
         if not query:
             return None
 
-        # Simple pattern extraction: replace values after : or =
+        # Only retain structured field/value predicates. Returning an
+        # unchanged free-form prompt here would persist the prompt verbatim,
+        # violating TOIN's privacy contract (and can produce multi-MB keys).
         import re
 
         # Match field:value or field="value" patterns, but don't include spaces in unquoted values
-        pattern = re.sub(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', r"\1:*", query)
+        matches = re.findall(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', query)
+        if not matches:
+            return None
+
+        # Preserve useful field shape while dropping operators, values, and
+        # all unrelated text (which may contain arbitrary prompt data).
+        pattern = " ".join(f"{field}:*" for field in matches)
 
         # Remove if it's just generic
-        if pattern in ("*", ""):
+        if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:
             return None
 
         return pattern
@@ -1217,6 +1292,7 @@ class ToolIntelligenceNetwork:
             for serialized_key, pattern_dict in patterns_data.items():
                 key = _deserialize_pattern_key(serialized_key)
                 imported = ToolPattern.from_dict(pattern_dict)
+                self._sanitize_loaded_pattern(imported)
                 # Make sure dataclass fields agree with the dict key — pre-B5
                 # dumps don't carry auth_mode/model_family on the pattern;
                 # promote from the (possibly default) key.
@@ -1241,6 +1317,7 @@ class ToolIntelligenceNetwork:
                             # CRITICAL: Always increment user_count (even after cap)
                             pattern.user_count += 1
 
+            self._prune_patterns_locked()
             self._dirty = True
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
@@ -1472,7 +1549,15 @@ class ToolIntelligenceNetwork:
             data = self._backend.load()
             if data:
                 self.import_patterns(data)
-                self._dirty = False
+                with self._lock:
+                    changed = any(
+                        self._sanitize_loaded_pattern(pattern)
+                        for pattern in self._patterns.values()
+                    )
+                    before = len(self._patterns)
+                    self._prune_patterns_locked()
+                    changed = changed or len(self._patterns) != before
+                    self._dirty = changed
         except Exception as e:
             logger.warning(
                 "TOIN storage load failed",

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.tokenizers import get_tokenizer
-from headroom.tokenizers.base import count_content_blocks
+from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider
 
@@ -178,9 +178,9 @@ class OpenAICompatibleTokenCounter:
         tool_calls = message.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
-                func = tc.get("function", {})
-                tokens += self.count_text(func.get("name", ""))
-                tokens += self.count_text(func.get("arguments", ""))
+                func = tc.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
                 tokens += 10
 
         tool_call_id = message.get("tool_call_id")

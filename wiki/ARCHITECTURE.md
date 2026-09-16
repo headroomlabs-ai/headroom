@@ -91,6 +91,14 @@ When you use AI models like GPT-4 or Claude, you pay for **tokens** - the pieces
 
 ### 1. HeadroomClient (`client.py`) - The Wrapper
 
+`HeadroomClient` is still exported (`headroom/__init__.py:93,197`), but it is
+no longer the only SDK entry point: the site's current architecture
+documentation (`docs/content/docs/architecture.mdx`) describes SDK mode as
+calling the one-function `compress()` API (`headroom.compress`,
+`headroom.CompressConfig`) directly on your messages, with `HeadroomClient`
+as the client-wrapping alternative. Both exist; this section covers only the
+wrapper.
+
 This is what you interact with. It wraps your existing OpenAI or Anthropic client:
 
 ```python
@@ -226,8 +234,8 @@ analysis = {
     "data": [
         {"ts": 45, "cpu": 92},  # Keep the spike!
         {"ts": 46, "cpu": 95},
-        ...
-    ]
+        ...,
+    ],
 }
 ```
 
@@ -397,11 +405,9 @@ def analyze_field(key, items):
         "unique_ratio": len(set(values)) / len(values),
         # 0.0 = all same (constant)
         # 1.0 = all different (unique IDs)
-
         "variance": statistics.variance(values),  # For numbers
         # Low = stable
         # High = changing
-
         "change_points": detect_spikes(values),
         # Indices where value jumps significantly
     }
@@ -502,19 +508,19 @@ When SmartCrusher compresses, the original content is stored for on-demand retri
 ```python
 @dataclass
 class CompressionEntry:
-    hash: str                    # 16-char SHA256 for retrieval
-    original_content: str        # Full JSON before compression
-    compressed_content: str      # Compressed JSON
+    hash: str  # 24-char SHA256 prefix for retrieval
+    original_content: str  # Full JSON before compression
+    compressed_content: str  # Compressed JSON
     original_item_count: int
     compressed_item_count: int
-    tool_name: str | None        # For feedback tracking
+    tool_name: str | None  # For feedback tracking
     created_at: float
-    ttl: int = 300               # 5 minute default
+    ttl: int = 1800  # 30 minute default (DEFAULT_CCR_TTL_SECONDS)
 ```
 
 **Features:**
 - Thread-safe in-memory storage
-- TTL-based expiration (default 5 minutes)
+- TTL-based expiration (default 30 minutes; `DEFAULT_CCR_TTL_SECONDS`, override via `HEADROOM_CCR_TTL_SECONDS`)
 - LRU-style eviction when capacity reached
 - Hash-keyed retrieval that always returns the full original content
 
@@ -625,12 +631,12 @@ The feedback system learns from retrieval patterns to improve future compression
 @dataclass
 class ToolPattern:
     tool_name: str
-    total_compressions: int      # Times we compressed this tool
-    total_retrievals: int        # Times LLM asked for more
-    full_retrievals: int         # Retrieved everything (all retrievals — hash-only)
-    search_retrievals: int       # Legacy; always 0 (retrieval is hash-only, no search)
-    common_queries: dict[str, int]   # Legacy query-pattern frequency (no longer populated)
-    queried_fields: dict[str, int]   # Legacy queried-field frequency (no longer populated)
+    total_compressions: int  # Times we compressed this tool
+    total_retrievals: int  # Times LLM asked for more
+    full_retrievals: int  # Retrieved everything (all retrievals — hash-only)
+    search_retrievals: int  # Legacy; always 0 (retrieval is hash-only, no search)
+    common_queries: dict[str, int]  # Legacy query-pattern frequency (no longer populated)
+    queried_fields: dict[str, int]  # Legacy queried-field frequency (no longer populated)
 ```
 
 **Key Metrics:**
@@ -644,12 +650,12 @@ class ToolPattern:
 ```python
 @dataclass
 class CompressionHints:
-    max_items: int = 15          # Target item count
+    max_items: int = 15  # Target item count
     suggested_items: int | None  # Calculated optimal
-    skip_compression: bool       # Don't compress at all
-    preserve_fields: list[str]   # Always keep these fields
-    aggressiveness: float        # 0.0 = aggressive, 1.0 = conservative
-    reason: str                  # Explanation
+    skip_compression: bool  # Don't compress at all
+    preserve_fields: list[str]  # Always keep these fields
+    aggressiveness: float  # 0.0 = aggressive, 1.0 = conservative
+    reason: str  # Explanation
 ```
 
 **Feedback-Driven Adjustment:**
@@ -733,24 +739,26 @@ if self.config.use_feedback_hints and tool_name:
 ```python
 @dataclass
 class CCRToolCall:
-    tool_call_id: str      # For matching response
-    hash_key: str          # CCR hash to retrieve
+    tool_call_id: str  # For matching response
+    hash_key: str  # CCR hash to retrieve
+
 
 @dataclass
 class CCRToolResult:
     tool_call_id: str
-    content: str           # Retrieved data as JSON
+    content: str  # Retrieved data as JSON
     success: bool
     items_retrieved: int
+
 
 class CCRResponseHandler:
     async def handle_response(
         self,
-        response: dict,           # Initial LLM response
-        messages: list,           # Conversation history
-        tools: list,              # Tool definitions
-        api_call_fn: Callable,    # Function to make API calls
-        provider: str,            # "anthropic" or "openai"
+        response: dict,  # Initial LLM response
+        messages: list,  # Conversation history
+        tools: list,  # Tool definitions
+        api_call_fn: Callable,  # Function to make API calls
+        provider: str,  # "anthropic" or "openai"
     ) -> dict:
         """Handle CCR tool calls until final response."""
 ```
@@ -762,11 +770,14 @@ The handler also supports streaming responses via `StreamingCCRHandler`:
 ```python
 class StreamingCCRBuffer:
     """Buffers streaming chunks to detect CCR tool calls."""
+
     chunks: list[bytes]
     detected_ccr: bool
 
+
 class StreamingCCRHandler:
     """Handles CCR in streaming responses."""
+
     async def process_stream(self, stream, messages, tools, api_call_fn):
         """Yields chunks, switching to buffered mode if CCR detected."""
 ```
@@ -848,11 +859,11 @@ The tracker uses simple but effective heuristics:
 @dataclass
 class ContextTrackerConfig:
     enabled: bool = True
-    max_tracked_contexts: int = 100      # LRU eviction
-    relevance_threshold: float = 0.3     # Min score to recommend
-    max_context_age_seconds: float = 300 # 5 minutes
+    max_tracked_contexts: int = 100  # LRU eviction
+    relevance_threshold: float = 0.3  # Min score to recommend
+    max_context_age_seconds: float = 300  # 5 minutes
     proactive_expansion: bool = True
-    max_proactive_expansions: int = 2    # Per query
+    max_proactive_expansions: int = 2  # Per query
 ```
 
 ---
@@ -1082,12 +1093,17 @@ This means:
 
 ## The Numbers (From Our Tests)
 
-Real-world SRE incident investigation:
-- **5 tool calls**: Metrics, logs, status, deployments, runbook
-- **Original**: 22,048 tokens
-- **After SmartCrusher**: 2,190 tokens
-- **Reduction**: 90%
-- **Quality Score**: 5.0/5 (no information loss)
+> **Audit note (2026-09-02):** the specific token counts previously shown here
+> (a "5 tool call SRE incident" example) could not be traced to any benchmark,
+> test, or committed artifact in this repo and have been removed rather than
+> replaced with another unverified figure. For sourced compression numbers see
+> [Benchmarks](benchmarks.md) / `docs/content/docs/benchmarks.mdx`.
+
+Real-world SRE incident investigation (metrics, logs, status, deployments,
+runbook tool calls in one turn) is the kind of workload SmartCrusher targets:
+statistical, repetitive tool output where most of the redundancy is in
+constant fields and stable regions, not in the handful of data points (spikes,
+errors) that actually matter to the model's answer.
 
 The model could still:
 - Identify the CPU spike (preserved by change point detection)

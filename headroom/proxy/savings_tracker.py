@@ -14,8 +14,10 @@ import math
 import os
 import tempfile
 import threading
+from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -164,6 +166,23 @@ def _normalize_model(value: Any) -> str:
     return cleaned or MODEL_UNKNOWN
 
 
+# `_resolve_litellm_model` is called on every savings-tracking update (i.e.
+# every request), and `model` is client-controlled — it comes straight off
+# the request body. For a model LiteLLM can't price (a custom / local /
+# gateway name), the uncached fallback below calls `litellm.cost_per_token`
+# purely to probe resolvability, which prints LiteLLM's noisy "Provider
+# List: https://docs.litellm.ai/docs/providers" banner on every failed probe
+# (#2851). Cache the resolution per model name so that probe runs at most
+# once per distinct model — bounded, not a plain dict: a request-facing
+# proxy must not let a caller grow an unbounded cache for free by sending a
+# fresh model string on every request. `maxsize` caps memory; LRU eviction
+# means a model that stops being sent eventually falls out and simply
+# re-probes if it's ever sent again — never a correctness issue, only
+# whether the probe (and its noisy failure banner) reruns.
+_MODEL_RESOLUTION_CACHE_MAXSIZE = 256
+
+
+@lru_cache(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes.
 
@@ -173,6 +192,12 @@ def _resolve_litellm_model(model: str) -> str:
     "claude-opus" identically to the live /stats path. Uses the shared result
     only when it maps to a priced model_cost key; otherwise falls through to the
     bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+
+    Bounded LRU cache, keyed by model name — see
+    ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that mock the LiteLLM
+    module across calls with the same model name must call
+    ``_resolve_litellm_model.cache_clear()`` between cases, or results from
+    an earlier case leak in.
     """
     litellm = _get_litellm_module()
     if litellm is None:
@@ -302,6 +327,37 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return float(cache_read_tokens) * discount
     except Exception:
         return 0.0
+
+
+def estimate_request_savings_usd(
+    model: str,
+    *,
+    compression_tokens_saved: int = 0,
+    tool_schema_tokens_saved: int = 0,
+    output_tokens_saved: int = 0,
+    cache_read_tokens: int = 0,
+) -> dict[str, float]:
+    """Price one request's distinct savings layers for external telemetry.
+
+    The values use the same pricing functions as the built-in dashboard. They
+    stay separate because provider-cache benefit is not caused by compression,
+    and extension attribution can be explanatory rather than additive.
+    """
+
+    return {
+        "compression": _estimate_compression_savings_usd(
+            model, max(_coerce_int(compression_tokens_saved), 0)
+        ),
+        "tool_schema": _estimate_compression_savings_usd(
+            model, max(_coerce_int(tool_schema_tokens_saved), 0)
+        ),
+        "output_shaping": _estimate_output_savings_usd(
+            model, max(_coerce_int(output_tokens_saved), 0)
+        ),
+        "provider_cache": _estimate_cache_savings_usd(
+            model, max(_coerce_int(cache_read_tokens), 0)
+        ),
+    }
 
 
 def _estimate_input_cost_usd(
@@ -444,7 +500,16 @@ def _empty_display_session() -> dict[str, Any]:
 def _empty_by_model_entry() -> dict[str, Any]:
     return {
         "requests": 0,
+        # Message-level compression only. Kept as its own bucket rather than
+        # widened in place, so the persisted meaning of an existing field never
+        # changes under a reader that predates this.
         "tokens_saved": 0,
+        # Tool-schema deferral, attributed to the model that benefited. This was
+        # dropped on the floor: `record_request` was handed it and passed only
+        # the message figure down, so a tool-heavy model read "0 tokens saved"
+        # while the headline counted its deferral. Deferral is routinely the
+        # larger half -- 589,206 of 625,277 in the report that prompted this.
+        "tool_tokens_saved": 0,
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
@@ -506,6 +571,8 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         normalized = _empty_by_model_entry()
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
+        # Absent in state files written before this field existed -> 0.
+        normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
         normalized["compression_savings_usd"] = round(
             _coerce_float(entry.get("compression_savings_usd")), 6
         )
@@ -685,6 +752,12 @@ class SavingsTracker:
         model: str,
         input_tokens: int,
         tokens_saved: int,
+        # Tool-schema deferral for this request, DISJOINT from ``tokens_saved``
+        # (which is the bare message figure). The caller has always had this
+        # number and already folds it into the priced dollars below; it simply
+        # had no parameter to arrive through, so per-model tokens stayed
+        # message-only while per-model dollars did not.
+        tool_search_saved: int = 0,
         output_tokens_saved: int = 0,
         provider: str | None = None,
         project: str | None = None,
@@ -693,6 +766,7 @@ class SavingsTracker:
         uncached_input_tokens: int = 0,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
+        estimated_savings_usd: Mapping[str, float] | None = None,
         timestamp: datetime | str | None = None,
     ) -> bool:
         """Persist a canonical display-session update for every request."""
@@ -707,12 +781,46 @@ class SavingsTracker:
             timestamp_dt = _utc_now()
 
         delta_tokens_saved = _coerce_int(tokens_saved)
+        delta_tool_tokens_saved = max(_coerce_int(tool_search_saved), 0)
         delta_input_tokens = _coerce_int(input_tokens)
-        delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
         delta_output_tokens_saved = max(_coerce_int(output_tokens_saved), 0)
-        delta_output_savings_usd = _estimate_output_savings_usd(model, delta_output_tokens_saved)
         delta_cache_read_tokens = _coerce_int(cache_read_tokens)
-        delta_cache_savings_usd = _estimate_cache_savings_usd(model, delta_cache_read_tokens)
+        priced = estimated_savings_usd
+        # ``estimate_request_savings_usd`` prices FOUR buckets, but this method
+        # only ever read three — ``tool_schema`` was computed and dropped on the
+        # floor. Tool-schema deferral is a quarter of the token headline on real
+        # traffic (2.7M of 11.2M), and ``tokens_saved`` here is the bare
+        # message-level figure (the caller folds deferral in separately for the
+        # ledger, see prometheus_metrics.record_request), so the dollars were
+        # simply missing rather than counted elsewhere. That is why "Cost saved"
+        # read materially below the token-savings percent on the same traffic.
+        # Add it to the compression bucket, matching how the PERF headline and
+        # perf/analyzer fold deferral into one number.
+        if priced is not None:
+            # Two DISJOINT buckets: the caller passes bare message savings as
+            # ``compression_tokens_saved`` and deferral separately as
+            # ``tool_schema_tokens_saved`` (see prometheus_metrics.record_request),
+            # so summing them is additive, not double counting. Written as a
+            # statement rather than folded into the ternary below — a money path
+            # should not depend on the reader knowing that ``a + b if c else d``
+            # groups as ``(a + b) if c else d``.
+            delta_savings_usd = max(_coerce_float(priced.get("compression")), 0.0) + max(
+                _coerce_float(priced.get("tool_schema")), 0.0
+            )
+        else:
+            # No priced breakdown available: only message savings are known here,
+            # so this path stays message-only exactly as before.
+            delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+        delta_output_savings_usd = (
+            max(_coerce_float(priced.get("output_shaping")), 0.0)
+            if priced is not None
+            else _estimate_output_savings_usd(model, delta_output_tokens_saved)
+        )
+        delta_cache_savings_usd = (
+            max(_coerce_float(priced.get("provider_cache")), 0.0)
+            if priced is not None
+            else _estimate_cache_savings_usd(model, delta_cache_read_tokens)
+        )
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,
@@ -812,6 +920,7 @@ class SavingsTracker:
                 model,
                 requests_delta=1,
                 tokens_saved_delta=delta_tokens_saved,
+                tool_tokens_saved_delta=delta_tool_tokens_saved,
                 savings_usd_delta=delta_savings_usd,
                 input_tokens_delta=delta_input_tokens,
                 input_cost_usd_delta=delta_input_cost_usd,
@@ -970,6 +1079,7 @@ class SavingsTracker:
         *,
         requests_delta: int = 0,
         tokens_saved_delta: int = 0,
+        tool_tokens_saved_delta: int = 0,
         savings_usd_delta: float = 0.0,
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
@@ -984,6 +1094,7 @@ class SavingsTracker:
         entry = by_model.setdefault(key, _empty_by_model_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
+        entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
             entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
         )
@@ -1016,15 +1127,26 @@ class SavingsTracker:
         by_model = self._state.get("by_model", {})
         ranked = sorted(
             by_model.items(),
-            key=lambda item: item[1]["tokens_saved"],
+            key=lambda item: item[1]["tokens_saved"] + item[1].get("tool_tokens_saved", 0),
             reverse=True,
         )
         result: dict[str, dict[str, Any]] = {}
         for model, entry in ranked:
             view = dict(entry)
-            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            tool_saved = _coerce_int(entry.get("tool_tokens_saved"))
+            # Deferred tool schemas never reached the model, so they were never in
+            # ``total_input_tokens`` — the pre-Headroom denominator is the input we
+            # sent plus what we withheld. Same construction the PERF headline and
+            # perf/analyzer use, so a row and the total printed above it share one
+            # definition of "saved".
+            headline_saved = entry["tokens_saved"] + tool_saved
+            total_before = headline_saved + entry["total_input_tokens"]
+            # Named "headline" rather than "total" because this module already uses
+            # ``total_tokens_saved`` for the cumulative lifetime figure on history
+            # points; reusing it here would mean two different things in one file.
+            view["headline_tokens_saved"] = headline_saved
             view["savings_percent"] = round(
-                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                (headline_saved / total_before * 100) if total_before > 0 else 0.0,
                 2,
             )
             result[model] = view

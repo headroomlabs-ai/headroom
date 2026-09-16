@@ -8,6 +8,8 @@ Covers the related counters added to ``PrometheusMetrics``:
   via the observer hook, split into "exceeded" vs "within".
 * ``headroom_compression_quarantine_total{event}`` — records quarantine
   activation and immediate executor skips while a timed-out worker remains.
+* ``headroom_upstream_connection_errors_total{provider}`` — recorded when the
+  streaming path exhausts its connect retries and answers 502 itself.
 
 Imports only the metrics module so the test stays free of heavy ML deps.
 """
@@ -39,6 +41,35 @@ def test_record_compression_failed_empty_reason_defaults_to_error() -> None:
     metrics.record_compression_failed("")
 
     assert metrics.compression_failed_by_reason["error"] == 1
+
+
+def test_record_upstream_connection_error_buckets_by_provider() -> None:
+    metrics = PrometheusMetrics()
+
+    metrics.record_upstream_connection_error("anthropic")
+    metrics.record_upstream_connection_error("openai")
+    metrics.record_upstream_connection_error("openai")
+
+    assert metrics.upstream_connection_errors_by_provider["anthropic"] == 1
+    assert metrics.upstream_connection_errors_by_provider["openai"] == 2
+
+
+def test_record_upstream_connection_error_empty_provider_defaults_to_unknown() -> None:
+    metrics = PrometheusMetrics()
+
+    metrics.record_upstream_connection_error("")
+
+    assert metrics.upstream_connection_errors_by_provider["unknown"] == 1
+
+
+async def test_upstream_connection_errors_exported_in_prometheus_text() -> None:
+    metrics = PrometheusMetrics()
+    metrics.record_upstream_connection_error("anthropic")
+
+    text = await metrics.export()
+
+    assert "# TYPE headroom_upstream_connection_errors_total counter" in text
+    assert 'headroom_upstream_connection_errors_total{provider="anthropic"} 1' in text
 
 
 def test_record_kompress_size_gate_buckets_by_outcome() -> None:

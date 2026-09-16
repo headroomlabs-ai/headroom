@@ -1,6 +1,9 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
+use headroom_core::rollout::{
+    feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
@@ -181,6 +184,48 @@ impl CompressionMode {
     }
 }
 
+/// Session-sticky provider beta headers (parity port of the Python
+/// proxy's `HEADROOM_BETA_HEADER_STICKY`; see
+/// `cache_stabilization::beta_sticky`).
+///
+/// When `enabled` (default), the proxy unions each request's
+/// `anthropic-beta` / `openai-beta` tokens with the tokens previously
+/// seen for the same conversation and forwards the union, so a client
+/// dropping a beta token mid-conversation doesn't rotate the upstream
+/// prefix-cache key.
+///
+/// When `disabled`, the client header is forwarded verbatim and no
+/// per-session token state is kept. Diagnostic operator opt-in — NOT
+/// a fallback per realignment build constraint #4.
+///
+/// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+/// env var → default (`enabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum BetaHeaderSticky {
+    /// Union beta tokens per conversation and forward the union.
+    /// Default. Matches the Python proxy's default behaviour.
+    Enabled,
+    /// Forward the client's beta header verbatim; keep no state.
+    /// Diagnostic-only.
+    Disabled,
+}
+
+impl BetaHeaderSticky {
+    /// Stable snake_case name suitable for log fields.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BetaHeaderSticky::Enabled => "enabled",
+            BetaHeaderSticky::Disabled => "disabled",
+        }
+    }
+
+    /// Convenience: is the sticky union switched on?
+    pub fn is_enabled(self) -> bool {
+        matches!(self, BetaHeaderSticky::Enabled)
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "headroom-proxy",
@@ -188,6 +233,49 @@ impl CompressionMode {
     about = "Headroom transparent reverse proxy"
 )]
 pub struct CliArgs {
+    /// Runtime rollout channel that bounds which managed features may run.
+    ///
+    /// `stable` admits only features that have completed bake time. `beta` and
+    /// `canary` admit progressively newer features. `dev` is for local work.
+    /// Explicit feature requests still cannot cross this boundary unless the
+    /// unsafe override is set.
+    #[arg(
+        long = "rollout-channel",
+        env = "HEADROOM_ROLLOUT_CHANNEL",
+        default_value = "stable",
+        value_parser = parse_rollout_channel,
+    )]
+    pub rollout_channel: String,
+
+    /// Comma-separated rollout features to request explicitly.
+    #[arg(
+        long = "features",
+        env = "HEADROOM_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub features: String,
+
+    /// Comma-separated rollout features to force off. Disable wins over defaults
+    /// and explicit enable requests.
+    #[arg(
+        long = "disable-features",
+        env = "HEADROOM_DISABLE_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub disable_features: String,
+
+    /// Break-glass override that allows unstable features below their channel.
+    /// Intended only for emergency mitigation and should be visible in logs.
+    #[arg(
+        long = "unsafe-allow-unstable-features",
+        env = "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub unsafe_allow_unstable_features: bool,
+
     /// Address the proxy listens on (e.g. 0.0.0.0:8787).
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
@@ -319,6 +407,28 @@ pub struct CliArgs {
         default_value_t = StripInternalHeaders::Enabled,
     )]
     pub strip_internal_headers: StripInternalHeaders,
+
+    /// Session-sticky provider beta headers: union `anthropic-beta` /
+    /// `openai-beta` tokens per conversation so a client dropping a
+    /// token mid-conversation doesn't bust the upstream prefix cache.
+    /// Parity port of the Python proxy's `SessionBetaTracker` (PR-A6).
+    /// Default `enabled`; `disabled` is a diagnostic operator opt-in.
+    ///
+    /// Active only when the compression interceptor is on
+    /// (`--compression` / `HEADROOM_PROXY_COMPRESSION=1`): with the
+    /// interceptor off the proxy is a strict byte-pipe and never
+    /// mutates headers. Startup logs a warning when this is `enabled`
+    /// while `--compression` is off.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_BETA_HEADER_STICKY`
+    /// env var → default (`enabled`).
+    #[arg(
+        long = "beta-header-sticky",
+        env = "HEADROOM_PROXY_BETA_HEADER_STICKY",
+        value_enum,
+        default_value_t = BetaHeaderSticky::Enabled,
+    )]
+    pub beta_header_sticky: BetaHeaderSticky,
 
     /// Phase C PR-C4: enable the `/v1/responses` SSE streaming
     /// pipeline. When `true` (default), `Accept: text/event-stream`
@@ -475,6 +585,32 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration `{s}`: {e}"))
 }
 
+fn parse_rollout_channel(value: &str) -> Result<String, String> {
+    value
+        .parse::<RolloutChannel>()
+        .map(|channel| channel.as_str().to_owned())
+        .map_err(|_| {
+            format!("unknown rollout channel `{value}` (valid: stable, beta, canary, dev)")
+        })
+}
+
+fn parse_rollout_features(value: &str) -> Result<String, String> {
+    let valid = feature_names();
+    let unknown: Vec<_> = split_feature_names(value)
+        .into_iter()
+        .filter(|name| !valid.contains(name.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "unknown rollout feature(s): {}; valid: {}",
+            unknown.join(", "),
+            valid.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
 fn parse_bytes(s: &str) -> Result<u64, String> {
     s.parse::<bytesize::ByteSize>()
         .map(|b| b.as_u64())
@@ -484,6 +620,8 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 /// Resolved configuration used by the running server.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Runtime rollout state resolved from CLI/env.
+    pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
     pub upstream: Url,
     pub upstream_timeout: Duration,
@@ -517,6 +655,9 @@ pub struct Config {
     /// upstream-bound requests. PR-A5 default-on guard against
     /// fingerprinting / leakage of internal flags.
     pub strip_internal_headers: StripInternalHeaders,
+    /// Session-sticky provider beta headers (parity port of the
+    /// Python `SessionBetaTracker`, PR-A6). Default `enabled`.
+    pub beta_header_sticky: BetaHeaderSticky,
     /// PR-C4: enable the `/v1/responses` streaming pipeline (SSE
     /// state-machine + telemetry tee). Default `true`.
     pub enable_responses_streaming: bool,
@@ -555,6 +696,30 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(args: CliArgs) -> Self {
+        let mut explicit_features = Vec::new();
+        if args.enable_responses_streaming {
+            explicit_features.push(Feature::OpenAiResponsesStreaming);
+        }
+        if args.enable_bedrock_native {
+            explicit_features.push(Feature::NativeBedrock);
+        }
+        // Preserve the pre-rollout rollback controls as legacy disables. Both
+        // features are stable defaults in the registry, so merely omitting a
+        // false flag from `explicit_features` would turn it straight back on.
+        let mut disabled_features = split_feature_names(&args.disable_features);
+        if !args.enable_responses_streaming {
+            disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
+        }
+        if !args.enable_bedrock_native {
+            disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
+        }
+        let rollout = RolloutSnapshot::from_parts_with_explicit(
+            &args.rollout_channel,
+            &args.features,
+            &disabled_features.join(","),
+            args.unsafe_allow_unstable_features,
+            &explicit_features,
+        );
         let rewrite_host = if args.no_rewrite_host {
             false
         } else {
@@ -564,6 +729,7 @@ impl Config {
             .compression_max_body_bytes
             .unwrap_or(args.max_body_bytes);
         Self {
+            rollout: rollout.clone(),
             listen: args.listen,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
@@ -578,9 +744,14 @@ impl Config {
             cache_control_auto_frozen: args.cache_control_auto_frozen,
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
-            enable_responses_streaming: args.enable_responses_streaming,
+            beta_header_sticky: args.beta_header_sticky,
+            enable_responses_streaming: rollout.is_enabled(
+                Feature::OpenAiResponsesStreaming,
+                args.enable_responses_streaming,
+            ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: args.enable_bedrock_native,
+            enable_bedrock_native: rollout
+                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -594,6 +765,7 @@ impl Config {
     /// production-default behaviour so existing tests stay unchanged.
     pub fn for_test(upstream: Url) -> Self {
         Self {
+            rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_secs(60),
@@ -621,6 +793,9 @@ impl Config {
             // from upstream-bound requests. Tests opt out per-case via
             // `start_proxy_with`.
             strip_internal_headers: StripInternalHeaders::Enabled,
+            // Production default: sticky beta-header union per
+            // conversation (Python-parity). Tests opt out per-case.
+            beta_header_sticky: BetaHeaderSticky::Enabled,
             // PR-C4: streaming pipeline + conversations passthrough
             // both default-on so tests exercise the same paths
             // production traffic will hit.
@@ -642,5 +817,50 @@ impl Config {
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod rollout_input_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_rollout_inputs_are_strict_and_diagnosable() {
+        assert_eq!(parse_rollout_channel("CANARY").unwrap(), "canary");
+        assert!(parse_rollout_channel("stabel")
+            .unwrap_err()
+            .contains("unknown rollout channel"));
+        assert!(parse_rollout_features("native-bedrock").is_ok());
+        let error = parse_rollout_features("native_bedrok").unwrap_err();
+        assert!(error.contains("native_bedrok"));
+        assert!(error.contains("native_bedrock"));
+    }
+
+    #[test]
+    fn legacy_false_flags_remain_effective_rollout_disables() {
+        let args = CliArgs::try_parse_from([
+            "headroom-proxy",
+            "--upstream",
+            "http://127.0.0.1:9",
+            "--enable-responses-streaming",
+            "false",
+            "--enable-bedrock-native",
+            "false",
+        ])
+        .unwrap();
+
+        let config = Config::from_cli(args);
+
+        for feature in [Feature::OpenAiResponsesStreaming, Feature::NativeBedrock] {
+            let decision = config.rollout.decision(feature);
+            assert!(!decision.enabled);
+            assert!(decision.disabled);
+            assert_eq!(
+                decision.reason,
+                headroom_core::rollout::FeatureDecisionReason::Disabled
+            );
+        }
+        assert!(!config.enable_responses_streaming);
+        assert!(!config.enable_bedrock_native);
     }
 }

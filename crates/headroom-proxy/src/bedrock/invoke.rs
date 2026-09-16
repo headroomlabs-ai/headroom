@@ -615,6 +615,7 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),
@@ -649,6 +650,7 @@ mod tests {
             // unit test never observes drift, but `AppState` requires
             // the field to be populated.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
@@ -684,6 +686,7 @@ mod tests {
             // PR-E6: see above — drift detector is unused by this
             // test; we just satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.

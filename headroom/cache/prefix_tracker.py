@@ -21,6 +21,7 @@ import hashlib
 import itertools
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -229,6 +230,184 @@ def _canonicalize_for_prefix_compare(obj: Any) -> Any:
     return obj
 
 
+# Canonical relationships between consecutive histories.  These constants are
+# strings (rather than an Enum) so they remain cheap to log on the request hot
+# path and easy to assert in tests.
+RELATION_EXACT = "exact"
+RELATION_MESSAGE_APPEND = "message_append"
+RELATION_BLOCK_APPEND = "block_append"
+RELATION_BLOCK_REWRITE_TAIL = "block_rewrite_tail"
+RELATION_DIVERGED = "diverged"
+
+
+@dataclass(frozen=True)
+class HistoryRelation:
+    """How a current message history relates to one recorded last turn.
+
+    ``block_append`` and ``block_rewrite_tail`` are deliberately distinct:
+    Anthropic should keep the breakpoint on the newest block for a pure append,
+    but anchor it to ``stable_prefix_blocks - 1`` when the previous tail was
+    rewritten and therefore can never match a prior cache write (#2671).
+    """
+
+    kind: str
+    message_index: int | None = None
+    stable_prefix_blocks: int = 0
+    stable_suffix_blocks: int = 0
+    previous_block_count: int = 0
+    current_block_count: int = 0
+
+
+# A rewritten-tail match is intentionally conservative.  The production shape
+# behind #2671 has a hundred-plus-block stable prefix and a fixed two-block
+# suffix.  Requiring both avoids merging sibling sub-calls which merely share a
+# short injected preamble or a single generic reminder at the end.
+_MIN_REWRITE_PREFIX_BLOCKS = 8
+_MIN_REWRITE_SUFFIX_BLOCKS = 2
+
+
+def _message_fields_outside_content(message: dict[str, Any]) -> dict[str, Any]:
+    """Return message identity fields, excluding the block list itself."""
+    return {key: value for key, value in message.items() if key != "content"}
+
+
+def _stable_leading_block_run(current: list[Any], previous: list[Any]) -> int:
+    """Number of canonical-equal blocks at the start of both lists."""
+    limit = min(len(current), len(previous))
+    run = 0
+    while run < limit and current[run] == previous[run]:
+        run += 1
+    return run
+
+
+def _stable_trailing_block_run(current: list[Any], previous: list[Any], *, leading_run: int) -> int:
+    """Non-overlapping canonical-equal suffix length."""
+    limit = min(len(current), len(previous)) - leading_run
+    run = 0
+    while run < limit and current[-(run + 1)] == previous[-(run + 1)]:
+        run += 1
+    return run
+
+
+def _classify_history_canonical(
+    current_messages: list[Any], previous_messages: list[Any]
+) -> HistoryRelation:
+    """Classify two already-canonical, structurally snapshotted histories."""
+    if not previous_messages or len(current_messages) < len(previous_messages):
+        return HistoryRelation(RELATION_DIVERGED)
+
+    changed: HistoryRelation | None = None
+    for index, previous_message in enumerate(previous_messages):
+        current_message = current_messages[index]
+        if current_message == previous_message:
+            continue
+        if changed is not None:
+            return HistoryRelation(RELATION_DIVERGED)
+        if not isinstance(previous_message, dict) or not isinstance(current_message, dict):
+            return HistoryRelation(RELATION_DIVERGED)
+        if _message_fields_outside_content(previous_message) != _message_fields_outside_content(
+            current_message
+        ):
+            return HistoryRelation(RELATION_DIVERGED)
+
+        previous_blocks = previous_message.get("content")
+        current_blocks = current_message.get("content")
+        if not isinstance(previous_blocks, list) or not isinstance(current_blocks, list):
+            return HistoryRelation(RELATION_DIVERGED)
+
+        previous_count = len(previous_blocks)
+        current_count = len(current_blocks)
+        leading = _stable_leading_block_run(current_blocks, previous_blocks)
+
+        # Pure block append.  The previous write remains intact and Anthropic's
+        # lookback can find it, so the breakpoint must advance to the newest
+        # block and cover the newly appended tail.
+        if current_count > previous_count and leading == previous_count:
+            changed = HistoryRelation(
+                RELATION_BLOCK_APPEND,
+                message_index=index,
+                stable_prefix_blocks=leading,
+                previous_block_count=previous_count,
+                current_block_count=current_count,
+            )
+            continue
+
+        # Rewritten-tail growth.  This is narrower than a fuzzy prefix match:
+        # message count may not change, content may not shrink, most of the old
+        # prefix must survive, and a substantial fixed suffix must identify the
+        # sub-call.  Crucially ``leading < previous_count`` proves this is NOT a
+        # pure append (the bug in the original #2702 discriminator).
+        trailing = _stable_trailing_block_run(current_blocks, previous_blocks, leading_run=leading)
+        if (
+            len(current_messages) == len(previous_messages)
+            and current_count >= previous_count
+            and _MIN_REWRITE_PREFIX_BLOCKS <= leading < previous_count
+            and leading * 2 >= previous_count
+            and leading * 2 >= current_count
+            and trailing >= _MIN_REWRITE_SUFFIX_BLOCKS
+        ):
+            changed = HistoryRelation(
+                RELATION_BLOCK_REWRITE_TAIL,
+                message_index=index,
+                stable_prefix_blocks=leading,
+                stable_suffix_blocks=trailing,
+                previous_block_count=previous_count,
+                current_block_count=current_count,
+            )
+            continue
+
+        return HistoryRelation(RELATION_DIVERGED)
+
+    if changed is not None:
+        return changed
+    return HistoryRelation(
+        RELATION_EXACT
+        if len(current_messages) == len(previous_messages)
+        else RELATION_MESSAGE_APPEND
+    )
+
+
+def classify_history_relation(
+    current_messages: list[dict[str, Any]],
+    previous_messages: list[dict[str, Any]],
+) -> HistoryRelation:
+    """Return the canonical cross-turn relationship for two raw histories.
+
+    The canonical projection may drop a whole directive-only message.  Refuse
+    classification when that would shift raw message indices: block replay
+    always slices the raw lists and must never consume a canonical index as a
+    raw one.
+    """
+    if not current_messages or not previous_messages:
+        return HistoryRelation(RELATION_DIVERGED)
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_messages))
+    prefix_len = len(previous_messages)
+    if len(previous) != prefix_len:
+        return HistoryRelation(RELATION_DIVERGED)
+    if len(_canonicalize_for_prefix_compare(current_messages[:prefix_len])) != prefix_len:
+        return HistoryRelation(RELATION_DIVERGED)
+    return _classify_history_canonical(current, previous)
+
+
+def segment_fingerprint(value: Any) -> str:
+    """Stable hash for non-message provider cache-key segments.
+
+    Cache-control placement and transport annotations are deliberately ignored;
+    semantic tool/model/thinking changes remain visible.  The hash is affinity
+    metadata only and is never used to reconstruct or forward request content.
+    """
+    canonical = _lineage_snapshot(_canonicalize_for_prefix_compare(value))
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()[:24]
+
+
 def extract_cache_stable_delta(
     current_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
@@ -251,13 +430,13 @@ def extract_cache_stable_delta(
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
+    relation = classify_history_relation(current_messages, previous_original_messages)
+    if relation.kind not in (RELATION_EXACT, RELATION_MESSAGE_APPEND):
+        # A same-message block append needs a block-level splice in
+        # ``overlay_cached_prefix``; slicing only whole messages would silently
+        # discard its new blocks.  Rewritten tails are not append-only deltas.
+        return None
     prefix_len = len(previous_original_messages)
-    if len(current_messages) < prefix_len:
-        return None
-    if _canonicalize_for_prefix_compare(
-        current_messages[:prefix_len]
-    ) != _canonicalize_for_prefix_compare(previous_original_messages):
-        return None
     return (
         copy.deepcopy(previous_forwarded_messages),
         copy.deepcopy(current_messages[prefix_len:]),
@@ -269,8 +448,10 @@ def overlay_cached_prefix(
     current_original_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
     previous_forwarded_messages: list[dict[str, Any]] | None,
+    *,
+    confirmed_frozen_count: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Replay the previously-forwarded (cached, compressed) prefix byte-identical.
+    """Replay a positional, non-inflating cached prefix when it is safe.
 
     Provider-agnostic cache-safety guard for the freeze path. When a message is
     "frozen", the compression pipeline may emit the agent's ORIGINAL bytes for
@@ -281,20 +462,43 @@ def overlay_cached_prefix(
     the corresponding leading messages so the forwarded prefix stays byte-for-byte
     what the provider hashed for its cache key.
 
-    Safe only when this turn append-only-extends the previous turn (the standard
-    growing-conversation shape): the previous ORIGINAL messages must be an exact
-    prefix of the current ORIGINAL messages, and there is exactly one forwarded
-    message per original. Otherwise the previous forwarded bytes may not
-    correspond to the same positions, so we return ``optimized_messages``
-    unchanged (accept a possible bust rather than forward wrong content).
+    Safe only when this turn extends the previous turn in a proven positional
+    shape: either whole-message append or pure block append inside one message.
+    There must be exactly one previous forwarded message per original. Otherwise
+    the previous bytes may not correspond to the same positions, so we return
+    ``optimized_messages`` unchanged (accept a possible bust rather than forward
+    wrong content).
 
-    This makes freezing byte-identical in BOTH proxy modes, so the only remaining
-    difference between them is how large a mutable (still-compressible) tail each
-    leaves — not whether the frozen prefix busts the cache.
+    The optimized and current-original lists must be positionally aligned, and
+    compact UTF-8 JSON for the replayed result must not exceed the optimized
+    candidate. These bounds prefer a cache miss to corrupting or inflating a
+    client's live history.
+
+    ``confirmed_frozen_count`` bounds UNCONDITIONAL replay. Leading positions
+    the provider has already confirmed cached (a message count derived from
+    ``cache_read_input_tokens``) are always replayed byte-identical: the
+    replay source there is exactly what the provider hashed, so changing
+    those bytes can only bust the cache. Beyond the floor the size bound
+    still arbitrates each turn: a shrinking replay (the pipeline emitted
+    original bytes for a frozen message) is repaired, while an inflating one
+    (fresh compression improved on the forwarded form) is declined so the
+    improvement reaches the wire. When the provider count collapses (cold
+    cache, TTL lapse) the floor collapses with it and every accumulated
+    improvement lands at once - the natural re-baselining that keeps
+    long-session growth bounded (#3026). Callers with no provider-confirmed
+    count pass None and keep the fully size-bounded behavior.
     """
     prev_orig = previous_original_messages
     prev_fwd = previous_forwarded_messages
     if not prev_orig or not prev_fwd:
+        return optimized_messages
+    if len(optimized_messages) != len(current_original_messages):
+        logger.debug(
+            "overlay: optimized/current-original length mismatch (optimized=%d, current=%d) "
+            "— skipping positional cached-prefix replay",
+            len(optimized_messages),
+            len(current_original_messages),
+        )
         return optimized_messages
     n = len(prev_orig)
     # Positional 1:1 correspondence between prev_orig[i] and prev_fwd[i] holds
@@ -311,6 +515,66 @@ def overlay_cached_prefix(
             n,
         )
         return optimized_messages
+
+    relation = classify_history_relation(current_original_messages, prev_orig)
+    if relation.kind == RELATION_BLOCK_APPEND and relation.message_index is not None:
+        message_index = relation.message_index
+        if message_index < len(optimized_messages):
+            previous_message = prev_fwd[message_index]
+            previous_original_message = prev_orig[message_index]
+            current_message = optimized_messages[message_index]
+            previous_content = (
+                previous_message.get("content") if isinstance(previous_message, dict) else None
+            )
+            previous_original_content = (
+                previous_original_message.get("content")
+                if isinstance(previous_original_message, dict)
+                else None
+            )
+            current_content = (
+                current_message.get("content") if isinstance(current_message, dict) else None
+            )
+            split = (
+                len(previous_original_content)
+                if isinstance(previous_original_content, list)
+                else -1
+            )
+            if (
+                isinstance(previous_content, list)
+                and isinstance(previous_original_content, list)
+                and isinstance(current_content, list)
+                and len(previous_content) == split
+                and len(current_content) >= split
+                and _canonicalize_for_prefix_compare(current_content[:split])
+                == _canonicalize_for_prefix_compare(previous_original_content)
+            ):
+                merged = copy.deepcopy(previous_message)
+                merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                    current_content[split:]
+                )
+                logger.debug(
+                    "overlay: replayed %d forwarded blocks and appended %d new blocks "
+                    "inside message %d",
+                    split,
+                    len(current_content) - split,
+                    message_index,
+                )
+                replayed = (
+                    list(prev_fwd[:message_index])
+                    + [merged]
+                    + list(optimized_messages[message_index + 1 :])
+                )
+                if message_index >= max(confirmed_frozen_count or 0, 0):
+                    replayed_bytes = _compact_json_bytes(replayed)
+                    optimized_bytes = _compact_json_bytes(optimized_messages)
+                    if (
+                        replayed_bytes is None
+                        or optimized_bytes is None
+                        or len(replayed_bytes) > len(optimized_bytes)
+                    ):
+                        logger.debug("overlay: block replay inflated compact JSON — skipping")
+                        return optimized_messages
+                return replayed
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
     # run of messages that is byte-for-byte (content-canonical) identical to
@@ -334,7 +598,7 @@ def overlay_cached_prefix(
     # current_original[k] canonicalize-equals prev_orig[k], and prev_fwd[k]
     # positionally corresponds to prev_orig[k] (guaranteed by the count check
     # above), so no wrong bytes are ever forwarded.
-    limit = min(n, len(current_original_messages), len(optimized_messages))
+    limit = min(n, len(current_original_messages))
     k = 0
     while k < limit and _canonicalize_for_prefix_compare(
         current_original_messages[k]
@@ -356,11 +620,119 @@ def overlay_cached_prefix(
         )
     # Replay the cached (compressed) prefix byte-identical up to the first
     # divergence; keep this turn's freshly-produced output for the rest.
-    return list(prev_fwd[:k]) + list(optimized_messages[k:])
+    replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
+    replayed_bytes = _compact_json_bytes(replayed)
+    optimized_bytes = _compact_json_bytes(optimized_messages)
+    if (
+        replayed_bytes is None
+        or optimized_bytes is None
+        or len(replayed_bytes) > len(optimized_bytes)
+    ):
+        # Something in the replay is byte-larger than this turn's fresh form:
+        # fresh compression improved on already-forwarded bytes. Landing the
+        # improvement is only safe OUTSIDE the provider-confirmed prefix -
+        # inside it, the improvement would change bytes the provider has
+        # already cached and bust the whole suffix. Split at the confirmed
+        # floor: replay the confirmed region unconditionally, forward
+        # everything beyond it fresh so the improvement reaches the wire.
+        floor = min(k, max(confirmed_frozen_count or 0, 0))
+        if floor <= 0:
+            logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
+            return optimized_messages
+        logger.debug(
+            "overlay: replay inflated beyond the confirmed floor — replaying %d/%d "
+            "confirmed messages, forwarding the rest fresh",
+            floor,
+            k,
+        )
+        return list(prev_fwd[:floor]) + list(optimized_messages[floor:])
+    return replayed
+
+
+def _compact_json_bytes(value: Any) -> bytes | None:
+    """Return compact JSON bytes, or ``None`` when sizing cannot be proved."""
+    try:
+        return json.dumps(
+            value,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, UnicodeError):
+        return None
+
+
+_STABLE_BOUNDARY_ENV = "HEADROOM_STABLE_BOUNDARY_BREAKPOINT"
+_MIN_BLOCKS_FOR_RELOCATION = 20
+
+
+def _stable_boundary_enabled() -> bool:
+    return os.environ.get(_STABLE_BOUNDARY_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _breakpoint_index(
+    content: list[Any],
+    message: dict[str, Any],
+    message_index: int,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> int:
+    """Choose newest for appends, stable-prefix end for rewritten tails."""
+    newest = len(content) - 1
+    if (
+        not previous_forwarded_messages
+        or not _stable_boundary_enabled()
+        or len(content) < _MIN_BLOCKS_FOR_RELOCATION
+        or message_index >= len(previous_forwarded_messages)
+    ):
+        return newest
+    previous = previous_forwarded_messages[message_index]
+    if not isinstance(previous, dict):
+        return newest
+    relation = classify_history_relation([message], [previous])
+    if relation.kind != RELATION_BLOCK_REWRITE_TAIL:
+        return newest
+    logger.debug(
+        "cache breakpoint anchored to stable run %d/%d blocks in message %d "
+        "(previous=%d, stable_suffix=%d)",
+        relation.stable_prefix_blocks,
+        relation.current_block_count,
+        message_index,
+        relation.previous_block_count,
+        relation.stable_suffix_blocks,
+    )
+    return relation.stable_prefix_blocks - 1
+
+
+def _client_marker_positions(
+    client_messages: list[dict[str, Any]],
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """(message index, block index, marker) for every CLIENT cache_control.
+
+    Block-level, not one-per-message: clients mark multiple blocks within a
+    single long message (Claude Code does this on 1-2-message requests with a
+    large first message), and the ~20-block lookback applies within a message
+    just as it does across messages. Only block-style content carries markers.
+    """
+    positions: list[tuple[int, int, dict[str, Any]]] = []
+    for i, msg in enumerate(client_messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for bi, b in enumerate(content):
+            if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
+                positions.append((i, bi, b["cache_control"]))
+    return positions
 
 
 def normalize_message_cache_control(
     messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]] | None = None,
+    client_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Own message-level cache_control placement so breakpoints stay bounded.
 
@@ -370,22 +742,35 @@ def normalize_message_cache_control(
     hard-errors at **>4 cache_control blocks total** (system + tools + messages),
     so on a long conversation the accumulation eventually 400s.
 
-    Fix: strip EVERY message-level cache_control and re-place a **single**
-    ephemeral breakpoint on the last block of the last block-style message. One
-    breakpoint caches the whole message prefix up to it, and — because the
-    provider's cache key is message CONTENT, not marker presence (moving the
-    breakpoint forward is the documented client pattern and it hits) — stripping
-    and re-placing markers never busts. system/tools breakpoints live outside
-    ``messages`` and are left untouched (they still count toward the 4 limit, so
-    holding messages to one breakpoint leaves room for them).
+    Fix: strip EVERY message-level cache_control, then re-place markers at the
+    positions the CLIENT's current request marks (``client_messages``). The
+    client's positions are load-bearing, not redundant: Anthropic resolves each
+    breakpoint by walking back **at most ~20 content blocks** for a prior cache
+    entry, and agentic clients (Claude Code) keep a marker on the previous
+    turn's newest message precisely so the new turn's write can chain to the
+    old entry. Collapsing to a single newest-block marker breaks that chain
+    whenever one turn adds >20 blocks (typical for tool-heavy turns): the
+    lookback misses, the entire message history silently re-bills as cache
+    creation, and a marker anchored short of the final block leaves the tail
+    billing as fully uncached input. Mirroring the client's positions bounds
+    accumulation identically (the client manages its own 4-marker budget) while
+    preserving its read/write chaining.
 
-    Headroom owns WHERE the breakpoint goes; the client still owns WHAT it says:
-    the re-placed marker reuses the newest client marker verbatim, so an explicit
-    ``ttl`` (e.g. ``"1h"``) survives consolidation instead of silently
-    downgrading to the 5-minute default (#2375).
+    The provider's cache key is message CONTENT, not marker presence (moving
+    the breakpoint forward is the documented client pattern and it hits), so
+    stripping replay leftovers and re-placing markers never busts. system/tools
+    breakpoints live outside ``messages`` and are left untouched.
 
-    Only block-style (list) content can carry cache_control; string content is
-    left as-is. Returns the input unchanged when there is nothing to normalize.
+    Headroom owns WHICH BLOCK carries each marker; the client owns the message
+    positions and the marker values, so an explicit ``ttl`` (e.g. ``"1h"``)
+    survives per position instead of silently downgrading (#2375). The newest
+    position uses stable-run anchoring for proven rewritten tails; earlier
+    positions go on their message's last block.
+
+    Without ``client_messages`` (or when the transformed list no longer aligns
+    with it), falls back to the legacy single-marker consolidation. Only
+    block-style (list) content can carry cache_control; string content is left
+    as-is. Returns the input unchanged when there is nothing to normalize.
     """
     changed = False
     out: list[dict[str, Any]] = []
@@ -412,13 +797,75 @@ def normalize_message_cache_control(
                 last_block_idx = i
         else:
             out.append(msg)
-    # Re-place exactly one breakpoint on the last block-style message.
+
+    def _place(
+        target_idx: int,
+        marker: dict[str, Any],
+        *,
+        anchor: bool,
+        block_idx: int | None = None,
+    ) -> bool:
+        msg = out[target_idx]
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        content = list(content)
+        if block_idx is not None and 0 <= block_idx < len(content):
+            # Transforms can shift block indices (e.g. a dropped thinking
+            # block); a slightly-off placement still lands on a stable block
+            # in the same message, which is harmless — markers are not part
+            # of the provider's cache key.
+            breakpoint_index = block_idx
+        elif anchor:
+            breakpoint_index = _breakpoint_index(
+                content, msg, target_idx, previous_forwarded_messages
+            )
+        else:
+            breakpoint_index = len(content) - 1
+        # Anthropic content blocks are dictionaries, but callers can still
+        # supply mixed list content. Fall back to the newest block rather than
+        # attempting ``**`` on a scalar stable-boundary element, and skip the
+        # message entirely when even that is not a dict.
+        if not isinstance(content[breakpoint_index], dict):
+            breakpoint_index = len(content) - 1
+        if not isinstance(content[breakpoint_index], dict):
+            return False
+        content[breakpoint_index] = {**content[breakpoint_index], "cache_control": dict(marker)}
+        out[target_idx] = {**msg, "content": content}
+        return True
+
+    # Preferred: mirror the client's marker positions 1:1, block-level. The
+    # transform pipeline preserves message count, so index alignment is the
+    # invariant; fall back to legacy consolidation if it ever does not hold,
+    # or when the client marked nothing (legacy still places one so the
+    # prefix caches). The newest client marker keeps stable-run anchoring
+    # when the client placed it on its message's final block (intent: "cache
+    # through the end"); an explicit mid-message marker is honored verbatim.
+    if client_messages is not None and len(client_messages) == len(messages):
+        positions = _client_marker_positions(client_messages)
+        if positions:
+            placed_any = False
+            newest_mi, newest_bi, _ = positions[-1]
+            newest_client_content = client_messages[newest_mi].get("content")
+            newest_on_final_block = (
+                isinstance(newest_client_content, list)
+                and newest_bi == len(newest_client_content) - 1
+            )
+            for mi, bi, marker in positions:
+                is_newest = (mi, bi) == (newest_mi, newest_bi)
+                if is_newest and newest_on_final_block:
+                    placed = _place(mi, marker, anchor=True)
+                else:
+                    placed = _place(mi, marker, anchor=False, block_idx=bi)
+                placed_any = placed or placed_any
+            if placed_any or changed:
+                return out
+            return messages
+
+    # Legacy: re-place exactly one breakpoint on the last block-style message.
     if last_block_idx >= 0:
-        msg = out[last_block_idx]
-        content = list(msg["content"])
         marker = dict(last_marker) if last_marker else {"type": "ephemeral"}
-        content[-1] = {**content[-1], "cache_control": marker}
-        out[last_block_idx] = {**msg, "content": content}
+        _place(last_block_idx, marker, anchor=True)
         changed = True
     return out if changed else messages
 
@@ -550,6 +997,26 @@ class PrefixCacheTracker:
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
+
+    def record_returned(
+        self,
+        original_messages: list[dict[str, Any]],
+        returned_messages: list[dict[str, Any]],
+    ) -> None:
+        """Record the compressed form handed back to a compress-only caller.
+
+        Sidecar mode (session-aware ``/v1/compress``): Headroom does not
+        forward upstream, but whatever it RETURNS is what the caller forwards
+        — the same fact ``update_from_response`` records in proxy mode, just
+        captured at return time instead of send time. Only the transcript
+        snapshots and the activity clock move here; frozen-prefix counts are
+        left untouched because no provider response has confirmed anything
+        yet — they advance when the caller relays usage via ``/v1/usage``
+        (``update_from_response``), or stay at their conservative local value.
+        """
+        self._last_activity = time.time()
+        self._last_original_messages = copy.deepcopy(original_messages)
+        self._last_forwarded_messages = copy.deepcopy(returned_messages)
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
@@ -829,7 +1296,31 @@ class SessionTrackerStore:
         # value, so a synthetic key can never collide with a client-supplied
         # x-headroom-session-id.
         self._lineages: dict[str, OrderedDict[str, list[Any]]] = {}
+        # Exact non-message cache-key affinity per tracker.  Anthropic renders
+        # tools before system/messages, so two sub-calls with identical history
+        # but different tool profiles must never share frozen-prefix state.
+        self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+
+    def peek(self, session_id: str) -> PrefixCacheTracker | None:
+        """Return the live tracker for ``session_id``, else None.
+
+        Never creates: lookup paths that must not leave a footprint (e.g. the
+        ``/v1/usage`` unknown-session check, where ``get_or_create`` would let
+        a flood of novel ids grow the store unboundedly within each TTL
+        window) use this instead of :meth:`get_or_create`.
+
+        A TTL-expired-but-unswept tracker answers None too: the sweep runs
+        lazily from get_or_create at 60s granularity, so without this check an
+        expired session would keep answering with stale pre-expiry state — and
+        a caller that then touched it (``update_from_response`` stamps
+        ``_last_activity``) would resurrect the dead tracker indefinitely,
+        making the documented 404-on-expired contract nondeterministic.
+        """
+        tracker = self._trackers.get(session_id)
+        if tracker is None or tracker.is_expired:
+            return None
+        return tracker
 
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
@@ -854,6 +1345,7 @@ class SessionTrackerStore:
         session_id: str,
         provider: str,
         messages: list[dict[str, Any]] | None = None,
+        cache_affinity: str | None = None,
     ) -> PrefixCacheTracker:
         """Resolve the tracker for THIS conversation within a session id (#2085).
 
@@ -866,10 +1358,11 @@ class SessionTrackerStore:
 
         Lineage resolution keys trackers by conversation content instead:
         reuse the tracker whose previous request messages are a prefix of the
-        incoming history (client histories are append-only, so a
-        conversation's next request always extends its previous one); start a
-        fresh lineage when the history diverges or was rewritten (client-side
-        compaction — the provider cache line is gone then anyway).
+        incoming history. It also recognizes a conservative block-level shape
+        where a large leading run and two-block identity suffix survive while
+        the middle tail is regenerated; all other rewrites start a fresh
+        lineage. This keeps #2671's stable cache boundary attached without
+        merging unrelated parallel sub-calls.
         Byte-identical histories (templated fan-outs before they diverge)
         intentionally share a tracker: their provider cache line is identical
         too, so sharing is harmless.
@@ -888,6 +1381,9 @@ class SessionTrackerStore:
                 compares like against like across turns. ``None``/empty
                 (legacy callers, stub stores in tests) falls back to plain
                 :meth:`get_or_create`.
+            cache_affinity: Stable fingerprint of the provider's non-message
+                cache-key segments (model/tools/tool choice/thinking). Lineages
+                with different affinity never share a tracker.
 
         Returns:
             The ``PrefixCacheTracker`` for this conversation's lineage.
@@ -918,14 +1414,48 @@ class SessionTrackerStore:
 
         family = self._lineages.setdefault(session_id, OrderedDict())
 
-        # Longest recorded chain that prefixes the incoming history wins.
+        # Strict whole-message continuations win first, then pure block appends.
+        # Rewritten-tail matches are deliberately last and require a unique best
+        # structural score; ambiguity starts a fresh lineage instead of making
+        # sibling sub-calls ping-pong one tracker.
+        by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
         best_key: str | None = None
-        best_len = -1
-        for key, chain in family.items():
-            if len(chain) > len(snap) or len(chain) <= best_len:
-                continue
-            if snap[: len(chain)] == chain:
-                best_key, best_len = key, len(chain)
+        for accepted in (
+            (RELATION_EXACT, RELATION_MESSAGE_APPEND),
+            (RELATION_BLOCK_APPEND,),
+        ):
+            for key, chain in by_length:
+                if self._lineage_affinities.get(key) != cache_affinity:
+                    continue
+                relation = _classify_history_canonical(snap, chain)
+                if relation.kind in accepted:
+                    best_key = key
+                    break
+            if best_key is not None:
+                break
+
+        if best_key is None:
+            rewrite_candidates: list[tuple[tuple[int, int, int], str]] = []
+            for key, chain in by_length:
+                if self._lineage_affinities.get(key) != cache_affinity:
+                    continue
+                relation = _classify_history_canonical(snap, chain)
+                if relation.kind == RELATION_BLOCK_REWRITE_TAIL:
+                    rewrite_candidates.append(
+                        (
+                            (
+                                relation.stable_prefix_blocks,
+                                relation.stable_suffix_blocks,
+                                relation.previous_block_count,
+                            ),
+                            key,
+                        )
+                    )
+            rewrite_candidates.sort(reverse=True)
+            if rewrite_candidates and (
+                len(rewrite_candidates) == 1 or rewrite_candidates[0][0] != rewrite_candidates[1][0]
+            ):
+                best_key = rewrite_candidates[0][1]
 
         if best_key is None:
             cap = self._default_config.max_lineages_per_session
@@ -963,6 +1493,7 @@ class SessionTrackerStore:
         # the family before the stamp below.
         tracker = self.get_or_create(best_key, provider)
         family[best_key] = snap
+        self._lineage_affinities[best_key] = cache_affinity
         return tracker
 
     def compute_session_id(
@@ -1031,6 +1562,7 @@ class SessionTrackerStore:
                 family = self._lineages[base]
                 for key in [k for k in family if k not in self._trackers]:
                     del family[key]
+                    self._lineage_affinities.pop(key, None)
                 if not family:
                     del self._lineages[base]
             logger.debug("SessionTrackerStore: cleaned up %d expired sessions", len(expired))

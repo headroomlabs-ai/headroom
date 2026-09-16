@@ -199,7 +199,10 @@ def test_inject_provider_config_creates_file(
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
     # Bare model ids: OpenCode resolves them as "headroom/<id>" (#1657).
     models = config["provider"]["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+    # The injected provider is OpenAI-compatible. Claude models must remain on
+    # OpenCode's native Anthropic provider so they are not sent to OpenAI.
+    assert not any(model_id.startswith("claude-") for model_id in models)
     assert all(not model_id.startswith("headroom/") for model_id in models)
     assert "mcp" not in config
     assert "model" not in config  # headroom provider is a transparent pass-through
@@ -456,10 +459,12 @@ def test_build_opencode_config_content_without_mcp(
     providers = config["provider"]
     assert providers["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     assert providers["openai"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    # The headroom provider exposes explicit models so "headroom/<id>" resolves (#1657).
+    # The headroom provider exposes only models supported by its
+    # OpenAI-compatible endpoint so "headroom/<id>" resolves safely (#1657).
     assert providers["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     models = providers["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+    assert not any(model_id.startswith("claude-") for model_id in models)
     assert all(not model_id.startswith("headroom/") for model_id in models)
     # The transport plugin is injected by absolute path (opencode loads it directly).
     assert config["plugin"] == [str(plugin)]

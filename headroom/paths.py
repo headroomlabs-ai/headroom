@@ -73,7 +73,10 @@ _SAVINGS_EVENTS_FILE = "savings_events.jsonl"
 _SYNC_STATE_FILE = "sync_state.json"
 _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
+# Legacy shared runtime-log filename. Kept only as the readers' backward-compat
+# fallback; live proxies now write per-port files (see ``proxy_log_path``).
 _PROXY_LOG_FILE = "proxy.log"
+_PROXY_STDIO_LOG_FILE = "proxy-stdio.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
@@ -300,10 +303,33 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path() -> Path:
-    """Return the path for the proxy log file."""
+def proxy_log_path(port: int | None = None, *, process_id: int | None = None) -> Path:
+    """Return the path for the proxy runtime log file.
 
-    return log_dir() / _PROXY_LOG_FILE
+    Multi-worker processes pass both values and write
+    ``proxy-<port>-<pid>.log``. Omitting *process_id* returns the standard
+    per-port name; omitting *port* returns the legacy shared name. Readers
+    honor all three.
+    """
+
+    if port is None:
+        name = _PROXY_LOG_FILE
+    elif process_id is None:
+        name = f"proxy-{port}.log"
+    else:
+        name = f"proxy-{port}-{process_id}.log"
+    return log_dir() / name
+
+
+def proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Return the path for the proxy stdout/stderr capture file.
+
+    Per-port for the same reason as :func:`proxy_log_path`; the legacy
+    ``proxy-stdio.log`` name is used when *port* is omitted.
+    """
+
+    name = f"proxy-stdio-{port}.log" if port is not None else _PROXY_STDIO_LOG_FILE
+    return log_dir() / name
 
 
 def debug_400_dir() -> Path:
@@ -340,6 +366,12 @@ def beacon_lock_path(port: int) -> Path:
     """Return the per-port proxy beacon lock file path."""
 
     return workspace_dir() / f".beacon_lock_{int(port)}"
+
+
+def proxy_start_lock_path(port: int) -> Path:
+    """Return the per-port lock used to serialize wrap proxy startup."""
+
+    return workspace_dir() / f".proxy_start_{int(port)}.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +458,14 @@ __all__ = [
     "bridge_state_path",
     "log_dir",
     "proxy_log_path",
+    "proxy_stdio_log_path",
     "debug_400_dir",
     "codex_wire_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
     "deploy_root",
     "beacon_lock_path",
+    "proxy_start_lock_path",
     "models_config_path",
     "plugin_config_dir",
     "plugin_workspace_dir",

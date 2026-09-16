@@ -2,6 +2,26 @@
 
 Headroom can be configured via the SDK, proxy command line, or per-request overrides.
 
+## Runtime Rollout Channels
+
+Rollout channels control behaviors in an already-installed artifact. They do
+not install or select a Headroom release/version.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HEADROOM_ROLLOUT_CHANNEL` | `stable` | Selects `stable`, `beta`, `canary`, or `dev`. |
+| `HEADROOM_FEATURES` | unset | Comma-separated feature names to request explicitly. |
+| `HEADROOM_DISABLE_FEATURES` | unset | Comma-separated feature names to force off. Disable wins over every enable path. |
+| `HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES` | unset | Break-glass override for emergency mitigation only. |
+
+Example:
+
+```bash
+export HEADROOM_ROLLOUT_CHANNEL=canary
+export HEADROOM_FEATURES=tool_result_interceptors
+headroom proxy --intercept-tool-results
+```
+
 ## SDK Configuration
 
 ```python
@@ -11,22 +31,17 @@ from openai import OpenAI
 client = HeadroomClient(
     original_client=OpenAI(),
     provider=OpenAIProvider(),
-
     # Mode: "audit" (observe only) or "optimize" (apply transforms)
     default_mode="optimize",
-
     # Enable provider-specific cache optimization
     enable_cache_optimizer=True,
-
     # Enable query-level semantic caching
     enable_semantic_cache=False,
-
     # Override default context limits per model
     model_context_limits={
         "gpt-4o": 128000,
         "gpt-4o-mini": 128000,
     },
-
     # Database location (defaults to temp directory)
     # store_url="sqlite:////absolute/path/to/headroom.db",
 )
@@ -116,20 +131,14 @@ Override configuration for specific requests:
 response = client.chat.completions.create(
     model="gpt-4o",
     messages=[...],
-
     # Override mode for this request
     headroom_mode="audit",
-
     # Reserve more tokens for output
     headroom_output_buffer_tokens=8000,
-
     # Keep last N turns (don't compress)
     headroom_keep_turns=5,
-
     # Skip compression for specific tools
-    headroom_tool_profiles={
-        "important_tool": {"skip_compression": True}
-    }
+    headroom_tool_profiles={"important_tool": {"skip_compression": True}},
 )
 ```
 
@@ -166,16 +175,16 @@ from headroom.transforms import SmartCrusherConfig
 config = SmartCrusherConfig(
     # Maximum items to keep after compression
     max_items_after_crush=15,
-
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
-
-    # Relevance scoring tier: "bm25" (fast) or "embedding" (accurate)
-    relevance_tier="bm25",
-
-    # Always keep items with these field values
-    preserve_fields=["error", "warning", "failure"],
+    # Guarantee rows matching these patterns survive compression verbatim
+    # (requires audit_safe=True; matched against each row's canonical JSON)
+    audit_safe=True,
+    protected_patterns=["error", "warning", "failure"],
 )
+# Error items and statistical anomalies (>2 std from mean) are always kept
+# automatically. Relevance-scoring tier ("bm25"/"embedding"/"hybrid") is a
+# separate `relevance_config` argument to SmartCrusher(), not a field here.
 ```
 
 ## Cache Aligner Configuration
@@ -183,14 +192,18 @@ config = SmartCrusherConfig(
 Control prefix stabilization:
 
 ```python
-from headroom.transforms import CacheAlignerConfig
+from headroom import CacheAlignerConfig
 
 config = CacheAlignerConfig(
-    # Enable/disable cache alignment
+    # Enable/disable cache alignment (disabled by default: prefix-stability
+    # gains are marginal in practice -- see headroom/config.py:61)
     enabled=True,
-
-    # Patterns to extract from system prompt
-    dynamic_patterns=[
+    # Legacy pattern list (only used when use_dynamic_detector=False;
+    # the field is `date_patterns`, not `dynamic_patterns`). Default mode
+    # (use_dynamic_detector=True) auto-detects dates, UUIDs, tokens, etc.
+    # via detection_tiers instead -- see headroom/config.py:68-79.
+    use_dynamic_detector=False,
+    date_patterns=[
         r"Today is \w+ \d+, \d{4}",
         r"Current time: .*",
     ],

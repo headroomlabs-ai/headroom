@@ -35,6 +35,14 @@ _OPENAI_STANDARD_PARAMS = (
     "response_format",
     "seed",
     "n",
+    # Reasoning / token dials. These MUST be forwarded as top-level litellm
+    # kwargs, not swept into `extra_body`: litellm maps them per provider
+    # (e.g. reasoning_effort -> Anthropic thinking config), whereas anything in
+    # `extra_body` is shipped to the provider verbatim and a non-OpenAI target
+    # like Claude 400s on the unknown field. Without this, an OpenAI-in
+    # reasoning request routed cross-protocol to a Claude model fails.
+    "reasoning_effort",
+    "max_completion_tokens",
 )
 
 _OPENAI_CONSUMED_BODY_KEYS = frozenset(
@@ -413,6 +421,81 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 }
 
 
+# How long an upstream call may go silent before we give up on it.
+#
+# WHY THIS EXISTS. There was no timeout here at all, so a request the upstream
+# never answered blocked its caller forever. Observed 2026-08-07 under load:
+# four agent workers sat on ESTABLISHED connections for 36+ minutes while this
+# proxy answered /readyz in 0.11s. No error, no retry, no log line -- the
+# client just stops. That is the worst shape a failure can take, because it is
+# indistinguishable from slow work and no supervisor can tell the difference.
+#
+# A float, not an httpx.Timeout, on purpose: litellm expands a float into all
+# four httpx phases, so for a STREAMING call this becomes the maximum gap
+# BETWEEN CHUNKS rather than a cap on total generation time. A long answer
+# streaming steadily is never cut off; a stalled one dies. That is the
+# semantic we want, and it falls out of the simpler type.
+#
+# 600s is deliberately generous -- long enough that no healthy call is at
+# risk, short enough that a hang surfaces within a coffee break instead of
+# never.
+UPSTREAM_TIMEOUT_ENV = "HEADROOM_UPSTREAM_TIMEOUT"
+DEFAULT_UPSTREAM_TIMEOUT = 600.0
+
+
+def _upstream_timeout() -> float:
+    """Seconds. Never raises; a junk env value must not disable the timeout."""
+    import os
+
+    try:
+        v = float(os.getenv(UPSTREAM_TIMEOUT_ENV, DEFAULT_UPSTREAM_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_UPSTREAM_TIMEOUT
+    # 0 or negative would mean "no timeout" to httpx, which is the bug.
+    return v if v > 0 else DEFAULT_UPSTREAM_TIMEOUT
+
+
+# Providers that cannot possibly accept an Anthropic `sk-ant-` credential.
+#
+# Explicit, rather than the inverse "anything not Anthropic": an unrecognised
+# provider is usually a compatible or self-hosted gateway, and guessing wrong
+# there drops a key that WAS working. Bedrock/Vertex are absent because the
+# dispatch sites already skip them entirely (env-based auth).
+#
+# ponytail: a hand-kept tuple; grow it as targets are confirmed. A registry
+# lookup would be the upgrade if this ever outgrows a handful of entries.
+_REJECTS_ANTHROPIC_KEY = ("openai", "azure", "gemini")
+
+
+def _caller_key_travels_to(model: str, key: str) -> bool:
+    """Can this inbound credential authenticate the provider we are about to call?
+
+    The caller authenticates to the PROXY. A routing extension may then rewrite
+    the model across families mid-request (claude-opus-5 -> gpt-5-mini), and the
+    caller's key does not travel with that rewrite: we forward `sk-ant-...` to
+    OpenAI and earn a guaranteed 401, which reads downstream as "the cheap model
+    failed the task" rather than as the routing bug it is.
+
+    Only an unambiguous mismatch is refused. `sk-ant-` is Anthropic's documented
+    vendor-specific prefix, so it cannot authenticate one of the providers above.
+    Every other credential -- a plain Bearer token, an OpenAI-style `sk-` that a
+    dozen vendors also mint, anything aimed at a compatible or custom gateway --
+    is unclassifiable from the string alone and keeps the pass-through.
+
+    Returning False drops the api_key kwarg, so litellm falls back to the target
+    provider's own env credential: the only key that can work.
+    """
+    if not key.startswith("sk-ant-"):
+        return True
+    try:
+        from litellm import get_llm_provider
+
+        provider = (get_llm_provider(model)[1] or "").lower()
+    except Exception:  # noqa: BLE001 - unclassifiable model, keep pass-through
+        return True
+    return provider not in _REJECTS_ANTHROPIC_KEY
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -503,6 +586,96 @@ def _parse_tool_arguments(arguments: Any) -> Any:
         except (json.JSONDecodeError, TypeError):
             return arguments
     return arguments
+
+
+def _is_anthropic_family_model(litellm_model: str) -> bool:
+    """True when the resolved litellm target speaks the Anthropic Messages
+    dialect: the Anthropic API, Bedrock-Claude, Vertex-Claude, Azure-Claude.
+
+    Only these accept — and on a tool-use continuation *require* — the prior
+    assistant turn's signed ``thinking`` blocks echoed back verbatim. Any other
+    target (OpenAI, DeepSeek, ...) must instead have thinking stripped, because
+    litellm forwards a stray ``thinking_blocks``/``reasoning_content`` field to
+    them unchanged and they reject the unknown key. Keyed on the model id, not
+    ``self.provider``, so a Bedrock/Vertex backend serving a Claude profile is
+    recognised while the same backend serving a non-Claude model is not.
+
+    Known limitation: a substring test on the resolved id. An OPAQUE Bedrock
+    application-inference-profile ARN naming neither "claude" nor "anthropic"
+    reads as non-family, so thinking is stripped even though the target is
+    Claude; operators using such an ARN should map it to an id carrying the
+    model name. Conversely a non-Claude model whose id happens to contain
+    "claude" would be treated as family.
+    """
+    m = (litellm_model or "").lower()
+    return "claude" in m or "anthropic" in m
+
+
+def _thinking_block_to_dict(block: Any) -> dict[str, Any]:
+    """Normalise a litellm thinking block (dict or pydantic) to a plain dict."""
+    if isinstance(block, dict):
+        return block
+    if hasattr(block, "model_dump"):
+        try:
+            dumped = block.model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:  # noqa: BLE001 - fall through to attribute scrape
+            pass
+    return {
+        k: getattr(block, k)
+        for k in ("type", "thinking", "signature", "data")
+        if getattr(block, k, None) is not None
+    }
+
+
+def _extract_thinking_content_blocks(message: Any) -> list[dict[str, Any]]:
+    """Anthropic-shaped ``thinking``/``redacted_thinking`` content blocks to
+    prepend to a rebuilt Anthropic response, taken from litellm's
+    ``message.thinking_blocks``.
+
+    Only blocks that can be legally replayed are emitted: a ``thinking`` block
+    is kept only if it carries a real ``signature`` (Anthropic validates it
+    cryptographically and 400s an unsigned block on the next turn), and a
+    ``redacted_thinking`` block only if it carries its opaque ``data``. Bare,
+    signatureless reasoning text is dropped rather than turned into a poison
+    block the client cannot send back.
+    """
+    raw = getattr(message, "thinking_blocks", None) or []
+    out: list[dict[str, Any]] = []
+    for block in raw:
+        bd = _thinking_block_to_dict(block)
+        btype = bd.get("type")
+        if btype == "redacted_thinking":
+            if bd.get("data"):
+                out.append({"type": "redacted_thinking", "data": bd["data"]})
+        elif btype in (None, "thinking"):
+            signature = bd.get("signature")
+            if signature:
+                out.append(
+                    {
+                        "type": "thinking",
+                        "thinking": bd.get("thinking") or "",
+                        "signature": signature,
+                    }
+                )
+    return out
+
+
+def _reasoning_from_stream_delta(delta: Any) -> tuple[str, str | None]:
+    """Incremental reasoning text and (if present) signature from a litellm
+    streaming delta. Prefers ``reasoning_content`` for the text and reads the
+    signature off ``thinking_blocks`` (where litellm places it, usually on the
+    final reasoning chunk)."""
+    text = getattr(delta, "reasoning_content", None) or ""
+    signature: str | None = None
+    for block in getattr(delta, "thinking_blocks", None) or []:
+        bd = _thinking_block_to_dict(block)
+        if not text and bd.get("thinking"):
+            text = bd["thinking"]
+        if bd.get("signature"):
+            signature = bd["signature"]
+    return text, signature
 
 
 class LiteLLMBackend(Backend):
@@ -622,6 +795,21 @@ class LiteLLMBackend(Backend):
             if anthropic_model.startswith("arn:aws:"):
                 return f"bedrock/converse/{anthropic_model}"
 
+            # Cross-region prefixed IDs are already fully qualified system-defined
+            # profile IDs — pass through directly.  Normalizing and re-looking them
+            # up in the discovery map can route the request to a wrong or
+            # unauthorized profile (e.g. an APPLICATION profile in the same account
+            # that also wraps the same foundation model). This applies whether the
+            # prefix arrives bare ("us.anthropic...") or already LiteLLM-qualified
+            # ("bedrock/us.anthropic...").
+            _CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
+            if anthropic_model.startswith(_CROSS_REGION_PREFIXES):
+                return f"bedrock/{anthropic_model}"
+            if anthropic_model.startswith("bedrock/") and anthropic_model[
+                len("bedrock/") :
+            ].startswith(_CROSS_REGION_PREFIXES):
+                return anthropic_model
+
             normalized = _normalize_bedrock_profile_id(anthropic_model)
             if normalized and normalized in self._model_map:
                 return self._model_map[normalized]
@@ -656,7 +844,11 @@ class LiteLLMBackend(Backend):
             return True
         return "claude" in model.lower() or model in self._model_map
 
-    def _convert_messages_for_litellm(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _convert_messages_for_litellm(
+        self,
+        messages: list[dict[str, Any]],
+        preserve_thinking: bool = False,
+    ) -> list[dict[str, Any]]:
         """Convert Anthropic message format to LiteLLM/OpenAI format.
 
         Anthropic and OpenAI have different representations for tool calls:
@@ -665,6 +857,15 @@ class LiteLLMBackend(Backend):
 
         This method converts Anthropic-style messages to OpenAI-style so LiteLLM
         can send them to any provider.
+
+        When ``preserve_thinking`` is set (Anthropic-family target only), an
+        assistant turn's ``thinking``/``redacted_thinking`` blocks are carried
+        through on the outgoing message's ``thinking_blocks`` field. litellm's
+        own Anthropic and Bedrock request transforms read that field and forward
+        the blocks — signature and position intact — which Anthropic *requires*
+        on a tool-use continuation. Left unset (cross-vendor target), the blocks
+        are dropped: litellm would otherwise ship the unknown field to a
+        non-Anthropic provider, which rejects it.
         """
         converted = []
         for msg in messages:
@@ -682,6 +883,7 @@ class LiteLLMBackend(Backend):
                 text_parts = []
                 tool_use_blocks = []
                 tool_result_blocks = []
+                thinking_blocks: list[dict[str, Any]] = []
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -693,6 +895,15 @@ class LiteLLMBackend(Backend):
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
                         tool_result_blocks.append(block)
+                    elif block_type == "redacted_thinking":
+                        if block.get("data"):
+                            thinking_blocks.append(block)
+                    elif block_type == "thinking":
+                        # Only a signed block is legal to replay: Anthropic 400s
+                        # an unsigned thinking block, and litellm would drop it
+                        # anyway. Symmetric with the response-side guard.
+                        if block.get("signature"):
+                            thinking_blocks.append(block)
 
                 # tool_result blocks → OpenAI "tool" role messages
                 if tool_result_blocks:
@@ -741,14 +952,23 @@ class LiteLLMBackend(Backend):
                         }
                         for tu in tool_use_blocks
                     ]
+                    # Anthropic 400s a tool continuation whose assistant turn
+                    # carried thinking but lost it here. litellm's Anthropic /
+                    # Bedrock transforms read thinking_blocks off the message and
+                    # re-emit them, signature and lead position intact.
+                    if preserve_thinking and thinking_blocks:
+                        assistant_msg["thinking_blocks"] = thinking_blocks
                     converted.append(assistant_msg)
                     continue
 
-                # Simple text only
-                if text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
-                else:
-                    converted.append({"role": role, "content": ""})
+                # Simple text only (or a thinking-only assistant turn)
+                simple_msg: dict[str, Any] = {
+                    "role": role,
+                    "content": "\n".join(text_parts) if text_parts else "",
+                }
+                if preserve_thinking and thinking_blocks and role == "assistant":
+                    simple_msg["thinking_blocks"] = thinking_blocks
+                converted.append(simple_msg)
 
         return converted
 
@@ -815,8 +1035,12 @@ class LiteLLMBackend(Backend):
         choice = litellm_response.choices[0]
         message = choice.message
 
-        # Build Anthropic content blocks
-        content = []
+        # Build Anthropic content blocks. Signed thinking must LEAD the content
+        # (Anthropic rejects a thinking block that does not come first) and
+        # round-trip verbatim so the client can replay it on the next tool turn.
+        # litellm surfaces upstream thinking on message.thinking_blocks with the
+        # signature intact; unsigned reasoning is dropped, not emitted.
+        content: list[dict[str, Any]] = list(_extract_thinking_content_blocks(message))
         if message.content:
             content.append({"type": "text", "text": message.content})
 
@@ -863,10 +1087,13 @@ class LiteLLMBackend(Backend):
         """Send message via LiteLLM."""
         original_model = body.get("model", "claude-3-5-sonnet-20241022")
         litellm_model = self.map_model_id(original_model)
+        preserve_thinking = _is_anthropic_family_model(litellm_model)
 
         try:
             # Convert messages
-            messages = self._convert_messages_for_litellm(body.get("messages", []))
+            messages = self._convert_messages_for_litellm(
+                body.get("messages", []), preserve_thinking=preserve_thinking
+            )
 
             # Build kwargs for litellm
             kwargs: dict[str, Any] = {
@@ -883,6 +1110,12 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
+            # Forward the extended-thinking config to Anthropic-family targets.
+            # Required for consistency with preserved history: Anthropic errors
+            # if an assistant message carries thinking blocks while thinking is
+            # disabled for the turn. Never sent cross-vendor.
+            if preserve_thinking and "thinking" in body:
+                kwargs["thinking"] = body["thinking"]
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
@@ -917,14 +1150,21 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -976,9 +1216,12 @@ class LiteLLMBackend(Backend):
         """
         original_model = body.get("model", "claude-3-5-sonnet-20241022")
         litellm_model = self.map_model_id(original_model)
+        preserve_thinking = _is_anthropic_family_model(litellm_model)
 
         try:
-            messages = self._convert_messages_for_litellm(body.get("messages", []))
+            messages = self._convert_messages_for_litellm(
+                body.get("messages", []), preserve_thinking=preserve_thinking
+            )
 
             kwargs: dict[str, Any] = {
                 "model": litellm_model,
@@ -994,6 +1237,10 @@ class LiteLLMBackend(Backend):
                 kwargs["top_p"] = body["top_p"]
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
+            # Forward extended-thinking config to Anthropic-family targets only
+            # (see send_message for why). Never sent cross-vendor.
+            if preserve_thinking and "thinking" in body:
+                kwargs["thinking"] = body["thinking"]
             if "tools" in body:
                 tools_in = body["tools"]
                 # Bedrock Converse API hard-rejects tool names over 64 chars.
@@ -1022,10 +1269,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1055,6 +1306,9 @@ class LiteLLMBackend(Backend):
             kwargs["stream_options"] = {"include_usage": True}
 
             # Stream content — blocks emitted dynamically based on response
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
@@ -1070,6 +1324,99 @@ class LiteLLMBackend(Backend):
             final_input_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
+
+            # Extended thinking is BUFFERED, not streamed live. A thinking block
+            # is only legal to replay if it leads the turn and carries a real
+            # signature; litellm delivers the signature on a later chunk, so
+            # emitting live would risk (a) an unsigned block if the stream ends
+            # first, and (b) a block reopened after text/tool_use if a signature
+            # arrives late. Instead we accumulate here and flush a single signed
+            # block at the transition to the first non-thinking content (or at
+            # end of stream), dropping it entirely if no signature ever arrived —
+            # the same guard the non-streaming path applies.
+            #
+            # KNOWN LIMITATION (litellm-routed streaming): litellm normalises the
+            # native Anthropic SSE into a flattened OpenAI shape — reasoning text
+            # concatenated on `reasoning_content`, blocks accumulated on
+            # `thinking_blocks` — which loses per-block boundaries. So this
+            # reconstructs the common case (one signed thinking block) faithfully
+            # but does NOT reconstruct `redacted_thinking` blocks, nor multiple
+            # distinct thinking blocks with independent signatures, on the stream.
+            # Anthropic validates signatures BY POSITION, so guessing an order
+            # would risk a corrupt (400/poison) block — strictly worse than a
+            # clean drop, which on this litellm path merely makes litellm disable
+            # thinking for the next turn (it detects the missing blocks), not a
+            # crash. Full streaming fidelity for those cases requires routing
+            # Anthropic-family targets through litellm.anthropic_messages (the
+            # native passthrough), which preserves the native SSE untouched.
+            thinking_text = ""
+            thinking_signature: str | None = None
+            thinking_seen = False
+            thinking_flushed = False
+            content_started = False  # a text/tool_use block has opened
+
+            def _flush_thinking() -> list[StreamEvent]:
+                nonlocal current_block_index, active_block_type, output_tokens
+                nonlocal thinking_flushed
+                thinking_flushed = True
+                if not thinking_signature or content_started:
+                    # Drop when unsigned (Anthropic 400s it on replay) or when
+                    # content already started (a thinking block MUST lead — a
+                    # late one cannot be legally placed). Matches the
+                    # non-streaming guard; a genuine Anthropic stream always
+                    # sends thinking, signed, before any text/tool_use anyway.
+                    return []
+                events: list[StreamEvent] = []
+                if active_block_type is not None:
+                    events.append(
+                        StreamEvent(
+                            event_type="content_block_stop",
+                            data={"type": "content_block_stop", "index": current_block_index},
+                        )
+                    )
+                current_block_index += 1
+                idx = current_block_index
+                events.append(
+                    StreamEvent(
+                        event_type="content_block_start",
+                        data={
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "thinking", "thinking": ""},
+                        },
+                    )
+                )
+                if thinking_text:
+                    events.append(
+                        StreamEvent(
+                            event_type="content_block_delta",
+                            data={
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "thinking_delta", "thinking": thinking_text},
+                            },
+                        )
+                    )
+                    output_tokens += 1
+                events.append(
+                    StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "signature_delta", "signature": thinking_signature},
+                        },
+                    )
+                )
+                events.append(
+                    StreamEvent(
+                        event_type="content_block_stop",
+                        data={"type": "content_block_stop", "index": idx},
+                    )
+                )
+                # Thinking block fully closed; the next content opens fresh.
+                active_block_type = None
+                return events
 
             async for chunk in response:
                 if hasattr(chunk, "usage") and chunk.usage:
@@ -1094,6 +1441,28 @@ class LiteLLMBackend(Backend):
                 elif choice.finish_reason == "length":
                     stop_reason = "max_tokens"
 
+                # Accumulate extended-thinking (buffered — see _flush_thinking).
+                # Only for Anthropic-family targets, and only until flushed;
+                # a late reasoning delta after content has started is ignored
+                # rather than emitted as an illegal non-leading thinking block.
+                if preserve_thinking and not thinking_flushed:
+                    reasoning_piece, signature_piece = _reasoning_from_stream_delta(delta)
+                    if reasoning_piece:
+                        thinking_text += reasoning_piece
+                        thinking_seen = True
+                    if signature_piece:
+                        thinking_signature = signature_piece
+                        thinking_seen = True
+
+                # First non-thinking content: flush the buffered thinking block
+                # (signed) so it leads, before opening any text/tool_use block.
+                has_content = bool(getattr(delta, "tool_calls", None)) or bool(
+                    getattr(delta, "content", None)
+                )
+                if thinking_seen and not thinking_flushed and has_content:
+                    for ev in _flush_thinking():
+                        yield ev
+
                 # Handle tool_calls in the delta
                 if hasattr(delta, "tool_calls") and delta.tool_calls:
                     for tc in delta.tool_calls:
@@ -1112,6 +1481,7 @@ class LiteLLMBackend(Backend):
                             current_block_index += 1
                             tool_block_map[idx] = current_block_index
                             active_block_type = "tool_use"
+                            content_started = True
                             tool_id = tc.id or f"toolu_{uuid.uuid4().hex[:24]}"
                             tool_name = tc.function.name if tc.function and tc.function.name else ""
                             yield StreamEvent(
@@ -1159,6 +1529,7 @@ class LiteLLMBackend(Backend):
                         # Open a new text block
                         current_block_index += 1
                         active_block_type = "text"
+                        content_started = True
                         yield StreamEvent(
                             event_type="content_block_start",
                             data={
@@ -1177,6 +1548,12 @@ class LiteLLMBackend(Backend):
                         },
                     )
                     output_tokens += 1
+
+            # Thinking-only turn: no non-thinking content ever arrived to trigger
+            # the mid-loop flush, so flush it now (still signature-guarded).
+            if thinking_seen and not thinking_flushed:
+                for ev in _flush_thinking():
+                    yield ev
 
             # Close the last open block
             if active_block_type is not None:
@@ -1275,14 +1652,21 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1293,10 +1677,16 @@ class LiteLLMBackend(Backend):
             # cache_creation_tokens for the OpenAI nested dialect. Surface both
             # so PrefixCacheTracker.update_from_response on the backend-routed
             # path observes a stable shape instead of branching on key presence.
+            # None-guard the core counts (same defensive style as the cache
+            # fields just below). A provider can leave any of these None on the
+            # Usage object; emitting None here flows into the OpenAI-shape body,
+            # and the backend-routed OpenAI handler reads them straight into
+            # arithmetic and RequestOutcome (output_tokens=..., and
+            # max(0, prompt_tokens - ...)), which raises TypeError on None.
             usage_block: dict[str, Any] = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+                "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
             }
 
             # Defensive getattr: LiteLLM only attaches these top-level attrs
@@ -1340,6 +1730,28 @@ class LiteLLMBackend(Backend):
                         "message": {
                             "role": c.message.role,
                             "content": c.message.content,
+                            # Carry reasoning through for the OpenAI-in ->
+                            # Anthropic-out direction (e.g. Codex routed to a
+                            # Claude model): the model's thinking would otherwise
+                            # be dropped from the OpenAI-shape response. Keep
+                            # both dialects — reasoning_content (text) and the
+                            # signed thinking_blocks — so a caller can display or
+                            # replay it.
+                            **(
+                                {"reasoning_content": c.message.reasoning_content}
+                                if getattr(c.message, "reasoning_content", None)
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "thinking_blocks": [
+                                        _thinking_block_to_dict(b)
+                                        for b in c.message.thinking_blocks
+                                    ]
+                                }
+                                if getattr(c.message, "thinking_blocks", None)
+                                else {}
+                            ),
                             **(
                                 {
                                     "tool_calls": [
@@ -1447,11 +1859,18 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             async for chunk in response:

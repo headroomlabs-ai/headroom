@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -24,10 +25,22 @@ from headroom import paths
 from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+from headroom.proxy import ssl_context as proxy_ssl_context
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://api.githubcopilot.com"
+# Copilot serves *chat* from the CAPI host above and *inline completions* from a
+# separate proxy host. GitHub's own client library keeps them apart:
+#
+#     _getCAPIUrl(t)   -> t?.endpoints.api   || "https://api.githubcopilot.com"
+#     _getProxyUrl(t)  -> t?.endpoints.proxy || DEFAULT_PROXY_BASE_URL
+#     DEFAULT_PROXY_BASE_URL = "https://copilot-proxy.githubusercontent.com"
+#
+# and builds completions as `${proxyBaseURL}/v1/engines/<engine>/completions`
+# (@vscode/copilot-api 0.5.2). Sending that path to the CAPI host is the wrong
+# surface, so the completions default has to be its own constant (#3076).
+DEFAULT_COMPLETIONS_PROXY_URL = "https://copilot-proxy.githubusercontent.com"
 DEFAULT_TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 DEFAULT_USER_INFO_URL = "https://api.github.com/copilot_internal/user"
 DEFAULT_GITHUB_HOST = "github.com"
@@ -62,6 +75,15 @@ _OAUTH_TOKEN_KEYS = (
     "accessToken",
 )
 _EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry", "expires")
+
+
+def _urlopen(request: urllib_request.Request, *, timeout: float) -> Any:
+    """Open a GitHub request with Headroom's configured corporate trust roots."""
+
+    context = proxy_ssl_context.build_urlopen_context()
+    if context is not None:
+        return urllib_request.urlopen(request, timeout=timeout, context=context)
+    return urllib_request.urlopen(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -243,6 +265,120 @@ def _configured_api_url() -> str:
     if configured:
         return configured
     return DEFAULT_API_URL
+
+
+def copilot_api_url() -> str:
+    """Return the configured Copilot API base URL without any network calls.
+
+    Resolves ``GITHUB_COPILOT_API_URL``, then the configured enterprise domain,
+    then ``api.githubcopilot.com``. Unlike :func:`resolve_copilot_api_url` this
+    performs no token exchange, so it is safe to call while routing a request.
+    """
+
+    return _configured_api_url()
+
+
+# GitHub's token exchange advertises the host that serves inline completions
+# under ``endpoints.proxy``, alongside the ``endpoints.api`` chat host. It is
+# recorded here when observed so completions routing uses GitHub's own answer
+# instead of an assumption about which host serves that endpoint (#3076).
+_observed_completions_base_url: str | None = None
+
+
+def _remember_completions_endpoint(payload: Any) -> None:
+    """Record the completions host advertised by a token-exchange payload."""
+
+    global _observed_completions_base_url
+    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    proxy_url = endpoints.get("proxy") if isinstance(endpoints, dict) else None
+    if isinstance(proxy_url, str) and proxy_url.strip():
+        _observed_completions_base_url = proxy_url.strip().rstrip("/")
+
+
+def reset_observed_completions_endpoint() -> None:
+    """Forget the advertised completions host (test isolation)."""
+
+    global _observed_completions_base_url
+    _observed_completions_base_url = None
+
+
+def _url_host(value: str) -> str:
+    """Hostname for a URL, tolerating a scheme-less value.
+
+    Mirrors the normalization :func:`is_copilot_api_url` performs, so a host
+    configured without "https://" is not silently treated as a different host.
+    """
+
+    parsed = urlparse(value)
+    netloc_or_path = parsed.netloc.lower() or parsed.path.lower()
+    return (parsed.hostname or netloc_or_path.split("/", 1)[0]).lower()
+
+
+def is_copilot_completions_host(url: str | None) -> bool:
+    """Return True when *url* already points at a Copilot inline-completions host.
+
+    Distinct from :func:`is_copilot_api_url`, which matches the CAPI (chat)
+    surface. A CAPI host is *not* a completions host, so the two must not be
+    conflated when deciding whether a completions request is already addressed
+    correctly.
+    """
+
+    if not url:
+        return False
+    # Compare hosts, never whole strings: this is asked both about a bare base
+    # URL (routing) and about a fully-built URL with the path appended (auth).
+    # A string compare answers True for the first and False for the second, so
+    # an operator override would route correctly and then be forwarded with no
+    # credentials at all.
+    host = _url_host(url)
+    if not host:
+        return False
+    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip()
+    if override and host == _url_host(override):
+        return True
+    if host == "copilot-proxy.githubusercontent.com":
+        return True
+    # Per-SKU hosts GitHub hands out via `endpoints.proxy`, e.g.
+    # proxy.individual.githubcopilot.com / proxy.business… / proxy.enterprise….
+    return host.startswith("proxy.") and host.endswith(".githubcopilot.com")
+
+
+def copilot_completions_base_url() -> str:
+    """Return the base URL serving Copilot's inline-completions endpoint.
+
+    Resolution order, most authoritative first:
+
+    1. ``GITHUB_COPILOT_PROXY_URL`` — an explicit operator override, so a
+       network that fronts Copilot behind its own gateway (or a GitHub change
+       to this endpoint) is a config edit rather than a code change.
+    2. ``endpoints.proxy`` from the last Copilot token exchange — GitHub
+       telling us directly where completions go.
+    3. ``copilot-proxy.githubusercontent.com`` — GitHub's own documented
+       default for this endpoint (see ``DEFAULT_COMPLETIONS_PROXY_URL``).
+    4. For an enterprise or otherwise custom Copilot deployment, that
+       deployment's own host. Falling back to the public GitHub host there would
+       send an enterprise tenant's keystrokes outside their deployment, which is
+       worse than failing to resolve.
+
+    Note what step 4 must *not* capture: a configured API URL that is itself a
+    public Copilot host. ``headroom wrap vscode`` sets ``GITHUB_COPILOT_API_URL``
+    to the resolved subscription URL (e.g. ``api.business.githubcopilot.com``),
+    which is the chat surface — returning it here would put the completions path
+    straight back on the host that answers it with 404. Only a host outside
+    ``*.githubcopilot.com`` indicates a deployment whose traffic has to stay put.
+
+    Never performs I/O; step 2 only reads what a previous exchange recorded.
+    """
+
+    override = os.environ.get("GITHUB_COPILOT_PROXY_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    if _observed_completions_base_url:
+        return _observed_completions_base_url
+    configured = _configured_api_url_override()
+    if configured and not _is_public_copilot_api_host(_url_host(configured)):
+        return configured
+    return DEFAULT_COMPLETIONS_PROXY_URL
 
 
 def _github_oauth_domain(domain: str | None = None) -> str:
@@ -536,7 +672,7 @@ def start_copilot_device_authorization(
         },
         method="POST",
     )
-    with urllib_request.urlopen(request, timeout=timeout) as response:
+    with _urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8", errors="replace"))
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -574,7 +710,7 @@ def poll_copilot_device_authorization(
             },
             method="POST",
         )
-        with urllib_request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
         if not isinstance(payload, dict):
             raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -777,7 +913,45 @@ def resolve_client_bearer_token() -> str | None:
     return read_cached_oauth_token()
 
 
-def _copilot_chat_header_defaults() -> dict[str, str]:
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """Case-insensitive header lookup."""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def resolve_copilot_integration_id(client_value: str | None = None) -> str:
+    """Return the integration ID this request's credential must be bound to.
+
+    GitHub binds a Copilot API token to the ``Copilot-Integration-Id`` it was
+    minted under and verifies the pairing with an HMAC. Presenting a token
+    minted for one integration alongside a header naming another fails with:
+
+        401 unauthorized: unable to validate HMAC for the given
+            Copilot-Integration-ID
+
+    Resolution order — the client's own header wins, matching the long-standing
+    contract that ``GITHUB_COPILOT_INTEGRATION_ID`` configures the DEFAULT this
+    proxy sends rather than overriding a client that stated its own identity
+    (pinned by ``test_apply_copilot_api_auth_preserves_existing_copilot_headers``):
+
+    1. The client's own header — a Copilot CLI session identifies as something
+       other than ``vscode-chat``, and minting under its ID keeps GitHub's usage
+       attribution pointing at the surface that actually made the call.
+    2. ``GITHUB_COPILOT_INTEGRATION_ID`` — the operator-configured default.
+    3. The historical built-in default.
+    """
+    if client_value and client_value.strip():
+        return client_value.strip()
+    configured = os.environ.get("GITHUB_COPILOT_INTEGRATION_ID", "").strip()
+    if configured:
+        return configured
+    return _DEFAULT_COPILOT_INTEGRATION_ID
+
+
+def _copilot_chat_header_defaults(integration_id: str | None = None) -> dict[str, str]:
     return {
         "User-Agent": os.environ.get("GITHUB_COPILOT_USER_AGENT", _DEFAULT_USER_AGENT).strip()
         or _DEFAULT_USER_AGENT,
@@ -790,12 +964,24 @@ def _copilot_chat_header_defaults() -> dict[str, str]:
             _DEFAULT_EDITOR_PLUGIN_VERSION,
         ).strip()
         or _DEFAULT_EDITOR_PLUGIN_VERSION,
-        "Copilot-Integration-Id": os.environ.get(
-            "GITHUB_COPILOT_INTEGRATION_ID",
-            _DEFAULT_COPILOT_INTEGRATION_ID,
-        ).strip()
-        or _DEFAULT_COPILOT_INTEGRATION_ID,
+        "Copilot-Integration-Id": integration_id or resolve_copilot_integration_id(),
     }
+
+
+def _overwrite_header(headers: dict[str, str], name: str, value: str) -> None:
+    """Set a header, replacing any case-variant already present.
+
+    Writes through the EXISTING key when there is one, so a client that sent
+    ``copilot-integration-id`` does not end up with a second
+    ``Copilot-Integration-Id`` beside it — duplicate case-variants are what
+    ``_set_header_default`` exists to avoid, and the same care applies when
+    overwriting.
+    """
+    for key in list(headers):
+        if key.lower() == name.lower():
+            headers[key] = value
+            return
+    headers[name] = value
 
 
 def _set_header_default(headers: dict[str, str], name: str, value: str) -> None:
@@ -807,11 +993,13 @@ def _set_header_default(headers: dict[str, str], name: str, value: str) -> None:
     headers[name] = value
 
 
-def _copilot_token_exchange_headers(oauth_token: str) -> dict[str, str]:
+def _copilot_token_exchange_headers(
+    oauth_token: str, *, integration_id: str | None = None
+) -> dict[str, str]:
     return {
         "Accept": "application/json",
         "Authorization": f"Bearer {oauth_token}",
-        **_copilot_chat_header_defaults(),
+        **_copilot_chat_header_defaults(integration_id),
     }
 
 
@@ -993,6 +1181,25 @@ def is_copilot_api_url(url: str | None) -> bool:
     return _is_public_copilot_api_host(hostname) or _is_ghe_copilot_api_host(hostname)
 
 
+def is_copilot_upstream_url(url: str | None) -> bool:
+    """Return True for any Copilot-served upstream: chat (CAPI) or completions.
+
+    Copilot has two surfaces on two different hosts, and code that asks "is this
+    request going to Copilot?" means the union. :func:`is_copilot_api_url` alone
+    answers only for chat, so the completions host looked like a stranger:
+    ``apply_copilot_api_auth`` attached no credentials to it (401) and
+    ``build_copilot_upstream_url`` skipped ``mark_request_routed_to_copilot``,
+    which mislabels the provider in telemetry.
+
+    Deliberately *not* folded into :func:`is_copilot_api_url`, which also gates
+    validation of the ``endpoints.api`` value from a token exchange and the
+    Responses-API preference check — neither of which should treat a completions
+    host as a chat host (#3076).
+    """
+
+    return is_copilot_api_url(url) or is_copilot_completions_host(url)
+
+
 def _is_public_copilot_api_host(host: str) -> bool:
     """Return True for GitHub-hosted Copilot API domains."""
 
@@ -1056,12 +1263,35 @@ def reset_request_routed_to_copilot() -> None:
     _request_routed_to_copilot.set(False)
 
 
+def is_copilot_completions_path(path: str) -> bool:
+    """Return True for Copilot's inline-completions ("ghost text") endpoint.
+
+    The Copilot editor extensions send code completions to
+    ``/v1/engines/<engine>/completions`` on whatever host
+    ``github.copilot.advanced.debug.overrideProxyUrl`` names — so when that
+    setting points at Headroom, this is the path that arrives.
+
+    The shape identifies GitHub Copilot on its own. OpenAI's Engines API was
+    removed years ago and no other provider Headroom fronts serves it, so a
+    request on this path is Copilot's and can never be answered by the default
+    OpenAI target (#3076).
+    """
+
+    normalized = (path if path.startswith("/") else f"/{path}").rstrip("/")
+    prefix = "/v1/engines/"
+    suffix = "/completions"
+    if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+        return False
+    engine = normalized[len(prefix) : -len(suffix)]
+    return bool(engine) and "/" not in engine
+
+
 def build_copilot_upstream_url(base_url: str, path: str) -> str:
     """Build an upstream URL, normalizing GitHub Copilot's non-/v1 path layout."""
 
     normalized_base = base_url.rstrip("/")
     normalized_path = path if path.startswith("/") else f"/{path}"
-    if is_copilot_api_url(normalized_base):
+    if is_copilot_upstream_url(normalized_base):
         # Single routing chokepoint for every Copilot surface (OpenAI
         # chat/responses and Anthropic messages all build their upstream URL
         # here), so mark the request for provider relabeling downstream.
@@ -1071,7 +1301,17 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
         # Anthropic surface for Claude models IS ``/v1/messages`` (with the
         # ``/v1``); stripping it forwarded ``/messages`` and Copilot returned 404
         # for claude-* models (#2409). Keep ``/v1`` for the messages endpoint.
-        if normalized_path.startswith("/v1/") and not normalized_path.startswith("/v1/messages"):
+        #
+        # Inline completions are the same story: the Copilot extension itself
+        # builds ``/v1/engines/<engine>/completions``, so the path that reaches
+        # us is already the exact path Copilot serves. Stripping ``/v1`` there
+        # rewrites a Copilot-native path into one that 404s (#3076). The rule
+        # this encodes: strip only for clients speaking generic-OpenAI at
+        # Copilot, never for Copilot's own paths.
+        keep_v1 = normalized_path.startswith("/v1/messages") or is_copilot_completions_path(
+            normalized_path
+        )
+        if normalized_path.startswith("/v1/") and not keep_v1:
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
@@ -1111,7 +1351,7 @@ def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
     headers = _copilot_token_exchange_headers(token)
     request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
     try:
-        with urllib_request.urlopen(request, timeout=10.0) as response:
+        with _urlopen(request, timeout=10.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         logger.debug("Unable to resolve Copilot API URL from user info: %s", exc)
@@ -1125,9 +1365,29 @@ class CopilotTokenProvider:
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._cached: CopilotAPIToken | None = None
+        # Keyed by integration ID: GitHub binds each token to the
+        # ``Copilot-Integration-Id`` it was minted under and HMAC-verifies the
+        # pairing, so a token cached for one integration is NOT reusable for
+        # another. A single slot handed a vscode-chat token to a CLI session
+        # and GitHub answered 401 "unable to validate HMAC for the given
+        # Copilot-Integration-ID".
+        self._cached_by_integration: dict[str, CopilotAPIToken] = {}
 
-    async def get_api_token(self) -> CopilotAPIToken:
+    @property
+    def _cached(self) -> CopilotAPIToken | None:
+        """Back-compat view of the default integration's token (tests/callers)."""
+        return self._cached_by_integration.get(resolve_copilot_integration_id())
+
+    @_cached.setter
+    def _cached(self, value: CopilotAPIToken | None) -> None:
+        key = resolve_copilot_integration_id()
+        if value is None:
+            self._cached_by_integration.pop(key, None)
+        else:
+            self._cached_by_integration[key] = value
+
+    async def get_api_token(self, *, integration_id: str | None = None) -> CopilotAPIToken:
+        key = resolve_copilot_integration_id(integration_id)
         explicit_api_token = os.environ.get("GITHUB_COPILOT_API_TOKEN", "").strip()
         refresh_oauth_token = os.environ.get(_REFRESH_OAUTH_TOKEN_ENV_VAR, "").strip()
         if explicit_api_token and not refresh_oauth_token:
@@ -1137,12 +1397,12 @@ class CopilotTokenProvider:
                 api_url=_configured_api_url(),
             )
 
-        cached = self._cached
+        cached = self._cached_by_integration.get(key)
         if cached is not None and cached.is_valid:
             return cached
 
         async with self._lock:
-            cached = self._cached
+            cached = self._cached_by_integration.get(key)
             if cached is not None and cached.is_valid:
                 return cached
 
@@ -1154,11 +1414,11 @@ class CopilotTokenProvider:
                         expires_at=seeded_expires_at if seeded_expires_at is not None else 0.0,
                         api_url=_configured_api_url(),
                     )
-                    self._cached = seeded
+                    self._cached_by_integration[key] = seeded
                     if seeded.is_valid:
                         return seeded
-                exchanged = await self._exchange_token(refresh_oauth_token)
-                self._cached = exchanged
+                exchanged = await self._exchange_token(refresh_oauth_token, integration_id=key)
+                self._cached_by_integration[key] = exchanged
                 return exchanged
 
             oauth_token = read_cached_oauth_token()
@@ -1171,15 +1431,17 @@ class CopilotTokenProvider:
                     expires_at=time.time() + 3600,
                     api_url=_configured_api_url(),
                 )
-                self._cached = direct_token
+                self._cached_by_integration[key] = direct_token
                 return direct_token
 
-            exchanged = await self._exchange_token(oauth_token)
-            self._cached = exchanged
+            exchanged = await self._exchange_token(oauth_token, integration_id=key)
+            self._cached_by_integration[key] = exchanged
             return exchanged
 
-    async def _exchange_token(self, oauth_token: str) -> CopilotAPIToken:
-        headers = _copilot_token_exchange_headers(oauth_token)
+    async def _exchange_token(
+        self, oauth_token: str, *, integration_id: str | None = None
+    ) -> CopilotAPIToken:
+        headers = _copilot_token_exchange_headers(oauth_token, integration_id=integration_id)
         payload = await asyncio.to_thread(self._exchange_token_sync, headers)
         token = str(payload.get("token") or "").strip()
         if not token:
@@ -1205,9 +1467,14 @@ class CopilotTokenProvider:
     def _exchange_token_sync(headers: dict[str, str]) -> dict[str, Any]:
         request = urllib_request.Request(_token_exchange_url(), headers=headers, method="GET")
         try:
-            with urllib_request.urlopen(request, timeout=10.0) as response:
+            with _urlopen(request, timeout=10.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-                return payload if isinstance(payload, dict) else {}
+                if not isinstance(payload, dict):
+                    return {}
+                # Every exchange funnels through here, so this is the one place
+                # that sees GitHub's advertised completions host (#3076).
+                _remember_completions_endpoint(payload)
+                return payload
         except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -1314,10 +1581,20 @@ def _is_managed_copilot_seeded_bearer(token: str) -> bool:
 async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
     """Apply Copilot auth headers for GitHub Copilot API requests."""
     resolved = dict(headers)
-    if not is_copilot_api_url(url):
+    # Both Copilot surfaces need credentials. Gating on the chat host alone left
+    # inline completions unauthenticated: the request reached
+    # copilot-proxy.githubusercontent.com with no Authorization header, and that
+    # host answers 401 (#3076).
+    if not is_copilot_upstream_url(url):
         return resolved
 
-    for name, value in _copilot_chat_header_defaults().items():
+    # Read the CLIENT's integration ID before any default is applied, so the
+    # credential we mint below can be bound to the surface that actually made
+    # the call rather than to whatever this proxy happens to default to.
+    client_integration_id = _header_value(resolved, "Copilot-Integration-Id")
+    integration_id = resolve_copilot_integration_id(client_integration_id)
+
+    for name, value in _copilot_chat_header_defaults(integration_id).items():
         _set_header_default(resolved, name, value)
 
     incoming_auth = next((v for k, v in resolved.items() if k.lower() == "authorization"), None)
@@ -1347,9 +1624,23 @@ async def apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[s
             _token_kind(raw_token) if raw_token else "none",
         )
 
-    token = await get_copilot_token_provider().get_api_token()
+    token = await get_copilot_token_provider().get_api_token(integration_id=integration_id)
     for key in list(resolved):
         if key.lower() in {"authorization", "x-api-key"}:
             resolved.pop(key)
     resolved["Authorization"] = f"Bearer {token.token}"
+    # The credential and the integration ID must leave together. Until now the
+    # ID was applied with set-default semantics BEFORE this branch was chosen,
+    # so replacing the client's token left its ID in place next to OUR token —
+    # a pair GitHub cannot HMAC-validate:
+    #
+    #   401 unauthorized: unable to validate HMAC for the given
+    #       Copilot-Integration-ID
+    #
+    # It surfaced first on model discovery (`Failed to fetch models`), which
+    # left the client falling back to its built-in model list. Overwrite here,
+    # never above: the pass-through branch returns before this point and keeps
+    # the client's own ID beside the client's own token, which is equally the
+    # matched pair.
+    _overwrite_header(resolved, "Copilot-Integration-Id", integration_id)
     return resolved

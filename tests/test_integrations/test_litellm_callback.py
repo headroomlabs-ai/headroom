@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -52,3 +53,30 @@ class TestHeadroomCallbackPostCallSuccessHook:
             response=sentinel,
         )
         assert result is sentinel
+
+
+class TestHeadroomCallbackClientLifecycle:
+    """Cloud client cleanup must be explicit and safe to repeat."""
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_and_clears_initialized_client(self) -> None:
+        cb = HeadroomCallback(api_key="hdr_test")
+        client = MagicMock()
+        client.aclose = AsyncMock()
+        cb._client = client
+
+        await cb.aclose()
+
+        client.aclose.assert_awaited_once_with()
+        assert cb._client is None
+
+        await cb.aclose()
+        client.aclose.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_aclose_without_initialized_client_is_a_noop(self) -> None:
+        cb = HeadroomCallback(api_key="hdr_test")
+
+        await cb.aclose()
+
+        assert cb._client is None

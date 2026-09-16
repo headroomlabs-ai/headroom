@@ -34,6 +34,29 @@ def test_write_preserves_other_env_keys(tmp_path: Path) -> None:
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
 
 
+def test_tool_search_write_and_restore_reaches_daemon_worker_settings(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true", "KEEP": "1"}}),
+        encoding="utf-8",
+    )
+
+    previous = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+
+    assert previous == "true"
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "false",
+        "KEEP": "1",
+    }
+
+    wrap_cli._restore_claude_wrap_tool_search(previous, settings_path=path)
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "true",
+        "KEEP": "1",
+    }
+
+
 def test_write_returns_none_when_key_absent(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     prev = wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)

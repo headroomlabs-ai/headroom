@@ -46,6 +46,14 @@ _STACK_SLUG_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 # header values.
 MAX_DISTINCT_STACKS = 32
 
+# Cardinality cap on the per-process requests_by_model / _cache_requests_by_model
+# dicts. Protects the Prometheus scrape, the in-memory counters, and telemetry
+# from unbounded label explosion when clients send arbitrary `model` values.
+# 32x MAX_DISTINCT_STACKS: models are a larger legitimate vocabulary (provider
+# and snapshot variants across a multi-tenant deployment) than stacks, while the
+# cap stays a hard ceiling. Over-cap models bucket into the "other" sentinel.
+MAX_DISTINCT_MODELS = 1024
+
 
 def normalize_stack(raw: str | None) -> str | None:
     """Validate and normalize a stack slug.

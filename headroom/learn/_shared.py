@@ -85,6 +85,14 @@ def classify_error(content: str) -> ErrorCategory:
     return ErrorCategory.UNKNOWN
 
 
+# "exit code" only signals an error for a NONZERO code. Agent harnesses (Codex,
+# Grok, opencode, ...) append "exit code 0" to every SUCCESSFUL shell command,
+# so a bare "exit code" substring wrongly flagged those as errors and inflated
+# the learned failure rate. Match a nonzero code (case-insensitive, so
+# "Exit code: 1" counts too), never "exit code 0".
+_NONZERO_EXIT_RE = re.compile(r"exit code:?\s*(?!0\b)\d", re.IGNORECASE)
+
+
 def is_error_content(content: str) -> bool:
     """Heuristic: does this tool result look like an error?"""
     if not content or len(content) < 10:
@@ -105,10 +113,11 @@ def is_error_content(content: str) -> bool:
         "auto-denied",
         "Sibling tool call errored",
         "timed out",
-        "exit code",
         "FileNotFoundError",
     ]
-    return any(ind in snippet for ind in indicators)
+    if any(ind in snippet for ind in indicators):
+        return True
+    return bool(_NONZERO_EXIT_RE.search(snippet))
 
 
 # =============================================================================

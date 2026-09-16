@@ -494,13 +494,32 @@ class HierarchicalMemory:
         # Save updates
         await self._store.save(memory)
 
-        # Update indexes
+        # Vector indexes also carry filterable metadata. Refresh them for
+        # metadata-only updates, not just when the embedding content changes.
+        vector_metadata_changed = any(
+            value is not None for value in (importance, entity_refs, metadata)
+        )
+        if (content_changed or vector_metadata_changed) and memory.embedding is not None:
+            await self._vector_index.index(memory)
         if content_changed:
-            if memory.embedding is not None:
-                await self._vector_index.index(memory)
             await self._index_for_text_search(memory)
 
         # Invalidate and re-cache
+        if self._cache is not None:
+            await self._cache.invalidate(memory_id)
+            await self._cache.put(memory)
+
+        return memory
+
+    async def refresh_memory_indexes(self, memory_id: str) -> Memory | None:
+        """Refresh secondary index metadata from the primary memory store."""
+        memory = await self._store.get(memory_id)
+        if memory is None:
+            return None
+
+        if memory.embedding is not None:
+            await self._vector_index.index(memory)
+
         if self._cache is not None:
             await self._cache.invalidate(memory_id)
             await self._cache.put(memory)

@@ -10,6 +10,10 @@ one that leaks.
 
 from __future__ import annotations
 
+import hashlib
+
+import pytest
+
 from headroom.transforms import kompress_compressor as kc
 
 
@@ -21,7 +25,7 @@ def test_compress_bails_at_deadline_keeping_tail_verbatim(monkeypatch):
     monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (object(), object(), "onnx"))
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
 
-    comp = kc.KompressCompressor()
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
     monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
 
     content = " ".join(f"w{i}" for i in range(1000))
@@ -32,14 +36,26 @@ def test_compress_bails_at_deadline_keeping_tail_verbatim(monkeypatch):
     assert result.compressed.split() == content.split()
 
 
-def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatch):
-    # The real partial case: chunk 0 processes (gets compressed), chunk 1 trips
-    # the deadline (kept verbatim). Output must be compressed-head + verbatim-tail.
-    # Clock: call1=t_deadline(0); calls 2-4 are chunk-0's check+inference reads
-    # (under budget); call 5+ is chunk-1's check -> trips.
-    # Robust clock: jump past the deadline only AFTER chunk 0 is processed
-    # (tracked via the model mock), so adding perf_counter calls inside the chunk
-    # body -- e.g. sub-stage timing -- can't shift when the deadline trips.
+@pytest.mark.parametrize(
+    ("n_words", "net_saving"),
+    [(200, True), (20, False)],
+    ids=["net-saving", "no-net-saving"],
+)
+def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(
+    monkeypatch, n_words, net_saving
+):
+    # real partial case: chunk 0 processes (gets compressed), chunk 1 trips the
+    # deadline (kept verbatim). Output must be compressed-head + verbatim-tail.
+    # Clock: call 1 = t_deadline (0); calls 2-4 chunk-0's check + inference
+    # reads (under budget); call 5+ chunk-1's check -> trips.
+    # Robust clock: jump past the deadline only AFTER chunk 0 processed
+    # (tracked via the model mock), so adding perf_counter calls inside the
+    # chunk body -- e.g. sub-stage timing -- can't shift when the deadline trips.
+    #
+    # Two sizes: at 200 words the marked partial result is smaller than the
+    # original and ships; at 20 words (150 -> 300-odd tokens either way, plus a
+    # ~43-token marker) the CCR gate finds no net saving and passes the whole
+    # payload through, which is the other half of the contract.
     state = {"chunks_done": 0}
 
     def fake_clock():
@@ -67,16 +83,28 @@ def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(monkeypatc
     monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
     monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
 
-    comp = kc.KompressCompressor()
-    comp.config.chunk_words = 10  # 20 words -> 2 chunks
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
+    comp.config.chunk_words = n_words // 2  # two chunks
     monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
+    monkeypatch.setattr(
+        comp,
+        "_store_in_ccr",
+        lambda source, *a, **k: hashlib.sha256(source.encode()).hexdigest()[:24],
+    )
 
-    words = [f"w{i}" for i in range(20)]
-    out = comp.compress(" ".join(words)).compressed.split()
+    words = [f"w{i}" for i in range(n_words)]
+    result = comp.compress(" ".join(words))
+    if not net_saving:
+        assert result.compressed == " ".join(words)
+        assert result.compression_ratio == 1.0
+        return
 
-    # chunk 0 processed: first half kept (w0..w4), second half dropped (w5..w9)
-    assert "w0" in out and "w4" in out
-    assert "w5" not in out and "w9" not in out
-    # chunk 1 tripped the deadline -> its words kept verbatim (w10..w19 all present)
-    for i in range(10, 20):
+    out = result.compressed.split()
+    half = n_words // 2
+    assert result.cache_key is not None and "Retrieve more" in result.compressed
+    # chunk 0 processed: its first half kept, its second half dropped
+    assert "w0" in out and f"w{half // 2 - 1}" in out
+    assert f"w{half // 2}" not in out and f"w{half - 1}" not in out
+    # chunk 1 tripped the deadline -> its words kept verbatim (all present)
+    for i in range(half, n_words):
         assert f"w{i}" in out

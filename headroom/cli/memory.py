@@ -30,6 +30,8 @@ from ._utils.formatting import (
 from ._utils.parsers import parse_duration
 from .main import main
 
+_REINDEX_PAGE_SIZE = 1_000
+
 
 def _default_db_path() -> str:
     """Resolve the memory DB the proxy/install actually use.
@@ -64,6 +66,148 @@ def db_path_option(fn: Any) -> Any:
 def get_store(db_path: str) -> SQLiteMemoryStore:
     """Get a SQLiteMemoryStore instance."""
     return SQLiteMemoryStore(db_path)
+
+
+def _sqlite_table_exists(conn: Any, table_name: str) -> bool:
+    """Return whether a SQLite table or virtual table has been initialized."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _remove_from_search_indexes(db_path: str, memory_ids: list[str]) -> bool:
+    """Remove specific memories from FTS5 and vector search indexes.
+
+    FTS5 cleanup uses a bare sqlite3 connection (FTS5 is built-in).
+    Vector cleanup requires sqlite-vec to load the vec0 virtual-table
+    module; when not installed a warning is printed.
+
+    Returns True when both indexes were fully synced, False when any part
+    of the sync failed.  Callers must treat False as a partial failure and
+    surface it — typically by exiting with a non-zero code so the primary
+    store mutation is not silently reported as fully successful.
+    """
+    if not memory_ids:
+        return True
+
+    import sqlite3
+
+    db = Path(db_path)
+    ok = True
+
+    # FTS5 table lives in the same memory.db file (built-in, no extension needed).
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            if _sqlite_table_exists(conn, "memory_fts"):
+                for i in range(0, len(memory_ids), 500):
+                    chunk = memory_ids[i : i + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    conn.execute(
+                        f"DELETE FROM memory_fts WHERE memory_id IN ({placeholders})",
+                        chunk,
+                    )
+                conn.commit()
+    except Exception as exc:
+        print_warning(f"FTS5 index cleanup incomplete: {exc}")
+        ok = False
+
+    # Vector DB is a sibling file: memory.db -> memory_vectors.db.
+    # vec_embeddings is a vec0 virtual table — the sqlite-vec extension must be
+    # loaded on every connection before touching it.
+    vector_db = db.parent / f"{db.stem}_vectors.db"
+    if not vector_db.exists():
+        return ok
+
+    try:
+        with sqlite3.connect(str(vector_db)) as conn:
+            # A sibling database may exist before the optional vector index has
+            # ever been initialized. That is a valid no-op, not a sync failure.
+            if not _sqlite_table_exists(conn, "vec_metadata"):
+                return ok
+
+            try:
+                import sqlite_vec
+            except ImportError:
+                print_warning(
+                    "sqlite-vec is not installed; stale vector index entries may remain. "
+                    "Run 'headroom memory reindex' after installing sqlite-vec to repair."
+                )
+                return False
+
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            for i in range(0, len(memory_ids), 500):
+                chunk = memory_ids[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT rowid FROM vec_metadata WHERE memory_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                rowids = [r[0] for r in rows]
+                if rowids:
+                    rph = ",".join("?" * len(rowids))
+                    conn.execute(f"DELETE FROM vec_embeddings WHERE rowid IN ({rph})", rowids)
+                    conn.execute(f"DELETE FROM vec_metadata WHERE rowid IN ({rph})", rowids)
+            conn.commit()
+    except Exception as exc:
+        print_warning(f"Vector index cleanup incomplete: {exc}")
+        ok = False
+
+    return ok
+
+
+def _clear_all_search_indexes(db_path: str) -> bool:
+    """Truncate both search indexes after a full purge.
+
+    Same extension-loading requirement as :func:`_remove_from_search_indexes`.
+    Returns True on full success, False on any partial failure.
+    """
+    import sqlite3
+
+    db = Path(db_path)
+    ok = True
+
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            if _sqlite_table_exists(conn, "memory_fts"):
+                conn.execute("DELETE FROM memory_fts")
+                conn.commit()
+    except Exception as exc:
+        print_warning(f"FTS5 index cleanup incomplete: {exc}")
+        ok = False
+
+    vector_db = db.parent / f"{db.stem}_vectors.db"
+    if not vector_db.exists():
+        return ok
+
+    try:
+        with sqlite3.connect(str(vector_db)) as conn:
+            if not _sqlite_table_exists(conn, "vec_metadata"):
+                return ok
+
+            try:
+                import sqlite_vec
+            except ImportError:
+                print_warning(
+                    "sqlite-vec is not installed; stale vector index entries may remain. "
+                    "Run 'headroom memory reindex' after installing sqlite-vec to repair."
+                )
+                return False
+
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+            conn.execute("DELETE FROM vec_embeddings")
+            conn.execute("DELETE FROM vec_metadata")
+            conn.commit()
+    except Exception as exc:
+        print_warning(f"Vector index cleanup incomplete: {exc}")
+        ok = False
+
+    return ok
 
 
 def _resolve_memory(store: SQLiteMemoryStore, memory_id: str) -> Memory:
@@ -620,13 +764,37 @@ def edit_memory(
                 mem = matches[0]
 
         # Update fields
+        content_changed = content is not None and content != mem.content
         if content is not None:
             mem.content = content
         if importance is not None:
             mem.importance = importance
 
+        index_ok = True
+        if content_changed:
+            # Clear the stale embedding so the memory MCP server re-embeds on
+            # next startup. Also remove the old FTS5 and vector index entries
+            # now to avoid serving stale search results until then.
+            mem.embedding = None
+            index_ok = _remove_from_search_indexes(db_path, [mem.id])
+            # Re-index FTS5 immediately with new content (no embedder needed).
+            try:
+                from ..memory.adapters.fts5 import FTS5TextIndex
+
+                fts = FTS5TextIndex(db_path=db_path)
+                asyncio.run(fts.index_memory(mem))
+            except Exception as exc:
+                print_warning(f"FTS5 re-index incomplete: {exc}")
+                index_ok = False
+
         # Save
         asyncio.run(store.save(mem))
+        if not index_ok:
+            print_warning(
+                f"Updated memory {mem.id[:8]}, but search index sync incomplete. "
+                "Run 'headroom memory reindex' to repair."
+            )
+            sys.exit(1)
         print_success(f"Updated memory {mem.id[:8]}")
 
     except Exception as e:
@@ -775,7 +943,14 @@ def delete_memories(
 
         # Delete
         deleted = asyncio.run(store.delete_batch(resolved_ids))
-        print_success(f"Deleted {deleted} memory(ies).")
+        if _remove_from_search_indexes(db_path, resolved_ids):
+            print_success(f"Deleted {deleted} memory(ies).")
+        else:
+            print_warning(
+                f"Deleted {deleted} memory(ies) from store, but search index sync "
+                "incomplete. Run 'headroom memory reindex' to repair."
+            )
+            sys.exit(1)
 
     except click.Abort:
         click.echo("Aborted.")
@@ -897,7 +1072,14 @@ def prune_memories(
         # Delete
         ids_to_delete = [m.id for m in memories]
         deleted = asyncio.run(store.delete_batch(ids_to_delete))
-        print_success(f"Deleted {deleted} memory(ies).")
+        if _remove_from_search_indexes(db_path, ids_to_delete):
+            print_success(f"Deleted {deleted} memory(ies).")
+        else:
+            print_warning(
+                f"Deleted {deleted} memory(ies) from store, but search index sync "
+                "incomplete. Run 'headroom memory reindex' to repair."
+            )
+            sys.exit(1)
 
     except click.BadParameter as e:
         print_error(str(e))
@@ -952,13 +1134,157 @@ def purge_memories(ctx: click.Context, db_path: str, confirm_flag: bool) -> None
 
         # Purge
         deleted = asyncio.run(store.clear_all())
-        print_success(f"Purged {deleted} memory(ies).")
+        if _clear_all_search_indexes(db_path):
+            print_success(f"Purged {deleted} memory(ies).")
+        else:
+            print_warning(
+                f"Purged {deleted} memory(ies) from store, but search index sync "
+                "incomplete. Run 'headroom memory reindex' to repair."
+            )
+            sys.exit(1)
 
     except click.Abort:
         click.echo("Aborted.")
         sys.exit(0)
     except Exception as e:
         print_error(f"Failed to purge memories: {e}")
+        sys.exit(1)
+
+
+@memory.command("reindex")
+@db_path_option
+@click.pass_context
+def reindex_memories(ctx: click.Context, db_path: str) -> None:
+    """Rebuild FTS5 search index and remove orphaned vector entries.
+
+    Use this to repair an inconsistent index after a failed delete, prune,
+    or purge.  Run it after installing sqlite-vec to clean up any vector
+    entries that could not be removed earlier.
+
+    Vector embeddings are not regenerated by this command — they are rebuilt
+    automatically when the Headroom server next starts.
+
+    \b
+    Example:
+        headroom memory reindex
+    """
+    import sqlite3
+
+    store = get_store(db_path)
+
+    try:
+        # Page through the complete active store. A fixed cap is destructive:
+        # clearing FTS and rebuilding only the first N rows drops valid search
+        # coverage, while using the same truncated ID set for vector cleanup
+        # misclassifies later primary rows as orphans.
+        memories: list[Memory] = []
+        offset = 0
+        while True:
+            page = asyncio.run(
+                store.query(
+                    MemoryFilter(
+                        limit=_REINDEX_PAGE_SIZE,
+                        offset=offset,
+                        order_by="created_at",
+                        order_desc=False,
+                    )
+                )
+            )
+            if not page:
+                break
+            memories.extend(page)
+            offset += len(page)
+
+        db = Path(db_path)
+        ok = True
+
+        # --- FTS5: wipe and rebuild from primary store ---
+        from ..memory.adapters.fts5 import FTS5TextIndex
+
+        # Construction initializes an absent optional FTS table. Cleanup
+        # helpers, by contrast, intentionally treat an absent table as a no-op.
+        fts = FTS5TextIndex(db_path=db_path)
+        try:
+            with sqlite3.connect(str(db)) as conn:
+                conn.execute("DELETE FROM memory_fts")
+                conn.commit()
+        except Exception as exc:
+            print_error(f"Failed to clear FTS5 index: {exc}")
+            sys.exit(1)
+
+        fts_indexed = 0
+        for mem in memories:
+            try:
+                asyncio.run(fts.index_memory(mem))
+                fts_indexed += 1
+            except Exception as exc:
+                print_warning(f"FTS5: failed to index {mem.id[:8]}: {exc}")
+                ok = False
+
+        # --- Vector: remove orphaned entries (requires sqlite-vec) ---
+        vector_db = db.parent / f"{db.stem}_vectors.db"
+        vector_msg = ""
+        if vector_db.exists():
+            # Orphan detection is based on every primary row, including
+            # superseded memories that are intentionally omitted from FTS.
+            with store._get_conn() as conn:
+                primary_ids = {row[0] for row in conn.execute("SELECT id FROM memories")}
+            try:
+                with sqlite3.connect(str(vector_db)) as conn:
+                    if not _sqlite_table_exists(conn, "vec_metadata"):
+                        vector_msg = ", vector index not initialized"
+                    else:
+                        import sqlite_vec
+
+                        conn.enable_load_extension(True)
+                        sqlite_vec.load(conn)
+                        conn.enable_load_extension(False)
+                        rows = conn.execute("SELECT memory_id FROM vec_metadata").fetchall()
+                        orphan_ids = [r[0] for r in rows if r[0] not in primary_ids]
+                        if orphan_ids:
+                            for i in range(0, len(orphan_ids), 500):
+                                chunk = orphan_ids[i : i + 500]
+                                ph = ",".join("?" * len(chunk))
+                                vec_rows = conn.execute(
+                                    f"SELECT rowid FROM vec_metadata WHERE memory_id IN ({ph})",
+                                    chunk,
+                                ).fetchall()
+                                rowids = [r[0] for r in vec_rows]
+                                if rowids:
+                                    rph = ",".join("?" * len(rowids))
+                                    conn.execute(
+                                        f"DELETE FROM vec_embeddings WHERE rowid IN ({rph})",
+                                        rowids,
+                                    )
+                                    conn.execute(
+                                        f"DELETE FROM vec_metadata WHERE rowid IN ({rph})",
+                                        rowids,
+                                    )
+                            conn.commit()
+                        vector_msg = (
+                            f", removed {len(orphan_ids)} orphaned vector entry(ies)"
+                            if orphan_ids
+                            else ", vector index clean"
+                        )
+            except ImportError:
+                vector_msg = (
+                    " (vector index skipped: sqlite-vec not installed — "
+                    "install with: pip install sqlite-vec)"
+                )
+                ok = False
+            except Exception as exc:
+                vector_msg = f" (vector index cleanup failed: {exc})"
+                ok = False
+
+        msg = f"Re-indexed {fts_indexed}/{len(memories)} memories{vector_msg}."
+        if ok:
+            print_success(msg)
+        else:
+            print_warning(msg)
+            sys.exit(1)
+
+    except Exception as e:
+        print_error(f"Failed to reindex: {e}")
         sys.exit(1)
 
 

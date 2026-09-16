@@ -41,6 +41,7 @@ from headroom.install.runtime import (
 from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
 
@@ -181,7 +182,12 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     # all into its context window — overflowing it (breaks sub-agent spawns,
     # forces constant compaction). Keep deferral on; respect a user-set value.
     # Shares the TOOL_SEARCH_* constants with `wrap` and `install`.
-    env_map.setdefault(TOOL_SEARCH_ENV, TOOL_SEARCH_DEFAULT)
+    tool_search_default = (
+        TOOL_SEARCH_FOUNDRY_DEFAULT
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY")
+        else TOOL_SEARCH_DEFAULT
+    )
+    env_map.setdefault(TOOL_SEARCH_ENV, tool_search_default)
     payload["env"] = env_map
 
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
@@ -650,7 +656,7 @@ def _marketplace_source() -> str:
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / ".claude-plugin" / "marketplace.json").exists():
         return str(repo_root)
-    return "chopratejas/headroom"
+    return "headroomlabs-ai/headroom"
 
 
 def _run_checked(command: list[str], *, action: str) -> None:

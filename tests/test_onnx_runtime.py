@@ -2,10 +2,12 @@ import os
 import sys
 
 from headroom.onnx_runtime import (
+    ONNX_ALLOW_SPINNING_ENV,
     ONNX_CPU_ARENA_ENV,
     cpu_arena_enabled,
     create_cpu_session_options,
     hf_entry_known_absent,
+    onnx_thread_spinning_enabled,
 )
 
 
@@ -15,6 +17,10 @@ class _FakeSessionOptions:
         self.inter_op_num_threads = None
         self.enable_cpu_mem_arena = True
         self.enable_mem_pattern = True
+        self.config_entries: dict[str, str] = {}
+
+    def add_session_config_entry(self, key: str, value: str) -> None:
+        self.config_entries[key] = value
 
 
 class _FakeOrt:
@@ -25,6 +31,10 @@ class _FakeSessionOptionsWithoutToggles:
     def __init__(self):
         self.intra_op_num_threads = None
         self.inter_op_num_threads = None
+
+    def add_session_config_entry(self, key: str, value: str) -> None:
+        # No config storage on this stand-in; ORT here just accepts the call.
+        return None
 
 
 class _FakeOrtWithoutToggles:
@@ -106,6 +116,53 @@ def test_create_cpu_session_options_handles_older_session_options(monkeypatch):
 
     assert options.intra_op_num_threads is None
     assert options.inter_op_num_threads is None
+
+
+def test_thread_spinning_disabled_by_default(monkeypatch):
+    # #2495: ORT thread pools spin-wait on all cores between inferences, so a
+    # long-lived proxy pegs every core while idle. Disable spinning by default.
+    monkeypatch.delenv(ONNX_ALLOW_SPINNING_ENV, raising=False)
+    monkeypatch.delenv(ONNX_CPU_ARENA_ENV, raising=False)
+
+    assert onnx_thread_spinning_enabled() is False
+    options = create_cpu_session_options(_FakeOrt)
+    assert options.config_entries.get("session.intra_op.allow_spinning") == "0"
+    assert options.config_entries.get("session.inter_op.allow_spinning") == "0"
+
+
+def test_thread_spinning_env_can_reenable(monkeypatch):
+    monkeypatch.setenv(ONNX_ALLOW_SPINNING_ENV, "1")
+    monkeypatch.delenv(ONNX_CPU_ARENA_ENV, raising=False)
+
+    assert onnx_thread_spinning_enabled() is True
+    options = create_cpu_session_options(_FakeOrt)
+    assert "session.intra_op.allow_spinning" not in options.config_entries
+    assert "session.inter_op.allow_spinning" not in options.config_entries
+
+
+def test_thread_spinning_env_explicit_off(monkeypatch):
+    monkeypatch.setenv(ONNX_ALLOW_SPINNING_ENV, "0")
+
+    assert onnx_thread_spinning_enabled() is False
+    options = create_cpu_session_options(_FakeOrt)
+    assert options.config_entries.get("session.intra_op.allow_spinning") == "0"
+
+
+def test_spinning_disable_is_best_effort_on_older_ort(monkeypatch):
+    # An ORT build that rejects the config key must not break session creation.
+    monkeypatch.delenv(ONNX_ALLOW_SPINNING_ENV, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    class _RejectingSessionOptions(_FakeSessionOptions):
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            raise RuntimeError(f"unknown config key: {key}")
+
+    class _RejectingOrt:
+        SessionOptions = _RejectingSessionOptions
+
+    # Must not raise.
+    options = create_cpu_session_options(_RejectingOrt)
+    assert options.enable_cpu_mem_arena is False
 
 
 def _write_fake_hf_cache(

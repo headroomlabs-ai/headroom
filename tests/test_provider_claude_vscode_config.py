@@ -55,7 +55,7 @@ def test_configure_and_remove_preserve_unrelated_and_previous_values(tmp_path: P
     assert configured["env"] == {
         "KEEP": "yes",
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/p/demo",
-        "ENABLE_TOOL_SEARCH": "true",
+        "ENABLE_TOOL_SEARCH": "false",
     }
     assert configured["permissions"] == {"allow": ["Read"]}
 
@@ -162,7 +162,7 @@ def test_reconfigure_refuses_incomplete_or_conflicting_state(tmp_path: Path) -> 
     state_path.unlink()
     configure_vscode_claude_settings(path, proxy_url)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["env"]["ENABLE_TOOL_SEARCH"] = "false"
+    payload["env"]["ENABLE_TOOL_SEARCH"] = "true"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(click.ClickException, match="managed values"):
         configure_vscode_claude_settings(path, proxy_url)

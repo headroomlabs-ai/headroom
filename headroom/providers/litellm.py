@@ -25,6 +25,7 @@ import logging
 import os
 from typing import Any
 
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -240,19 +241,13 @@ class LiteLLMProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        try:
-            # LiteLLM's cost calculation
-            cost = litellm.completion_cost(
-                model=model,
-                prompt="",  # We're using token counts directly
-                completion="",
-                prompt_tokens=input_tokens,
-                completion_tokens=output_tokens,
-            )
-            return cost
-        except Exception as e:
-            logger.debug(f"LiteLLM cost estimation failed for {model}: {e}")
-            return None
+        # LiteLLM's cost calculation, from token counts directly.
+        return estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
 
     @classmethod
     def list_supported_providers(cls) -> list[str]:

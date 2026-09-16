@@ -16,9 +16,12 @@ MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
+# Names must match ``WasteSignals.to_dict()`` in headroom/config.py — the
+# parser emits ``json_bloat``; an allowlist that says ``json_noise`` silently
+# shoves the largest waste category into the catch-all bucket.
 KNOWN_WASTE_SIGNALS = frozenset(
     {
-        "json_noise",
+        "json_bloat",
         "html_noise",
         "base64",
         "whitespace",
@@ -174,8 +177,12 @@ class PersistentMetricsState:
         raw_cost = _dict_or_empty(source.get("cost"))
         for key in ("input_usd", "compression_savings_usd", "cache_savings_usd"):
             result["cost"][key] = round(_coerce_float(raw_cost.get(key)), 6)
+        # Record-time puts unrecognised names in ``other`` (see
+        # ``record_request``); load-time must do the same, or every restart
+        # relabels the whole ``other`` bucket as ``unknown`` and the two
+        # grow side by side.
         result["waste_signals"] = self._normalize_enum_map(
-            source.get("waste_signals"), KNOWN_WASTE_SIGNALS
+            source.get("waste_signals"), KNOWN_WASTE_SIGNALS, fallback="other"
         )
 
         raw_models = _dict_or_empty(source.get("models"))
@@ -204,12 +211,14 @@ class PersistentMetricsState:
         return result
 
     @staticmethod
-    def _normalize_enum_map(raw: Any, allowed: frozenset[str]) -> dict[str, int]:
+    def _normalize_enum_map(
+        raw: Any, allowed: frozenset[str], *, fallback: str = "unknown"
+    ) -> dict[str, int]:
         result: dict[str, int] = {}
         if not isinstance(raw, dict):
             return result
         for key, value in raw.items():
-            label = key if isinstance(key, str) and key in allowed else "unknown"
+            label = key if isinstance(key, str) and key in allowed | {fallback} else fallback
             result[label] = result.get(label, 0) + _coerce_int(value)
         return result
 

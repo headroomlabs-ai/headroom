@@ -14,6 +14,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+from headroom.rollout import resolve_rollout  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -61,22 +62,18 @@ def test_set_overrides_ignores_unknown_keys_and_non_strings():
 def test_explicit_env_returns_only_explicitly_set_knobs():
     environ = {
         "HEADROOM_OUTPUT_SHAPER": "1",
-        "HEADROOM_MECHANICAL_EFFORT": "low",
         "HEADROOM_VERBOSITY_LEVEL": "   ",  # blank -> not "explicitly set"
         "PATH": "/usr/bin",  # not a knob
     }
     assert rt.explicit_env(environ) == {
         "HEADROOM_OUTPUT_SHAPER": "1",
-        "HEADROOM_MECHANICAL_EFFORT": "low",
     }
 
 
 def test_effective_runtime_env_reports_override_or_none(monkeypatch):
-    monkeypatch.setenv("HEADROOM_EFFORT_ROUTER", "0")
     rt.set_overrides({"HEADROOM_OUTPUT_SHAPER": "1"})
     eff = rt.effective_runtime_env()
     assert eff["HEADROOM_OUTPUT_SHAPER"] == "1"  # from override
-    assert eff["HEADROOM_EFFORT_ROUTER"] == "0"  # from env
     assert eff["HEADROOM_VERBOSITY_LEVEL"] is None  # unset
     # Every registered knob is reported.
     assert set(eff) == {knob.env for knob in rt.RUNTIME_ENV_KNOBS}
@@ -155,9 +152,85 @@ def test_admin_runtime_env_applies_and_reflects_in_health(loopback_client):
     assert health["HEADROOM_VERBOSITY_LEVEL"] == "3"
 
 
+@pytest.mark.parametrize(
+    ("rollout", "expected_enabled", "expected_reason"),
+    [
+        (resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"}), True, "legacy_alias"),
+        # Was ``(resolve_rollout({}), False, "blocked_by_channel")`` while
+        # ``proxy_output_shaper`` was BETA: on the default channel the admin
+        # POST could not enable it. The feature is now STABLE and on by
+        # default, so the same POST is honoured. The escalation-refusal
+        # property this case used to cover cannot be reproduced through this
+        # endpoint any more — ``/admin/runtime-env`` re-resolves exactly one
+        # rollout alias, ``HEADROOM_OUTPUT_SHAPER`` (see server.py), so there
+        # is no second, still-gated feature to point it at. Channel gating
+        # itself stays covered in test_rollout.py.
+        (resolve_rollout({}), True, "legacy_alias"),
+        (
+            resolve_rollout(
+                {
+                    "HEADROOM_ROLLOUT_CHANNEL": "beta",
+                    "HEADROOM_DISABLE_FEATURES": "proxy_output_shaper",
+                }
+            ),
+            False,
+            "disabled",
+        ),
+    ],
+)
+def test_admin_runtime_env_reresolves_running_rollout_without_weakening_policy(
+    rollout, expected_enabled, expected_reason
+):
+    app = create_app(
+        ProxyConfig(
+            rollout=rollout,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+        )
+    )
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        before = client.get("/stats?cached=1").json()["rollout"]
+        response = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        after = client.get("/stats?cached=1").json()["rollout"]
+
+    decision = next(item for item in after["features"] if item["name"] == "proxy_output_shaper")
+    assert response.status_code == 200
+    assert response.json()["rollout"] == after
+    assert decision["enabled"] is expected_enabled
+    assert decision["decision"] == expected_reason
+    assert after["snapshot_digest"] != before["snapshot_digest"]
+
+
 def test_admin_runtime_env_rejects_non_object(loopback_client):
     resp = loopback_client.post("/admin/runtime-env", json=["not", "a", "dict"])
     assert resp.status_code == 400
+
+
+def test_admin_runtime_env_rejects_process_local_update_with_multiple_workers(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    rollout = resolve_rollout({"HEADROOM_ROLLOUT_CHANNEL": "beta"})
+    config = ProxyConfig(
+        worker_processes=2,
+        rollout=rollout,
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    before_digest = rollout.snapshot_digest
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        response = client.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
+        after = client.get("/stats").json()["rollout"]
+
+    assert response.status_code == 409
+    assert response.json()["worker_processes"] == 2
+    assert "restart" in response.json()["error"]
+    assert rt.getenv("HEADROOM_OUTPUT_SHAPER") is None
+    assert after["snapshot_digest"] == before_digest
 
 
 def test_admin_runtime_env_is_loopback_only():

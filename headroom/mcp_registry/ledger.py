@@ -21,6 +21,10 @@ from .base import ServerSpec
 _LEDGER_FILE = "mcp_installs.json"
 
 
+class LedgerMutationError(ValueError):
+    """Raised when a ledger cannot be safely updated."""
+
+
 def ledger_path() -> Path:
     """Return the Headroom MCP install ledger path."""
     return paths.workspace_dir() / _LEDGER_FILE
@@ -41,9 +45,17 @@ def spec_fingerprint(spec: ServerSpec) -> str:
 def record_install(agent: str, spec: ServerSpec, *, path: Path | None = None) -> None:
     """Record that Headroom installed ``spec`` for ``agent``."""
     ledger_file = path or ledger_path()
+    # Automatic installs must recover from a stale or damaged ledger. The
+    # explicit reconcile route performs strict validation before config writes.
     data = _read_ledger(ledger_file)
-    agents = data.setdefault("agents", {})
-    agent_entry = agents.setdefault(agent, {})
+    agents = data.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+        data["agents"] = agents
+    agent_entry = agents.get(agent)
+    if not isinstance(agent_entry, dict):
+        agent_entry = {}
+        agents[agent] = agent_entry
     agent_entry[spec.name] = {
         "fingerprint": spec_fingerprint(spec),
         "installed_at": datetime.now(timezone.utc).isoformat(),
@@ -89,16 +101,45 @@ def headroom_installed_matching(
     return entry.get("fingerprint") == spec_fingerprint(current_spec)
 
 
-def _read_ledger(path: Path) -> dict[str, Any]:
+def validate_ledger_for_mutation(path: Path | None = None) -> None:
+    """Reject malformed ledger structure before a config mutation."""
+    _read_ledger(path or ledger_path(), for_mutation=True)
+
+
+def _read_ledger(path: Path, *, for_mutation: bool = False) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is unreadable: {path}") from exc
         return {}
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if for_mutation:
+            raise LedgerMutationError(f"MCP install ledger is invalid JSON: {path}") from exc
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        if for_mutation:
+            raise LedgerMutationError("MCP install ledger must contain a JSON object")
+        return {}
+    if for_mutation:
+        for section in ("agents",):
+            section_data = data.get(section)
+            if not isinstance(section_data, dict) or any(
+                not isinstance(agent_entry, dict)
+                or any(
+                    not isinstance(server_entry, dict)
+                    or not isinstance(server_entry.get("fingerprint"), str)
+                    or not isinstance(server_entry.get("installed_at"), str)
+                    for server_entry in agent_entry.values()
+                )
+                for agent_entry in section_data.values()
+            ):
+                raise LedgerMutationError(f"MCP install ledger section {section!r} is malformed")
+    return data
 
 
 def _write_ledger(path: Path, data: dict[str, Any]) -> None:

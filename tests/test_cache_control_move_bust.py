@@ -61,14 +61,11 @@ def test_marker_move_would_fail_a_raw_dict_guard():
     assert _strip_cache_control(CUR_ORIG[:2]) == _strip_cache_control(PREV_ORIG)
 
 
-def test_overlay_replays_despite_moved_marker():
+def test_overlay_skips_inflating_moved_marker_replay():
     out = overlay_cached_prefix(OPTIMIZED, CUR_ORIG, PREV_ORIG, PREV_FWD)
-    # The content-only guard lets the replay happen: the forwarded prefix is now
-    # byte-identical to what the provider cached (compressed), NOT the freeze's
-    # original bytes → cache hits instead of busting.
-    assert out[:2] == PREV_FWD
-    assert out[:2] != OPTIMIZED[:2]
-    assert out[2] == OPTIMIZED[2]  # compressed tail preserved
+    # Moving cache_control must not exempt a larger replay candidate from the
+    # no-inflation bound, even when content-only history alignment succeeds.
+    assert out == OPTIMIZED
 
 
 # ── Cross-turn: client moves the marker every turn, provider keys on full bytes ─
@@ -224,3 +221,177 @@ def test_normalize_ttl_survives_many_turns():
         conv = normalize_message_cache_control(conv)
         assert _markers(conv) == 1
         assert conv[-1]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+# ── fix-4: mirror the CLIENT's marker positions (20-block lookback chain) ────
+# Anthropic resolves each breakpoint by walking back at most ~20 content
+# blocks. Agentic clients keep a marker on the previous turn's newest message
+# as the read anchor; collapsing to a single newest-block marker breaks the
+# chain on tool-heavy turns. With client_messages provided, normalize must
+# keep exactly the client's positions.
+
+
+def test_normalize_mirrors_client_marker_positions():
+    client = [
+        B("user", "a", cc=True),
+        B("assistant", "b"),
+        B("user", "c", cc=True),  # read anchor (previous newest)
+        B("assistant", "d"),
+        B("user", "e", cc=True),  # newest
+    ]
+    # Forwarded form: replay leftovers piled markers onto other messages too.
+    merged = [
+        B("user", "a", cc=True),
+        B("assistant", "b", cc=True),
+        B("user", "c", cc=True),
+        B("assistant", "d", cc=True),
+        B("user", "e", cc=True),
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 3  # exactly the client's three, not one
+    for idx in (0, 2, 4):
+        assert "cache_control" in out[idx]["content"][-1], idx
+    for idx in (1, 3):
+        assert _markers([out[idx]]) == 0, idx
+    assert _strip_cache_control(out) == _strip_cache_control(merged)
+
+
+def test_normalize_mirror_preserves_per_position_ttl():
+    client = [B_ttl("user", "a", "1h"), B("user", "b", cc=True)]
+    merged = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert out[0]["content"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert out[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_normalize_mirror_bounded_across_many_turns():
+    """Client moves its pair of markers forward; forwarded stays at client count."""
+    conv = []
+    for t in range(1, 12):
+        conv = conv + [B("user", f"turn-{t}")]
+        # Client marks the newest and second-newest marked position (CC pattern).
+        client = [dict(m) for m in conv]
+        client[-1] = B("user", f"turn-{t}", cc=True)
+        if len(client) >= 2:
+            client[-2] = B(client[-2]["role"], client[-2]["content"][0]["text"], cc=True)
+        # Forwarded side accumulated replay leftovers everywhere.
+        merged = [B(m["role"], m["content"][0]["text"], cc=True) for m in client]
+        out = normalize_message_cache_control(merged, client_messages=client)
+        assert _markers(out) == min(2, len(client))
+        assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_falls_back_when_counts_mismatch():
+    client = [B("user", "a", cc=True)]  # transform changed message count
+    merged = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1  # legacy consolidation
+    assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_falls_back_when_client_has_no_markers():
+    client = [B("user", "a"), B("user", "b")]
+    merged = [B("user", "a", cc=True), B("user", "b")]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1  # legacy: still place one so the prefix caches
+    assert "cache_control" in out[-1]["content"][-1]
+
+
+def test_normalize_mirror_skips_string_content_positions():
+    # Client marked message 0; forwarded counterpart is string-content (cannot
+    # carry a marker) — the position is skipped, the rest still mirror.
+    client = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    merged = [{"role": "user", "content": "a"}, B("user", "b", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1
+    assert "cache_control" in out[1]["content"][-1]
+
+
+# ── fix-5: block-level mirroring (multiple client markers in one message) ────
+
+
+def test_normalize_mirrors_multiple_markers_within_one_message():
+    """A 2-message request where the client marks TWO blocks of message 0
+    (Claude Code's pattern on large first messages) keeps all three markers."""
+    big = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "part-1", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "part-2"},
+            {"type": "text", "text": "part-3", "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+    client = [big, B("user", "follow-up", cc=True)]
+    # Forwarded form: an extra replay leftover on message 1's sibling... use
+    # identical structure with markers everywhere to prove selective stripping.
+    merged = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "part-1", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "part-2", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "part-3", "cache_control": {"type": "ephemeral"}},
+            ],
+        },
+        B("user", "follow-up", cc=True),
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 3
+    assert "cache_control" in out[0]["content"][0]
+    assert "cache_control" not in out[0]["content"][1]
+    assert "cache_control" in out[0]["content"][2]
+    assert "cache_control" in out[1]["content"][-1]
+    assert _strip_cache_control(out) == _strip_cache_control(merged)
+
+
+def test_normalize_mirror_clamps_out_of_range_block_index():
+    # Client marked block 2; forwarded message only has 1 block (transform
+    # merged content) — marker falls back to the last block, not dropped.
+    client = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "c", "cache_control": {"type": "ephemeral"}},
+            ],
+        },
+        B("user", "tail", cc=True),
+    ]
+    merged = [B("user", "abc-merged"), B("user", "tail", cc=True)]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 2
+    assert "cache_control" in out[0]["content"][-1]
+    assert "cache_control" in out[1]["content"][-1]
+
+
+def test_normalize_mirror_scalar_only_content_is_left_unchanged():
+    """Client marks a message whose forwarded counterpart carries only scalar
+    blocks: nothing can hold a marker and nothing was stripped, so the input
+    comes back unchanged (identity, not a copy)."""
+    client = [B("user", "a", cc=True)]
+    merged = [{"role": "user", "content": ["scalar-only"]}]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert out is merged
+    assert _markers(out) == 0
+
+
+def test_normalize_mirror_scalar_target_still_strips_leftovers():
+    # Message 0's forwarded content is scalar-only (marker unplaceable) but a
+    # replay leftover on message 1 still gets stripped, and message 1 keeps
+    # its client marker.
+    client = [B("user", "a", cc=True), B("user", "b", cc=True)]
+    merged = [
+        {"role": "user", "content": ["scalar-only"]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "left-over", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b"},
+            ],
+        },
+    ]
+    out = normalize_message_cache_control(merged, client_messages=client)
+    assert _markers(out) == 1
+    assert "cache_control" not in out[1]["content"][0]
+    assert "cache_control" in out[1]["content"][-1]

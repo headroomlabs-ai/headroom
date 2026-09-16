@@ -6,12 +6,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+
+
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the reserved, intentionally unresolvable test origin."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "custom.example,opencode.ai,www.opencode.ai")
 
 
 class _Runtime:

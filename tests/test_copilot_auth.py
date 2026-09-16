@@ -10,6 +10,7 @@ from urllib import error as urllib_error
 import pytest
 
 from headroom import copilot_auth
+from headroom.proxy import ssl_context
 
 
 def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -986,7 +987,9 @@ def test_build_copilot_upstream_url_strips_v1_for_configured_enterprise_api_url(
 
 
 def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1018,7 +1021,9 @@ def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.Monke
 def test_apply_copilot_api_auth_passes_through_existing_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         raise AssertionError("provider should not be called for existing API token")
 
     monkeypatch.setattr(
@@ -1044,7 +1049,9 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
 def test_apply_copilot_api_auth_replaces_managed_seeded_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-refreshed",
             expires_at=time.time() + 3600,
@@ -1117,7 +1124,9 @@ def test_apply_copilot_api_auth_passes_through_github_oauth_bearer(
 def test_apply_copilot_api_auth_replaces_non_bearer_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1172,7 +1181,9 @@ def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None
 def test_apply_copilot_api_auth_injects_required_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1203,7 +1214,9 @@ def test_apply_copilot_api_auth_injects_required_headers(
 def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1237,7 +1250,9 @@ def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
 def test_apply_copilot_api_auth_preserves_existing_headers_case_insensitively(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1601,3 +1616,36 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     )
 
     assert result == payload
+
+
+def test_exchange_token_sync_uses_configured_corporate_tls_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot refresh must use the same corporate trust config as upstream I/O."""
+    payload = {"token": "copilot-api", "expires_at": int(time.time()) + 3600}
+    tls_context = object()
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(ssl_context, "build_urlopen_context", lambda: tls_context)
+    monkeypatch.setattr(copilot_auth.urllib_request, "urlopen", fake_urlopen)
+
+    result = copilot_auth.CopilotTokenProvider._exchange_token_sync(
+        {"Authorization": "Bearer gho_test"}  # noqa: S105
+    )
+
+    assert result == payload
+    assert captured["context"] is tls_context

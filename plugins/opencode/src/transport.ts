@@ -5,9 +5,11 @@ const http = nodeRequire("node:http") as typeof import("node:http");
 const https = nodeRequire("node:https") as typeof import("node:https");
 const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
 const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
@@ -24,12 +26,14 @@ type ChildFork = typeof childProcess.fork;
 
 interface InstallOptions {
   proxyUrl: string;
+  project?: string;
   debug?: boolean;
 }
 
 interface TransportState {
   refs: number;
   proxyUrl: string;
+  project: string | undefined;
   debug: boolean;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
@@ -61,8 +65,15 @@ function setState(state: TransportState | undefined): void {
   (globalThis as GlobalWithHeadroomTransport)[STATE_KEY] = state;
 }
 
-function shimImportSpecifier(): string {
-  return new URL("../hook-shim/handler.js", import.meta.url).href;
+// ponytail: the shim only exists next to the checkout build
+// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// `--import=<missing file>` killed every Node child at startup — including
+// OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
+// children go direct instead of dying. Upgrade path is bundling the shim into
+// _dist/ so wheel installs get child-process routing back.
+function shimImportSpecifier(): string | undefined {
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : undefined;
 }
 
 function withNodeImportOption(existing: string | undefined, shim: string): string {
@@ -79,13 +90,19 @@ function withNodeImportOption(existing: string | undefined, shim: string): strin
 function withShimEnv(env: NodeJS.ProcessEnv | Record<string, unknown> | undefined, proxyUrl: string): NodeJS.ProcessEnv {
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
-  nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
 
 function installProcessEnv(proxyUrl: string): void {
   process.env[PROXY_ENV] = proxyUrl;
-  process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shimImportSpecifier());
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 
 function isOptions(value: unknown): value is Record<string, unknown> {
@@ -219,6 +236,7 @@ function mergeFetchHeaders(
   init: RequestInit | undefined,
   upstream: URL | undefined,
   originalPath: string | undefined = undefined,
+  project: string | undefined = undefined,
 ): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
@@ -231,10 +249,13 @@ function mergeFetchHeaders(
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   return headers;
 }
 
-function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | undefined, proxy: URL): FetchArgs {
+function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | undefined, proxy: URL, project: string | undefined): FetchArgs {
   const upstream = requestUrl(input);
   if (!shouldRoute(upstream, proxy)) {
     return [input, init];
@@ -243,7 +264,7 @@ function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | unde
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
   };
 
   if (input instanceof Request) {
@@ -300,11 +321,15 @@ function headersForNodeRequest(
   options: Record<string, unknown>,
   upstream: URL,
   originalPath: string | undefined,
+  project: string | undefined,
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
   }
   headers.delete("host");
 
@@ -315,7 +340,7 @@ function headersForNodeRequest(
   return result;
 }
 
-function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, unknown> | undefined {
+function routedNodeOptions(parts: NodeRequestParts, proxy: URL, project: string | undefined): Record<string, unknown> | undefined {
   if (!parts.url || !shouldRoute(parts.url, proxy)) {
     return undefined;
   }
@@ -348,7 +373,7 @@ function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, 
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
   };
 }
 
@@ -365,7 +390,7 @@ function wrapRequest(
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -406,6 +431,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
     existing.debug = Boolean(options.debug);
     installProcessEnv(options.proxyUrl);
     return () => uninstallHeadroomTransport();
@@ -414,6 +440,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   const state: TransportState = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
     debug: Boolean(options.debug),
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
@@ -435,7 +462,7 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project);
     return state.originalFetch(nextInput, nextInit);
   };
 

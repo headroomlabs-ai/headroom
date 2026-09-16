@@ -26,6 +26,7 @@ from datetime import date
 from typing import Any
 
 from headroom.models.registry import ModelRegistry
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -346,18 +347,13 @@ class GoogleProvider(Provider):
                 model_lower,  # gemini-1.5-pro
             ]
             for variant in model_variants:
-                try:
-                    cost = litellm.completion_cost(
-                        model=variant,
-                        prompt="",
-                        completion="",
-                        prompt_tokens=input_tokens,
-                        completion_tokens=output_tokens,
-                    )
-                    if cost is not None:
-                        return cost
-                except Exception:
-                    continue
+                cost = estimate_cost_from_tokens(
+                    variant,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                if cost is not None:
+                    return cost
 
         # Fallback to hardcoded pricing
         input_price, output_price = None, None

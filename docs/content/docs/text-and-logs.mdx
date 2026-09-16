@@ -7,11 +7,11 @@ Headroom provides specialized compressors for text-based content that isn't JSON
 
 | Compressor | Input Type | What It Preserves | Typical Savings |
 |---|---|---|---|
-| `SearchCompressor` | grep/ripgrep output | Relevant matches, file diversity | 80-95% |
-| `LogCompressor` | Build/test logs | Errors, stack traces, summaries | 85-95% |
-| `DiffCompressor` | Unified diffs | Changed lines, context | 60-80% |
-| `TextCrusher` | General text | Relevant sentences, anchors | 30-60% |
-| `KompressCompressor` | General text fallback | Learned token scoring via ONNX | 30-50% |
+| `SearchCompressor` | grep/ripgrep output | Relevant matches, file diversity | 80-95% (measured ~91% on a synthetic 40-file corpus) |
+| `LogCompressor` | Build/test logs | Errors, stack traces, summaries | 85-95% (measured ~93% on a synthetic 1,000-line log) |
+| `DiffCompressor` | Unified diffs | Changed lines, context | 60-80% (measured ~70% on a multi-file diff) |
+| `TextCrusher` | General text | Relevant sentences, anchors | 30-60% (its `target_ratio` defaults to 0.5; measured ~50% on real docs prose) |
+| `KompressCompressor` | General text fallback | Learned token scoring via ONNX | Highly variable -- `target_ratio` defaults to `None` ("model decides"), which measured only 6-24% on real prose; an explicit `target_ratio=0.5` measured ~40%. There is no fixed default range; see `benchmarks/text_crusher_quality_eval.py`. |
 
 ## SearchCompressor
 
@@ -159,9 +159,11 @@ print(f"Saved: {result.savings_percentage:.1f}%")
 If you're building your own routing logic, you can use the content type detector directly:
 
 ```python
-from headroom.transforms import detect_content_type, ContentType
+from headroom.transforms import detect_content_type, ContentType, SearchCompressor, LogCompressor
 
-content = "src/main.py:42:def process():"
+# A single file:line:content line isn't enough signal -- the detector wants
+# several matching lines before it calls something SEARCH_RESULTS.
+content = "src/main.py:42:def process():\nsrc/utils.py:10:def helper():\nsrc/models.py:5:class Foo:"
 
 detection = detect_content_type(content)
 if detection.content_type == ContentType.SEARCH_RESULTS:
@@ -182,15 +184,18 @@ The ContentRouter selects the right compressor automatically. Here's when each f
 | `file:line:content` lines | SearchCompressor | grep/ripgrep output format |
 | pytest, npm, cargo markers | LogCompressor | Build tool output patterns |
 | `---/+++` and `@@` markers | DiffCompressor | Unified diff format |
-| Prose, documentation | TextCrusher | Fallback for non-structured text |
-| Long plain text | KompressCompressor | ContentRouter fallback |
+| Prose, documentation | KompressCompressor | ContentRouter's default for `PLAIN_TEXT` (`CompressionStrategy.TEXT` and `KOMPRESS` share the same ML compressor dispatch -- see `headroom/transforms/content_router.py:3524-3540`) |
+| Long plain text that exceeds Kompress's size gate | TextCrusher | Request-path-safe fallback when the content is too large for synchronous ONNX inference (`_kompress_max_tokens`); TextCrusher is not ContentRouter's default path for ordinary prose |
 
 ## Performance
 
-| Compressor | Typical Input | Output | Speed |
+Speed depends heavily on input size and shape; the figures below are one
+measurement each (warm process, this package version), not a guarantee:
+
+| Compressor | Measured Input | Measured Output | Measured Speed (warm) |
 |---|---|---|---|
-| SearchCompressor | 1,000 matches | 30-50 matches | ~2ms |
-| LogCompressor | 5,000 lines | 100-200 lines | ~3ms |
-| DiffCompressor | Large diff | Changed hunks only | ~2ms |
-| TextCrusher | 10,000 chars | 2,000 chars | ~2ms |
-| KompressCompressor | Plain text | 50-70% of original | model-dependent |
+| SearchCompressor | 1,000 matches across 60 files | 30 matches | ~2.0ms |
+| LogCompressor | 5,000 lines, ~12 errors | 67 lines | ~17ms |
+| DiffCompressor | 30-file / 90-hunk synthetic diff | changed hunks only | ~0.4ms |
+| TextCrusher | 10,000 chars of prose | ~50% of input tokens (`target_ratio` default) | ~0.7ms |
+| KompressCompressor | Plain text | Highly variable (see the ranges above) | model-dependent; first call after process start pays a one-time model-load cost |

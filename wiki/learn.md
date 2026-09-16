@@ -157,7 +157,7 @@ Options:
   --apply                      Write recommendations (default: dry-run)
   --target TEXT                Context file to write (default: CLAUDE.local.md for Claude Code)
   --main-only                  Write only to the main context file, skip MEMORY.md
-  --agent [auto|claude|codex|gemini]
+  --agent [auto|claude|codex|gemini|grok|opencode]
                                Which agent to analyze (default: auto-detect)
   --model TEXT                 LLM for analysis (default: auto from API keys or CLI)
   --workers / -j INTEGER       Parallel analysis workers (min 1, default: auto)
@@ -169,11 +169,12 @@ Options:
 
 `headroom learn --verbosity` analyzes past sessions to infer the ideal output verbosity level for your project and writes a `verbosity.json` profile.
 
-**Important**: the output shaper is **off by default**. Running `--verbosity --apply` will either:
-- Hot-enable the output shaper on a running proxy (`POST /admin/runtime-env`), OR
-- Print instructions to set `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
+**Important**: the output shaper is **off by default** and requires the `beta`
+runtime rollout channel. Running `--verbosity --apply` will either:
+- Hot-enable the output shaper on an eligible running proxy (`POST /admin/runtime-env`), OR
+- Print instructions to set `HEADROOM_ROLLOUT_CHANNEL=beta` and `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
 
-To keep the shaper on across proxy restarts, add `export HEADROOM_OUTPUT_SHAPER=1` to your shell profile before starting the proxy.
+To keep the shaper on across proxy restarts, export both variables before starting the proxy.
 
 **Flag interactions**:
 - `--all` and `--project` are mutually exclusive
@@ -187,6 +188,8 @@ To keep the shaper on across proxy restarts, add `export HEADROOM_OUTPUT_SHAPER=
 | **Claude Code** | Reads `~/.claude/projects/*.jsonl` | ClaudeCodeWriter | CLAUDE.md, MEMORY.md |
 | **OpenAI Codex** | Reads `~/.codex/sessions/*.json` | CodexWriter | AGENTS.md, instructions.md |
 | **Gemini CLI** | Reads `~/.gemini/tmp/*/chats/session-*.json` | GeminiWriter | GEMINI.md |
+| **Grok CLI** | Reads `~/.grok/sessions/<workspace>/<session-id>/updates.jsonl` | GrokWriter | GROK.md |
+| **OpenCode** | Reads the OpenCode SQLite DB at `~/.local/share/opencode/opencode.db` (or `opencode-local.db`; override with `HEADROOM_OPENCODE_DB`) | CodexWriter (shared) | AGENTS.md, instructions.md |
 
 ## LLM Backend Selection
 

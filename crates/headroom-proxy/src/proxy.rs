@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -17,6 +17,7 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
+use crate::cache_stabilization::beta_sticky::BetaProvider;
 use crate::cache_stabilization::drift_detector::{
     compute_structural_hash, derive_session_key, observe_drift, ApiKind, DriftState,
 };
@@ -24,7 +25,7 @@ use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
-use crate::health::{healthz, healthz_upstream};
+use crate::health::{healthz, healthz_upstream, rollout_status};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -66,6 +67,13 @@ pub struct AppState {
     /// request body — so this can be cloned freely into every handler
     /// path that buffers the body.
     pub drift_state: DriftState,
+    /// Session-sticky beta-header tracker (parity port of the Python
+    /// `SessionBetaTracker`, PR-A6): per-`(provider, session)` LRU of
+    /// `anthropic-beta` / `openai-beta` tokens, unioned across turns
+    /// so a client dropping a token mid-conversation doesn't rotate
+    /// the upstream prefix-cache key. Shares the drift detector's
+    /// session identity (same `derive_session_key` output).
+    pub beta_sticky: cache_stabilization::beta_sticky::BetaStickyState,
     /// PR-D4: GCP ADC bearer-token source for Vertex routes. Default:
     /// [`crate::vertex::adc::GcpAdcTokenSource`] constructed lazily;
     /// the actual ADC chain is only resolved when the first Vertex
@@ -111,6 +119,9 @@ impl AppState {
             client,
             bedrock_credentials: None,
             drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
+            beta_sticky: cache_stabilization::beta_sticky::BetaStickyState::new(
+                cache_stabilization::beta_sticky::BETA_TRACKER_CAPACITY,
+            ),
             vertex_token_source,
         })
     }
@@ -146,6 +157,7 @@ pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
+        .route("/rollout/status", get(rollout_status))
         // PR-D3: Prometheus scrape endpoint. Renders the global
         // registry in text format. The handler is stateless — no
         // `AppState` needed — and idempotent across concurrent
@@ -177,14 +189,14 @@ pub fn build_app(state: AppState) -> Router {
         // publisher endpoints look like
         // `POST /v1beta1/projects/{p}/locations/{l}/publishers/anthropic/models/{m}:rawPredict`
         // (and `:streamRawPredict`). The trailing `:<verb>` is awkward
-        // in axum's `:param` syntax, so we capture the entire trailing
-        // segment as `:model_action` and split on the last `:` inside
+        // in axum's `{param}` syntax, so we capture the entire trailing
+        // segment as `{model_action}` and split on the last `:` inside
         // the dispatcher. Both verbs share the same axum route shape
         // — matchit can't distinguish two patterns that overlap on the
         // literal parameter. The verb dispatch lives in
         // [`crate::vertex::handle_vertex_predict_dispatch`].
         .route(
-            "/v1beta1/projects/:project/locations/:location/publishers/anthropic/models/:model_action",
+            "/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}",
             post(crate::vertex::handle_vertex_predict_dispatch),
         );
 
@@ -207,11 +219,11 @@ pub fn build_app(state: AppState) -> Router {
         // Bedrock handlers identically.
         let bedrock_router: Router<AppState> = Router::new()
             .route(
-                "/model/:model_id/invoke",
+                "/model/{model_id}/invoke",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             .route(
-                "/model/:model_id/converse",
+                "/model/{model_id}/converse",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             // PR-D2/PR-D5: streaming counterparts. Bedrock's protocol is
@@ -223,11 +235,11 @@ pub fn build_app(state: AppState) -> Router {
             // processing pipeline, so both route to the same handler.
             // See `bedrock::invoke_streaming`.
             .route(
-                "/model/:model_id/invoke-with-response-stream",
+                "/model/{model_id}/invoke-with-response-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route(
-                "/model/:model_id/converse-stream",
+                "/model/{model_id}/converse-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route_layer(axum::middleware::from_fn(
@@ -269,18 +281,18 @@ pub fn build_app(state: AppState) -> Router {
                 post(crate::handlers::conversations::handle_conversations_create),
             )
             .route(
-                "/v1/conversations/:conversation_id",
+                "/v1/conversations/{conversation_id}",
                 get(crate::handlers::conversations::handle_conversations_get)
                     .post(crate::handlers::conversations::handle_conversations_update)
                     .delete(crate::handlers::conversations::handle_conversations_delete),
             )
             .route(
-                "/v1/conversations/:conversation_id/items",
+                "/v1/conversations/{conversation_id}/items",
                 post(crate::handlers::conversations::handle_conversations_items_create)
                     .get(crate::handlers::conversations::handle_conversations_items_list),
             )
             .route(
-                "/v1/conversations/:conversation_id/items/:item_id",
+                "/v1/conversations/{conversation_id}/items/{item_id}",
                 get(crate::handlers::conversations::handle_conversations_item_get)
                     .delete(crate::handlers::conversations::handle_conversations_item_delete),
             );
@@ -303,17 +315,22 @@ pub fn build_app(state: AppState) -> Router {
 async fn catch_all(
     State(state): State<AppState>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
-    ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response<Body> {
-    if is_websocket_upgrade(req.headers()) {
-        if let Some(ws) = ws {
+    let (mut parts, body) = req.into_parts();
+    if is_websocket_upgrade(&parts.headers) {
+        // axum 0.8 requires optional extractors to opt in explicitly, and
+        // WebSocketUpgrade intentionally does not. Extract it only after the
+        // upgrade headers have identified this as a WebSocket request.
+        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            let req = Request::from_parts(parts, body);
             return ws_handler(ws, state, client_addr, req).await;
         }
         // Header says websocket but axum didn't extract it (likely missing
         // Sec-WebSocket-Key) — fall through to HTTP forwarding which will
         // surface the upstream error.
     }
+    let req = Request::from_parts(parts, body);
     forward_http(state, client_addr, req)
         .await
         .unwrap_or_else(|e| e.into_response())
@@ -707,6 +724,41 @@ pub(crate) async fn forward_http(
                 let session_key = derive_session_key(headers, &client_addr, &parsed, kind);
                 let hash = compute_structural_hash(&parsed, kind);
                 observe_drift(&state.drift_state, &session_key, hash);
+
+                // Session-sticky provider beta headers — port of the
+                // Python PR-A6 `SessionBetaTracker`. Beta headers are
+                // part of the bytes that determine the upstream
+                // prefix-cache key; a client dropping a token between
+                // turns rotates the key and re-writes the whole
+                // prefix at the customer's cost. Forward the
+                // per-conversation union instead. See
+                // `cache_stabilization::beta_sticky` for the behavior
+                // contract, the auth-mode rationale (applies to every
+                // mode, like the Python handler), and the one
+                // documented divergence from Python (per-conversation
+                // keying). Reuses the drift detector's `session_key`
+                // so both cache-stability subsystems agree on
+                // conversation identity. Mutates upstream-bound
+                // HEADERS only; body bytes stay untouched (Phase-A
+                // cache-safety invariant).
+                if state.config.beta_header_sticky.is_enabled() {
+                    let provider = match endpoint {
+                        compression::CompressibleEndpoint::AnthropicMessages => {
+                            BetaProvider::Anthropic
+                        }
+                        compression::CompressibleEndpoint::OpenAiChatCompletions
+                        | compression::CompressibleEndpoint::OpenAiResponses => {
+                            BetaProvider::OpenAi
+                        }
+                    };
+                    cache_stabilization::beta_sticky::apply_sticky_betas(
+                        &state.beta_sticky,
+                        provider,
+                        &session_key,
+                        &mut outgoing_headers,
+                        &request_id,
+                    );
+                }
             }
         }
         let outcome = match endpoint {
