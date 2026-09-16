@@ -48,6 +48,7 @@ import os
 import re
 import threading
 import time
+from bisect import bisect_left
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -984,6 +985,7 @@ class _SymbolAnalysis:
 
     scores: dict[str, float] = field(default_factory=dict)
     calls: dict[str, set[str]] = field(default_factory=dict)
+    qualified_calls_by_bare_name: dict[str, set[str]] | None = None
     ref_counts: dict[str, int] = field(default_factory=dict)
     body_line_counts: dict[str, int] = field(default_factory=dict)
     bare_names: dict[str, str] = field(default_factory=dict)  # qname -> short_name
@@ -1098,71 +1100,53 @@ class CodeAwareCompressor(Transform):
         all_identifiers: dict[str, int] = {}  # short_name -> count
         function_calls: dict[str, set[str]] = {}
 
-        def collect_definitions(node: Any, parent_name: str = "") -> None:
-            if node.type in all_definition_types:
-                short_name = _get_definition_name(node)
-                if short_name:
-                    qualified = f"{parent_name}.{short_name}" if parent_name else short_name
-                    definitions[qualified] = node
-                    bare_names[qualified] = short_name
-                    for child in node.children:
-                        collect_definitions(child, parent_name=qualified)
-                    return
-            # Also check for decorated definitions
-            if lang_config.decorator_node and node.type == lang_config.decorator_node:
-                for child in node.children:
-                    if child.type in all_definition_types:
-                        short_name = _get_definition_name(child)
-                        if short_name:
-                            qualified = f"{parent_name}.{short_name}" if parent_name else short_name
-                            definitions[qualified] = child
-                            bare_names[qualified] = short_name
-                            for grandchild in child.children:
-                                collect_definitions(grandchild, parent_name=qualified)
-                            return
-            for child in node.children:
-                collect_definitions(child, parent_name)
+        from tree_sitter import Query, QueryCursor
 
-        def collect_identifiers(node: Any) -> None:
-            if node.type in ("identifier", "property_identifier", "type_identifier"):
-                text = node.text
-                name = text.decode("utf-8") if isinstance(text, bytes) else str(text)
-                all_identifiers[name] = all_identifiers.get(name, 0) + 1
-            for child in node.children:
-                collect_identifiers(child)
-
-        def collect_calls_in_function(func_node: Any, func_qname: str) -> None:
-            func_short = bare_names[func_qname]
-            defined_short_names = set(bare_names.values())
-            calls: set[str] = set()
-
-            def walk(node: Any) -> None:
-                if node.type in ("identifier", "property_identifier"):
-                    text = node.text
-                    name = text.decode("utf-8") if isinstance(text, bytes) else str(text)
-                    if name in defined_short_names and name != func_short:
-                        calls.add(name)
-                for child in node.children:
-                    walk(child)
-
-            walk(func_node)
-            function_calls[func_qname] = calls
-
-        # Pass 1: Collect definitions with qualified names
-        collect_definitions(root)
-
+        grammar = _get_parser(language.value).language
+        groups = {
+            "definition": all_definition_types,
+            "identifier": {"identifier", "property_identifier", "type_identifier"},
+        }
+        patterns = []
+        for capture, types in groups.items():
+            for name in sorted(types):
+                if grammar.id_for_node_kind(name, True) is not None:
+                    patterns.append("(" + name + ") @" + capture)
+        captured = QueryCursor(Query(grammar, "\n".join(patterns))).captures(root)
+        nodes = captured.get("definition", [])
+        # Captures are unordered; source order preserves nesting and duplicate-name behavior.
+        nodes.sort(key=lambda node: (node.start_byte, -node.end_byte))
+        parents: list[tuple[int, str]] = []
+        for node in nodes:
+            while parents and node.start_byte >= parents[-1][0]:
+                parents.pop()
+            short_name = _get_definition_name(node)
+            if short_name:
+                parent_name = parents[-1][1] if parents else ""
+                qualified = f"{parent_name}.{short_name}" if parent_name else short_name
+                definitions[qualified] = node
+                bare_names[qualified] = short_name
+                parents.append((node.end_byte, qualified))
         if not definitions:
             return _SymbolAnalysis()
-
-        # Pass 2: Collect all identifiers
-        collect_identifiers(root)
-
-        # Pass 3: Collect call relationships and body sizes
-        body_line_counts: dict[str, int] = {}
+        defined_short_names = set(bare_names.values())
+        identifiers = []
+        for node in captured.get("identifier", []):
+            text = node.text
+            name = text.decode("utf-8") if isinstance(text, bytes) else str(text)
+            all_identifiers[name] = all_identifiers.get(name, 0) + 1
+            if node.type != "type_identifier" and name in defined_short_names:
+                identifiers.append((node.start_byte, name))
+        identifiers.sort()
+        positions = [position for position, _ in identifiers]
+        body_line_counts = {}
         for qname, node in definitions.items():
-            collect_calls_in_function(node, qname)
-            node_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
-            body_line_counts[qname] = max(1, len(node_text.split("\n")) - 2)
+            # Include nested definitions, matching the previous subtree walk.
+            start = bisect_left(positions, node.start_byte)
+            end = bisect_left(positions, node.end_byte)
+            short = bare_names[qname]
+            function_calls[qname] = {name for _, name in identifiers[start:end] if name != short}
+            body_line_counts[qname] = max(1, node.text.count(b"\n") - 1)
 
         # Reference counts: subtract definition occurrences
         short_name_def_count: dict[str, int] = {}
@@ -1214,9 +1198,18 @@ class CodeAwareCompressor(Transform):
         else:
             scores = dict.fromkeys(raw_signals, 0.5)
 
+        qualified_calls_by_bare_name: dict[str, set[str]] = {}
+        for qname, called in function_calls.items():
+            # _compress_function_ast passes a bare _get_definition_name() result;
+            # rpartition mirrors its prior qualified-name suffix lookup.
+            _, separator, bare_name = qname.rpartition(".")
+            if separator:
+                qualified_calls_by_bare_name.setdefault(bare_name, called)
+
         return _SymbolAnalysis(
             scores=scores,
             calls=function_calls,
+            qualified_calls_by_bare_name=qualified_calls_by_bare_name,
             ref_counts=ref_counts,
             body_line_counts=body_line_counts,
             bare_names=bare_names,
@@ -1625,6 +1618,7 @@ class CodeAwareCompressor(Transform):
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
         candidate_validator: Callable[[Any, str], str] | None = None,
+        code_lines: list[str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
 
@@ -1632,6 +1626,8 @@ class CodeAwareCompressor(Transform):
         the LangConfig tables. No per-language extraction methods needed.
         """
         structure = CodeStructure()
+        if code_lines is None:
+            code_lines = code.split("\n")
         captured_byte_ranges: list[tuple[int, int]] = []
 
         def _validated_candidate(node: Any, compressed: str) -> str:
@@ -1669,7 +1665,7 @@ class CodeAwareCompressor(Transform):
                     ):
                         has_func_or_class = True
                         compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, code_lines
                         )
                         # Reconstruct export with compressed inner definition
                         export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
@@ -1697,11 +1693,11 @@ class CodeAwareCompressor(Transform):
                         decorator_text.append(_get_node_text(child, code))
                     elif child.type in lang_config.function_nodes:
                         definition_compressed = self._compress_function_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, code_lines
                         )
                     elif child.type in lang_config.class_nodes:
                         definition_compressed = self._compress_class_ast(
-                            child, code, language, lang_config, body_limits, analysis
+                            child, code, language, lang_config, body_limits, analysis, code_lines
                         )
                 if decorator_text and definition_compressed:
                     full_def = _validated_candidate(
@@ -1726,7 +1722,7 @@ class CodeAwareCompressor(Transform):
             if node_type in lang_config.function_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_function_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, code_lines
                 )
                 structure.function_signatures.append(
                     leading + _validated_candidate(node, compressed)
@@ -1736,7 +1732,7 @@ class CodeAwareCompressor(Transform):
 
             if lang_config.container_node_types and node_type in lang_config.container_node_types:
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, code_lines
                 )
                 structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1746,7 +1742,7 @@ class CodeAwareCompressor(Transform):
             if node_type in lang_config.class_nodes:
                 leading = _get_leading_comment_text(node, code, captured_byte_ranges)
                 compressed = self._compress_class_ast(
-                    node, code, language, lang_config, body_limits, analysis
+                    node, code, language, lang_config, body_limits, analysis, code_lines
                 )
                 structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
@@ -1804,9 +1800,10 @@ class CodeAwareCompressor(Transform):
         # e.g. tree-sitter-c-sharp rejects top-level `#region` after a type
         # declaration, which would fail validation and forfeit compression.
         first_captured = min((r[0] for r in captured_byte_ranges), default=None)
+        captured_ranges = set(captured_byte_ranges)
         for child in root.children:
             child_range = (child.start_byte, child.end_byte)
-            if child_range not in captured_byte_ranges:
+            if child_range not in captured_ranges:
                 text = _get_node_text(child, code).strip()
                 if text:
                     if first_captured is not None and child.end_byte <= first_captured:
@@ -1828,6 +1825,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        code_lines: list[str] | None = None,
     ) -> str:
         """Compress a function/class/impl block using AST body detection.
 
@@ -1841,7 +1839,8 @@ class CodeAwareCompressor(Transform):
         # Use line-based slicing from original code (not byte offsets) to
         # preserve indentation. This is critical for nested definitions
         # (methods inside classes).
-        code_lines = code.split("\n")
+        if code_lines is None:
+            code_lines = code.split("\n")
         start_row = node.start_point[0]
         node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
@@ -2098,6 +2097,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        code_lines: list[str] | None = None,
     ) -> str:
         """Compress a class by individually compressing each method.
 
@@ -2106,7 +2106,8 @@ class CodeAwareCompressor(Transform):
         indentation for each method's omitted-body comment.
         """
         # Use line-based extraction to preserve indentation
-        code_lines = code.split("\n")
+        if code_lines is None:
+            code_lines = code.split("\n")
         start_row = node.start_point[0]
         node_lines = _get_node_lines(node, code_lines)
         node_text = "\n".join(node_lines)
@@ -2153,7 +2154,7 @@ class CodeAwareCompressor(Transform):
             # Methods/functions inside the class — compress individually
             if child.type in lang_config.function_nodes:
                 compressed = self._compress_function_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, lang_config, body_limits, analysis, code_lines
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -2168,7 +2169,13 @@ class CodeAwareCompressor(Transform):
                         decorator_lines.append("\n".join(code_lines[deco_start : deco_end + 1]))
                     elif deco_child.type in lang_config.function_nodes:
                         method_compressed = self._compress_function_ast(
-                            deco_child, code, language, lang_config, body_limits, analysis
+                            deco_child,
+                            code,
+                            language,
+                            lang_config,
+                            body_limits,
+                            analysis,
+                            code_lines,
                         )
                 if decorator_lines and method_compressed:
                     body_parts.append("\n".join(decorator_lines) + "\n" + method_compressed)
@@ -2182,7 +2189,7 @@ class CodeAwareCompressor(Transform):
                 lang_config.container_node_types and child.type in lang_config.container_node_types
             ):
                 compressed = self._compress_class_ast(
-                    child, code, language, lang_config, body_limits, analysis
+                    child, code, language, lang_config, body_limits, analysis, code_lines
                 )
                 body_parts.append(compressed)
                 processed_ranges.append((child.start_byte, child.end_byte))
@@ -2218,14 +2225,16 @@ class CodeAwareCompressor(Transform):
 
         return "\n".join(result_parts)
 
-    def _extract_generic_structure(self, root: Any, code: str) -> CodeStructure:
+    def _extract_generic_structure(
+        self, root: Any, code: str, code_lines: list[str] | None = None
+    ) -> CodeStructure:
         """Extract structure from generic/unknown code.
 
         For languages without a LangConfig, we can't reliably separate
         imports from other code. Just preserve everything in 'other'.
         """
         structure = CodeStructure()
-        structure.other = code.split("\n")
+        structure.other = code_lines if code_lines is not None else code.split("\n")
         return structure
 
     def _assemble_compressed(
@@ -2655,18 +2664,28 @@ def _make_omitted_comment(
     """Build omitted comment with call information from analysis."""
     calls_info = ""
     if analysis and func_name:
-        for key in (
-            func_name,
-            *(k for k in analysis.calls if k.endswith(f".{func_name}")),
-        ):
-            if key in analysis.calls:
-                called = analysis.calls[key]
-                if called:
-                    sorted_calls = sorted(called)[:5]
-                    calls_info = "; calls: " + ", ".join(sorted_calls)
-                    if len(called) > 5:
-                        calls_info += f" +{len(called) - 5} more"
-                break
+        called: set[str] | None
+        if func_name in analysis.calls:
+            called = analysis.calls[func_name]
+        else:
+            qualified_calls = getattr(analysis, "qualified_calls_by_bare_name", None)
+            called = (
+                qualified_calls.get(func_name)
+                if qualified_calls is not None
+                else next(
+                    (
+                        analysis.calls[key]
+                        for key in analysis.calls
+                        if key.endswith(f".{func_name}")
+                    ),
+                    None,
+                )
+            )
+        if called:
+            sorted_calls = sorted(called)[:5]
+            calls_info = "; calls: " + ", ".join(sorted_calls)
+            if len(called) > 5:
+                calls_info += f" +{len(called) - 5} more"
     return f"{indent}{comment_prefix} [{omitted_count} lines omitted{calls_info}]"
 
 
@@ -2680,12 +2699,8 @@ def _detect_indent(lines: list[str]) -> str:
 
 def _has_syntax_issues(node: Any) -> bool:
     """Check if AST contains ERROR or MISSING nodes."""
-    if node.type == "ERROR" or node.is_missing:
-        return True
-    for child in node.children:
-        if _has_syntax_issues(child):
-            return True
-    return False
+    # Tree-sitter propagates descendant syntax errors, including missing nodes.
+    return bool(node.has_error or node.is_missing)
 
 
 def compress_code(
