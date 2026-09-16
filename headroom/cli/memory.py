@@ -1225,9 +1225,10 @@ def reindex_memories(ctx: click.Context, db_path: str) -> None:
                 fts_indexed += asyncio.run(fts.index_batch_memories(page))
                 continue
             except Exception as exc:
-                # Not a failure on its own: exit status stays tied to whether
-                # records actually got indexed, exactly as before.
-                print_warning(f"FTS5: batch failed ({exc}); retrying page record by record")
+                # Not a failure on its own: nothing from this page committed,
+                # and the per-record retry below still gets to index it. Exit
+                # status stays tied to whether records actually got indexed.
+                print_warning(f"FTS5: page rolled back ({exc}); retrying record by record")
 
             for mem in page:
                 try:

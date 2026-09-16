@@ -16,6 +16,7 @@ from pathlib import Path
 # checkout would win and we would silently measure the wrong tree.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from headroom.cli.memory import _REINDEX_PAGE_SIZE
 from headroom.memory.adapters.fts5 import FTS5TextIndex
 from headroom.memory.models import Memory
 
@@ -70,7 +71,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--records", type=int, nargs="+", default=[1000])
     parser.add_argument("--content-words", type=int, default=40)
-    parser.add_argument("--page-size", type=int, default=1000)
+    parser.add_argument("--page-size", type=int, default=_REINDEX_PAGE_SIZE)
     parser.add_argument("--runs", type=int, default=3)
     args = parser.parse_args()
 

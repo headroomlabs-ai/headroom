@@ -628,7 +628,7 @@ def test_reindex_failed_batch_still_indexes_valid_records_in_that_page(tmp_path,
 
     assert result.exit_code == 0, result.output
     assert _fts_ids(db_path) == {m.id for m in memories}
-    assert "batch failed" in result.output
+    assert "page rolled back" in result.output
     assert "Re-indexed 4/4 memories" in result.output
 
 
