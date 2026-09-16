@@ -68,7 +68,7 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
-| `--mode` | `token` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
+| `--mode` | `cache` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
 | `--no-optimize` | `false` | Disable optimization (passthrough mode) |
 | `--no-cache` | `false` | Disable semantic caching |
 | `--no-rate-limit` | `false` | Disable rate limiting |
@@ -274,7 +274,7 @@ Compression-only endpoint. Compresses messages without ever making a **completio
 
 **No format conversion.** `messages` may be OpenAI-shaped (`role: "tool"` + `tool_call_id`) or Anthropic-shaped (`tool_use` / `tool_result` content blocks); the same shape comes back. `model` selects the tokenizer and context limit — send the real name, including gateway-prefixed forms like `bedrock/anthropic.claude-3-5-sonnet`.
 
-**`system` and `tools` are ignored.** Anthropic sends both out of band. This endpoint accepts them without complaint (200, no warning) and returns neither, so neither is compressed — keep carrying them yourself. That means the Anthropic system prompt is not compressed here, and tool-schema compaction / tool-search deferral are not reachable through this route; run Headroom as the proxy if you need those.
+**`system` and `tools` are ignored outside gateway mode.** Anthropic sends both out of band. Without a `gateway` block this endpoint accepts them without complaint (200, no warning) and returns neither, so neither is compressed — keep carrying them yourself. That means the Anthropic system prompt is not compressed here, and tool-schema compaction / tool-search deferral are not reachable this way. Gateway mode (below) passes `tools` through and compacts them; in OSS, native tool-search deferral is still proxy-only — the headroom-tool-search extension adds it to gateway mode as a turn hook.
 
 **Request:**
 ```json
@@ -285,6 +285,7 @@ Compression-only endpoint. Compresses messages without ever making a **completio
   "config": {                 // optional
     "mode": "lossy_inline",       // ccr | lossy_inline | lossless_then_lossy
     "frozen_message_count": 12,   // pin an already-cached prefix
+    "session_id": "conv-8f1c",    // session mode: Headroom keeps the replay state
     "compress_user_messages": false,
     "target_ratio": 0.5,
     "protect_recent": 2,
@@ -303,18 +304,19 @@ Compression-only endpoint. Compresses messages without ever making a **completio
   "compression_ratio": 0.23,    // tokens_after / tokens_before — LOWER is better
   "transforms_applied": ["router:smart_crusher:0.35"],
   "transforms_summary": {"router:smart_crusher:0.35": 1},
-  "ccr_hashes": []              // non-empty only with mode="ccr"
+  "ccr_hashes": [],             // non-empty only with mode="ccr"
+  "session": {"id": "conv-8f1c", "frozen_message_count": 12, "cached_prefix_replayed": true}  // session mode only
 }
 ```
 
 **Headers:**
 - `x-headroom-bypass: true` — skip compression, return messages as-is with zeroed metrics
 
-**Error responses:** 400 (missing/invalid fields, bad `config.mode` or `config.frozen_message_count`), 401 (bad `HEADROOM_PROXY_TOKEN`), 404 (non-loopback without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`), 503 (compression failed)
+**Error responses:** 400 (missing/invalid fields, bad `config.mode`, `config.frozen_message_count` or `config.session_id`, `session_id` with `compress_user_messages`, malformed `gateway` block), 401 (bad `HEADROOM_PROXY_TOKEN`), 404 (non-loopback without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`), 503 (compression failed; in session mode also `compression_timeout` — retry the turn)
 
-**Fail-open:** on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`.
+**Fail-open:** without a session, on timeout you get 200 with the original messages plus `compression_skipped: true` and `skip_reason: "compression_timeout"`. In session mode a timeout or busy session lock is a 503 instead, because handing back originals would desync the replay state.
 
-**Multi-turn callers — don't lose the prefix cache.** This endpoint is stateless: unlike the proxy's own request path (which runs a CacheAligner and tracks provider cache hits across turns), it has no idea what the provider already cached.
+**Multi-turn callers — don't lose the prefix cache.** Without `config.session_id` this endpoint is stateless: unlike the proxy's own request path (which runs a CacheAligner and tracks provider cache hits across turns), it has no idea what the provider already cached. Either let Headroom keep the state (session mode, below) or keep it yourself with `frozen_message_count`.
 
 The provider caches the bytes you *forwarded*, which compression already changed — so your originals and the cached prefix are no longer the same thing, and it is the forwarded version you must keep reproducing. Compression also varies with position: an older tool result can fall outside the recent-read protection window as the conversation grows and be compressed harder than last turn, so re-compression is not guaranteed to reproduce earlier output either. Two rules:
 
@@ -339,6 +341,16 @@ def next_turn(new_messages):
 ```
 
 Note `protect_recent` is not a substitute — it guards the newest messages, while `frozen_message_count` guards the oldest, which is the cached end.
+
+**Session mode.** Pass `config.session_id` (non-empty, at most 256 chars) and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy uses — so a gateway that owns routing can resend the raw conversation every turn and get a byte-identical prefix back. Everything previously returned for the session comes back unchanged; only the new tail is compressed; an explicit `frozen_message_count` still wins when larger. Forward the returned messages verbatim. `compress_user_messages` is refused (400). State is in-process (replay cache: `HEADROOM_COMPRESSION_CACHE_TTL_SECONDS`, default 3900; tracker state: 10 idle minutes), so multi-process deployments must pin a session to one process. `HEADROOM_COMPRESS_SESSION_FROM_HEADER=1` lets the `x-headroom-session-id` header stand in for `config.session_id` (off by default).
+
+Optionally relay the provider's usage for attribution with `POST /v1/usage` `{"session_id": "...", "usage": {...}}`. Anthropic `cache_read_input_tokens` / `cache_creation_input_tokens` and OpenAI `prompt_tokens_details.cached_tokens` / flat `cached_tokens` are accepted; a block with none of them is a 400. Replies `{"session_id", "frozen_message_count", "applied"}` (`applied: false, reason: "no_cache_signal"` when the only present field is 0), 404 `unknown_session`, or 503 `session_busy` (retry). Telemetry only — it never raises the frozen count.
+
+**Gateway mode (two-half turn contract).** Add a top-level `gateway` object (`{}` is enough) and one model turn becomes two calls, so a gateway that never lets Headroom see the provider response can still run transforms whose reload step needs it — the proxy's "no shrink without reload" rule at the API boundary. `gateway` fields: `can_redrive` (default `false`: the gateway can call the provider again with a request Headroom hands it; send `false` when streaming), `can_relay_response` (default `false`: the gateway will post status/usage after each turn), `session_affinity` (default `true`; `false` disables re-driving because pending turns are in-process), `plugin_version` (diagnostics). Every other top-level field (`system`, `tools`, `temperature`, …) passes through; `tools` is compacted deterministically (`tool_schema_compaction`; `tool_desc_compaction` with `HEADROOM_TOOL_DESC_MAX_CHARS`); extension turn hooks run, stream-safe-only unless `can_redrive` and `session_affinity` both hold. The response adds `body` (the complete provider request — forward it as-is; never contains `config`, `gateway`, `token_budget`), `turn_id`, `route` (`{model, provider, service_tier, reason}`, advisory; a routing extension's model is also written into `body.model`), `obligations` (`redrive` and/or `relay_usage`) and a `gateway` echo. Fail-open answers carry the same keys with originals and `obligations: []`. A turn is registered only when `obligations` is non-empty; with `relay_usage` the `/stats` record waits for the response half. Knobs: `HEADROOM_GATEWAY_TURN_TTL_SECONDS` (120), `HEADROOM_GATEWAY_MAX_PENDING_TURNS` (10000), `HEADROOM_GATEWAY_MAX_REDRIVES` (8). With `config.mode: "ccr"` and re-drive allowed, `headroom_retrieve` is injected into `body.tools` (`ccr_tool_injected`) and the response half answers the model's retrieval calls itself.
+
+`POST /v1/compress/response` (same exposure rules as `/v1/compress`) is the response half: `{"turn_id", "status": 200, "latency_ms", "usage": {...}, "response": {...}}`. `usage` accepts Anthropic, OpenAI chat (`prompt_tokens_details.cached_tokens`), OpenAI Responses (`input_tokens_details.cached_tokens`) and Kong's flat `cached_tokens` shapes, or the whole provider body (a nested `usage` key is descended into once); billed counters are summed across re-drive rounds. `response` is required when the turn carries `redrive`. Answers: `{"action": "done", "turn_id", "response": <replacement or null — forward what you hold>, "frozen_message_count", "usage_applied", "rounds"}` or `{"action": "redrive", "turn_id", "request": <full provider body to send>, "round"}` — post the provider's JSON back under the same `turn_id`; past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and `response: null`. Errors: 400 `invalid_request` / `missing_response`, 404 `unknown_turn` (unregistered, finished, or expired), 409 `turn_busy`.
+
+**Kong plugin.** [kong-plugin-headroom](https://github.com/headroomlabs-ai/kong-plugin-headroom) (its own repo; `luarocks install kong-plugin-headroom`) implements both halves for Kong Gateway 3.9 (session id from a header, usage relay from the `log` phase, re-drive loop in `access`). The contract itself is installed in Headroom through the compress-turn seam (`headroom.proxy.compress_turn`, `HEADROOM_GATEWAY_CONTRACT`), the same seam a third-party contract would use.
 
 ## Using with Claude Code
 
@@ -436,11 +448,13 @@ For production deployments:
 # Use a process manager
 pip install gunicorn
 
-# Run with gunicorn
-gunicorn headroom.proxy.server:app \
+# Run with gunicorn — server.py has no module-level `app`; FastAPI is built
+# by the create_app() factory, so gunicorn needs --factory
+gunicorn headroom.proxy.server:create_app \
   --workers 4 \
   --bind 0.0.0.0:8787 \
-  --worker-class uvicorn.workers.UvicornWorker
+  --worker-class uvicorn.workers.UvicornWorker \
+  --factory
 ```
 
 Or with Docker:

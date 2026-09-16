@@ -1,10 +1,9 @@
 # Benchmarks
 
-Headroom's core promise: **compress context without losing accuracy**. This page shows accuracy benchmarks, compression performance, and real-world production telemetry from 250+ active proxy instances.
+Headroom's core promise: **compress context without losing accuracy**. This page shows accuracy benchmarks and compression performance, all reproducible from this repo (see [Reproducing Results](#reproducing-results)).
 
 !!! success "Key Results"
     **98.2% recall** on article extraction with **94.9% compression**.
-    **52ms median overhead** in production. **1.4 billion tokens saved** across 249 instances.
 
 ---
 
@@ -26,58 +25,6 @@ Tested on Apple M-series (CPU), headroom v0.5.18. Each test runs `compress()` on
 
 - grep results and Python source show 0% compression — these are already compact structured formats. SmartCrusher only compresses JSON arrays; code passes through to preserve correctness.
 - Latency is for the `compress()` SDK call, not the full proxy round-trip.
-
----
-
-## Production Telemetry
-
-Real-world data from **50,000+ proxy sessions** across 250+ unique instances (March 30 – April 2, 2026). Collected via anonymous telemetry beacon (opt-in: `HEADROOM_TELEMETRY=on`; telemetry is off by default).
-
-### Proxy Overhead
-
-| Percentile | Latency |
-|---|---|
-| **Median (P50)** | **52ms** |
-| P90 | 309ms |
-| P99 | 4,172ms |
-| Mean | 161ms |
-
-The median 52ms overhead is negligible compared to LLM inference time (typically 2-10 seconds).
-
-### Compression Rate
-
-| Percentile | Compression |
-|---|---|
-| P25 | 4.8% |
-| **Median** | **4.8%** |
-| P75 | 6.9% |
-| Mean | 11.3% |
-
-Median compression is modest because many requests are short conversational turns. Heavy tool-use sessions (file reads, shell output) see 40-80% compression.
-
-### Pipeline Step Timing (Production Median)
-
-| Step | Median | P90 | Description |
-|---|---|---|---|
-| `pipeline_total` | **16.9ms** | 289ms | Full compression pipeline |
-| `content_router` | 11.7ms | 259ms | Content detection + routing |
-| `compressor:smart_crusher` | 50.1ms | 50ms | JSON array compression |
-| `compressor:text` | 32.0ms | 576ms | Text compression (Kompress ONNX) |
-| `compressor:mixed` | 316ms | 428ms | Mixed content compression |
-| `compressor:code_aware` | 815ms | 886ms | Tree-sitter AST compression |
-| `_initial_token_count` | 2.9ms | 16ms | Token counting (tiktoken) |
-| `_deep_copy` | 0.1ms | 0.3ms | Message copy overhead |
-
-### Fleet Summary
-
-| Metric | Value |
-|---|---|
-| Clean instances | 249 |
-| Total tokens saved | 1.4 billion |
-| Total $ saved | ~$4,000 |
-| OS distribution | Linux 57%, macOS 38%, Windows 5% |
-| Top version | 0.5.17 (77%) |
-| Models used | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5 |
 
 ---
 
@@ -148,14 +95,14 @@ SmartCrusher preserves first N items (schema), last N items (recency), all anoma
 
 ### When Headroom Adds the Most Value
 
-- **Long agent sessions** with accumulated tool outputs (40-80% compression)
-- **JSON-heavy workflows** (API responses, database queries) — 83-94% compression
-- **Build/test output** — 85-94% compression
-- **Multi-tool agents** — 60-76% compression across tool results
+- **Long agent sessions** with accumulated tool outputs
+- **JSON-heavy workflows** (API responses, database queries) — see the JSON array rows above
+- **Build/test output** — see the Shell/Build log rows above
+- **Multi-tool agents** — repeated tool results compound the per-call savings shown above
 
 ### When Headroom Adds Little Value
 
-- **Short conversational exchanges** — median 4.8% compression
+- **Short conversational exchanges** — overhead can exceed savings on small payloads (see "What Headroom Does NOT Compress" above)
 - **Code-only sessions** (reading/writing files) — code passes through
 - **Single-turn requests** — no accumulated context to compress
 
@@ -179,20 +126,13 @@ Compression = 1 - (compressed_size / original_size)
 
 A 94.9% compression means the output is 5.1% of the original size.
 
-### Production Telemetry
-
-- Collected via anonymous beacon (no prompts, no content, no PII)
-- Image-inflated instances excluded (base64 counted as text tokens — fixed in v0.5.18)
-- Multi-worker beacon spam excluded (per-instance MAX, not SUM)
-- Opt-in: `HEADROOM_TELEMETRY=on` (telemetry is off by default)
-
 ---
 
 ## Reproducing Results
 
 ```bash
 # Clone the repo
-git clone https://github.com/chopratejas/headroom.git
+git clone https://github.com/headroomlabs-ai/headroom.git
 cd headroom
 
 # Install with eval dependencies

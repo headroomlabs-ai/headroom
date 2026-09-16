@@ -57,3 +57,52 @@ def test_503_recorded_as_failed():
     asyncio.run(emit_request_outcome(handler, _outcome(503)))
     assert handler.metrics.failed == ["anthropic"]
     assert handler.metrics.requested == []
+
+
+def test_stream_outcome_529_recorded_as_failed_and_skips_success_funnel():
+    handler = _Handler()
+    outcome = RequestOutcome.from_stream(
+        body={"messages": []},
+        provider="anthropic",
+        model="claude-opus-4-8",
+        request_id="req-stream-529",
+        original_tokens=100,
+        optimized_tokens=80,
+        output_tokens=0,
+        tokens_saved=20,
+        transforms_applied=[],
+        total_latency_ms=100.0,
+        overhead_ms=10.0,
+        tags=None,
+        client=None,
+        status_code=529,
+    )
+
+    assert outcome.status_code == 529
+    asyncio.run(emit_request_outcome(handler, outcome))
+    assert handler.metrics.failed == ["anthropic"]
+    assert handler.metrics.requested == []
+
+
+def test_stream_outcome_without_status_code_defaults_to_success():
+    handler = _Handler()
+    outcome = RequestOutcome.from_stream(
+        body={"messages": []},
+        provider="anthropic",
+        model="claude-opus-4-8",
+        request_id="req-stream-200",
+        original_tokens=100,
+        optimized_tokens=80,
+        output_tokens=10,
+        tokens_saved=20,
+        transforms_applied=[],
+        total_latency_ms=100.0,
+        overhead_ms=10.0,
+        tags=None,
+        client=None,
+    )
+
+    assert outcome.status_code == 200
+    asyncio.run(emit_request_outcome(handler, outcome))
+    assert handler.metrics.failed == []
+    assert len(handler.metrics.requested) == 1

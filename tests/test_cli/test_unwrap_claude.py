@@ -243,18 +243,24 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "foundry_mode": False,
             "vertex_mode": False,
             "settings_path": settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's ownership claim instead of deferring to a
+            # live sibling and silently doing nothing (#3205).
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": True,
             "vertex_mode": False,
             "settings_path": settings_path,
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": True,
             "settings_path": settings_path,
+            "force": True,
         },
     ]
 

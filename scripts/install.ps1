@@ -194,14 +194,10 @@ function Get-SharedDockerArgs {
 function Add-TtyArgs {
     param($ArgsList)
 
+    # MCP stdio always uses a pipe for stdin. Docker only forwards stdin when
+    # explicitly given -i, regardless of whether the host console is redirected.
+    $ArgsList.Add('-i')
     if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-        $ArgsList.Add('-it')
-        return
-    }
-    if (-not [Console]::IsInputRedirected) {
-        $ArgsList.Add('-i')
-    }
-    if (-not [Console]::IsOutputRedirected) {
         $ArgsList.Add('-t')
     }
 }
@@ -1803,4 +1799,4 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Restart PowerShell"
 Write-Host "  2. Try: headroom proxy"
-Write-Host "  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md"
+Write-Host "  3. Docs: https://docs.headroomlabs.ai/docs/docker-install"

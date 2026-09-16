@@ -6,7 +6,9 @@ from headroom.transforms.kompress_remote import RemoteKompressCompressor
 
 
 def _long_text() -> str:
-    return " ".join(f"word{i}" for i in range(20))
+    # Above the production word floor (min_input_words=64) so the remote
+    # call under test actually fires.
+    return " ".join(f"word{i}" for i in range(80))
 
 
 def _compressor(transport: httpx.BaseTransport) -> RemoteKompressCompressor:

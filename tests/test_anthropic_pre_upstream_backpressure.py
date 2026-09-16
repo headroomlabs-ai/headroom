@@ -485,8 +485,23 @@ def test_unbounded_mode_no_semaphore_instance():
 def test_unbounded_mode_requests_run_concurrently():
     """With concurrency=0 (sem disabled), two slow requests overlap."""
 
-    async def _run() -> float:
-        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=None, upstream_delay_s=0.10)
+    async def _run() -> None:
+        both_entered = asyncio.Event()
+        entered = 0
+
+        class _OverlapHandler(_DummyAnthropicHandler):
+            async def _retry_request(self, *args, **kwargs):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+                # Neither request can finish until both reach upstream. A
+                # serialized handler deadlocks here instead of merely running
+                # slower; the timeout below only bounds that failure.
+                await both_entered.wait()
+                return await super()._retry_request(*args, **kwargs)
+
+        handler = _OverlapHandler(anthropic_pre_upstream_sem=None)
         reqs = [
             _build_request(
                 {
@@ -497,15 +512,15 @@ def test_unbounded_mode_requests_run_concurrently():
             )
             for i in range(2)
         ]
-        start = time.perf_counter()
-        await asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs))
-        return time.perf_counter() - start
+        responses = await asyncio.wait_for(
+            asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs)),
+            timeout=10,
+        )
+        assert entered == 2
+        assert all(response.status_code == 200 for response in responses)
 
     with _tokenizer_patch():
-        elapsed = anyio.run(_run)
-    # Unbounded -> both sleeps run in parallel. Total should be ~0.10 s,
-    # nowhere near 0.20 s.
-    assert elapsed < 0.18, elapsed
+        anyio.run(_run)
 
 
 # --------------------------------------------------------------------------- #
@@ -1094,3 +1109,74 @@ def test_response_cache_keys_on_lookup_messages_not_mutated():
     assert cache.set_messages == cache.get_messages
     # And specifically the raw lookup messages, not the scanner's rewrite.
     assert cache.set_messages == [{"role": "user", "content": "hello"}]
+
+
+# --------------------------------------------------------------------------- #
+# Backpressure must not bust the provider prompt cache: the compression        #
+# pipeline is skipped under saturation, but the previously-forwarded          #
+# (compressed) prefix must still be replayed byte-identical. Forwarding raw   #
+# originals would mismatch the bytes the provider cached — busting every      #
+# gated session's prefix exactly when the proxy is busiest.                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_backpressure_passthrough_replays_cached_prefix(stage_log_capture):
+    prev_original = [{"role": "user", "content": "ORIGINAL " * 6000}]
+    prev_forwarded = [{"role": "user", "content": "[compressed-form]"}]
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # saturate: the request's acquire will time out
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.optimize = True
+        handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
+        handler.anthropic_pipeline = SimpleNamespace(apply=MagicMock())
+
+        tracker = SimpleNamespace(
+            _cached_token_count=0,
+            get_frozen_message_count=lambda: 0,
+            get_last_original_messages=lambda: copy.deepcopy(prev_original),
+            get_last_forwarded_messages=lambda: copy.deepcopy(prev_forwarded),
+            update_from_response=lambda *a, **k: None,
+            record_request=lambda *a, **k: None,
+        )
+        handler.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *a, **k: "sess-1",
+            get_or_create=lambda *a, **k: tracker,
+            resolve_tracker=lambda *a, **k: tracker,
+        )
+
+        forwarded_bodies: list[dict] = []
+        orig_retry = handler._retry_request
+
+        async def _capturing_retry(method, url, headers, body, **kw):
+            forwarded_bodies.append(copy.deepcopy(body))
+            return await orig_retry(method, url, headers, body, **kw)
+
+        handler._retry_request = _capturing_retry
+
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": copy.deepcopy(prev_original)
+                + [{"role": "user", "content": "next turn"}],
+            },
+            {"authorization": "Bearer sk-ant-api-test"},
+        )
+        try:
+            response = await handler.handle_anthropic_messages(req)
+            assert response.status_code == 200
+            # Saturation must still skip the CPU-bound pipeline...
+            assert not handler.anthropic_pipeline.apply.called
+        finally:
+            sem.release()
+
+        assert forwarded_bodies, "request never reached upstream"
+        sent = forwarded_bodies[-1]["messages"]
+        # ...but the forwarded prefix must be last turn's exact bytes, not the
+        # raw original (which the provider never cached).
+        assert sent[0]["content"] == "[compressed-form]"
+        assert sent[-1]["content"] == "next turn"
+
+    with _tokenizer_patch():
+        anyio.run(_run)

@@ -24,9 +24,14 @@ console.log(`Saved ${result.tokensSaved} tokens (${((1 - result.compressionRatio
 <Tab value="Python">
 ```python
 from headroom import compress
+from openai import OpenAI
+
+messages = [{"role": "user", "content": "Analyze these results"}]
 
 result = compress(messages, model="gpt-4o")
-response = client.messages.create(
+
+client = OpenAI()
+response = client.chat.completions.create(
     model="gpt-4o",
     messages=result.messages,
 )
@@ -39,13 +44,17 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 
 | Content type | What happens | Typical savings |
 |---|---|---|
-| JSON arrays (tool outputs) | Statistical analysis keeps errors, anomalies, boundaries | 70--90% |
-| Source code | AST-aware compression preserves signatures, collapses bodies | 40--70% (opt-in; disabled by default) |
-| Build/test logs | Keeps failures and errors, drops passing noise | 80--95% |
-| Search results | Ranks by relevance, keeps top matches | 60--80% |
-| Plain text | ModernBERT token classification removes redundancy | 30--50% |
-| Git diffs | Preserves change hunks, drops unchanged context | 40--60% |
-| Images | ML router selects optimal resize/quality tradeoff | 40--90% |
+| JSON arrays (tool outputs) | Statistical analysis keeps errors, anomalies, boundaries | varies with array size and redundancy |
+| Source code | AST-aware compression preserves signatures, collapses bodies | opt-in; disabled by default |
+| Build/test logs | Keeps failures and errors, drops passing noise | varies with log verbosity |
+| Search results | Ranks by relevance, keeps top matches | varies with result set size |
+| Plain text | ModernBERT token classification removes redundancy | varies with redundancy |
+| Git diffs | Preserves change hunks, drops unchanged context | varies with diff size |
+| Images | ML router selects optimal resize/quality tradeoff | varies with image content |
+
+Savings depend heavily on how repetitive the content is -- see
+[Benchmarks](/docs/benchmarks) and the reproducible scenario table below for
+measured numbers on real workloads.
 
 ## Where Headroom fits
 
@@ -64,21 +73,35 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
 
 ## Real-world results
 
-**100 production log entries. One critical error buried at position 67.**
+Headroom is built for the scenario that matters most in agent workflows: a
+single critical error or fact buried inside a large, mostly-routine tool
+output. SmartCrusher preserves error items, anomalies (values outside normal
+statistical range), and first/last boundaries by construction -- not by
+keyword matching, but by statistical analysis of field variance -- so the
+signal survives even when the surrounding noise is compressed away
+aggressively.
 
-| Metric | Baseline | Headroom |
-|---|---|---|
-| Input tokens | 10,144 | 1,260 |
-| Correct answers | **4/4** | **4/4** |
-
-87.6% fewer tokens. Same answer. The FATAL error was automatically preserved -- not by keyword matching, but by statistical analysis of field variance.
+Measured on local, seeded test data built from real MCP server output
+formats. These are not production telemetry, and they are reproducible:
 
 | Scenario | Before | After | Savings |
 |---|---|---|---|
-| Code search (100 results) | 17,765 | 1,408 | **92%** |
-| SRE incident debugging | 65,694 | 5,118 | **92%** |
-| Codebase exploration | 78,502 | 41,254 | **47%** |
-| GitHub issue triage | 54,174 | 14,761 | **73%** |
+| Code search (100 results) | 17,199 | 13,597 | **21%** |
+| SRE incident debugging | 55,957 | 24,340 | **57%** |
+| Codebase exploration | 58,801 | 33,895 | **42%** |
+| GitHub issue triage | 46,067 | 32,429 | **30%** |
+
+```bash
+uv run python benchmarks/index_proof_table.py --seed 20260902
+```
+
+Token counts are from the `gpt-5.6` tokenizer. The corpus is generated, so the
+exact before/after counts move slightly with the seed; the savings hold across
+seeds (Code search 21%, SRE 56--57%, triage 29--30%, exploration 41--50% over
+five seeds). Savings depend on how repetitive your tool output is, so treat
+these as a shape, not a promise.
+
+See [Benchmarks](/docs/benchmarks) for the wider suite.
 
 ## Key Features
 
