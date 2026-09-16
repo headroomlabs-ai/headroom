@@ -1,0 +1,59 @@
+---
+title: Hermes Agent
+description: Give Hermes a native headroom_retrieve tool so compression markers are reversible, via the bundled hermes plugin.
+---
+
+Hermes Agent registers its own tools, so unlike Claude Code it does not automatically receive the `headroom_retrieve` MCP tool. The bundled [`plugins/hermes`](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/hermes) plugin closes that loop: it gives Hermes a native `headroom_retrieve` tool that calls the proxy's `POST /v1/retrieve` endpoint directly, so compression markers like `<<ccr:abc123>>` are no longer a black box.
+
+Without it, the model tends to re-run the original command (wasting tokens and time) or treat `ccr:abc123` as a file path and try to `cat` it.
+
+## Install
+
+1. Copy the plugin into Hermes's user plugin directory:
+
+   ```bash
+   mkdir -p ~/.hermes/plugins
+   cp -r plugins/hermes/headroom_retrieve ~/.hermes/plugins/
+   ```
+
+2. Enable it in `~/.hermes/config.yaml`:
+
+   ```yaml
+   toolsets:
+     - hermes-cli
+     - web
+     - headroom        # add this
+
+   plugins:
+     enabled:
+       - headroom_retrieve
+   ```
+
+   > Once the `plugins.enabled` key exists it acts as an explicit allowlist — list any other user plugins you already rely on.
+
+3. Restart the Hermes gateway / TUI (plugin discovery is cached per process).
+
+## Proxy configuration
+
+No configuration is required to prevent the retrieval loop on current headroom releases: `headroom_retrieve` is a protected built-in — it ships in `DEFAULT_EXCLUDE_TOOLS` and `DEFAULT_VERBATIM_EXCLUDE_TOOLS` (`headroom/config.py`), and the content router has dedicated guards that never recompress retrieved originals (issue #1077). Exclusion matching also unwraps Hermes's deferred `tool_call` bridge (`tool_search` / `tool_call` indirection), so the real tool name is matched even when Hermes invokes the plugin through the bridge.
+
+The one Hermes-specific exclusion worth considering is `read_file`: Hermes's tool names don't match Claude Code's `Read` / `Grep` / `Edit` that the built-in defaults protect, and file reads are reference data the agent needs verbatim:
+
+```bash
+HEADROOM_EXCLUDE_TOOLS=read_file
+```
+
+Configured exclusions merge with (rather than replace) the built-in defaults, so this leaves every built-in protection — including the `headroom_retrieve` guards — intact.
+
+## Behavior
+
+- Accepts the bare hash or the whole marker — `<<ccr:abc123,base64,4.5KB>>`, `ccr:abc123`, and `hash=abc123` all normalize to `abc123`.
+- Retrieval is by hash and always returns the full original content.
+- Expired-hash (TTL) and proxy-unreachable errors tell the model to re-run the original command instead of retrying blindly.
+
+## Requirements
+
+- headroom proxy running on `127.0.0.1:8787` (edit `_PROXY_URL` in the plugin's `__init__.py` otherwise)
+- `httpx` (already a Hermes dependency)
+
+Tested against headroom 0.22.4 and 0.23.0 with Hermes Agent on macOS and Linux.
