@@ -153,8 +153,18 @@ class SQLiteBackend:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return None
+        if not isinstance(data, dict):
+            return None
         known = {f.name for f in fields(CompressionEntry)}
-        return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        try:
+            return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        except (TypeError, ValueError):
+            # A blob that parses as JSON but is missing a required field (schema
+            # drift across an upgrade, a partially written row) must degrade to a
+            # miss, not raise. Otherwise a single bad row crashes get() — and,
+            # via items(), _clean_expired() runs it on every store's eviction, so
+            # one poison row would break all reads, evictions, and stores.
+            return None
 
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""
