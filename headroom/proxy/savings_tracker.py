@@ -31,6 +31,38 @@ sanitize_project_name = project_name_policy.sanitize_project_name
 
 logger = logging.getLogger(__name__)
 
+_CO2_MODEL_WH_PER_TOKEN: dict[str, float] = {
+    "claude-opus": 0.0005,
+    "claude-sonnet": 0.0003,
+    "claude-haiku": 0.00008,
+    "gpt-4": 0.0004,
+    "gpt-4o": 0.0003,
+    "gpt-4o-mini": 0.00008,
+    "o1": 0.0006,
+    "o3": 0.0006,
+    "gemini-1.5-pro": 0.0003,
+    "gemini-1.5-flash": 0.00008,
+}
+_CO2_DEFAULT_WH_PER_TOKEN = 0.0002
+_CO2_CARBON_INTENSITY_KG_PER_KWH = 0.4
+
+
+def estimate_co2_saved_mg(tokens_saved: int, model: str = "") -> float:
+    """Estimate CO2 saved in milligrams from avoided input tokens."""
+    if tokens_saved <= 0:
+        return 0.0
+
+    model_lower = model.lower()
+    wh_per_token = _CO2_DEFAULT_WH_PER_TOKEN
+    for key, value in _CO2_MODEL_WH_PER_TOKEN.items():
+        if key in model_lower:
+            wh_per_token = value
+            break
+
+    grams_per_token = wh_per_token * _CO2_CARBON_INTENSITY_KG_PER_KWH
+    return float(tokens_saved) * grams_per_token * 1000
+
+
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
@@ -1171,9 +1203,11 @@ class SavingsTracker:
             response["projects"] = self._projects_snapshot_locked()
             return response
 
-    def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
+    def stats_preview(self, recent_points: int = 20, model: str = "") -> dict[str, Any]:
         """Return a compact preview for `/stats`."""
         snapshot = self.snapshot()
+        tokens_saved = _coerce_int(snapshot["lifetime"].get("tokens_saved"))
+        co2_mg = estimate_co2_saved_mg(tokens_saved, model=model)
         return {
             "schema_version": snapshot["schema_version"],
             "storage_path": snapshot["storage_path"],
@@ -1186,6 +1220,13 @@ class SavingsTracker:
             "projects": snapshot["projects"],
             "projects_limit": DEFAULT_MAX_PROJECTS,
             "by_model": snapshot["by_model"],
+            "co2": {
+                "tokens_saved": tokens_saved,
+                "co2_saved_mg": round(co2_mg, 3),
+                "co2_saved_g": round(co2_mg / 1000, 6),
+                "methodology": "EcoLogits v0.8 energy model x IEA 2023 global carbon intensity (0.4 kg CO2/kWh)",
+                "note": "Conservative estimate. Actual savings vary by provider data center region.",
+            },
         }
 
     def history_response(self, history_mode: str = "compact") -> dict[str, Any]:
