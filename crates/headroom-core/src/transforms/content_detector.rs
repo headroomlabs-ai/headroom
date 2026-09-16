@@ -27,6 +27,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
+use super::code_compressor::ruby_structural_evidence_for_detection;
+
 /// Content types recognized by the detector. String tags match Python's
 /// `ContentType` enum values 1:1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -162,6 +164,14 @@ static CODE_PATTERNS: LazyLock<Vec<CodePatterns>> = LazyLock::new(|| {
                 Regex::new(r"^\s*(public|private|protected)\s+(class|interface|enum)").unwrap(),
                 Regex::new(r"^\s*@\w+").unwrap(),
                 Regex::new(r"^\s*package\s+[\w.]+;").unwrap(),
+            ],
+        },
+        CodePatterns {
+            name: "ruby",
+            patterns: vec![
+                Regex::new(r"^\s*(class|module|def)\s+[\w:!?=]+").unwrap(),
+                Regex::new(r#"^\s*(require|require_relative|load|autoload)\s+['\"]"#).unwrap(),
+                Regex::new(r"^\s*@[A-Za-z_]\w*").unwrap(),
             ],
         },
     ]
@@ -503,10 +513,25 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
         return None;
     }
     let max_score = language_scores.iter().map(|x| x.1).max().unwrap_or(0);
-    let (best_lang, best_score) = *language_scores
+    let ruby_has_structure = language_scores
         .iter()
-        .find(|x| x.1 == max_score)
-        .expect("language_scores non-empty");
+        .any(|(name, score)| *name == "ruby" && *score >= 3 && ruby_structural_evidence(content));
+    let (best_lang, best_score) = if ruby_has_structure
+        && language_scores
+            .iter()
+            .any(|(name, score)| *name == "ruby" && *score == max_score)
+    {
+        language_scores
+            .iter()
+            .find(|(name, score)| *name == "ruby" && *score == max_score)
+            .copied()
+            .expect("ruby score exists")
+    } else {
+        *language_scores
+            .iter()
+            .find(|x| x.1 == max_score)
+            .expect("language_scores non-empty")
+    };
     if best_score < 3 {
         return None;
     }
@@ -524,6 +549,22 @@ fn try_detect_code(content: &str) -> Option<DetectionResult> {
         .cloned()
         .unwrap(),
     ))
+}
+
+fn ruby_structural_evidence(content: &str) -> bool {
+    if content.lines().any(|line| {
+        let trimmed = line.trim();
+        let declaration = trimmed
+            .split_once('#')
+            .map_or(trimmed, |(prefix, _)| prefix.trim_end());
+        let before_colon = declaration.strip_suffix(':').unwrap_or_default();
+        (trimmed.starts_with("class ") || trimmed.starts_with("def "))
+            && !before_colon.is_empty()
+            && !before_colon.contains(':')
+    }) {
+        return false;
+    }
+    ruby_structural_evidence_for_detection(content)
 }
 
 #[cfg(test)]
@@ -662,6 +703,29 @@ if __name__ == '__main__':
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SourceCode);
         assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("python"));
+    }
+
+    #[test]
+    fn python_decorated_class_is_not_claimed_as_ruby() {
+        let content = "@dataclass\nclass Service:  # Python class\n    def run(self):  # Python method\n        return 1\n\n    def stop(self):  # Python method\n        return 2\n";
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("python"));
+    }
+
+    #[test]
+    fn ruby_code_detected() {
+        let content = r#"require "json"
+class Worker
+  def run(items)
+    @items = items
+    @items
+  end
+end
+"#;
+        let r = detect_content_type(content);
+        assert_eq!(r.content_type, ContentType::SourceCode);
+        assert_eq!(r.metadata.get("language").unwrap().as_str(), Some("ruby"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ produce many other formats that need specialized handling.
 
 Supported content types:
 - JSON_ARRAY: Structured JSON data (existing SmartCrusher)
-- SOURCE_CODE: Python, JavaScript, TypeScript, Go, etc.
+- SOURCE_CODE: Python, JavaScript, TypeScript, Go, Ruby, etc.
 - SEARCH_RESULTS: grep/ripgrep output (file:line:content)
 - BUILD_OUTPUT: Compiler, test, lint logs
 - GIT_DIFF: Unified diff format
@@ -117,6 +117,11 @@ _CODE_PATTERNS = {
         re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;"),
         re.compile(r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\("),
         re.compile(r"\$this->"),
+    ],
+    "ruby": [
+        re.compile(r"^\s*(class|module|def)\s+[\w:!?=]+"),
+        re.compile(r"^\s*(require|require_relative|load|autoload)\s+['\"]"),
+        re.compile(r"^\s*@[A-Za-z_]\w*"),
     ],
 }
 
@@ -793,8 +798,16 @@ def _try_detect_code(content: str) -> DetectionResult | None:
     if not language_scores:
         return None
 
-    # Find best matching language
-    best_lang = max(language_scores, key=lambda k: language_scores[k])
+    # Ruby's regexes overlap with Python decorators and definitions. Only let
+    # the Ruby tie-break run when the Ruby parser owns a structural node.
+    ruby_score = language_scores.get("ruby", 0)
+    ruby_has_structure = ruby_score >= 3 and _ruby_structural_evidence_for_detection(content)
+    if ruby_has_structure and ruby_score >= max(
+        (score for lang, score in language_scores.items() if lang != "ruby"), default=0
+    ):
+        best_lang = "ruby"
+    else:
+        best_lang = max(language_scores, key=lambda k: language_scores[k])
     best_score = language_scores[best_lang]
 
     # Need at least 3 pattern matches to be confident
@@ -811,6 +824,18 @@ def _try_detect_code(content: str) -> DetectionResult | None:
         confidence,
         {"language": best_lang, "pattern_matches": best_score},
     )
+
+
+def _ruby_structural_evidence_for_detection(content: str) -> bool:
+    """Require the Ruby parser to identify a Ruby structural node."""
+    if re.search(r"^\s*(?:class|def)\b[^\n:]*:\s*(?:#.*)?$", content, re.MULTILINE):
+        return False
+    try:
+        from .code_compressor import _ruby_structural_evidence_for_detection
+
+        return _ruby_structural_evidence_for_detection(content)
+    except Exception:
+        return False
 
 
 def is_json_array_of_dicts(content: str) -> bool:
