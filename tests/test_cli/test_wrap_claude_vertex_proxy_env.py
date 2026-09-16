@@ -66,7 +66,7 @@ def _invoke_wrap_claude(
 
     _clear_claude_mode_env(monkeypatch)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port, session_token=None: None)
     monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda _holder, _port: lambda: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *_args, **_kwargs: None)
@@ -157,7 +157,11 @@ def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
     monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
     proxy_calls: list[int] = []
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: proxy_calls.append(port))
+    monkeypatch.setattr(
+        wrap_mod,
+        "_register_proxy_client",
+        lambda port, session_token=None: proxy_calls.append(port),
+    )
 
     result = runner.invoke(
         main,
