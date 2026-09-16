@@ -2400,6 +2400,18 @@ class ContentRouter(Transform):
             # trust it over the regex heuristics.
             if detection.content_type == ContentType.SOURCE_CODE and detection.confidence >= 0.8:
                 return self._strategy_from_detection(detection)
+            # Same false-positive shape on a complete HTML document: embedded
+            # JSON (``<script type="application/ld+json">``) or ordinary body
+            # prose trips ``has_json_blocks``/``has_prose``, so a page with a
+            # clear DOCTYPE/``<html>`` root still gets routed through MIXED —
+            # split section-by-section instead of reaching the HTML extractor.
+            # The split JSON section can compress well in isolation while the
+            # surrounding markup never gets HTML-specific extraction, and the
+            # split sections lose the parent HTML type entirely. 0.7 matches
+            # the threshold ``detect_content_type`` already uses for its own
+            # internal HTML branch, not a new number.
+            if detection.content_type == ContentType.HTML and detection.confidence >= 0.7:
+                return self._strategy_from_detection(detection)
             return CompressionStrategy.MIXED
 
         # 2. Not mixed — map the detected type straight to a strategy.
