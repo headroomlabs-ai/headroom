@@ -924,6 +924,11 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Custom OpenAI API URL for passthrough endpoints (env: OPENAI_TARGET_API_URL)",
 )
 @click.option(
+    "--deepseek-api-url",
+    default=None,
+    help="Custom DeepSeek API URL for passthrough endpoints (env: DEEPSEEK_TARGET_API_URL)",
+)
+@click.option(
     "--provider-name",
     default=None,
     help=(
@@ -1099,6 +1104,7 @@ def proxy(
     anthropic_extra_headers: str | None,
     openai_extra_headers: str | None,
     openai_api_url: str | None,
+    deepseek_api_url: str | None,
     provider_name: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
@@ -1244,6 +1250,7 @@ def proxy(
     provider_api_overrides = resolve_api_overrides(
         anthropic_api_url=anthropic_api_url,
         openai_api_url=openai_api_url,
+        deepseek_api_url=deepseek_api_url,
         gemini_api_url=gemini_api_url,
         cloudcode_api_url=cloudcode_api_url,
         vertex_api_url=vertex_api_url,
@@ -1315,6 +1322,7 @@ def proxy(
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,
         openai_api_url=provider_api_overrides.openai,
+        deepseek_api_url=provider_api_overrides.deepseek,
         provider_name=provider_name,
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,

@@ -403,6 +403,18 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     return normalized
 
 
+def _is_deepseek_request(request_headers: dict[str, str], model: str | None) -> bool:
+    """Return True when a chat-completions request belongs to DeepSeek Harness.
+
+    dsh sends ``x-deepseek-harness-user-id`` on every provider request after
+    credential resolution; the ``deepseek-*`` model prefix is a fallback for
+    non-harness clients targeting DeepSeek models.
+    """
+    if _header_get(request_headers, "x-deepseek-harness-user-id") is not None:
+        return True
+    return isinstance(model, str) and model.startswith("deepseek-")
+
+
 def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     """Return the upstream path suffix for an OpenAI chat-completions request."""
 
@@ -1909,16 +1921,20 @@ class OpenAIHandlerMixin:
         """Return True when inbound headers request full passthrough."""
         return _headroom_bypass_enabled(headers)
 
-    def _resolve_openai_upstream(self, request: Request) -> str:
-        """Return the OpenAI upstream base URL for ``request``.
+    def _resolve_openai_upstream(self, request: Request, model: str | None = None) -> str:
+        """Return the upstream base URL for ``request``.
 
-        Honors the ``x-headroom-base-url`` request header so OpenAI-compatible
-        gateways (LiteLLM, CPA, self-hosted vLLM, Azure OpenAI) route through
-        the dedicated ``/v1/chat/completions`` and ``/v1/responses`` handlers,
-        not just the generic passthrough route that already honors it. Falls
-        back to the configured ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
+        Honors the explicit ``x-headroom-base-url`` request header first, then
+        routes DeepSeek Harness traffic (``x-deepseek-harness-user-id`` header,
+        or a ``deepseek-*`` model) to the configured DeepSeek upstream. Falls
+        back to the configured ``OPENAI_API_URL``.
         """
-        return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
+        base = _resolve_openai_upstream_base(request.headers)
+        if base is not None:
+            return base
+        if _is_deepseek_request(request.headers, model):
+            return self.DEEPSEEK_API_URL
+        return self.OPENAI_API_URL
 
     @staticmethod
     def _strict_previous_turn_frozen_count(
@@ -3322,7 +3338,7 @@ class OpenAIHandlerMixin:
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
-        upstream_base_url = self._resolve_openai_upstream(request)
+        upstream_base_url = self._resolve_openai_upstream(request, model=model)
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
             model,
@@ -4890,7 +4906,7 @@ class OpenAIHandlerMixin:
 
         # Direct OpenAI API (no backend configured)
         url = build_copilot_upstream_url(
-            upstream_base_url or self.OPENAI_API_URL,
+            self._resolve_openai_upstream(request, model=model),
             handler_path,
         )
         url = _append_request_query(url, request.url.query)

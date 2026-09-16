@@ -756,6 +756,22 @@ class TestOpenAIURLNormalization:
         finally:
             HeadroomProxy.OPENAI_API_URL = original
 
+    def test_deepseek_v1_suffix_stripped(self):
+        from headroom.proxy.server import HeadroomProxy, ProxyConfig
+
+        original = HeadroomProxy.DEEPSEEK_API_URL
+        try:
+            config = ProxyConfig(
+                deepseek_api_url="http://localhost:4000/v1",
+                optimize=False,
+                cache_enabled=False,
+                rate_limit_enabled=False,
+            )
+            proxy = HeadroomProxy(config)
+            assert proxy.DEEPSEEK_API_URL == "http://localhost:4000"
+        finally:
+            HeadroomProxy.DEEPSEEK_API_URL = original
+
 
 # =============================================================================
 # Bedrock API Key Forwarding Regression (#105)
