@@ -1784,6 +1784,35 @@ async def test_ws_recognized_client_with_real_path_is_not_restamped():
 
 
 @pytest.mark.asyncio
+async def test_ws_pi_codex_responses_alias_is_stamped():
+    """The Pi-compatible Codex alias gets the same client stamp as /v1/responses."""
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    connect_calls: list[tuple[tuple, dict]] = []
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream, connect_calls=connect_calls)
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame()],
+        headers={
+            "authorization": "Bearer test",
+            "user-agent": "pi/0.11.11 (darwin 25.5.0; arm64)",
+        },
+    )
+    client_ws.url = SimpleNamespace(path="/v1/codex/responses")
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(connect_calls) == 1
+    forwarded_headers = connect_calls[0][1]["additional_headers"]
+    assert forwarded_headers["x-client"] == "codex"
+    assert handler.ws_sessions.active_count() == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("store", [True, False])
 @pytest.mark.parametrize(
     "include",
