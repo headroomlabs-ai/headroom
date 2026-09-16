@@ -33,6 +33,27 @@ class TestOpenAITokenCounting:
         count = openai_tokenizer.count_text(text)
         assert count > openai_tokenizer.count_text("before  after")
 
+    def test_count_text_caches_large_strings(self):
+        """count_text memoizes large strings so a stable prefix / repeated tool
+        result is not re-encoded on every turn (the counter is a per-model
+        singleton). Cached counts must equal the uncached count, and tiny
+        strings must stay below the admission floor."""
+        from headroom.providers.openai import OpenAITokenCounter
+
+        counter = OpenAITokenCounter("gpt-4o")
+        large = "lorem ipsum dolor sit amet consectetur adipiscing elit " * 8  # > 256 chars
+        assert len(large) >= 256
+
+        direct = counter._count_text_uncached(large)
+        assert counter._count_cache.get(large) is None  # cold before first count
+        assert counter.count_text(large) == direct  # value-identical to uncached
+        assert counter._count_cache.get(large) == direct  # now memoized
+
+        # A short string encodes in microseconds and stays below the floor, so
+        # it never evicts the large entries the cache exists for.
+        counter.count_text("hi there")
+        assert counter._count_cache.get("hi there") is None
+
     def test_count_messages_single(self, openai_tokenizer):
         messages = [{"role": "user", "content": "Hello"}]
         count = openai_tokenizer.count_messages(messages)
