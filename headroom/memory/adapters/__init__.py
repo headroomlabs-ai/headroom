@@ -11,6 +11,9 @@ This module provides concrete implementations of the memory system's ports:
 - LocalEmbedder: sentence-transformers embedding (local, optional)
 - OpenAIEmbedder: OpenAI API embedding (cloud, optional)
 - OllamaEmbedder: Ollama API embedding (local server, optional)
+- RemoteEmbedder: Embedder backed by the embedding server sidecar
+- RemoteVectorIndex: VectorIndex backed by the embedding server sidecar
+- EmbeddingServerWatchdog: Sidecar process manager with restart logic
 
 Note: Some adapters require optional dependencies. Import errors are
 deferred until the adapter is actually used.
@@ -20,8 +23,17 @@ deferred until the adapter is actually used.
 from headroom.memory.adapters.cache import LRUMemoryCache
 from headroom.memory.adapters.fts5 import FTS5TextIndex
 from headroom.memory.adapters.graph import InMemoryGraphStore
+
+# Embedding server sidecar adapters (stdlib-only dependencies)
+from headroom.memory.adapters.remote import (
+    EmbeddingServerUnavailable,
+    RemoteEmbedder,
+    RemoteVectorIndex,
+    _EmbeddingServerConnection,
+)
 from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+from headroom.memory.adapters.watchdog import EmbeddingServerWatchdog
 
 # Check for optional dependencies availability
 # Note: We don't import from hnsw.py here because hnswlib may crash with
@@ -106,6 +118,12 @@ __all__ = [
     "LRUMemoryCache",
     "SQLiteGraphStore",
     "SQLiteMemoryStore",
+    # Embedding server sidecar adapters
+    "EmbeddingServerUnavailable",
+    "EmbeddingServerWatchdog",
+    "RemoteEmbedder",
+    "RemoteVectorIndex",
+    "_EmbeddingServerConnection",
     # Optional adapters (lazy-loaded)
     "HNSWVectorIndex",
     "SQLiteVectorIndex",
