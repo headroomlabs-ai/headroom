@@ -1305,15 +1305,6 @@ your responses, not to drive new actions."""
                 f"or ignore if these are distinct facts."
             )
 
-        logger.info(
-            "event=memory_save user=%s scope=%s agent=%s provider=%s similar=%d",
-            effective_user_id,
-            scope.display_name if scope else "<legacy>",
-            self.agent_type,
-            provider,
-            len(similar_memories),
-        )
-
         return json.dumps(result)
 
     async def _execute_search(
@@ -1408,10 +1399,6 @@ your responses, not to drive new actions."""
                 new_content=new_content,
                 reason=f"Updated by {self.agent_type} via {provider}: {reason or 'no reason'}",
                 user_id=effective_user_id,
-            )
-            logger.info(
-                f"Memory: Updated {memory_id} by {self.agent_type} "
-                f"(provider={provider}, reason={reason})"
             )
             return json.dumps({"status": "updated", "memory_id": memory.id})
         else:

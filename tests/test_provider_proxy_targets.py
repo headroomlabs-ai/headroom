@@ -78,3 +78,18 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+
+
+def test_select_passthrough_base_url_factory_mode_wins_over_auth_modes() -> None:
+    proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
+    proxy.config = type("Config", (), {"factory_api_url": "https://api.factory.ai/"})()
+
+    # In Factory Droid mode every non-LLM REST call is pinned to Factory,
+    # ahead of the header-derived auth modes, with the trailing slash trimmed.
+    assert select_passthrough_base_url(proxy, {}) == "https://api.factory.ai"
+    assert (
+        select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == "https://api.factory.ai"
+    )
+    assert (
+        select_passthrough_base_url(proxy, {"chatgpt-account-id": "a"}) == "https://api.factory.ai"
+    )

@@ -1347,3 +1347,324 @@ def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:
 
     assert response.status_code == 200
     assert fake_http_client.bodies[0]["model"] == "claude-opus-4-8"
+
+
+def _factory_app(factory_api_url: str = "https://api.factory.ai") -> Any:
+    return create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url="https://api.anthropic.test",
+            openai_api_url="https://api.openai.test",
+            factory_api_url=factory_api_url,
+        )
+    )
+
+
+def test_factory_inference_route_compresses_and_forwards_to_factory(monkeypatch) -> None:
+    seen: list[tuple[str, str | None, str]] = []
+
+    async def fake_anthropic_messages(
+        self,
+        request,
+        upstream_base_url=None,
+        provider_name="anthropic",
+        model_override=None,
+        force_stream=False,
+    ):  # type: ignore[no-untyped-def]
+        seen.append((request.url.path, upstream_base_url, provider_name))
+        return JSONResponse({"provider": provider_name, "upstream_base_url": upstream_base_url})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake_anthropic_messages)
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/a/v1/messages",
+            headers={"authorization": "Bearer fk-test"},
+            json={"model": "minimax-m3", "max_tokens": 16, "messages": []},
+        ).json()
+
+    # Every Droid model flows through the one Anthropic-shaped endpoint, so it
+    # reuses the anthropic pipeline (compression) and forwards to Factory.
+    assert payload == {"provider": "factory", "upstream_base_url": "https://api.factory.ai"}
+    assert seen == [("/api/llm/a/v1/messages", "https://api.factory.ai", "factory")]
+
+
+def test_factory_inference_route_absent_without_factory_upstream(monkeypatch) -> None:
+    async def fake_anthropic_messages(self, request, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_anthropic_messages"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_anthropic_messages", fake_anthropic_messages)
+
+    # The default app has no factory_api_url, so the Droid route is not mounted;
+    # the catch-all passthrough handles it instead (not the anthropic handler).
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_passthrough", "base_url": base_url})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        payload = client.post(
+            "/api/llm/a/v1/messages",
+            json={"model": "minimax-m3", "max_tokens": 16, "messages": []},
+        ).json()
+
+    assert payload["handler"] == "handle_passthrough"
+
+
+def test_factory_openai_chat_route_compresses_and_forwards_to_factory(monkeypatch) -> None:
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_openai_chat(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append((request.url.path, kwargs))
+        return JSONResponse({"handler": "handle_openai_chat"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_openai_chat)
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/chat/completions",
+            headers={"authorization": "Bearer fk-test"},
+            json={"model": "kimi-k2", "messages": []},
+        ).json()
+
+    assert payload == {"handler": "handle_openai_chat"}
+    assert seen == [
+        (
+            "/api/llm/o/v1/chat/completions",
+            {
+                "trusted_upstream_base_url": "https://api.factory.ai",
+                "trusted_original_path": "/api/llm/o/v1/chat/completions",
+                "trusted_provider_name": "factory",
+            },
+        )
+    ]
+
+
+def test_factory_openai_chat_route_ignores_spoofed_routing_headers(monkeypatch) -> None:
+    # Regression: a client must not be able to override Factory routing by
+    # sending its own x-headroom-* headers. The route now replaces (not
+    # appends) them, and handle_openai_chat resolves the upstream via
+    # `request.headers.get(...)`, which returns the FIRST duplicate, so a
+    # leftover spoofed value would win. Assert the injected Factory base/path
+    # are authoritative and the spoofed values are gone entirely.
+    seen: list[tuple[str, str | None, dict[str, object]]] = []
+
+    async def fake_openai_chat(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(
+            (
+                request.url.path,
+                request.headers.get("x-headroom-base-url"),
+                kwargs,
+            )
+        )
+        return JSONResponse({"handler": "handle_openai_chat"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_openai_chat)
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/chat/completions",
+            headers={
+                "authorization": "Bearer fk-test",
+                "x-headroom-base-url": "https://evil.example",
+                "x-headroom-original-path": "/evil/chat/completions",
+            },
+            json={"model": "kimi-k2", "messages": []},
+        ).json()
+
+    assert payload == {"handler": "handle_openai_chat"}
+    assert seen == [
+        (
+            "/api/llm/o/v1/chat/completions",
+            "https://evil.example",
+            {
+                "trusted_upstream_base_url": "https://api.factory.ai",
+                "trusted_original_path": "/api/llm/o/v1/chat/completions",
+                "trusted_provider_name": "factory",
+            },
+        )
+    ]
+
+
+def test_factory_openai_chat_route_passes_private_upstream_as_trusted_state(
+    monkeypatch,
+) -> None:
+    seen: list[tuple[str, str | None, dict[str, object]]] = []
+
+    async def fake_openai_chat(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(
+            (
+                request.url.path,
+                request.headers.get("x-headroom-base-url"),
+                kwargs,
+            )
+        )
+        return JSONResponse({"handler": "handle_openai_chat"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_openai_chat)
+
+    with TestClient(_factory_app("http://127.0.0.1:9999/private")) as client:
+        response = client.post(
+            "/api/llm/o/v1/chat/completions",
+            headers={"x-headroom-base-url": "https://evil.example"},
+            json={"model": "kimi-k2", "messages": []},
+        )
+
+    assert response.status_code == 200
+    assert seen == [
+        (
+            "/api/llm/o/v1/chat/completions",
+            "https://evil.example",
+            {
+                "trusted_upstream_base_url": "http://127.0.0.1:9999/private",
+                "trusted_original_path": "/api/llm/o/v1/chat/completions",
+                "trusted_provider_name": "factory",
+            },
+        )
+    ]
+
+
+def test_factory_openai_chat_route_uses_private_configured_upstream() -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    class _Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            calls.append((str(request.url), request.headers.get("authorization")))
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "model": "kimi-k2",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            )
+
+    with TestClient(_factory_app("http://127.0.0.1:9999/private")) as client:
+        transport = _Transport()
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=transport)
+        client.app.state.proxy.http_client_h1 = httpx.AsyncClient(transport=transport)
+        response = client.post(
+            "/api/llm/o/v1/chat/completions",
+            headers={
+                "authorization": "Bearer fk-test",
+                "x-headroom-base-url": "https://evil.example",
+            },
+            json={"model": "kimi-k2", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200, response.text
+    assert calls == [
+        (
+            "http://127.0.0.1:9999/private/api/llm/o/v1/chat/completions",
+            "Bearer fk-test",
+        )
+    ]
+
+
+def test_factory_openai_chat_route_absent_without_factory_upstream(monkeypatch) -> None:
+    async def fake_openai_chat(self, request):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_openai_chat"})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_openai_chat", fake_openai_chat)
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_passthrough", "base_url": base_url})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/chat/completions",
+            json={"model": "kimi-k2", "messages": []},
+        ).json()
+
+    assert payload["handler"] == "handle_passthrough"
+
+
+def test_factory_openai_responses_route_uses_trusted_factory_state(monkeypatch) -> None:
+    seen: list[tuple[str, str | None, dict[str, object]]] = []
+
+    async def fake_openai_responses(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        seen.append(
+            (
+                request.url.path,
+                request.headers.get("x-headroom-base-url"),
+                kwargs,
+            )
+        )
+        return JSONResponse({"handler": "handle_openai_responses"})
+
+    monkeypatch.setattr(
+        HeadroomProxy,
+        "handle_openai_responses",
+        fake_openai_responses,
+    )
+
+    with TestClient(_factory_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/responses?trace=test",
+            headers={
+                "authorization": "Bearer fk-test",
+                "x-headroom-base-url": "https://evil.example",
+            },
+            json={"model": "gpt-5.6-luna", "input": "hello"},
+        ).json()
+
+    assert payload == {"handler": "handle_openai_responses"}
+    assert seen == [
+        (
+            "/api/llm/o/v1/responses",
+            "https://evil.example",
+            {
+                "trusted_upstream_base_url": "https://api.factory.ai",
+                "trusted_original_path": "/api/llm/o/v1/responses",
+                "trusted_provider_name": "factory",
+            },
+        )
+    ]
+
+
+def test_factory_openai_responses_route_absent_without_factory_upstream(
+    monkeypatch,
+) -> None:
+    async def fake_openai_responses(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_openai_responses"})
+
+    async def fake_passthrough(
+        self,
+        request,
+        base_url,
+        sub_path="",
+        provider_name="",
+    ):  # type: ignore[no-untyped-def]
+        return JSONResponse({"handler": "handle_passthrough"})
+
+    monkeypatch.setattr(
+        HeadroomProxy,
+        "handle_openai_responses",
+        fake_openai_responses,
+    )
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        payload = client.post(
+            "/api/llm/o/v1/responses",
+            json={"model": "gpt-5.6-luna", "input": "hello"},
+        ).json()
+
+    assert payload == {"handler": "handle_passthrough"}
