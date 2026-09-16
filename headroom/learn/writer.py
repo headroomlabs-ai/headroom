@@ -386,7 +386,14 @@ class CodexWriter(ContextWriter):
 
 
 class GeminiWriter(ContextWriter):
-    """Writes learned patterns to GEMINI.md for Gemini CLI."""
+    """Writes learned patterns to GEMINI.md or context target for Gemini CLI & Antigravity."""
+
+    def __init__(self, context_target: str | None = None) -> None:
+        self._context_target = context_target
+
+    def set_context_target(self, context_target: str | None) -> None:
+        """Override where CONTEXT_FILE recommendations are written."""
+        self._context_target = context_target
 
     def write(
         self,
@@ -400,12 +407,17 @@ class GeminiWriter(ContextWriter):
         if not recommendations:
             return result
 
-        gemini_md = project.context_file or (project.project_path / "GEMINI.md")
-        full_content = _merge_into_file(gemini_md, recommendations)
-        result.add(gemini_md, full_content)
+        if self._context_target is not None:
+            target = Path(self._context_target).expanduser()
+            target_path = target if target.is_absolute() else project.project_path / target
+        else:
+            target_path = project.context_file or (project.project_path / "GEMINI.md")
+
+        full_content = _merge_into_file(target_path, recommendations)
+        result.add(target_path, full_content)
         if not dry_run:
-            gemini_md.parent.mkdir(parents=True, exist_ok=True)
-            gemini_md.write_text(full_content, encoding="utf-8")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(full_content, encoding="utf-8")
 
         return result
 
