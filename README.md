@@ -371,7 +371,7 @@ reduction, and blocks under `min_input_words` come back byte-identical.
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types. It keeps error items, values outside the normal statistical range, and first/last boundaries, selected from field-variance statistics rather than a keyword list.
-- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++ and Perl.
+- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, C#, PHP.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction through a trained ML router.
 - **CacheAligner** — flags volatile content that would bust a provider KV-cache prefix; never rewrites prompts.
