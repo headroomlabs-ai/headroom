@@ -1315,6 +1315,10 @@ def build_copilot_upstream_url(base_url: str, path: str) -> str:
             normalized_path = normalized_path[3:]
     else:
         reset_request_routed_to_copilot()
+    # Avoid a duplicate /v1 for custom upstreams that already include it
+    # (for example, https://host/api/v1 plus /v1/responses).
+    if normalized_base.endswith("/v1") and normalized_path.startswith("/v1/"):
+        normalized_path = normalized_path[3:]
     return f"{normalized_base}{normalized_path}"
 
 
