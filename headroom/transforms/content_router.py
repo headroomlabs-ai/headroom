@@ -3405,22 +3405,20 @@ class ContentRouter(Transform):
         # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
         # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
         # stable, and a strict no-op when the block has no embedded JSON.
-        if _allow_embedded:
-            from headroom.transforms.recursive_json import route_embedded_json
-
-            def _dispatch_span(span: str) -> str | None:
-                strat = self._strategy_from_detection_type(_detect_content(span).content_type)
-                text, _t, _c = self._apply_strategy_to_content(
-                    span,
-                    strat,
-                    context,
-                    question=question,
-                    bias=bias,
-                    _allow_embedded=False,
-                )
-                return text if text != span else None
-
-            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+        #
+        # HTML blocks are the one exception (#3609): whole-document extraction
+        # routinely beats a local JSON minify by orders of magnitude (the report
+        # measured a 2% splice win pre-empting a 95% extraction), so the splice
+        # must not short-circuit the parent strategy. Defer it: run the HTML
+        # dispatch below first and compute the splice in the passthrough
+        # fallback only when extraction found nothing. Lossless mode never
+        # reaches that dispatch, so it keeps the immediate-return behavior
+        # (JSON minification is itself byte-lossless).
+        _defer_embedded_for_html = (
+            _allow_embedded and strategy is CompressionStrategy.HTML and not self.config.lossless
+        )
+        if _allow_embedded and not _defer_embedded_for_html:
+            routed = self._embedded_json_route(content, context, question, bias)
             if routed is not None:
                 return routed, _estimate_tokens(routed), ["embedded_json"]
 
@@ -3720,9 +3718,15 @@ class ContentRouter(Transform):
                         # ``result.extracted is None`` path (chain
                         # ``[html, passthrough]``). A real extraction is
                         # byte-identical to the historical ``result.extracted``.
+                        # An EMPTY extraction (trafilatura found no article text)
+                        # collapses to None too: a blank page is "nothing
+                        # extracts", and returning "" here would discard the
+                        # whole block instead of falling through (#3609).
                         output = self._registry_compress("html", strategy, content, context, bias)
                         compressed = (
-                            output.content if output is not None and output.compressed else None
+                            output.content
+                            if output is not None and output.compressed and output.content.strip()
+                            else None
                         )
                         # Estimate tokens from extracted text (simple word count)
                         compressed_tokens = _estimate_tokens(compressed) if compressed else 0
@@ -3935,6 +3939,16 @@ class ContentRouter(Transform):
             )
             return compressed, compressed_tokens, strategy_chain
 
+        # #3609: deferred embedded-JSON splice. The HTML strategy ran above and
+        # extracted nothing (``compressed`` is still None), so the local JSON
+        # win — held back at the top to give whole-document extraction first
+        # refusal — is now the best available outcome.
+        if _defer_embedded_for_html:
+            routed = self._embedded_json_route(content, context, question, bias)
+            if routed is not None:
+                strategy_chain.append("embedded_json")
+                return routed, _estimate_tokens(routed), strategy_chain
+
         # Fallback: return unchanged
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
         if logger.isEnabledFor(logging.DEBUG):
@@ -3958,6 +3972,32 @@ class ContentRouter(Transform):
                 error=error,
             )
         return content, original_tokens, strategy_chain
+
+    def _embedded_json_route(
+        self, content: str, context: str, question: str | None, bias: float
+    ) -> str | None:
+        """Route embedded JSON spans inside ``content`` through the JSON compressors.
+
+        Extracted from the ``_apply_strategy_to_content`` pre-pass so the HTML
+        strategy can defer the splice (#3609) and retry it in the passthrough
+        fallback. Returns the spliced block, or ``None`` when nothing
+        safe/smaller applied.
+        """
+        from headroom.transforms.recursive_json import route_embedded_json
+
+        def _dispatch_span(span: str) -> str | None:
+            strat = self._strategy_from_detection_type(_detect_content(span).content_type)
+            text, _t, _c = self._apply_strategy_to_content(
+                span,
+                strat,
+                context,
+                question=question,
+                bias=bias,
+                _allow_embedded=False,
+            )
+            return text if text != span else None
+
+        return route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
 
     def _try_ml_compressor(
         self,
