@@ -57,14 +57,18 @@ Examples:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
+
+if TYPE_CHECKING:
+    from .config import MessageDecision
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,14 @@ class CompressConfig:
     savings_profile: str | None = None
     """Named high-savings profile, e.g. 'agent-90' for Codex/Claude/Cursor."""
 
+    diagnostics: bool = False
+    """Collect per-message compression decisions.  Also enabled by the
+    ``HEADROOM_DIAGNOSTICS=1`` environment variable.  When True, the returned
+    :class:`CompressResult` carries a ``diagnostics`` list of
+    :class:`~headroom.config.MessageDecision` objects — one per message —
+    describing which action was taken (compressed, protected, skipped …) and
+    how many tokens were spent before/after."""
+
 
 @dataclass
 class CompressResult:
@@ -166,6 +178,7 @@ class CompressResult:
     tokens_saved: int = 0
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
+    diagnostics: list[MessageDecision] | None = None
 
 
 def compress(
@@ -224,6 +237,8 @@ def compress(
     if cfg.savings_profile:
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
+    collect_diagnostics = cfg.diagnostics or os.environ.get("HEADROOM_DIAGNOSTICS", "") == "1"
+
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
@@ -266,6 +281,7 @@ def compress(
             min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
             frozen_message_count=cfg.frozen_message_count,
+            collect_diagnostics=collect_diagnostics,
         )
 
         tokens_before = result.tokens_before
@@ -344,6 +360,7 @@ def compress(
             tokens_saved=tokens_saved,
             compression_ratio=ratio,
             transforms_applied=result.transforms_applied,
+            diagnostics=result.message_decisions if collect_diagnostics else None,
         )
 
     except Exception as e:

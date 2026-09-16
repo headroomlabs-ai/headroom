@@ -876,6 +876,22 @@ class CachePrefixMetrics:
 
 
 @dataclass
+class MessageDecision:
+    """Per-message compression decision recorded in diagnostics mode.
+
+    Collected by ContentRouter when ``collect_diagnostics=True`` is passed
+    as a kwarg (set automatically when ``CompressConfig.diagnostics`` is True
+    or ``HEADROOM_DIAGNOSTICS=1`` is set in the environment).
+    """
+
+    message_index: int
+    role: str
+    tokens_before: int
+    tokens_after: int
+    action: str
+
+
+@dataclass
 class TransformResult:
     """Output of a transform operation."""
 
@@ -889,6 +905,7 @@ class TransformResult:
     cache_metrics: CachePrefixMetrics | None = None  # Populated by CacheAligner
     timing: dict[str, float] = field(default_factory=dict)  # transform_name → ms
     waste_signals: WasteSignals | None = None  # Detected waste in original messages
+    message_decisions: list[MessageDecision] = field(default_factory=list)
 
     @property
     def transforms_summary(self) -> dict[str, int]:
