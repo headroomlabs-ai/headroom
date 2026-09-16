@@ -54,6 +54,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
+    // The ~261 MB Kompress ONNX session must never build on the request
+    // path: dispatch answers NoOp until the model is ready. Warm it in
+    // the background at startup so steady-state traffic meets a settled
+    // slot; a byte-pipe proxy (--compression off) never loads a model.
+    if config.compression {
+        if let Err(e) = std::thread::Builder::new()
+            .name("live-zone-warmup".into())
+            .spawn(|| {
+                let ready = headroom_core::transforms::live_zone::warm_live_zone_compressors();
+                tracing::info!(event = "live_zone_warmup_complete", kompress_ready = ready);
+            })
+        {
+            // Non-fatal: the dispatcher's lazy path still initializes
+            // off-request; only the eager warmup is lost.
+            tracing::warn!(event = "live_zone_warmup_spawn_failed", error = %e);
+        }
+    }
+
     let mut state = AppState::new(config.clone())?;
 
     // PR-D1: resolve AWS credentials at startup via the `aws-config`
