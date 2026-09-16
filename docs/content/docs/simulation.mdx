@@ -7,7 +7,7 @@ Simulation mode lets you preview what Headroom would do to your messages without
 
 ## Basic Usage
 
-<Tabs groupId="lang" items={['TypeScript', 'Python']}>
+<Tabs groupId="lang" items={['TypeScript', 'Python', 'Go']}>
 <Tab value="TypeScript">
 ```ts twoslash
 import { compress } from 'headroom-ai';
@@ -31,6 +31,24 @@ print(f"Tokens before: {plan.tokens_before}")
 print(f"Tokens after: {plan.tokens_after}")
 print(f"Would save: {plan.tokens_saved} tokens ({plan.tokens_saved/plan.tokens_before*100:.1f}%)")
 print(f"Transforms: {plan.transforms}")
+```
+</Tab>
+<Tab value="Go">
+```go
+import "github.com/headroomlabs-ai/headroom/sdk/golang"
+
+// Simulate accepts any-format []any input. Pass []headroom.Message via
+// headroom.MessagesAsAny if you have a typed slice — or build []any directly.
+sim, err := headroom.Simulate(ctx, messages, headroom.SimulateOptions{
+    Model:  "gpt-4o",
+    Client: client,
+})
+if err != nil { panic(err) }
+
+fmt.Printf("Tokens before: %d\n", sim.TokensBefore)
+fmt.Printf("Tokens after:  %d\n", sim.TokensAfter)
+fmt.Printf("Would save:    %d tokens (%s)\n", sim.TokensSaved, sim.EstimatedSavings)
+fmt.Printf("Transforms:    %v\n", sim.Transforms)
 ```
 </Tab>
 </Tabs>
