@@ -1,6 +1,6 @@
 """Background subscription window tracker for Anthropic OAuth accounts.
 
-Polls GET https://api.anthropic.com/api/oauth/usage on a configurable interval
+Polls the provider-owned Anthropic OAuth usage endpoint on a configurable interval
 while there has been at least one active OAuth session within the last minute.
 Falls back to a stored token from ~/.claude/.credentials.json when no live
 request has come through the proxy recently.
