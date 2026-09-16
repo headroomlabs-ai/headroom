@@ -156,6 +156,73 @@ def provider_key_source(provider_type: str) -> str:
     return "ANTHROPIC_API_KEY" if provider_type == "anthropic" else "OPENAI_API_KEY"
 
 
+COPILOT_NATIVE_API_URL_ENV = "COPILOT_API_URL"
+
+# Any survivor keeps Copilot in its single-model BYOK lane, defeating native
+# model routing while making the launch look superficially successful.
+COPILOT_BYOK_ENV_VARS: tuple[str, ...] = (
+    "COPILOT_PROVIDER_BASE_URL",
+    "COPILOT_PROVIDER_TYPE",
+    "COPILOT_PROVIDER_API_KEY",
+    "COPILOT_PROVIDER_BEARER_TOKEN",
+    "COPILOT_PROVIDER_WIRE_API",
+    "COPILOT_PROVIDER_TRANSPORT",
+    "COPILOT_PROVIDER_AZURE_API_VERSION",
+    "COPILOT_PROVIDER_MODEL_ID",
+    "COPILOT_PROVIDER_WIRE_MODEL",
+    "COPILOT_PROVIDER_MODEL_LIMITS_ID",
+    "COPILOT_PROVIDER_MAX_PROMPT_TOKENS",
+    "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS",
+    "COPILOT_PROVIDER_HEADERS",
+)
+
+
+def build_native_launch_env(
+    *,
+    port: int,
+    environ: Mapping[str, str] | None = None,
+    project: str | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Redirect Copilot's native API surface through Headroom, not BYOK."""
+    env = dict(environ if environ is not None else os.environ)
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
+    env[COPILOT_NATIVE_API_URL_ENV] = base_url
+    for variable in COPILOT_BYOK_ENV_VARS:
+        env.pop(variable, None)
+    return env, [
+        f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
+        "COPILOT_AUTH_MODE=github-native",
+    ]
+
+
+def native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    """Best-effort tri-state probe for the CLI's native API URL override."""
+    env = environ if environ is not None else os.environ
+    local = env.get("LOCALAPPDATA") or env.get("HOME") or os.path.expanduser("~")
+    roots = (
+        os.path.join(local, "copilot", "pkg"),
+        os.path.join(os.path.expanduser("~"), ".local", "share", "copilot", "pkg"),
+    )
+    found_bundle = False
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if "app.js" not in filenames:
+                continue
+            found_bundle = True
+            try:
+                with open(
+                    os.path.join(dirpath, "app.js"), encoding="utf-8", errors="replace"
+                ) as bundle:
+                    while chunk := bundle.read(1 << 20):
+                        if COPILOT_NATIVE_API_URL_ENV in chunk:
+                            return True
+            except OSError:
+                continue
+    return False if found_bundle else None
+
+
 def build_launch_env(
     *,
     port: int,

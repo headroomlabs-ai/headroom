@@ -143,3 +143,49 @@ async def test_standard_params_still_forwarded() -> None:
     assert kwargs["top_p"] == 0.9
     assert kwargs["response_format"] == {"type": "json_object"}
     assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_params_forwarded_top_level_not_extra_body() -> None:
+    # reasoning_effort / max_completion_tokens are litellm-mapped params: they
+    # must go as top-level kwargs (litellm maps reasoning_effort -> Anthropic
+    # thinking), NOT swept into extra_body, which a Claude target 400s. Regression
+    # for the OpenAI-in -> Claude-out cross-protocol reasoning path.
+    backend = make_backend()
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = make_response()
+
+        await backend.send_openai_message(
+            request_body(reasoning_effort="low", max_completion_tokens=256),
+            {},
+        )
+
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["reasoning_effort"] == "low"
+    assert kwargs["max_completion_tokens"] == 256
+    # Must NOT leak into extra_body (which would reach a non-OpenAI provider raw).
+    assert "reasoning_effort" not in kwargs.get("extra_body", {})
+    assert "max_completion_tokens" not in kwargs.get("extra_body", {})
+    assert "extra_body" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_reasoning_params_forwarded_top_level_streaming() -> None:
+    backend = make_backend()
+    stream = FakeAsyncStream(
+        [SimpleNamespace(model_dump=lambda **kwargs: {"id": "c1", "choices": []})]
+    )
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = stream
+        _ = [
+            c
+            async for c in backend.stream_openai_message(
+                request_body(reasoning_effort="high"),
+                {},
+            )
+        ]
+
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in kwargs.get("extra_body", {})

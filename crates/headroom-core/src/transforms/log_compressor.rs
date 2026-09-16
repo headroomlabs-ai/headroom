@@ -1776,8 +1776,10 @@ mod tests {
         // With collapse disabled, the old head-truncation loses the
         // `Caused by:` head buried past max_lines; with it enabled, kept.
         let content = java_chained_trace(30);
-        let mut cfg = LogCompressorConfig::default();
-        cfg.collapse_runtime_frames = false;
+        let cfg = LogCompressorConfig {
+            collapse_runtime_frames: false,
+            ..Default::default()
+        };
         let (result_off, _) = LogCompressor::new(cfg).compress(&content, 1.0);
         assert!(!result_off.compressed.contains("com.example.Disk.read"));
         let (result_on, _) = cmp().compress(&content, 1.0);

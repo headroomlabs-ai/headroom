@@ -224,6 +224,15 @@ class CCRToolInjector:
             # redeem (silent data loss, #1006). Match the load-bearing
             # "Retrieve original: hash=" phrase directly.
             re.compile(r"Retrieve original: hash=([a-f0-9]{12,24})"),
+            # CodeCompressor (and any marker that appends "Expires in Nm.]" or
+            # uses "N tokens compressed." rather than "compressed to M"):
+            # `[128 tokens compressed. ... Retrieve more: hash=xxx. Expires in
+            # 30m.]`. The bracket patterns above anchor the hash on a trailing
+            # `]`, so the hash=...`. Expires` suffix (and the missing "to M")
+            # makes them all miss it -- the same silent-data-loss failure as
+            # #1006. Match the load-bearing "Retrieve more: hash=" phrase
+            # directly, matching how parser.py / session_probes detect it.
+            re.compile(r"Retrieve more: hash=([a-f0-9]{12,24})"),
         ]
     )
 

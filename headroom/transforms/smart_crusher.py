@@ -653,11 +653,12 @@ class SmartCrusher(Transform):
         kept, lost = self._splice_missing_protected(protected, kept)
         if len(kept) != before_count:
             # Only reserialize when something was actually spliced in —
-            # an unmodified `kept` stays byte-identical to Rust's output
-            # (Python's `json.dumps` and serde_json don't necessarily
-            # agree on e.g. non-ASCII escaping).
+            # an unmodified `kept` stays byte-identical to Rust's output.
+            # ensure_ascii=False matches serde_json (which never escapes
+            # non-ASCII), so a splice doesn't turn readable unicode into
+            # model-visible \uXXXX soup.
             result = dict(result)
-            result["items"] = json.dumps(kept)
+            result["items"] = json.dumps(kept, ensure_ascii=False)
         if not lost:
             return result
 
@@ -712,7 +713,9 @@ class SmartCrusher(Transform):
             kept, lost = self._splice_missing_protected(protected, parsed)
             # Only reserialize when something was actually spliced in —
             # see the matching comment in `_apply_audit_safe_protection`.
-            candidate = json.dumps(kept) if len(kept) != len(parsed) else crushed
+            candidate = (
+                json.dumps(kept, ensure_ascii=False) if len(kept) != len(parsed) else crushed
+            )
         else:
             lost = sum(
                 max(0, len(p.findall(original_content)) - len(p.findall(crushed)))

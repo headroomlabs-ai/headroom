@@ -293,6 +293,8 @@ class TestStreamingRatelimitHeaderForwarding:
         proxy.http_client.send = AsyncMock(return_value=mock_response)
         fake_logger = MagicMock()
         monkeypatch.setattr(streaming_module, "logger", fake_logger)
+        prefix_tracker = MagicMock()
+        prefix_tracker.classify_cache_miss.return_value.is_miss = False
 
         result = await proxy._stream_response(
             url="https://api.anthropic.com/v1/messages",
@@ -312,6 +314,7 @@ class TestStreamingRatelimitHeaderForwarding:
             transforms_applied=[],
             tags={},
             optimization_latency=0.0,
+            prefix_tracker=prefix_tracker,
         )
 
         assert result.status_code == 503
@@ -323,9 +326,55 @@ class TestStreamingRatelimitHeaderForwarding:
             503,
             "https://api.anthropic.com/v1/messages",
         )
-        proxy.metrics.record_request.assert_awaited_once()
-        proxy.cost_tracker.record_tokens.assert_called_once()
+        # A 503 is an upstream failure, so it books via record_failed and stops
+        # before the savings/cost success path — otherwise a failed request
+        # inflates the save-rate (#1568).
+        proxy.metrics.record_failed.assert_awaited_once()
+        proxy.metrics.record_request.assert_not_awaited()
+        proxy.cost_tracker.record_tokens.assert_not_called()
+        prefix_tracker.classify_cache_miss.assert_not_called()
+        prefix_tracker.update_from_response.assert_not_called()
         mock_response.aclose.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_upstream_redirect_does_not_mutate_prefix_tracker(self):
+        """Upstream redirects should not change provider prefix state."""
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        mock_response.status_code = 307
+
+        mock_request = MagicMock()
+        proxy.http_client.build_request = MagicMock(return_value=mock_request)
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+        prefix_tracker = MagicMock()
+        prefix_tracker.classify_cache_miss.return_value.is_miss = False
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-redirect",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+            prefix_tracker=prefix_tracker,
+        )
+
+        async for _ in result.body_iterator:
+            pass
+
+        prefix_tracker.classify_cache_miss.assert_not_called()
+        prefix_tracker.update_from_response.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_upstream_http_error_closes_response_when_body_read_fails(self, monkeypatch):

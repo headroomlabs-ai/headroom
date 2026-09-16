@@ -60,3 +60,34 @@ def test_codex_stamp_only_for_unidentified_responses_callers() -> None:
         is False
     )
     assert should_stamp_codex_client_signals("/v1/chat/completions", AuthSignals()) is False
+
+
+def test_bearer_scheme_is_case_insensitive() -> None:
+    # RFC 7235 §2.1: the auth-scheme token is case-insensitive. A lowercase or
+    # mixed-case "bearer" carrying a PAYG key must classify as PAYG, not fall
+    # through to the non-Bearer OAUTH branch.
+    for scheme in ("bearer", "BEARER", "Bearer", "BeArEr"):
+        signals = AuthSignals(authorization=f"{scheme} sk-ant-api03-abc")
+        assert classify_auth_signals(signals) is AuthMode.PAYG, scheme
+
+
+def test_bearer_case_insensitive_preserves_oauth_and_jwt_shapes() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature"
+    assert classify_auth_signals(AuthSignals(authorization="bearer sk-ant-oat01-abc")) is (
+        AuthMode.OAUTH
+    )
+    assert classify_auth_signals(AuthSignals(authorization=f"bearer {jwt}")) is AuthMode.OAUTH
+
+
+def test_credential_case_is_not_folded() -> None:
+    # Only the scheme is case-folded; the token keeps its case, so a PAYG
+    # `sk-...` prefix still matches exactly (it is lowercase by construction).
+    signals = AuthSignals(authorization="Bearer sk-PROJ-Abc123")
+    assert classify_auth_signals(signals) is AuthMode.PAYG
+
+
+def test_non_bearer_scheme_still_oauth() -> None:
+    # AWS SigV4 (Bedrock) and any other non-Bearer scheme keep the OAUTH
+    # passthrough-prefer classification.
+    signals = AuthSignals(authorization="AWS4-HMAC-SHA256 Credential=AKIA/...")
+    assert classify_auth_signals(signals) is AuthMode.OAUTH

@@ -11,8 +11,9 @@ just makes each call cheaper.
 
 ## What you get
 
-- **Fewer input tokens** on every Claude Code request to Vertex (often 30–60% on
-  agent workloads), so you pay Vertex for less.
+- **Fewer input tokens** on every Claude Code request to Vertex — large file
+  reads, logs, and tool output are compressed before forwarding — so you pay
+  Vertex for less.
 - **Same answers** — compression is reversible and content-aware.
 - **No new secrets** — Headroom never holds your Google credentials. Claude Code
   keeps authenticating to Vertex with its own ADC token; Headroom passes it through.
@@ -34,7 +35,7 @@ No `ANTHROPIC_API_KEY` is needed — Vertex mode uses your Google login.
 ## Run it (one command)
 
 ```bash
-pip install headroom-ai
+pip install "headroom-ai[proxy]"
 headroom wrap claude
 ```
 

@@ -457,6 +457,23 @@ def _try_detect_html(content: str) -> DetectionResult | None:
     )
 
 
+def _is_search_result_line(line: str) -> bool:
+    """True when a line looks like ``path:line:content`` grep output.
+
+    The bare ``^[^\\s:]+:\\d+:`` shape also matches ISO-8601 timestamps
+    (``…T09:57:59…``) and XML-ish wrappers harnesses prepend to user turns
+    (Copilot CLI's ``<current_datetime>…`` line), which misroutes prose to
+    the SearchCompressor — and that compressor keeps only matching lines,
+    deleting the rest. So the pre-colon segment must additionally look like
+    a file path: no angle brackets and no ``=`` (rules out markup tags and
+    ``key=value:12:`` log lines).
+    """
+    if not _SEARCH_RESULT_PATTERN.match(line):
+        return False
+    prefix = line.split(":", 1)[0]
+    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+
+
 def _try_detect_search(content: str) -> DetectionResult | None:
     """Try to detect grep/ripgrep search results."""
     lines = content.split("\n")[:100]  # Check first 100 lines
@@ -465,10 +482,16 @@ def _try_detect_search(content: str) -> DetectionResult | None:
 
     matching_lines = 0
     for line in lines:
-        if line.strip() and _SEARCH_RESULT_PATTERN.match(line):
+        if line.strip() and _is_search_result_line(line):
             matching_lines += 1
 
-    if matching_lines == 0:
+    # Absolute floor: a single coincidental `word:digits:` line (a timestamp,
+    # a URL, a time literal inside prose) must not classify a whole payload as
+    # search results — the SearchCompressor drops every non-matching line, so
+    # a false positive is data loss. A genuine one-line grep result loses
+    # nothing by staying uncompressed: all of its lines match, so the
+    # compressor would have kept it verbatim anyway.
+    if matching_lines < 2:
         return None
 
     # Calculate confidence based on proportion of matching lines

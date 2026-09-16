@@ -690,6 +690,49 @@ class TestSQLiteGraphStoreEdgeCases:
         assert len(subgraph.relationships) == 0
 
     @pytest.mark.asyncio
+    async def test_one_corrupt_row_does_not_abort_a_multi_row_scan(self, tmp_path):
+        """A single unparseable row must not take down an entire query.
+
+        Regression: ``_row_to_relationship`` / ``_row_to_entity`` parsed stored
+        JSON/timestamps with no guard, so one corrupt row (partial write, manual
+        edit, bad migration) raised inside the row loop and aborted the whole
+        ``query_subgraph`` / ``get_relationships`` scan — taking unrelated,
+        perfectly good edges down with it. The corrupt row is now skipped.
+        """
+        import sqlite3
+
+        store = SQLiteGraphStore(db_path=str(tmp_path / "graph.db"))
+        a = Entity(user_id="u", name="A", entity_type="n")
+        b = Entity(user_id="u", name="B", entity_type="n")
+        c = Entity(user_id="u", name="C", entity_type="n")
+        for entity in (a, b, c):
+            await store.add_entity(entity)
+        await store.add_relationship(
+            Relationship(user_id="u", source_id=a.id, target_id=b.id, relation_type="e")
+        )
+        await store.add_relationship(
+            Relationship(user_id="u", source_id=a.id, target_id=c.id, relation_type="e")
+        )
+
+        # Corrupt the A->B relationship row's properties JSON out-of-band.
+        con = sqlite3.connect(str(store.db_path))
+        con.execute("UPDATE relationships SET properties = '{oops' WHERE target_id = ?", (b.id,))
+        con.commit()
+        con.close()
+
+        # get_relationships returns the one good edge instead of raising.
+        rels = await store.get_relationships(a.id)
+        assert len(rels) == 1
+        assert rels[0].target_id == c.id
+
+        # query_subgraph completes, skipping the corrupt edge and its node.
+        subgraph = await store.query_subgraph(
+            [a.id], max_hops=1, direction=RelationshipDirection.OUTGOING
+        )
+        assert {e.name for e in subgraph.entities} == {"A", "C"}
+        assert len(subgraph.relationships) == 1
+
+    @pytest.mark.asyncio
     async def test_entity_with_special_characters(self, store):
         """Test entity names with special characters."""
         entity = Entity(
