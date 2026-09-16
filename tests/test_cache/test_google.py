@@ -1,6 +1,6 @@
 """Tests for GoogleCacheOptimizer."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -122,6 +122,56 @@ class TestGoogleCacheOptimizer:
 
         found = optimizer.get_reusable_cache("expired123")
         assert found is None
+
+    def test_cache_registration_accepts_aware_expiry(self, optimizer):
+        """A timezone-aware ``expires_at`` must not crash lifecycle checks.
+
+        Google's ``genai.caching.CachedContent.expire_time`` is an aware
+        RFC3339 value, and the documented integration registers it directly.
+        Comparing it against a naive ``datetime.now()`` raised
+        ``TypeError: can't compare offset-naive and offset-aware datetimes``,
+        which crashed ``register_cache`` itself (it logs ``ttl_remaining_seconds``)
+        and every ``is_expired`` consumer.
+        """
+        aware_future = datetime.now(timezone.utc) + timedelta(hours=1)
+        cache_info = optimizer.register_cache(
+            cache_id="aware-cache",
+            content_hash="aware123",
+            token_count=50000,
+            expires_at=aware_future,
+        )
+        assert not cache_info.is_expired
+        assert cache_info.ttl_remaining_seconds > 0
+        assert cache_info.age_seconds >= 0
+
+        # Lookup and cleanup iterate is_expired over the registry.
+        assert optimizer.get_reusable_cache("aware123") is not None
+        assert optimizer.cleanup_expired_caches() == []
+
+    def test_cache_lookup_expired_aware(self, optimizer):
+        """An already-expired aware cache is recognized as expired, not crashed."""
+        aware_past = datetime.now(timezone.utc) - timedelta(hours=1)
+        cache_info = optimizer.register_cache(
+            cache_id="aware-expired",
+            content_hash="awareexp123",
+            token_count=50000,
+            expires_at=aware_past,
+        )
+        assert cache_info.is_expired
+        assert optimizer.get_reusable_cache("awareexp123") is None
+
+    def test_from_dict_roundtrip_preserves_aware_expiry(self):
+        """``to_dict``/``from_dict`` of an aware timestamp stays comparable."""
+        info = CachedContentInfo(
+            cache_id="rt",
+            content_hash="rt123",
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            token_count=50000,
+        )
+        restored = CachedContentInfo.from_dict(info.to_dict())
+        assert restored.is_expired is False
+        assert restored.ttl_remaining_seconds > 0
 
     def test_cache_lookup_insufficient_ttl(self, optimizer):
         """Test that caches with insufficient TTL are not returned."""
