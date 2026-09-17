@@ -165,15 +165,28 @@ you're integrating CCR outside the proxy.
 
 ## Retention
 
-Proxy CCR originals are kept for 1800 seconds (30 minutes) by default. For longer autonomous
-agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
+Proxy CCR originals are kept for 3600 seconds (60 minutes) of *inactivity* by default. The
+window is an idle timer, not a countdown from creation: every successful retrieval restarts
+it, so an entry the agent keeps using survives an arbitrarily long session. An absolute
+ceiling of 8x the idle TTL still applies, so originals never sit on disk indefinitely.
+
+For longer autonomous agent runs, set `HEADROOM_CCR_TTL_SECONDS` before starting the proxy:
 
 ```bash
 HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
 ```
 
 Check the effective setting at `/v1/retrieve/stats` under
-`store.default_ttl_seconds`.
+`store.default_ttl_seconds` (and the ceiling under
+`store.default_max_lifetime_seconds`).
+
+When retrieval misses, the error says why: `Entry expired (CCR idle TTL: ...)` means the
+entry went untouched too long (raise `HEADROOM_CCR_TTL_SECONDS`), while
+`Entry evicted for capacity` means the store hit its entry limit (raise
+`store_max_entries`). Those reasons are best-effort: the store remembers why it removed a
+hash, but not why the storage backend did. A plain `Entry not found` therefore means either
+the hash was never stored, or it was expired/evicted by a backend sweep or by an earlier
+proxy process, which leaves no reason behind.
 
 ## Message-level CCR
 

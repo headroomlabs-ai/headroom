@@ -35,7 +35,10 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
-from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.cache.compression_store import (
+    DEFAULT_CCR_TTL_SECONDS,
+    format_retrieval_miss_detail,
+)
 from headroom.telemetry import session as telemetry_session
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
@@ -193,9 +196,11 @@ def _format_session_summary(
     return "\n".join(lines)
 
 
-# Session-scoped TTL: content persists for the session (1 hour), not 5 minutes.
-# The MCP server process lives as long as the coding session.
-MCP_SESSION_TTL = 3600
+# Session-scoped TTL: an idle window (restarted on every retrieval), so
+# content the session keeps using never expires under it. The MCP server
+# process lives as long as the coding session. Kept equal to the store
+# default so proxy-compressed and MCP-compressed entries age alike (#2604).
+MCP_SESSION_TTL = DEFAULT_CCR_TTL_SECONDS
 
 # Shared stats file: all MCP instances (main + sub-agents) append here.
 # headroom_stats aggregates across all instances within the session window.
