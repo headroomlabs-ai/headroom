@@ -112,7 +112,6 @@ from openai import OpenAI
 
 messages = [{"role": "user", "content": "Analyze these results"}]
 result = compress(messages, model="gpt-4o")
-
 client = OpenAI()
 response = client.chat.completions.create(model="gpt-4o", messages=result.messages)
 print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
@@ -416,10 +415,11 @@ docker pull ghcr.io/headroomlabs-ai/headroom:latest
 ```
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
-`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain, not in
-`[all]`), `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`,
-`[pytorch-mps]` (Apple-GPU memory-embedder offload — set
-`HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python 3.10+**.
+`[memory]`, `[vector]` (optional HNSW backend — needs a C++ toolchain and, on
+distro Python, development headers; not in `[all]`), `[relevance]`, `[image]`,
+`[agno]`, `[langchain]`, `[evals]`, `[pytorch-mps]` (Apple-GPU memory-embedder
+offload — set `HEADROOM_EMBEDDER_RUNTIME=pytorch_mps`). Requires **Python
+3.10+**.
 
 > `[all]` covers the core stack but not the framework adapters. Install those
 > separately: `pip install "headroom-ai[langchain]"`, and likewise `[agno]`,
@@ -611,6 +611,116 @@ with your stack and rough monthly LLM spend.
 Everything in this repo stays open source under Apache 2.0. The managed offering
 is for teams that would rather have it deployed, supported and scaled for them.
 
+## Ignoring governed / generated files (`.headroomignore`)
+
+Some repositories generate agent-instruction files (`CLAUDE.md`, `AGENTS.md`,
+`.github/copilot-instructions.md`, `.cursorrules`, `ANTIGRAVITY.md`, ...) from
+a canonical source of truth managed by another tool — for example a
+cARL-managed repository, where durable governance/memory lives under
+`.github/carl/` and the harness files above are generated projections. If
+Headroom compresses, learns from, indexes, or mutates those projections
+directly, it can drift from the canonical source and get silently overwritten
+the next time the owning tool regenerates them.
+
+Add a `.headroomignore` file at your repository root (limited gitignore-like
+glob syntax — see below) to protect those paths from every Headroom behavior:
+
+```gitignore
+# cARL canonical runtime and governance artefacts
+.github/carl/**
+
+# cARL-generated harness projections
+.github/copilot-instructions.md
+CLAUDE.md
+AGENTS.md
+.cursorrules
+ANTIGRAVITY.md
+```
+
+This is a **limited gitignore-like** syntax, not a full gitignore/`pathspec`
+implementation:
+
+- Blank lines and `#` comments are ignored.
+- A pattern ending in `/` ignores that directory. A bare directory name (e.g.
+  `node_modules/`) matches at any depth; one containing another `/` (e.g.
+  `.github/carl/`) or a leading `/` is rooted instead.
+- A leading `/` roots the pattern at the repository root (e.g. `/CLAUDE.md`
+  matches only the top-level `CLAUDE.md`, never `nested/CLAUDE.md`).
+- A pattern containing `/` is matched relative to the repository root using
+  `fnmatch` glob semantics (`*`/`?`/`[...]`, and `**` for "any number of path
+  segments"). **Known deviation from real gitignore**: a single `*` can still
+  cross `/` boundaries, so `.github/*` also matches `.github/nested/file`,
+  not just direct children — use `.github/**` if that's what you mean.
+- A bare pattern with no `/` (e.g. `CLAUDE.md`) matches at any depth, like a
+  normal `.gitignore` entry.
+- Negation (`!pattern`, gitignore's "re-include") is **not supported**. Such
+  lines are skipped and reported via `headroom doctor` / `IgnorePolicy.warnings`
+  rather than silently matched as a literal path.
+
+For code-driven configuration, or to scope a rule to a single behavior, set
+`HeadroomConfig.ignore`:
+
+```python
+from headroom.config import HeadroomConfig, IgnoreConfig
+
+config = HeadroomConfig(
+    ignore=IgnoreConfig(
+        # Applies to every behavior (compress/learn/mutate/memory) — equivalent
+        # to a .headroomignore entry.
+        paths=[".github/carl/**"],
+        # Or scope to a single behavior:
+        mutate=[
+            ".github/copilot-instructions.md",
+            "CLAUDE.md",
+            "AGENTS.md",
+            ".cursorrules",
+            "ANTIGRAVITY.md",
+        ],
+    )
+)
+```
+
+`.headroomignore` and `HeadroomConfig.ignore` are merged — a path ignored by
+either is ignored. With neither present, nothing changes: existing behavior
+is fully backward compatible.
+
+**Where this is enforced today:**
+
+- `ignore.mutate` / `.headroomignore` — every `headroom learn` writer
+  (`CLAUDE.local.md`/`AGENTS.md`/`GEMINI.md`/`MEMORY.md`) and every
+  agent-native memory writer (`headroom memory export`) refuses to write an
+  ignored target.
+- `ignore.learn` / `.headroomignore` — `headroom learn` never treats an
+  ignored `CLAUDE.md`/`MEMORY.md` as a prior-learned-patterns baseline.
+- `ignore.memory` / `.headroomignore` — the code-graph file watcher
+  (`--code-graph`) never triggers a reindex for an ignored path and excludes
+  ignored paths from the reindex input when an allowed file triggers indexing.
+- `ignore.compress` / `.headroomignore` — the Read-lifecycle stale/superseded
+  detector (the pipeline stage that decides whether a previously-Read file's
+  content gets replaced/compressed) never replaces an ignored path's content.
+  This is the only compression-path enforcement point today: `ContentRouter`
+  otherwise compresses message content that isn't tied to a filesystem path,
+  so there's nowhere else to check a path-based rule.
+- `HeadroomConfig.ignore` is wired into the SDK compression path
+  (`TransformPipeline` → `ContentRouter`) and the proxy compression path
+  (`ProxyConfig.ignore` → `ContentRouter` / `CodeGraphWatcher`). The
+  `headroom learn` and `headroom memory export` CLIs have no config-file
+  loader today, so they only ever see `.headroomignore`; programmatic callers
+  that already hold a `HeadroomConfig` can pass it explicitly to
+  `ContextWriter.write(..., config=...)` / `AgentWriter.export(..., config=...)`
+  / `SessionAnalyzer(config=...)` to get `ignore.mutate`/`ignore.learn`
+  enforcement too.
+
+The same `headroom.ignore.IgnorePolicy` is a small, reusable API any other
+code path can call to ask "is this path ignored for X?" instead of adding ad
+hoc glob checks.
+
+Run `headroom doctor` to see which ignore rules are currently active (an
+`ignore-rules` check lists every loaded pattern, its scope, and its source).
+Note: `headroom doctor` (the CLI) only ever sees a `.headroomignore` file —
+it has no way to load a caller's in-process `HeadroomConfig.ignore`, since
+there is no on-disk config-file format today.
+
 ## Documentation
 
 | Start here | Go deeper |
@@ -646,6 +756,7 @@ Caveman, or any other MCP server, and Headroom compresses downstream of all of i
 ```bash
 git clone https://github.com/headroomlabs-ai/headroom.git && cd headroom
 uv sync --extra dev && uv run pytest
+# Add `--extra vector` if you need the optional HNSW backend/tests.
 ```
 
 Devcontainers in `.devcontainer/` (default, plus `memory-stack` with Qdrant and

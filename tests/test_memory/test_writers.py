@@ -219,6 +219,44 @@ class TestClaudeCodeWriter:
         assert "john-doe" not in rendered
         assert rendered.endswith("MEMORY.md")
 
+    def test_headroomignore_blocks_export(self, tmp_path: Path):
+        (tmp_path / ".headroomignore").write_text("MEMORY.md\n")
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+
+        result = writer.export(entries, dry_run=False)
+
+        assert not (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_blocks_export(self, tmp_path: Path):
+        """HeadroomConfig.ignore.mutate (passed to export()) blocks a real write."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["MEMORY.md"]))
+
+        result = writer.export(entries, dry_run=False, config=config)
+
+        assert not (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_ignored_without_passing_config(self, tmp_path: Path):
+        """Backward compatibility: omitting `config` behaves exactly as before."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        entries = _make_entries(3)
+        HeadroomConfig(ignore=IgnoreConfig(mutate=["MEMORY.md"]))  # never passed in
+
+        result = writer.export(entries, dry_run=False)
+
+        assert (tmp_path / "memory" / "MEMORY.md").exists()
+        assert result.warnings == []
+
 
 # =============================================================================
 # Cursor Writer Tests
@@ -263,6 +301,60 @@ class TestCursorWriter:
         assert "old stuff" not in content
         assert "Test memory entry" in content
         assert "alwaysApply: true" in content  # Preserved
+
+    def test_headroomignore_blocks_export(self, tmp_path: Path):
+        (tmp_path / ".headroomignore").write_text(".cursor/rules/**\n")
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        entries = _make_entries(3)
+
+        result = writer.export(entries, dry_run=False)
+
+        mdc_path = tmp_path / ".cursor" / "rules" / "headroom-memory.mdc"
+        assert not mdc_path.exists()
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_blocks_export(self, tmp_path: Path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        result = writer.export(
+            _make_entries(3),
+            dry_run=False,
+            config=HeadroomConfig(ignore=IgnoreConfig(mutate=[".cursor/rules/**"])),
+        )
+
+        assert not (tmp_path / ".cursor" / "rules" / "headroom-memory.mdc").exists()
+        assert any(".cursor/rules/**" in w for w in result.warnings)
+
+    def test_existing_mdc_without_markers_appends_section(self, tmp_path: Path):
+        mdc_dir = tmp_path / ".cursor" / "rules"
+        mdc_dir.mkdir(parents=True)
+        mdc_file = mdc_dir / "headroom-memory.mdc"
+        mdc_file.write_text("---\ndescription: test\nalwaysApply: true\n---\n\n# Header\n")
+
+        writer = CursorMemoryWriter(project_path=tmp_path)
+        writer.export(_make_entries(2), dry_run=False)
+
+        content = mdc_file.read_text()
+        assert "# Header" in content
+        assert MARKER_START in content
+        assert "Test memory entry" in content
+
+    def test_budget_and_dedup_stats_are_reported(self, tmp_path: Path):
+        writer = CursorMemoryWriter(project_path=tmp_path, token_budget=20)
+        entries = [
+            MemoryEntry(content="duplicate memory entry", importance=1.0),
+            MemoryEntry(content="duplicate memory entry", importance=0.5),
+            MemoryEntry(
+                content="another unique entry that exceeds the remaining budget", importance=0.9
+            ),
+        ]
+
+        result = writer.export(entries, dry_run=True)
+
+        assert result.memories_exported == 1
+        assert result.memories_skipped_dedup == 1
+        assert result.memories_skipped_budget == 1
 
 
 # =============================================================================

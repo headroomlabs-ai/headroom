@@ -9,6 +9,9 @@ from headroom.learn.writer import (
     _MARKER_END,
     _MARKER_START,
     ClaudeCodeWriter,
+    CodexWriter,
+    GeminiWriter,
+    GrokWriter,
     _merge_into_file,
     _parse_prior_recommendations,
     _read_text_tolerant,
@@ -257,6 +260,123 @@ def _legacy_block(section: str, body: str) -> str:
     )
 
 
+class TestIgnorePolicyEnforcement:
+    """Writers must not mutate paths ignored for the 'mutate' behavior (#1150)."""
+
+    def test_headroomignore_blocks_context_file_write(self, tmp_path):
+        proj = _project(tmp_path)
+        (proj.project_path / ".headroomignore").write_text("CLAUDE.local.md\n")
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = writer.write(recs, proj, dry_run=False)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert not claude_local.exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_headroomignore_blocks_memory_file_write(self, tmp_path):
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        memory_path = writer._resolve_memory_path(proj)
+        # MEMORY.md lives under data_path (outside project_path in this
+        # fixture); a bare-name rule still matches it by basename.
+        (proj.project_path / ".headroomignore").write_text("MEMORY.md\n")
+        recs = [_rec(RecommendationTarget.MEMORY_FILE, "Preference", "- Use pytest")]
+
+        result = writer.write(recs, proj, dry_run=False)
+
+        assert not memory_path.exists()
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_unrelated_file_still_written_when_ignore_present(self, tmp_path):
+        proj = _project(tmp_path)
+        (proj.project_path / ".headroomignore").write_text("AGENTS.md\n")
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = writer.write(recs, proj, dry_run=False)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert claude_local.exists()
+        assert result.warnings == []
+
+    def test_grok_writer_accepts_config_and_honors_ignore(self, tmp_path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = GrokWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["GROK.md"]))
+
+        result = writer.write(recs, proj, dry_run=False, config=config)
+
+        assert not (proj.project_path / "GROK.md").exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_blocks_context_file_write(self, tmp_path):
+        """HeadroomConfig.ignore.mutate — not just .headroomignore — is honored.
+
+        Exercises the real `ClaudeCodeWriter.write(..., config=...)` production
+        path (not just `IgnorePolicy` directly), per issue review: config-driven
+        ignore.mutate must actually stop a writer mutation.
+        """
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        config = HeadroomConfig(ignore=IgnoreConfig(mutate=["CLAUDE.local.md"]))
+
+        result = writer.write(recs, proj, dry_run=False, config=config)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert not claude_local.exists()
+        assert result.files_written == []
+        assert any("ignored for mutation" in w for w in result.warnings)
+
+    def test_config_ignore_mutate_not_applied_without_passing_config(self, tmp_path):
+        """Backward compatibility: omitting `config` behaves exactly as before."""
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        # A HeadroomConfig with a matching ignore.mutate rule exists, but the
+        # caller doesn't pass it in — matches today's `headroom learn` CLI,
+        # which has no config-file loader.
+        HeadroomConfig(ignore=IgnoreConfig(mutate=["CLAUDE.local.md"]))
+
+        result = writer.write(recs, proj, dry_run=False)
+
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert claude_local.exists()
+        assert result.warnings == []
+
+    def test_protected_legacy_claude_md_is_not_mutated_during_migration(self, tmp_path):
+        proj = _project(tmp_path)
+        claude_md = proj.project_path / "CLAUDE.md"
+        original = _legacy_block("Build Commands", "- cargo check from src-tauri/")
+        claude_md.write_text(original)
+        (proj.project_path / ".headroomignore").write_text("CLAUDE.md\n")
+
+        writer = ClaudeCodeWriter()
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        result = writer.write(recs, proj, dry_run=False)
+
+        assert claude_md.read_text() == original
+        claude_local = proj.project_path / "CLAUDE.local.md"
+        assert claude_local.exists()
+        local_content = claude_local.read_text()
+        assert "### Environment" in local_content
+        assert "Use uv" in local_content
+        assert "Build Commands" not in local_content
+        assert any("ignored for mutation" in w for w in result.warnings)
+        assert any("legacy migration" in w for w in result.warnings)
+
+
 class TestContextTargetOverride:
     """--target / set_context_target controls where CONTEXT_FILE recs are written."""
 
@@ -438,6 +558,81 @@ class TestHomeDirectoryContext:
         assert global_md.exists()
         assert "Use uv" in global_md.read_text()
         assert not (fake_home / "CLAUDE.local.md").exists()
+
+
+class TestCodexWriter:
+    def test_write_uses_project_overrides_for_both_targets(self, tmp_path):
+        proj = _project(tmp_path)
+        proj.context_file = proj.project_path / "docs" / "AGENTS.md"
+        proj.memory_file = proj.project_path / "docs" / "instructions.md"
+        writer = CodexWriter()
+
+        result = writer.write(
+            [
+                _rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv"),
+                _rec(RecommendationTarget.MEMORY_FILE, "Workflow", "- Run tests first"),
+            ],
+            proj,
+            dry_run=False,
+        )
+
+        assert result.warnings == []
+        assert proj.context_file.exists()
+        assert proj.memory_file.exists()
+        assert "Use uv" in proj.context_file.read_text()
+        assert "Run tests first" in proj.memory_file.read_text()
+
+    def test_write_accepts_config_and_blocks_only_ignored_target(self, tmp_path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = CodexWriter()
+        result = writer.write(
+            [
+                _rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv"),
+                _rec(RecommendationTarget.MEMORY_FILE, "Workflow", "- Run tests first"),
+            ],
+            proj,
+            dry_run=False,
+            config=HeadroomConfig(ignore=IgnoreConfig(mutate=["AGENTS.md"])),
+        )
+
+        assert not (proj.project_path / "AGENTS.md").exists()
+        assert (proj.data_path.parent / "instructions.md").exists()
+        assert any("AGENTS.md" in w for w in result.warnings)
+
+
+class TestGeminiWriter:
+    def test_write_creates_gemini_md(self, tmp_path):
+        proj = _project(tmp_path)
+        writer = GeminiWriter()
+
+        result = writer.write(
+            [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")],
+            proj,
+            dry_run=False,
+        )
+
+        gemini_md = proj.project_path / "GEMINI.md"
+        assert result.warnings == []
+        assert gemini_md.exists()
+        assert "Use uv" in gemini_md.read_text()
+
+    def test_write_accepts_config_and_honors_ignore(self, tmp_path):
+        from headroom.config import HeadroomConfig, IgnoreConfig
+
+        proj = _project(tmp_path)
+        writer = GeminiWriter()
+
+        result = writer.write(
+            [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")],
+            proj,
+            dry_run=False,
+            config=HeadroomConfig(ignore=IgnoreConfig(mutate=["GEMINI.md"])),
+        )
+
+        assert not (proj.project_path / "GEMINI.md").exists()
+        assert any("GEMINI.md" in w for w in result.warnings)
 
 
 class TestParsePriorRecommendations:
