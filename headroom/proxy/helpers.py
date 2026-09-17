@@ -3130,6 +3130,68 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 _TOOL_SEARCH_MIN_TOOLS = 12
 
 
+# Model-id shapes that name a Bedrock or Vertex deployment. The chat path
+# excludes those upstreams by base URL / backend (it knows where it forwards);
+# on the gateway contract the gateway routes, so the model id is the only
+# signal. Shared with the tool-search extension, which applies deferral on the
+# gateway path.
+_NON_FIRST_PARTY_MODEL_PREFIXES: tuple[str, ...] = (
+    "bedrock/",
+    "vertex_ai/",
+    "vertex/",
+    "anthropic.",  # bare Bedrock ids: anthropic.claude-3-5-sonnet-20241022-v2:0
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
+)
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+(:\d+)?$")
+
+
+def anthropic_model_is_first_party(model_name: str) -> bool:
+    """Whether ``model_name`` is a first-party Claude API id (not Bedrock/Vertex).
+
+    First-party tool search (``tool_search_tool_*`` + ``defer_loading``) is
+    rejected by Bedrock and Vertex, which the chat path skips by upstream URL.
+    Gateway callers name those deployments in the model id instead:
+    ``bedrock/anthropic.claude-…``, ``anthropic.claude-…-v2:0``,
+    ``vertex_ai/claude-…``, ``claude-sonnet-4@20250514``. A LiteLLM-style
+    ``anthropic/claude-…`` prefix is first-party and stays eligible.
+    """
+    lowered = (model_name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_NON_FIRST_PARTY_MODEL_PREFIXES):
+        return False
+    if "@" in lowered:  # Vertex dated ids
+        return False
+    return not _BEDROCK_VERSION_SUFFIX.search(lowered)
+
+
+def tools_are_anthropic_shaped(tools: Any) -> bool:
+    """Every dict tool is Anthropic-shaped (top-level ``name``/``input_schema``
+    or a typed server tool), and none carries the OpenAI ``function`` wrapper.
+
+    ``provider`` is inferred from the model name, and a LiteLLM-style caller
+    can pair a Claude model with chat-completions tools; deferral must not
+    touch those (Anthropic would never see this shape as-is anyway).
+    """
+    if not isinstance(tools, list) or not tools:
+        return False
+    saw_real_tool = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        if "function" in tool:
+            return False
+        if tool.get("type"):
+            continue  # typed server tool (web_search, computer, …)
+        if not tool.get("name") or "input_schema" not in tool:
+            return False
+        saw_real_tool = True
+    return saw_real_tool
+
+
 def _tool_search_resident_key(name: Any) -> str:
     """Normalize a client tool name for resident-tool membership checks."""
     # Oh My Pi prefixes every built-in with ``_``. Strip only leading namespace
@@ -3285,17 +3347,38 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     return names
 
 
+# Stand-in for a tool-search block the outbound tools array cannot support. Text
+# so it is inert to every validator, short so it costs ~10 tokens, and constant so
+# the repaired prefix stays byte-stable across turns (the provider cache needs the
+# same bytes every time).
+_TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
+    "type": "text",
+    "text": "[tool search omitted: unavailable in this request]",
+}
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
-    """Drop tool-search blocks this request's ``tools`` array cannot support.
+    """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
     A block pair is unsupportable when the request carries no ``tool_search_tool_*``
     tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
     shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    ``server_tool_use`` are handled (an orphan of either 400s on its own).
 
-    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
-    when nothing was removed — callers rely on identity to skip the write-back.
+    Replace in place rather than remove (#3456). The block indexes of a message
+    are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
+    by ``(message_index, block_index)``, so deleting a block that sits BEFORE a
+    thinking block in the same message — or deleting a whole message ahead of one —
+    moves that block, ``thinking_blocks_survived_mutation`` reports False, and
+    ``select_outbound_body`` then forwards the client's ORIGINAL bytes and discards
+    every mutation, this repair included. The request that needed repairing is
+    exactly the one that loses it, and upstream 400s on the reference we had
+    already found. Swapping each block for a short text block keeps every thinking
+    block at its original coordinates, so the repair survives to the wire. Same
+    reasoning as the CCR sibling below.
+
+    Returns ``(messages, blocks_repaired)``, and the ORIGINAL ``messages`` object
+    when nothing changed — callers rely on identity to skip the write-back.
     """
     if not isinstance(messages, list):
         return messages, 0
@@ -3328,7 +3411,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             out.append(message)
             continue
 
-        drop_indexes: set[int] = set()
+        neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
         for index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
@@ -3336,7 +3419,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
                 continue
-            drop_indexes.add(index)
+            neutralize_indexes.add(index)
             use_id = block.get("tool_use_id")
             if use_id:
                 orphaned_ids.add(str(use_id))
@@ -3348,19 +3431,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                 continue
             is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
-                drop_indexes.add(index)
+                neutralize_indexes.add(index)
 
-        if not drop_indexes:
+        if not neutralize_indexes:
             out.append(message)
             continue
 
         changed = True
-        removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
-        if not kept:
-            continue  # the whole turn was tool-search bookkeeping
+        removed += len(neutralize_indexes)
         repaired = dict(message)
-        repaired["content"] = kept
+        repaired["content"] = [
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            for index, block in enumerate(content)
+        ]
         out.append(repaired)
 
     return (out, removed) if changed else (messages, 0)
