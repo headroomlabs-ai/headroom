@@ -140,8 +140,8 @@ def test_responses_http_request_reaches_traffic_learner() -> None:
     assert len(learner.message_batches) == 1
     assert learner.tool_results == [
         {
-            "tool_name": "shell",
-            "tool_input": {"cmd": "missing-command"},
+            "tool_name": "Bash",
+            "tool_input": {"command": "missing-command"},
             "tool_output": "command not found",
             "is_error": True,
         }
