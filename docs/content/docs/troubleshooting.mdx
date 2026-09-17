@@ -215,11 +215,48 @@ See [issue #746](https://github.com/headroomlabs-ai/headroom/issues/746) for the
 
 ## Remote Control unavailable through custom ANTHROPIC_BASE_URL
 
-**Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent.
+**Symptom**: When Claude Code runs with `ANTHROPIC_BASE_URL` set to a custom host (for example, Headroom), the Remote Control menu is absent. Invoking `/remote-control` reports `Remote Control is only available when using Claude via api.anthropic.com`.
 
-**Cause**: This is a Claude-side gate. Headroom only receives normal API traffic and can still compress it, but Claude evaluates Remote Control availability before proxy traffic reaches the server.
+**Cause**: A client-side gate, evaluated before any traffic reaches Headroom. Claude Code v2.1.196+ parses `ANTHROPIC_BASE_URL` and compares the host against `api.anthropic.com` exactly, so a loopback address fails it. The check is satisfied by any one of:
 
-**Fix**: Use Headroom for normal proxied API sessions, and launch Claude directly (without `ANTHROPIC_BASE_URL`) when you need Claude Remote Control.
+- `ANTHROPIC_BASE_URL` unset, or naming `api.anthropic.com` as its host, or
+- `ANTHROPIC_UNIX_SOCKET` pointing at a Unix domain socket — but see [below](#why-the-unix-socket-route-does-not-help): it passes this check and fails a different one.
+
+Note that Remote Control does **not** honor `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, the flag that re-enables the 1M window and on-demand tool loading — it reads the base URL directly. Headroom cannot re-enable Remote Control from the server side the way `--1m` restores the `context-1m` beta header, because the eligibility decision and the bridge connection both happen in the client.
+
+**Fix**: Launch Claude directly, without `ANTHROPIC_BASE_URL`, for sessions that need Remote Control, and use Headroom for the rest.
+
+### Why the Unix socket route does not help
+
+`ANTHROPIC_UNIX_SOCKET` satisfies the host check above, so it looks like a way to keep a first-party base URL while routing through Headroom. It does not work, and the reason is worth recording so nobody re-derives it.
+
+That variable is reserved for `claude ssh`, where the process on the other end of the socket supplies credentials. Claude Code 2.1.198 carries the diagnostic verbatim:
+
+```
+ANTHROPIC_UNIX_SOCKET is set (claude ssh remote), and the local proxy is API-key-authed.
+```
+
+Setting it therefore makes Claude Code classify the session as API-key auth. Remote Control separately requires *claude.ai subscription* auth — the binary's eligibility messages include `Remote Control requires claude.ai subscription auth.` — so the one variable opens the host gate and closes the subscription gate at the same time.
+
+Confirmed on Linux against Claude Code 2.1.198 with `headroom proxy --uds` and no API key set. The session starts with:
+
+```
+⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set
+  and takes precedence over your claude.ai login
+```
+
+sends `Not logged in · Please run /login`, and after a successful subscription login still fails inside the SDK, because nothing ever attached a credential:
+
+```
+API invalid_api_key: Could not resolve authentication method. Expected one of apiKey,
+authToken, credentials, config, or profile to be set.
+```
+
+No proxy-side change can repair this: the eligibility decision happens in the client before any request is made.
+
+**What remains**: a transport that leaves `ANTHROPIC_BASE_URL` unset and does not set `ANTHROPIC_UNIX_SOCKET` — an `HTTPS_PROXY` CONNECT/MITM front end with a locally-generated CA trusted through `NODE_EXTRA_CA_CERTS`. That keeps the host genuinely `api.anthropic.com` and leaves subscription auth untouched. It is tracked on [issue #1779](https://github.com/headroomlabs-ai/headroom/issues/1779); `headroom proxy --uds` is still useful as a transport, just not for this.
+
+The upstream request to allow loopback proxies is tracked at [anthropics/claude-code#76653](https://github.com/anthropics/claude-code/issues/76653).
 
 `ENABLE_TOOL_SEARCH` is unaffected and can stay enabled for context-window savings while routing through Headroom.
 
