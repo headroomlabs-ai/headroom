@@ -260,6 +260,18 @@ def mcp_reconcile(adopt: bool) -> None:
     click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
     if observed is not None and observed != recommended:
         click.echo("  action: use --adopt to replace it")
+    # A Serena bundled by an enabled Claude Code plugin runs alongside the
+    # entry above (``claude mcp list`` shows it as ``plugin:serena:serena``)
+    # with none of Headroom's flags. It is a third-party plugin, so it is
+    # never removed here — point at the command that disables it (#3570).
+    for plugin_id, spec in registrar.get_plugin_servers("serena"):
+        click.echo(
+            f"  plugin: {plugin_id} also provides a Serena MCP server "
+            f"({spec.command} {' '.join(spec.args)})"
+        )
+        click.echo(
+            f"  action: disable it so only one Serena runs: claude plugin disable {plugin_id}"
+        )
 
 
 @mcp.command("status")

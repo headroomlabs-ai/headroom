@@ -1104,6 +1104,11 @@ class HeadroomProxy(
         self._compression_caches_last_cleanup: float = time.time()
         self._compression_caches_lock = threading.RLock()
 
+        # Gateway turn contract: its pending-turn registry (`gateway_turns`) is
+        # attached by headroom.proxy.gateway_extension.install, which
+        # create_app runs by default (HEADROOM_GATEWAY_CONTRACT=0 leaves it out).
+        self.gateway_turns = None
+
         self.logger = (
             RequestLogger(
                 log_file=config.log_file,
@@ -3912,7 +3917,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
         )
 
-    # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
+    # Vendored dashboard JS (tailwind/alpine). Mounted before
     # register_provider_routes' catch-all so it is not tunneled upstream.
     from starlette.staticfiles import StaticFiles
 
@@ -5508,6 +5513,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.post("/v1/usage", dependencies=_compress_dependencies)
     async def compress_usage(request: Request):
         return await proxy.handle_compress_usage(request)
+
+    # Contracts layered on /v1/compress install through the compress-turn seam
+    # (headroom/proxy/compress_turn.py). The gateway turn contract is built in
+    # and on by default; it adds /v1/compress/response under the same exposure
+    # policy as /v1/compress. A third-party contract's install(app, config)
+    # can read the policy from app.state.compress_route_dependencies.
+    app.state.compress_route_dependencies = list(_compress_dependencies)
+    from headroom.proxy.gateway_extension import install_builtin as _install_gateway_contract
+
+    _install_gateway_contract(app, config, route_dependencies=_compress_dependencies)
 
     register_provider_routes(app, proxy)
 
