@@ -338,6 +338,41 @@ class SavingsEstimate:
 _SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
 
 
+# Whether an arm is a real sample is decided by :data:`MEASURED_MIN_CLUSTERS`
+# in ``estimate_from_holdout``, not here: assignment is conversation-stable, so
+# requests are not independent draws and a per-arm REQUEST floor would pass 30
+# turns of one session while failing five separate ones. The two gates below
+# are about something else -- whether a qualifying measurement has earned the
+# headline slot away from the synthetic control.
+
+# A measured (A/B holdout) estimate replaces the synthetic-control one only
+# once strata with data in both arms account for this share of the requests the
+# baseline can also score. Below it the holdout describes a corner of the
+# traffic, not the traffic.
+MEASURED_MIN_COVERAGE = 0.5
+
+# ...and only once its 95% band is at least this tight, in percentage points of
+# reduction. An arm can clear the cluster gate and still be too noisy to say
+# anything: the observation that produced 20% +/- 277pp was three control
+# samples spread over an order of magnitude, and that spread does not go away
+# just because the arm eventually fills.
+MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
+
+
+def _measured_supersedes(measured: SavingsEstimate, estimated: SavingsEstimate) -> bool:
+    """Whether the A/B measurement has outgrown the synthetic-control estimate."""
+    if measured.n_requests == 0:
+        return False
+    half_width = (measured.ci_high_pct - measured.ci_low_pct) / 2.0
+    if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT:
+        return False
+    if estimated.n_requests == 0:
+        # No baseline to fall back on: a well-bounded measurement is all there
+        # is, and it is still better than reporting nothing.
+        return True
+    return measured.n_requests >= MEASURED_MIN_COVERAGE * estimated.n_requests
+
+
 @dataclass
 class SavingsLedger:
     """Accumulates shaped (treatment) and unshaped (control) observations and
@@ -513,15 +548,27 @@ class SavingsLedger:
         )
 
     def best_estimate(self, level: int | None = None) -> SavingsEstimate:
-        """Strongest available tier: measured > estimated > modelled.
+        """Strongest believable tier: measured > estimated > modelled.
 
         ``level`` enables the modelled fallback; without it the behaviour is
         unchanged from before, which keeps every existing caller honest.
+
+        The measured tier is preferred only once it is worth believing. A
+        holdout arm starts empty and fills slowly -- at a 1-3% holdout, over
+        weeks. Preferring it the moment a single stratum has one sample in both
+        arms means the headline number is decided by a handful of requests: a
+        three-sample control arm reported a -1439.9% reduction, which a UI then
+        has to either render or suppress. Neither is the estimator's job to
+        force. So the measured number displaces the synthetic control only when
+        it actually measures the traffic: every stratum it is built from must
+        clear the conversation-cluster gate in ``estimate_from_holdout``, it
+        must cover a real share of the requests the baseline can also speak to,
+        and it must carry a band tight enough to mean something.
         """
-        measured = self.estimate_from_holdout()
-        if measured is not None:
-            return measured
         estimated = self.estimate_from_baseline()
+        measured = self.estimate_from_holdout()
+        if measured is not None and _measured_supersedes(measured, estimated):
+            return measured
         if estimated.n_requests > 0:
             return estimated
         if level is not None:
