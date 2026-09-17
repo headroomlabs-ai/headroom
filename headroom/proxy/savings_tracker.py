@@ -302,7 +302,7 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
     falls back to ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, matching
     ``_estimate_input_cost_usd``/``_estimate_compression_savings_usd`` — otherwise
     cache_savings_usd silently reads as $0 forever on any install without
-    litellm (e.g. Python 3.14, where headroom's own dependency spec excludes it).
+    litellm.
 
     Deliberately diverges from ``proxy/cost.py``'s session-scoped provider
     multipliers (``_CACHE_ECONOMICS``): this lifetime figure follows the

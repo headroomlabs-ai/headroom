@@ -2157,10 +2157,13 @@ class OpenAIHandlerMixin:
         # _tool_call_command_text helper:
         #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
         #   - local_shell_call.action  (native Responses shell; argv or string)
+        #   - custom_tool_call.input   (Codex code-mode `exec`: JavaScript calling
+        #                               tools.exec_command({"cmd": …}))
         # Content is gated per-output by _read_output_should_be_protected so
         # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
         # compressible, exactly like the chat path.
         from headroom.transforms.content_router import (
+            _custom_tool_call_commands,
             _is_read_command,
             _read_output_should_be_protected,
             _tool_call_command_text,
@@ -2177,6 +2180,17 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("arguments"))
                 elif item_type == "local_shell_call":
                     command = _tool_call_command_text(item.get("action"))
+                elif item_type == "custom_tool_call":
+                    # One script can run several commands; its single output is a
+                    # read when any of them is (over-protecting only costs savings).
+                    command = next(
+                        (
+                            c
+                            for c in _custom_tool_call_commands(item.get("input"))
+                            if _is_read_command(c)
+                        ),
+                        "",
+                    )
                 else:
                     continue
                 call_id = item.get("call_id")
@@ -4481,7 +4495,10 @@ class OpenAIHandlerMixin:
 
         _normalize_openai_max_tokens(
             body,
-            backend_owns_translation=resolver_for(self).for_request(request) is not None,
+            backend_owns_translation=resolver_for(self).for_request(
+                request, native_providers=("openai",)
+            )
+            is not None,
         )
 
         # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
@@ -4550,9 +4567,13 @@ class OpenAIHandlerMixin:
 
         # Route through LiteLLM/any-llm backend if configured -- or through a
         # per-request one an extension asked for (see proxy/route_advice.py).
-        # No advice resolves to `self.anthropic_backend`, so this is the same
-        # condition it has always been.
-        request_backend = resolver_for(self).for_request(request, body=body)
+        # anthropic is NOT native to this OpenAI-shape handler, so cross-family
+        # advice (e.g. Codex routed to a Claude model) resolves to a translating
+        # litellm backend; same-family (openai) advice still resolves to
+        # `self.anthropic_backend`, unchanged.
+        request_backend = resolver_for(self).for_request(
+            request, body=body, native_providers=("openai",)
+        )
         if request_backend is not None:
             try:
                 if stream:
@@ -9698,7 +9719,31 @@ class OpenAIHandlerMixin:
         """
         from fastapi.responses import JSONResponse
 
+        # Compress-turn extensions (headroom/proxy/compress_turn.py). A
+        # registered contract — the built-in gateway turn contract, installed
+        # by create_app through the same seam a third party would use — may
+        # claim the body (`begin`), transform the outbound messages on the
+        # executor, add response fields (`finish`) and take ownership of the
+        # outcome (`commit`). With none claiming it — legacy mode — nothing
+        # below this comment changes behaviour.
+        from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
         from headroom.proxy.helpers import _read_request_json
+
+        def _gateway_invalid(e: CompressTurnError) -> JSONResponse:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"type": "invalid_request", "message": e.message}},
+            )
+
+        def _begin_turn(body: Any):
+            if not isinstance(body, dict):
+                return None
+            return begin_compress_turn(
+                proxy=self,
+                request=request,
+                body=body,
+                client=classify_client(dict(request.headers)),
+            )
 
         # Check bypass header
         if request.headers.get("x-headroom-bypass", "").lower() == "true":
@@ -9710,17 +9755,22 @@ class OpenAIHandlerMixin:
                     content={"error": f"Invalid request body: {e!s}"},
                 )
             messages = body.get("messages", [])
-            return JSONResponse(
-                {
-                    "messages": messages,
-                    "tokens_before": 0,
-                    "tokens_after": 0,
-                    "tokens_saved": 0,
-                    "compression_ratio": 1.0,
-                    "transforms_applied": [],
-                    "ccr_hashes": [],
-                }
-            )
+            _bypass_payload = {
+                "messages": messages,
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "compression_ratio": 1.0,
+                "transforms_applied": [],
+                "ccr_hashes": [],
+            }
+            try:
+                _bypass_turn = _begin_turn(body)
+            except CompressTurnError as e:
+                return _gateway_invalid(e)
+            if _bypass_turn is not None:
+                _bypass_payload.update(_bypass_turn.fail_open_fields(messages))
+            return JSONResponse(_bypass_payload)
 
         try:
             body = await _read_request_json(request)
@@ -9760,18 +9810,24 @@ class OpenAIHandlerMixin:
                 },
             )
 
+        try:
+            _turn = _begin_turn(body)
+        except CompressTurnError as e:
+            return _gateway_invalid(e)
+
         if not messages:
-            return JSONResponse(
-                {
-                    "messages": [],
-                    "tokens_before": 0,
-                    "tokens_after": 0,
-                    "tokens_saved": 0,
-                    "compression_ratio": 1.0,
-                    "transforms_applied": [],
-                    "ccr_hashes": [],
-                }
-            )
+            _empty_payload = {
+                "messages": [],
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "compression_ratio": 1.0,
+                "transforms_applied": [],
+                "ccr_hashes": [],
+            }
+            if _turn is not None:
+                _empty_payload.update(_turn.fail_open_fields([]))
+            return JSONResponse(_empty_payload)
 
         start_time = time.time()
         headers = dict(request.headers)
@@ -9983,13 +10039,25 @@ class OpenAIHandlerMixin:
                     _session_key, _tracker_provider
                 )
 
+            # A claimed turn prepares its executor-side work here (tokenizer,
+            # hooks, scope binding) — CPU-bound parts run inside the closures
+            # below with the rest of the turn.
+            if _turn is not None:
+                _turn.prepare(model_name=model_name, tags=tags, config=self.config)
+
             def _run_stateless():
                 result = pipeline.apply(messages=messages, model=model, **pipeline_kwargs)
+                final = result.messages
+                tokens_after = result.tokens_after
+                if _turn is not None:
+                    final = _turn.transform(final)
+                    if _turn.folded_messages:
+                        tokens_after = _turn.count_messages(final, tokens_after)
                 return (
                     result,
-                    result.messages,
+                    final,
                     result.tokens_before,
-                    result.tokens_after,
+                    tokens_after,
                     None,
                 )
 
@@ -10045,7 +10113,25 @@ class OpenAIHandlerMixin:
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
                     turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
-                    final = turn.messages
+                    # A replay can carry an earlier turn's cache_control marker
+                    # after the caller moved its breakpoint forward, and
+                    # Anthropic rejects more than four. Keep message markers at
+                    # the caller's current positions, as the /v1/messages
+                    # handler does after its own replay. The gateway's finish
+                    # step still enforces the hard budget on the whole body.
+                    from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+                    final = normalize_message_cache_control(
+                        turn.messages, prev_returned, client_messages=messages
+                    )
+                    if _turn is not None:
+                        # AFTER the replay overlay, BEFORE update_from_result /
+                        # record_returned: the turn's output is what the caller
+                        # forwards, so it must be what next turn's snapshot
+                        # replays. A transform that is not a pure function of
+                        # its input busts the prefix here as it would on the
+                        # proxy.
+                        final = _turn.transform(final)
                     # Savings are reported against the caller's RAW payload,
                     # not the cache-swapped pipeline input: on a warm turn the
                     # swap has already shrunk the input before the pipeline
@@ -10108,34 +10194,58 @@ class OpenAIHandlerMixin:
 
             tokens_saved = max(0, tokens_before - tokens_after)
             latency_ms = (time.time() - start_time) * 1000
-            await self._record_request_outcome(
-                RequestOutcome(
-                    request_id=(
-                        await self._next_request_id()
-                        if hasattr(self, "_next_request_id")
-                        else f"compress_{int(time.time())}"
-                    ),
-                    provider="compress",
-                    model=model if isinstance(model, str) else str(model),
-                    original_tokens=tokens_before,
-                    optimized_tokens=tokens_after,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    attempted_input_tokens=tokens_before,
-                    total_latency_ms=latency_ms,
-                    overhead_ms=latency_ms,
-                    num_messages=len(messages) if isinstance(messages, list) else 0,
-                    transforms_applied=tuple(result.transforms_applied or ()),
-                    waste_signals=(
-                        result.waste_signals.to_dict()
-                        if getattr(result, "waste_signals", None) is not None
-                        else None
-                    ),
-                    pipeline_timing=getattr(result, "timing", None) or None,
-                    tags=tags,
-                    client=client,
+            _transforms_applied = list(result.transforms_applied or ())
+            # The claimed turn adds its labels and response fields BEFORE the
+            # outcome is built, so the outcome's transforms carry them.
+            _finished = None
+            if _turn is not None:
+                _finished = _turn.finish(
+                    messages=final_messages,
+                    tokens_before=tokens_before,
+                    transforms_applied=_transforms_applied,
+                    mode=mode,
+                    ccr_hashes=ccr_hashes,
                 )
+                _transforms_applied = list(_finished.transforms)
+                if _finished.messages is not None:
+                    final_messages = _finished.messages
+            _outcome = RequestOutcome(
+                request_id=(
+                    await self._next_request_id()
+                    if hasattr(self, "_next_request_id")
+                    else f"compress_{int(time.time())}"
+                ),
+                provider="compress",
+                model=model if isinstance(model, str) else str(model),
+                original_tokens=tokens_before,
+                optimized_tokens=tokens_after,
+                output_tokens=0,
+                tokens_saved=tokens_saved,
+                attempted_input_tokens=tokens_before,
+                total_latency_ms=latency_ms,
+                overhead_ms=latency_ms,
+                num_messages=len(messages) if isinstance(messages, list) else 0,
+                transforms_applied=tuple(_transforms_applied or ()),
+                waste_signals=(
+                    result.waste_signals.to_dict()
+                    if getattr(result, "waste_signals", None) is not None
+                    else None
+                ),
+                pipeline_timing=getattr(result, "timing", None) or None,
+                tags=tags,
+                client=client,
             )
+            # A claimed turn may take ownership of the outcome (a gateway waits
+            # for the relayed usage); otherwise it is recorded now.
+            _deferred = False
+            if _turn is not None:
+                _deferred = _turn.commit(
+                    _outcome,
+                    session_key=(_session_key if session_id else None),
+                    session_id=session_id,
+                )
+            if not _deferred:
+                await self._record_request_outcome(_outcome)
 
             _payload = {
                 "messages": final_messages,
@@ -10147,12 +10257,14 @@ class OpenAIHandlerMixin:
                 # telemetry records 0 would be two answers for one number.
                 "tokens_saved": tokens_saved,
                 "compression_ratio": (tokens_after / tokens_before if tokens_before > 0 else 1.0),
-                "transforms_applied": result.transforms_applied,
+                "transforms_applied": _transforms_applied,
                 "transforms_summary": result.transforms_summary,
                 "ccr_hashes": ccr_hashes,
             }
             if session_info is not None:
                 _payload["session"] = session_info
+            if _finished is not None and _finished.fields:
+                _payload.update(_finished.fields)
             return JSONResponse(_payload)
         except TimeoutError:
             self.metrics.record_compression_failed("timeout")
@@ -10235,20 +10347,21 @@ class OpenAIHandlerMixin:
                     client=client,
                 )
             )
-            return JSONResponse(
-                content={
-                    "messages": messages,
-                    "tokens_before": 0,
-                    "tokens_after": 0,
-                    "tokens_saved": 0,
-                    "compression_ratio": 1.0,
-                    "transforms_applied": [],
-                    "transforms_summary": {},
-                    "ccr_hashes": [],
-                    "compression_skipped": True,
-                    "skip_reason": "compression_timeout",
-                },
-            )
+            _timeout_payload = {
+                "messages": messages,
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "compression_ratio": 1.0,
+                "transforms_applied": [],
+                "transforms_summary": {},
+                "ccr_hashes": [],
+                "compression_skipped": True,
+                "skip_reason": "compression_timeout",
+            }
+            if _turn is not None:
+                _timeout_payload.update(_turn.fail_open_fields(messages))
+            return JSONResponse(content=_timeout_payload)
         except Exception as e:
             logger.exception("Compression failed: %s", e)
             await self.metrics.record_failed(provider="compress")
@@ -10308,6 +10421,17 @@ class OpenAIHandlerMixin:
         usage = body.get("usage")
         if not isinstance(usage, dict):
             return _invalid("Missing or invalid usage: expected an object.")
+        # OpenAI-shaped relays (Kong's log statistics, an OpenAI-mapped
+        # gateway) carry the cache read under prompt_tokens_details.cached_tokens
+        # or a flat cached_tokens. Map it to the Anthropic read field so the
+        # relay is not a 400. OpenAI has no write signal, so the write field
+        # stays absent and the only-present-field-is-zero rule below applies.
+        if "cache_read_input_tokens" not in usage and "cache_creation_input_tokens" not in usage:
+            _details = usage.get("prompt_tokens_details")
+            if isinstance(_details, dict) and "cached_tokens" in _details:
+                usage = {**usage, "cache_read_input_tokens": _details["cached_tokens"]}
+            elif "cached_tokens" in usage:
+                usage = {**usage, "cache_read_input_tokens": usage["cached_tokens"]}
         # A usage block carrying NEITHER cache field is a no-signal relay (an
         # OpenAI-style {"prompt_tokens": N} forwarded verbatim, for example).
         # Defaulting the absent fields to 0 would make update_from_response

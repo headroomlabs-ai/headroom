@@ -343,8 +343,8 @@ class AnthropicHandlerMixin:
 
         return await count_tokens_offloaded(self, model, messages)
 
-    @staticmethod
     def _resolve_ccr_workspace(
+        self,
         request: Any,
         body: Any,
     ) -> tuple[str, str | None]:
@@ -379,11 +379,12 @@ class AnthropicHandlerMixin:
         )
 
         try:
+            config = getattr(self, "config", None)
             ctx = _CtxFor(
                 headers=dict(request.headers),
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=resolve_memory_identity(request, default=""),
-                project_root_override=None,
+                project_root_override=(getattr(config, "memory_project_root_override", "") or None),
             )
             ident = ProjectResolver().resolve(ctx)
         except Exception as exc:  # noqa: BLE001
@@ -3111,6 +3112,20 @@ class AnthropicHandlerMixin:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                     )
+                # Provider headers a hook asked for (``TurnContext.provider_headers``):
+                # allow-listed names only, ``anthropic-beta`` merged behind the
+                # client's own tokens — the same reduction the gateway contract
+                # applies before handing ``headers`` to the gateway.
+                _hook_headers = getattr(_req_ctx, "provider_headers", None)
+                if isinstance(_hook_headers, dict) and _hook_headers:
+                    from headroom.proxy.turn_hooks import merge_provider_headers
+
+                    for _hh_key, _hh_value in merge_provider_headers(
+                        {"anthropic-beta": headers.get("anthropic-beta", "")}, _hook_headers
+                    ).items():
+                        if _hh_key == "anthropic-beta" and headers.get(_hh_key) != _hh_value:
+                            _headroom_beta_added = True
+                        headers[_hh_key] = _hh_value
 
             # Tool-search history repair (#2805). Once deferral is on, the client
             # stores Anthropic's server_tool_use / tool_search_tool_result blocks in
@@ -3140,8 +3155,9 @@ class AnthropicHandlerMixin:
                 body_mutation_tracker.mark_mutated("tool_search_history_repair")
                 transforms_applied.append(f"router:tool_search_repair:{_ts_stripped}blocks")
                 logger.info(
-                    "[%s] Tool search: dropped %d unsupportable history block(s) "
-                    "(tools array cannot resolve their tool_reference entries)",
+                    "[%s] Tool search: repaired %d unsupportable history block(s) "
+                    "(replaced with text in place; tools array cannot resolve their "
+                    "tool_reference entries)",
                     request_id,
                     _ts_stripped,
                 )

@@ -425,12 +425,6 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
 > separately: `pip install "headroom-ai[langchain]"`, and likewise `[agno]`,
 > `[strands]`, `[anyllm]`, `[bedrock]`.
 
-> **Pick Python 3.13 if you want the dollar figure.** The dashboard's *Proxy $
-> Saved* tile prices compression with [LiteLLM](https://github.com/BerriAI/litellm),
-> which cannot be installed on Python 3.14+. Token savings still track on 3.14,
-> but the dollar figure stays `$0.00`. To switch:
-> `pipx reinstall headroom-ai --python python3.13`, then restart the proxy.
-
 → [Installation guide](https://docs.headroomlabs.ai/docs/installation) — Docker
 tags, persistent service, PowerShell, devcontainers.
 

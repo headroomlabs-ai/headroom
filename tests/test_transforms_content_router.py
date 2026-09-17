@@ -1991,3 +1991,163 @@ def test_datetime_prefixed_user_prompt_survives_router() -> None:
     result = ContentRouter().compress(prompt)
     assert result.strategy_used is not CompressionStrategy.SEARCH
     assert "Please update the PR desc" in result.compressed
+
+
+# --- The caller's prompt stays verbatim on replaying paths -----------------
+#
+# The proxy's coding profile turns user-message compression on so tool
+# observations inside user messages shrink. On a replaying path (proxy
+# handlers, the /v1/compress session turn) that used to reach the prompt text
+# too, and only a cache_control marker stopped it: Claude Code sets one, a
+# plain agent does not, and its task statement went out with stop words
+# stripped and pytest node ids mangled.
+
+_TASK = "Fix this bug in the library source. " * 60
+
+
+def _prompt_router(monkeypatch: pytest.MonkeyPatch) -> tuple[ContentRouter, list[str]]:
+    return _fresh_cc_router(monkeypatch)
+
+
+def test_opening_task_text_block_is_verbatim_under_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    router, _ = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": [{"type": "text", "text": _TASK}]}]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[0]["content"][0]["text"] == _TASK
+
+
+def test_opening_task_string_is_verbatim_under_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    router, _ = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": _TASK}]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[0]["content"] == _TASK
+
+
+def test_newest_user_turn_keeps_text_but_compresses_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, calls = _prompt_router(monkeypatch)
+    follow_up = "Now also handle the async path. " * 60
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": _FRESH_CC_OUTPUT},
+                {"type": "text", "text": follow_up},
+            ],
+        },
+    ]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    blocks = out.messages[2]["content"]
+    assert blocks[0]["content"].endswith("[compressed]")
+    assert blocks[1]["text"] == follow_up
+    assert follow_up not in calls
+
+
+def test_text_harness_observation_string_still_compresses_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A text harness returns its tool output as a role:user string after the
+    # assistant turn. That is an observation, not the prompt.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "```bash\npytest -q\n```"},
+        {"role": "user", "content": _FRESH_CC_OUTPUT},
+    ]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _FRESH_CC_OUTPUT in calls
+
+
+def test_follow_up_prompt_string_after_assistant_turn_is_verbatim_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A plain-string follow-up after an assistant reply is the caller's new
+    # instruction, the same as the list-content case above.
+    router, calls = _prompt_router(monkeypatch)
+    follow_up = "Now also handle the async path in tenacity/asyncio. " * 60
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "All 167 tests pass on the sync path."},
+        {"role": "user", "content": follow_up},
+    ]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[2]["content"] == follow_up
+    assert follow_up not in calls
+
+
+def test_text_harness_observation_text_block_still_compresses_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The list-content twin of the string observation above: both shapes
+    # decide "prompt or observation" the same way.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "```bash\npytest -q\n```"},
+        {"role": "user", "content": [{"type": "text", "text": _FRESH_CC_OUTPUT}]},
+    ]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _FRESH_CC_OUTPUT in calls
+
+
+def test_prompt_text_compresses_without_replay_guarantee(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SDK / document callers that opt into user compression keep it: a
+    # spreadsheet or pasted document in a user message is the payload.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": [{"type": "text", "text": _TASK}]}]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _TASK in calls

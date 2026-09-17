@@ -81,8 +81,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
     # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
-    # get_context_limit; these are the manual fallback for installs without it
-    # (the litellm dep is gated python_version < '3.14').
+    # get_context_limit; these are the manual fallback for installs without it.
     "gpt-4.1": 1_047_576,
     "gpt-4.1-mini": 1_047_576,
     "gpt-4.1-nano": 1_047_576,
@@ -705,8 +704,7 @@ class OpenAIProvider(Provider):
 
         The table used to be authoritative, which is how it went ~18 months stale
         and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
-        a fallback means that drift only reaches installs with no LiteLLM — the
-        dependency is gated ``python_version < '3.14'``.
+        a fallback means that drift only reaches installs with no LiteLLM.
         """
         # 1. Explicit configuration wins.
         override = self._pricing_overrides.get(model)

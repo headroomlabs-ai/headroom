@@ -182,6 +182,7 @@ The ContentRouter selects the right compressor automatically. Here's when each f
 | Content Pattern | Compressor | Detection Signal |
 |---|---|---|
 | `file:line:content` lines | SearchCompressor | grep/ripgrep output format |
+| `file-line-content` context lines (`grep -A/-B/-C`) | SearchCompressor | grep/ripgrep context-line format (same section carving as match lines; `file:line:content` and context lines may mix with `--` separators) |
 | pytest, npm, cargo markers | LogCompressor | Build tool output patterns |
 | `---/+++` and `@@` markers | DiffCompressor | Unified diff format |
 | Prose, documentation | KompressCompressor | ContentRouter's default for `PLAIN_TEXT` (`CompressionStrategy.TEXT` and `KOMPRESS` share the same ML compressor dispatch -- see `headroom/transforms/content_router.py:3524-3540`) |
