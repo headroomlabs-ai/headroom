@@ -83,6 +83,11 @@ release.yml:
                  -> publish-docker          --+
 ```
 
+The immutable candidate workflow calls the same build-only workflow directly.
+Its entire call tree has read-only repository permissions and contains no
+publishing jobs. This separation is required because GitHub validates nested
+workflow permissions before evaluating job conditions.
+
 The workflow never commits back to the repo.
 
 ### detect-version
@@ -276,6 +281,7 @@ cp .env.act.example .env.act
 |------|---------|
 | `.github/workflows/release.yml` | Release orchestration and publishing |
 | `.github/workflows/release-build.yml` | Shared read-only build and smoke gates |
+| `.github/workflows/candidate-artifact.yml` | Immutable candidate bundle and verification |
 | `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
 | `.github/workflows/ci.yml` | CI — lint, test, commitlint |
 | `.github/workflows/publish.yml` | Manual-only PyPI fallback (superseded by `release.yml`) |
