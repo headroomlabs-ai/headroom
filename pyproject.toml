@@ -49,11 +49,11 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
-    # model registry / pricing / non-core providers — all lazily imported and
-    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
-    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
-    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
+    # Model registry, pricing and non-core providers; all lazily imported and
+    # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
+    # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
+    # Python 3.14 (GH #956) or fall back to a Rust source build.
+    "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -90,7 +90,10 @@ proxy = [
     "onnxruntime>=1.24.0; python_version>='3.11'",
     "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
-    "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
+    # File watcher for live code graph reindexing (--code-graph). watchdog 6.0.0
+    # publishes no macOS wheel for Python 3.14, so installing it there needs a C
+    # compiler. The watcher is optional and skips itself when watchdog is absent.
+    "watchdog>=4.0.0; sys_platform != 'darwin' or python_version < '3.14'",
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
@@ -290,7 +293,7 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
+    "litellm>=1.96.2,<2.0",       # see core deps note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",

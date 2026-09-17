@@ -34,7 +34,6 @@ def ensure_proxy_dependencies() -> None:
         "websockets",
         "onnxruntime",
         "transformers",
-        "watchdog",
     ]
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")

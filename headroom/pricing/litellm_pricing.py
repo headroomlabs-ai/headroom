@@ -241,9 +241,8 @@ def pricing_per_1m(model: str) -> tuple[float, float] | None:
 
     The tuple shape providers already use for their own tables, so a provider can
     prefer this over a hand-maintained copy with a single call. ``None`` means
-    "LiteLLM can't answer" — either it isn't installed (the dependency is gated
-    ``python_version < '3.14'``) or it doesn't know the model — which is the
-    provider's cue to fall back.
+    "LiteLLM can't answer" — either it isn't installed or it doesn't know the
+    model — which is the provider's cue to fall back.
 
     A found-but-zero price is returned as ``0.0`` rather than treated as missing:
     some models genuinely are free, and ``savings_ledger`` already made this call
@@ -301,9 +300,8 @@ def estimate_cost_from_tokens(
     against the total, so passing a cache-exclusive count would both
     double-discount the cached tokens and understate the threshold.
 
-    Returns ``None`` when LiteLLM is unavailable (the dependency is gated
-    ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
-    to fall back to its own table.
+    Returns ``None`` when LiteLLM is unavailable or doesn't know the model --
+    the caller's cue to fall back to its own table.
     """
     if not LITELLM_AVAILABLE:
         return None
