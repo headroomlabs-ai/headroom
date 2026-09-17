@@ -233,6 +233,8 @@ Some settings can be configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | - |
+| `HEADROOM_CONTEXT_LIMIT_MODE` | Context budget guard mode. `observe` (default) logs over-limit finalized requests and forwards them; `reject` returns a local 400 before any upstream attempt. Effective only when a model limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`. | `observe` |
+| `HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN` | Token reserve subtracted from the declared model context limit before comparing against the finalized request token count. The reserve is the larger of this value and `max_tokens`. A non-negative integer. | `0` |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings ledger, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |
@@ -351,6 +353,19 @@ export HEADROOM_MODEL_LIMITS='{"anthropic":{"context_limits":{"claude-new":20000
 
 # File path
 export HEADROOM_MODEL_LIMITS=/path/to/models.json
+```
+
+### Context budget guard
+
+When a model's context limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`, the proxy evaluates every finalized Anthropic `/v1/messages` request against that limit before forwarding. The threshold is `declared_limit - max(HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN, max_tokens)`.
+
+In the default `observe` mode the proxy logs an over-limit request at WARNING and forwards it unchanged. Set `HEADROOM_CONTEXT_LIMIT_MODE=reject` to have the proxy return a local 400 before any upstream attempt, which stops the provider's own 400 from triggering a client retry storm. Unconfigured installs are unaffected; the guard is a no-op when no limit is declared for the model.
+
+```bash
+export HEADROOM_MODEL_LIMITS='{"context_limits":{"step-router-v1":262144}}'
+export HEADROOM_CONTEXT_LIMIT_MODE=reject
+export HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN=4096
+headroom proxy
 ```
 
 ### Pattern-Based Inference
