@@ -125,3 +125,22 @@ def test_card_hidden_when_no_session_and_no_lifetime_data() -> None:
         expect(page.get_by_text("Prefix Cache Impact", exact=True)).to_have_count(0)
 
         browser.close()
+
+
+def test_history_keeps_one_lifetime_total_and_retains_checkpoints() -> None:
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 1400})
+        _open_dashboard(page, _session_stats_no_cache(), _lifetime_cache_payload())
+
+        page.get_by_role("button", name="Historical", exact=True).click()
+        expect(page.get_by_text("Lifetime Tokens Saved", exact=True)).to_be_visible()
+        expect(page.get_by_test_id("history-total-value")).to_have_text("143.0k")
+        expect(page.get_by_test_id("history-total-value")).to_have_count(1)
+        expect(page.get_by_text("Latest total", exact=True)).to_have_count(0)
+        expect(page.get_by_text("Recent Historical Checkpoints", exact=True)).to_be_visible()
+        expect(page.get_by_text("Cumulative proxy compression savings", exact=True)).to_have_count(
+            2
+        )
+
+        browser.close()
