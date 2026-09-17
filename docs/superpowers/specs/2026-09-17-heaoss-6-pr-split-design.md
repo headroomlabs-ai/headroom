@@ -120,7 +120,8 @@ the candidate workflow and can be adopted by later qualification lanes.
 
 - Add `scripts/candidate_manifest.py` with `inventory`, `create`, and `verify`
   commands.
-- Add `.candidate/` to `.gitignore` for local command output.
+- Unignore `scripts/candidate_manifest.py` in `.gitignore`, whose existing
+  `scripts/*` rule would otherwise exclude the CLI.
 - Add focused tests for deterministic ordering, hashes, sizes, package/version
   identity, source SHA, producer repository/workflow/run identity, rollout
   identity, safe qualification eligibility, schema versions, missing files,
