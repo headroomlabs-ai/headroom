@@ -76,6 +76,7 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "timestamp": "2026-03-27T09:00:00Z",
         "provider": "unknown",
         "model": "unknown",
+        "agent": "unknown",
         "total_tokens_saved": 12,
         "compression_savings_usd": 0.5,
         "cache_read_tokens": 0,
@@ -141,6 +142,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "timestamp": "2026-03-27T09:00:00Z",
             "provider": "unknown",
             "model": "unknown",
+            "agent": "unknown",
             "total_tokens_saved": 30,
             "compression_savings_usd": 0.03,
             "cache_read_tokens": 0,
@@ -216,6 +218,7 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
         {
             "timestamp": "2026-03-27T08:00:00Z",
             "provider": "unknown",
+            "agent": "unknown",
             "model": "gpt-4o",
             "total_tokens_saved": 10,
             "compression_savings_usd": 0.01,
@@ -225,6 +228,7 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
         {
             "timestamp": "2026-03-27T12:34:00Z",
             "provider": "unknown",
+            "agent": "unknown",
             "model": "gpt-4o",
             "total_tokens_saved": 15,
             "compression_savings_usd": 0.015,
@@ -896,6 +900,111 @@ def test_savings_tracker_rollup_attributes_savings_per_provider(tmp_path, monkey
     third = hourly[2]
     assert set(third["by_provider"]) == {"unknown"}
     assert third["by_provider"]["unknown"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_rollup_attributes_savings_per_agent(tmp_path, monkeypatch):
+    path = tmp_path / "proxy_savings.json"
+    tracker = SavingsTracker(
+        path=str(path),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+    monkeypatch.setattr(
+        "headroom.proxy.savings_tracker._estimate_compression_savings_usd",
+        lambda model, tokens_saved: tokens_saved / 1000.0,
+    )
+
+    # Two agents sharing the SAME upstream provider in one hour bucket - the
+    # case by_provider fundamentally cannot separate (Claude Code and
+    # OpenCode both talk to anthropic).
+    tracker.record_compression_savings(
+        model="claude-3-5-sonnet",
+        tokens_saved=100,
+        provider="anthropic",
+        agent="claude-code",
+        total_input_tokens=120,
+        total_input_cost_usd=0.24,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+    tracker.record_compression_savings(
+        model="claude-3-5-sonnet",
+        tokens_saved=40,
+        provider="anthropic",
+        agent="opencode",
+        total_input_tokens=200,
+        total_input_cost_usd=0.40,
+        timestamp="2026-03-27T09:40:00Z",
+    )
+    # A legacy-style record with no agent collapses into "unknown".
+    tracker.record_compression_savings(
+        model="gpt-4o",
+        tokens_saved=15,
+        provider="openai",
+        total_input_tokens=260,
+        total_input_cost_usd=0.52,
+        timestamp="2026-03-27T10:05:00Z",
+    )
+
+    hourly = tracker.history_response()["series"]["hourly"]
+
+    first = hourly[0]
+    # by_provider blends the two agents...
+    assert set(first["by_provider"]) == {"anthropic"}
+    assert first["by_provider"]["anthropic"]["tokens_saved"] == 140
+    # ...by_agent separates them.
+    assert set(first["by_agent"]) == {"claude-code", "opencode"}
+    assert first["by_agent"]["claude-code"]["tokens_saved"] == 100
+    assert first["by_agent"]["claude-code"]["total_input_tokens_delta"] == 120
+    assert first["by_agent"]["claude-code"]["compression_savings_usd_delta"] == pytest.approx(0.1)
+    assert first["by_agent"]["opencode"]["tokens_saved"] == 40
+    assert first["by_agent"]["opencode"]["total_input_tokens_delta"] == 80
+    assert (
+        first["by_agent"]["claude-code"]["tokens_saved"]
+        + first["by_agent"]["opencode"]["tokens_saved"]
+        == first["tokens_saved"]
+    )
+
+    second = hourly[1]
+    assert set(second["by_agent"]) == {"unknown"}
+    assert second["by_agent"]["unknown"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_rollup_reloads_persisted_agent_field(tmp_path):
+    """Persisted checkpoints keep their agent across a reload.
+
+    ``_normalize_history_entry`` runs on every load; if it drops the ``agent``
+    key, a real ``agent: "claude-code"`` checkpoint collapses into "unknown"
+    on the next restart even though in-memory attribution was correct.
+    """
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "timestamp": "2026-03-27T09:10:00Z",
+                        "provider": "anthropic",
+                        "agent": "claude-code",
+                        "model": "claude-3-5-sonnet",
+                        "total_tokens_saved": 100,
+                        "compression_savings_usd": 0.1,
+                        "total_input_tokens": 120,
+                        "total_input_cost_usd": 0.24,
+                    }
+                ]
+            }
+        )
+    )
+
+    tracker = SavingsTracker(
+        path=str(path),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+
+    by_agent = tracker.history_response()["series"]["hourly"][0]["by_agent"]
+    assert set(by_agent) == {"claude-code"}
+    assert by_agent["claude-code"]["tokens_saved"] == 100
 
 
 def test_savings_tracker_rollup_attributes_savings_per_model(tmp_path, monkeypatch):
