@@ -1,0 +1,198 @@
+{
+  "production_revision": "fcfe5108a6f6f7c8b03069ab5cbd5efb27398ef3",
+  "observer": "Wrap metrics.record_request; await original unchanged, retain four numeric arguments after successful completion. Response scoring is independent of metrics.",
+  "rows": [
+    {
+      "missing_usage_call": null,
+      "streaming": false,
+      "calls": 1,
+      "actual": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 13,
+        "cache_creation_input_tokens": 17
+      },
+      "metrics": [
+        {
+          "input_tokens": 41,
+          "output_tokens": 7,
+          "cache_read_tokens": 13,
+          "cache_write_tokens": 17
+        }
+      ]
+    },
+    {
+      "missing_usage_call": null,
+      "streaming": false,
+      "calls": 2,
+      "actual": {
+        "input_tokens": 33,
+        "output_tokens": 21,
+        "cache_read_input_tokens": 39,
+        "cache_creation_input_tokens": 51
+      },
+      "metrics": [
+        {
+          "input_tokens": 123,
+          "output_tokens": 21,
+          "cache_read_tokens": 39,
+          "cache_write_tokens": 51
+        }
+      ]
+    },
+    {
+      "missing_usage_call": null,
+      "streaming": false,
+      "calls": 3,
+      "actual": {
+        "input_tokens": 66,
+        "output_tokens": 42,
+        "cache_read_input_tokens": 78,
+        "cache_creation_input_tokens": 102
+      },
+      "metrics": [
+        {
+          "input_tokens": 246,
+          "output_tokens": 42,
+          "cache_read_tokens": 78,
+          "cache_write_tokens": 102
+        }
+      ]
+    },
+    {
+      "missing_usage_call": null,
+      "streaming": true,
+      "calls": 1,
+      "actual": {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "cache_read_input_tokens": 13,
+        "cache_creation_input_tokens": 17
+      },
+      "metrics": [
+        {
+          "input_tokens": 41,
+          "output_tokens": 7,
+          "cache_read_tokens": 13,
+          "cache_write_tokens": 17
+        }
+      ]
+    },
+    {
+      "missing_usage_call": null,
+      "streaming": true,
+      "calls": 2,
+      "actual": {
+        "input_tokens": 33,
+        "output_tokens": 21,
+        "cache_read_input_tokens": 39,
+        "cache_creation_input_tokens": 51
+      },
+      "metrics": [
+        {
+          "input_tokens": 123,
+          "output_tokens": 21,
+          "cache_read_tokens": 39,
+          "cache_write_tokens": 51
+        }
+      ]
+    },
+    {
+      "missing_usage_call": null,
+      "streaming": true,
+      "calls": 3,
+      "actual": {
+        "input_tokens": 66,
+        "output_tokens": 42,
+        "cache_read_input_tokens": 78,
+        "cache_creation_input_tokens": 102
+      },
+      "metrics": [
+        {
+          "input_tokens": 246,
+          "output_tokens": 42,
+          "cache_read_tokens": 78,
+          "cache_write_tokens": 102
+        }
+      ]
+    },
+    {
+      "missing_usage_call": 1,
+      "streaming": false,
+      "calls": 2,
+      "actual": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null,
+        "cache_creation": null
+      },
+      "metrics": [
+        {
+          "input_tokens": 33,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ]
+    },
+    {
+      "missing_usage_call": 1,
+      "streaming": false,
+      "calls": 3,
+      "actual": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null,
+        "cache_creation": null
+      },
+      "metrics": [
+        {
+          "input_tokens": 33,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ]
+    },
+    {
+      "missing_usage_call": 1,
+      "streaming": true,
+      "calls": 2,
+      "actual": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null
+      },
+      "metrics": [
+        {
+          "input_tokens": 33,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ]
+    },
+    {
+      "missing_usage_call": 1,
+      "streaming": true,
+      "calls": 3,
+      "actual": {
+        "input_tokens": null,
+        "output_tokens": null,
+        "cache_read_input_tokens": null,
+        "cache_creation_input_tokens": null
+      },
+      "metrics": [
+        {
+          "input_tokens": 33,
+          "output_tokens": 0,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0
+        }
+      ]
+    }
+  ]
+}
