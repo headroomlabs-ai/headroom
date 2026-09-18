@@ -63,7 +63,14 @@ def test_savings_tracker_migrates_v4_lifetime_to_v5_metrics_and_preserves_legacy
     tracker.flush()
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["schema_version"] == 5
-    assert saved["lifetime"] == legacy_state["lifetime"]
+    # Legacy values verbatim, plus the additive output block, which a v4 state
+    # has no keys for and so normalizes to zero.
+    assert saved["lifetime"] == {
+        **legacy_state["lifetime"],
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
+    }
     assert saved["display_session"]["requests"] == 2
     assert saved["projects"]["keep-me"]["requests"] == 1
     assert saved["lifetime_metrics"]["models"]["other"]["input_tokens"] == 80
