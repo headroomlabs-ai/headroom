@@ -83,7 +83,9 @@ pub struct SmartCrusherConfig {
     /// Strict lossless mode. When `true`, lossless tabular compaction
     /// still applies, but any path that would otherwise need a CCR
     /// marker — the lossy row-drop sentinel AND opaque-blob offload —
-    /// leaves the content uncompacted instead. The result is always
+    /// leaves the content uncompacted instead. The string, number and
+    /// mixed-array crushers and the object-key crusher, which drop items
+    /// without any marker, keep every item too. The result is always
     /// marker-free and byte-recoverable: rows are never dropped and
     /// opaque cells render inline. Default `false` (markers allowed).
     pub lossless_only: bool,
