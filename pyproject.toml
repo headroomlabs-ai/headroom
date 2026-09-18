@@ -342,7 +342,7 @@ sandbox = [
 ]
 
 [project.scripts]
-headroom = "headroom.cli:main"
+headroom = "headroom.cli.main:main"
 headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
 [project.urls]
