@@ -27,6 +27,15 @@ headroom install status
 
 This installs a background service on the current machine, applies persistent tool wiring, and keeps the proxy healthy on port `8787`.
 
+Native `persistent-service` manifests explicitly default the memory embedder to
+`cpu` and Kompress to `onnx`. This avoids selecting the Apple Silicon Metal
+backends during supervised startup, where a native MPS abort cannot be handled
+by Python. These are safe defaults only: explicit `--env
+HEADROOM_EMBEDDER_RUNTIME=pytorch_mps` or
+`--env HEADROOM_KOMPRESS_BACKEND=pytorch_mps` still opts into MPS and requires
+the matching platform and optional dependencies. The two settings are
+independent; the Kompress setting does not control memory embedding.
+
 ### Persistent watchdog task
 
 ```bash
