@@ -18,6 +18,7 @@ import os
 import signal
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import click
@@ -27,6 +28,8 @@ from click.testing import CliRunner
 from headroom import paths as paths_mod
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.memory.storage_router import ProjectResolver, RequestContext
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 
 # ---------------------------------------------------------------------------
 # _print_wrap_banner — centering math + box drawing.
@@ -377,7 +380,79 @@ class TestApplyProjectHeaderEnv:
         env: dict[str, str] = {}
         wrap_mod._apply_project_header_env(env)
 
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Project: my-project"
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Headroom-Project: my-project",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
+
+    def test_wrap_project_header_resolves_ccr_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+        headers = {
+            name.strip().lower(): value.strip()
+            for name, value in (
+                line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+            )
+        }
+
+        key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers), {}
+        )
+
+        assert key.startswith("my-project-")
+        assert label == "my-project"
+
+    def test_wrap_same_basename_projects_get_distinct_memory_and_ccr_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The wrapped headers keep same-named projects in separate stores."""
+        first = tmp_path / "one" / "api"
+        second = tmp_path / "two" / "api"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+
+        def wrapped_headers(project_dir: Path) -> dict[str, str]:
+            monkeypatch.chdir(project_dir)
+            env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Headroom-Project: shared"}
+            wrap_mod._apply_project_header_env(env)
+            return {
+                name.strip().lower(): value.strip()
+                for name, value in (
+                    line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+                )
+            }
+
+        headers_a = wrapped_headers(first)
+        headers_b = wrapped_headers(second)
+
+        assert headers_a["x-headroom-project"] == headers_b["x-headroom-project"] == "shared"
+        assert headers_a["x-headroom-cwd"] != headers_b["x-headroom-cwd"]
+
+        resolver = ProjectResolver()
+        memory_a = resolver.resolve(
+            RequestContext(headers=headers_a, system_prompt="", base_user_id="")
+        )
+        memory_b = resolver.resolve(
+            RequestContext(headers=headers_b, system_prompt="", base_user_id="")
+        )
+        assert memory_a is not None and memory_b is not None
+        assert memory_a[0] != memory_b[0]
+
+        ccr_a = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_a), {}
+        )
+        ccr_b = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_b), {}
+        )
+        assert ccr_a[0] == memory_a[0]
+        assert ccr_b[0] == memory_b[0]
+        assert ccr_a[0] != ccr_b[0]
 
     def test_appends_to_existing_custom_headers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -390,9 +465,11 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # User header preserved verbatim, ours appended on a new line.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
-            "X-Custom-Trace: abc123\nX-Headroom-Project: proj"
-        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Custom-Trace: abc123",
+            "X-Headroom-Project: proj",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
 
     @pytest.mark.parametrize(
         "user_value",
@@ -416,8 +493,10 @@ class TestApplyProjectHeaderEnv:
         env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
         wrap_mod._apply_project_header_env(env)
 
-        # Untouched: no duplicate header, user override wins.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+        # The user label remains untouched; the missing routing identity is appended.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     @pytest.mark.parametrize(
         "user_value",
@@ -440,7 +519,10 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # Only an exact header-name match counts as a user override.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (f"{user_value}\nX-Headroom-Project: proj")
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Project: proj\n"
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     def test_empty_cwd_name_sets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A degenerate cwd (e.g. filesystem root → empty basename) is a no-op."""
@@ -485,6 +567,34 @@ class TestApplyProjectHeaderEnv:
 
         assert urllib.parse.unquote(result) == "第二大脑共享"
 
+    def test_project_cwd_is_percent_encoded_and_round_trips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "project with space-中文"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        result = wrap_mod._project_cwd_from_cwd()
+        assert result is not None
+        result.encode("ascii")
+
+        import urllib.parse
+
+        assert urllib.parse.unquote(result) == str(project_dir.resolve())
+
+    def test_existing_cwd_header_wins_case_insensitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        user_value = "X-Headroom-Project: their-name\nx-headroom-cwd: /already/trusted"
+        env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
+        wrap_mod._apply_project_header_env(env)
+
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+
     def test_non_ascii_cwd_header_is_ascii_safe(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -498,6 +608,7 @@ class TestApplyProjectHeaderEnv:
 
         header_value = env["ANTHROPIC_CUSTOM_HEADERS"]
         assert header_value.startswith("X-Headroom-Project: ")
+        assert "X-Headroom-Cwd: " in header_value
         header_value.encode("ascii")  # raises UnicodeEncodeError if non-ASCII
 
 
