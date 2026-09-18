@@ -685,7 +685,7 @@ The response half. Same exposure rules as `/v1/compress`: loopback-only unless `
 | `latency_ms` | number | no | Gateway-measured provider latency, added to the turn's recorded latency. Must be non-negative. |
 | `round` | integer | no | Which provider call this response answers: `0` for the original forward, `n` for the `n`-th re-drive (the `round` this endpoint returned). Makes the call idempotent: a retried relay for a round already answered gets the same `redrive` answer again instead of being fed to the hook, and its usage is not billed twice. A round ahead of the turn is a `400`. |
 | `usage` | object | no | The provider's usage block, in any accepted shape (below). |
-| `response` | object | no | The full provider response JSON. **Required** when the turn carries `redrive`. |
+| `response` | object | no | The full provider response JSON. **Required** when the turn carries `redrive` and the provider call succeeded (`2xx`). A failed call closes the turn with its `status` alone. |
 | `model` | string | no | Provider-reported model. Accepted, not read today. |
 
 Accepted `usage` shapes — the whole provider response body works too, since a nested `usage` key is descended into once:
@@ -706,11 +706,12 @@ There are two answers. `done` ends the turn:
   "response": null,
   "frozen_message_count": 12,
   "usage_applied": true,
-  "rounds": 0
+  "rounds": 0,
+  "billed_usage": { "input_tokens": 3120, "output_tokens": 212, "cache_read_input_tokens": 20414 }
 }
 ```
 
-`response` is a replacement to send to the client when a hook produced one; otherwise it is `null` and you forward the provider response you already hold. `frozen_message_count` is the session's count after the usage was applied (`null` for a stateless turn). `usage_applied` is `false` when the usage carried no cache signal, the session had expired, or its lock was busy — never an error, since the turn is finishing and there is nothing to retry with. After `done` the turn is gone.
+`response` is what to send to the client. On a turn with no re-drive it is the hook's replacement when there is one, otherwise `null` and you forward the provider response you already hold. After one or more re-drives it is never `null`: it is the hook's replacement or the latest provider response, with `usage` set to the whole turn's bill. `frozen_message_count` is the session's count after the usage was applied (`null` for a stateless turn). `usage_applied` is `false` when the usage carried no cache signal, the session had expired, or its lock was busy — never an error, since the turn is finishing and there is nothing to retry with. `billed_usage` is what the provider billed for the whole turn: every counter, cache reads and writes included, summed across all rounds, in Anthropic keys (`null` when no usage was relayed). That total is the re-driven `response`'s `usage`, since the client made one call. After `done` the turn is gone.
 
 `redrive` asks for another provider call:
 
@@ -723,7 +724,7 @@ There are two answers. `done` ends the turn:
 }
 ```
 
-Send `request` to the provider exactly as given — it is the provider body with the hook's messages and possibly reloaded tools — and post the provider's JSON back under the same `turn_id`. Past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and `response: null`. Hook failures never fail the turn either: the answer is `done` with `response: null` and the gateway forwards what it holds.
+Send `request` to the provider exactly as given — it is the provider body with the hook's messages and possibly reloaded tools — and post the provider's JSON back under the same `turn_id`. Past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and the latest provider response. Hook failures never fail the turn either: the answer is `done`, with the latest provider response after a re-drive, or `response: null` before one, and the gateway forwards what it gets.
 
 | Status | Body | When |
 | --- | --- | --- |

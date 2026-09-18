@@ -187,6 +187,27 @@ class GatewayTurn:
             input_tokens=tokens_before,
             transforms=transforms,
         )
+        if self.provider == "anthropic":
+            # Last stop before the body leaves: a request over Anthropic's
+            # cache_control budget is a guaranteed 400 on the provider.
+            from headroom.proxy.helpers import enforce_cache_breakpoint_budget
+
+            provider_body = self._fields["body"]
+            client_messages = self.body.get("messages") if isinstance(self.body, dict) else None
+            system, guarded, tools, budget = enforce_cache_breakpoint_budget(
+                provider_body.get("system"),
+                provider_body.get("messages"),
+                provider_body.get("tools"),
+                client_messages=client_messages,
+                request_id=self._turn_id or "",
+            )
+            if budget["repaired"]:
+                if provider_body.get("system") is not None:
+                    provider_body["system"] = system
+                provider_body["messages"] = guarded
+                if provider_body.get("tools") is not None:
+                    provider_body["tools"] = tools
+                transforms.append("cache_breakpoint_budget")
         # I-BODY: top-level `messages` and `body.messages` are one list.
         return FinishedTurn(
             fields=self._fields,

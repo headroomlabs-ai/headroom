@@ -740,6 +740,129 @@ def enforce_cache_control_ttl_order(
     return system, messages, tools, stats
 
 
+#: Anthropic rejects a request with more than this many cache_control blocks
+#: across tools, system and messages ("A maximum of 4 blocks with
+#: cache_control may be provided").
+ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+
+
+def enforce_cache_breakpoint_budget(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    client_messages: Any = None,
+    limit: int = ANTHROPIC_MAX_CACHE_BREAKPOINTS,
+    request_id: str = "",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Last-stop guard: never forward more ``cache_control`` blocks than allowed.
+
+    A request over the limit is a guaranteed 400, and the client cannot have
+    caused it with its own markers, so whatever pushed it over was added on
+    the way through. Repairs in the order that costs the least caching:
+
+    1. Re-place message markers at the client's own positions
+       (:func:`~headroom.cache.prefix_tracker.normalize_message_cache_control`),
+       which drops markers a replay or transform carried in.
+    2. If still over, drop the OLDEST message markers first: the newest one is
+       the client's write anchor for the growing tail, and system/tools
+       markers cover the hottest, longest-lived prefix.
+    3. If still over, drop system markers, then tools markers, earliest first.
+
+    Returns ``(system, messages, tools, stats)``; the inputs come back by
+    identity when nothing needed repairing. Logs one WARNING per repair with
+    the per-section counts so the source of the extra marker is traceable.
+    """
+    before = count_cache_breakpoints(system, messages, tools)
+    stats: dict[str, Any] = {"repaired": False, "before": before, "after": before}
+    if before["total"] <= limit:
+        return system, messages, tools, stats
+
+    if isinstance(messages, list) and client_messages is not None:
+        from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+        messages = normalize_message_cache_control(messages, None, client_messages=client_messages)
+
+    for section in ("messages", "system", "tools"):
+        excess = count_cache_breakpoints(system, messages, tools)["total"] - limit
+        if excess <= 0:
+            break
+        budget = {"left": excess}
+        # Removal, oldest first in Anthropic's evaluation order. Copy-on-write:
+        # the forwarded body shares structure with the session snapshot.
+        if section == "messages" and isinstance(messages, list):
+            rebuilt: list[Any] = []
+            for msg in messages:
+                if budget["left"] <= 0 or not isinstance(msg, dict):
+                    rebuilt.append(msg)
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_blocks = []
+                    for block in content:
+                        if budget["left"] > 0 and isinstance(block, dict):
+                            inner = block.get("content")
+                            if isinstance(inner, list):
+                                new_inner = []
+                                for sub in inner:
+                                    if (
+                                        budget["left"] > 0
+                                        and isinstance(sub, dict)
+                                        and "cache_control" in sub
+                                    ):
+                                        sub = {k: v for k, v in sub.items() if k != "cache_control"}
+                                        budget["left"] -= 1
+                                    new_inner.append(sub)
+                                block = {**block, "content": new_inner}
+                            if budget["left"] > 0 and "cache_control" in block:
+                                block = {k: v for k, v in block.items() if k != "cache_control"}
+                                budget["left"] -= 1
+                        new_blocks.append(block)
+                    msg = {**msg, "content": new_blocks}
+                if budget["left"] > 0 and "cache_control" in msg:
+                    msg = {k: v for k, v in msg.items() if k != "cache_control"}
+                    budget["left"] -= 1
+                rebuilt.append(msg)
+            messages = rebuilt
+        elif section in ("system", "tools"):
+            holders = system if section == "system" else tools
+            if isinstance(holders, list):
+                rebuilt_h = []
+                for holder in holders:
+                    if (
+                        budget["left"] > 0
+                        and isinstance(holder, dict)
+                        and "cache_control" in holder
+                    ):
+                        holder = {k: v for k, v in holder.items() if k != "cache_control"}
+                        budget["left"] -= 1
+                    rebuilt_h.append(holder)
+                if section == "system":
+                    system = rebuilt_h
+                else:
+                    tools = rebuilt_h
+
+    after = count_cache_breakpoints(system, messages, tools)
+    stats.update({"repaired": True, "after": after})
+    logger.warning(
+        "event=cache_breakpoint_budget request_id=%s limit=%d "
+        "before_total=%d before_system=%d before_tools=%d before_messages=%d "
+        "after_total=%d after_system=%d after_tools=%d after_messages=%d; "
+        "the outbound request carried more cache_control blocks than the provider accepts",
+        request_id,
+        limit,
+        before["total"],
+        before["system"],
+        before["tools"],
+        before["messages"],
+        after["total"],
+        after["system"],
+        after["tools"],
+        after["messages"],
+    )
+    return system, messages, tools, stats
+
+
 def log_cache_breakpoints(
     *,
     request_id: str | None,
@@ -917,7 +1040,9 @@ def relocate_system_messages_to_top_level(
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
-    is dropped.
+    is dropped. Only text-shaped content moves: non-text blocks (images,
+    documents) stay in a mid-conversation system section at their original
+    position, because top-level `system` accepts text blocks only (issue #3552).
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -979,14 +1104,48 @@ def relocate_system_messages_to_top_level(
         return messages, system, False
 
     relocated_blocks: list[Any] = []
+    retained: dict[int, dict[str, Any]] = {}
     for i in sorted(system_indices):
-        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
-
-    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+        message = messages[i]
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            # Only text-shaped content may move into the top-level ``system``
+            # parameter (text blocks and bare strings). Non-text blocks such as
+            # images or documents stay in place so nothing is dropped and
+            # upstreams that reject non-text system blocks keep working
+            # (issue #3552).
+            hoisted_from_list: list[Any] = []
+            leftovers: list[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
+                    hoisted_from_list.append(block)
+                elif isinstance(block, str) and block:
+                    hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+                else:
+                    leftovers.append(block)
+            relocated_blocks.extend(hoisted_from_list)
+            if leftovers:
+                retained[i] = {**message, "content": leftovers}
+        else:
+            # String (and other) content converts losslessly to text blocks.
+            relocated_blocks.extend(_system_message_to_blocks(message))
 
     if not relocated_blocks:
+        if retained:
+            # Nothing text-shaped to relocate: the sections stay as they are.
+            return messages, system, False
         # System message(s) carried no content — drop the empty entries only.
+        clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
         return clean_messages, system, True
+
+    clean_messages = []
+    for i, message in enumerate(messages):
+        if i in system_indices:
+            trimmed = retained.get(i)
+            if trimmed is not None:
+                clean_messages.append(trimmed)
+            continue
+        clean_messages.append(message)
 
     if system is None or system == "" or system == []:
         new_system: Any = relocated_blocks

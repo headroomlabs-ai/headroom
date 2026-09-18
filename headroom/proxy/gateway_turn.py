@@ -263,6 +263,37 @@ class NormalizedUsage:
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
         )
 
+    def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
+        """Sum every counter across re-drive rounds: what the provider billed
+        for the whole turn, cache reads and writes of every round included.
+        ``merged_with`` keeps the latest cache state for freeze decisions;
+        this is the bill."""
+
+        def _sum(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        return NormalizedUsage(
+            input_tokens=_sum(self.input_tokens, other.input_tokens),
+            output_tokens=_sum(self.output_tokens, other.output_tokens),
+            cache_read=_sum(self.cache_read, other.cache_read),
+            cache_write=_sum(self.cache_write, other.cache_write),
+        )
+
+    def as_anthropic(self) -> dict[str, int]:
+        """Anthropic ``usage`` keys, only for the counters that were reported."""
+        out: dict[str, int] = {}
+        if self.input_tokens is not None:
+            out["input_tokens"] = self.input_tokens
+        if self.output_tokens is not None:
+            out["output_tokens"] = self.output_tokens
+        if self.cache_read is not None:
+            out["cache_read_input_tokens"] = self.cache_read
+        if self.cache_write is not None:
+            out["cache_creation_input_tokens"] = self.cache_write
+        return out
+
 
 def _usage_int(usage: dict[str, Any], name: str) -> int | None:
     if name not in usage:
@@ -475,8 +506,11 @@ class PendingTurn:
     runner: SuspendedHookRunner | None = None
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
-    # Billed usage accumulated across every response-half call for the turn.
+    # Usage accumulated across every response-half call for the turn: input
+    # and output summed, cache fields from the latest round (freeze state).
     usage: NormalizedUsage | None = None
+    # Every counter summed across rounds: the turn's bill.
+    billed: NormalizedUsage | None = None
     # A second response-half call while one is being driven would race the
     # parked coroutine; the handler answers 409 instead.
     in_flight: bool = False
@@ -1325,6 +1359,31 @@ def _redrive_payload(turn: PendingTurn, step: Step) -> dict[str, Any]:
     }
 
 
+def _usage_in_shape(existing: dict[str, Any], billed: NormalizedUsage) -> dict[str, Any]:
+    """Overwrite ``existing`` usage counters with ``billed``, keeping its shape.
+
+    An OpenAI chat usage block (``prompt_tokens``) gets chat keys; anything
+    else gets Anthropic keys. Counters the provider never reported stay out.
+    """
+    out = dict(existing)
+    if "prompt_tokens" in existing or "completion_tokens" in existing:
+        if billed.input_tokens is not None:
+            out["prompt_tokens"] = billed.input_tokens
+        if billed.output_tokens is not None:
+            out["completion_tokens"] = billed.output_tokens
+        if billed.input_tokens is not None or billed.output_tokens is not None:
+            out["total_tokens"] = (billed.input_tokens or 0) + (billed.output_tokens or 0)
+        if billed.cache_read is not None:
+            details = existing.get("prompt_tokens_details")
+            out["prompt_tokens_details"] = {
+                **(details if isinstance(details, dict) else {}),
+                "cached_tokens": billed.cache_read,
+            }
+        return out
+    out.update(billed.as_anthropic())
+    return out
+
+
 async def handle_compress_response(proxy: Any, request: Any) -> Any:
     """``POST /v1/compress/response`` — finish or re-drive a pending turn."""
     from fastapi.responses import JSONResponse
@@ -1375,7 +1434,9 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
             "unknown_turn",
             f"No pending turn {turn_id!r} (never registered, already finished, or expired).",
         )
-    if OBLIGATION_REDRIVE in turn.obligations and response is None:
+    # A failed provider call has nothing to re-drive: its status (and usage,
+    # if any) closes the turn. Only a successful response must carry the body.
+    if OBLIGATION_REDRIVE in turn.obligations and response is None and 200 <= status < 300:
         return _error(
             400,
             "missing_response",
@@ -1416,6 +1477,7 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     try:
         if usage is not None:
             turn.usage = usage if turn.usage is None else turn.usage.merged_with(usage)
+            turn.billed = usage if turn.billed is None else turn.billed.summed_with(usage)
 
         step: Step | None = None
         if turn.hooks_armed and turn.ctx is not None:
@@ -1461,7 +1523,10 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
         frozen, applied = await apply_session_usage(proxy, turn, turn.usage)
         if turn.outcome_draft is not None:
             outcome = complete_outcome(
-                turn.outcome_draft, turn.usage, status=status, latency_ms=latency_ms
+                turn.outcome_draft,
+                turn.billed or turn.usage,
+                status=status,
+                latency_ms=latency_ms,
             )
             turn.outcome_draft = None
             await proxy._record_request_outcome(outcome)
@@ -1470,6 +1535,25 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
         )
         if registry is not None:
             registry.pop(turn_id)
+        billed = turn.billed.as_anthropic() if turn.billed is not None else None
+        # After a re-drive the answer is either the hook's replacement or, when
+        # the hook handed back the latest provider response (``response: null``),
+        # the response the gateway posted on this call. Either way the client made
+        # one call, so its response reports what the provider billed for all of
+        # it, the way a server-side tool loop does, in the response's own usage
+        # shape. A turn with no re-drive keeps ``response: null``: the gateway's
+        # held response already carries the whole bill.
+        answer = final_response if final_response is not None else response
+        if (
+            turn.rounds > 0
+            and billed
+            and isinstance(answer, dict)
+            and isinstance(answer.get("usage"), dict)
+        ):
+            final_response = {
+                **answer,
+                "usage": _usage_in_shape(answer["usage"], turn.billed),
+            }
         return JSONResponse(
             {
                 "action": "done",
@@ -1478,6 +1562,8 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
                 "frozen_message_count": frozen,
                 "usage_applied": applied,
                 "rounds": turn.rounds,
+                # Every counter summed across rounds, Anthropic keys.
+                "billed_usage": billed,
             }
         )
     finally:

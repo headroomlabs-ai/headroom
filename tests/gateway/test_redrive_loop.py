@@ -123,11 +123,23 @@ def test_one_redrive_round_end_to_end(headroom_client, fake_provider, make_gatew
     done = result.done
     assert done is not None
     assert done["rounds"] == 1
-    # The hook's final answer IS the last provider response the gateway posted,
-    # so ``response`` may be null ("forward what you already have") or that same
-    # body; the client-visible invariant (asserted above) is what matters.
-    assert done["response"] is None or done["response"]["id"] == "chatcmpl-final"
+    # The hook hands back the latest provider response object itself (no
+    # replacement). After a re-drive Headroom still returns that response, with
+    # usage summed over both provider calls, so the client never sees the last
+    # round's usage alone.
+    assert done["response"] is not None
+    assert done["response"]["id"] == "chatcmpl-final"
     assert done["usage_applied"] is True  # cached_tokens=300 on the final answer
+    # The turn's bill covers both provider calls, not just the last one.
+    assert done["billed_usage"]["input_tokens"] == 300 + 420
+    assert done["billed_usage"]["output_tokens"] == 8 + 6
+    assert done["billed_usage"]["cache_read_input_tokens"] == 300
+    assert done["response"]["usage"]["prompt_tokens"] == 720
+    assert done["response"]["usage"]["completion_tokens"] == 14
+    assert done["response"]["usage"]["prompt_tokens_details"]["cached_tokens"] == 300
+    # What the gateway hands the client is that cumulative response.
+    assert result.final_response["usage"]["prompt_tokens"] == 720
+    assert result.final_response["usage"]["completion_tokens"] == 14
     assert hook.rounds_driven == 1
     assert hook.queries == ["create issue"]
     # L-CLEAN
@@ -221,7 +233,11 @@ def test_registry_max_redrives_env_caps_the_loop(
     # ``rounds`` past the cap and is answered ``done`` instead of ``redrive``.
     assert len(fake_provider.calls) == 3
     assert result.done["rounds"] == 3
-    assert result.done["response"] is None
+    # The capped turn still ran three provider calls for one client call: the
+    # latest provider answer comes back with usage summed over all three.
+    assert result.done["response"]["choices"][0]["message"]["tool_calls"][0]["id"] == "s2"
+    assert result.done["response"]["usage"]["prompt_tokens"] == 3 * 10
+    assert result.done["response"]["usage"]["completion_tokens"] == 3 * 5
     assert registry_of(client).get(result.turn_id) is None
 
 
@@ -256,6 +272,25 @@ def test_missing_response_on_redrive_turn_is_400(headroom_client) -> None:
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"]["type"] == "missing_response"
     assert registry_of(headroom_client).get(data["turn_id"]) is not None
+
+
+def test_failed_call_closes_a_redrive_turn_without_a_response(headroom_client) -> None:
+    """L-GUARDS: a provider failure has nothing to re-drive. A gateway that
+    only knows the status (LiteLLM's failure hooks see an exception, not a
+    body) must still be able to close the turn and leave a ledger row."""
+    redrive_hook_ext.register()
+    data = headroom_client.post(
+        "/v1/compress",
+        json={**_chat_body(), "gateway": {"can_redrive": True}, "config": {"session_id": "fail"}},
+    ).json()
+    assert data["obligations"] == ["redrive"]
+    resp = headroom_client.post(
+        "/v1/compress/response", json={"turn_id": data["turn_id"], "round": 0, "status": 529}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["action"] == "done"
+    assert resp.json()["response"] is None
+    assert registry_of(headroom_client).get(data["turn_id"]) is None
 
 
 def test_non_200_provider_status_skips_hooks(headroom_client, fake_provider, make_gateway) -> None:
@@ -449,3 +484,28 @@ def test_stale_retry_replays_last_redrive_without_double_billing(
     assert result.path == "loop"
     assert [c.request["round"] for c in result.response_half_calls] == [0, 1]
     assert result.final_response["choices"][0]["message"]["content"] == "final answer"
+
+
+def test_billed_usage_is_written_in_the_responses_own_shape() -> None:
+    from headroom.proxy.gateway_turn import NormalizedUsage, _usage_in_shape
+
+    billed = NormalizedUsage(input_tokens=720, output_tokens=14, cache_read=300, cache_write=50)
+    anthropic = _usage_in_shape(
+        {"input_tokens": 420, "output_tokens": 6, "service_tier": "standard"}, billed
+    )
+    assert anthropic == {
+        "input_tokens": 720,
+        "output_tokens": 14,
+        "cache_read_input_tokens": 300,
+        "cache_creation_input_tokens": 50,
+        "service_tier": "standard",
+    }
+    chat = _usage_in_shape(
+        {"prompt_tokens": 420, "completion_tokens": 6, "total_tokens": 426}, billed
+    )
+    assert chat == {
+        "prompt_tokens": 720,
+        "completion_tokens": 14,
+        "total_tokens": 734,
+        "prompt_tokens_details": {"cached_tokens": 300},
+    }

@@ -1873,6 +1873,75 @@ class HeadroomProxy(
 
         return eager_status, transform_statuses
 
+    def _start_kompress_background_warmup(self) -> bool:
+        """Load the Kompress model on a daemon thread once startup has returned.
+
+        Startup must not build the model (native init before the port binds
+        segfaults on RHEL/CentOS 7-family hosts, #1908), so it used to load
+        inside the first request that needed it: a benchmark turn through a
+        gateway stalled 21 s while transformers, torch and the ONNX session
+        came up. Loading on a background thread after a short delay moves that
+        cost off the request path. Skipped on glibc older than 2.28 (the
+        affected host family) and when ``HEADROOM_KOMPRESS_WARMUP`` is ``0``;
+        ``1`` forces it. Returns ``True`` when a warm-up thread was started.
+        """
+        raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        if not raw and os.environ.get("PYTEST_CURRENT_TEST"):
+            # Test apps boot by the hundred; none of them should load a model.
+            return False
+        if raw not in ("1", "true", "yes", "on"):
+            import platform
+
+            libc, version = platform.libc_ver()
+            if libc == "glibc":
+                try:
+                    major, minor = (int(part) for part in version.split(".")[:2])
+                except ValueError:
+                    major, minor = 0, 0
+                if (major, minor) < (2, 28):
+                    return False
+        compressor = None
+        for pipeline in (self.anthropic_pipeline, self.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", []):
+                getter = getattr(transform, "_get_kompress", None)
+                if getter is None:
+                    continue
+                try:
+                    compressor = getter()
+                except Exception:
+                    compressor = None
+                if compressor is not None and hasattr(compressor, "preload"):
+                    break
+                compressor = None
+            if compressor is not None:
+                break
+        if compressor is None:
+            return False
+
+        try:
+            delay = float(os.environ.get("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "2") or 2)
+        except ValueError:
+            delay = 2.0
+
+        def _warm() -> None:
+            time.sleep(max(0.0, delay))
+            started = time.monotonic()
+            try:
+                backend = compressor.preload(allow_download=True)
+            except Exception as exc:  # the lazy request path still loads on first use
+                logger.warning("Kompress background warm-up failed: %s", exc)
+                return
+            logger.info(
+                "Kompress: warmed in the background in %.0f ms (backend %s)",
+                (time.monotonic() - started) * 1000,
+                backend,
+            )
+
+        threading.Thread(target=_warm, name="kompress-warmup", daemon=True).start()
+        return True
+
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
@@ -2013,7 +2082,10 @@ class HeadroomProxy(
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
-            logger.info("Kompress: DEFERRED (model loads on first request)")
+            if self._start_kompress_background_warmup():
+                logger.info("Kompress: DEFERRED (warming in the background after startup)")
+            else:
+                logger.info("Kompress: DEFERRED (model loads on first request)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -3847,6 +3919,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
+    _MAX_RUNTIME_ENV_BODY_BYTES = 64 * 1024
+
     @app.post(
         "/admin/runtime-env",
         dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
@@ -3866,8 +3940,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         the resulting live config. Last writer wins in a single-worker proxy;
         multi-worker proxies reject the update because overrides are process-local.
         """
+        body_bytes = bytearray()
+        async for chunk in request.stream():
+            body_bytes.extend(chunk)
+            if len(body_bytes) > _MAX_RUNTIME_ENV_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "request body too large"},
+                )
         try:
-            body = await request.json()
+            body = json.loads(bytes(body_bytes))
         except (ValueError, UnicodeDecodeError):
             body = None
         if not isinstance(body, dict):
@@ -4675,10 +4757,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
             # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
-            # derived entirely from LiteLLM's cost tables, and LiteLLM is gated
-            # off on Python >=3.14 in pyproject — so when this is False the
-            # dashboard tells the user to reinstall on 3.13 instead of just
-            # showing $0.00 forever.
+            # derived entirely from LiteLLM's cost tables, so when this is False
+            # (LiteLLM missing from the environment) clients can tell "pricing
+            # unavailable" apart from a genuine $0.00.
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,

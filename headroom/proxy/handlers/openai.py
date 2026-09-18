@@ -2157,10 +2157,13 @@ class OpenAIHandlerMixin:
         # _tool_call_command_text helper:
         #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
         #   - local_shell_call.action  (native Responses shell; argv or string)
+        #   - custom_tool_call.input   (Codex code-mode `exec`: JavaScript calling
+        #                               tools.exec_command({"cmd": …}))
         # Content is gated per-output by _read_output_should_be_protected so
         # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
         # compressible, exactly like the chat path.
         from headroom.transforms.content_router import (
+            _custom_tool_call_commands,
             _is_read_command,
             _read_output_should_be_protected,
             _tool_call_command_text,
@@ -2177,6 +2180,17 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("arguments"))
                 elif item_type == "local_shell_call":
                     command = _tool_call_command_text(item.get("action"))
+                elif item_type == "custom_tool_call":
+                    # One script can run several commands; its single output is a
+                    # read when any of them is (over-protecting only costs savings).
+                    command = next(
+                        (
+                            c
+                            for c in _custom_tool_call_commands(item.get("input"))
+                            if _is_read_command(c)
+                        ),
+                        "",
+                    )
                 else:
                     continue
                 call_id = item.get("call_id")
@@ -10099,7 +10113,17 @@ class OpenAIHandlerMixin:
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
                     turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
-                    final = turn.messages
+                    # A replay can carry an earlier turn's cache_control marker
+                    # after the caller moved its breakpoint forward, and
+                    # Anthropic rejects more than four. Keep message markers at
+                    # the caller's current positions, as the /v1/messages
+                    # handler does after its own replay. The gateway's finish
+                    # step still enforces the hard budget on the whole body.
+                    from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+                    final = normalize_message_cache_control(
+                        turn.messages, prev_returned, client_messages=messages
+                    )
                     if _turn is not None:
                         # AFTER the replay overlay, BEFORE update_from_result /
                         # record_returned: the turn's output is what the caller

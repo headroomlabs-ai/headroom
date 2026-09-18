@@ -159,7 +159,7 @@ def _public_model(model: str) -> str | None:
 
     litellm's cost map is exactly the "is this a public SKU" oracle, and
     Headroom already consults it for pricing in ``proxy/savings_tracker.py``.
-    Unknown model, or litellm absent (it is gated to Python < 3.14), means no
+    Unknown model, or litellm absent, means no
     model field. Under-reporting is the correct failure direction here.
     """
     if not model:
