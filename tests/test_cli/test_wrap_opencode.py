@@ -374,6 +374,105 @@ def test_wrap_opencode_missing_binary_errors_clearly(
     assert "'opencode' not found in PATH" in result.output
 
 
+def test_wrap_opencode_custom_binary_option(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--opencode-bin launches an OpenCode fork by a different command name,
+    still treated as opencode for savings attribution (#1927)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_BIN", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="/usr/local/bin/rolandcode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(
+                main,
+                ["wrap", "opencode", "--no-mcp", "--opencode-bin", "rolandcode"],
+            )
+
+    assert result.exit_code == 0, result.output
+    assert captured["binary"] == "/usr/local/bin/rolandcode"
+    assert captured["agent_type"] == "opencode"
+
+
+def test_wrap_opencode_custom_binary_env_var(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_OPENCODE_BIN selects the fork binary when no flag is given."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.setenv("HEADROOM_OPENCODE_BIN", "rolandcode")
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="/opt/rolandcode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "opencode", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["binary"] == "/opt/rolandcode"
+
+
+def test_wrap_opencode_custom_binary_relative_path(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing relative binary path launches by path, not by PATH lookup."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_BIN", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+    local_bin = tmp_path / "rolandcode"
+    local_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value=None):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(
+                main,
+                ["wrap", "opencode", "--no-mcp", "--opencode-bin", "./rolandcode"],
+            )
+
+    assert result.exit_code == 0, result.output
+    assert captured["binary"] == str(local_bin.resolve())
+
+
+def test_wrap_opencode_missing_custom_binary_names_it(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing fork binary names the requested command in the error."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("HEADROOM_OPENCODE_BIN", raising=False)
+
+    with patch.object(wrap_mod.shutil, "which", return_value=None):
+        result = runner.invoke(main, ["wrap", "opencode", "--opencode-bin", "rolandcode"])
+
+    assert result.exit_code == 1
+    assert "'rolandcode' not found in PATH" in result.output
+
+
 def test_wrap_opencode_missing_binary_does_not_mutate_config(
     runner: CliRunner,
     tmp_path: Path,
