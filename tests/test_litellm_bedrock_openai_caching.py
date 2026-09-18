@@ -31,6 +31,7 @@ import litellm  # noqa: E402
 
 from headroom.backends.litellm import (  # noqa: E402  (must follow importorskip)
     LiteLLMBackend,
+    _bedrock_openai_caching_eligible,
     _place_system_cache_control,
 )
 
@@ -277,4 +278,90 @@ def test_helper_marks_last_text_block_of_list_content() -> None:
 
     assert out[0]["content"][1] == {"type": "text", "text": "b", "cache_control": EPHEMERAL}
     assert out[0]["content"][0] is messages[0]["content"][0]
+    assert messages == before
+
+
+def test_eligible_returns_false_when_supports_prompt_caching_unavailable() -> None:
+    """ImportError path leaves supports_prompt_caching as None; treat as ineligible."""
+    with patch("headroom.backends.litellm.supports_prompt_caching", None):
+        assert _bedrock_openai_caching_eligible("bedrock/anthropic.claude-sonnet-4") is False
+
+
+def test_helper_skips_non_dict_messages_then_marks_system() -> None:
+    messages = [
+        "not-a-dict",
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "sys"},
+    ]
+    before = copy.deepcopy(messages)
+
+    out = _place_system_cache_control(messages)
+
+    assert out[0] is messages[0]
+    assert out[1] is messages[1]
+    assert out[2] == {"role": "system", "content": "sys", "cache_control": EPHEMERAL}
+    assert messages == before
+
+
+def test_helper_respects_message_level_cache_control() -> None:
+    messages = [
+        {"role": "system", "content": "sys", "cache_control": EPHEMERAL},
+        {"role": "user", "content": "hi"},
+    ]
+
+    out = _place_system_cache_control(messages)
+
+    assert out is messages
+
+
+def test_helper_skips_system_with_empty_or_non_text_content() -> None:
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "system", "content": None},
+        {
+            "role": "system",
+            "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://x"}},
+                {"type": "text", "text": ""},
+            ],
+        },
+        {"role": "user", "content": "hi"},
+    ]
+    before = copy.deepcopy(messages)
+
+    out = _place_system_cache_control(messages)
+
+    assert out is messages
+    assert messages == before
+
+
+def test_helper_returns_unchanged_when_no_system_message() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+
+    out = _place_system_cache_control(messages)
+
+    assert out is messages
+
+
+def test_helper_marks_system_after_unmarkable_system_and_user() -> None:
+    """Empty/list-without-text systems are skipped; first markable system wins."""
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "hi"},
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "keep"}],
+        },
+    ]
+    before = copy.deepcopy(messages)
+
+    out = _place_system_cache_control(messages)
+
+    assert out[0] is messages[0]
+    assert out[1] is messages[1]
+    assert out[2]["content"][0] == {
+        "type": "text",
+        "text": "keep",
+        "cache_control": EPHEMERAL,
+    }
     assert messages == before
