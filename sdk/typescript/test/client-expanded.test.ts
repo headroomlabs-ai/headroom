@@ -2,7 +2,7 @@
  * Tests for expanded HeadroomClient — chat.completions, messages, metrics, CCR, etc.
  * Uses mocked proxy (no real server needed).
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { HeadroomClient } from "../src/client.js";
 
 const mockFetch = vi.fn();
@@ -16,6 +16,46 @@ function jsonResponse(data: any, ok = true) {
     text: async () => JSON.stringify(data),
   };
 }
+
+describe("provider requests authenticate to the proxy separately", () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    mockFetch.mockResolvedValue(jsonResponse({}));
+    for (const name of ["HEADROOM_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]) {
+      vi.stubEnv(name, "");
+    }
+  });
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([
+    ["openai", "explicit"], ["anthropic", "explicit"],
+    ["openai", "environment"], ["anthropic", "environment"],
+    ["openai", "proxy-only"], ["anthropic", "proxy-only"],
+    ["openai", "provider-only"], ["anthropic", "provider-only"],
+  ])("sends the correct credentials for %s (%s)", async (provider, source) => {
+    const hasProxy = source !== "provider-only";
+    const hasProvider = source !== "proxy-only";
+    const fromEnv = source === "environment";
+    if (fromEnv) {
+      vi.stubEnv("HEADROOM_API_KEY", "proxy-token");
+      vi.stubEnv(provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY", "provider-key");
+    }
+    const client = new HeadroomClient({
+      baseUrl: "http://proxy:8787",
+      apiKey: hasProxy && !fromEnv ? "proxy-token" : undefined,
+      providerApiKey: hasProvider && !fromEnv ? "provider-key" : undefined,
+    });
+    const params = { model: "test-model", messages: [{ role: "user" as const, content: "hello" }] };
+    await (provider === "openai" ? client.chat.completions.create(params) : client.messages.create(params));
+
+    const headers = new Headers(mockFetch.mock.calls[0][1].headers);
+    expect(headers.get("X-Headroom-Proxy-Token")).toBe(hasProxy ? "proxy-token" : null);
+    expect(headers.get("Authorization")).toBe(
+      hasProvider ? (provider === "openai" ? "Bearer provider-key" : null) : "Bearer proxy-token",
+    );
+    expect(headers.get("x-api-key")).toBe(hasProvider && provider === "anthropic" ? "provider-key" : null);
+  });
+});
 
 describe("HeadroomClient constructor", () => {
   it("accepts extended options", () => {
