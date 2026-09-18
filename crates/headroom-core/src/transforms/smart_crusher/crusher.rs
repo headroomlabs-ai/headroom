@@ -980,6 +980,13 @@ impl SmartCrusher {
             return (items.to_vec(), "mixed:passthrough".to_string());
         }
 
+        // Strict lossless mode: the string and number groups below are
+        // sampled without a CCR marker, so keep every item instead. (The
+        // dict group would already be kept whole by `crush_array`.)
+        if self.config.lossless_only {
+            return (items.to_vec(), "mixed:lossless_only".to_string());
+        }
+
         // Group by type, tracking original indices.
         let mut groups: GroupBuckets = GroupBuckets::default();
         for (i, item) in items.iter().enumerate() {
@@ -2072,5 +2079,74 @@ mod tests {
             store_len_before,
             "ccr_store grew under lossless_only — invariant violated"
         );
+    }
+
+    #[test]
+    fn lossless_only_keeps_every_mixed_array_item() {
+        // The mixed-array crusher samples its string and number groups
+        // and drops the rest with no marker (#3625).
+        let items: Vec<Value> = (0..40)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!(format!("entry-{i}"))
+                } else {
+                    json!(i)
+                }
+            })
+            .collect();
+
+        let (lossy, _) = crusher().crush_mixed_array(&items, "", 1.0);
+        assert!(lossy.len() < items.len(), "default config should drop");
+
+        let strict = SmartCrusher::new(SmartCrusherConfig {
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let (out, strategy) = strict.crush_mixed_array(&items, "", 1.0);
+        assert_eq!(out, items, "lossless_only must keep every item");
+        assert_eq!(strategy, "mixed:lossless_only");
+    }
+
+    #[test]
+    fn lossless_only_crush_keeps_non_dict_arrays_and_object_keys() {
+        // End-to-end through `crush()`, starting from the #3625 report:
+        // an object whose value is a string array lost 38 of 53 items
+        // with no marker even though lossless_only was set.
+        let mut meta = serde_json::Map::new();
+        for i in 0..40 {
+            meta.insert(
+                format!("k{i:02}"),
+                json!(format!(
+                    "long description for entry {i}, above the small-value floor"
+                )),
+            );
+        }
+        let doc = json!({
+            "slugs": (0..53).map(|i| format!("r{i}")).collect::<Vec<_>>(),
+            "sizes": (1..=40).collect::<Vec<_>>(),
+            "mixed": (0..40)
+                .map(|i| if i % 2 == 0 { json!(format!("entry-{i}")) } else { json!(i) })
+                .collect::<Vec<_>>(),
+            "meta": meta,
+        });
+        let content = doc.to_string();
+
+        let lossy: Value = serde_json::from_str(&crusher().crush(&content, "", 1.0).compressed)
+            .expect("default output is JSON");
+        assert_ne!(lossy, doc, "default config should drop items");
+
+        let strict = SmartCrusher::new(SmartCrusherConfig {
+            lossless_only: true,
+            ..SmartCrusherConfig::default()
+        });
+        let result = strict.crush(&content, "", 1.0);
+        assert!(
+            !result.compressed.contains("<<ccr:"),
+            "marker leaked under lossless_only: {}",
+            result.compressed
+        );
+        let parsed: Value =
+            serde_json::from_str(&result.compressed).expect("lossless_only output is JSON");
+        assert_eq!(parsed, doc, "lossless_only output must decode to the input");
     }
 }
