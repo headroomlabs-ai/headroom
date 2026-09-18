@@ -13,6 +13,7 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
+from headroom.providers.grok import session_upstream
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 
@@ -48,6 +49,9 @@ def select_passthrough_base_url(
         return CHATGPT_BACKEND_API_URL
     if headers.get("x-goog-api-key"):
         return api_target(proxy, "gemini")
+    grok_session = session_upstream(headers)
+    if grok_session:
+        return grok_session
     if headers.get("api-key"):
         azure_base = headers.get("x-headroom-base-url", "")
         if azure_base:

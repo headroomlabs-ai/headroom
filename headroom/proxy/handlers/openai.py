@@ -69,6 +69,7 @@ from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
 from headroom.providers.copilot import model_prefers_responses_api
+from headroom.providers.grok import session_upstream as grok_session_upstream
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -378,7 +379,9 @@ def _resolve_openai_handler_path(
 def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
-        return None
+        # A `grok login` session token is only valid at the Grok CLI's own
+        # session host; the Grok CLI cannot set x-headroom-base-url itself.
+        return grok_session_upstream(request_headers)
 
     normalized = _normalize_origin(raw_base_url)
     if normalized is None:

@@ -97,3 +97,34 @@ def test_header_with_subpath_preserves_path() -> None:
     # Trailing slash is normalized away, not doubled.
     trailing = _FakeRequest({"x-headroom-base-url": "https://gateway.example/api/v1/"})
     assert proxy._resolve_openai_upstream(trailing) == "https://gateway.example/api/v1"
+
+
+def test_grok_session_login_request_routes_to_session_host_without_header() -> None:
+    """The Grok CLI cannot send x-headroom-base-url; a `grok login` session token
+    must still reach the host that accepts it instead of the api.x.ai target
+    `headroom wrap grok` configures (which answers it 401)."""
+    proxy = _stub_proxy("https://api.x.ai")
+    session = _FakeRequest(
+        {
+            "Authorization": "Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y",
+            "X-Xai-Token-Auth": "xai-grok-cli",
+            "User-Agent": "grok-shell/0.2.112 (macos; aarch64)",
+        }
+    )
+    assert proxy._resolve_openai_upstream(session) == "https://cli-chat-proxy.grok.com"
+
+    # An xai- API key stays on the configured target.
+    keyed = _FakeRequest(
+        {"Authorization": "Bearer xai-abc", "User-Agent": "grok-shell/0.2.112 (macos; aarch64)"}
+    )
+    assert proxy._resolve_openai_upstream(keyed) == "https://api.x.ai"
+
+    # An explicit header still wins over the session default.
+    explicit = _FakeRequest(
+        {
+            "Authorization": "Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y",
+            "X-Xai-Token-Auth": "xai-grok-cli",
+            "x-headroom-base-url": "https://gateway.example",
+        }
+    )
+    assert proxy._resolve_openai_upstream(explicit) == "https://gateway.example"

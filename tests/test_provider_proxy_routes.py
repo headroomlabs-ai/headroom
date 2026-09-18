@@ -595,6 +595,39 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
     assert len(delegated) >= 26
 
 
+def test_list_models_routes_grok_session_login_to_session_host(monkeypatch) -> None:
+    """GET /v1/models is the Grok CLI's catalog fetch. A `grok login` session
+    (no `x-headroom-base-url`, which Grok cannot send) must resolve to the
+    session host, not the configured OpenAI target that answers it 401."""
+    captured: list[str] = []
+
+    async def fake_metadata(proxy, request, *, endpoint, provider_api_base_url, provider_name):  # type: ignore[no-untyped-def]
+        captured.append(provider_api_base_url)
+        return JSONResponse({"provider_api_base_url": provider_api_base_url})
+
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes.handle_model_metadata_endpoint", fake_metadata
+    )
+
+    grok_session = {
+        "authorization": "Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y",
+        "x-xai-token-auth": "xai-grok-cli",
+        "user-agent": "grok-shell/0.2.112 (macos; aarch64)",
+    }
+    with TestClient(_app()) as client:
+        assert client.get("/v1/models", headers=grok_session).json() == {
+            "provider_api_base_url": "https://cli-chat-proxy.grok.com"
+        }
+        # A Grok CLI carrying an xai- API key keeps the configured OpenAI target.
+        client.get(
+            "/v1/models",
+            headers={"authorization": "Bearer xai-abc", "user-agent": "grok-shell/0.2.112"},
+        )
+
+    assert captured[0] == "https://cli-chat-proxy.grok.com"
+    assert captured[1] != "https://cli-chat-proxy.grok.com"
+
+
 def test_openai_response_websocket_aliases_delegate_to_openai_ws_handler(monkeypatch) -> None:
     seen_paths: list[str] = []
 
