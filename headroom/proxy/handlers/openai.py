@@ -88,6 +88,7 @@ from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_fo
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
+from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -1187,13 +1188,21 @@ def _should_buffer_openai_responses_stream_ccr(
     ccr_response_handler_enabled: bool,
     tools: Any,
     is_chatgpt_auth: bool,
+    upstream_base_url: str | None = None,
 ) -> bool:
-    """Return whether streaming Responses CCR should use buffered JSON mode."""
+    """Return whether streaming Responses CCR should use buffered JSON mode.
+
+    OpenCode Zen validates OpenCode-client attribution on the wire and rejects
+    requests Headroom has reshaped (``stream:false`` plus
+    ``accept: application/json``) with ``403 FreeTierError`` (#3656). Leave the
+    client's streaming request untouched for that gateway.
+    """
 
     return bool(
         stream
         and ccr_response_handler_enabled
         and not is_chatgpt_auth
+        and not is_opencode_zen_base(upstream_base_url)
         and _has_headroom_retrieve_tool_responses(tools)
     )
 
@@ -5558,10 +5567,13 @@ class OpenAIHandlerMixin:
         # This handler also honors `x-headroom-base-url` (resolved further
         # below); resolve it here too so the secret headers are gated on the
         # real destination rather than merged before it is known.
+        # Resolve the client-supplied upstream once: the secret-header gate,
+        # the routing decision, and the CCR streaming decision all need it.
+        upstream_base_url = _resolve_openai_upstream_base(request.headers)
         headers = merge_extra_headers(
             headers,
             self.config.openai_extra_headers,
-            upstream_url=_resolve_openai_upstream_base(request.headers),
+            upstream_url=upstream_base_url,
             config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
@@ -5865,7 +5877,6 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = _resolve_openai_upstream_base(request.headers)
             handler_path = (
                 _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
                 if upstream_base_url is not None
@@ -6093,6 +6104,7 @@ class OpenAIHandlerMixin:
             ccr_response_handler_enabled=_ccr_response_handler_enabled,
             tools=body.get("tools"),
             is_chatgpt_auth=is_chatgpt_auth,
+            upstream_base_url=upstream_base_url,
         )
         if buffered_stream_ccr:
             if body.get("stream") is not False:
