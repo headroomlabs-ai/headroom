@@ -342,12 +342,22 @@ The recommended way to install rust is using `rustup`. You can find the official
 Headroom serves a live savings dashboard while the proxy is running. Open it with:
 
 ```bash
-headroom dashboard            # opens http://localhost:8787/dashboard in your browser
+headroom dashboard            # opens the running proxy's dashboard in your browser
 headroom dashboard --no-open  # just print the URL
 ```
 
-Or browse to `http://localhost:8787/dashboard` directly (use `--port` / `HEADROOM_PORT` if you
-run the proxy on a different port).
+With no `--port`, `headroom dashboard` auto-detects the port of the most recently
+started live wrap session before falling back to `8787`. This matters because
+`headroom wrap ...` does not always land on `8787` — a Copilot-subscription session
+takes a dedicated port, and any wrap falls forward to the next free port when `8787`
+is busy, so a session can be serving on `8788` while `8787` is stale or empty.
+
+Pass `--port` (or set `HEADROOM_PORT`) to target a specific proxy explicitly; an
+explicit value always wins over auto-detection. `headroom doctor` and
+`headroom inspect` resolve their port the same way.
+
+If nothing is listening on the resolved port, the command prints a warning
+instead of silently opening a dead page.
 
 ## Next steps
 
