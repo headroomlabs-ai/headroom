@@ -7,6 +7,7 @@ Extracted from server.py to keep the codebase maintainable.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -19,6 +20,28 @@ from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_ITEMS_WARNED = False
+
+
+def warn_if_max_items_configured() -> None:
+    """Warn once if the removed max-items knob is still being set.
+
+    ``max_items_after_crush`` was forwarded into the crusher and ignored; the
+    adaptive sizer derives the item count from the content. The env var and CLI
+    flag are still accepted so existing scripts keep running, but every entry
+    point that used to read them should say they no longer do anything.
+    """
+    global _MAX_ITEMS_WARNED
+    if _MAX_ITEMS_WARNED or "HEADROOM_MAX_ITEMS" not in os.environ:
+        return
+    _MAX_ITEMS_WARNED = True
+    logger.warning(
+        "HEADROOM_MAX_ITEMS is deprecated and ignored. SmartCrusher derives how "
+        "many items to keep from the content itself; use a CompressionProfile "
+        "bias to lean conservative or aggressive."
+    )
 
 
 def _qdrant_env_port_or_default() -> int:
@@ -179,7 +202,6 @@ class ProxyConfig:
     optimize: bool = True
     image_optimize: bool = True
     min_tokens_to_crush: int = 500
-    max_items_after_crush: int = 50
     smart_crusher_with_compaction: bool | None = None
     keep_last_turns: int = 4
 

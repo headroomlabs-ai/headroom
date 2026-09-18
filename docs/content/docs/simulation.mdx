@@ -128,9 +128,9 @@ from headroom import HeadroomClient, HeadroomConfig, OpenAIProvider
 from headroom.transforms import SmartCrusherConfig
 
 configs = [
-    SmartCrusherConfig(max_items_after_crush=10),
-    SmartCrusherConfig(max_items_after_crush=25),
-    SmartCrusherConfig(max_items_after_crush=50),
+    SmartCrusherConfig(min_tokens_to_crush=200),
+    SmartCrusherConfig(min_tokens_to_crush=1000),
+    SmartCrusherConfig(min_tokens_to_crush=5000),
 ]
 
 for smart_crusher_config in configs:
@@ -140,7 +140,7 @@ for smart_crusher_config in configs:
         config=HeadroomConfig(smart_crusher=smart_crusher_config),
     )
     plan = client.chat.completions.simulate(model="gpt-4o", messages=messages)
-    print(f"max_items={smart_crusher_config.max_items_after_crush}: "
+    print(f"min_tokens={smart_crusher_config.min_tokens_to_crush}: "
           f"{plan.tokens_saved} tokens saved ({plan.tokens_saved/plan.tokens_before*100:.1f}%)")
 ```
 

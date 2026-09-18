@@ -183,9 +183,6 @@ Fine-tune JSON compression behavior:
 from headroom.transforms import SmartCrusherConfig
 
 config = SmartCrusherConfig(
-    # Maximum items to keep after compression
-    max_items_after_crush=15,
-
     # Minimum tokens before applying compression
     min_tokens_to_crush=200,
 
@@ -592,7 +589,7 @@ response = client.chat.completions.create(
     messages=messages,
     headroom_tool_profiles={
         "important_tool": {"skip_compression": True},
-        "search_tool": {"max_items_after_crush": 25},
+        "search_tool": {"min_tokens_to_crush": 500},
     },
 )
 ```
