@@ -201,6 +201,28 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+def _csv_with_an_oversized_cell() -> str:
+    # csv.field_size_limit is 128 KB per cell; one pasted document, log excerpt
+    # or base64 blob in a column goes past it.
+    return "id,title,body\nl,short,ok\n2,long,{}\n".format("x" * 200_000)
+
+
+def test_parse_csv_gives_up_on_a_cell_past_the_field_size_limit() -> None:
+    headers, rows = parse_csv(_csv_with_an_oversized_cell())
+
+    # csv.Error: field larger than field limit (131072) before this.
+    assert (headers, rows) == ([], [])
+
+
+def test_compress_passes_through_a_table_with_an_oversized_cell() -> None:
+    content = _csv_with_an_oversized_cell()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 def test_parse_tabular_returns_none_for_non_tabular() -> None:
     assert parse_tabular("just a normal paragraph here") is None
 
