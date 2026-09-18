@@ -286,6 +286,81 @@ fn nested_array_inside_object_gets_marker_injected() {
 }
 
 #[test]
+fn string_array_drop_is_disclosed_and_retrievable() {
+    let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+    let store = crusher.ccr_store().unwrap().clone();
+    let slugs: Vec<Value> = (0..120)
+        .map(|i| Value::String(format!("release-{}", i % 8)))
+        .collect();
+    let doc = json!({"slugs": slugs, "total": 120});
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let output = parsed.get("slugs").unwrap().as_array().unwrap();
+    let marker = output
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|value| value.starts_with("<<ccr:") && value.ends_with("_rows_offloaded>>"))
+        .unwrap_or_else(|| {
+            panic!(
+                "dropped string-array items must be disclosed: {}",
+                result.compressed
+            )
+        });
+    assert_eq!(output.last().and_then(Value::as_str), Some(marker));
+    assert!(marker.contains("113_rows_offloaded"));
+    let hash = marker[6..].split(' ').next().unwrap();
+
+    let retrieved: Value = serde_json::from_str(&store.get(hash).unwrap()).unwrap();
+    assert_eq!(retrieved, doc.get("slugs").cloned().unwrap());
+    assert_eq!(parsed.get("total"), Some(&json!(120)));
+}
+
+#[test]
+fn number_array_drop_preserves_numeric_shape_when_marker_is_enabled() {
+    let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+    let numbers: Vec<Value> = (0..120).map(|i| json!(i)).collect();
+    let doc = json!({"values": numbers, "total": 120});
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let values = parsed.get("values").unwrap().as_array().unwrap();
+
+    assert_eq!(values.len(), 120);
+    assert!(values.iter().all(Value::is_number));
+    assert_eq!(parsed.get("total"), Some(&json!(120)));
+}
+
+#[test]
+fn mixed_array_drop_is_disclosed_and_retrievable() {
+    let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+    let store = crusher.ccr_store().unwrap().clone();
+    let items: Vec<Value> = (0..120)
+        .map(|i| {
+            if i % 2 == 0 {
+                json!(format!("release-{}", i % 8))
+            } else {
+                json!(i)
+            }
+        })
+        .collect();
+    let doc = json!({"items": items, "total": 120});
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let output = parsed.get("items").unwrap().as_array().unwrap();
+    let marker = output
+        .last()
+        .and_then(Value::as_str)
+        .expect("mixed-array drop must end with a marker");
+    assert!(marker.starts_with("<<ccr:") && marker.ends_with("_rows_offloaded>>"));
+    let hash = marker[6..].split(' ').next().unwrap();
+
+    let retrieved: Value = serde_json::from_str(&store.get(hash).unwrap()).unwrap();
+    assert_eq!(retrieved, doc.get("items").cloned().unwrap());
+}
+
+#[test]
 fn opaque_string_in_object_emits_marker_and_stores_original() {
     // Walker semantics in process_value: a long base64-ish blob in
     // an object field should be replaced with a CCR marker AND the

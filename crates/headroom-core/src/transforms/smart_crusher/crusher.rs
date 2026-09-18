@@ -579,20 +579,32 @@ impl SmartCrusher {
                             let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                             let (crushed, strategy) = crush_string_array(&strs, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            let crushed_values: Vec<Value> =
+                            let mut crushed_values: Vec<Value> =
                                 crushed.into_iter().map(Value::String).collect();
+                            self.append_dropped_marker(&mut crushed_values, arr);
                             return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::NumberArray => {
                             let (crushed, strategy) = crush_number_array(arr, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            if self.config.enable_ccr_marker && crushed.len() < arr.len() {
+                                // A string marker would change a homogeneous
+                                // number array into a mixed array. Preserve
+                                // the numeric shape instead of introducing a
+                                // new silent compatibility break.
+                                return (Value::Array(arr.clone()), info_parts.join(","));
+                            }
+                            let mut crushed_values = crushed;
+                            self.append_dropped_marker(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::MixedArray => {
                             let (crushed, strategy) =
                                 self.crush_mixed_array(arr, query_context, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            self.append_dropped_marker(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         // NestedArray, BoolArray, Empty → fall through
                         // to recursive descent.
@@ -651,6 +663,25 @@ impl SmartCrusher {
             // Other scalars — passthrough.
             _ => (value.clone(), String::new()),
         }
+    }
+
+    /// Make row drops visible for array shapes whose crusher cannot carry the
+    /// dict-array sentinel inline. The marker points to the original array in
+    /// the same CCR store used by the dict-array path.
+    fn append_dropped_marker(&self, kept: &mut Vec<Value>, original: &[Value]) {
+        let dropped_count = original.len().saturating_sub(kept.len());
+        if dropped_count == 0 || !self.config.enable_ccr_marker {
+            return;
+        }
+
+        let canonical = canonical_array_json(original);
+        let hash = hash_canonical(&canonical);
+        if let Some(store) = &self.ccr_store {
+            store.put(&hash, &canonical);
+        }
+        kept.push(Value::String(format!(
+            "<<ccr:{hash} {dropped_count}_rows_offloaded>>"
+        )));
     }
 
     /// Walker-equivalent string handling. Mirrors `walker::walk_string`
