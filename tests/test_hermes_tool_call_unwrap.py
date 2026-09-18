@@ -13,6 +13,10 @@ into `ContentRouter._build_tool_name_map` (OpenAI + Anthropic paths).
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
     is_tool_excluded,
@@ -23,6 +27,34 @@ from headroom.transforms.content_router import ContentRouter, ContentRouterConfi
 # ---------------------------------------------------------------------------
 # Helper unit tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("encoded", [False, True])
+def test_unwrap_mcp_daemon_retrieval(encoded: bool) -> None:
+    arguments = {"action": "call", "selector": "headroom.headroom_retrieve"}
+    name = unwrap_tool_call_name("mcp_daemon", json.dumps(arguments) if encoded else arguments)
+    assert name == "mcp__headroom__headroom_retrieve"
+    assert is_tool_excluded(name, DEFAULT_EXCLUDE_TOOLS)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        None,
+        "bad json",
+        [],
+        {},
+        {"action": "describe", "selector": "headroom.headroom_retrieve"},
+        {"action": "search", "selector": "headroom.headroom_retrieve"},
+        {"action": "call", "selector": None},
+        {"action": "call", "selector": "headroom"},
+        {"action": "call", "selector": "headroom."},
+        {"action": "call", "selector": ".headroom_retrieve"},
+        {"action": "call", "selector": "headroom.tool.extra"},
+    ],
+)
+def test_unwrap_mcp_daemon_passthrough(arguments: object) -> None:
+    assert unwrap_tool_call_name("mcp_daemon", arguments) == "mcp_daemon"
 
 
 def test_unwrap_passthrough_plain_name() -> None:
