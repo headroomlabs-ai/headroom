@@ -254,6 +254,24 @@ headroom wrap claude --1m
 
 `HEADROOM_1M_MODEL` is a fallback only: an explicit `--model` or `ANTHROPIC_MODEL` always wins. The value may be given with or without the `[1m]` suffix; both `claude-opus-5` and `claude-opus-5[1m]` are accepted, and the suffix is added when absent.
 
+For Claude Code's official VS Code extension, use the client-owned persisted
+setting instead of `ANTHROPIC_MODEL`:
+
+```bash
+headroom wrap vscode-claude --1m
+```
+
+This writes the resolved model with exactly one `[1m]` suffix to the top-level
+`model` setting in Claude Code's user settings and records the prior presence and
+value in Headroom's reversible sidecar. Running the command without `--1m`
+restores a model previously managed by Headroom; `headroom unwrap vscode-claude`
+restores the model and proxy environment values together. Use
+`--no-configure --1m` to print the setting without writing either file.
+
+Claude Code and Anthropic own model support and account eligibility. Local tests
+prove settings persistence and restoration, not a live entitled VS Code session
+or a resulting 1M context window.
+
 ## Pipeline Extensions
 
 Use a `headroom.pipeline_extension` entry point when you need to normalize or annotate requests before they leave Headroom. The `PRE_SEND` stage is the right place for provider-specific request cleanup, such as turning `content: null` into `content: ""` for upstreams that reject OpenAI-spec tool-call messages.
