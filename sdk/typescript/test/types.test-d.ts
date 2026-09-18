@@ -123,7 +123,10 @@ describe("CompressOptions", () => {
 describe("CompressResult", () => {
   it("has all required fields with correct types", () => {
     expectTypeOf<CompressResult>().toHaveProperty("messages");
-    expectTypeOf<CompressResult["messages"]>().toEqualTypeOf<OpenAIMessage[]>();
+    // Intentionally `any[]`: the universal compress() returns messages in the
+    // input format (via fromOpenAI), so this field is not OpenAI-shaped in
+    // general — asserting OpenAIMessage[] would misrepresent non-OpenAI results.
+    expectTypeOf<CompressResult["messages"]>().toEqualTypeOf<any[]>();
     expectTypeOf<CompressResult["tokensBefore"]>().toBeNumber();
     expectTypeOf<CompressResult["tokensAfter"]>().toBeNumber();
     expectTypeOf<CompressResult["tokensSaved"]>().toBeNumber();
@@ -173,7 +176,7 @@ describe("HeadroomClientInterface", () => {
 
   it("compress accepts messages and optional options", () => {
     expectTypeOf<HeadroomClientInterface["compress"]>().parameters.toEqualTypeOf<
-      [OpenAIMessage[], ({ model?: string } | undefined)?]
+      [OpenAIMessage[], ({ model?: string; tokenBudget?: number } | undefined)?]
     >();
   });
 });
