@@ -411,3 +411,76 @@ def test_router_lru_eviction_drops_oldest(tmp_path: Path, monkeypatch: pytest.Mo
     for i in range(5):
         router.backend_for(_ctx(headers={"x-headroom-cwd": f"/code/p{i}"}))
     assert len(router.open_backends()) == 4
+
+
+# ---------------------------------------------------------------------------
+# Claude Code 2.x sends the env block as an isMeta user message (#3595)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_string() -> None:
+    """A non-empty ``system`` must not hide the ``cwd:`` in a user message.
+
+    Claude Code 2.x always sends a system prompt *and* puts its ``<env>``
+    block in an ``isMeta`` user message. The old first-match-wins early
+    return made that block unreachable, so resolution fell through to the
+    fail-closed fallback for every 2.x request.
+    """
+    body = {
+        "system": "You are Claude Code.",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<env>\nPrimary working directory: /work/myproj\n</env>",
+                    }
+                ],
+            },
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "You are Claude Code." in prompt
+    assert resolved is not None
+    assert resolved[1] == "myproj"
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_blocks() -> None:
+    """Same when ``system`` is a block list rather than a string."""
+    body = {
+        "system": [{"type": "text", "text": "You are Claude Code."}],
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /work/other\nhi"},
+        ],
+    }
+
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=extract_system_prompt(body)))
+
+    assert resolved is not None
+    assert resolved[1] == "other"
+
+
+def test_extract_system_prompt_user_cwd_cannot_override_system_field_cwd() -> None:
+    """A user turn must not redirect resolution away from the system cwd.
+
+    User content is client-controlled, so it stays a fallback only. This is
+    the top-level-``system`` counterpart of the ``role="system"`` precedence
+    already covered above.
+    """
+    body = {
+        "system": "Primary working directory: /system/project",
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /spoofed/evil"},
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "spoofed" not in prompt
+    assert resolved is not None
+    assert resolved[1] == "project"
