@@ -53,6 +53,18 @@ def test_process_stateless_env(monkeypatch, value, expected):
     assert paths.process_is_stateless() is expected
 
 
+def test_install_id_stays_in_memory_when_stateless(tmp_path, monkeypatch):
+    from headroom.telemetry import session
+
+    workspace = tmp_path / "state"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setattr(session, "_install_id", None)
+    paths.set_process_stateless(True)
+
+    assert len(session.install_id()) == 32
+    assert not workspace.exists()
+
+
 # ---- output-savings recorder ----------------------------------------------
 
 
@@ -79,14 +91,15 @@ def test_output_savings_flush_persists_when_not_stateless(tmp_path, monkeypatch)
 
 def test_memory_disabled_under_stateless(tmp_path, monkeypatch):
     """A stateless proxy with --memory must not initialize memory or write a DB."""
+    workspace = tmp_path / "state"
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     from headroom.proxy.server import ProxyConfig, create_app
 
     app = create_app(ProxyConfig(memory_enabled=True, stateless=True))
     proxy = app.state.proxy
     assert proxy.memory_handler is None
-    assert not (tmp_path / ".headroom" / "memory.db").exists()
+    assert not workspace.exists()
 
 
 # ---- fastembed model pinning ----------------------------------------------
