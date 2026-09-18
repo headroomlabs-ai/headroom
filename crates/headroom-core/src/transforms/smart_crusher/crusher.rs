@@ -446,10 +446,26 @@ impl SmartCrusher {
         let (crushed, info) =
             self.process_value_with_hook(&parsed, 0, query_context, bias, prose_hook);
 
+        // When an object and its descendants were left unchanged, keep
+        // the original bytes. Re-serializing would rewrite Unicode
+        // escapes and numeric lexical forms, then advertise a false
+        // compression. Nested skip/compaction still serializes below
+        // because those paths populate `info`. Spaced JSON without a
+        // nested strategy is compact-serialized for historical crush()
+        // / parity fixtures.
+        if crushed == parsed
+            && info.is_empty()
+            && matches!(parsed, Value::Object(_))
+            && !has_json_insignificant_whitespace(content)
+        {
+            return (content.to_string(), false, String::new());
+        }
+
         // Re-serialize with Python `safe_json_dumps` formatting:
         // compact `(",", ":")` separators + `ensure_ascii=False`,
         // preserving object-key insertion order. Matches the Python
-        // SmartCrusher output bytes the proxy writes.
+        // SmartCrusher output bytes the proxy writes. When descendants
+        // actually change, this path keeps strategy attribution.
         let result = crate::transforms::anchor_selector::python_safe_json_dumps(&crushed);
         let was_modified = result != content.trim();
         (result, was_modified, info)
@@ -629,8 +645,11 @@ impl SmartCrusher {
                     }
                 }
 
-                // Second pass: if the object itself has many keys,
-                // compress at the key level.
+                // Second pass: crush_object preserves every property
+                // (object fields are not interchangeable sampled
+                // records). Nested arrays were already compacted above,
+                // so large-array compaction and CCR row offload still
+                // run without deleting their enclosing keys.
                 if processed.len() >= self.config.min_items_to_analyze {
                     let (crushed_dict, strategy) = crush_object(&processed, &self.config, bias);
                     if strategy != "object:passthrough" {
@@ -1213,6 +1232,36 @@ fn hash_canonical(canonical: &str) -> String {
 // here because `process_string`'s `string_ccr:<kind>` strategy-info
 // label is local to this module's debug-string convention.
 
+/// True when `s` has JSON whitespace outside of string literals
+/// (spaces after `:` / `,`, pretty-print newlines, etc.). Used to
+/// keep compact unchanged objects on the original-bytes path while
+/// still compact-serializing spaced inputs for historical crush()
+/// output.
+fn has_json_insignificant_whitespace(s: &str) -> bool {
+    let mut in_string = false;
+    let mut escape = false;
+    for ch in s.trim().chars() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+        if ch.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
 fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
     use super::compaction::OpaqueKind;
     match kind {
@@ -1533,18 +1582,70 @@ mod tests {
     }
 
     #[test]
-    fn crush_serializes_with_python_safe_format() {
+    fn crush_serializes_changed_objects_with_python_safe_format() {
         let c = crusher();
-        // SmartCrusher uses Python's `safe_json_dumps`: compact
-        // separators `(",", ":")` + `ensure_ascii=False`, preserving
-        // object-key insertion order. A spaced input round-trips to
-        // the compact form.
-        let input = r#"{"a": 1, "b": 2, "c": 3}"#;
-        let result = c.crush(input, "", 1.0);
-        assert_eq!(
-            result.compressed, r#"{"a":1,"b":2,"c":3}"#,
-            "safe_json_dumps emits compact `,` / `:` separators"
+        // When descendants change, SmartCrusher re-serializes with
+        // Python's `safe_json_dumps`: compact separators `(",", ":")`
+        // + `ensure_ascii=False`. Unchanged objects keep original
+        // bytes instead of being rewritten.
+        let mut inner = String::from("[");
+        for i in 0..30 {
+            if i > 0 {
+                inner.push(',');
+            }
+            inner.push_str(r#"{"status": "ok"}"#);
+        }
+        inner.push(']');
+        let input = format!(r#"{{"a": 1, "data": {inner}}}"#);
+        let result = c.crush(&input, "", 1.0);
+        assert!(
+            result.was_modified,
+            "nested compressible array must trigger serialization"
         );
+        assert!(
+            result.compressed.contains(r#""a":1"#),
+            "safe_json_dumps emits compact `:`; got {}",
+            result.compressed
+        );
+        assert!(
+            !result.compressed.contains(": "),
+            "changed output must not keep spaced separators: {}",
+            result.compressed
+        );
+        assert_ne!(result.strategy, "passthrough");
+    }
+
+    #[test]
+    fn crush_unchanged_object_keeps_original_bytes() {
+        let c = crusher();
+        // Compact input: escaped Unicode and numeric lexical forms must
+        // survive the passthrough branch rather than being reserialized
+        // (`\u00e9` → `é`, `1.0` → `1`).
+        let compact = r#"{"cafe":"caf\u00e9","n":1.0,"ok":true}"#;
+        let result = c.crush(compact, "", 1.0);
+        assert_eq!(result.compressed, compact);
+        assert!(!result.was_modified);
+        assert_eq!(result.strategy, "passthrough");
+        assert!(
+            !result.compressed.contains("<<ccr:"),
+            "unchanged object must not invent a CCR marker"
+        );
+
+        // Spaced / pretty-printed unchanged objects still compact-serialize
+        // (historical crush() output, required by parity fixtures) but
+        // must not advertise a key-drop strategy or invent a CCR hash.
+        let spaced = "{ \"cafe\": \"caf\\u00e9\", \"n\": 1.0, \"ok\": true }";
+        let spaced_result = c.crush(spaced, "", 1.0);
+        assert_eq!(spaced_result.strategy, "passthrough");
+        assert!(
+            !spaced_result.strategy.contains("adaptive"),
+            "must not report a key-drop strategy: {}",
+            spaced_result.strategy
+        );
+        assert!(!spaced_result.compressed.contains("<<ccr:"));
+        let parsed: Value = serde_json::from_str(&spaced_result.compressed).unwrap();
+        assert_eq!(parsed["cafe"], "café");
+        assert_eq!(parsed["ok"], true);
     }
 
     #[test]
@@ -1552,6 +1653,7 @@ mod tests {
         let c = crusher();
         // Top-level dict with a nested array of 30 identical items.
         // The inner array should compress (low_uniqueness path).
+        // Sibling fields stay even though the array is rewritten.
         let mut inner = String::from("[");
         for i in 0..30 {
             if i > 0 {
@@ -1560,12 +1662,105 @@ mod tests {
             inner.push_str(r#"{"status":"ok"}"#);
         }
         inner.push(']');
-        let input = format!(r#"{{"data": {}}}"#, inner);
+        let input =
+            format!(r#"{{"label":"keep","data":{inner},"empty":[],"flag":false,"missing":null}}"#);
         let result = c.crush(&input, "", 1.0);
         assert!(
             result.was_modified,
             "nested compressible array must be crushed even inside a wrapper object"
         );
+        let parsed: Value = serde_json::from_str(&result.compressed).expect("output is JSON");
+        assert_eq!(parsed["label"], "keep");
+        assert_eq!(parsed["empty"], json!([]));
+        assert_eq!(parsed["flag"], false);
+        assert_eq!(parsed["missing"], Value::Null);
+        assert!(
+            parsed.get("data").is_some(),
+            "enclosing array property must survive"
+        );
+    }
+
+    /// Issue #3634 MCP `saga-mcp_task_get` payload (813 bytes, original
+    /// key order, tags encoded as a JSON string).
+    const MCP_TASK_GET_JSON: &str = r#"{"id":79,"epic_id":9,"title":"test","description":null,"status":"done","priority":"medium","sort_order":0,"assigned_to":null,"estimated_hours":null,"actual_hours":null,"due_date":null,"source_ref":null,"metadata":"{}","created_at":"2026-09-15 20:32:06","updated_at":"2026-09-16 11:59:27","description_locked":0,"is_deleted":0,"deleted_at":null,"deleted_by":null,"delete_reason":null,"epic_name":"latency-routing","tags":"[\"cherry-pick\",\"dedicated branch\"]","subtasks":[{"id":163,"task_id":79,"title":"test2","status":"todo","sort_order":1,"created_at":"2026-09-15 20:32:13","updated_at":"2026-09-16 14:02:26"},{"id":165,"task_id":79,"title":"test4","status":"todo","sort_order":2,"created_at":"2026-09-15 20:38:47","updated_at":"2026-09-17 20:29:04"}],"notes":[],"comments":[],"depends_on":[],"dependents":[]}"#;
+
+    #[test]
+    fn crush_preserves_mcp_task_object_fields() {
+        let c = crusher();
+        let result = c.crush(MCP_TASK_GET_JSON, "", 1.0);
+        assert_eq!(
+            result.compressed, MCP_TASK_GET_JSON,
+            "compact unchanged object must stay byte-identical"
+        );
+        assert!(!result.was_modified);
+        assert_eq!(result.strategy, "passthrough");
+        assert!(
+            !result.strategy.contains("adaptive"),
+            "must not report a key-drop strategy: {}",
+            result.strategy
+        );
+        assert!(
+            !result.compressed.contains("<<ccr:"),
+            "must not invent a CCR marker"
+        );
+        let parsed: Value = serde_json::from_str(&result.compressed).expect("output is JSON");
+        assert_eq!(parsed["tags"], "[\"cherry-pick\",\"dedicated branch\"]");
+        let subtasks = parsed["subtasks"].as_array().expect("subtasks array");
+        assert_eq!(subtasks.len(), 2);
+        assert_eq!(subtasks[0]["title"], "test2");
+        assert_eq!(subtasks[1]["title"], "test4");
+        assert_eq!(parsed["description"], Value::Null);
+        assert_eq!(parsed["notes"], json!([]));
+    }
+
+    #[test]
+    fn nested_array_offload_keeps_enclosing_object_keys() {
+        // Force the lossy row-drop path so CCR offload fires. The
+        // enclosing object must keep every sibling field, and the
+        // stored payload must round-trip as the original rows.
+        let cfg = SmartCrusherConfig {
+            lossless_min_savings_ratio: 0.99,
+            ..SmartCrusherConfig::default()
+        };
+        let c = SmartCrusher::new(cfg);
+        let rows: Vec<Value> = (0..50).map(|_| json!({"status": "ok"})).collect();
+        let doc = json!({
+            "keep_me": "sibling",
+            "rows": rows,
+            "also_keep": null,
+            "flag": true,
+            "empty": []
+        });
+        let content = serde_json::to_string(&doc).unwrap();
+        let result = c.crush(&content, "", 1.0);
+        assert!(result.was_modified, "lossy nested array should compress");
+        assert_ne!(result.strategy, "passthrough");
+        let parsed: Value = serde_json::from_str(&result.compressed).expect("output is JSON");
+        assert_eq!(parsed["keep_me"], "sibling");
+        assert_eq!(parsed["also_keep"], Value::Null);
+        assert_eq!(parsed["flag"], true);
+        assert_eq!(parsed["empty"], json!([]));
+        assert!(
+            parsed.get("rows").is_some(),
+            "enclosing array property must survive"
+        );
+        assert!(
+            result.compressed.contains("<<ccr:"),
+            "offload must emit a CCR marker: {}",
+            result.compressed
+        );
+        let marker_at = result
+            .compressed
+            .find("<<ccr:")
+            .expect("CCR marker present");
+        let hash = &result.compressed[marker_at + 6..marker_at + 18];
+        let stored = c
+            .ccr_store()
+            .expect("default crusher has a store")
+            .get(hash)
+            .expect("offloaded rows are retrievable");
+        let recovered: Value = serde_json::from_str(&stored).expect("stored JSON");
+        assert_eq!(recovered, Value::Array(rows));
     }
 
     #[test]
@@ -2134,6 +2329,12 @@ mod tests {
         let lossy: Value = serde_json::from_str(&crusher().crush(&content, "", 1.0).compressed)
             .expect("default output is JSON");
         assert_ne!(lossy, doc, "default config should drop items");
+        // Object keys are not sampled records: default mode may crush
+        // nested arrays but must keep every property of `meta`.
+        assert_eq!(
+            lossy["meta"], doc["meta"],
+            "default mode must keep object keys"
+        );
 
         let strict = SmartCrusher::new(SmartCrusherConfig {
             lossless_only: true,
