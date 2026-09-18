@@ -71,6 +71,9 @@ Then point your LLM client at it:
 # Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 
+# CodeBuddy
+CODEBUDDY_BASE_URL=http://localhost:8787/v2 codebuddy
+
 # GitHub Copilot CLI (default Anthropic-style proxy route)
 headroom wrap copilot -- --model claude-sonnet-4-20250514
 

@@ -46,7 +46,7 @@ file content is sent anywhere to be compressed.
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app.
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language.
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`.
+- **Agent wrap** — `headroom wrap claude|codebuddy|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`.
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client.
 - **Cross-agent memory** — one shared store across Claude, Codex, Gemini and Grok, with automatic dedup.
 - **`headroom learn`** — mines failed sessions and writes corrections to `CLAUDE.local.md` (default, gitignored), `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or `GROK.md`.
@@ -228,6 +228,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Agent | `headroom wrap` | Notes |
 |---|:---:|---|
 | Claude Code | ✅ | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
+| CodeBuddy | ✅ | Claude Code compatible |
 | Codex | ✅ | shares memory with Claude |
 | Grok CLI | ✅ | routes via `GROK_MODELS_BASE_URL` |
 | Cursor | Manual setup | starts the proxy and prints base URLs for Cursor settings |
@@ -248,7 +249,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
-(`claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
+(`claude`, `codebuddy`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
 `zcode`). Registry authors should use the canonical [`server.json`](server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
 
@@ -400,7 +401,7 @@ One request lifecycle is shared by `compress()`, the SDKs and the proxy:
 Provider- and tool-specific behaviour lives under `headroom/providers/`, so core
 orchestration stays focused on lifecycle, sequencing and policy:
 
-- CLI/tool slices — `headroom/providers/claude`, `copilot`, `codex`, `grok`, `openclaw`
+- CLI/tool slices — `headroom/providers/claude`, `codebuddy`, `copilot`, `codex`, `grok`, `openclaw`
 - Provider runtime slices — `headroom/providers/claude`, `gemini`, with shared backend dispatch in `headroom/providers/registry.py`
 - `wrap.py`, `client.py`, `cli/proxy.py` and `proxy/server.py` delegate env shaping, API target normalisation, backend selection and transport dispatch
 

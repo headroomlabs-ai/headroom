@@ -365,7 +365,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Headroom memory sync")
     parser.add_argument("--db", required=True, help="Path to memory DB")
     parser.add_argument("--user", required=True, help="User ID")
-    parser.add_argument("--agent", required=True, choices=["claude", "codex"], help="Agent to sync")
+    parser.add_argument(
+        "--agent", required=True, choices=["claude", "codebuddy", "codex"], help="Agent to sync"
+    )
     parser.add_argument("--force", action="store_true", help="Skip no-op check")
     args = parser.parse_args()
 
@@ -383,6 +385,13 @@ def main() -> None:
             )
 
             adapter: ClaudeCodeAdapter | Any = ClaudeCodeAdapter(get_claude_memory_dir())
+        elif args.agent == "codebuddy":
+            from headroom.memory.sync_adapters.codebuddy_code import (
+                CodeBuddyAdapter,
+                get_codebuddy_memory_dir,
+            )
+
+            adapter = CodeBuddyAdapter(get_codebuddy_memory_dir())
         elif args.agent == "codex":
             from headroom.memory.sync_adapters.codex_agent import CodexAdapter
 

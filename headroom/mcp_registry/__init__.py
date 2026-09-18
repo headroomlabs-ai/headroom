@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeConfigMutationError, ClaudeRegistrar
+from .codebuddy import CodeBuddyRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
 from .grok import GrokRegistrar
@@ -34,6 +35,7 @@ __all__ = [
     "CLAUDE_SERENA_CONTEXT",
     "ClaudeConfigMutationError",
     "ClaudeRegistrar",
+    "CodeBuddyRegistrar",
     "CodexRegistrar",
     "GrokRegistrar",
     "MCPRegistrar",
