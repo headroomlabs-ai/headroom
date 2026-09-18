@@ -122,6 +122,10 @@ class CopilotSubscriptionTokenResolution:
     token_fingerprint: str
     refresh_oauth_token: str | None = None
     api_token_expires_at: float | None = None
+    #: The ``endpoints.api`` host GitHub advertised for this account, before
+    #: Headroom's routing policy chose ``api_url``. Lets callers tell the user
+    #: when the two differ (subscription-based network routing, data residency).
+    advertised_api_url: str | None = None
 
 
 def token_fingerprint(token: str) -> str:
@@ -1011,6 +1015,40 @@ def _api_url_from_payload(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
+#: Opt-in: route Business/Enterprise accounts through the segmented host GitHub
+#: advertises for them instead of the generic public host.
+USE_ADVERTISED_HOST_ENV = "GITHUB_COPILOT_USE_ADVERTISED_HOST"
+
+#: Per-plan chat hosts GitHub advertises in ``endpoints.api``. The generic host
+#: serves all of them, and it is the one Headroom routes to by default: the
+#: segmented hosts regressed model availability for wrapped sessions (#610 for
+#: individual, #2441 for Business/Enterprise) and the official client's results
+#: could not be reproduced through them at the time. Enterprises whose firewall
+#: uses GitHub's subscription-based network routing block the generic host, so
+#: they need the advertised host — hence the opt-in above and the explicit
+#: ``GITHUB_COPILOT_API_URL`` pin.
+_SEGMENTED_PLAN_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.business.githubcopilot.com",
+        "api.enterprise.githubcopilot.com",
+    }
+)
+
+
+def use_advertised_host() -> bool:
+    """Return True when the operator opted into GitHub's advertised per-plan host."""
+    value = os.environ.get(USE_ADVERTISED_HOST_ENV, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def advertised_host_is_normalized(api_url: str | None) -> bool:
+    """Return True when ``api_url`` is a per-plan host Headroom would fold into the generic one."""
+    if not api_url:
+        return False
+    host = urlparse(api_url).netloc.lower()
+    return host in _SEGMENTED_PLAN_HOSTS and not use_advertised_host()
+
+
 def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None) -> str:
     configured = _configured_api_url_override()
     if configured:
@@ -1021,14 +1059,20 @@ def _subscription_api_url_from_user_info_payload(payload: dict[str, Any] | None)
         return DEFAULT_API_URL
 
     host = urlparse(api_url).netloc.lower()
+    if host in _SEGMENTED_PLAN_HOSTS and use_advertised_host():
+        return api_url
     if host in {
         "api.githubcopilot.com",
         "api.individual.githubcopilot.com",
-        "api.business.githubcopilot.com",
-        "api.enterprise.githubcopilot.com",
+        *_SEGMENTED_PLAN_HOSTS,
     }:
         return DEFAULT_API_URL
     if host.endswith(".githubcopilot.com"):
+        return api_url
+    if _is_ghe_copilot_api_host(host):
+        # A data-residency tenant's token is minted by that tenant's GHE.com
+        # deployment; the public host cannot validate it. Folding it into the
+        # generic host guarantees a 401, so keep the advertised host.
         return api_url
     return DEFAULT_API_URL
 
@@ -1062,6 +1106,7 @@ def _subscription_resolution(
     api_url: str,
     refresh_oauth_token: str | None = None,
     api_token_expires_at: float | None = None,
+    advertised_api_url: str | None = None,
 ) -> CopilotSubscriptionTokenResolution:
     return CopilotSubscriptionTokenResolution(
         token=token,
@@ -1071,6 +1116,7 @@ def _subscription_resolution(
         token_fingerprint=token_fingerprint(token),
         refresh_oauth_token=refresh_oauth_token,
         api_token_expires_at=api_token_expires_at,
+        advertised_api_url=advertised_api_url,
     )
 
 
@@ -1104,6 +1150,7 @@ def _subscription_resolution_from_token_exchange(
         api_url=_api_url_from_exchange_payload(payload, oauth_token=candidate.token),
         refresh_oauth_token=candidate.token,
         api_token_expires_at=_parse_expiry(payload.get("expires_at")),
+        advertised_api_url=_api_url_from_payload(payload),
     )
 
 
@@ -1121,6 +1168,7 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 source=f"env:{env_var}",
                 confidence="explicit-api-token",
                 api_url=_subscription_api_url_from_user_info_payload(payload),
+                advertised_api_url=_api_url_from_payload(payload),
             )
 
     for candidate in iter_oauth_token_candidates():
@@ -1139,6 +1187,7 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                     source=candidate.source,
                     confidence=candidate.confidence,
                     api_url=_subscription_api_url_from_user_info_payload(payload),
+                    advertised_api_url=_api_url_from_payload(payload),
                 )
             continue
 
@@ -1526,7 +1575,8 @@ def _is_forwardable_copilot_bearer_token(token: str) -> bool:
     """Return True when a bearer token should be forwarded as-is for Copilot inference.
 
     Unlike _is_copilot_api_token() (used only for subscription/user-info
-    resolution), this accepts both short-lived Copilot API tokens (`tid_`)
+    resolution), this accepts both short-lived Copilot API tokens (the
+    ``tid=<hex>;exp=…`` claim string GitHub mints, or the ``tid_`` prefix form)
     AND GitHub OAuth tokens (`gho_`, `ghs_`, `ghp_`, `github_pat_`) as valid,
     forwardable Copilot bearer credentials for chat-completion/inference
     requests.
@@ -1552,7 +1602,26 @@ def _is_forwardable_copilot_bearer_token(token: str) -> bool:
     if not normalized:
         return False
 
-    return normalized.startswith(("tid_", "gho_", "ghs_", "ghp_", "github_pat_"))
+    return _is_copilot_api_token_shape(normalized) or normalized.startswith(
+        ("gho_", "ghs_", "ghp_", "github_pat_")
+    )
+
+
+def _is_copilot_api_token_shape(token: str) -> bool:
+    """Return True for the wire shape of a Copilot API token.
+
+    The token GitHub mints at ``/copilot_internal/v2/token`` is a
+    semicolon-separated claim string, ``tid=<hex>;exp=<unix>;sku=...:<sig>``;
+    the CLI and VS Code send it verbatim as the bearer. The ``tid_`` prefix form
+    is kept for callers and fixtures that already use it.
+    """
+    normalized = token.strip()
+    if normalized.startswith("tid_"):
+        return True
+    if not normalized.startswith("tid="):
+        return False
+    claim, sep, _rest = normalized[4:].partition(";")
+    return bool(sep) and bool(claim) and all(c in "0123456789abcdefABCDEF" for c in claim)
 
 
 def _token_kind(token: str) -> str:
@@ -1562,6 +1631,66 @@ def _token_kind(token: str) -> str:
         if t.startswith(prefix):
             return prefix + "***"
     return "unknown" if t else "empty"
+
+
+def _is_copilot_routing_bearer(token: str) -> bool:
+    """Return True for a bearer whose presence means "this client is a Copilot client".
+
+    Deliberately narrower than :func:`_is_forwardable_copilot_bearer_token` and a
+    strict subset of it: a Copilot API token (``tid=…``) or the ``gho_`` OAuth
+    token the CLI and VS Code hold. Every token accepted here must also be
+    forwardable, otherwise redirecting it to Copilot would make
+    :func:`apply_copilot_api_auth` substitute the operator's own credential for an
+    arbitrary caller's — the redirect must never widen who can spend the
+    operator's seat. ``ghp_``/``github_pat_``/``ghs_`` are forwardable but say
+    nothing about which provider the caller meant, so they do not route.
+    """
+    return _is_copilot_api_token_shape(token) or token.startswith("gho_")
+
+
+#: Stock provider hosts a Copilot credential can never authenticate against.
+_STOCK_PROVIDER_HOSTS: frozenset[str] = frozenset({"api.openai.com", "api.anthropic.com"})
+
+
+def _bearer_token(headers: Mapping[str, str]) -> str | None:
+    for key, value in headers.items():
+        if key.lower() == "authorization":
+            scheme, _, token = value.partition(" ")
+            if scheme.lower() == "bearer" and token.strip():
+                return token.strip()
+            return None
+    return None
+
+
+def copilot_bearer_upstream(
+    headers: Mapping[str, str], configured_target: str | None
+) -> str | None:
+    """Return the Copilot API base when a Copilot-authenticated request would otherwise hit a stock provider.
+
+    A persistent (shared) proxy keeps its OpenAI and Anthropic targets on the
+    stock hosts so Codex, aider, and SDK clients keep working. The Copilot CLI
+    in native mode and the VS Code extension send GitHub's own credential
+    (``tid_``/``gho_``) on ``/chat/completions``, ``/responses``,
+    ``/v1/messages``, ``/models``, ``/models/session`` and ``/auto``. That
+    credential cannot succeed at ``api.openai.com`` or ``api.anthropic.com``, so
+    redirecting it to Copilot can only turn a certain 401 into the request the
+    client intended. Anything else — an operator-pinned gateway, an explicit
+    per-request ``x-headroom-base-url``, a non-Copilot token — is left alone.
+
+    Callers that go on to merge operator ``*_extra_headers`` must withhold them
+    when this returns a URL: those secrets belong to the configured target, not
+    to the host the request was redirected to.
+    """
+    if _header_value(headers, "x-headroom-base-url"):
+        return None
+    if configured_target:
+        host = (urlparse(configured_target).hostname or "").lower()
+        if host not in _STOCK_PROVIDER_HOSTS:
+            return None
+    token = _bearer_token(headers)
+    if not token or not _is_copilot_routing_bearer(token):
+        return None
+    return copilot_api_url()
 
 
 def _is_managed_copilot_seeded_bearer(token: str) -> bool:
