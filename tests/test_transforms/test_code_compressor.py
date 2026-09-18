@@ -2210,3 +2210,440 @@ class TestPhpSupport:
         code = "<?php\nclass Broken {\n    public function oops( {\n"
         result = self._compressor().compress(code, language="php")
         assert result.compressed == code
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestElixirSupport:
+    """Elixir (``elixir`` grammar) support.
+
+    Elixir has no dedicated definition nodes: ``def``, ``defmodule``, ``alias``
+    and friends are macros, so tree-sitter-elixir emits a generic ``call`` for
+    all of them. These tests pin the macro-name dispatch (``_effective_type``),
+    the ``do``/``end`` block delimiters, and the false negatives that keep
+    output valid — one-line ``, do:`` clauses, ``defstruct``/``schema``
+    declarations, and malformed input.
+    """
+
+    def _compressor(self, **overrides):
+        kwargs = {
+            "min_tokens_for_compression": 1,
+            "max_body_lines": 1,
+            "enable_ccr": False,
+        }
+        kwargs.update(overrides)
+        return CodeAwareCompressor(CodeCompressorConfig(**kwargs))
+
+    def test_defmodule_compresses_bodies_and_keeps_structure(self):
+        """A `call` whose target is `defmodule` must route through class
+        compression: header, aliases and signatures verbatim, bodies elided,
+        module emitted exactly once and still closed by its `end`."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Billing do
+              @moduledoc "Billing."
+              alias MyApp.Repo
+
+              def charge(user, amount) do
+                invoice = Repo.get_by!(Invoice, user_id: user.id)
+                total = amount + invoice.balance
+                fee = round(total * 0.029) + 30
+                net = total - fee
+                Repo.update(invoice, %{balance: net})
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.language == CodeLanguage.ELIXIR
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "defmodule MyApp.Billing do" in result.compressed
+        assert '@moduledoc "Billing."' in result.compressed
+        assert "alias MyApp.Repo" in result.compressed
+        assert "def charge(user, amount) do" in result.compressed
+        assert "lines omitted" in result.compressed
+        assert "net = total - fee" not in result.compressed
+        assert result.compressed.count("defmodule MyApp.Billing") == 1
+        assert result.compressed.rstrip().endswith("end")
+
+    def test_private_function_with_guard_keeps_full_signature(self):
+        """`when` guards are part of the head; the whole clause line must
+        survive so the compressed clause still matches the same inputs."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Norm do
+              defp normalize(attrs) when is_map(attrs) do
+                pairs = Map.to_list(attrs)
+                keyed = Enum.map(pairs, fn {k, v} -> {to_string(k), v} end)
+                Map.new(keyed)
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "defp normalize(attrs) when is_map(attrs) do" in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_module_attributes_are_preserved(self):
+        """`@spec`/`@type`/`@doc`/`@impl` are Elixir's type annotations and
+        docs; they parse as `unary_operator` siblings of the definition and
+        must be kept verbatim rather than swept into a compressed body."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Accounts do
+              @type result :: {:ok, map()} | {:error, term()}
+
+              @doc "Lists active users."
+              @spec list_active_users(map()) :: [map()]
+              @impl true
+              def list_active_users(params) do
+                base = build_query(params)
+                filtered = apply_filters(base, params)
+                ordered = apply_order(filtered, params)
+                Repo.all(ordered)
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "@type result :: {:ok, map()} | {:error, term()}" in result.compressed
+        assert '@doc "Lists active users."' in result.compressed
+        assert "@spec list_active_users(map()) :: [map()]" in result.compressed
+        assert "@impl true" in result.compressed
+
+    def test_single_line_do_clause_is_preserved_verbatim(self):
+        """`def area(s), do: expr` has no `do_block`; there is no body to
+        compress, so the clause must come through byte-identical."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Shape do
+              def area(%{kind: :rect} = s), do: s.width * s.height
+              def area(_), do: {:error, :unknown}
+
+              def perimeter(s) do
+                w = s.width
+                h = s.height
+                two = 2
+                two * (w + h)
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "def area(%{kind: :rect} = s), do: s.width * s.height" in result.compressed
+        assert "def area(_), do: {:error, :unknown}" in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_defstruct_and_schema_blocks_are_preserved_verbatim(self):
+        """`defstruct` and Ecto `schema` declare the module's shape. They are
+        routed to type_nodes, not compressed: eliding field lists would hide
+        exactly what a reader of compressed Ecto code needs."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.User do
+              use Ecto.Schema
+
+              defstruct [:id, :email, active: true]
+
+              schema "users" do
+                field :email, :string
+                field :active, :boolean, default: true
+                field :role, :string
+                timestamps()
+              end
+
+              def changeset(user, attrs) do
+                casted = cast(user, attrs, [:email, :active, :role])
+                required = validate_required(casted, [:email])
+                unique = unique_constraint(required, :email)
+                unique
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "defstruct [:id, :email, active: true]" in result.compressed
+        assert "field :email, :string" in result.compressed
+        assert "timestamps()" in result.compressed
+        # the behaviour, not the shape, is what gets elided
+        assert "lines omitted" in result.compressed
+
+    def test_nested_defmodule_compresses_without_duplication(self):
+        """A nested `defmodule` must recurse through class compression exactly
+        once — the Elixir analogue of the C# block-namespace re-dump trap."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Outer do
+              defmodule Inner do
+                def hello do
+                  a = 1
+                  b = 2
+                  c = 3
+                  a + b + c
+                end
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert result.compressed.count("defmodule Inner") == 1
+        assert result.compressed.count("def hello") == 1
+        assert "lines omitted" in result.compressed
+
+    def test_exunit_blocks_compress(self):
+        """`describe`/`test` are block macros, not definitions, but they own
+        the bulk of a test file's lines and compress the same way."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.AccountsTest do
+              use MyApp.DataCase, async: true
+
+              describe "list_users/1" do
+                test "returns active users" do
+                  a = insert(:user, active: true)
+                  b = insert(:user, active: false)
+                  result = Accounts.list_users()
+                  assert a.id in Enum.map(result, & &1.id)
+                  refute b.id in Enum.map(result, & &1.id)
+                end
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "use MyApp.DataCase, async: true" in result.compressed
+        assert 'describe "list_users/1" do' in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_heredoc_sigil_body_stays_intact(self):
+        """A `~H` template is a single statement; keeping it whole is what
+        makes the output still parse."""
+        code = textwrap.dedent("""\
+            defmodule MyAppWeb.UserLive do
+              use MyAppWeb, :live_view
+
+              def render(assigns) do
+                ~H\"\"\"
+                <div class="p-4">
+                  <h1>{@title}</h1>
+                </div>
+                \"\"\"
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "<h1>{@title}</h1>" in result.compressed
+
+    def test_remote_call_is_not_treated_as_a_definition(self):
+        """`Repo.all(query)` is a `call` whose target is a `dot`, not an
+        identifier. Dispatching it as a definition would rewrite ordinary
+        code; it must stay top-level and verbatim."""
+        code = textwrap.dedent("""\
+            alias MyApp.Repo
+
+            emails = Repo.all(query)
+
+            Enum.each(emails, fn email ->
+              IO.puts(email)
+            end)
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "emails = Repo.all(query)" in result.compressed
+        assert "IO.puts(email)" in result.compressed
+        assert "lines omitted" not in result.compressed
+
+    def test_malformed_elixir_passes_through_unchanged(self):
+        code = "defmodule Broken do\n  def oops do\n    x = \n  end\n"
+        result = self._compressor(fallback_to_kompress=False).compress(code, language="elixir")
+        assert result.compressed == code
+
+    def test_language_detection_and_aliases(self):
+        code = textwrap.dedent("""\
+            defmodule MyApp.Accounts do
+              @moduledoc "Accounts."
+              alias MyApp.Repo
+
+              def list_users do
+                MyApp.User
+                |> Repo.all()
+              end
+            end
+            """)
+        lang, confidence = detect_language(code)
+        assert lang == CodeLanguage.ELIXIR
+        assert confidence > 0.0
+        assert coerce_language("ex") == CodeLanguage.ELIXIR
+        assert coerce_language("exs") == CodeLanguage.ELIXIR
+        assert coerce_language("elixir") == CodeLanguage.ELIXIR
+
+    def test_python_source_is_not_detected_as_elixir(self):
+        """The Elixir pre-filter deliberately omits bare `def` so that Python,
+        which shares it, cannot score on the Elixir patterns."""
+        code = textwrap.dedent("""\
+            import os
+            from typing import List
+
+
+            def process(items: List[str]) -> List[str]:
+                out = []
+                for item in items:
+                    out.append(item.strip())
+                return out
+            """)
+        assert detect_language(code)[0] == CodeLanguage.PYTHON
+
+    def test_definition_names_come_from_the_macro_argument(self):
+        """The call's own identifier is the macro (`def`), not the name being
+        defined. Symbol analysis must key on `charge`/`audit`, not on `def`,
+        or every function in the file shares one body budget."""
+        code = textwrap.dedent("""\
+            defmodule MyApp.Billing do
+              def charge(user, amount) do
+                a = amount + 1
+                b = a + 2
+                c = b + 3
+                c
+              end
+
+              defp audit(user) do
+                x = user.id
+                y = x + 1
+                z = y + 2
+                z
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert "charge" in result.symbol_scores
+        assert "audit" in result.symbol_scores
+        assert "def" not in result.symbol_scores
+        assert "defp" not in result.symbol_scores
+
+    def test_block_macro_without_arguments_has_no_name(self):
+        """`setup do` is a definition-role call with no `arguments` child at
+        all. The name lookup must return None (falling back to the default body
+        budget) rather than raising."""
+        parser = cc._get_parser("elixir")
+        config = cc._LANG_CONFIGS[CodeLanguage.ELIXIR]
+        node = parser.parse(b"setup do\n  :ok\nend\n").root_node.children[0]
+
+        assert cc._effective_type(node, config) == cc._CALL_ROLE_FUNCTION
+        assert [c.type for c in node.children] == ["identifier", "do_block"]
+        assert cc._get_call_definition_name(node) is None
+
+    def test_definition_name_walk_is_depth_capped(self):
+        """The leftmost-head walk stops after `_CALL_HEAD_MAX_DEPTH` levels.
+        Real heads are two or three deep; a pathological operator chain must
+        give up and return None instead of walking an arbitrary tree."""
+        parser = cc._get_parser("elixir")
+        source = b"def " + b"!" * (cc._CALL_HEAD_MAX_DEPTH + 2) + b"x do\n  1\nend\n"
+        node = parser.parse(source).root_node.children[0]
+
+        assert node.type == "call"
+        assert cc._get_call_definition_name(node) is None
+
+    def test_effective_type_resolves_macro_calls(self):
+        """Unit-level pin on the dispatch helper itself."""
+        parser = cc._get_parser("elixir")
+        config = cc._LANG_CONFIGS[CodeLanguage.ELIXIR]
+        source = (
+            b"defmodule A do\n"
+            b"  alias B\n"
+            b"  defstruct [:x]\n"
+            b"  def go(v), do: v\n"
+            b"  Enum.map([], & &1)\n"
+            b"end\n"
+        )
+        root = parser.parse(source).root_node
+        module = root.children[0]
+        assert cc._effective_type(module, config) == cc._CALL_ROLE_CLASS
+
+        body = next(c for c in module.children if c.type == "do_block")
+        roles = [cc._effective_type(c, config) for c in body.named_children]
+        assert cc._CALL_ROLE_IMPORT in roles
+        assert cc._CALL_ROLE_TYPE in roles
+        assert cc._CALL_ROLE_FUNCTION in roles
+        # `Enum.map/2` is an ordinary remote call, never a definition.
+        assert roles.count("call") == 1
+
+    def test_definition_macro_roles_match_the_grammars_own_list(self):
+        """The role table is the grammar's classification, not a guess: the
+        function role is `queries/highlights.scm`'s function-definition subset
+        verbatim, and every one of the 15 definition macros that file lists is
+        assigned a role. Pins the table so a grammar bump surfaces here."""
+        config = cc._LANG_CONFIGS[CodeLanguage.ELIXIR]
+        upstream_function_definitions = {
+            "def",
+            "defdelegate",
+            "defguard",
+            "defguardp",
+            "defmacro",
+            "defmacrop",
+            "defn",
+            "defnp",
+            "defp",
+        }
+        # ExUnit block macros are ours, not the grammar's; strip them to compare.
+        exunit_blocks = {"test", "setup", "setup_all"}
+        assert config.call_function_targets - exunit_blocks == upstream_function_definitions
+
+        upstream_definition_keywords = upstream_function_definitions | {
+            "defexception",
+            "defimpl",
+            "defmodule",
+            "defoverridable",
+            "defprotocol",
+            "defstruct",
+        }
+        assigned = (
+            config.call_function_targets | config.call_class_targets | config.call_type_targets
+        )
+        assert upstream_definition_keywords <= assigned
+
+    def test_defoverridable_declaration_is_preserved(self):
+        code = textwrap.dedent("""\
+            defmodule MyApp.Base do
+              def handle(x) do
+                a = x + 1
+                b = a + 2
+                c = b + 3
+                c
+              end
+
+              defoverridable handle: 1
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert "defoverridable handle: 1" in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_declarations_inside_a_macro_wrapper_are_not_duplicated(self):
+        """Elixir wraps declarations in ordinary macros. Capturing the inner
+        `defimpl` while the uncaptured `for`/`if` wrapper is re-emitted verbatim
+        duplicated the whole file (1.9x input on ecto/lib/ecto/json.ex). The
+        wrapper is opaque: emitted once, never recursed into."""
+        code = textwrap.dedent("""\
+            for encoder <- [Jason.Encoder, JSON.Encoder] do
+              if Code.ensure_loaded?(encoder) do
+                defimpl encoder, for: Ecto.Association.NotLoaded do
+                  def encode(%{__owner__: owner}, _) do
+                    raise "cannot encode association from #{inspect(owner)}"
+                  end
+                end
+              end
+            end
+            """)
+        result = self._compressor().compress(code, language="elixir")
+
+        assert result.syntax_valid is True
+        assert result.compressed.count("defimpl encoder") == 1
+        assert result.compressed.count("def encode(") == 1
+        assert result.compression_ratio <= 1.0
