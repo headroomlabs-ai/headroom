@@ -252,6 +252,8 @@ Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `zcode`). Registry authors should use the canonical [`server.json`](server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
 
+When `--mode cache` is active, `--memory` context injection is skipped because prefix stability takes precedence; use `--mode token` if you need memory recall.
+
 <details>
 <summary><b>GitHub Copilot CLI subscription mode</b></summary>
 
