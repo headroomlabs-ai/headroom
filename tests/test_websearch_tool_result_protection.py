@@ -159,7 +159,10 @@ def test_web_tool_results_skip_cross_turn_dedup() -> None:
     assert second["content"] == payload  # type: ignore[index]
 
 
-def test_bash_remains_compressible() -> None:
+def test_non_excluded_tool_remains_compressible() -> None:
+    """Exclusion is name-based: a tool not in DEFAULT_EXCLUDE_TOOLS is still
+    lossily compressed. Bash coverage lives in test_bash_tool_result_protection.
+    """
     router = _router()
     calls = 0
 
@@ -168,7 +171,7 @@ def test_bash_remains_compressible() -> None:
         calls += 1
         content = str(args[0])
         return RouterCompressionResult(
-            compressed="compressed bash output",
+            compressed="compressed other output",
             original=content,
             strategy_used=CompressionStrategy.TEXT,
             routing_log=[
@@ -177,8 +180,8 @@ def test_bash_remains_compressible() -> None:
         )
 
     router.compress = fake_compress  # type: ignore[method-assign]
-    payload = "bash output " * 100
-    result = router.apply(_messages("Bash", payload), _Tokenizer())
+    payload = "other output " * 100
+    result = router.apply(_messages("OtherTool", payload), _Tokenizer())
 
     assert calls == 1
     assert "router:excluded:tool" not in result.transforms_applied

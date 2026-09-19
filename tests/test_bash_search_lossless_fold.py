@@ -1,11 +1,13 @@
 # ruff: noqa: E402 — test sections import after helper/setup code by design.
 """Bash-search lossless fold.
 
-`bash` is not an excluded tool, so its output normally takes the lossy strategy
-path. But a read-only search run through it (grep/rg/git grep) produces byte-
-losslessly foldable output — the router detects the *command* and folds it with
-the same ripgrep --heading transform excluded Grep gets, instead of lossy
-compression. Non-search bash commands (cat/build/mutate) are untouched.
+`Bash` is in DEFAULT_EXCLUDE_TOOLS, so default config folds search-shaped
+output on the excluded-tool lossless path (`router:excluded:lossless_search`).
+When Bash is not excluded (custom exclude_tools, or other `bash_tool_names`
+such as `shell`), a read-only search (grep/rg/git grep) still takes
+`router:bash:lossless_search` — the same ripgrep --heading transform excluded
+Grep gets — instead of lossy compression. Non-search bash commands
+(cat/build/mutate) are not search-folded.
 """
 
 from __future__ import annotations
@@ -124,16 +126,23 @@ def _anthropic(command: str, content: str, tokenizer):
     return result.messages[1]["content"][0]["content"], result.transforms_applied
 
 
+def _assert_bash_search_folded(transforms: list[str]) -> None:
+    assert (
+        "router:bash:lossless_search" in transforms
+        or "router:excluded:lossless_search" in transforms
+    ), transforms
+
+
 def test_openai_bash_grep_folds_and_recovers(tokenizer):
     out, transforms = _openai("grep -rn foo .", GREP, tokenizer)
-    assert "router:bash:lossless_search" in transforms
+    _assert_bash_search_folded(transforms)
     assert len(out) < len(GREP)
     assert search_unheading(out) == GREP  # byte-exact
 
 
 def test_anthropic_bash_rtk_grep_folds_and_recovers(tokenizer):
     out, transforms = _anthropic("rtk grep foo headroom/", GREP, tokenizer)
-    assert "router:bash:lossless_search" in transforms
+    _assert_bash_search_folded(transforms)
     assert search_unheading(out) == GREP
 
 

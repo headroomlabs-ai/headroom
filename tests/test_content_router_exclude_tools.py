@@ -215,12 +215,12 @@ def test_protect_tool_results_survives_runtime_read_protection_window_kwarg() ->
 
 
 # ---------------------------------------------------------------------------
-# Baseline: Bash NOT in DEFAULT_EXCLUDE_TOOLS (unchanged by this PR)
+# Baseline: Bash IS in DEFAULT_EXCLUDE_TOOLS (#3652)
 # ---------------------------------------------------------------------------
 
 
-def test_bash_not_in_default_exclude_tools() -> None:
-    """Bash must remain absent from DEFAULT_EXCLUDE_TOOLS; protect_tool_results
-    is the opt-in path."""
-    assert "Bash" not in DEFAULT_EXCLUDE_TOOLS
-    assert "bash" not in DEFAULT_EXCLUDE_TOOLS
+def test_bash_in_default_exclude_tools() -> None:
+    """Bash is excluded by default so columnar shell output is not lossily
+    compressed. protect_tool_results remains the opt-in path for other tools."""
+    assert "Bash" in DEFAULT_EXCLUDE_TOOLS
+    assert "bash" in DEFAULT_EXCLUDE_TOOLS

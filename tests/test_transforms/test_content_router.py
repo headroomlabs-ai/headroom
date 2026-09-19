@@ -1265,40 +1265,41 @@ class TestExcludeTools:
         # (we just verify it wasn't excluded)
         assert "router:excluded:tool" in result.transforms_applied
 
-    def test_bash_not_in_default_exclude_tools(self):
-        """Bash is NOT excluded by default — its outputs (build logs, test
-        output) are ideal compression targets. Regression test for PR #704.
+    def test_bash_in_default_exclude_tools(self):
+        """Bash is excluded by default so columnar shell output keeps its
+        fields (#3652). Regression against the PR #704 "compress Bash"
+        membership that let `ls -la` / `git status` reach Kompress.
 
         This test validates the DEFAULT_EXCLUDE_TOOLS frozenset directly
         (pure config check — no Rust dependency).
         """
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
-        assert "Bash" not in DEFAULT_EXCLUDE_TOOLS, (
-            "Bash should NOT be in DEFAULT_EXCLUDE_TOOLS — "
-            "its outputs (build logs, test output) are ideal compression targets"
+        assert "Bash" in DEFAULT_EXCLUDE_TOOLS, (
+            "Bash should be in DEFAULT_EXCLUDE_TOOLS — "
+            "columnar shell output must not take the lossy Kompress path"
         )
-        assert "bash" not in DEFAULT_EXCLUDE_TOOLS, "'bash' should NOT be in DEFAULT_EXCLUDE_TOOLS"
+        assert "bash" in DEFAULT_EXCLUDE_TOOLS, "'bash' should be in DEFAULT_EXCLUDE_TOOLS"
 
-    def test_bash_lowercase_not_in_exclude_tools(self):
-        """Lowercase 'bash' is also NOT in default exclude tools."""
+    def test_bash_lowercase_in_exclude_tools(self):
+        """Lowercase 'bash' is also in default exclude tools."""
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
-        assert "bash" not in DEFAULT_EXCLUDE_TOOLS
+        assert "bash" in DEFAULT_EXCLUDE_TOOLS
 
     def test_default_exclude_tools_membership(self):
         """Verify all expected exclude tools and their lowercase variants."""
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
-        # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep outputs)
-        for tool in ("Read", "Glob", "Grep", "Write", "Edit"):
+        # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep/Bash)
+        for tool in ("Read", "Glob", "Grep", "Write", "Edit", "Bash"):
             assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
             assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"
             )
 
         # Tools that should NOT be excluded
-        for tool in ("Bash", "bash", "TodoWrite", "todo_write"):
+        for tool in ("TodoWrite", "todo_write"):
             assert tool not in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool} should NOT be in DEFAULT_EXCLUDE_TOOLS"
             )
