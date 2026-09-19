@@ -9,12 +9,14 @@ never touched.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
-import pytest
-import yaml
-from click.testing import CliRunner
+import pytest  # type: ignore[import-not-found]
+import yaml  # type: ignore[import-untyped]
+from click.testing import CliRunner  # type: ignore[import-not-found]
 
 from headroom.cli.main import main
 from headroom.providers.omp import (
@@ -171,11 +173,17 @@ def test_build_launch_env_passes_env_through_and_emits_display(omp_home: Path) -
     source = {"PATH": "/usr/bin", "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
     env, display = build_launch_env(8787, source, project="proj")
 
-    # The redirect lives in models.yml, so env is a verbatim copy — notably
-    # ANTHROPIC_BASE_URL is NOT rewritten to the proxy.
-    assert env == source
+    # Anthropic inference redirects through models.yml. The provider-independent
+    # Pi-compatible extension uses its own loopback endpoint variable.
+    assert env == {
+        **source,
+        "HEADROOM_PI_BASE_URL": "http://127.0.0.1:8787",
+    }
     assert env is not source  # a copy, so caller's environ can't be mutated
-    assert display == ["models.yml: providers.anthropic.baseUrl=http://127.0.0.1:8787/p/proj"]
+    assert display == [
+        "models.yml: providers.anthropic.baseUrl=http://127.0.0.1:8787/p/proj",
+        "HEADROOM_PI_BASE_URL=http://127.0.0.1:8787",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +205,21 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
     captured: dict[str, object] = {}
 
     def fake_launch_tool(**kwargs: object) -> None:
+        configure = cast(
+            Callable[
+                [int, tuple, dict[str, str], list[str]],
+                tuple[tuple, dict[str, str], list[str]],
+            ],
+            kwargs["configure_launch"],
+        )
+        args, env, display = configure(
+            8787,
+            cast(tuple, kwargs["args"]),
+            cast(dict[str, str], kwargs["env"]),
+            cast(list[str], kwargs["env_vars_display"]),
+        )
         captured.update(kwargs)
+        captured.update(args=args, env=env, env_vars_display=display)
         # Prove models.yml is on disk BEFORE omp is launched.
         captured["models_text_at_launch"] = (
             omp_home.read_text(encoding="utf-8") if omp_home.exists() else None
@@ -212,7 +234,11 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
     assert result.exit_code == 0, result.output
     assert captured["tool_label"] == "OMP"
     assert captured["agent_type"] == "omp"
+    assert captured["launch_message"] == "Headroom inference route + extension connected"
     assert captured["args"] == ("-p", "fix the bug")
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_PI_BASE_URL"] == "http://127.0.0.1:8787"
 
     text_at_launch = captured["models_text_at_launch"]
     assert isinstance(text_at_launch, str)
@@ -223,6 +249,47 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
     display = captured["env_vars_display"]
     assert isinstance(display, list)
     assert f"models.yml: providers.anthropic.baseUrl={base_url}" in display
+    assert "HEADROOM_PI_BASE_URL=http://127.0.0.1:8787" in display
+
+
+def test_wrap_omp_rewrites_both_routes_after_proxy_port_fallback(
+    runner: CliRunner, omp_home: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs: object) -> None:
+        configure = cast(
+            Callable[
+                [int, tuple, dict[str, str], list[str]],
+                tuple[tuple, dict[str, str], list[str]],
+            ],
+            kwargs["configure_launch"],
+        )
+        args, env, display = configure(
+            8788,
+            cast(tuple, kwargs["args"]),
+            cast(dict[str, str], kwargs["env"]),
+            cast(list[str], kwargs["env_vars_display"]),
+        )
+        captured.update(args=args, env=env, display=display)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="omp"),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(main, ["wrap", "omp"])
+
+    assert result.exit_code == 0, result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["HEADROOM_PI_BASE_URL"] == "http://127.0.0.1:8788"
+    models = yaml.safe_load(omp_home.read_text(encoding="utf-8"))
+    base_url = models["providers"]["anthropic"]["baseUrl"]
+    assert base_url.startswith("http://127.0.0.1:8788/p/")
+    assert captured["display"] == [
+        f"models.yml: providers.anthropic.baseUrl={base_url}",
+        "HEADROOM_PI_BASE_URL=http://127.0.0.1:8788",
+    ]
 
 
 def test_wrap_omp_does_not_write_agents_md(
@@ -250,10 +317,12 @@ def test_unwrap_omp_restores_pristine_and_stops_proxy(runner: CliRunner, omp_hom
     inject_models_override(8787, "proj")
 
     stopped: list[int] = []
-    with patch(
-        "headroom.cli.wrap._stop_local_proxy_for_unwrap",
-        side_effect=lambda port: stopped.append(port) or "not_running",
-    ):
+
+    def stop_proxy(port: int) -> str:
+        stopped.append(port)
+        return "not_running"
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", side_effect=stop_proxy):
         result = runner.invoke(main, ["unwrap", "omp"])
 
     assert result.exit_code == 0, result.output
@@ -269,10 +338,12 @@ def test_unwrap_omp_removes_wrap_created_file(runner: CliRunner, omp_home: Path)
     inject_models_override(8787, "proj")  # fresh create → no backup
 
     stopped: list[int] = []
-    with patch(
-        "headroom.cli.wrap._stop_local_proxy_for_unwrap",
-        side_effect=lambda port: stopped.append(port) or "not_running",
-    ):
+
+    def stop_proxy(port: int) -> str:
+        stopped.append(port)
+        return "not_running"
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", side_effect=stop_proxy):
         result = runner.invoke(main, ["unwrap", "omp", "--port", "9191"])
 
     assert result.exit_code == 0, result.output

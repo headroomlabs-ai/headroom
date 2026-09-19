@@ -31,6 +31,8 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     sdk = root / "sdk"
     typescript = sdk / "typescript"
     typescript.mkdir(parents=True)
+    pi_extension = plugins / "pi"
+    pi_extension.mkdir(parents=True)
 
     # pyproject.toml
     pyproject = root / "pyproject.toml"
@@ -93,6 +95,26 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     typescript_pkg = typescript / "package.json"
     typescript_pkg.write_text(json.dumps({"name": "test", "version": "0.5.25"}))
 
+    # plugins/pi package manifests
+    pi_extension_pkg = pi_extension / "package.json"
+    pi_extension_pkg.write_text(json.dumps({"name": "headroom-pi", "version": "0.5.25"}))
+    pi_extension_lock = pi_extension / "package-lock.json"
+    pi_extension_lock.write_text(
+        json.dumps(
+            {
+                "name": "headroom-pi",
+                "version": "0.5.25",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {
+                        "name": "headroom-pi",
+                        "version": "0.5.25",
+                    }
+                },
+            }
+        )
+    )
+
     # server.json — the MCP registry descriptor. Asserted byte-for-byte against
     # render_server_json(), which reads the version from pyproject.toml, so it has
     # to move with every bump or the release PR's test job fails.
@@ -118,6 +140,8 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
         "claude_plugin": claude_plugin,
         "github_plugin": github_plugin,
         "typescript_pkg": typescript_pkg,
+        "pi_extension_pkg": pi_extension_pkg,
+        "pi_extension_lock": pi_extension_lock,
         "server_json": server_json,
     }
 
@@ -156,6 +180,12 @@ def test_version_sync_explicit_version(temp_project: dict[str, Path]) -> None:
     typescript_pkg = json.loads(temp_project["typescript_pkg"].read_text())
     assert typescript_pkg["version"] == "0.7.0"
 
+    pi_extension_pkg = json.loads(temp_project["pi_extension_pkg"].read_text())
+    assert pi_extension_pkg["version"] == "0.7.0"
+    pi_extension_lock = json.loads(temp_project["pi_extension_lock"].read_text())
+    assert pi_extension_lock["version"] == "0.7.0"
+    assert pi_extension_lock["packages"][""]["version"] == "0.7.0"
+
     repo_claude_marketplace = json.loads(temp_project["repo_claude_marketplace"].read_text())
     assert repo_claude_marketplace["metadata"]["version"] == "0.7.0"
     assert repo_claude_marketplace["plugins"][0]["version"] == "0.7.0"
@@ -179,6 +209,7 @@ def test_version_sync_explicit_version(temp_project: dict[str, Path]) -> None:
     assert metadata["packages"]["npm-sdk"] == "0.7.0"
     assert metadata["packages"]["npm-openclaw"] == "0.7.0"
     assert metadata["packages"]["npm-opencode"] == "0.7.0"
+    assert metadata["packages"]["npm-pi-extension"] == "0.7.0"
     assert metadata["packages"]["agent-hooks-plugin"] == "0.7.0"
 
 
@@ -311,6 +342,7 @@ def test_release_metadata_written(temp_project: dict[str, Path]) -> None:
             "npm-sdk": "0.6.0",
             "npm-openclaw": "0.6.0",
             "npm-opencode": "0.6.0",
+            "npm-pi-extension": "0.6.0",
             "agent-hooks-plugin": "0.6.0",
         },
     }

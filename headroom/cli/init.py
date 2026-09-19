@@ -10,23 +10,45 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from copy import deepcopy
 from hashlib import sha1
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from headroom._subprocess import run
+from headroom._version import __version__ as _HEADROOM_VERSION
 
 try:
-    import tomllib
+    import tomllib  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
 import click
 
-from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
-from headroom.install.paths import claude_settings_path, codex_config_path, validate_profile_name
+from headroom.install.models import (
+    ArtifactRecord,
+    ConfigScope,
+    InstallPreset,
+    RuntimeKind,
+    SupervisorKind,
+)
+from headroom.install.paths import (
+    claude_settings_path,
+    codex_config_path,
+    manifest_path,
+    profile_root,
+    unix_ensure_script_path,
+    unix_run_script_path,
+    validate_profile_name,
+    windows_ensure_cmd_path,
+    windows_ensure_script_path,
+    windows_run_cmd_path,
+    windows_run_script_path,
+)
 from headroom.install.planner import build_manifest
 from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env_scope
 from headroom.install.runtime import (
@@ -38,12 +60,25 @@ from headroom.install.runtime import (
     stop_runtime,
     wait_ready,
 )
-from headroom.install.state import ManifestError, load_manifest, save_manifest
-from headroom.install.supervisors import start_supervisor
+from headroom.install.state import ManifestError, delete_manifest, load_manifest, save_manifest
+from headroom.install.supervisors import (
+    install_supervisor,
+    remove_supervisor,
+    start_supervisor,
+)
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
+from headroom.providers.pi_extension import (
+    ensure_extension_config,
+    ensure_host_package,
+    extension_config_path,
+    extension_release_version,
+    inspect_host_package,
+    remove_owned_extension_config,
+    remove_owned_host_package,
+)
 
 from .main import main
 
@@ -59,9 +94,10 @@ _CODEX_PROVIDER_MARKER_START = "# --- Headroom init provider ---"
 _CODEX_PROVIDER_MARKER_END = "# --- end Headroom init provider ---"
 _CODEX_FEATURE_MARKER_START = "# --- Headroom init features ---"
 _CODEX_FEATURE_MARKER_END = "# --- end Headroom init features ---"
-_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
+_SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw", "pi", "omp")
 _LOCAL_TARGETS = {"claude", "codex"}
-_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
+_GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw", "pi", "omp"}
+_NATIVE_EXTENSION_TARGETS = {"pi", "omp"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
@@ -552,23 +588,17 @@ def _manifest_changed(
     )
 
 
-def _ensure_runtime_manifest(
+def _build_runtime_manifest(
     *,
-    global_scope: bool,
+    profile: str,
+    existing: Any | None,
     targets: list[str],
     port: int,
     backend: str,
     anyllm_provider: str | None,
     region: str | None,
     memory: bool,
-) -> str:
-    profile = _runtime_profile(global_scope)
-    try:
-        existing = load_manifest(profile)
-    except ManifestError as e:
-        # Recover from a corrupt manifest by overwriting it rather than crashing.
-        click.echo(f"Warning: {e}; overwriting.")
-        existing = None
+) -> Any:
     merged_targets = sorted(set(existing.targets if existing else []).union(targets))
     manifest = build_manifest(
         profile=profile,
@@ -586,9 +616,47 @@ def _ensure_runtime_manifest(
         telemetry_enabled=True,
         image="ghcr.io/headroomlabs-ai/headroom:latest",
     )
-    manifest.supervisor_kind = SupervisorKind.NONE.value
-    manifest.artifacts = []
+    # The planner intentionally recognizes only proxy/provider targets. Native
+    # hosts share this manifest, so restore the merged ownership list afterward.
+    manifest.targets = merged_targets
+    manifest.supervisor_kind = (
+        getattr(existing, "supervisor_kind", SupervisorKind.NONE.value)
+        if existing
+        else SupervisorKind.NONE.value
+    )
+    manifest.artifacts = list(getattr(existing, "artifacts", [])) if existing else []
     manifest.mutations = existing.mutations if existing else []
+    return manifest
+
+
+def _ensure_runtime_manifest(
+    *,
+    global_scope: bool,
+    targets: list[str],
+    port: int,
+    backend: str,
+    anyllm_provider: str | None,
+    region: str | None,
+    memory: bool,
+) -> str:
+    profile = _runtime_profile(global_scope)
+    try:
+        existing = load_manifest(profile)
+    except ManifestError as e:
+        # Keep the legacy init behavior; native init preflights corrupt ownership
+        # state before calling this path and never overwrites it.
+        click.echo(f"Warning: {e}; overwriting.")
+        existing = None
+    manifest = _build_runtime_manifest(
+        profile=profile,
+        existing=existing,
+        targets=targets,
+        port=port,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+        memory=memory,
+    )
     if existing is not None and _manifest_changed(
         existing,
         port=port,
@@ -603,6 +671,560 @@ def _ensure_runtime_manifest(
             pass
     save_manifest(manifest)
     return profile
+
+
+def _artifact_key(artifact: ArtifactRecord) -> tuple[str, str]:
+    return artifact.kind, artifact.path
+
+
+def _upsert_artifacts(manifest: Any, records: list[ArtifactRecord]) -> None:
+    replacements = {_artifact_key(record): record for record in records}
+    manifest.artifacts = [
+        artifact for artifact in manifest.artifacts if _artifact_key(artifact) not in replacements
+    ] + list(replacements.values())
+
+
+def _snapshot_manifest(profile: str) -> tuple[bool, bytes, Any | None]:
+    path = manifest_path(profile)
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return False, b"", load_manifest(profile)
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError as exc:
+        raise click.ClickException(
+            f"Native Pi/OMP init cannot use corrupt ownership state: {exc}. "
+            "Fix or move the manifest, then retry."
+        ) from exc
+    return True, content, manifest
+
+
+def _restore_manifest_snapshot(profile: str, existed: bool, content: bytes) -> None:
+    path = manifest_path(profile)
+    if not existed:
+        root = profile_root(profile)
+        shutil.rmtree(root, ignore_errors=True)
+        if root.exists():
+            raise click.ClickException(
+                f"Could not remove newly created ownership state for profile {profile}."
+            )
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if path.read_bytes() != content:
+        raise click.ClickException(
+            f"Could not verify restored ownership state for profile {profile}."
+        )
+
+
+def _save_manifest_verified(manifest: Any) -> None:
+    save_manifest(manifest)
+    persisted = load_manifest(manifest.profile)
+    if (
+        persisted is None
+        or persisted.targets != manifest.targets
+        or persisted.artifacts != manifest.artifacts
+    ):
+        raise click.ClickException(
+            f"Could not verify persisted ownership state for profile {manifest.profile}."
+        )
+
+
+def _task_file_paths(manifest: Any) -> set[Path]:
+    paths = {
+        Path(artifact.path)
+        for artifact in manifest.artifacts
+        if artifact.kind in {"script", "service-unit", "cron", "plist"}
+    }
+    if sys.platform == "win32":
+        paths.update(
+            {
+                windows_run_script_path(manifest.profile),
+                windows_run_cmd_path(manifest.profile),
+                windows_ensure_script_path(manifest.profile),
+                windows_ensure_cmd_path(manifest.profile),
+            }
+        )
+    else:
+        paths.update(
+            {
+                unix_run_script_path(manifest.profile),
+                unix_ensure_script_path(manifest.profile),
+            }
+        )
+    return paths
+
+
+def _snapshot_files(paths: set[Path]) -> dict[Path, tuple[bytes, int] | None]:
+    snapshot: dict[Path, tuple[bytes, int] | None] = {}
+    for path in paths:
+        try:
+            snapshot[path] = (path.read_bytes(), path.stat().st_mode & 0o777)
+        except FileNotFoundError:
+            snapshot[path] = None
+    return snapshot
+
+
+def _restore_files(snapshot: dict[Path, tuple[bytes, int] | None]) -> None:
+    for path, prior in snapshot.items():
+        if prior is None:
+            path.unlink(missing_ok=True)
+            continue
+        content, mode = prior
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        path.chmod(mode)
+
+
+def _snapshot_extension_config() -> tuple[bool, bytes, int | None]:
+    path = extension_config_path().absolute()
+    try:
+        return True, path.read_bytes(), path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return False, b"", None
+
+
+def _expected_extension_config(snapshot: tuple[bool, bytes, int | None], port: int) -> bytes | None:
+    _existed, content, _mode = snapshot
+    try:
+        payload = json.loads(content) if content else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["baseUrl"] = f"http://127.0.0.1:{port}"
+    return (json.dumps(payload, indent=2) + "\n").encode()
+
+
+def _restore_extension_config_snapshot(
+    snapshot: tuple[bool, bytes, int | None],
+    *,
+    expected_managed: bytes | None,
+) -> None:
+    existed, content, mode = snapshot
+    path = extension_config_path().absolute()
+    try:
+        current = path.read_bytes()
+    except FileNotFoundError:
+        current = None
+
+    if current == content if existed else current is None:
+        return
+    if expected_managed is None or current != expected_managed:
+        raise click.ClickException(
+            f"Pi extension config at {path} changed during the failed init; "
+            "the concurrent file was preserved."
+        )
+    if not existed:
+        path.unlink()
+        return
+    path.write_bytes(content)
+    if mode is not None:
+        path.chmod(mode)
+
+
+def _command_bytes(value: Any) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    return str(value or "").encode("utf-8", errors="surrogateescape")
+
+
+def _scheduler_snapshot_error(platform: str, stderr: Any) -> click.ClickException:
+    detail = _command_bytes(stderr).decode("utf-8", errors="replace").strip()
+    return click.ClickException(
+        f"Could not snapshot {platform} scheduler state: {detail or 'unknown query failure'}."
+    )
+
+
+def _snapshot_scheduler(manifest: Any) -> tuple[str, Any]:
+    if sys.platform.startswith("linux"):
+        result = run(["crontab", "-l"], capture_output=True)
+        if result.returncode == 0:
+            return "linux", (True, _command_bytes(result.stdout))
+        detail = _command_bytes(result.stderr).lower()
+        if result.returncode == 1 and b"no crontab for" in detail:
+            return "linux", (False, b"")
+        raise _scheduler_snapshot_error("Linux crontab", result.stderr)
+    if sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"com.headroom.{manifest.profile}.plist"
+        try:
+            content = plist.read_bytes()
+        except FileNotFoundError:
+            content = None
+        domain = f"gui/{os.getuid()}"
+        result = run(
+            ["launchctl", "print", f"{domain}/com.headroom.{manifest.profile}"],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            loaded = True
+        else:
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode == 113 and b"could not find service" in detail:
+                loaded = False
+            else:
+                raise _scheduler_snapshot_error("macOS launchd", result.stderr)
+        return "darwin", (plist, content, loaded, domain)
+    if sys.platform.startswith("win"):
+        tasks: dict[str, bytes | None] = {}
+        for suffix in ("startup", "health"):
+            name = f"{manifest.service_name}-{suffix}"
+            result = run(
+                ["schtasks", "/Query", "/TN", name, "/XML"],
+                capture_output=True,
+            )
+            if result.returncode == 0:
+                tasks[name] = _command_bytes(result.stdout)
+                continue
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode == 1 and b"cannot find the file specified" in detail:
+                tasks[name] = None
+                continue
+            raise _scheduler_snapshot_error("Windows Task Scheduler", result.stderr)
+        return "windows", tasks
+    return "none", None
+
+
+def _restore_windows_task(name: str, xml: bytes) -> None:
+    temp = Path(tempfile.mkstemp(suffix=".xml")[1])
+    try:
+        temp.write_bytes(xml)
+        run(["schtasks", "/Create", "/TN", name, "/XML", str(temp), "/F"], check=True)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _restore_scheduler(snapshot: tuple[str, Any]) -> None:
+    platform, state = snapshot
+    if platform == "linux":
+        existed, content = state
+        if existed:
+            run(["crontab", "-"], input=content, check=True)
+        else:
+            result = run(["crontab", "-r"], capture_output=True)
+            if result.returncode != 0:
+                detail = _command_bytes(result.stderr).lower()
+                if result.returncode != 1 or b"no crontab for" not in detail:
+                    raise _scheduler_snapshot_error("Linux crontab rollback", result.stderr)
+    elif platform == "darwin":
+        plist, content, was_loaded, domain = state
+        result = run(
+            ["launchctl", "bootout", f"{domain}/{plist.stem}"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            detail = _command_bytes(result.stderr).lower()
+            if result.returncode != 3 or b"no such process" not in detail:
+                raise _scheduler_snapshot_error("macOS launchd rollback", result.stderr)
+        if content is None:
+            plist.unlink(missing_ok=True)
+        else:
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_bytes(content)
+        if was_loaded and content is not None:
+            run(["launchctl", "bootstrap", domain, str(plist)], check=True)
+    elif platform == "windows":
+        for name, xml in state.items():
+            if xml is None:
+                result = run(
+                    ["schtasks", "/Delete", "/TN", name, "/F"],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    detail = _command_bytes(result.stderr).lower()
+                    if result.returncode != 1 or b"cannot find the file specified" not in detail:
+                        raise _scheduler_snapshot_error(
+                            "Windows Task Scheduler rollback", result.stderr
+                        )
+            else:
+                _restore_windows_task(name, xml)
+
+
+def _restore_native_package(
+    *,
+    host: Literal["pi", "omp"],
+    binary: str,
+    previous: Any,
+    current_artifact: ArtifactRecord | None,
+) -> None:
+    if current_artifact is None:
+        return
+    if previous is None:
+        result = remove_owned_host_package(host, binary, current_artifact)
+        if result == "preserved":
+            raise click.ClickException(f"Could not roll back the {host} package install.")
+        return
+    ensure_host_package(host, binary, previous.version, current_artifact)
+
+
+def _wait_runtime_status(manifest: Any, expected: str, timeout_seconds: int = 10) -> bool:
+    for _ in range(timeout_seconds):
+        if runtime_status(manifest) == expected:
+            return True
+        time.sleep(1)
+    return runtime_status(manifest) == expected
+
+
+def _wait_runtime_transition(manifest: Any, expected: str, before: str) -> bool:
+    current = runtime_status(manifest)
+    # stop_runtime removes the PID file before SIGTERM is necessarily observed,
+    # so a first "stopped" result after a running snapshot is not authoritative.
+    if expected == "stopped" and before == "running" and current == "stopped":
+        time.sleep(1)
+        return runtime_status(manifest) == "stopped"
+    if current == expected:
+        return True
+    return _wait_runtime_status(manifest, expected)
+
+
+def _start_profile_strict_locked(manifest: Any) -> None:
+    if not getattr(manifest, "preset", None):
+        start_detached_agent(manifest.profile)
+        return
+    if runtime_status(manifest) != "running":
+        start_detached_agent(manifest.profile)
+    if not wait_ready(manifest, timeout_seconds=45):
+        raise click.ClickException(
+            f"Headroom runtime for profile {manifest.profile} did not become ready."
+        )
+
+
+def _start_profile_strict(manifest: Any) -> None:
+    with acquire_runtime_start_lock(manifest.profile) as acquired:
+        if not acquired:
+            raise click.ClickException(
+                f"Headroom runtime for profile {manifest.profile} is already being started."
+            )
+        _start_profile_strict_locked(manifest)
+
+
+def _restore_runtime_state(
+    manifest: Any, status: str, was_ready: bool, *, assume_start_lock: bool = False
+) -> None:
+    if getattr(manifest, "preset", None):
+        current_status = runtime_status(manifest)
+        stop_runtime(manifest)
+        if not _wait_runtime_transition(manifest, "stopped", current_status):
+            raise click.ClickException(
+                f"Could not restore stopped runtime state for profile {manifest.profile}."
+            )
+    if status == "stopped":
+        return
+    if status != "running":
+        raise click.ClickException(
+            f"Cannot restore unknown runtime state {status!r} for profile {manifest.profile}."
+        )
+    if was_ready:
+        if assume_start_lock:
+            _start_profile_strict_locked(manifest)
+        else:
+            _start_profile_strict(manifest)
+        return
+    start_detached_agent(manifest.profile)
+    if not _wait_runtime_status(manifest, "running"):
+        raise click.ClickException(
+            f"Could not restore running runtime state for profile {manifest.profile}."
+        )
+
+
+def _init_native_hosts(
+    *,
+    hosts: list[tuple[Literal["pi", "omp"], str]],
+    release: str,
+    manifest: Any,
+    manifest_snapshot: tuple[bool, bytes, Any | None],
+    port: int,
+) -> None:
+    _manifest_existed, _manifest_bytes, previous_manifest = manifest_snapshot
+    package_states: dict[str, Any] = {
+        host: inspect_host_package(host, binary) for host, binary in hosts
+    }
+    config_snapshot = _snapshot_extension_config()
+    expected_config_bytes = _expected_extension_config(config_snapshot, port)
+    task_files_snapshot = _snapshot_files(_task_file_paths(manifest))
+    scheduler_snapshot = _snapshot_scheduler(manifest)
+    prior_runtime_status = (
+        runtime_status(previous_manifest)
+        if previous_manifest is not None and getattr(previous_manifest, "preset", None)
+        else "stopped"
+    )
+    prior_runtime_ready = bool(
+        previous_manifest is not None
+        and prior_runtime_status == "running"
+        and wait_ready(previous_manifest, timeout_seconds=1)
+    )
+    previous_config = next(
+        (
+            artifact
+            for artifact in (previous_manifest.artifacts if previous_manifest else [])
+            if artifact.kind == "pi-extension-config"
+        ),
+        None,
+    )
+    with acquire_runtime_start_lock(manifest.profile) as acquired:
+        if not acquired:
+            raise click.ClickException(f"Profile {manifest.profile} is already being initialized.")
+        _init_native_hosts_locked(
+            hosts=hosts,
+            release=release,
+            manifest=manifest,
+            manifest_snapshot=manifest_snapshot,
+            port=port,
+            package_states=package_states,
+            config_snapshot=config_snapshot,
+            expected_config_bytes=expected_config_bytes,
+            task_files_snapshot=task_files_snapshot,
+            scheduler_snapshot=scheduler_snapshot,
+            prior_runtime_status=prior_runtime_status,
+            prior_runtime_ready=prior_runtime_ready,
+            previous_config=previous_config,
+        )
+
+
+def _init_native_hosts_locked(
+    *,
+    hosts: list[tuple[Literal["pi", "omp"], str]],
+    release: str,
+    manifest: Any,
+    manifest_snapshot: tuple[bool, bytes, Any | None],
+    port: int,
+    package_states: dict[str, Any],
+    config_snapshot: tuple[bool, bytes, int | None],
+    expected_config_bytes: bytes | None,
+    task_files_snapshot: dict[Path, tuple[bytes, int] | None],
+    scheduler_snapshot: tuple[str, Any],
+    prior_runtime_status: str,
+    prior_runtime_ready: bool,
+    previous_config: ArtifactRecord | None,
+) -> None:
+    manifest_existed, manifest_bytes, previous_manifest = manifest_snapshot
+    installed_packages: list[tuple[Literal["pi", "omp"], str, ArtifactRecord]] = []
+    config_managed_bytes: bytes | None = None
+
+    try:
+        if previous_manifest is not None and _manifest_changed(
+            previous_manifest,
+            port=getattr(manifest, "port", port),
+            backend=getattr(manifest, "backend", "anthropic"),
+            anyllm_provider=getattr(manifest, "anyllm_provider", None),
+            region=getattr(manifest, "region", None),
+            memory=getattr(manifest, "memory_enabled", False),
+        ):
+            try:
+                stop_runtime(previous_manifest)
+            except Exception:
+                pass
+        config_artifact = ensure_extension_config(port, previous_config)
+        try:
+            config_managed_bytes = extension_config_path().absolute().read_bytes()
+        except FileNotFoundError:
+            config_managed_bytes = None
+
+        for host, binary in hosts:
+            previous_artifact = next(
+                (
+                    artifact
+                    for artifact in (previous_manifest.artifacts if previous_manifest else [])
+                    if artifact.kind == "pi-extension-package" and artifact.path == host
+                ),
+                None,
+            )
+            package_artifact = ensure_host_package(host, binary, release, previous_artifact)
+            installed_packages.append((host, binary, package_artifact))
+
+        native_targets = [host for host, _binary in hosts]
+        final_targets = sorted(
+            set(previous_manifest.targets if previous_manifest else []).union(native_targets)
+        )
+        provisional = deepcopy(manifest)
+        provisional.targets = list(previous_manifest.targets if previous_manifest else [])
+        provisional.artifacts = list(previous_manifest.artifacts if previous_manifest else [])
+        provisional.supervisor_kind = SupervisorKind.TASK.value
+        _save_manifest_verified(provisional)
+        task_artifacts = install_supervisor(provisional)
+        _start_profile_strict_locked(provisional)
+
+        manifest.targets = final_targets
+        manifest.supervisor_kind = SupervisorKind.TASK.value
+        _upsert_artifacts(
+            manifest,
+            [
+                config_artifact,
+                *(artifact for _host, _binary, artifact in installed_packages),
+                *task_artifacts,
+            ],
+        )
+        _save_manifest_verified(manifest)
+    except BaseException as initiating_error:
+        rollback_errors: list[str] = []
+        for host, binary, artifact in reversed(installed_packages):
+            try:
+                _restore_native_package(
+                    host=host,
+                    binary=binary,
+                    previous=package_states[host],
+                    current_artifact=artifact,
+                )
+            except BaseException as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        # The failing helper owns its internal rollback. Verify that contract.
+        installed_hosts = {host for host, _binary, _artifact in installed_packages}
+        for host, binary in hosts:
+            if host in installed_hosts:
+                continue
+            try:
+                if inspect_host_package(host, binary) != package_states[host]:
+                    rollback_errors.append(
+                        f"{host} package helper did not restore its pre-init state."
+                    )
+            except BaseException as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        for restore in (
+            lambda: _restore_extension_config_snapshot(
+                config_snapshot,
+                expected_managed=config_managed_bytes or expected_config_bytes,
+            ),
+            lambda: remove_supervisor(manifest),
+            lambda: _restore_scheduler(scheduler_snapshot),
+            lambda: _restore_files(task_files_snapshot),
+            lambda: _restore_manifest_snapshot(manifest.profile, manifest_existed, manifest_bytes),
+            lambda: (
+                _restore_runtime_state(
+                    previous_manifest,
+                    prior_runtime_status,
+                    prior_runtime_ready,
+                    assume_start_lock=True,
+                )
+                if previous_manifest is not None
+                else stop_runtime(manifest)
+                if getattr(manifest, "preset", None) is not None
+                else None
+            ),
+        ):
+            try:
+                restore()
+            except BaseException as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        message = str(initiating_error)
+        if rollback_errors:
+            message += " Rollback also failed: " + "; ".join(rollback_errors)
+        raise click.ClickException(message) from initiating_error
+
+
+def _init_native_host(*, host: Literal["pi", "omp"], binary: str, profile: str, port: int) -> None:
+    release = extension_release_version(_HEADROOM_VERSION)
+    manifest_snapshot = _snapshot_manifest(profile)
+    manifest = manifest_snapshot[2]
+    if manifest is None:
+        raise click.ClickException(f"Deployment profile {profile!r} was not created.")
+    _init_native_hosts(
+        hosts=[(host, binary)],
+        release=release,
+        manifest=deepcopy(manifest),
+        manifest_snapshot=manifest_snapshot,
+        port=port,
+    )
 
 
 def _env_manifest(values: dict[str, str]) -> Any:
@@ -902,16 +1524,42 @@ def _run_init_targets(
         backend,
         memory,
     )
-    runtime_targets = [target for target in targets if target != "openclaw"]
-    profile = _ensure_runtime_manifest(
-        global_scope=global_scope,
-        targets=runtime_targets,
-        port=port,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-        memory=memory,
-    )
+    native_targets = _NATIVE_EXTENSION_TARGETS.intersection(targets)
+    if not global_scope and native_targets:
+        raise click.ClickException("Durable Pi/OMP init requires -g (current-user scope).")
+
+    native_preflight: dict[str, tuple[str, str]] = {}
+    native_manifest_snapshot: tuple[bool, bytes, Any | None] | None = None
+    native_manifest: Any | None = None
+    profile = _runtime_profile(global_scope)
+    if native_targets:
+        release = extension_release_version(_HEADROOM_VERSION)
+        for target in sorted(native_targets):
+            binary = shutil.which(target)
+            if not binary:
+                raise click.ClickException(f"'{target}' not found in PATH. Install {target} first.")
+            native_preflight[target] = (binary, release)
+        native_manifest_snapshot = _snapshot_manifest(profile)
+        native_manifest = _build_runtime_manifest(
+            profile=profile,
+            existing=native_manifest_snapshot[2],
+            targets=[target for target in targets if target != "openclaw"],
+            port=port,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            memory=memory,
+        )
+    else:
+        profile = _ensure_runtime_manifest(
+            global_scope=global_scope,
+            targets=[target for target in targets if target != "openclaw"],
+            port=port,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            memory=memory,
+        )
     logger.debug("run_init_targets: using profile=%s", profile)
     for target in targets:
         logger.debug("run_init_targets: dispatching -> %s", target)
@@ -923,6 +1571,21 @@ def _run_init_targets(
             _init_codex(global_scope=global_scope, profile=profile, port=port)
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
+    if native_targets:
+        if native_manifest_snapshot is None or native_manifest is None:
+            raise click.ClickException("Native Pi/OMP init transaction was not prepared.")
+        native_hosts: list[tuple[Literal["pi", "omp"], str]] = [
+            (cast(Literal["pi", "omp"], target), native_preflight[target][0])
+            for target in targets
+            if target in native_targets
+        ]
+        _init_native_hosts(
+            hosts=native_hosts,
+            release=next(iter(native_preflight.values()))[1],
+            manifest=native_manifest,
+            manifest_snapshot=native_manifest_snapshot,
+            port=port,
+        )
 
     # Register the headroom MCP server with every targeted agent that has
     # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
@@ -1033,6 +1696,119 @@ def _ctx_value(ctx: click.Context, key: str) -> Any:
     return (ctx.obj or {}).get(key)
 
 
+def _remove_native_target(host: Literal["pi", "omp"], global_scope: bool) -> None:
+    if not global_scope:
+        raise click.ClickException("Durable Pi/OMP removal requires -g (current-user scope).")
+
+    try:
+        manifest = load_manifest(_GLOBAL_PROFILE)
+    except ManifestError as exc:
+        raise click.ClickException(
+            f"Cannot remove durable {host} integration: {exc}. Fix or move the manifest, then retry."
+        ) from exc
+    if manifest is None or host not in manifest.targets:
+        click.echo(f"No durable {host} integration is installed.")
+        return
+
+    package = next(
+        (
+            artifact
+            for artifact in manifest.artifacts
+            if artifact.kind == "pi-extension-package" and artifact.path == host
+        ),
+        None,
+    )
+    removing_last_native = not (_NATIVE_EXTENSION_TARGETS.intersection(manifest.targets) - {host})
+    if removing_last_native:
+        with acquire_runtime_start_lock(manifest.profile) as acquired:
+            if not acquired:
+                raise click.ClickException(
+                    f"Profile {manifest.profile} is already being initialized."
+                )
+            _remove_native_target_locked(host, manifest, package)
+        return
+    _remove_native_target_locked(host, manifest, package)
+
+
+def _remove_native_target_locked(host: Literal["pi", "omp"], manifest: Any, package: Any) -> None:
+    if package is not None:
+        binary = shutil.which(host)
+        if not binary and package.metadata.get("owned") is True:
+            raise click.ClickException(
+                f"'{host}' not found in PATH; cannot safely remove its managed package."
+            )
+        remove_owned_host_package(host, binary or "", package)
+
+    remaining_targets = [target for target in manifest.targets if target != host]
+    if _NATIVE_EXTENSION_TARGETS.intersection(remaining_targets):
+        manifest.targets = remaining_targets
+        if package is not None:
+            manifest.artifacts.remove(package)
+        _save_manifest_verified(manifest)
+        click.echo(f"Removed durable {host} integration.")
+        return
+
+    config = next(
+        (artifact for artifact in manifest.artifacts if artifact.kind == "pi-extension-config"),
+        None,
+    )
+    if config is not None:
+        remove_owned_extension_config(config)
+    task_paths = _task_file_paths(manifest)
+    remove_supervisor(manifest)
+    manifest.targets = remaining_targets
+    if package is not None:
+        manifest.artifacts.remove(package)
+    for path in task_paths:
+        path.unlink(missing_ok=True)
+    manifest.artifacts = [
+        artifact
+        for artifact in manifest.artifacts
+        if artifact.kind
+        not in {
+            "pi-extension-config",
+            "script",
+            "service-unit",
+            "cron",
+            "crontab",
+            "plist",
+            "windows-service",
+            "windows-task",
+        }
+    ]
+    manifest.supervisor_kind = SupervisorKind.NONE.value
+
+    if manifest.targets:
+        _save_manifest_verified(manifest)
+    else:
+        stop_runtime(manifest)
+        delete_manifest(manifest.profile)
+        if profile_root(manifest.profile).exists():
+            raise click.ClickException(
+                f"Could not verify deletion of profile {manifest.profile!r}."
+            )
+    click.echo(f"Removed durable {host} integration.")
+
+
+@init.group("remove")
+def init_remove() -> None:
+    """Remove Headroom-managed durable agent integrations."""
+
+
+@init_remove.command("pi")
+@click.pass_context
+def init_remove_pi(ctx: click.Context) -> None:
+    """Remove the durable Pi Headroom extension."""
+    _remove_native_target("pi", bool(_ctx_value(ctx, "global_scope")))
+
+
+@init_remove.command("omp")
+@click.pass_context
+def init_remove_omp(ctx: click.Context) -> None:
+    """Remove the durable OMP Headroom extension."""
+    _remove_native_target("omp", bool(_ctx_value(ctx, "global_scope")))
+
+
 @init.command("claude")
 @click.pass_context
 def init_claude(ctx: click.Context) -> None:
@@ -1069,6 +1845,36 @@ def init_codex(ctx: click.Context) -> None:
     """Install Codex durable hooks and provider routing."""
     _run_init_targets(
         targets=["codex"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("pi")
+@click.pass_context
+def init_pi(ctx: click.Context) -> None:
+    """Install the durable Pi Headroom extension for the current user."""
+    _run_init_targets(
+        targets=["pi"],
+        global_scope=bool(_ctx_value(ctx, "global_scope")),
+        port=int(_ctx_value(ctx, "port") or 8787),
+        backend=str(_ctx_value(ctx, "backend") or "anthropic"),
+        anyllm_provider=_ctx_value(ctx, "anyllm_provider"),
+        region=_ctx_value(ctx, "region"),
+        memory=bool(_ctx_value(ctx, "memory")),
+    )
+
+
+@init.command("omp")
+@click.pass_context
+def init_omp(ctx: click.Context) -> None:
+    """Install the durable OMP Headroom extension for the current user."""
+    _run_init_targets(
+        targets=["omp"],
         global_scope=bool(_ctx_value(ctx, "global_scope")),
         port=int(_ctx_value(ctx, "port") or 8787),
         backend=str(_ctx_value(ctx, "backend") or "anthropic"),

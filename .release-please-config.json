@@ -28,6 +28,21 @@
           "type": "json",
           "path": "plugins/opencode/package.json",
           "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugins/pi/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugins/pi/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugins/pi/package-lock.json",
+          "jsonpath": "$.packages[''].version"
         }
       ]
     }
