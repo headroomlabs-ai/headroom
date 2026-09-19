@@ -44,7 +44,8 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "off"
     assert "--no-telemetry" in manifest.proxy_args
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
-    assert manifest.tool_envs["copilot"]["COPILOT_PROVIDER_TYPE"] == "anthropic"
+    # Native lane by default: the CLI keeps GitHub's model picker and Auto mode.
+    assert manifest.tool_envs["copilot"] == {"COPILOT_API_URL": "http://127.0.0.1:8787"}
     assert "--memory" in manifest.proxy_args
     # A container runtime must NOT carry the host memory DB path: it does not
     # exist inside the container and would keep /readyz at 503 (#2803). The proxy
