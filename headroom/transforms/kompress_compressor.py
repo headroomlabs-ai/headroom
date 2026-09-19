@@ -1097,10 +1097,13 @@ def _download_retry_blocked(model_id: str) -> bool:
     if entry is None:
         return False
     failures, last_attempt = entry
-    window = min(
-        _DOWNLOAD_RETRY_MAX_SECONDS,
-        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
-    )
+    # Stop doubling at the cap: computing 2 ** (failures - 1) first can
+    # overflow when converted to float after a long run of failed downloads.
+    window = min(_DOWNLOAD_RETRY_BASE_SECONDS, _DOWNLOAD_RETRY_MAX_SECONDS)
+    for _ in range(failures - 1):
+        if window >= _DOWNLOAD_RETRY_MAX_SECONDS:
+            break
+        window = min(window * 2, _DOWNLOAD_RETRY_MAX_SECONDS)
     return bool((time.monotonic() - last_attempt) < window)
 
 
