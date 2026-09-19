@@ -10,9 +10,10 @@ Locks the following invariants:
    decrements after it completes — under load, the high-water mark moves up
    as expected.
 3. When a compression call exceeds its timeout, the awaiter unblocks with
-   ``TimeoutError`` — but the worker thread keeps running (Python cannot
-   preempt running CPython bytecode or in-flight Rust calls), and when the
-   work eventually completes, ``compression_leaked_threads`` increments.
+   ``TimeoutError`` — the worker thread keeps running (Python cannot
+   preempt it) and ``compression_leaked_threads`` counts currently
+   unreclaimed slots. When the worker later exits, that count drops and
+   the thread/FDs return to the pool (#3653).
 4. Jobs that time out while still queued do not leak the running gauge.
 5. ``/stats runtime.compression_executor`` surfaces the gauges + counters so
    operators can see leaked-thread rate and queue pressure.
@@ -168,10 +169,92 @@ def test_high_water_mark_persists_after_completion() -> None:
         assert proxy._compression_in_flight_max >= 3
 
 
+def test_timeout_reclaims_worker_when_it_exits() -> None:
+    """A job that exceeds its asyncio deadline must not permanently leak a worker (#3653).
+
+    Python cannot preempt the running thread, so the slot stays occupied until
+    the callable returns. Once it does, the thread goes back to the pool and
+    ``leaked_threads_total`` must drop to 0 instead of accumulating 1:1 with
+    every quarantine activation.
+    """
+    proxy = _make_proxy(compression_max_workers=1)
+    started_event = threading.Event()
+    finished_event = threading.Event()
+    timeout_seconds = 0.08
+
+    def _slow_compression():
+        started_event.set()
+        time.sleep(timeout_seconds * 5)
+        finished_event.set()
+        return "completed-after-deadline"
+
+    async def _drive():
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy._run_compression_in_executor(_slow_compression, timeout=timeout_seconds)
+        assert started_event.is_set()
+
+        with proxy._compression_metrics_lock:
+            leaked_during = proxy._compression_leaked_threads
+            debt_during = proxy._compression_timed_out_in_flight
+
+        assert finished_event.wait(timeout=2.0)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with proxy._compression_metrics_lock:
+                if (
+                    proxy._compression_leaked_threads == 0
+                    and proxy._compression_timed_out_in_flight == 0
+                    and proxy._compression_in_flight == 0
+                ):
+                    break
+            await asyncio.sleep(0.01)
+
+        with proxy._compression_metrics_lock:
+            leaked_after = proxy._compression_leaked_threads
+            debt_after = proxy._compression_timed_out_in_flight
+            in_flight_after = proxy._compression_in_flight
+            activations = proxy._compression_quarantine_activations
+
+        # The same slot must be reusable after reclaim.
+        reused = await proxy._run_compression_in_executor(lambda: "ok", timeout=1.0)
+        return (
+            leaked_during,
+            debt_during,
+            leaked_after,
+            debt_after,
+            in_flight_after,
+            activations,
+            reused,
+        )
+
+    (
+        leaked_during,
+        debt_during,
+        leaked_after,
+        debt_after,
+        in_flight_after,
+        activations,
+        reused,
+    ) = asyncio.run(_drive())
+
+    assert debt_during == 1
+    assert leaked_during >= 1, (
+        "timed-out worker still running must show up as currently leaked; "
+        f"got leaked_threads={leaked_during}"
+    )
+    assert leaked_after == 0, (
+        f"leaked_threads_total must not stay elevated after the worker exits; got {leaked_after}"
+    )
+    assert debt_after == 0
+    assert in_flight_after == 0
+    assert activations == 1
+    assert reused == "ok"
+
+
 def test_timeout_fires_and_leaked_thread_is_counted() -> None:
     """When the compression exceeds ``timeout``, the awaiter sees
     ``TimeoutError`` immediately. The worker keeps running; when it finishes,
-    ``_compression_leaked_threads`` increments by 1.
+    the slot is reclaimed and ``_compression_leaked_threads`` returns to 0.
     """
     proxy = _make_proxy(compression_max_workers=2)
     finished_event = threading.Event()
@@ -191,19 +274,18 @@ def test_timeout_fires_and_leaked_thread_is_counted() -> None:
 
     # Wait for the worker to actually finish (it ran past the deadline).
     finished_event.wait(timeout=2.0)
-    # Give the worker thread a moment to update the counter under the lock.
+    # Give the worker thread a moment to reclaim the slot under the lock.
     deadline = time.monotonic() + 1.0
     while time.monotonic() < deadline:
         with proxy._compression_metrics_lock:
-            if proxy._compression_leaked_threads >= 1:
+            if proxy._compression_leaked_threads == 0 and proxy._compression_in_flight == 0:
                 break
         time.sleep(0.01)
 
     with proxy._compression_metrics_lock:
-        assert proxy._compression_leaked_threads >= 1, (
-            f"leaked_threads should be ≥ 1; got {proxy._compression_leaked_threads}. "
-            f"The worker either didn't finish past the deadline, or the wrapper "
-            f"didn't increment the counter."
+        assert proxy._compression_leaked_threads == 0, (
+            f"leaked_threads should be 0 after the worker exits; got "
+            f"{proxy._compression_leaked_threads}."
         )
         # In-flight gauge restored.
         assert proxy._compression_in_flight == 0
@@ -262,7 +344,7 @@ def test_timeout_quarantines_new_work_until_timed_out_worker_finishes() -> None:
 
         with proxy._compression_metrics_lock:
             assert proxy._compression_timed_out_in_flight == 0
-            assert proxy._compression_leaked_threads == 1
+            assert proxy._compression_leaked_threads == 0
 
         # Quarantine is self-clearing: normal compression resumes after the
         # timed-out worker has genuinely left the executor.
