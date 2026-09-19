@@ -1174,11 +1174,11 @@ class HeadroomProxy(
         #   1. Compression work is bounded — CPU-bound Rust runs here, and
         #      bursts cannot starve other ``asyncio.to_thread`` callers
         #      sharing the loop's default executor (file IO, etc.).
-        #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` and complete
-        #      *after* the asyncio future was cancelled are counted in the
-        #      ``compression_leaked_threads`` gauge — Python cannot preempt
-        #      the worker, so this is the only signal that some pool slots
-        #      are sitting on stuck work.
+        #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` occupy a
+        #      pool slot until the worker actually returns (Python cannot
+        #      preempt a running thread). ``compression_leaked_threads`` is
+        #      the current unreclaimed count: it rises on timeout and drops
+        #      when that worker exits so the slot/FDs go back to the pool.
         _compression_max_cfg = config.compression_max_workers
         if _compression_max_cfg is None:
             _compression_max = max(1, os.cpu_count() or 1)
@@ -1224,8 +1224,9 @@ class HeadroomProxy(
         self._compression_in_flight_max: int = 0
         self._compression_run_seconds_total: float = 0.0
         self._compression_run_seconds_max: float = 0.0
-        # Counter: threads that finished AFTER their asyncio future hit the
-        # timeout. Stuck-thread leak indicator.
+        # Gauge: workers still occupying a pool slot after their asyncio
+        # waiter timed out. Incremented when we abandon a running worker;
+        # decremented when that worker exits and the slot is reclaimed.
         self._compression_leaked_threads: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
         # asyncio waiter times out, so accepting more compression while that
@@ -1473,13 +1474,15 @@ class HeadroomProxy(
 
         Why "cancel-aware metrics": when ``asyncio.wait_for`` times out, it
         cancels the *asyncio future*. The underlying
-        ``concurrent.futures.Future`` from ``run_in_executor`` cannot
-        actually cancel a thread that has started — Python has no way to
-        preempt running CPython bytecode or in-flight Rust calls. The
-        worker keeps running to completion, ignored. We detect this by
-        marking the call timed out on the asyncio side and incrementing
-        ``_compression_leaked_threads`` from the worker's ``finally``
-        block after it eventually finishes. While any such worker remains,
+        ``concurrent.futures.Future`` cannot actually cancel a thread that
+        has started — Python has no way to preempt running CPython bytecode
+        or in-flight Rust calls. The worker keeps running to completion.
+        We mark the call timed out on the asyncio side, count it in
+        ``_compression_leaked_threads`` while the slot is still occupied,
+        and reclaim that count from the worker's ``finally`` once it
+        exits so the thread/FDs return to the pool instead of accumulating
+        forever (#3653). The abandoned future's result is discarded so the
+        return value cannot pin open files. While any such worker remains,
         new calls raise :class:`CompressionQuarantinedError` immediately so
         callers apply the existing compression-failure policy instead of
         filling the rest of the pool with the same timeout debt. Jobs that are
@@ -1495,7 +1498,8 @@ class HeadroomProxy(
                 counter may double-count.
             timeout: Wall-clock timeout for the asyncio side. The
                 executor worker keeps running past this (Python limitation
-                — see above), but at least the awaiter unblocks.
+                — see above) until it returns, at which point the slot is
+                reclaimed. The awaiter unblocks at ``timeout``.
 
         Returns:
             Whatever ``fn()`` returns.
@@ -1531,7 +1535,9 @@ class HeadroomProxy(
             self.metrics.record_compression_quarantine("released")
             logger.warning(
                 "Compression quarantine released after %.0fs cap; %d timed-out "
-                "worker(s) presumed leaked. Compression resumes.",
+                "worker(s) still occupying pool slots (Python cannot preempt them). "
+                "leaked_threads_total stays elevated until those workers exit or "
+                "the process restarts. Compression resumes.",
                 self._compression_quarantine_max_seconds,
                 timed_out_in_flight,
             )
@@ -1571,6 +1577,7 @@ class HeadroomProxy(
                 return False
             was_clear = self._compression_timed_out_in_flight == 0
             self._compression_timed_out_in_flight += 1
+            self._compression_leaked_threads += 1
             self._compression_timed_out_in_flight_max = max(
                 self._compression_timed_out_in_flight_max,
                 self._compression_timed_out_in_flight,
@@ -1588,9 +1595,14 @@ class HeadroomProxy(
 
         def _announce_quarantine() -> None:
             self.metrics.record_compression_quarantine("activated")
+            with self._compression_metrics_lock:
+                leaked = self._compression_leaked_threads
             logger.warning(
                 "Compression worker exceeded its request deadline and is still running; "
-                "new compression is quarantined until timed-out workers exit"
+                "Python cannot preempt the thread, so the pool slot and any FDs it holds "
+                "stay occupied until the worker exits. New compression is quarantined. "
+                "leaked_threads_total=%d tracks currently unreclaimed workers.",
+                leaked,
             )
 
         def _wrapped():  # noqa: ANN202
@@ -1620,18 +1632,29 @@ class HeadroomProxy(
                     self._compression_run_seconds_total += elapsed
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
-                    if state["timed_out"]:
-                        self._compression_leaked_threads += 1
+                    reclaimed = False
+                    leaked_remaining = self._compression_leaked_threads
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
+                        if self._compression_leaked_threads > 0:
+                            self._compression_leaked_threads -= 1
+                        leaked_remaining = self._compression_leaked_threads
                         state["timeout_debt_recorded"] = False
+                        reclaimed = True
                         quarantine_cleared = self._compression_timed_out_in_flight == 0
                     else:
                         quarantine_cleared = False
+                if reclaimed:
+                    logger.info(
+                        "Compression worker finished after timeout; reclaimed executor slot "
+                        "(%d still unreclaimed)",
+                        leaked_remaining,
+                    )
                 if quarantine_cleared:
                     logger.info("Compression quarantine cleared after all timed-out workers exited")
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        cf_future = self._compression_executor.submit(_wrapped)
+        future = asyncio.wrap_future(cf_future, loop=loop)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1644,6 +1667,15 @@ class HeadroomProxy(
                 quarantine_activated = _record_timeout_debt_locked()
             if quarantine_activated:
                 _announce_quarantine()
+
+            def _discard_abandoned_result(done: concurrent.futures.Future) -> None:
+                # Drop the late return value so it cannot pin open files/FDs.
+                try:
+                    done.result()
+                except Exception:
+                    pass
+
+            cf_future.add_done_callback(_discard_abandoned_result)
             raise
 
     async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
