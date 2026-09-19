@@ -80,6 +80,32 @@ class TestHNSWVectorIndex:
         print("[TEST] PASSED!")
 
     @pytest.mark.asyncio
+    async def test_search_index_larger_than_ef_search(self, vector_index):
+        # With the default ef_search=50 and top_k=10, k_with_buffer reaches 60
+        # for a 60-entry index. hnswlib requires ef >= k at query time, so before
+        # the fix knn_query raised "Probably ef or M is too small". Search must
+        # succeed once the index grows past ef_search.
+        np.random.seed(7)
+        for i in range(60):
+            await vector_index.index(
+                Memory(
+                    content=f"content {i}",
+                    user_id="alice",
+                    embedding=np.random.randn(384).astype(np.float32),
+                )
+            )
+
+        filter = VectorFilter(
+            query_vector=np.random.randn(384).astype(np.float32),
+            top_k=10,
+            user_id="alice",
+        )
+        results = await vector_index.search(filter)  # must not raise
+
+        assert isinstance(results, list)
+        assert len(results) <= 10
+
+    @pytest.mark.asyncio
     async def test_bounded_index_eviction(self, temp_db_path):
         """Test that bounded index evicts low-importance entries."""
         from headroom.memory.adapters.hnsw import HNSWVectorIndex
