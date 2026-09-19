@@ -237,7 +237,10 @@
                             <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed">
-                            <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
+                            <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of every input token billed, cached prefix included"></span>
+                        </div>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                            <span x-text="'Cost-weighted: ' + (stats.tokens?.cost_weighted_savings_percent || 0).toFixed(1) + '%'" title="The same saving in money. Lower than the token share because most removed tokens would have been cheap prefix-cache reads."></span>
                         </div>
                         <div class="mt-2 h-8">
                             <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
