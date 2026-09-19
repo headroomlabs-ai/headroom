@@ -2949,15 +2949,15 @@ class AnthropicHandlerMixin:
                             model=model,
                             request_id=request_id,
                         )
-                    if _sys_modified:
-                        transforms_applied.append("anthropic:system_prompt_compaction")
-                        logger.debug(
-                            "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
-                            request_id,
-                            _sys_before,
-                            _sys_after,
-                            (1 - _sys_after / max(_sys_before, 1)) * 100,
-                        )
+                        if _sys_modified:
+                            transforms_applied.append("anthropic:system_prompt_compaction")
+                            logger.debug(
+                                "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
+                                request_id,
+                                _sys_before,
+                                _sys_after,
+                                (1 - _sys_after / max(_sys_before, 1)) * 100,
+                            )
             except Exception as _sys_compaction_exc:
                 _sys_modified = False
                 logger.warning(
