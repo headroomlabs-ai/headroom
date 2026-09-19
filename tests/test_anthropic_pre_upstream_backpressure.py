@@ -136,8 +136,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -723,8 +721,6 @@ def test_compression_is_not_bypassed_when_gated(stage_log_capture):
         mode="token",
         cache_enabled=False,
         rate_limit_enabled=False,
-        fallback_enabled=False,
-        fallback_provider=None,
         prefix_freeze_enabled=False,
         memory_enabled=False,
         anthropic_pre_upstream_concurrency=2,

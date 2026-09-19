@@ -105,8 +105,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
