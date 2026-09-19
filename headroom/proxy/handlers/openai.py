@@ -3797,6 +3797,7 @@ class OpenAIHandlerMixin:
             )
         if _decision.should_compress:
             try:
+                compression_pipeline = self._chat_compression_pipeline(stream=stream)
                 context_limit = self.openai_provider.get_context_limit(model)
 
                 # F2.1 c5/5: per-request CompressionPolicy. Hoisted out of
@@ -3851,7 +3852,7 @@ class OpenAIHandlerMixin:
                         working_messages = comp_cache.apply_cached(messages)
 
                     result = await self._run_compression_in_executor(
-                        lambda: self.openai_pipeline.apply(
+                        lambda: compression_pipeline.apply(
                             messages=working_messages,
                             model=model,
                             model_limit=context_limit,
@@ -3900,7 +3901,7 @@ class OpenAIHandlerMixin:
                         else openai_frozen_count
                     )
                     result = await self._run_compression_in_executor(
-                        lambda: self.openai_pipeline.apply(
+                        lambda: compression_pipeline.apply(
                             messages=messages,
                             model=model,
                             model_limit=context_limit,
@@ -9662,6 +9663,12 @@ class OpenAIHandlerMixin:
             ccr_inject_marker=False,  # no markers in returned content
             ccr_enabled=False,  # no CCR store writes
         )
+
+    def _chat_compression_pipeline(self, *, stream: bool) -> Any:
+        """Choose a recoverable pipeline for OpenAI chat completions."""
+        if stream:
+            return self._no_ccr_pipeline()
+        return self.openai_pipeline
 
     def _ccr_pipeline(self) -> Any:
         """Pipeline for ``/v1/compress`` ``config.mode="ccr"``.
