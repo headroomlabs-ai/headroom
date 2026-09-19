@@ -3405,6 +3405,7 @@ class ContentRouter(Transform):
         # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
         # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
         # stable, and a strict no-op when the block has no embedded JSON.
+        embedded_fallback: str | None = None
         if _allow_embedded:
             from headroom.transforms.recursive_json import route_embedded_json
 
@@ -3422,7 +3423,17 @@ class ContentRouter(Transform):
 
             routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
             if routed is not None:
-                return routed, _estimate_tokens(routed), ["embedded_json"]
+                if strategy is not CompressionStrategy.HTML or self.config.lossless:
+                    return routed, _estimate_tokens(routed), ["embedded_json"]
+                # HTML owns the whole document: HTMLExtractor drops navigation,
+                # scripts and styling, which routinely banks far more than
+                # shrinking one embedded span, so returning here would trade a
+                # document-level win for a local one (#3609). Hold the embedded
+                # result instead: extraction gets first refusal, and the held
+                # result is returned unchanged whenever extraction yields
+                # nothing. Lossless-only mode keeps the immediate return above,
+                # because it stops at STAGE 0 and never reaches extraction.
+                embedded_fallback = routed
 
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
@@ -3487,7 +3498,12 @@ class ContentRouter(Transform):
         # beyond the fold). Keeps the fold AND reclaims the semantic word-drop
         # tail, never doing worse than the fold. DIFF folds are returned verbatim
         # — Kompressing hunks corrupts `git apply`.
-        if _ll_label is not None:
+        # An HTML block holding an embedded-JSON result skips this return
+        # (#3609): returning the fold here bypasses document-level extraction,
+        # and a blank-run fold can keep far more than the held result. That
+        # result, not the fold, is what such a block returned before the
+        # deferral, so extraction runs below with it as the fallback.
+        if _ll_label is not None and embedded_fallback is None:
             _lossy_after_fold = (
                 self._lossless_then_lossy
                 and strategy != CompressionStrategy.DIFF
@@ -3782,6 +3798,15 @@ class ContentRouter(Transform):
             error = f"{type(e).__name__}: {e}"
             decision_reason = "compression_exception"
             logger.warning("Compression with %s failed: %s", strategy.value, e)
+
+        # The HTML extractor produced nothing: it is disabled or unavailable,
+        # it raised, or it found no article text (the adapter reports
+        # trafilatura's empty string as a successful result). Return the
+        # embedded-JSON result held back above exactly as the pre-pass would
+        # have, instead of a blank block or passthrough (#3609).
+        if embedded_fallback is not None and not (compressed or "").strip():
+            strategy_chain.append("embedded_json")
+            return embedded_fallback, _estimate_tokens(embedded_fallback), strategy_chain
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
