@@ -489,6 +489,57 @@ def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -
     assert new_system == system
 
 
+def test_relocate_system_messages_drops_non_text_from_leading_section(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    cached_text = {
+        "type": "text",
+        "text": "leading instruction",
+        "cache_control": {"type": "ephemeral"},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [cached_text, image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    caplog.set_level("WARNING", logger="headroom.proxy")
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [
+        {"type": "text", "text": "base"},
+        cached_text,
+    ]
+    assert "event=system_relocation_block_dropped" in caplog.text
+    assert "block_type=image" in caplog.text
+
+
+def test_relocate_system_messages_drops_all_non_text_leading_section() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages: list[dict] = [
+        {"role": "system", "content": [image_block]},
+        {"role": "user", "content": "hi"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(
+        messages, [{"type": "text", "text": "base"}], "claude-opus-5"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert new_system == [{"type": "text", "text": "base"}]
+
+
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
     assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True

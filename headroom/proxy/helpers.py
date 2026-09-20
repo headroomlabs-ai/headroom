@@ -1009,6 +1009,16 @@ _ROLE_SYSTEM = "system"
 _TEXT_BLOCK_TYPE = "text"
 
 
+def _coerce_system_block(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a block representable by Anthropic's top-level ``system`` field."""
+    text = block.get("text")
+    if isinstance(text, str) and text:
+        if block.get("type") == _TEXT_BLOCK_TYPE:
+            return block
+        return {**block, "type": _TEXT_BLOCK_TYPE}
+    return None
+
+
 def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     """Convert a ``role="system"`` message into Anthropic system content blocks."""
     content = message.get("content")
@@ -1039,10 +1049,12 @@ def relocate_system_messages_to_top_level(
     field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
-    so wire order (system prompt, then conversation) is preserved and no content
-    is dropped. Only text-shaped content moves: non-text blocks (images,
-    documents) stay in a mid-conversation system section at their original
-    position, because top-level `system` accepts text blocks only (issue #3552).
+    so wire order (system prompt, then conversation) is preserved. Only
+    text-shaped content moves: non-text blocks (images, documents) stay in a
+    mid-conversation system section at their original position, because
+    top-level `system` accepts text blocks only (issue #3552). A leading system
+    section cannot stay in ``messages[0]``; non-text blocks there are dropped
+    with a warning because they cannot be represented in either valid location.
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -1111,20 +1123,41 @@ def relocate_system_messages_to_top_level(
         if isinstance(content, list):
             # Only text-shaped content may move into the top-level ``system``
             # parameter (text blocks and bare strings). Non-text blocks such as
-            # images or documents stay in place so nothing is dropped and
-            # upstreams that reject non-text system blocks keep working
-            # (issue #3552).
+            # images or documents stay in mid-conversation sections so nothing
+            # is dropped and upstreams that reject non-text system blocks keep
+            # working (issue #3552). A leading section cannot remain there
+            # without violating Anthropic's message contract.
             hoisted_from_list: list[Any] = []
             leftovers: list[Any] = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
-                    hoisted_from_list.append(block)
+                if isinstance(block, dict):
+                    if i == 0:
+                        coerced = _coerce_system_block(block)
+                        if coerced is not None:
+                            hoisted_from_list.append(coerced)
+                        else:
+                            logger.warning(
+                                "event=system_relocation_block_dropped block_type=%s "
+                                "reason=not_representable_as_text",
+                                block.get("type", "missing"),
+                            )
+                    elif block.get("type") == _TEXT_BLOCK_TYPE:
+                        hoisted_from_list.append(block)
+                    else:
+                        leftovers.append(block)
                 elif isinstance(block, str) and block:
                     hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
                 else:
-                    leftovers.append(block)
+                    if i == 0:
+                        logger.warning(
+                            "event=system_relocation_block_dropped block_type=%s "
+                            "reason=not_representable_as_text",
+                            "string" if isinstance(block, str) else type(block).__name__,
+                        )
+                    else:
+                        leftovers.append(block)
             relocated_blocks.extend(hoisted_from_list)
-            if leftovers:
+            if leftovers and i != 0:
                 retained[i] = {**message, "content": leftovers}
         else:
             # String (and other) content converts losslessly to text blocks.
