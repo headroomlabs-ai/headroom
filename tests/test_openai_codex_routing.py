@@ -401,7 +401,13 @@ class _ZdrResponsesHandler(_DummyOpenAIHandler):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
+def _build_request(
+    body: dict,
+    headers: dict[str, str],
+    *,
+    path: str = "/v1/responses",
+    query: bytes = b"",
+) -> Request:
     payload = json.dumps(body).encode("utf-8")
 
     async def receive():
@@ -413,9 +419,9 @@ def _build_request(body: dict, headers: dict[str, str]) -> Request:
         "http_version": "1.1",
         "method": "POST",
         "scheme": "https",
-        "path": "/v1/responses",
-        "raw_path": b"/v1/responses",
-        "query_string": b"",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query,
         "headers": [
             (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()
         ],
@@ -696,6 +702,224 @@ def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatc
     assert headers.get("ChatGPT-Account-ID") is None
     assert body["input"] == "hello"
     assert response.status_code == 200
+
+
+def test_handle_openai_responses_routes_trusted_factory_request(monkeypatch):
+    request = _build_request(
+        {
+            "model": "gpt-5.6-luna",
+            "input": "hello",
+        },
+        {
+            "Authorization": "Bearer fk-test",
+            "x-headroom-base-url": "https://evil.example",
+        },
+        path="/api/llm/o/v1/responses",
+        query=b"trace=test",
+    )
+    handler = _DummyOpenAIHandler()
+    outcomes = []
+
+    async def capture_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = capture_outcome
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer",
+        lambda model: _DummyTokenizer(),
+    )
+
+    async def run():
+        return await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="http://127.0.0.1:9999/private",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+
+    response = anyio.run(run)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    method, url, _headers, body = handler.captured_request
+    assert method == "POST"
+    assert url == ("http://127.0.0.1:9999/private/api/llm/o/v1/responses?trace=test")
+    assert body["input"] == "hello"
+    assert [outcome.provider for outcome in outcomes] == ["factory"]
+
+
+def test_handle_openai_responses_stream_attributes_trusted_factory(monkeypatch):
+    request = _build_request(
+        {
+            "model": "gpt-5.6-luna",
+            "stream": True,
+            "input": "hello",
+        },
+        {"Authorization": "Bearer fk-test"},
+        path="/api/llm/o/v1/responses",
+    )
+    handler = _DummyOpenAIHandler()
+    seen: list[tuple[str, str]] = []
+
+    async def capture_stream(url, headers, body, provider, *args, **kwargs):
+        seen.append((url, provider))
+        return SimpleNamespace(status_code=200)
+
+    handler._stream_response = capture_stream
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer",
+        lambda model: _DummyTokenizer(),
+    )
+
+    async def run():
+        return await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="https://api.factory.ai",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+
+    response = anyio.run(run)
+
+    assert response.status_code == 200
+    assert seen == [
+        ("https://api.factory.ai/api/llm/o/v1/responses", "factory"),
+    ]
+
+
+def test_handle_openai_responses_failure_attributes_trusted_factory(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-5.6-luna", "input": "hello"},
+        {"Authorization": "Bearer fk-test"},
+        path="/api/llm/o/v1/responses",
+    )
+    handler = _DummyOpenAIHandler()
+    failures = []
+
+    async def fail_request(*args, **kwargs):
+        raise RuntimeError("upstream failed")
+
+    async def record_failed(**kwargs):
+        failures.append(kwargs)
+
+    handler._retry_request = fail_request
+    handler.metrics.record_failed = record_failed
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer",
+        lambda model: _DummyTokenizer(),
+    )
+
+    async def run():
+        return await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="https://api.factory.ai",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+
+    response = anyio.run(run)
+
+    assert response.status_code == 502
+    assert failures == [{"provider": "factory"}]
+
+
+def test_buffered_responses_failure_attributes_trusted_factory(monkeypatch):
+    request = _build_request(
+        {
+            "model": "gpt-5.6-luna",
+            "stream": True,
+            "input": "hello",
+            "tools": [{"type": "function", "name": "headroom_retrieve"}],
+        },
+        {"Authorization": "Bearer fk-test"},
+        path="/api/llm/o/v1/responses",
+    )
+    handler = _DummyOpenAIHandler()
+    handler.ccr_response_handler = SimpleNamespace(
+        config=SimpleNamespace(enabled=True),
+        has_ccr_tool_calls=lambda *args: False,
+    )
+    failures = []
+    captured = {}
+
+    async def record_failed(**kwargs):
+        failures.append(kwargs)
+
+    def capture_buffered_call(**kwargs):
+        captured.update(kwargs)
+
+        async def call(scope, receive, send):
+            return None
+
+        return call
+
+    handler.metrics.record_failed = record_failed
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai.buffered_ccr_asgi_call",
+        capture_buffered_call,
+    )
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer",
+        lambda model: _DummyTokenizer(),
+    )
+
+    async def run():
+        response = await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="https://api.factory.ai",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+        await captured["record_failed"](provider="openai")
+        return response
+
+    response = anyio.run(run)
+
+    assert response.status_code == 200
+    assert failures == [{"provider": "factory"}]
+
+
+def test_handle_openai_responses_compresses_trusted_factory_body(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-5.6-luna", "input": "large tool output"},
+        {"Authorization": "Bearer fk-test"},
+        path="/api/llm/o/v1/responses",
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+
+    async def compress(body, **kwargs):
+        return (
+            {**body, "input": "compressed"},
+            True,
+            5,
+            ["test"],
+            None,
+            20,
+            10,
+            5,
+            {},
+        )
+
+    handler._compress_openai_responses_payload_in_executor = compress
+    monkeypatch.setattr(
+        "headroom.tokenizers.get_tokenizer",
+        lambda model: _DummyTokenizer(),
+    )
+
+    async def run():
+        return await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="https://api.factory.ai",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+
+    response = anyio.run(run)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    assert handler.captured_request[3]["input"] == "compressed"
 
 
 def test_handle_openai_responses_non_stream_adapts_sse_upstream(monkeypatch):

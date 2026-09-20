@@ -62,6 +62,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 | `--gemini-api-url` | Gemini default | Custom Gemini API URL |
 | `--backend` | `anthropic` | Backend: `anthropic`, `bedrock`, `openrouter`, `anyllm`, or `litellm-<provider>` |
 | `--bedrock-api-url` | None | Bedrock InvokeModel upstream for the `/model/{id}/invoke` passthrough routes (see [Bedrock via a local gateway](#bedrock-via-a-local-gateway)) |
+| `--factory-api-url` | None | Factory upstream for the Droid passthrough. Compresses the Anthropic-shaped `/api/llm/a/v1/messages` inference route and forwards every other Factory REST path verbatim (see [Factory Droid](/docs/droid)) |
 | `--telemetry` | `false` | Enable local, in-process usage stats (for your own `/stats` and dashboard; nothing leaves the machine) |
 | `--no-telemetry` | `false` | Force local telemetry off (already the default) |
 | `--stateless` | `false` | Disable filesystem writes and keep runtime state in memory |
