@@ -153,6 +153,16 @@ SETTINGS: tuple[SettingField, ...] = (
     ),
     # --- Limits ---
     SettingField(
+        "HEADROOM_CIRCUIT_BREAKER",
+        "circuit_breaker",
+        "Tool repetition circuit breaker",
+        "Limits",
+        "enum",
+        default="warn",
+        choices=("warn", "enforce", "off"),
+        help="Warn about repeated tool calls, reject them with HTTP 429, or disable detection.",
+    ),
+    SettingField(
         "HEADROOM_RPM",
         "rpm",
         "Requests / min",
