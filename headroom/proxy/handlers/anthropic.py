@@ -4119,9 +4119,13 @@ class AnthropicHandlerMixin:
                         # ``stream`` is what the *client* asked for, not what
                         # went upstream: a buffered CCR turn deliberately
                         # requests JSON on behalf of a streaming client and
-                        # re-emits SSE further down, and must keep doing so.
+                        # re-emits SSE further down. That same flip means the
+                        # upstream's stream contract is JSON, so its SSE reply
+                        # must still be reconstructed before CCR processing;
+                        # otherwise a keepalive-only stream can be relayed as a
+                        # successful but contentless response (#3266).
                         if should_recover_sse_reply(
-                            client_requested_stream=bool(stream),
+                            client_requested_stream=bool(stream and not buffered_stream_ccr),
                             status_code=response.status_code,
                             content_type=response.headers.get("content-type"),
                             body_is_event_stream=_looks_like_sse_response(response),
