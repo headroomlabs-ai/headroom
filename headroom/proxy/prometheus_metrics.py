@@ -755,6 +755,13 @@ class PrometheusMetrics:
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
         savings_attribution: list[dict[str, Any]] | None = None,
+        # True when ``cache_write_tokens`` was DERIVED by a handler rather than
+        # billed by the provider (OpenAI exposes no write counter). Such a
+        # "write" is the same tokens as ``uncached_input_tokens`` and carries no
+        # write premium, so counterfactual pricing must drop it — see
+        # ``CacheMix.normalized``. Defaults False, preserving behaviour for the
+        # providers that report disjoint buckets.
+        cache_inferred: bool = False,
     ):
         """Record metrics for a request.
 
@@ -782,12 +789,28 @@ class PrometheusMetrics:
                 model,
             )
             tokens_saved = 0
+        # Priced CACHE-AWARE: the full provider breakdown goes in, and each
+        # layer is valued against the region of the request it actually came
+        # out of — compression against the live zone, tool-schema deferral
+        # against the cached prefix. The breakdown is already on this method's
+        # signature for every provider (see RequestOutcome's cache block); it
+        # simply was not reaching the pricer, so both layers were billed at flat
+        # list price regardless of how much of the prompt was a cache read.
         savings_usd = estimate_request_savings_usd(
             model,
             compression_tokens_saved=tokens_saved,
             tool_schema_tokens_saved=tool_search_saved,
             output_tokens_saved=output_tokens_saved,
             cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_write_5m_tokens=cache_write_5m_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+            cache_inferred=cache_inferred,
+            # Locally-counted forwarded tokens, used only to decide the
+            # above-200k price tier when the provider reported no breakdown.
+            local_input_tokens=ledger_input_tokens,
+            provider=provider,
         )
         async with self._lock:
             self.requests_total += 1
@@ -928,6 +951,7 @@ class PrometheusMetrics:
                 cache_write_5m_tokens=cache_write_5m_tokens,
                 cache_write_1h_tokens=cache_write_1h_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
                 waste_signals=waste_signals,
             )
             total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
@@ -1004,6 +1028,26 @@ class PrometheusMetrics:
                 model=model,
                 client=client or "proxy",
                 source="proxy",
+                # The two layers, kept APART on disk. They price against
+                # different regions of the request (live zone vs cached prefix)
+                # and therefore at different rates, so a ledger that stores only
+                # their sum can never be re-priced correctly — which is exactly
+                # why the pre-v2 ledger could not be corrected in place.
+                saved_compression=tokens_saved,
+                saved_tool_schema=deferral_saved,
+                # The observed cache mix. Storing the MIX rather than only the
+                # dollar it produced is the point of ledger v2: a stored dollar
+                # bakes in whatever basis was current when it was written, and
+                # every historical figure is then frozen wrong. Providers that
+                # report nothing leave these zero and the event prices at list,
+                # labelled `no-mix`.
+                cache_read_tokens=cache_read_tokens,
+                cache_write_5m_tokens=cache_write_5m_tokens,
+                cache_write_1h_tokens=cache_write_1h_tokens,
+                cache_write_tokens=cache_write_tokens,
+                uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
+                provider=provider,
             )
 
         otel_metrics = self._get_otel_metrics()

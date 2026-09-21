@@ -655,6 +655,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
+        # Already handed to the cost tracker below; the metrics path needs it
+        # too now that it prices savings cache-aware. An inferred write is the
+        # same tokens as `uncached_input_tokens` and carries no write premium,
+        # so counting it as a write would both double it and apply a premium
+        # OpenAI never charges.
+        cache_inferred=outcome.cache_inferred,
     )
 
     # 2. Cost tracker (optional).

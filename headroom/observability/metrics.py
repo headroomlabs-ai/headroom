@@ -458,7 +458,9 @@ class HeadroomOtelMetrics:
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
         output_tokens_saved: int = 0,
-        savings_usd: Mapping[str, float] | None = None,
+        # Mixed value types: per-layer dollars plus a string `basis` label.
+        # The loop below skips anything non-numeric rather than coercing it.
+        savings_usd: Mapping[str, Any] | None = None,
         project: str | None = None,
         client: str | None = None,
     ) -> None:
@@ -482,12 +484,37 @@ class HeadroomOtelMetrics:
             self._proxy_attempted_input_tokens.add(attempted_input_tokens, attrs)
         if output_tokens_saved > 0:
             self._proxy_output_saved_tokens.add(output_tokens_saved, attrs)
+        # ``savings_usd`` is the breakdown from
+        # ``savings_tracker.estimate_request_savings_usd``: per-layer dollars,
+        # plus two companions that must NOT become their own counter series.
+        #
+        #   * ``basis`` — a string saying how soundly the layers were priced.
+        #     It is a DIMENSION, not a measure, so it rides on the attributes
+        #     where a consumer can group by it.
+        #   * ``*_list`` — the same layers at flat list price (the upper bound).
+        #     Exporting them as sources would make a dashboard summing `source`
+        #     report roughly double the real saving, since each layer would
+        #     appear twice.
+        #
+        # Anything non-numeric is skipped rather than coerced: this loop used to
+        # call `float()` on every value and would raise on a string, taking the
+        # whole request-metrics path down with it.
+        savings_basis = str((savings_usd or {}).get("basis") or "")[:32]
         for source, value in (savings_usd or {}).items():
-            amount = max(float(value or 0.0), 0.0)
+            if source == "basis" or str(source).endswith("_list"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            amount = max(float(value), 0.0)
             if amount:
                 self._proxy_savings_usd.add(
                     amount,
-                    {**attrs, "source": str(source)[:64], "estimated": True},
+                    {
+                        **attrs,
+                        "source": str(source)[:64],
+                        "estimated": True,
+                        "basis": savings_basis,
+                    },
                 )
         compression_saved = max(tokens_saved, 0)
         tool_schema_saved = max(tool_search_saved, 0)

@@ -34,7 +34,21 @@ logger = logging.getLogger(__name__)
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 5
+# v6: ``compression_savings_usd`` changed BASIS (not shape). It now holds the
+# cache-aware counterfactual — what the removed tokens would actually have been
+# billed at, given the cache mix of the requests they came out of — instead of
+# flat list price. ``compression_savings_list_usd`` carries the old list-priced
+# figure alongside it as the upper bound.
+#
+# The basis flip is deliberately made in place rather than in a new field. The
+# mix was never persisted, so pre-v6 dollars cannot be re-derived either way;
+# a parallel field would have to be SEEDED from the same list-priced history and
+# would blend exactly as much, only in a field nothing reads. Flipping in place
+# means every existing surface (dashboard tiles, per-model table, per-project
+# rows, the history chart) reports the right number with no change of its own.
+# ``savings_basis_migrated_at`` records when the flip happened so a reader can
+# tell which part of a lifetime total predates it.
+SCHEMA_VERSION = 6
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
@@ -44,8 +58,49 @@ DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 # Blended output price used only when litellm cannot price the model.
 DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
 
+#: Basis label for a total that has not priced a single request yet. Not one of
+#: ``counterfactual``'s BASIS_* values on purpose: those all describe how a real
+#: figure was derived, and "no figure yet" is not a derivation. Treated as
+#: absent by :func:`_blend_basis`, so the first priced request sets the label
+#: outright instead of being dragged down to it forever.
+BASIS_UNKNOWN = "unknown"
+
+#: Basis stamped on state migrated from a schema older than v6. Those dollars
+#: were accumulated at flat list price and the cache mix that produced them was
+#: never persisted, so they cannot be re-derived — the total stays honestly
+#: labelled as containing list-priced history for the life of the install.
+BASIS_LIST = "list"
+
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 litellm: Any | None = None
+
+
+def _blend_basis(existing: Any, incoming: Any) -> str:
+    """Fold one request's pricing basis into a running total's label.
+
+    A total is only as sound as its weakest contributing request, so this keeps
+    the worst basis seen. ``BASIS_UNKNOWN`` means "nothing priced yet" and is
+    replaced outright rather than treated as the weakest — otherwise a fresh
+    install would report ``unknown`` forever after its first request.
+
+    Ranking lives in ``counterfactual``; importing it here is deferred for the
+    same startup reason as ``estimate_request_savings_usd``, and a missing
+    incoming label leaves the existing one alone.
+    """
+    incoming_label = str(incoming or "").strip()
+    existing_label = str(existing or "").strip() or BASIS_UNKNOWN
+    if not incoming_label:
+        return existing_label
+    if existing_label == BASIS_UNKNOWN:
+        return incoming_label
+    if incoming_label == existing_label:
+        return existing_label
+    try:
+        from headroom.pricing.counterfactual import weakest_basis
+
+        return weakest_basis(existing_label, incoming_label)
+    except Exception:  # pragma: no cover - defensive; labelling must not raise
+        return existing_label
 
 
 def _get_litellm_module() -> Any | None:
@@ -336,26 +391,97 @@ def estimate_request_savings_usd(
     tool_schema_tokens_saved: int = 0,
     output_tokens_saved: int = 0,
     cache_read_tokens: int = 0,
-) -> dict[str, float]:
+    cache_write_tokens: int = 0,
+    cache_write_5m_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
+    uncached_input_tokens: int = 0,
+    cache_inferred: bool = False,
+    local_input_tokens: int = 0,
+    provider: str | None = None,
+) -> dict[str, Any]:
     """Price one request's distinct savings layers for external telemetry.
 
-    The values use the same pricing functions as the built-in dashboard. They
-    stay separate because provider-cache benefit is not caused by compression,
-    and extension attribution can be explanatory rather than additive.
+    The layers stay separate because provider-cache benefit is not caused by
+    compression, and extension attribution can be explanatory rather than
+    additive.
+
+    The two input-side layers are priced CACHE-AWARE, each against the region of
+    the request it actually came out of (see
+    :mod:`headroom.pricing.counterfactual`):
+
+    * ``compression`` — live-zone content, which was never a cache read.
+    * ``tool_schema`` — prefix content, which on a warm turn was *entirely* a
+      cache read.
+
+    Both also report a ``*_list`` companion: the same tokens at flat list price.
+    That is the upper bound, the figure this function used to return for both
+    layers, and what budget enforcement keeps consuming because it is monotonic
+    in tokens and needs no provider cooperation. ``basis`` says how sound the
+    cache-aware numbers are — see the BASIS_* constants.
+
+    Passing no cache breakdown at all is fully supported and is what every
+    non-reporting harness and the MCP tool path do: the effective figures then
+    equal the list figures and ``basis`` reads ``no-mix``.
     """
 
+    # Imported at CALL time, not module scope. `headroom.pricing.__init__`
+    # eagerly imports litellm, which measures 4.1s — and savings_tracker is
+    # imported during proxy startup, so a module-level import here would put
+    # that on every boot. No request can be priced without litellm anyway, so
+    # deferring to the first priced request costs nothing and keeps startup
+    # unchanged. Repeat calls are a `sys.modules` dict hit. Same idiom as
+    # `_resolve_litellm_model` below.
+    from headroom.pricing.counterfactual import (
+        CacheMix,
+        PricedSavings,
+        Region,
+        price_savings,
+        weakest_basis,
+    )
+
+    mix = CacheMix.from_usage(
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_write_5m_tokens=cache_write_5m_tokens,
+        cache_write_1h_tokens=cache_write_1h_tokens,
+        uncached_input_tokens=uncached_input_tokens,
+        cache_inferred=cache_inferred,
+    )
+    long_context = mix.is_long_context(local_tokens=local_input_tokens)
+
+    def _price(tokens: Any, region: Region) -> PricedSavings:
+        return price_savings(
+            max(_coerce_int(tokens), 0),
+            model=model,
+            mix=mix,
+            region=region,
+            long_context=long_context,
+            provider=provider,
+            # Matches the blended rate the flat estimators fall back to, so an
+            # unpriceable model reports the same dollars it always has.
+            fallback_rate_per_token=DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
+        )
+
+    compression = _price(compression_tokens_saved, Region.LIVE_ZONE)
+    tool_schema = _price(tool_schema_tokens_saved, Region.PREFIX)
+
     return {
-        "compression": _estimate_compression_savings_usd(
-            model, max(_coerce_int(compression_tokens_saved), 0)
-        ),
-        "tool_schema": _estimate_compression_savings_usd(
-            model, max(_coerce_int(tool_schema_tokens_saved), 0)
-        ),
+        "compression": compression.usd,
+        "compression_list": compression.usd_list,
+        "tool_schema": tool_schema.usd,
+        "tool_schema_list": tool_schema.usd_list,
         "output_shaping": _estimate_output_savings_usd(
             model, max(_coerce_int(output_tokens_saved), 0)
         ),
         "provider_cache": _estimate_cache_savings_usd(
             model, max(_coerce_int(cache_read_tokens), 0)
+        ),
+        # An aggregate is only as sound as its weakest input, so a request whose
+        # tool-schema layer priced from the catalog but whose compression layer
+        # had no mix to work with reports the weaker of the two.
+        "basis": weakest_basis(
+            compression.basis if compression.tokens else None,
+            tool_schema.basis if tool_schema.tokens else None,
         ),
     }
 
@@ -487,6 +613,8 @@ def _empty_display_session() -> dict[str, Any]:
         "requests": 0,
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "compression_savings_list_usd": 0.0,
+        "savings_basis": BASIS_UNKNOWN,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
@@ -602,13 +730,27 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         2,
     )
 
+    # Presence of the list column is what distinguishes a v6+ session from one
+    # written before cache-aware pricing existed. A pre-v6 session's single
+    # dollar figure WAS the list figure, so it seeds both columns exactly, and
+    # the session is labelled `list` because its mix was never persisted and
+    # cannot be recovered. Written out rather than inlined into the dict below:
+    # a money path should not hinge on the reader parsing a nested ternary.
+    is_pre_v6 = "compression_savings_list_usd" not in entry
+    savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+    if is_pre_v6:
+        savings_list_usd = savings_usd
+        savings_basis = BASIS_LIST
+    else:
+        savings_list_usd = _coerce_float(entry.get("compression_savings_list_usd"))
+        savings_basis = str(entry.get("savings_basis") or BASIS_UNKNOWN)
+
     return {
         "requests": _coerce_int(entry.get("requests")),
         "tokens_saved": tokens_saved,
-        "compression_savings_usd": round(
-            _coerce_float(entry.get("compression_savings_usd")),
-            6,
-        ),
+        "compression_savings_usd": round(savings_usd, 6),
+        "compression_savings_list_usd": round(savings_list_usd, 6),
+        "savings_basis": savings_basis,
         "cache_read_tokens": _coerce_int(entry.get("cache_read_tokens")),
         "cache_savings_usd": round(
             _coerce_float(entry.get("cache_savings_usd")),
@@ -804,13 +946,29 @@ class SavingsTracker:
             # statement rather than folded into the ternary below — a money path
             # should not depend on the reader knowing that ``a + b if c else d``
             # groups as ``(a + b) if c else d``.
+            #
+            # As of v6 these two arrive CACHE-AWARE and region-correct: the
+            # compression bucket priced against the live zone (never a cache
+            # read) and the tool-schema bucket against the prefix (on a warm
+            # turn, entirely a cache read). Neither is clamped at zero any more
+            # than it was — but note the floor below is load-bearing in a new
+            # way, since a live-zone token on a cold Anthropic turn is worth
+            # 1.25x list, not 1.0x, and that is real money rather than an
+            # artifact.
             delta_savings_usd = max(_coerce_float(priced.get("compression")), 0.0) + max(
                 _coerce_float(priced.get("tool_schema")), 0.0
             )
+            delta_savings_list_usd = max(_coerce_float(priced.get("compression_list")), 0.0) + max(
+                _coerce_float(priced.get("tool_schema_list")), 0.0
+            )
+            delta_basis = priced.get("basis")
         else:
             # No priced breakdown available: only message savings are known here,
-            # so this path stays message-only exactly as before.
+            # so this path stays message-only exactly as before — and at list
+            # price, which is what "no mix to price against" honestly means.
             delta_savings_usd = _estimate_compression_savings_usd(model, delta_tokens_saved)
+            delta_savings_list_usd = delta_savings_usd
+            delta_basis = BASIS_LIST if delta_tokens_saved > 0 else None
         delta_output_savings_usd = (
             max(_coerce_float(priced.get("output_shaping")), 0.0)
             if priced is not None
@@ -866,6 +1024,12 @@ class SavingsTracker:
                 lifetime["compression_savings_usd"] + delta_savings_usd,
                 6,
             )
+            lifetime["compression_savings_list_usd"] = round(
+                _coerce_float(lifetime.get("compression_savings_list_usd"))
+                + delta_savings_list_usd,
+                6,
+            )
+            lifetime["savings_basis"] = _blend_basis(lifetime.get("savings_basis"), delta_basis)
             lifetime["cache_read_tokens"] += delta_cache_read_tokens
             lifetime["cache_savings_usd"] = round(
                 lifetime["cache_savings_usd"] + delta_cache_savings_usd,
@@ -897,6 +1061,11 @@ class SavingsTracker:
                 session["compression_savings_usd"] + delta_savings_usd,
                 6,
             )
+            session["compression_savings_list_usd"] = round(
+                _coerce_float(session.get("compression_savings_list_usd")) + delta_savings_list_usd,
+                6,
+            )
+            session["savings_basis"] = _blend_basis(session.get("savings_basis"), delta_basis)
             session["cache_read_tokens"] += delta_cache_read_tokens
             session["cache_savings_usd"] = round(
                 session["cache_savings_usd"] + delta_cache_savings_usd,
@@ -975,6 +1144,13 @@ class SavingsTracker:
         cache_read_tokens = _coerce_int(metrics.get("cache_read_tokens"))
         cache_write_tokens = _coerce_int(metrics.get("cache_write_tokens"))
         uncached_input_tokens = _coerce_int(metrics.get("uncached_input_tokens"))
+        # POPPED, not read: `metrics` is forwarded verbatim to
+        # `PersistentMetricsState.record_request`, whose signature is an
+        # explicit keyword list with no **kwargs. `cache_inferred` is a pricing
+        # input (it tells the counterfactual to drop a write bucket the
+        # provider never billed), not a metric that aggregate stores, so it
+        # must not survive into that call.
+        cache_inferred = bool(metrics.pop("cache_inferred", False))
         metrics.setdefault(
             "input_usd",
             _estimate_input_cost_usd(
@@ -985,10 +1161,28 @@ class SavingsTracker:
                 uncached_input_tokens=uncached_input_tokens,
             ),
         )
-        metrics.setdefault(
-            "compression_savings_usd",
-            _estimate_compression_savings_usd(model, _coerce_int(metrics.get("tokens_saved"))),
-        )
+        # Cache-aware, like every other savings figure as of v6. ``tokens_saved``
+        # here is message compression, so it prices against the LIVE ZONE — the
+        # region handlers actually compress, and the one region that can never
+        # have been a cache read. The caller (prometheus_metrics.record_request)
+        # already hands us the full breakdown, so no new plumbing is needed;
+        # a caller that omits it degrades to list price and says so.
+        if "compression_savings_usd" not in metrics:
+            priced = estimate_request_savings_usd(
+                model,
+                compression_tokens_saved=_coerce_int(metrics.get("tokens_saved")),
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+                cache_write_5m_tokens=_coerce_int(metrics.get("cache_write_5m_tokens")),
+                cache_write_1h_tokens=_coerce_int(metrics.get("cache_write_1h_tokens")),
+                uncached_input_tokens=uncached_input_tokens,
+                cache_inferred=cache_inferred,
+                local_input_tokens=input_tokens,
+                provider=metrics.get("provider"),
+            )
+            metrics["compression_savings_usd"] = priced["compression"]
+            metrics["compression_savings_list_usd"] = priced["compression_list"]
+            metrics["savings_basis"] = priced["basis"]
         metrics.setdefault(
             "cache_savings_usd", _estimate_cache_savings_usd(model, cache_read_tokens)
         )
@@ -1292,6 +1486,8 @@ class SavingsTracker:
                 "requests": 0,
                 "tokens_saved": 0,
                 "compression_savings_usd": 0.0,
+                "compression_savings_list_usd": 0.0,
+                "savings_basis": BASIS_UNKNOWN,
                 "cache_read_tokens": 0,
                 "cache_savings_usd": 0.0,
                 "total_input_tokens": 0,
@@ -1358,6 +1554,10 @@ class SavingsTracker:
         lifetime_cache_savings_usd = 0.0
         lifetime_input_tokens = 0
         lifetime_input_cost_usd = 0.0
+        lifetime_savings_list_usd = 0.0
+        lifetime_basis = BASIS_UNKNOWN
+        migrated_at = None
+        is_v6_lifetime = False
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
@@ -1366,6 +1566,13 @@ class SavingsTracker:
             lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
             lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
+            migrated_at = lifetime_raw.get("savings_basis_migrated_at")
+            is_v6_lifetime = "compression_savings_list_usd" in lifetime_raw
+            if is_v6_lifetime:
+                lifetime_savings_list_usd = _coerce_float(
+                    lifetime_raw.get("compression_savings_list_usd")
+                )
+                lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
 
         if normalized_history:
             last = normalized_history[-1]
@@ -1386,12 +1593,35 @@ class SavingsTracker:
                 _coerce_float(last.get("total_input_cost_usd")),
             )
 
+        # v6 migration seed. Runs HERE, after the history back-fill above, not
+        # beside the lifetime read: a state whose `lifetime` block is missing or
+        # empty still recovers its totals from the last history point, and
+        # seeding before that ran left the list column at 0 while the effective
+        # column carried the recovered dollars — a total that reads as a 100%
+        # cache-aware saving on data that was entirely list-priced.
+        #
+        # Everything a pre-v6 install accumulated was flat list price, so it
+        # seeds BOTH columns: for that history they genuinely are the same
+        # number. The cache mix that would let us re-derive the honest value was
+        # never persisted — which is the whole reason v6 exists — so the total
+        # stays labelled `list` for the life of the install, and
+        # `savings_basis_migrated_at` marks where the honest numbers begin.
+        if not is_v6_lifetime and (lifetime_requests or lifetime_savings_usd):
+            lifetime_savings_list_usd = lifetime_savings_usd
+            lifetime_basis = BASIS_LIST
+            if not migrated_at:
+                migrated_at = _to_utc_iso(_utc_now())
+                self._needs_schema_save = True
+
         state = {
             "schema_version": SCHEMA_VERSION,
             "lifetime": {
                 "requests": lifetime_requests,
                 "tokens_saved": lifetime_tokens_saved,
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
+                "compression_savings_list_usd": round(lifetime_savings_list_usd, 6),
+                "savings_basis": lifetime_basis,
+                "savings_basis_migrated_at": migrated_at,
                 "cache_read_tokens": lifetime_cache_read_tokens,
                 "cache_savings_usd": round(lifetime_cache_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
