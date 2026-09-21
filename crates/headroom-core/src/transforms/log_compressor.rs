@@ -953,15 +953,28 @@ fn extract_source_file(line: &str) -> Option<String> {
 
 /// Summarize what got dropped: distinct exception-type/error-code labels
 /// and distinct source files referenced by the lines in `all_lines` that
-/// are NOT present (by `line_number`) in `selected`. `BTreeSet` keeps the
-/// output deterministic (same input -> same marker text, no `HashMap`
-/// iteration-order dependence).
+/// are NOT present (by `line_number`) in `selected`, excluding any label or
+/// file that is *also* extractable from a kept line — those are already
+/// visible in the surviving text, so restating them would describe nothing
+/// retrieval could add. `BTreeSet` keeps the output deterministic (same
+/// input -> same marker text, no `HashMap` iteration-order dependence).
 ///
 /// Returns `""` when nothing extractable was found — callers append this
 /// directly after the lines-compressed count, so an empty descriptor
 /// leaves the marker exactly as it was before this was added.
 fn summarize_omitted(all_lines: &[LogLine], selected: &[LogLine]) -> String {
     let kept: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
+
+    let mut kept_error_types: BTreeSet<String> = BTreeSet::new();
+    let mut kept_files: BTreeSet<String> = BTreeSet::new();
+    for line in selected {
+        if let Some(label) = extract_error_label(&line.content) {
+            kept_error_types.insert(label);
+        }
+        if let Some(file) = extract_source_file(&line.content) {
+            kept_files.insert(file);
+        }
+    }
 
     let mut error_types: BTreeSet<String> = BTreeSet::new();
     let mut files: BTreeSet<String> = BTreeSet::new();
@@ -970,10 +983,14 @@ fn summarize_omitted(all_lines: &[LogLine], selected: &[LogLine]) -> String {
             continue;
         }
         if let Some(label) = extract_error_label(&line.content) {
-            error_types.insert(label);
+            if !kept_error_types.contains(&label) {
+                error_types.insert(label);
+            }
         }
         if let Some(file) = extract_source_file(&line.content) {
-            files.insert(file);
+            if !kept_files.contains(&file) {
+                files.insert(file);
+            }
         }
     }
 
@@ -1744,6 +1761,41 @@ mod tests {
         // detection (Python `CCR_RETRIEVAL_MARKER_RE`, `tool_injection.py`)
         // keys off this exact substring.
         assert!(compressed.contains("Retrieve more: hash="));
+    }
+
+    #[test]
+    fn summarize_omitted_excludes_error_type_and_file_visible_in_kept_lines() {
+        // KeyError/foo.py appear in both a kept line and a dropped line;
+        // ValueError/bar.py appear only in a dropped line. The descriptor
+        // must describe only what retrieval would actually add, so the
+        // dropped-but-also-visible pair should not be repeated. File names
+        // themselves are never printed (the marker only counts distinct
+        // files), so this is checked via the file count, not file text.
+        let all_lines = vec![
+            LogLine::new(0, "KeyError: 'port'"),
+            LogLine::new(1, "File \"foo.py\", line 3"),
+            LogLine::new(2, "KeyError: 'port'"),
+            LogLine::new(3, "File \"foo.py\", line 9"),
+            LogLine::new(4, "ValueError: bad literal"),
+            LogLine::new(5, "File \"bar.py\", line 1"),
+        ];
+        // Lines 0 and 1 survive compression; 2-5 are dropped.
+        let selected = vec![all_lines[0].clone(), all_lines[1].clone()];
+
+        let descriptor = summarize_omitted(&all_lines, &selected);
+
+        assert!(
+            !descriptor.contains("KeyError"),
+            "KeyError is already visible in a kept line, should not repeat: {descriptor}"
+        );
+        assert!(
+            descriptor.contains("ValueError"),
+            "ValueError only appears in dropped lines, should be described: {descriptor}"
+        );
+        // Only bar.py should count: foo.py is excluded because it's also
+        // extractable from a kept line (line 1), so the dropped-file count
+        // must be 1, not 2.
+        assert_eq!(descriptor, ": 1 file, 1 exception type (ValueError)");
     }
 
     #[test]
