@@ -15,6 +15,7 @@ from typing import Any, Literal
 from headroom.memory import qdrant_env
 from headroom.providers.registry import ProviderApiOverrides
 from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECONDS
+from headroom.proxy.jev_model_policy import JevModelPolicyConfig
 from headroom.proxy.model_router import ModelRouterConfig
 from headroom.rollout import RolloutSnapshot, resolve_rollout
 
@@ -187,6 +188,9 @@ class ProxyConfig:
     # when configured, an ordered rule set can rewrite the outgoing model based
     # on request size / tool presence. None keeps behavior unchanged.
     model_router: ModelRouterConfig | None = None
+    # Optional Jev semantic policy (#3690). When enabled, runs before the
+    # heuristic ModelRouter; fail-open leaves the static router as fallback.
+    jev_model_policy: JevModelPolicyConfig | None = None
 
     # CCR Tool Injection
     ccr_inject_tool: bool = True

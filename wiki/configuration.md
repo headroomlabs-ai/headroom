@@ -233,6 +233,9 @@ Some settings can be configured via environment variables:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HEADROOM_MODEL_LIMITS` | Custom model config (JSON string or file path) | - |
+| `HEADROOM_JEV_MODEL_ROUTER` | Enable optional Jev semantic model routing (see [jev-model-router](jev-model-router.md)) | unset (off) |
+| `HEADROOM_JEV_TIER_MODELS` | JSON map of Jev tiers → model IDs (`economy`/`standard`/`frontier`) | unset |
+| `TYPESAFE_API_KEY` | TypeSafe API key for Jev System One (only when Jev router enabled) | unset |
 | `HEADROOM_CONFIG_DIR` | Canonical config (read-mostly) root. Derives `models.json` and per-plugin config paths when set. | `~/.headroom/config` |
 | `HEADROOM_WORKSPACE_DIR` | Canonical workspace (read-write state) root. Derives savings ledger, memory DB, logs, TOIN, subscription state, and more when set. | `~/.headroom` |
 | `HEADROOM_SAVINGS_PATH` | Full path to the proxy savings JSON ledger. Always wins when set. | derived from `${HEADROOM_WORKSPACE_DIR}` |

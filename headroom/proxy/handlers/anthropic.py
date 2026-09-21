@@ -51,6 +51,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.image_isolation import run_image_compression_isolated
+from headroom.proxy.jev_model_policy import latest_user_text
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
@@ -853,16 +854,34 @@ class AnthropicHandlerMixin:
         body_mutation_tracker: Any,
         bypass: bool,
     ) -> str:
-        """Apply cost-aware model routing (#1706), returning the model to forward.
+        """Apply cost-aware model routing (#1706 / #3690), returning the model to forward.
 
         Fails closed to disabled when no ``model_router`` is present: alternate
         mixin hosts and test doubles that do not run ``HeadroomProxy.__init__``
         never set the attribute, and reading it unconditionally would crash them
         even when routing is off. Also skipped under bypass/passthrough so a
         byte-faithful request is never model-rewritten.
+
+        When an optional Jev policy is enabled (#3690), it runs first on
+        truncated user text. A matched decision (including low-confidence keep)
+        wins; unmatched / error falls through to the heuristic ``ModelRouter``.
         """
+        if bypass:
+            return model
+
+        jev = getattr(self, "jev_model_policy", None)
+        if jev is not None and jev.enabled:
+            jev_decision = jev.select(model=model, user_text=latest_user_text(messages))
+            logger.info("jev model routing decision: %s", jev_decision.reason)
+            if jev_decision.matched:
+                if jev_decision.changed:
+                    body["model"] = jev_decision.routed_model
+                    body_mutation_tracker.mark_mutated("jev_model_router")
+                    return jev_decision.routed_model
+                return model
+
         router = getattr(self, "model_router", None)
-        if router is None or not router.enabled or bypass:
+        if router is None or not router.enabled:
             return model
         decision = router.select(
             model=model,

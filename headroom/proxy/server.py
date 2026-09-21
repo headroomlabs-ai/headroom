@@ -146,12 +146,13 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+
+# Data models (extracted to headroom/proxy/models.py for maintainability)
+from headroom.proxy.jev_model_policy import JevModelPolicy, JevModelPolicyConfig
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
-
-# Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
@@ -888,6 +889,8 @@ class HeadroomProxy(
         # Cost-aware model routing (issue #1706). Disabled unless configured, so
         # the default request path is unchanged.
         self.model_router = ModelRouter(config.model_router)
+        # Optional Jev semantic policy (#3690). Off by default; fail-open.
+        self.jev_model_policy = JevModelPolicy(config.jev_model_policy)
 
         # Initialize transforms based on routing mode.
         #
@@ -5719,6 +5722,7 @@ def _proxy_config_from_env() -> ProxyConfig:
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
+        jev_model_policy=JevModelPolicyConfig.from_env(),
     )
 
 
