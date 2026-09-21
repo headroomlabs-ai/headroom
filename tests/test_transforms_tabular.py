@@ -510,7 +510,9 @@ def test_load_xls_and_xlsx_agree_above_the_exact_integer_range(tmp_path) -> None
     openpyxl_sheet.append([small, big])
     openpyxl_wb.save(tmp_path / "modern.xlsx")
 
-    small_field, big_field = load_spreadsheet(xls_path)["Data"].splitlines()[1].split(",")
+    xls_row = load_spreadsheet(xls_path)["Data"].splitlines()[1]
+    xlsx_row = load_spreadsheet(tmp_path / "modern.xlsx")["Data"].splitlines()[1]
+    small_field, big_field = xls_row.split(",")
 
     # The #3616 win has to survive the bound: a small whole number is still an int.
     assert small_field == "12"
@@ -518,6 +520,61 @@ def test_load_xls_and_xlsx_agree_above_the_exact_integer_range(tmp_path) -> None
     # it is, which reads as an approximation instead of an exact identifier.
     assert big_field == repr(big)
     assert big_field != str(int(big))
+    # Parity, asserted against the other loader rather than against my own
+    # expectation. Small values agree verbatim; above the range openpyxl writes a
+    # double with only 15 significant digits, so that side loses a digit on its
+    # own and the rows cannot be string-equal. The promise this fix makes is
+    # about magnitude: the two loaders agree to well within one unit in the last
+    # place of the stored value (16 here), and neither hands the agent the
+    # exact-looking decimal of the typed number.
+    xlsx_small, xlsx_big = xlsx_row.split(",")
+    assert small_field == xlsx_small == "12"
+    assert abs(float(big_field) - float(xlsx_big)) <= 16
+
+
+def test_load_xls_and_xlsx_agree_at_the_exact_integer_boundary(tmp_path) -> None:
+    """2**53 and -2**53 are exactly representable and openpyxl loads them as
+    integers, so the .xls path must convert them too - the bound is inclusive.
+    One step outside, the double cannot hold the value; what matters is that no
+    digits are invented, and the two loaders then differ only in the trailing
+    ``.0`` that marks a value as approximate.
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    boundary = 2**53
+    values = [boundary, -boundary, boundary - 2, boundary + 2]
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Value")
+    for row, value in enumerate(values, start=1):
+        xls_sheet.write(row, 0, float(value))
+    xls_path = tmp_path / "boundary.xls"
+    xls_book.save(xls_path)
+
+    xlsx_wb = openpyxl.Workbook()
+    xlsx_sheet = xlsx_wb.active
+    xlsx_sheet.title = "Data"
+    xlsx_sheet.append(["Value"])
+    for value in values:
+        xlsx_sheet.append([int(value)])
+    xlsx_path = tmp_path / "boundary.xlsx"
+    xlsx_wb.save(xlsx_path)
+
+    xls = [line.split(",")[0] for line in load_spreadsheet(xls_path)["Data"].splitlines()[1:]]
+    xlsx = [line.split(",")[0] for line in load_spreadsheet(xlsx_path)["Data"].splitlines()[1:]]
+
+    # Inside the range (and exactly on it) the two loaders agree verbatim.
+    assert xls[0] == xlsx[0] == "9007199254740992"
+    assert xls[1] == xlsx[1] == "-9007199254740992"
+    assert xls[2] == xlsx[2] == "9007199254740990"
+    # Above it the .xls side keeps the float marker, and the digits are the same.
+    assert xls[3].removesuffix(".0") == xlsx[3] == "9007199254740994"
+    assert all(not field.endswith(".0") or float(field) == int(float(field)) for field in xls)
 
 
 def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
