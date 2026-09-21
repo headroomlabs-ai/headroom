@@ -106,12 +106,18 @@ rate(headroom_cache_bust_total[5m])
 | `headroom_requests_total` | Requests handled. Unlabelled. |
 | `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… |
 | `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. |
-| `headroom_requests_failed_total` | Upstream 5xx errors. |
-| `headroom_requests_rate_limited_total` | Requests **Headroom** rejected via its own rate limiter (not upstream 429s). |
+| `headroom_requests_failed_total` | Requests that failed upstream — 4xx and 5xx, 429 excepted. Excluded from `requests_total`. |
+| `headroom_requests_rate_limited_total` | Requests rejected with 429, by **either** Headroom's own rate limiter or the upstream provider. Excluded from `requests_total`. |
 | `headroom_compression_failed_total{reason}` | Compression failures — `timeout` or `error`. Fails open, so traffic keeps flowing but savings quietly stop. **Worth an alert.** |
 | `headroom_compression_quarantine_total{event}` | Compression disabled after repeated timeouts — `activated`, `skipped`, `released`. |
 | `headroom_inbound_requests_active` | In-flight requests, gauge. Counts all HTTP including `/metrics`. |
 | `headroom_active_ws_sessions` | Live Codex WebSocket sessions, gauge. |
+
+> `headroom_requests_total` counts **completed** requests, not all traffic: an upstream
+> 4xx/5xx, a 429 or a Headroom-side rate-limit rejection increments its own counter and returns
+> before `requests_total` is touched (`proxy/outcome.py`), so a failure-rate query must add the
+> failure counters back into the denominator, as it does below. `headroom_inbound_requests_total`
+> is the counter that sees everything that arrived.
 
 ```promql
 # Failure rate
