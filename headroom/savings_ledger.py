@@ -583,23 +583,29 @@ def aggregate_savings(
             effective = None if raw_effective is None else max(float(raw_effective), 0.0)
         except (TypeError, ValueError):
             effective = None
-        basis = event.get("basis") or BASIS_LIST
-        row = {
-            "saved": saved,
-            "before": before,
-            "cost": cost,
-            "cost_effective": effective,
-            "basis": basis,
-        }
+        basis = str(event.get("basis") or BASIS_LIST)
 
-        windowed.add(**row)
+        # Explicit keywords rather than a `**row` splat: the values are
+        # heterogeneous (ints, floats, an optional float, a string), so a dict
+        # built from them widens to a union that no longer type-checks against
+        # `add`'s signature. Listed out per bucket rather than via a local
+        # helper, which would close over these loop variables.
+        targets = [windowed]
         if ts >= today_cutoff:
-            today.add(**row)
+            targets.append(today)
         if ts >= week_cutoff:
-            last_7.add(**row)
+            targets.append(last_7)
+        targets.append(by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()))
+        targets.append(by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()))
 
-        by_model.setdefault(str(event.get("model") or UNKNOWN), _Bucket()).add(**row)
-        by_client.setdefault(str(event.get("client") or UNKNOWN), _Bucket()).add(**row)
+        for bucket in targets:
+            bucket.add(
+                saved=saved,
+                before=before,
+                cost=cost,
+                cost_effective=effective,
+                basis=basis,
+            )
 
     model_rows = _ranked(by_model, "model")
     top_model = model_rows[0]["model"] if model_rows else UNKNOWN

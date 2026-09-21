@@ -908,7 +908,10 @@ class SavingsTracker:
         uncached_input_tokens: int = 0,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
-        estimated_savings_usd: Mapping[str, float] | None = None,
+        # Mixed value types: per-layer dollars plus the string `basis` label
+        # that says how soundly they were priced. See
+        # ``estimate_request_savings_usd``, which produces it.
+        estimated_savings_usd: Mapping[str, Any] | None = None,
         timestamp: datetime | str | None = None,
     ) -> bool:
         """Persist a canonical display-session update for every request."""
