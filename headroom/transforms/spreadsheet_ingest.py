@@ -94,7 +94,13 @@ def _xls_cell(cell: object, datemode: int) -> object:
         return datetime(year, month, day, hour, minute, second)
     if kind == xlrd.XL_CELL_BOOLEAN:
         return bool(value)
-    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer():
+    # int() is only lossless while the double can represent consecutive integers.
+    # Above 2**53 it renders the double's exact value instead of the number the
+    # sheet held -- 123456789012345678 is stored as 1.2345678901234568e+17 and would
+    # print a fabricated ...680 to an agent that has no way to tell it is an
+    # approximation. Fall through to the float, which is what the .xlsx loader
+    # renders (#3695).
+    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer() and abs(value) < 2**53:
         return int(value)
     if kind == xlrd.XL_CELL_ERROR:
         # openpyxl with data_only=True gives the text Excel shows, e.g. #DIV/0!

@@ -474,6 +474,52 @@ def test_load_xls_renders_a_time_only_cell_as_a_time(tmp_path) -> None:
     assert load_spreadsheet(xls_path)["Data"].splitlines()[1] == "12:00:00"
 
 
+def test_load_xls_and_xlsx_agree_above_the_exact_integer_range(tmp_path) -> None:
+    """A double cannot hold consecutive integers past 2**53.
+
+    ``_xls_cell`` converted any integral double with ``int()``, so a sheet
+    holding 123456789012345678 rendered the double's exact value, 123456789012345680
+    -- two fabricated digits presented to an agent as a precise identifier. The
+    .xlsx loader has always rendered the float, which at least says
+    "approximate", so bounding the conversion to the exactly-representable range
+    keeps the ``12.0 -> 12`` fix from #3616 and restores agreement (#3695).
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    small, big = 12, 1.2345678901234568e17
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Small")
+    xls_sheet.write(0, 1, "Big")
+    xls_sheet.write(1, 0, small)
+    xls_sheet.write(1, 1, big)
+    xls_path = tmp_path / "legacy.xls"
+    xls_book.save(xls_path)
+
+    # openpyxl is the reference the .xls path is written against, so the expected
+    # rendering is the float repr it yields for the same value.
+    openpyxl_wb = openpyxl.Workbook()
+    openpyxl_sheet = openpyxl_wb.active
+    openpyxl_sheet.title = "Data"
+    openpyxl_sheet.append(["Small", "Big"])
+    openpyxl_sheet.append([small, big])
+    openpyxl_wb.save(tmp_path / "modern.xlsx")
+
+    small_field, big_field = load_spreadsheet(xls_path)["Data"].splitlines()[1].split(",")
+
+    # The #3616 win has to survive the bound: a small whole number is still an int.
+    assert small_field == "12"
+    # And the fabricated integer must be gone: the cell is rendered as the double
+    # it is, which reads as an approximation instead of an exact identifier.
+    assert big_field == repr(big)
+    assert big_field != str(int(big))
+
+
 def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     """The reference: openpyxl is what the .xls path is matching."""
     xlwt = pytest.importorskip("xlwt")
