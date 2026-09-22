@@ -74,6 +74,46 @@ def test_build_manifest_for_persistent_docker_respects_explicit_compress_remote_
     assert manifest.base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "0"
 
 
+def test_build_manifest_for_docker_runtime_non_persistent_preset_sets_compress_remote() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset="custom-preset",
+        runtime_kind="docker",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+    assert manifest.base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "1"
+
+
+def test_build_manifest_for_persistent_docker_preset_independent_of_runtime_kind() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_DOCKER.value,
+        runtime_kind="custom",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+    assert manifest.base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "1"
+
+
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
     manifest = build_manifest(
         profile="default",
@@ -95,6 +135,7 @@ def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
     # On the host the resolved path is correct, so it is still passed explicitly.
     assert "--memory" in manifest.proxy_args
     assert "--memory-db-path" in manifest.proxy_args
+    assert "HEADROOM_COMPRESS_ALLOW_REMOTE" not in manifest.base_env
 
 
 def test_build_manifest_falls_back_from_windows_service_to_task(monkeypatch) -> None:
