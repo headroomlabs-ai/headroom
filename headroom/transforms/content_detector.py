@@ -167,6 +167,13 @@ _LOG_PATTERNS = [
     re.compile(r"^\s*at .+\) in .+:line \d+"),  # .NET frame with PDB info
     re.compile(r"^Caused by: "),  # Java exception chain head
     re.compile(r"^\s*\.\.\. \d+ more$"),  # Java elided-frames summary
+    # CMTrace record opener -- the log format SCCM, MDT and Intune Win32
+    # app/script deployments write on Windows. Every record is
+    # `<![LOG[message]LOG]!><time="..." date="..." ...>`, which matches none of
+    # the patterns above: the timestamp sits in an attribute *after* the
+    # message, so the anchored date/time/separator patterns cannot fire, and a
+    # record need not contain ERROR/WARN/INFO.
+    re.compile(r"^<!\[LOG\["),  # CMTrace (SCCM/Intune) log record
 ]
 
 
