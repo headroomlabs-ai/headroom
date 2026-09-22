@@ -487,6 +487,17 @@ class ToolIntelligenceNetwork:
         if self._backend is not None:
             self._load_from_backend()
 
+    @property
+    def backend_kind(self) -> str:
+        """Describe initialized storage without exposing adapter configuration."""
+        from .backends import FileSystemTOINBackend
+
+        if self._backend is None:
+            return "memory"
+        if isinstance(self._backend, FileSystemTOINBackend):
+            return "filesystem"
+        return "custom"
+
     def _generate_stable_instance_id(self) -> str:
         """Generate a stable instance ID that doesn't change across restarts.
 
