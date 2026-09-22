@@ -42,6 +42,7 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     assert manifest.health_url == "http://127.0.0.1:8787/readyz"
     assert manifest.base_env["HEADROOM_PORT"] == "8787"
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "off"
+    assert manifest.base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "1"
     assert "--no-telemetry" in manifest.proxy_args
     assert manifest.tool_envs["claude"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
     assert manifest.tool_envs["copilot"]["COPILOT_PROVIDER_TYPE"] == "anthropic"
@@ -50,6 +51,27 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     # exist inside the container and would keep /readyz at 503 (#2803). The proxy
     # resolves the DB under its own cwd, which is the bind-mounted ~/.headroom.
     assert "--memory-db-path" not in manifest.proxy_args
+
+
+def test_build_manifest_for_persistent_docker_respects_explicit_compress_remote_override() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_DOCKER.value,
+        runtime_kind="docker",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        extra_env={"HEADROOM_COMPRESS_ALLOW_REMOTE": "0"},
+    )
+    assert manifest.base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] == "0"
 
 
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:

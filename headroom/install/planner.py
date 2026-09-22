@@ -191,6 +191,16 @@ def build_manifest(
     target_set = set(resolved_targets)
     if target_set & _grok_targets and not (target_set & _openai_native):
         base_env.setdefault("OPENAI_TARGET_API_URL", _GROK_DEFAULT_API_URL)
+    # A persistent-docker deployment publishes its port to 127.0.0.1 on the
+    # host, but inbound host traffic routed across the docker bridge arrives with
+    # the bridge gateway IP (e.g. 172.17.0.1) instead of loopback. Allow remote
+    # access for /v1/compress and /v1/usage so host tools (SDKs, gateways,
+    # dashboards) can reach them without getting 404 from the loopback guard.
+    if (
+        effective_preset == InstallPreset.PERSISTENT_DOCKER.value
+        or runtime_kind == RuntimeKind.DOCKER.value
+    ):
+        base_env["HEADROOM_COMPRESS_ALLOW_REMOTE"] = "1"
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:
