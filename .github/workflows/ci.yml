@@ -107,7 +107,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache pip
@@ -134,10 +134,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -157,8 +159,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
@@ -176,13 +178,87 @@ jobs:
           path: dist/*.whl
           retention-days: 1
 
+  python-314-wheels:
+    # Partners on centrally managed machines cannot choose their Python, and
+    # many have no compiler. Install the proxy extras on the newest supported
+    # Python from prebuilt wheels only, so a dependency with no 3.14 wheel fails
+    # here instead of starting a C or Rust build on a user's machine.
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.packaging == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Download Linux wheel
+        if: runner.os == 'Linux'
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel
+          path: dist
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os == 'macOS'
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@v2
+        if: runner.os == 'macOS'
+        with:
+          workspaces: ". -> target"
+      - name: Build macOS wheel
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --profile ci --out dist --interpreter python3.14
+      - name: Install headroom-ai[sandbox] from prebuilt wheels only
+        run: |
+          python -m pip install --upgrade pip
+          WHEEL="$(ls dist/*.whl)"
+          python -m pip install --only-binary=:all: "${WHEEL}[sandbox]"
+      - name: Proxy dependencies and LiteLLM pricing are available
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'PY'
+          import sys
+
+          import litellm
+          from headroom.cli.proxy import ensure_proxy_dependencies
+          from headroom.proxy.cost import LITELLM_AVAILABLE
+
+          assert sys.version_info[:2] == (3, 14), sys.version
+          ensure_proxy_dependencies()
+          assert LITELLM_AVAILABLE
+          prompt_cost, _ = litellm.cost_per_token(model="gpt-4o", prompt_tokens=1000, completion_tokens=0)
+          assert prompt_cost > 0, prompt_cost
+          print("Python", sys.version.split()[0], "proxy deps OK, litellm pricing OK")
+          PY
+      - name: Proxy starts and reports healthy
+        working-directory: ${{ runner.temp }}
+        env:
+          HEADROOM_BEACON: "off"
+          HEADROOM_TELEMETRY: "off"
+          HEADROOM_UPDATE_CHECK: "off"
+        run: |
+          headroom proxy --host 127.0.0.1 --port 8799 > proxy.log 2>&1 &
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8799/health; then exit 0; fi
+            sleep 2
+          done
+          cat proxy.log
+          exit 1
+
   prefetch-model:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache HuggingFace model
@@ -217,7 +293,7 @@ jobs:
       TRANSFORMERS_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
 
@@ -312,7 +388,7 @@ jobs:
       FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Cache pip
@@ -365,7 +441,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Download prebuilt wheel
@@ -391,7 +467,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PY_VERSION }}
       - name: Download prebuilt wheel
@@ -445,7 +521,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Cache pip
@@ -454,7 +530,9 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-build-${{ hashFiles('pyproject.toml') }}
           restore-keys: ${{ runner.os }}-pip-build-
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -511,7 +589,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Build local Headroom image
@@ -555,7 +633,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install test dependencies
@@ -572,7 +650,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install bash and test dependencies

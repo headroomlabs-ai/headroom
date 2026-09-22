@@ -13,16 +13,36 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime, time
 from pathlib import Path
 
 __all__ = ["load_spreadsheet"]
 
 
+def _is_blank_row(row: list[object]) -> bool:
+    return all(cell is None or str(cell).strip() == "" for cell in row)
+
+
 def _rows_to_csv(rows: list[list[object]]) -> str:
-    """Render rows to CSV text, dropping fully empty trailing rows."""
+    """Render rows to CSV text, dropping fully empty trailing rows.
+
+    openpyxl's ``iter_rows`` walks the sheet's *used range*, which routinely
+    extends past the last data row (leftover formatting, a cleared cell), so a
+    real sheet commonly ends in ``(None, None, ...)`` tuples. Those were written
+    out as blank ``,`` rows — contradicting this function's own contract — so the
+    trailing empties are dropped here first.
+
+    ``lineterminator="\\n"`` is load-bearing: ``csv.writer`` defaults to
+    ``\\r\\n``, and the old ``.strip("\\n")`` removed only the ``\\n``, leaving a
+    dangling ``\\r`` on the final line (and ``,\\r`` residue behind each undropped
+    empty row). Using ``\\n`` makes the strip clean.
+    """
+    last = len(rows)
+    while last > 0 and _is_blank_row(rows[last - 1]):
+        last -= 1
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    for row in rows:
+    writer = csv.writer(buf, lineterminator="\n")
+    for row in rows[:last]:
         writer.writerow(["" if cell is None else cell for cell in row])
     return buf.getvalue().strip("\n")
 
@@ -49,9 +69,40 @@ def _load_xlsx(path: Path) -> dict[str, str]:
     return sheets
 
 
-def _load_xls(
-    path: Path,
-) -> dict[str, str]:  # pragma: no cover - legacy .xls; needs optional xlrd + binary fixture
+def _xls_cell(cell: object, datemode: int) -> object:
+    """Render one xlrd cell the way openpyxl renders the same cell in a .xlsx.
+
+    xlrd hands back the raw storage rather than the value: a date is the serial
+    number Excel keeps it as, a boolean is 1 or 0, and every number is a double,
+    so a whole number arrives as ``12.0``. Left alone, the two loaders disagree
+    about the same workbook -- ``45292.0`` here against ``2024-01-01 00:00:00``
+    there -- and the date is not recoverable from the text.
+    """
+    import xlrd
+
+    kind = cell.ctype  # type: ignore[attr-defined]
+    value = cell.value  # type: ignore[attr-defined]
+
+    if kind == xlrd.XL_CELL_DATE:
+        try:
+            year, month, day, hour, minute, second = xlrd.xldate_as_tuple(value, datemode)
+        except (ValueError, xlrd.XLDateError):
+            return value
+        if (year, month, day) == (0, 0, 0):
+            # A time-only cell has no date part; openpyxl reads one as a time.
+            return time(hour, minute, second)
+        return datetime(year, month, day, hour, minute, second)
+    if kind == xlrd.XL_CELL_BOOLEAN:
+        return bool(value)
+    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer():
+        return int(value)
+    if kind == xlrd.XL_CELL_ERROR:
+        # openpyxl with data_only=True gives the text Excel shows, e.g. #DIV/0!
+        return xlrd.error_text_from_code.get(value, "")
+    return value
+
+
+def _load_xls(path: Path) -> dict[str, str]:
     try:
         import xlrd
     except ImportError as e:
@@ -63,7 +114,9 @@ def _load_xls(
     book = xlrd.open_workbook(str(path))
     sheets: dict[str, str] = {}
     for sheet in book.sheets():
-        rows = [sheet.row_values(i) for i in range(sheet.nrows)]
+        rows = [
+            [_xls_cell(cell, book.datemode) for cell in sheet.row(i)] for i in range(sheet.nrows)
+        ]
         text = _rows_to_csv(rows)
         if text.strip():
             sheets[sheet.name] = text

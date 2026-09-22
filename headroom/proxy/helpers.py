@@ -740,6 +740,129 @@ def enforce_cache_control_ttl_order(
     return system, messages, tools, stats
 
 
+#: Anthropic rejects a request with more than this many cache_control blocks
+#: across tools, system and messages ("A maximum of 4 blocks with
+#: cache_control may be provided").
+ANTHROPIC_MAX_CACHE_BREAKPOINTS = 4
+
+
+def enforce_cache_breakpoint_budget(
+    system: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    client_messages: Any = None,
+    limit: int = ANTHROPIC_MAX_CACHE_BREAKPOINTS,
+    request_id: str = "",
+) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Last-stop guard: never forward more ``cache_control`` blocks than allowed.
+
+    A request over the limit is a guaranteed 400, and the client cannot have
+    caused it with its own markers, so whatever pushed it over was added on
+    the way through. Repairs in the order that costs the least caching:
+
+    1. Re-place message markers at the client's own positions
+       (:func:`~headroom.cache.prefix_tracker.normalize_message_cache_control`),
+       which drops markers a replay or transform carried in.
+    2. If still over, drop the OLDEST message markers first: the newest one is
+       the client's write anchor for the growing tail, and system/tools
+       markers cover the hottest, longest-lived prefix.
+    3. If still over, drop system markers, then tools markers, earliest first.
+
+    Returns ``(system, messages, tools, stats)``; the inputs come back by
+    identity when nothing needed repairing. Logs one WARNING per repair with
+    the per-section counts so the source of the extra marker is traceable.
+    """
+    before = count_cache_breakpoints(system, messages, tools)
+    stats: dict[str, Any] = {"repaired": False, "before": before, "after": before}
+    if before["total"] <= limit:
+        return system, messages, tools, stats
+
+    if isinstance(messages, list) and client_messages is not None:
+        from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+        messages = normalize_message_cache_control(messages, None, client_messages=client_messages)
+
+    for section in ("messages", "system", "tools"):
+        excess = count_cache_breakpoints(system, messages, tools)["total"] - limit
+        if excess <= 0:
+            break
+        budget = {"left": excess}
+        # Removal, oldest first in Anthropic's evaluation order. Copy-on-write:
+        # the forwarded body shares structure with the session snapshot.
+        if section == "messages" and isinstance(messages, list):
+            rebuilt: list[Any] = []
+            for msg in messages:
+                if budget["left"] <= 0 or not isinstance(msg, dict):
+                    rebuilt.append(msg)
+                    continue
+                content = msg.get("content")
+                if isinstance(content, list):
+                    new_blocks = []
+                    for block in content:
+                        if budget["left"] > 0 and isinstance(block, dict):
+                            inner = block.get("content")
+                            if isinstance(inner, list):
+                                new_inner = []
+                                for sub in inner:
+                                    if (
+                                        budget["left"] > 0
+                                        and isinstance(sub, dict)
+                                        and "cache_control" in sub
+                                    ):
+                                        sub = {k: v for k, v in sub.items() if k != "cache_control"}
+                                        budget["left"] -= 1
+                                    new_inner.append(sub)
+                                block = {**block, "content": new_inner}
+                            if budget["left"] > 0 and "cache_control" in block:
+                                block = {k: v for k, v in block.items() if k != "cache_control"}
+                                budget["left"] -= 1
+                        new_blocks.append(block)
+                    msg = {**msg, "content": new_blocks}
+                if budget["left"] > 0 and "cache_control" in msg:
+                    msg = {k: v for k, v in msg.items() if k != "cache_control"}
+                    budget["left"] -= 1
+                rebuilt.append(msg)
+            messages = rebuilt
+        elif section in ("system", "tools"):
+            holders = system if section == "system" else tools
+            if isinstance(holders, list):
+                rebuilt_h = []
+                for holder in holders:
+                    if (
+                        budget["left"] > 0
+                        and isinstance(holder, dict)
+                        and "cache_control" in holder
+                    ):
+                        holder = {k: v for k, v in holder.items() if k != "cache_control"}
+                        budget["left"] -= 1
+                    rebuilt_h.append(holder)
+                if section == "system":
+                    system = rebuilt_h
+                else:
+                    tools = rebuilt_h
+
+    after = count_cache_breakpoints(system, messages, tools)
+    stats.update({"repaired": True, "after": after})
+    logger.warning(
+        "event=cache_breakpoint_budget request_id=%s limit=%d "
+        "before_total=%d before_system=%d before_tools=%d before_messages=%d "
+        "after_total=%d after_system=%d after_tools=%d after_messages=%d; "
+        "the outbound request carried more cache_control blocks than the provider accepts",
+        request_id,
+        limit,
+        before["total"],
+        before["system"],
+        before["tools"],
+        before["messages"],
+        after["total"],
+        after["system"],
+        after["tools"],
+        after["messages"],
+    )
+    return system, messages, tools, stats
+
+
 def log_cache_breakpoints(
     *,
     request_id: str | None,
@@ -917,7 +1040,9 @@ def relocate_system_messages_to_top_level(
 
     The relocated content is appended after any existing top-level ``system``
     so wire order (system prompt, then conversation) is preserved and no content
-    is dropped.
+    is dropped. Only text-shaped content moves: non-text blocks (images,
+    documents) stay in a mid-conversation system section at their original
+    position, because top-level `system` accepts text blocks only (issue #3552).
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -979,14 +1104,48 @@ def relocate_system_messages_to_top_level(
         return messages, system, False
 
     relocated_blocks: list[Any] = []
+    retained: dict[int, dict[str, Any]] = {}
     for i in sorted(system_indices):
-        relocated_blocks.extend(_system_message_to_blocks(messages[i]))
-
-    clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
+        message = messages[i]
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            # Only text-shaped content may move into the top-level ``system``
+            # parameter (text blocks and bare strings). Non-text blocks such as
+            # images or documents stay in place so nothing is dropped and
+            # upstreams that reject non-text system blocks keep working
+            # (issue #3552).
+            hoisted_from_list: list[Any] = []
+            leftovers: list[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
+                    hoisted_from_list.append(block)
+                elif isinstance(block, str) and block:
+                    hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
+                else:
+                    leftovers.append(block)
+            relocated_blocks.extend(hoisted_from_list)
+            if leftovers:
+                retained[i] = {**message, "content": leftovers}
+        else:
+            # String (and other) content converts losslessly to text blocks.
+            relocated_blocks.extend(_system_message_to_blocks(message))
 
     if not relocated_blocks:
+        if retained:
+            # Nothing text-shaped to relocate: the sections stay as they are.
+            return messages, system, False
         # System message(s) carried no content — drop the empty entries only.
+        clean_messages = [m for i, m in enumerate(messages) if i not in system_indices]
         return clean_messages, system, True
+
+    clean_messages = []
+    for i, message in enumerate(messages):
+        if i in system_indices:
+            trimmed = retained.get(i)
+            if trimmed is not None:
+                clean_messages.append(trimmed)
+            continue
+        clean_messages.append(message)
 
     if system is None or system == "" or system == []:
         new_system: Any = relocated_blocks
@@ -1061,6 +1220,18 @@ def append_text_to_latest_user_input_item(
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
+
+# A *decompressed* body obeys the same ceiling as an uncompressed one. The
+# Content-Length gate at the handlers only ever saw the compressed wire size, so
+# a client could buy unlimited extra capacity with a compression ratio: ~2MB of
+# zeros expands to 2GB and the process dies allocating it (#3284). Same number,
+# deliberately: nobody should get more room by arriving gzipped.
+MAX_DECOMPRESSED_BODY_SIZE = MAX_REQUEST_BODY_SIZE
+
+# How much decompressed output to pull per step. The cap is re-checked after
+# every chunk, so the peak allocation is the limit plus one chunk — never the
+# full expansion of a bomb.
+_DECOMPRESS_CHUNK_SIZE = 64 * 1024
 
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
@@ -1549,37 +1720,64 @@ def _headroom_log_dir() -> Path:
     return _paths.log_dir()
 
 
-def _setup_file_logging() -> None:
+_PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
+
+
+def _setup_file_logging(
+    port: int | None = None,
+    *,
+    process_id: int | None = None,
+) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to ~/.headroom/logs/proxy.log with automatic rotation:
+    Writes to a per-port log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
+
+    The file is keyed by *port* so concurrent instances rotate separate logs.
+    Multi-worker callers also pass *process_id* so same-port workers cannot
+    race during rollover. When *port* is omitted the legacy shared name is used.
     """
     from logging.handlers import RotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "proxy.log"
+        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        # Attach to the headroom root logger so all sub-loggers are captured.
+        # Disable propagation to root to avoid duplicate writes when
+        # wrap.py redirects stderr to the same log file.
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.setLevel(logging.INFO)
+        headroom_logger.propagate = False
+        # Decide BEFORE constructing the handler: constructing a
+        # RotatingFileHandler opens (creates) the file, so building one only to
+        # discard it would leave an empty stray worker log and leak
+        # its fd. Reuse an already-attached handler for the same file; if one
+        # points at a different port during sequential app creation, replace
+        # and close it so later records use the newly selected path.
+        existing = [
+            h
+            for h in headroom_logger.handlers
+            if isinstance(h, RotatingFileHandler) and h.name == _PROXY_LOG_HANDLER_NAME
+        ]
+        if any(Path(h.baseFilename) == log_path for h in existing):
+            return
         handler = RotatingFileHandler(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,
             encoding="utf-8",
         )
+        handler.set_name(_PROXY_LOG_HANDLER_NAME)
         handler.setLevel(logging.INFO)
         handler.setFormatter(
             logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
-        # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
-        headroom_logger = logging.getLogger("headroom")
-        headroom_logger.setLevel(logging.INFO)
-        if not any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers):
-            headroom_logger.addHandler(handler)
-        headroom_logger.propagate = False
+        for stale in existing:
+            headroom_logger.removeHandler(stale)
+            stale.close()
+        headroom_logger.addHandler(handler)
     except OSError:
         # Non-fatal: can't write logs (read-only fs, permissions, etc.)
         pass
@@ -2537,24 +2735,145 @@ def apply_session_sticky_ccr_tool(
     return tools_out, True
 
 
+class RequestBodyTooLarge(ValueError):
+    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+
+    Subclasses ``ValueError`` so every existing ``except ValueError`` call site
+    keeps answering 400 unchanged, while giving a caller that would rather
+    answer 413 a type to branch on.
+    """
+
+
+def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
+    """Incrementally inflate ``raw``, stopping the instant output passes the cap.
+
+    ``zlib.decompress``/``gzip.decompress`` materialize the whole expansion
+    before anything can inspect it, which is what makes a bomb fatal. Feeding
+    the stream through ``decompressobj`` with a ``max_length`` keeps unproduced
+    output in ``unconsumed_tail`` instead of memory, so the check below runs
+    before the allocation rather than after it.
+    """
+    import zlib
+
+    out = bytearray()
+    pending = raw
+    first_member = True
+    while True:
+        if multi_member and not first_member:
+            # gzip is a *sequence* of members and CPython's reader skips NUL
+            # padding between and after them — real clients emit it, and
+            # `gzip.decompress(member + b"\x00" * 16)` returns the payload
+            # rather than raising. Parsing that padding as a fresh member
+            # would reject bodies the one-shot call accepted.
+            pending = pending.lstrip(b"\x00")
+        if multi_member and not pending:
+            # Either an empty body (`gzip.decompress(b"")` == b"") or a clean
+            # end after the last member. A body that is *only* padding never
+            # reaches here: `first_member` is still True, so it falls through
+            # to the header parse below and fails there, as CPython does.
+            break
+        decompressor = zlib.decompressobj(wbits)
+        while True:
+            chunk = decompressor.decompress(pending, _DECOMPRESS_CHUNK_SIZE)
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed {label} request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+            pending = decompressor.unconsumed_tail
+            if decompressor.eof or not pending:
+                break
+            if not chunk:
+                # Input left over but nothing produced: the stream cannot
+                # advance, and looping again would spin forever.
+                raise ValueError(f"Failed to decompress {label} request body: stalled stream")
+        out += decompressor.flush()
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed {label} request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+        if not decompressor.eof:
+            raise ValueError(f"Failed to decompress {label} request body: truncated stream")
+        # gzip streams may carry several members; `gzip.decompress` concatenates
+        # them, so restart on the trailer to keep that behavior.
+        pending = decompressor.unused_data
+        first_member = False
+        if not multi_member:
+            break
+    return bytes(out)
+
+
+def _zstd_bounded(raw: bytes) -> bytes:
+    """Read a zstd frame in chunks so a high-ratio frame cannot outrun the cap."""
+    import zstandard
+
+    out = bytearray()
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(raw) as reader:
+        while True:
+            chunk = reader.read(_DECOMPRESS_CHUNK_SIZE)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+                raise RequestBodyTooLarge(
+                    f"Decompressed zstd request body exceeds "
+                    f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+                )
+    return bytes(out)
+
+
+def _brotli_bounded(raw: bytes) -> bytes:
+    """Feed brotli input in slices, checking the cap after each one."""
+    import brotli
+
+    decompressor_cls = getattr(brotli, "Decompressor", None)
+    if decompressor_cls is None:
+        # Fail closed rather than fall back to the unbounded one-shot call: an
+        # old library is not a reason to reopen the hole.
+        raise ValueError(
+            "Installed 'brotli' is too old for incremental decompression "
+            "(needs brotli.Decompressor); upgrade it to accept br request bodies."
+        )
+
+    decompressor = decompressor_cls()
+    out = bytearray()
+    for start in range(0, len(raw), _DECOMPRESS_CHUNK_SIZE):
+        out += decompressor.process(raw[start : start + _DECOMPRESS_CHUNK_SIZE])
+        if len(out) > MAX_DECOMPRESSED_BODY_SIZE:
+            raise RequestBodyTooLarge(
+                f"Decompressed brotli request body exceeds "
+                f"{MAX_DECOMPRESSED_BODY_SIZE // (1024 * 1024)}MB"
+            )
+    is_finished = getattr(decompressor, "is_finished", None)
+    if is_finished is not None and not is_finished():
+        raise ValueError("Failed to decompress brotli request body: truncated stream")
+    return bytes(out)
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
     Mirrors ``_read_request_json`` but returns the bytes pre-parse so
     forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
-    Raises ``ValueError`` on any decompression failure.
+    Raises ``ValueError`` on any decompression failure, and the
+    :class:`RequestBodyTooLarge` subclass when the *decompressed* body would
+    exceed :data:`MAX_DECOMPRESSED_BODY_SIZE`.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
 
+    # Every branch below decompresses incrementally against
+    # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
+    # generic handlers so the size refusal is not reworded into a vague
+    # "failed to decompress" (#3284).
     if encoding in ("zstd", "zstandard"):
         try:
-            import zstandard
-
-            dctx = zstandard.ZstdDecompressor()
-            reader = dctx.stream_reader(raw)
-            raw = reader.read()
-            reader.close()
+            raw = _zstd_bounded(raw)
+        except RequestBodyTooLarge:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is zstd-compressed but the 'zstandard' package is not installed. "
@@ -2563,24 +2882,30 @@ async def _read_request_body_bytes(request: Request) -> bytes:
         except Exception as exc:
             raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
     elif encoding == "gzip":
-        import gzip as _gzip
+        import zlib
 
         try:
-            raw = _gzip.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
+            # both already carrying the message we want.
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
     elif encoding == "deflate":
         import zlib
 
         try:
-            raw = zlib.decompress(raw)
+            raw = _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
     elif encoding == "br":
         try:
-            import brotli
-
-            raw = brotli.decompress(raw)
+            raw = _brotli_bounded(raw)
+        except ValueError:
+            raise
         except ImportError:
             raise ValueError(
                 "Request body is brotli-compressed but the 'brotli' package is not installed."
@@ -2875,7 +3200,7 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
         "ENABLE_TOOL_SEARCH is unset with a custom ANTHROPIC_BASE_URL. Set "
         "ENABLE_TOOL_SEARCH=true (or auto) to keep on-demand tool loading active, "
         "or launch via `headroom wrap claude` (which sets it automatically). "
-        "See https://github.com/chopratejas/headroom/issues/746"
+        "See https://github.com/headroomlabs-ai/headroom/issues/746"
     )
 
 
@@ -2962,6 +3287,68 @@ _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
 # guidance: standard calling is better under ~10 tools).
 _TOOL_SEARCH_MIN_TOOLS = 12
+
+
+# Model-id shapes that name a Bedrock or Vertex deployment. The chat path
+# excludes those upstreams by base URL / backend (it knows where it forwards);
+# on the gateway contract the gateway routes, so the model id is the only
+# signal. Shared with the tool-search extension, which applies deferral on the
+# gateway path.
+_NON_FIRST_PARTY_MODEL_PREFIXES: tuple[str, ...] = (
+    "bedrock/",
+    "vertex_ai/",
+    "vertex/",
+    "anthropic.",  # bare Bedrock ids: anthropic.claude-3-5-sonnet-20241022-v2:0
+    "us.anthropic.",
+    "eu.anthropic.",
+    "apac.anthropic.",
+    "global.anthropic.",
+)
+_BEDROCK_VERSION_SUFFIX = re.compile(r"-v\d+(:\d+)?$")
+
+
+def anthropic_model_is_first_party(model_name: str) -> bool:
+    """Whether ``model_name`` is a first-party Claude API id (not Bedrock/Vertex).
+
+    First-party tool search (``tool_search_tool_*`` + ``defer_loading``) is
+    rejected by Bedrock and Vertex, which the chat path skips by upstream URL.
+    Gateway callers name those deployments in the model id instead:
+    ``bedrock/anthropic.claude-…``, ``anthropic.claude-…-v2:0``,
+    ``vertex_ai/claude-…``, ``claude-sonnet-4@20250514``. A LiteLLM-style
+    ``anthropic/claude-…`` prefix is first-party and stays eligible.
+    """
+    lowered = (model_name or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_NON_FIRST_PARTY_MODEL_PREFIXES):
+        return False
+    if "@" in lowered:  # Vertex dated ids
+        return False
+    return not _BEDROCK_VERSION_SUFFIX.search(lowered)
+
+
+def tools_are_anthropic_shaped(tools: Any) -> bool:
+    """Every dict tool is Anthropic-shaped (top-level ``name``/``input_schema``
+    or a typed server tool), and none carries the OpenAI ``function`` wrapper.
+
+    ``provider`` is inferred from the model name, and a LiteLLM-style caller
+    can pair a Claude model with chat-completions tools; deferral must not
+    touch those (Anthropic would never see this shape as-is anyway).
+    """
+    if not isinstance(tools, list) or not tools:
+        return False
+    saw_real_tool = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            return False
+        if "function" in tool:
+            return False
+        if tool.get("type"):
+            continue  # typed server tool (web_search, computer, …)
+        if not tool.get("name") or "input_schema" not in tool:
+            return False
+        saw_real_tool = True
+    return saw_real_tool
 
 
 def _tool_search_resident_key(name: Any) -> str:
@@ -3169,17 +3556,38 @@ def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
     return (kept, removed) if removed else (tools, 0)
 
 
+# Stand-in for a tool-search block the outbound tools array cannot support. Text
+# so it is inert to every validator, short so it costs ~10 tokens, and constant so
+# the repaired prefix stays byte-stable across turns (the provider cache needs the
+# same bytes every time).
+_TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
+    "type": "text",
+    "text": "[tool search omitted: unavailable in this request]",
+}
+
+
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
-    """Drop tool-search blocks this request's ``tools`` array cannot support.
+    """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
     A block pair is unsupportable when the request carries no ``tool_search_tool_*``
     tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
     shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are removed (an orphan of either 400s on its own), and a
-    message left with no content blocks is dropped rather than sent empty.
+    ``server_tool_use`` are handled (an orphan of either 400s on its own).
 
-    Returns ``(messages, blocks_removed)``, and the ORIGINAL ``messages`` object
-    when nothing was removed — callers rely on identity to skip the write-back.
+    Replace in place rather than remove (#3456). The block indexes of a message
+    are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
+    by ``(message_index, block_index)``, so deleting a block that sits BEFORE a
+    thinking block in the same message — or deleting a whole message ahead of one —
+    moves that block, ``thinking_blocks_survived_mutation`` reports False, and
+    ``select_outbound_body`` then forwards the client's ORIGINAL bytes and discards
+    every mutation, this repair included. The request that needed repairing is
+    exactly the one that loses it, and upstream 400s on the reference we had
+    already found. Swapping each block for a short text block keeps every thinking
+    block at its original coordinates, so the repair survives to the wire. Same
+    reasoning as the CCR sibling below.
+
+    Returns ``(messages, blocks_repaired)``, and the ORIGINAL ``messages`` object
+    when nothing changed — callers rely on identity to skip the write-back.
     """
     if not isinstance(messages, list):
         return messages, 0
@@ -3212,7 +3620,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             out.append(message)
             continue
 
-        drop_indexes: set[int] = set()
+        neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
         for index, block in enumerate(content):
             if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
@@ -3220,7 +3628,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
                 continue
-            drop_indexes.add(index)
+            neutralize_indexes.add(index)
             use_id = block.get("tool_use_id")
             if use_id:
                 orphaned_ids.add(str(use_id))
@@ -3232,19 +3640,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                 continue
             is_search_call = str(block.get("name", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
-                drop_indexes.add(index)
+                neutralize_indexes.add(index)
 
-        if not drop_indexes:
+        if not neutralize_indexes:
             out.append(message)
             continue
 
         changed = True
-        removed += len(drop_indexes)
-        kept = [block for index, block in enumerate(content) if index not in drop_indexes]
-        if not kept:
-            continue  # the whole turn was tool-search bookkeeping
+        removed += len(neutralize_indexes)
         repaired = dict(message)
-        repaired["content"] = kept
+        repaired["content"] = [
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            for index, block in enumerate(content)
+        ]
         out.append(repaired)
 
     return (out, removed) if changed else (messages, 0)

@@ -57,15 +57,21 @@ async def test_record_savings_event_uses_original_input_as_before(
         client="claude-code",
     )
 
-    assert calls == [
-        {
-            "tokens_before": 1000,
-            "tokens_after": 600,
-            "model": "claude-opus-4-6",
-            "client": "claude-code",
-            "source": "proxy",
-        }
-    ]
+    # Assert on the fields this test is ABOUT (the before/after reconstruction
+    # and attribution) rather than the whole kwargs dict. The ledger call also
+    # carries the savings split and the request's cache mix, which every future
+    # field addition would otherwise break this test on without saying anything
+    # about what it guards.
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["tokens_before"] == 1000
+    assert call["tokens_after"] == 600
+    assert call["model"] == "claude-opus-4-6"
+    assert call["client"] == "claude-code"
+    assert call["source"] == "proxy"
+    # No deferral on this request, so the whole saving is message compression.
+    assert call["saved_compression"] == 400
+    assert call["saved_tool_schema"] == 0
 
 
 @pytest.mark.asyncio

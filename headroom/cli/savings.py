@@ -38,11 +38,48 @@ def _window_line(label: str, window: dict[str, Any]) -> str:
     pct = float(window.get("savings_percent", 0.0) or 0.0)
     saved = int(window.get("tokens_saved", 0) or 0)
     before = int(window.get("tokens_before", 0) or 0)
-    cost = float(window.get("cost_usd", 0.0) or 0.0)
+    # The cache-aware figure is the headline: what the removed tokens would
+    # actually have been billed at. `cost_usd` (flat list price) is shown after
+    # it as the ceiling, and only when the two differ enough to be worth the
+    # ink -- on a cold-cache workload they legitimately coincide.
+    cost = float(window.get("cost_effective_usd", window.get("cost_usd", 0.0)) or 0.0)
+    ceiling = float(window.get("cost_usd", 0.0) or 0.0)
+    money = _money(cost)
+    if ceiling > 0 and abs(ceiling - cost) / ceiling >= 0.01:
+        money = f"{money} (list {_money(ceiling)})"
     return (
         f"{label:<12} {_bar(pct)} {pct:5.1f}%  "
-        f"saved {_tokens(saved)} / {_tokens(before)} tokens  {_money(cost)}"
+        f"saved {_tokens(saved)} / {_tokens(before)} tokens  {money}"
     )
+
+
+#: What each pricing basis means for a reader deciding how much to trust the
+#: number. Only the weaker ones are worth a line of output -- a catalog-priced
+#: total needs no apology.
+_BASIS_NOTES = {
+    "list": (
+        "Some events are priced at flat list price: either they predate "
+        "cache-aware pricing or their provider reported no cache breakdown. "
+        "The real saving is likely LOWER."
+    ),
+    "no-mix": (
+        "No provider cache breakdown was available, so savings are priced at "
+        "list. The real saving is likely LOWER."
+    ),
+    "unpriced": "Some events could not be priced at all and contribute $0.",
+    "provider-ratio": (
+        "Some models publish no cache pricing; their savings use a "
+        "provider-level ratio rather than a per-model rate."
+    ),
+}
+
+
+def _echo_basis_note(basis: Any) -> None:
+    """Print a caveat when the headline rests on something weaker than the catalog."""
+    note = _BASIS_NOTES.get(str(basis or ""))
+    if note:
+        click.echo("")
+        click.echo(f"  note: {note}")
 
 
 @main.command(name="savings")
@@ -93,7 +130,10 @@ def savings(as_json: bool, days: int, reset: bool) -> None:
         click.echo("")
         click.echo("Cost avoided per model:")
         for row in report.by_model:
-            click.echo(f"  {str(row['model']):<24} {_money(float(row['cost_usd']))}")
+            effective = float(row.get("cost_effective_usd", row["cost_usd"]))
+            click.echo(f"  {str(row['model']):<24} {_money(effective)}")
+
+    _echo_basis_note(report.lifetime.get("basis"))
 
     if report.by_client:
         click.echo("")

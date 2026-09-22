@@ -7,6 +7,7 @@ ingestion (spreadsheet_ingest / compress_spreadsheet).
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 
 import pytest
@@ -201,6 +202,28 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+def _csv_with_an_oversized_cell() -> str:
+    # csv.field_size_limit is 128 KB per cell; one pasted document, log excerpt
+    # or base64 blob in a column goes past it.
+    return "id,title,body\nl,short,ok\n2,long,{}\n".format("x" * 200_000)
+
+
+def test_parse_csv_gives_up_on_a_cell_past_the_field_size_limit() -> None:
+    headers, rows = parse_csv(_csv_with_an_oversized_cell())
+
+    # csv.Error: field larger than field limit (131072) before this.
+    assert (headers, rows) == ([], [])
+
+
+def test_compress_passes_through_a_table_with_an_oversized_cell() -> None:
+    content = _csv_with_an_oversized_cell()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 def test_parse_tabular_returns_none_for_non_tabular() -> None:
     assert parse_tabular("just a normal paragraph here") is None
 
@@ -322,6 +345,29 @@ def test_router_respects_disable_flag() -> None:
 # Binary spreadsheet ingestion -----------------------------------------------
 
 
+def test_rows_to_csv_drops_trailing_empty_rows_and_has_no_dangling_cr() -> None:
+    """Trailing all-empty rows are dropped and the output has no stray ``\\r``.
+
+    openpyxl's used-range routinely extends past the last data row, so a sheet
+    commonly ends in ``(None, None, ...)`` tuples. Those were emitted as blank
+    ``,`` rows, and ``csv.writer``'s default ``\\r\\n`` terminator combined with
+    ``.strip("\\n")`` left a dangling ``\\r`` — noise fed straight to the LLM.
+    """
+    from headroom.transforms.spreadsheet_ingest import _rows_to_csv
+
+    rendered = _rows_to_csv(
+        [["Name", "Age"], ["Alice", "30"], [None, None], ["", "  "], [None, None]]
+    )
+    assert rendered == "Name,Age\nAlice,30"
+    assert "\r" not in rendered
+
+    # Interior empty rows are preserved (only the trailing run is dropped).
+    assert _rows_to_csv([["a", "b"], [None, None], ["c", "d"], [None, None]]) == "a,b\n,\nc,d"
+
+    # A fully empty sheet renders to the empty string.
+    assert _rows_to_csv([[None, None], ["", ""]]) == ""
+
+
 @pytest.mark.skipif(not _HAS_OPENPYXL, reason="openpyxl not installed")
 def test_load_and_compress_xlsx(tmp_path) -> None:
     import openpyxl
@@ -360,6 +406,104 @@ def test_compress_spreadsheet_empty_workbook_returns_empty(tmp_path) -> None:
     result = compress_spreadsheet(str(path))
     assert result.messages == []
     assert result.tokens_saved == 0
+
+
+def test_load_xls_renders_cells_like_the_xlsx_loader(tmp_path) -> None:
+    """xlrd hands back the raw storage, not the value.
+
+    A date is the serial number Excel keeps it as, a boolean is 1 or 0, and
+    every number is a double, so a whole number arrives as ``12.0``. The two
+    loaders then disagree about the same workbook, and the date is no longer
+    recoverable from the text.
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "YYYY-MM-DD"
+
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    for column, heading in enumerate(["When", "Active", "Units", "Rate", "Text"]):
+        sheet.write(0, column, heading)
+    sheet.write(1, 0, datetime.date(2024, 1, 1), date_style)
+    sheet.write(1, 1, True)
+    sheet.write(1, 2, 12)
+    sheet.write(1, 3, 1.5)
+    sheet.write(1, 4, "ok")
+    path = tmp_path / "legacy.xls"
+    book.save(path)
+
+    rows = load_spreadsheet(path)["Data"].splitlines()
+
+    assert rows[0] == "When,Active,Units,Rate,Text"
+    # 45292.0,1,12.0,1.5,ok before this.
+    assert rows[1] == "2024-01-01 00:00:00,True,12,1.5,ok"
+
+
+def test_load_xls_renders_a_time_only_cell_as_a_time(tmp_path) -> None:
+    """A time carries no date, so xlrd reports year, month and day as zero."""
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    time_style = xlwt.XFStyle()
+    time_style.num_format_str = "HH:MM:SS"
+
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    sheet.write(0, 0, "Starts")
+    sheet.write(1, 0, datetime.time(12, 0, 0), time_style)
+    xls_path = tmp_path / "legacy.xls"
+    book.save(xls_path)
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["Starts"])
+    worksheet.append([datetime.time(12, 0, 0)])
+    xlsx_path = tmp_path / "modern.xlsx"
+    workbook.save(xlsx_path)
+
+    # ValueError: year 0 is out of range before this.
+    assert load_spreadsheet(xls_path)["Data"] == load_spreadsheet(xlsx_path)["Data"]
+    assert load_spreadsheet(xls_path)["Data"].splitlines()[1] == "12:00:00"
+
+
+def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
+    """The reference: openpyxl is what the .xls path is matching."""
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "YYYY-MM-DD"
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    sheet.write(0, 0, "When")
+    sheet.write(0, 1, "Active")
+    sheet.write(0, 2, "Units")
+    sheet.write(1, 0, datetime.date(2024, 1, 1), date_style)
+    sheet.write(1, 1, True)
+    sheet.write(1, 2, 12)
+    xls_path = tmp_path / "legacy.xls"
+    book.save(xls_path)
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["When", "Active", "Units"])
+    worksheet.append([datetime.date(2024, 1, 1), True, 12])
+    xlsx_path = tmp_path / "modern.xlsx"
+    workbook.save(xlsx_path)
+
+    assert load_spreadsheet(xls_path) == load_spreadsheet(xlsx_path)
 
 
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:

@@ -22,7 +22,19 @@ headroom proxy \
   --budget 100.0
 ```
 
-Telemetry is **local-only and off by default**. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — **nothing is sent to Headroom Labs**. (The anonymous aggregate beacon that older versions shipped has been removed from the code.)
+Two independent telemetry switches exist. `HEADROOM_TELEMETRY=on` (or `--telemetry`) turns on **local-only** in-process usage stats that power your own `/stats`, `/metrics`, and dashboard — off by default, and nothing under this switch leaves the machine.
+
+Separately, an **anonymous usage beacon is on by default** (opt-out). Once a session goes idle it POSTs a small summary of how compression behaved to a Headroom Labs collector.
+
+**Why it exists.** Compression quality is the product. The beacon tells us when a release changes it — a ratio that regresses, a content type that starts getting skipped, a provider path that begins failing — across real workloads rather than only our own test corpus. That is the whole purpose; there is no other use.
+
+**What it sends.** Counters and identifiers, never free text. The collector applies an allowlist server-side and drops everything else before storage ([`deploy/beacon/worker.js`](https://github.com/headroomlabs-ai/headroom/blob/main/deploy/beacon/worker.js)): token totals, compression ratios and rates, skip reasons, source and provider names, model ids, failure counts and status codes, and a routing summary. Alongside those, seven resource attributes: service name and version, install id, install mode, stack, OS type and CPU architecture. A typical event is about 2KB.
+
+**What it never sends.** Your prompts, your completions, your code, file paths, file contents, environment variables, or anything else derived from request or response bodies. None of these are on the allowlist, so even if a future client sent one the collector would discard it.
+
+The install id is a random UUID generated on first run and stored in your config directory. It is deliberately not derived from hostname, MAC address, or any hardware property — delete the file and you get a new one.
+
+Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--offline` (which also disables update checks and license reporting).
 
 ## CLI options
 
@@ -96,11 +108,11 @@ headroom proxy --mode cache
 | Profile | Target savings | Mode | Notes |
 |---------|----------------|------|-------|
 | `coding` | emergent (~50%) | `cache` | **Default.** Delta-only compression at ~0 prefix-cache busts; never lossy-compresses file reads. |
-| `balanced` | ~70% | `token` | Moderate compression with structural compaction. Also the fallback for an unknown profile name. |
+| `balanced` | ~70% | `token` | Moderate compression with structural compaction. |
 | `agent-90` | ~90% | `token` | Aggressive; pins a `0.10` keep-ratio and forces Kompress. |
 | `general` | emergent (~60%) | `token` | Non-coding workloads. |
 
-An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `balanced` — the proxy never fails to start over a bad profile name. See `headroom/agent_savings.py` for each profile's full set of knobs.
+An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is used only as a last-resort fallback when the runtime has no `coding` entry at all (old-runtime/new-client version skew). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
 Because the default `coding` profile uses **cache** mode (and the proxy's own default mode is also `cache`), Headroom runs in cache mode out of the box. Mode precedence: an explicit `--mode` wins, otherwise `HEADROOM_MODE` (which a profile seeds), otherwise the `cache` default. To run token mode, pass `--mode token` or choose a token-mode profile:
 
@@ -122,13 +134,13 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 | `--no-learn` | `false` | Explicitly disable traffic learning |
 | `--min-evidence` | `5` | Minimum observations before a learned pattern is persisted |
 | `--codex-wire-debug` | `false` | Write local Codex wire snapshots and matching proxy log traces |
-| `--compress-passthrough` | `false` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). Also `HEADROOM_COMPRESS_PASSTHROUGH=1` |
+| `HEADROOM_COMPRESS_PASSTHROUGH` | `0` | Also compress custom proxy paths that fall through to the catch-all handler (OpenAI Responses-shaped bodies, path ends in `/responses`). No `--compress-passthrough` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one |
 
 ```bash
 headroom proxy --memory
 headroom proxy --learn --min-evidence 3
 headroom proxy --codex-wire-debug
-headroom proxy --compress-passthrough
+HEADROOM_COMPRESS_PASSTHROUGH=1 headroom proxy
 ```
 
 <Callout type="info" title="LLMLingua removed from the proxy CLI">
@@ -153,7 +165,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy
 | `balanced` | 70% | `token` | No | General-purpose moderate compression |
 | `general` | ~60% (emergent) | `token` | No | Non-coding chat, little code in context |
 
-**`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). Protects the 2 most recent turns verbatim. Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
+**`coding` (default)** — Optimizes for coding-agent workloads with Anthropic. Uses **cache mode** (`proxy_mode="cache"`): compresses only the newest delta in each turn so the provider's prefix-cache is never busted. User messages are compressed, system prompts preserved (hottest cache). `protect_recent` is `0` — in cache mode the delta already *is* the newest turn, so a turn-count guard would suppress the only thing cache mode compresses; byte-exact fidelity instead comes from `protect_reads=True` (file reads are never lossy-compressed). Lossless-first with lossy fallback; tool search and cross-turn dedup enabled. This is the profile that `headroom wrap` uses.
 
 **`agent-90`** — Forces ML-based (Kompress) compression with a 10% keep-ratio, ignoring the lossless path. Compresses both user and system messages. Designed for non-coding or cost-sensitive workloads where maximum compression is the goal.
 
@@ -212,7 +224,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
-| `--compress-user-messages` / `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |
@@ -227,7 +239,7 @@ Kompress is the ModernBERT/ONNX compressor that ContentRouter falls back to for 
 |---|---|---|
 | `--disable-kompress` / `HEADROOM_DISABLE_KOMPRESS` | `false` | Turn off ML compression; keep the structural compressors. |
 | `--disable-kompress-anthropic` / `--disable-kompress-openai` | inherit | Per-provider override. |
-| `--force-kompress-all` / `HEADROOM_FORCE_KOMPRESS_ALL` | `false` | Route *all* content through Kompress, bypassing per-type selection. |
+| `HEADROOM_FORCE_KOMPRESS_ALL` | `false` | Route *all* content through Kompress, bypassing per-type selection. No `--force-kompress-all` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_KOMPRESS_ENDPOINT` | none | Offload ML compression to a remote `/compress` endpoint (e.g. a Modal deployment) instead of running the model locally. |
 | `HEADROOM_KOMPRESS_ENDPOINT_TOKEN` | none | Bearer token for the remote endpoint. |
 | `HEADROOM_KOMPRESS_BACKEND` | `auto` | Compute backend: `auto`, `onnx_cpu`, `onnx_coreml`, `pytorch`, `pytorch_mps`. |
@@ -445,14 +457,15 @@ So an Anthropic-native caller does not need to convert to OpenAI format first. B
 | `model` | string | yes | Model name. Drives tokenizer + context-limit resolution. `400` if missing. |
 | `token_budget` | integer | no | Overrides the model's context limit. Used by callers that need to fit a tighter budget. |
 | `config` | object | no | Compression options, below. A non-object value is ignored rather than rejected. |
+| `gateway` | object | no | Switches on [gateway mode](#gateway-mode-two-half-turn-contract). May be `{}`. Fields below. |
 
-<Callout type="warning" title="system and tools are ignored">
-Only the four fields above are read. Anthropic sends `system` and `tools` **out of band**, alongside `messages` — this endpoint accepts them without complaint (you get a `200`, no warning) and returns neither, so neither is compressed.
+<Callout type="warning" title="system and tools are ignored outside gateway mode">
+Without a `gateway` block, only the four fields above are read. Anthropic sends `system` and `tools` **out of band**, alongside `messages` — this endpoint accepts them without complaint (you get a `200`, no warning) and returns neither, so neither is compressed.
 
 Keep carrying both yourself and send them upstream unchanged. Two consequences worth knowing:
 
 - An Anthropic system prompt is not compressed here, even though it is resent on every request.
-- Tool-schema compaction and tool-search deferral are not reachable through this endpoint — on tool-heavy traffic those can be the largest share of available savings. Run Headroom as the proxy (rather than calling `/v1/compress`) if you need them.
+- Tool-schema compaction, tool-search deferral and output steering are not reachable this way — on tool-heavy traffic those can be the largest share of available savings. [Gateway mode](#gateway-mode-two-half-turn-contract) passes `tools` and `system` through and applies all three.
 </Callout>
 
 `config` fields:
@@ -461,6 +474,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | --- | --- | --- | --- |
 | `mode` | string | unset | `ccr`, `lossy_inline`, or `lossless_then_lossy`. Unset selects the default marker-free pipeline. Any other value is a `400`. |
 | `frozen_message_count` | integer | unset | Pin a prefix: the first N messages are returned byte-for-byte unchanged while staying visible to cross-message transforms like dedup. Set it to the number of messages the provider has already cached so compression cannot rewrite the prefix and bust that cache. Must be a non-negative integer; anything else is a `400`. |
+| `session_id` | string | unset | Opt into [session mode](#session-mode): Headroom keeps this conversation's replay state itself, so you can resend the raw conversation every turn and get a byte-identical prefix back. Non-empty, at most 256 characters; anything else is a `400`. Cannot be combined with `compress_user_messages` (`400`). |
 | `compress_user_messages` | boolean | `false` | Also compress user-role messages. |
 | `target_ratio` | number | unset | Target compression ratio. |
 | `protect_recent` | integer | unset | Leave the last N messages uncompressed. |
@@ -484,6 +498,7 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 | `transforms_applied` | array | Transform labels that ran. |
 | `transforms_summary` | object | Per-transform counts. |
 | `ccr_hashes` | array | Retrieval hashes for markers inserted (empty unless `mode: "ccr"`). |
+| `session` | object | [Session mode](#session-mode) only: `{ "id", "frozen_message_count", "cached_prefix_replayed" }`. |
 
 ```json
 {
@@ -506,12 +521,13 @@ Keep carrying both yourself and send them upstream unchanged. Two consequences w
 
 | Status | Body | When |
 | --- | --- | --- |
-| `400` | `error.type = "invalid_request"` | Missing `messages` or `model`, malformed JSON, invalid `config.mode`, or invalid `config.frozen_message_count`. |
+| `400` | `error.type = "invalid_request"` | Missing `messages` or `model`, malformed JSON, invalid `config.mode`, `config.frozen_message_count` or `config.session_id`, `session_id` combined with `compress_user_messages`, or a malformed `gateway` block. |
 | `401` | — | `HEADROOM_PROXY_TOKEN` is set and the bearer token is missing or wrong. |
 | `404` | — | Non-loopback caller without `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. |
 | `503` | `error.type = "compression_error"` | Compression failed unexpectedly. |
+| `503` | `error.type = "compression_timeout"` | Session mode only: the turn timed out or the session's lock was busy. Retry the turn. |
 
-Compression **fails open on timeout**: you get `200` with your original messages, zeroed metrics, plus `compression_skipped: true` and `skip_reason: "compression_timeout"`. Always check `compression_skipped` if you need to know whether compression actually ran.
+Without a session, compression **fails open on timeout**: you get `200` with your original messages, zeroed metrics, plus `compression_skipped: true` and `skip_reason: "compression_timeout"`. Always check `compression_skipped` if you need to know whether compression actually ran. In session mode the same timeout is a `503` instead — see below for why.
 
 Requests are recorded under `provider="compress"` in `/stats` and `/metrics`.
 
@@ -519,7 +535,7 @@ Requests are recorded under `provider="compress"` in `/stats` and `/metrics`.
 
 This is the single most important thing to get right, and the default is not safe for an agent loop.
 
-When Headroom proxies a request itself it watches the provider's cache hit rate turn over turn and freezes the already-cached prefix. `/v1/compress` **cannot do that — it is stateless.** It sees one isolated call and has no idea what the provider already cached.
+When Headroom proxies a request itself it watches the provider's cache hit rate turn over turn and freezes the already-cached prefix. Without `config.session_id`, `/v1/compress` cannot do that: it sees one isolated call and has no idea what the provider already cached. You have two options — let Headroom keep the state ([session mode](#session-mode), below) or keep it yourself with `frozen_message_count`, which the rest of this section covers.
 
 The provider caches the bytes you **forwarded**. Compression changed those bytes, so your original messages and the ones the provider cached are no longer the same thing — and it is the forwarded version you have to keep reproducing. Send the pristine originals again next turn and the provider sees a different prefix and re-reads it from scratch. On Anthropic a cache read is ~90% cheaper than fresh input, so that can easily cost more than the compression saves.
 
@@ -555,6 +571,175 @@ Also for multi-turn callers:
 - **Leave `config.mode` unset.** The default is marker-free, which is what a forward-only caller wants.
 - **Send the real model name** so the tokenizer and context limit resolve correctly — including gateway-prefixed forms.
 - **`protect_recent` is not a substitute.** It guards the newest messages; `frozen_message_count` guards the oldest, which is the cached end.
+
+#### Session mode
+
+Pass `config.session_id` and Headroom keeps the conversation's replay state itself — the same per-session compression cache and prefix tracker the proxy path uses — so a gateway that owns routing can resend the **raw** conversation every turn and still get a byte-identical prefix back. Whatever this endpoint previously returned for the session is treated as the provider's cache contract: every already-returned message comes back unchanged, even where recompressing it would do better, and only the new tail is compressed. An explicit `config.frozen_message_count` still wins when it is larger.
+
+```json
+{
+  "messages": [{ "role": "user", "content": "..." }],
+  "model": "claude-sonnet-4-6",
+  "config": { "session_id": "conv-8f1c" }
+}
+```
+
+The response gains a `session` object:
+
+```json
+"session": { "id": "conv-8f1c", "frozen_message_count": 12, "cached_prefix_replayed": true }
+```
+
+What differs from the stateless contract:
+
+- **Forward the returned messages verbatim.** They are what the next turn replays.
+- **`compress_user_messages` is refused** (`400`). User-message rewrites are not byte-replayable across turns, so they would bust the prefix later.
+- **Timeouts and busy sessions are a `503`, never fail-open.** Handing back originals would leave the caller forwarding bytes the replay state does not know about, so a compression timeout answers `503` with `error.type = "compression_timeout"`; retry the turn and it lands on consistent state. Turns for one session are serialized under a per-session lock, and a concurrent turn for the same session that waits more than 10 seconds gets the same `503`.
+- **State is in-process.** The replay cache lives for `HEADROOM_COMPRESSION_CACHE_TTL_SECONDS` of idle time (3900 by default, floor 600); the tracker's usage state expires after 10 idle minutes. Multi-process deployments (gunicorn workers, replicas) must pin a session to one process — hash the upstream on the session id — or replay silently misses.
+- `HEADROOM_COMPRESS_SESSION_FROM_HEADER=1` lets the `x-headroom-session-id` header stand in for `config.session_id`. Off by default: gateways commonly stamp that header on all traffic, and a value shared across conversations (Claude Code subagents do this) would blend them into one replay state.
+
+**Relaying provider usage: `POST /v1/usage`.** Session mode never sees the provider's response, so cache-hit attribution and savings accounting for the session come from this optional relay (same exposure rules as `/v1/compress`). Post the provider's `usage` block under the session id:
+
+```json
+{
+  "session_id": "conv-8f1c",
+  "usage": { "cache_read_input_tokens": 11800, "cache_creation_input_tokens": 400 }
+}
+```
+
+OpenAI-shaped usage is accepted too: `prompt_tokens_details.cached_tokens` or a flat `cached_tokens` is read as the cache-read count (OpenAI reports no write counter). A block carrying none of these fields is a `400` — it has no cache signal, and reading it as zeros would wipe the tracker's cached-prefix state.
+
+The reply is `{ "session_id": "conv-8f1c", "frozen_message_count": 12, "applied": true }`. `applied: false` with `reason: "no_cache_signal"` means the only present field was `0` (a fully cold turn can only be asserted with both fields present). `404` with `error.type = "unknown_session"` means the tracker's state for that session has expired — replay may still be active; only this telemetry landed nowhere. `503` with `error.type = "session_busy"` means a compress turn for the session is in flight; retry.
+
+The relay is telemetry only. It never raises the frozen count, because a provider-confirmed count could freeze a message whose cache entry has since been evicted. Skipping it costs attribution, never correctness.
+
+#### Gateway mode (two-half turn contract)
+
+An API gateway that owns routing (Kong, LiteLLM, a custom sidecar) never lets Headroom see the provider's response, which rules out every transform whose reload step needs it. Gateway mode splits one model turn into two HTTP calls: the **request half** (`POST /v1/compress` with a top-level `gateway` object) returns the complete provider body plus the *obligations* the gateway must redeem, and the **response half** (`POST /v1/compress/response`) takes the provider's answer and either finishes the turn or asks the gateway to call the provider again.
+
+The rule behind it is the proxy's own **no shrink without reload**, moved to the API boundary: a transform whose reload step needs the response only runs when the gateway has said it can re-drive. A body without a `gateway` key never touches any of this — stateless and session behaviour are unchanged.
+
+**The `gateway` block.** Presence is the switch: `"gateway": {}` is gateway mode with every default. Unknown keys are ignored (a newer plugin can talk to an older Headroom); a non-object block or a non-boolean field is a `400`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `can_redrive` | boolean | `false` | The gateway can call the provider again with a request Headroom hands it and post the result back. Unlocks re-driving turn hooks and, with `config.mode: "ccr"`, in-band CCR retrieval. Send `false` for streaming requests. |
+| `can_relay_response` | boolean | `false` | The gateway will post the provider's status and usage to `/v1/compress/response` after every turn. |
+| `session_affinity` | boolean | `true` | The gateway pins this session to one Headroom replica. Pending turns are in-process state, so `false` disables re-driving for the turn even when `can_redrive` is set. |
+| `plugin_version` | string | unset | Diagnostics only. |
+| `request_headers` | object | `{}` | The client's request headers the gateway is willing to hand over, as lowercase name → string value. Only `anthropic-beta` is read today: when a turn hook asks for an `anthropic-beta` token, the client's tokens go first in the returned `headers`; every other name is ignored, so a gateway may pass its whole header map. A non-object block or a non-string value is a `400`. Never forwarded anywhere by Headroom. |
+
+**What changes on the request half.** Every top-level field other than `messages`, `model`, `token_budget`, `config` and `gateway` passes through into the returned `body`: `system`, `tools`, `temperature`, `stream`, `metadata`, anything the provider accepts. `tools` is compacted deterministically (`tool_schema_compaction` in `transforms_applied`, plus `tool_desc_compaction` when `HEADROOM_TOOL_DESC_MAX_CHARS` is set), so identical tools come back byte-identical every turn. Two more request-only, streaming-safe levers run here exactly as they do on the proxy path:
+
+- **Tool-search deferral (Anthropic) is an extension's job on this path.** OSS core does not mark tools `defer_loading` on `/v1/compress`; the [headroom-tool-search](https://github.com/headroomlabs-ai/headroom-tool-search) extension's native tier does, through the turn-hook contract, when it is installed, enabled (`HEADROOM_PROXY_EXTENSIONS=tool_search`) and licensed. It applies the same primitives as the proxy path (12 or more Anthropic-shaped tools on a first-party Claude model, the same resident set, the same client-already-searching check, `HEADROOM_TOOL_SEARCH=0` as the kill switch), is a pure function of the input tools so the tools prefix keeps prompt-caching turn over turn, and is named `tool_search:native_deferral:<n>tools:<n>tok` in `transforms_applied` and credited as `tool_schema_tokens_saved` in `/stats`. Without the extension the tools pass through compacted and `headers` is `{}`. Tool-search history repair stays in core regardless: once a transcript carries Anthropic's tool-search blocks, a later request whose tools cannot support them (a side request with a smaller tools array) has those blocks replaced in place by an inert placeholder text block, as on the proxy path (`router:tool_search_repair:<n>blocks`).
+- **Output steering.** When the output shaper is on (`HEADROOM_OUTPUT_SHAPER=1` or the `proxy_output_shaper` rollout; off in `mode="cache"` for steering), the byte-stable verbosity block is appended to the tail of `system` (Anthropic) or the last system/developer message (OpenAI chat), the conversation-stable `HEADROOM_OUTPUT_HOLDOUT` arm is honoured, and the `output_shaper:stratum:…` / `output_shaper:control:…` label rides `transforms_applied` — it is what turns the response half's relayed `output_tokens` into output savings in `/stats`. The block is identical every turn, so the prefix still caches; it is applied to the returned `body` only, never to the session snapshot, so it is re-appended once per turn rather than accumulating.
+
+Both fail open: any error leaves the body as built and `headers` empty.
+
+Turn hooks registered by proxy extensions run here as they do on the proxy path. Request hooks run stream-safe-only unless `can_redrive` and `session_affinity` are both `true` — a hook that must see the response is skipped when the gateway cannot come back with one. Hook savings show up as `turn_hook` and `turn_hook:tools:<n>tok`. In session mode hooks run after the replay overlay and before the snapshot, so a hook that is not a pure function of its input busts the prefix exactly as it would on the proxy.
+
+The response keeps every field above and adds six:
+
+```json
+{
+  "messages": [{ "role": "user", "content": "..." }],
+  "tokens_before": 15000,
+  "tokens_after": 3500,
+  "body": {
+    "model": "gpt-4o",
+    "messages": [{ "role": "user", "content": "..." }],
+    "tools": [{ "type": "function", "function": { "name": "search", "parameters": {} } }],
+    "temperature": 0.2
+  },
+  "turn_id": "3d2f6c0e0b0a4e1a9c1b2f3d4e5f6a7b",
+  "route": { "model": "gpt-4o", "provider": "openai", "service_tier": null, "reason": "" },
+  "obligations": ["relay_usage"],
+  "gateway": { "can_redrive": false, "can_relay_response": true, "session_affinity": true },
+  "headers": {}
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `body` | The complete provider request: every pass-through field, final `messages` (the same list as top-level `messages`) and final `tools`. Never contains `config`, `gateway` or `token_budget`. Forward it as-is. |
+| `headers` | Request headers the gateway must **set** on the provider request (name → value), on the original forward and on every `redrive`. `{}` when nothing is needed. Produced by turn hooks through `TurnContext.provider_headers`: only allow-listed names are honoured (today `anthropic-beta`), and `anthropic-beta` is merged behind the client's value from `gateway.request_headers` (deduplicated, client tokens first — the same merge the proxy path uses for every Headroom-required beta). The tool-search extension's native tier uses it for `advanced-tool-use-2025-11-20`. Fail-open answers always carry `{}`. |
+| `turn_id` | Handle for the response half. Always present, but a turn is only *registered* — and worth posting back — when `obligations` is non-empty. |
+| `route` | Advisory. `provider` is inferred from the model name (`anthropic` for names containing `claude` or `anthropic`, else `openai`) unless a routing extension published advice; when it did, its model is also written into `body.model`, so `route.model` and `body.model` never disagree. `service_tier` echoes the request. Headroom never switches the upstream itself. |
+| `obligations` | `redrive` — a transform ran whose reload step needs the response; post `response` to `/v1/compress/response` and honour `redrive` answers. `relay_usage` — you offered `can_relay_response`; post status and usage when the provider answers. |
+| `gateway` | Echo of the capabilities Headroom honoured. |
+
+Fail-open answers (bypass header, empty `messages`, stateless timeout) carry the same six keys with your original body, `obligations: []` and `headers: {}`.
+
+When `relay_usage` is owed, the turn's `/stats` record is deferred until the response half arrives with billed input and output, cache counts, provider status and latency; a turn that never comes back is recorded as-is when it expires. Pending turns live `HEADROOM_GATEWAY_TURN_TTL_SECONDS` (default `120`, refreshed on every `redrive`), at most `HEADROOM_GATEWAY_MAX_PENDING_TURNS` at a time (default `10000`, oldest evicted first), and a turn may re-drive at most `HEADROOM_GATEWAY_MAX_REDRIVES` times (default `8`).
+
+**`config.mode: "ccr"` on this contract.** When markers were inserted and re-driving is allowed, Headroom injects the `headroom_retrieve` tool into `body.tools` (`ccr_tool_injected` in `transforms_applied`), adds the `redrive` obligation, and the response half answers the model's retrieval calls itself — the gateway just keeps re-driving. Without `can_redrive`, `ccr` mode behaves as it does today: the markers are yours to resolve.
+
+#### `POST /v1/compress/response`
+
+The response half. Same exposure rules as `/v1/compress`: loopback-only unless `HEADROOM_COMPRESS_ALLOW_REMOTE=1`, and `HEADROOM_PROXY_TOKEN` applies.
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `turn_id` | string | yes | From the request half. |
+| `status` | integer | no | Provider HTTP status, `100`–`599`. Default `200`. Hooks only start on a `200`. |
+| `latency_ms` | number | no | Gateway-measured provider latency, added to the turn's recorded latency. Must be non-negative. |
+| `round` | integer | no | Which provider call this response answers: `0` for the original forward, `n` for the `n`-th re-drive (the `round` this endpoint returned). Makes the call idempotent: a retried relay for a round already answered gets the same `redrive` answer again instead of being fed to the hook, and its usage is not billed twice. A round ahead of the turn is a `400`. |
+| `usage` | object | no | The provider's usage block, in any accepted shape (below). |
+| `response` | object | no | The full provider response JSON. **Required** when the turn carries `redrive` and the provider call succeeded (`2xx`). A failed call closes the turn with its `status` alone. |
+| `model` | string | no | Provider-reported model. Accepted, not read today. |
+
+Accepted `usage` shapes — the whole provider response body works too, since a nested `usage` key is descended into once:
+
+- Anthropic: `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`
+- OpenAI chat: `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`
+- OpenAI Responses: `input_tokens`, `output_tokens`, `input_tokens_details.cached_tokens`
+- Kong's flattened `ai.proxy` log shape: `prompt_tokens`, `completion_tokens`, top-level `cached_tokens`
+
+Booleans and negative counts are a `400`. Usage with no cache field is accepted but not applied to the session tracker; the apply rule is `/v1/usage`'s (a positive count, or both cache fields present at `0`). Across re-drive rounds the billed counters are summed and the cache fields come from the latest round that carried them.
+
+There are two answers. `done` ends the turn:
+
+```json
+{
+  "action": "done",
+  "turn_id": "3d2f6c0e0b0a4e1a9c1b2f3d4e5f6a7b",
+  "response": null,
+  "frozen_message_count": 12,
+  "usage_applied": true,
+  "rounds": 0,
+  "billed_usage": { "input_tokens": 3120, "output_tokens": 212, "cache_read_input_tokens": 20414 }
+}
+```
+
+`response` is what to send to the client. On a turn with no re-drive it is the hook's replacement when there is one, otherwise `null` and you forward the provider response you already hold. After one or more re-drives it is never `null`: it is the hook's replacement or the latest provider response, with `usage` set to the whole turn's bill. `frozen_message_count` is the session's count after the usage was applied (`null` for a stateless turn). `usage_applied` is `false` when the usage carried no cache signal, the session had expired, or its lock was busy — never an error, since the turn is finishing and there is nothing to retry with. `billed_usage` is what the provider billed for the whole turn: every counter, cache reads and writes included, summed across all rounds, in Anthropic keys (`null` when no usage was relayed). That total is the re-driven `response`'s `usage`, since the client made one call. After `done` the turn is gone.
+
+`redrive` asks for another provider call:
+
+```json
+{
+  "action": "redrive",
+  "turn_id": "3d2f6c0e0b0a4e1a9c1b2f3d4e5f6a7b",
+  "request": { "model": "gpt-4o", "messages": [], "tools": [] },
+  "round": 1
+}
+```
+
+Send `request` to the provider exactly as given — it is the provider body with the hook's messages and possibly reloaded tools — and post the provider's JSON back under the same `turn_id`. Past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and the latest provider response. Hook failures never fail the turn either: the answer is `done`, with the latest provider response after a re-drive, or `response: null` before one, and the gateway forwards what it gets.
+
+| Status | Body | When |
+| --- | --- | --- |
+| `400` | `error.type = "invalid_request"` | Malformed JSON, missing or invalid `turn_id`, `status` not an HTTP status code, negative `latency_ms`, non-object `usage` or `response`, boolean or negative usage counts. |
+| `400` | `error.type = "missing_response"` | The turn carries `redrive` and `response` is absent. |
+| `404` | `error.type = "unknown_turn"` | Never registered (the request half returned no obligations), already finished, or expired. |
+| `409` | `error.type = "turn_busy"` | A response-half call for this turn is already being driven. |
+| `400` | `error.type = "round_out_of_sequence"` | `round` is ahead of the round the turn is waiting for. |
+| `409` | `error.type = "round_already_answered"` | `round` names a round that was already answered with `done`. |
+
+#### Kong plugin
+
+[kong-plugin-headroom](https://github.com/headroomlabs-ai/kong-plugin-headroom) is a Kong Gateway 3.9 plugin, in its own repository and installable with `luarocks install kong-plugin-headroom` or as a Konnect custom plugin, that implements both halves: it sends every chat request through `/v1/compress` with `config.session_id` and a `gateway` block, swaps `body` in, relays usage from the `log` phase, and runs the re-drive loop in `access` when a `redrive` obligation comes back. Install steps, configuration and limits are in its README. Headroom's docker end-to-end test (`tests/gateway/test_kong_integration.py`, `HEADROOM_KONG_E2E=1`) expects a checkout of it next to this repository or at `HEADROOM_KONG_PLUGIN_DIR`.
+
+**The contract is itself an extension.** Core exposes a compress-turn seam (`headroom.proxy.compress_turn`): an extension registers a contract with `register_compress_turn_extension`, and per request it may claim the body (`begin`), prepare executor-side work (`prepare`), rewrite the outbound messages at the one safe moment in session mode (`transform`, after the prefix replay and before the tracker records what was returned), add response fields and transform labels (`finish`), take ownership of the outcome (`commit`), and answer the fail-open cases (`fail_open_fields`). The gateway turn contract described above is installed through that seam by `headroom.proxy.gateway_extension` (on by default; `HEADROOM_GATEWAY_CONTRACT=0` leaves it out, after which a `gateway` block is ignored and the endpoint answers in legacy shape). A third-party contract's `install(app, config)` finds the `/v1/compress` exposure policy on `app.state.compress_route_dependencies` for any route it adds.
 
 <Callout type="info" title="Not the same as HEADROOM_KOMPRESS_ENDPOINT">
 `HEADROOM_KOMPRESS_ENDPOINT` points *outbound* at a remote Kompress ML model server that happens to expose a `/compress` path. It is unrelated to this inbound endpoint.
@@ -740,11 +925,13 @@ headroom proxy
 ```bash
 pip install gunicorn
 
-gunicorn headroom.proxy.server:app \
+gunicorn "headroom.proxy.server:create_app()" \
   --workers 4 \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker
 ```
+
+`headroom.proxy.server` has no module-level `app` object — it exposes a `create_app(config: ProxyConfig | None = None) -> FastAPI` factory, so gunicorn's import string must call it.
 
 ### Docker
 

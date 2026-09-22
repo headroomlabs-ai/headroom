@@ -101,15 +101,14 @@ def test_http_responses_output_shaper_rewrites_and_labels(monkeypatch):
     assert response.status_code == 200
     sent = captured["body"]
     assert "<headroom_output_shaping>" in sent["instructions"]
-    assert sent["reasoning"]["effort"] == "low"
-    assert sent["text"]["verbosity"] == "low"
+    # Steering is the only lever; request params pass through untouched.
+    assert sent["reasoning"]["effort"] == "xhigh"
+    assert sent["text"]["verbosity"] == "medium", "client value passes through"
     assert captured["retry_kwargs"]["body_mutated"] is True
     assert captured["retry_kwargs"]["original_body_bytes"] is not None
     transforms = outcomes[-1].transforms_applied
     assert any(t.startswith("output_shaper:stratum:") for t in transforms)
     assert "output_shaper:verbosity:L2" in transforms
-    assert "output_shaper:reasoning_effort:xhigh->low" in transforms
-    assert "output_shaper:text_verbosity:medium->low" in transforms
 
 
 def test_http_responses_output_shaper_respects_bypass(monkeypatch):

@@ -28,8 +28,8 @@ export default defineConfig({
         transformerTwoslash({
           twoslashOptions: {
             compilerOptions: {
-              target: 9, // ES2022
-              lib: ['lib.es2022.d.ts', 'lib.dom.d.ts', 'lib.dom.iterable.d.ts'],
+              target: 'es2022',
+              lib: ['es2022', 'dom', 'dom.iterable'],
             },
             // Documentation code snippets are illustrative — don't require full type validity
             handbookOptions: {
