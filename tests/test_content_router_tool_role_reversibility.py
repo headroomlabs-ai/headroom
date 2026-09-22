@@ -87,8 +87,8 @@ def _force_result(strategy: CompressionStrategy, compressed: str) -> SimpleNames
 
 def _tool_msg(content: str) -> dict:
     # tool_call_id with no matching assistant tool_calls -> not in the exclude
-    # map -> not protected by the Read/Glob/Grep/Write/Edit window, so it reaches
-    # compression (matches Bash/shell output, which is never excluded).
+    # map -> not protected by the Read/Glob/Grep/shell window, so it reaches
+    # compression. A named Bash/shell result is excluded; this fixture is not.
     return {"role": "tool", "tool_call_id": "call_bash_1", "content": content}
 
 

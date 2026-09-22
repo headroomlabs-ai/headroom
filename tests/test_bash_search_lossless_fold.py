@@ -1,13 +1,13 @@
 # ruff: noqa: E402 — test sections import after helper/setup code by design.
 """Bash-search lossless fold.
 
-`Bash` is in DEFAULT_EXCLUDE_TOOLS, so default config folds search-shaped
-output on the excluded-tool lossless path (`router:excluded:lossless_search`).
-When Bash is not excluded (custom exclude_tools, or other `bash_tool_names`
-such as `shell`), a read-only search (grep/rg/git grep) still takes
-`router:bash:lossless_search` — the same ripgrep --heading transform excluded
-Grep gets — instead of lossy compression. Non-search bash commands
-(cat/build/mutate) are not search-folded.
+Every raw-shell name (`bash`, `shell`, `local_shell`, and `Bash`) is in
+DEFAULT_EXCLUDE_TOOLS, so default config folds search-shaped output on the
+excluded-tool lossless path (`router:excluded:lossless_search`). When a caller
+supplies an exclude set that omits the shell name, a read-only search
+(grep/rg/git grep) still takes `router:bash:lossless_search` — the same
+ripgrep --heading transform excluded Grep gets — instead of lossy compression.
+Non-search shell commands (cat/build/mutate) are not search-folded.
 """
 
 from __future__ import annotations

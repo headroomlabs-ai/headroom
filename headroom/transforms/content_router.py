@@ -53,6 +53,7 @@ from enum import Enum
 from typing import Any
 
 from ..config import (
+    DEFAULT_BASH_TOOL_NAMES,
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
@@ -1722,13 +1723,15 @@ class ContentRouterConfig:
     # whitespace-minify, data-lossless), in every path — see
     # ``_lossless_compact_excluded``. Always recoverable, so no config gate.
 
-    # Shell tool names (case-insensitive). ``Bash``/``bash`` are also in
-    # DEFAULT_EXCLUDE_TOOLS (lossy skipped; lossless fold still applies).
-    # Remaining names, or Bash when a caller empties exclude_tools, still take
-    # the lossy path — except a read-only *search* (grep/rg/git grep), which
-    # is byte-losslessly foldable. See ``_bash_search_fold``. Config so new
-    # harness tool names / search programs can be added without code changes.
-    bash_tool_names: frozenset[str] = frozenset({"bash", "shell", "local_shell"})
+    # Shell tool names (case-insensitive via tool_name.lower()). Same set as
+    # DEFAULT_BASH_TOOL_NAMES, which is unioned into DEFAULT_EXCLUDE_TOOLS, so
+    # default config skips the lossy path for every one of them (lossless fold
+    # still applies). ``_bash_search_fold`` still runs when a caller supplies an
+    # exclude set that omits the name: a read-only search (grep/rg/git grep) is
+    # byte-losslessly foldable. Config so new harness tool names / search
+    # programs can be added without code changes — add the name to both
+    # DEFAULT_BASH_TOOL_NAMES and DEFAULT_EXCLUDE_TOOLS (test-locked).
+    bash_tool_names: frozenset[str] = DEFAULT_BASH_TOOL_NAMES
     bash_search_commands: frozenset[str] = frozenset(
         {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"}
     )
@@ -6144,16 +6147,16 @@ class ContentRouter(Transform):
     def _bash_search_fold(self, tool_name: str, tool_id: str, content: Any) -> str | None:
         """Byte-lossless fold for a read-only search run through a shell tool.
 
-        ``Bash`` is in DEFAULT_EXCLUDE_TOOLS, so default config never reaches
-        this method for that name (the excluded-tool lossless fold runs first).
-        This still fires for other ``bash_tool_names`` (``shell``, ``local_shell``)
-        and for Bash when a caller empties exclude_tools. When the command is a
-        read-only search (grep/rg/git grep/…), fold it (the same guarantee
-        excluded Grep gets) instead of lossy-compressing. The command whitelist
-        is only a *gate to attempt*: ``compact_lossless`` verifies reversibility
-        and returns the input unchanged when it can't safely shrink, so a mis-
-        gated command (``grep -l`` path-lists, ``grep -c`` counts) simply falls
-        through to the normal path with no accuracy risk.
+        Every ``bash_tool_names`` entry is in DEFAULT_EXCLUDE_TOOLS, so default
+        config never reaches this method (the excluded-tool lossless fold runs
+        first). This still fires when a caller supplies an exclude set that
+        omits the shell name. When the command is a read-only search
+        (grep/rg/git grep/…), fold it (the same guarantee excluded Grep gets)
+        instead of lossy-compressing. The command whitelist is only a *gate to
+        attempt*: ``compact_lossless`` verifies reversibility and returns the
+        input unchanged when it can't safely shrink, so a mis-gated command
+        (``grep -l`` path-lists, ``grep -c`` counts) simply falls through to the
+        normal path with no accuracy risk.
 
         Returns the folded text (smaller, recoverable) or ``None`` to fall through.
         """

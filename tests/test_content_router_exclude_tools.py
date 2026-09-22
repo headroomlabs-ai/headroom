@@ -220,7 +220,7 @@ def test_protect_tool_results_survives_runtime_read_protection_window_kwarg() ->
 
 
 def test_bash_in_default_exclude_tools() -> None:
-    """Bash is excluded by default so columnar shell output is not lossily
-    compressed. protect_tool_results remains the opt-in path for other tools."""
-    assert "Bash" in DEFAULT_EXCLUDE_TOOLS
-    assert "bash" in DEFAULT_EXCLUDE_TOOLS
+    """Every raw-shell name is excluded by default so columnar output is not
+    lossily compressed. protect_tool_results remains the opt-in path for
+    other tools."""
+    assert {"Bash", "bash", "shell", "local_shell"} <= DEFAULT_EXCLUDE_TOOLS

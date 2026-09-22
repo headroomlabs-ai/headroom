@@ -1280,6 +1280,10 @@ class TestExcludeTools:
             "columnar shell output must not take the lossy Kompress path"
         )
         assert "bash" in DEFAULT_EXCLUDE_TOOLS, "'bash' should be in DEFAULT_EXCLUDE_TOOLS"
+        assert "shell" in DEFAULT_EXCLUDE_TOOLS, "'shell' should be in DEFAULT_EXCLUDE_TOOLS"
+        assert "local_shell" in DEFAULT_EXCLUDE_TOOLS, (
+            "'local_shell' should be in DEFAULT_EXCLUDE_TOOLS"
+        )
 
     def test_bash_lowercase_in_exclude_tools(self):
         """Lowercase 'bash' is also in default exclude tools."""
@@ -1291,8 +1295,8 @@ class TestExcludeTools:
         """Verify all expected exclude tools and their lowercase variants."""
         from headroom.config import DEFAULT_EXCLUDE_TOOLS
 
-        # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep/Bash)
-        for tool in ("Read", "Glob", "Grep", "Write", "Edit", "Bash"):
+        # Tools that SHOULD be excluded (fresh Read/Write/Edit/Glob/Grep/shell)
+        for tool in ("Read", "Glob", "Grep", "Write", "Edit", "Bash", "shell", "local_shell"):
             assert tool in DEFAULT_EXCLUDE_TOOLS, f"{tool} should be in DEFAULT_EXCLUDE_TOOLS"
             assert tool.lower() in DEFAULT_EXCLUDE_TOOLS, (
                 f"{tool.lower()} should be in DEFAULT_EXCLUDE_TOOLS"

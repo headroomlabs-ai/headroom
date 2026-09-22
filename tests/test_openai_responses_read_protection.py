@@ -208,8 +208,8 @@ def test_responses_lockfile_read_stays_compressible(monkeypatch):
     """Lockfiles are tool-regenerated, never byte-patched: the command-level
     carve-out keeps `cat uv.lock` compressible even with protection on.
 
-    Uses ``local_shell`` (not ``bash``) because Bash is in DEFAULT_EXCLUDE_TOOLS
-    and would skip this command-level gate (#3652).
+    Uses ``custom_exec`` because every raw-shell name (bash, shell, local_shell)
+    is in DEFAULT_EXCLUDE_TOOLS and would skip this command-level gate (#3652).
     """
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
     handler = _handler_with_router(_lossy_router())
@@ -219,7 +219,7 @@ def test_responses_lockfile_read_stays_compressible(monkeypatch):
             {
                 "type": "function_call",
                 "call_id": "call_lock",
-                "name": "local_shell",
+                "name": "custom_exec",
                 "arguments": '{"command": "cat uv.lock"}',
             },
             {
@@ -323,7 +323,7 @@ def test_responses_view_json_shaped_output_stays_byte_exact():
 def test_responses_malformed_arguments_do_not_break_extraction(monkeypatch):
     """Malformed function_call arguments yield no command -> normal compression.
 
-    Uses a non-excluded tool name: ``bash`` would skip compression via
+    Uses a non-shell tool name: raw-shell names skip compression via
     DEFAULT_EXCLUDE_TOOLS even with unparseable arguments (#3652).
     """
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
@@ -334,7 +334,7 @@ def test_responses_malformed_arguments_do_not_break_extraction(monkeypatch):
             {
                 "type": "function_call",
                 "call_id": "call_bad",
-                "name": "local_shell",
+                "name": "custom_exec",
                 "arguments": "{not json at all",
             },
             {
@@ -425,8 +425,8 @@ def test_responses_read_command_with_releasable_json_output_compresses(monkeypat
     """Content gate: a read command whose output is confidently DATA (JSON array)
     is released to compression even with HEADROOM_PROTECT_READS=1.
 
-    Uses ``local_shell`` because Bash is in DEFAULT_EXCLUDE_TOOLS and would
-    skip this content gate (#3652).
+    Uses ``custom_exec`` because every raw-shell name is in DEFAULT_EXCLUDE_TOOLS
+    and would skip this content gate (#3652).
     """
     monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
     handler = _handler_with_router(_lossy_router())
@@ -437,7 +437,7 @@ def test_responses_read_command_with_releasable_json_output_compresses(monkeypat
             {
                 "type": "function_call",
                 "call_id": "call_json",
-                "name": "local_shell",
+                "name": "custom_exec",
                 "arguments": '{"command": "cat data.json"}',
             },
             {
