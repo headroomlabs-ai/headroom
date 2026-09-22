@@ -230,21 +230,18 @@ def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     # cross-platform matrix that produces the linux/macos/aarch64 wheels)
     # and `collect-dist` (aggregator that merges wheel artifacts + npm
     # release-assets) between `build` and the publish jobs. create-release
-    # must wait for all of them.
+    # must wait for all of them through the shared build-and-smoke call.
     # PR #387 (X1) added `smoke-import-wheels` — the runtime gate that
     # actually loads the wheel on a customer-representative environment
     # before publish. create-release must wait for it AND require its
     # success in the `if:` block (otherwise `always()` would let the
     # release proceed even when the smoke gate failed).
     assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
+        "needs: [build-and-smoke, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
         in content
     )
     assert "always()" in content
-    assert "needs.build.result == 'success'" in content
-    assert "needs.build-wheels.result == 'success'" in content
-    assert "needs.collect-dist.result == 'success'" in content
-    assert "needs.smoke-import-wheels.result == 'success'" in content
+    assert "needs.build-and-smoke.result == 'success'" in content
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
 
@@ -453,7 +450,7 @@ def test_release_yml_does_not_install_openssl_or_perl_for_wheels() -> None:
     Linux entry honest — every package install we keep here
     represents a hidden assumption about the manylinux container.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     bw_start = content.index("\n  build-wheels:")
     bw_end = content.index("\n  collect-dist:")
@@ -488,7 +485,7 @@ def test_build_wheels_matrix_includes_intel_macos_with_dynamic_ort() -> None:
     on a non-comment line) so explanatory comments mentioning other
     triples don't false-positive.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     bw_start = content.index("\n  build-wheels:")
     bw_end = content.index("\n  collect-dist:")
@@ -527,7 +524,7 @@ def test_smoke_import_macos_selects_wheel_arch_from_target() -> None:
     """The macOS smoke-import step must pick the wheel tag from the matrix
     target (arm64 for Apple Silicon, x86_64 for Intel) instead of
     hardcoding `_arm64` for every macOS row."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     step_start = content.index("- name: Smoke-import wheel on macOS host")
     step_end = content.index("- name: Smoke-import wheel on Windows host", step_start)
@@ -555,7 +552,7 @@ def test_aarch64_wheel_uses_native_arm64_runner() -> None:
     would silently re-introduce QEMU and slow CI back down — this test
     pins the runner.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     bw_start = content.index("\n  build-wheels:")
     bw_end = content.index("\n  collect-dist:")
@@ -709,7 +706,7 @@ def test_sdist_build_conditional_keyed_on_target_not_os() -> None:
     add `os` back to the conditional for clarity" refactor will fail
     at PR time, not 8 minutes into a release.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     # Locate the "Build sdist" step.
     sdist_marker = "name: Build sdist"
@@ -733,7 +730,7 @@ def test_sdist_build_conditional_keyed_on_target_not_os() -> None:
 
 def test_release_workflow_verifies_versions_before_build_outputs() -> None:
     """Release sync must be followed by an explicit cross-package version gate."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     assert "scripts/verify-versions.py" in content
     assert "scripts/version-sync.py" in content
@@ -752,7 +749,7 @@ def test_release_workflow_verifies_versions_before_build_outputs() -> None:
 
 def test_release_workflow_uses_local_npm_asset_builder() -> None:
     """npm tarball metadata must be built and verified by the reusable local gate."""
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
     builder = (ROOT / "scripts" / "build_npm_release_assets.mjs").read_text(encoding="utf-8")
     verifier = (ROOT / "scripts" / "verify_npm_release_assets.mjs").read_text(encoding="utf-8")
 
@@ -769,7 +766,8 @@ def test_release_workflow_uses_local_npm_asset_builder() -> None:
     )
 
     assert "scripts/build_npm_release_assets.mjs" in content
-    assert "scripts/verify_npm_release_assets.mjs" in content
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert "scripts/verify_npm_release_assets.mjs" in release
     assert "scripts/verify_npm_release_assets.mjs" in builder
     assert "registerHeadroomPlugin" in verifier
 
@@ -899,7 +897,7 @@ def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
     duplicate wheels, surfaced once PR #412 added skip-existing.
     """
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    release_yml = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    release_yml = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     assert '{ path = "LICENSE", format = "sdist" }' in pyproject, (
         "pyproject.toml [tool.maturin].include must list LICENSE for sdist format"
@@ -1004,7 +1002,7 @@ def test_release_workflow_audits_wheel_glibc_symbols() -> None:
     post-floor symbol that our current shim doesn't cover. The audit
     catches that at release time, before publish-pypi.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     assert "audit_wheel_glibc_symbols.py" in content, (
         "release.yml must invoke `scripts/audit_wheel_glibc_symbols.py` "
@@ -1038,7 +1036,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
     - macOS native (Apple Silicon).
 
     Required gating: `publish-pypi`, `publish-docker`, AND
-    `create-release` must all `needs:` smoke-import-wheels. A
+    `create-release` must all depend on the shared build-and-smoke call. A
     smoke failure has to BLOCK publish, not just produce a
     notification.
 
@@ -1049,9 +1047,12 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
     """
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
+    release = content
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
+
     # The job itself must exist.
     assert "\n  smoke-import-wheels:" in content, (
-        "release.yml must define a `smoke-import-wheels` job. This is the "
+        "release-build.yml must define a `smoke-import-wheels` job. This is the "
         "X1 gate that catches runtime symbol mismatches in the published "
         "wheel before it hits PyPI. Issue #355 + #384/#385/#386 are the "
         "canonical reason this gate exists."
@@ -1078,36 +1079,36 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         )
 
     # Gating: publish-pypi must wait for the smoke job.
-    publish_pypi_idx = content.index("\n  publish-pypi:")
-    next_job_idx = content.index("\n  publish-npm:", publish_pypi_idx)
-    publish_pypi_block = content[publish_pypi_idx:next_job_idx]
-    assert "smoke-import-wheels" in publish_pypi_block, (
-        "publish-pypi must `needs: [..., smoke-import-wheels]` — without "
+    publish_pypi_idx = release.index("\n  publish-pypi:")
+    next_job_idx = release.index("\n  publish-npm:", publish_pypi_idx)
+    publish_pypi_block = release[publish_pypi_idx:next_job_idx]
+    assert "needs: [build-and-smoke]" in publish_pypi_block, (
+        "publish-pypi must `needs: [build-and-smoke]` — without "
         "the dependency, a broken wheel can be published before the "
         "smoke job has even finished. The whole point of X1 is that it "
         "BLOCKS publish."
     )
 
     # Same for publish-docker.
-    publish_docker_idx = content.index("\n  publish-docker:")
-    next_idx = content.index("\n  create-release:", publish_docker_idx)
-    publish_docker_block = content[publish_docker_idx:next_idx]
-    assert "smoke-import-wheels" in publish_docker_block, (
-        "publish-docker must `needs: [..., smoke-import-wheels]` — the "
+    publish_docker_idx = release.index("\n  publish-docker:")
+    next_idx = release.index("\n  create-release:", publish_docker_idx)
+    publish_docker_block = release[publish_docker_idx:next_idx]
+    assert "needs: [build-and-smoke]" in publish_docker_block, (
+        "publish-docker must `needs: [build-and-smoke]` — the "
         "docker image bundles the same wheels; a broken wheel will fail "
         "the docker build's `pip install` 3 minutes later anyway. "
         "Failing fast in smoke saves matrix budget."
     )
 
     # And create-release.
-    create_release_idx = content.index("\n  create-release:")
-    create_release_block = content[create_release_idx:]
-    assert "smoke-import-wheels" in create_release_block, (
-        "create-release must `needs: [..., smoke-import-wheels]` and gate on its success"
+    create_release_idx = release.index("\n  create-release:")
+    create_release_block = release[create_release_idx:]
+    assert "build-and-smoke" in create_release_block, (
+        "create-release must `needs: [build-and-smoke]` and gate on its success"
     )
-    assert "needs.smoke-import-wheels.result == 'success'" in create_release_block, (
+    assert "needs.build-and-smoke.result == 'success'" in create_release_block, (
         "create-release's `if:` must explicitly require "
-        "`needs.smoke-import-wheels.result == 'success'` — without "
+        "`needs.build-and-smoke.result == 'success'` — without "
         "this, `always()` would let the release proceed even if the "
         "smoke gate failed."
     )
@@ -1164,9 +1165,9 @@ def test_smoke_import_ubuntu_apt_installs_are_retried() -> None:
     package operations and use --fix-missing so transient mirror skew does not
     make unrelated PRs red.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
     smoke_start = content.index("\n  smoke-import-wheels:")
-    smoke_end = content.index("\n  publish-pypi:", smoke_start)
+    smoke_end = len(content)
     smoke_body = content[smoke_start:smoke_end]
 
     assert "apt_retry()" in smoke_body
@@ -1325,7 +1326,7 @@ def test_release_yml_resolves_manual_ver_from_release_tag() -> None:
     job must read `github.event.release.tag_name` and strip the leading
     `v` so the SemVer parser accepts it.
     """
-    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    content = (ROOT / ".github" / "workflows" / "release-build.yml").read_text(encoding="utf-8")
 
     assert "Resolve MANUAL_VER from trigger" in content, (
         "detect-version must include a step that resolves MANUAL_VER from "
