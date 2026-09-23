@@ -9,6 +9,13 @@ Backend selection depends on how the store is constructed:
 - ``CompressionStore()`` constructed directly defaults to **in-memory**
   unless a backend is passed explicitly.
 
+Stateless mode (``--stateless`` / ``HEADROOM_STATELESS``) overrides all of
+that: every store handed out by ``get_compression_store()``, and every store
+installed with ``set_request_compression_store()``, is checked and swapped to
+an in-process backend unless the backend declares ``writes_local_disk =
+False``. A custom backend that stores off-machine should set that class
+attribute; see ``base.CompressionStoreBackend``.
+
 Usage:
     from headroom.cache.backends import SQLiteBackend, CompressionStoreBackend
     from headroom.cache.compression_store import CompressionStore, get_compression_store

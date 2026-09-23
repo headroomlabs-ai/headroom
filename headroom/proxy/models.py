@@ -133,6 +133,13 @@ class RateLimitState:
     last_update: float
 
 
+def _env_stateless_default() -> bool:
+    """Default for ``ProxyConfig.stateless`` — honors ``HEADROOM_STATELESS``."""
+    from headroom.paths import env_says_stateless
+
+    return env_says_stateless()
+
+
 @dataclass
 class ProxyConfig:
     """Proxy configuration."""
@@ -478,8 +485,13 @@ class ProxyConfig:
     periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
     malloc_trim_interval_seconds: int = 60
 
-    # Stateless mode — disable all filesystem writes for read-only / container deployments
-    stateless: bool = False
+    # Stateless mode — disable all filesystem writes for read-only / container
+    # deployments. Defaults from HEADROOM_STATELESS so `--stateless` and the env
+    # var really are the same switch: the field is what
+    # ``paths.set_process_stateless()`` is handed, and that call now wins over
+    # the environment in both directions (so a non-stateless proxy can be built
+    # in a process where a stateless one exported the var).
+    stateless: bool = field(default_factory=_env_stateless_default)
 
     # Optional inbound auth. When set, non-loopback requests to the data-plane
     # routes must present this token (``Authorization: Bearer <token>`` or the

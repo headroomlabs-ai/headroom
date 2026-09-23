@@ -38,7 +38,26 @@ LLM PROCESSING
 
 When SmartCrusher compresses tool output:
 
-1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `headroom/cache/compression_store.py:1000-1017`.
+1. The original content is stored, keyed by hash, with LRU-style eviction once the store hits capacity. In the proxy, this store defaults to a SQLite file (`ccr_store.db` in the workspace directory) rather than a pure in-process dict -- so it survives a proxy restart and is shared across worker processes. Set `HEADROOM_CCR_BACKEND=memory` to opt back into an in-process-only store. `--stateless` / `HEADROOM_STATELESS` forces that in-process store when the configured backend would write to local disk (unset or `sqlite`), so no tool-result original ever reaches `ccr_store.db`. It does **not** downgrade an external backend: `HEADROOM_CCR_BACKEND=redis` writes nothing to the local filesystem and is kept under `--stateless`, which is the only way to keep retrieval shared across `--workers > 1` in stateless mode -- with the in-process store, a retrieval handled by a different worker than the compression misses. Other backend names are resolved via the `headroom.ccr_backend` setuptools entry-point group (e.g. a `redis` backend, if one is installed and registered) -- none besides `sqlite`/`memory` ship in this repo. See `_create_default_ccr_backend()` in `headroom/cache/compression_store.py`.
+
+### Stateless mode and the store backend
+
+Stateless mode wins over **every** backend choice, not only the one the environment selects, because it is enforced where the store is handed out rather than only where the default is built:
+
+- **Unconfigured global store** -- `_create_default_ccr_backend()` returns an in-process backend.
+- **Explicit backend** -- `get_compression_store(backend=...)`, the embedding path, is checked on the way out and swapped if the backend is not stateless-safe.
+- **Request-scoped / per-tenant store** -- `set_request_compression_store()` (SaaS middleware) is checked at installation *and* on every `get_compression_store()` hand-out, so a tenant store created per request, long after startup, cannot bypass the mode.
+- **A singleton that already exists** -- swapped in place at proxy construction; see the lifecycle below.
+
+A backend is **stateless-safe** if it is process-local (`is_process_local = True`) or it declares `writes_local_disk = False`. A backend that declares neither fails closed and is replaced by the in-process one, with a warning naming it: a third-party backend could be writing verbatim tool-result originals to a file, and there is no way to tell from the outside. External adapters opt in with that one class attribute.
+
+Only the backend is swapped, never the store object, so components that captured the store (for example `CompressionFeedback.store`) stop writing to disk through their own reference.
+
+**Lifecycle when the process already holds a SQLite-backed store.** Building a stateless proxy in that process swaps the live store's backend in place. It deliberately does **not** call `reset_compression_store()`, whose `clear()` is a `DELETE FROM ccr_entries` against a database other worker processes are still serving from. Consequences, all intended:
+
+- rows written before the switch stay in `ccr_store.db` -- `--stateless` stops new writes, it does not retroactively erase an earlier stateful run. Purging that file is an explicit operator action (delete `ccr_store.db` from the workspace directory);
+- entries the store held in memory are dropped rather than migrated, so the stateless process stops serving originals it was told to stop touching;
+- retrieval for markers issued before the switch misses, and the miss message says the store is in-process only rather than blaming the TTL.
 2. A hash key is generated for retrieval
 3. A marker is added to the compressed output:
 

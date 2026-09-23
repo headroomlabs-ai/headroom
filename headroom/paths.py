@@ -103,26 +103,49 @@ def _env(name: str) -> str:
 # module-level singletons reached without a config object, so the proxy records
 # the mode here once at startup and writers consult ``process_is_stateless()``.
 
-_PROCESS_STATELESS: bool = False
+# Tri-state: None means "nobody said", so the environment decides. An explicit
+# True/False wins in BOTH directions -- see ``set_process_stateless``.
+_PROCESS_STATELESS: bool | None = None
+
+_STATELESS_TRUTHY = ("1", "true", "yes", "on")
 
 
-def set_process_stateless(value: bool) -> None:
-    """Record process-wide stateless mode (set once at proxy startup)."""
+def env_says_stateless() -> bool:
+    """True when ``HEADROOM_STATELESS`` is set to a truthy value."""
+
+    return _env("HEADROOM_STATELESS").lower() in _STATELESS_TRUTHY
+
+
+def set_process_stateless(value: bool | None) -> None:
+    """Record process-wide stateless mode (set once at proxy startup).
+
+    An explicit ``False`` must be able to turn the mode back OFF. ``headroom
+    proxy --stateless`` *exports* ``HEADROOM_STATELESS=true`` so uvicorn worker
+    subprocesses inherit the mode; if the env var could only ever be OR-ed in,
+    that export would be an unclearable process-wide latch and every later
+    proxy built in the same process would silently keep the stateless
+    behaviour (no CCR backend, no output-savings recorder) despite
+    ``config.stateless is False``.
+
+    Pass ``None`` to go back to consulting the environment.
+    """
 
     global _PROCESS_STATELESS
-    _PROCESS_STATELESS = bool(value)
+    _PROCESS_STATELESS = None if value is None else bool(value)
 
 
 def process_is_stateless() -> bool:
     """True when the process must not write to the workspace.
 
-    True if ``set_process_stateless(True)`` was called OR the ``HEADROOM_STATELESS``
-    environment variable is set, so non-proxy entrypoints honor it too.
+    ``set_process_stateless()`` decides once it has been called with a bool.
+    Otherwise ``HEADROOM_STATELESS`` decides, so non-proxy entrypoints honor it
+    too. ``ProxyConfig.stateless`` itself defaults from the same env var, so a
+    proxy built while it is set still reports ``True`` here.
     """
 
-    if _PROCESS_STATELESS:
-        return True
-    return _env("HEADROOM_STATELESS").lower() in ("1", "true", "yes", "on")
+    if _PROCESS_STATELESS is not None:
+        return _PROCESS_STATELESS
+    return env_says_stateless()
 
 
 def _resolve(explicit: str | os.PathLike[str] | None, env_var: str, derived: Path) -> Path:
@@ -439,6 +462,7 @@ __all__ = [
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
     "HEADROOM_SETTINGS_PATH_ENV",
+    "env_says_stateless",
     "set_process_stateless",
     "process_is_stateless",
     "config_dir",

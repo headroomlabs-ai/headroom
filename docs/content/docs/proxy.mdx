@@ -309,7 +309,7 @@ See [Metrics](/docs/metrics) for the Prometheus and Grafana setup.
 | `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress). Required to run Headroom as a gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
-| `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
+| `--stateless` / `HEADROOM_STATELESS` | `false` | Keep request-derived state out of the filesystem: disables memory, TOIN, savings persistence, request logs, and the on-disk [CCR retrieval store](/docs/ccr) (an external CCR backend such as `redis` is kept -- see [CCR](/docs/ccr)). The runtime log (`~/.headroom/logs/proxy-<port>.log`), the beacon lock, subscription state, and model caches are still written. |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
 

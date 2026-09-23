@@ -76,6 +76,11 @@ class SQLiteBackend:
     field (one without a default) raises ``TypeError`` on construction.
     """
 
+    # Entries land in a local file, so stateless mode must not use this
+    # backend. Read by stateless mode and the retrieval-miss diagnostics.
+    is_process_local = False
+    writes_local_disk = True
+
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._path = Path(db_path).expanduser() if db_path else default_db_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,12 +241,28 @@ class SQLiteBackend:
         return row is not None
 
     def clear(self) -> None:
+        """Delete every row.
+
+        NOTE: the database file is shared with the other worker processes and
+        outlives this one by design, so this destroys data those workers are
+        still serving. It exists for tests and for an explicit operator purge —
+        it is NOT the way to stop *this* process writing (see
+        ``CompressionStore.use_process_local_backend``).
+        """
         with self._lock:
             try:
                 self._conn.execute("DELETE FROM ccr_entries")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "op")
+
+    def close(self) -> None:
+        """Close this process's handle. Leaves the database file intact."""
+        with self._lock:
+            try:
+                self._conn.close()
+            except sqlite3.Error:  # pragma: no cover - best-effort close
+                logger.debug("Closing CCR SQLite handle failed", exc_info=True)
 
     def count(self) -> int:
         with self._lock:
