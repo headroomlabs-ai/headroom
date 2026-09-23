@@ -19,6 +19,10 @@ Locks the following invariants:
 6. Once a timed-out worker is known to still be running, new compression work
    raises an asyncio timeout immediately until that worker exits instead of
    multiplying the timeout debt across the executor.
+7. A started worker that hits its deadline emits a WARNING with the timeout,
+   elapsed run, quarantine flags, cumulative ``compression_leaked_threads``,
+   in-flight timed-out workers, and pool size. The cumulative counter does
+   not move until the worker's ``finally`` runs.
 
 These tests also serve as documentation: anyone reading them sees that
 "timeout fired" does not mean "compression was cancelled" — it means "we
@@ -29,8 +33,11 @@ leaked-thread counter is how we make that visible.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -38,6 +45,25 @@ pytest.importorskip("fastapi")
 
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS  # noqa: F401
 from headroom.proxy.server import ProxyConfig, create_app
+
+
+@contextmanager
+def _capture_proxy_warnings(caplog: pytest.LogCaptureFixture):
+    """Capture ``headroom.proxy`` warnings onto ``caplog``.
+
+    ``create_app`` calls ``_setup_file_logging``, which sets
+    ``headroom.propagate = False``. caplog's handler hangs off the root
+    logger, so without a direct handler those records never arrive.
+    """
+    target = logging.getLogger("headroom.proxy")
+    previous_level = target.level
+    target.setLevel(logging.WARNING)
+    target.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        target.removeHandler(caplog.handler)
+        target.setLevel(previous_level)
 
 
 def _make_proxy(compression_max_workers: int | None = None):
@@ -454,3 +480,154 @@ def test_explicit_None_resolves_to_auto_source() -> None:
     with TestClient(app) as client:
         r = client.get("/health")
         assert r.json()["runtime"]["compression_executor"]["source"] == "auto"
+
+
+def test_started_worker_timeout_logs_warning_with_executor_counters(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A running compression that outlives its deadline logs a WARNING.
+
+    Break this catches: dropping the timeout/quarantine log (or moving
+    ``leaked_threads_total`` so it counts the still-running worker). The line
+    must carry the deadline, elapsed run, quarantine activation, the cumulative
+    leak counter, in-flight timed-out workers, and pool size. The cumulative
+    counter stays unchanged until the worker's ``finally`` runs.
+    """
+    proxy = _make_proxy(compression_max_workers=2)
+    timeout_seconds = 0.10
+    started = threading.Event()
+    release = threading.Event()
+
+    def _slow_compression() -> str:
+        started.set()
+        release.wait(timeout=5.0)
+        return "late"
+
+    async def _drive() -> None:
+        task = asyncio.create_task(
+            proxy._run_compression_in_executor(_slow_compression, timeout=timeout_seconds)
+        )
+        for _ in range(50):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        with pytest.raises(asyncio.TimeoutError):
+            await task
+
+    with _capture_proxy_warnings(caplog):
+        asyncio.run(_drive())
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and record.name == "headroom.proxy"
+            and "event=compression_executor_timeout" in record.getMessage()
+        ]
+        assert len(warnings) == 1, [record.getMessage() for record in caplog.records]
+        message = warnings[0].getMessage()
+        assert "timeout_seconds=0.100" in message
+        assert "quarantine_activated=true" in message
+        assert "quarantine_active=true" in message
+        assert "timed_out_workers=1" in message
+        assert "max_workers=2" in message
+        assert "leaked_threads_total=0" in message
+        assert "quarantine_activations_total=1" in message
+        run_match = re.search(r"run_seconds=([0-9]+\.[0-9]+)", message)
+        assert run_match is not None
+        run_seconds = float(run_match.group(1))
+        assert 0.0 < run_seconds < timeout_seconds * 5
+        remaining_match = re.search(
+            r"quarantine_deadline_remaining_seconds=([0-9]+\.[0-9]+)", message
+        )
+        assert remaining_match is not None
+        assert float(remaining_match.group(1)) > 0.0
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_leaked_threads == 0
+            assert proxy._compression_timed_out_in_flight == 1
+
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with proxy._compression_metrics_lock:
+                if proxy._compression_timed_out_in_flight == 0:
+                    break
+            time.sleep(0.01)
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_leaked_threads == 1
+            assert proxy._compression_timed_out_in_flight == 0
+
+
+def test_later_compression_timeout_logs_while_quarantine_already_active(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second in-flight timeout is logged after quarantine is already on.
+
+    Break this catches: warning only on the clear-to-quarantined transition,
+    so later timeouts stay invisible unless an operator polls /health.
+    Quarantine still activates once. ``leaked_threads_total`` stays cumulative
+    and only moves when each worker's ``finally`` runs.
+    """
+    proxy = _make_proxy(compression_max_workers=2)
+    timeout_seconds = 0.10
+    started = [threading.Event(), threading.Event()]
+    release = threading.Event()
+
+    def _make_slow(idx: int):
+        def _slow() -> str:
+            started[idx].set()
+            release.wait(timeout=5.0)
+            return f"late-{idx}"
+
+        return _slow
+
+    async def _drive() -> None:
+        tasks = [
+            asyncio.create_task(
+                proxy._run_compression_in_executor(_make_slow(idx), timeout=timeout_seconds)
+            )
+            for idx in range(2)
+        ]
+        for event in started:
+            for _ in range(50):
+                if event.is_set():
+                    break
+                await asyncio.sleep(0.01)
+        assert all(event.is_set() for event in started)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(isinstance(result, asyncio.TimeoutError) for result in results)
+
+    with _capture_proxy_warnings(caplog):
+        asyncio.run(_drive())
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and record.name == "headroom.proxy"
+            and "event=compression_executor_timeout" in record.getMessage()
+        ]
+        assert len(warnings) == 2, warnings
+        assert sum("quarantine_activated=true" in message for message in warnings) == 1
+        assert sum("quarantine_activated=false" in message for message in warnings) == 1
+        assert any("timed_out_workers=1" in message for message in warnings)
+        assert any("timed_out_workers=2" in message for message in warnings)
+        assert all("timeout_seconds=0.100" in message for message in warnings)
+        assert all("max_workers=2" in message for message in warnings)
+        assert all("leaked_threads_total=0" in message for message in warnings)
+        assert all("quarantine_active=true" in message for message in warnings)
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_quarantine_activations == 1
+            assert proxy._compression_leaked_threads == 0
+            assert proxy._compression_timed_out_in_flight == 2
+
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with proxy._compression_metrics_lock:
+                if proxy._compression_timed_out_in_flight == 0:
+                    break
+            time.sleep(0.01)
+        with proxy._compression_metrics_lock:
+            assert proxy._compression_leaked_threads == 2
+            assert proxy._compression_timed_out_in_flight == 0
+            assert proxy._compression_quarantine_activations == 1
