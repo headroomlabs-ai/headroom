@@ -171,6 +171,8 @@ COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# ast-grep-cli wheel binary (issue #3649). Do not copy `sg` (shadows /usr/bin/sg).
+COPY --from=builder /usr/local/bin/ast-grep /usr/local/bin/ast-grep
 
 RUN mkdir -p /home/nonroot /data && \
     if [ "$RUNTIME_USER" = "nonroot" ]; then \
@@ -212,6 +214,8 @@ ARG PYTHON_SITE_PACKAGES
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# ast-grep-cli wheel binary (issue #3649). Do not copy `sg` (shadows /usr/bin/sg).
+COPY --from=builder /usr/local/bin/ast-grep /usr/local/bin/ast-grep
 
 USER ${RUNTIME_USER}
 WORKDIR /app

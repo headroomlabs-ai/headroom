@@ -44,6 +44,26 @@ def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> 
     assert {"boto3", "botocore"} <= bedrock_names
 
 
+def test_runtime_whitelist_copies_include_ast_grep_not_sg() -> None:
+    """Runtime stages whitelist /usr/local/bin; ast-grep-cli is a real binary (#3649).
+
+    Site-packages only ships dist-info, so ``pip list`` shows ast-grep-cli while
+    ``which ast-grep`` fails. Do not copy the ``sg`` alias: it shadows Debian
+    ``/usr/bin/sg`` (set-group).
+    """
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    expected = "COPY --from=builder /usr/local/bin/ast-grep /usr/local/bin/ast-grep"
+    # Both runtime-slim-base and runtime-slim whitelist /usr/local/bin.
+    assert dockerfile.count(expected) == 2
+    assert "COPY --from=builder /usr/local/bin/sg " not in dockerfile
+    assert (
+        dockerfile.count(
+            "COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy"
+        )
+        == 2
+    )
+
+
 def test_public_docker_instructions_use_the_current_organization_package() -> None:
     """Do not send users back to the personal GHCR package frozen at 0.27.0."""
     public_docs = (
