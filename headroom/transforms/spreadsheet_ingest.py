@@ -94,7 +94,7 @@ def _xls_cell(cell: object, datemode: int) -> object:
         return datetime(year, month, day, hour, minute, second)
     if kind == xlrd.XL_CELL_BOOLEAN:
         return bool(value)
-    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer():
+    if kind == xlrd.XL_CELL_NUMBER and float(value).is_integer() and abs(value) < 2**53:
         return int(value)
     if kind == xlrd.XL_CELL_ERROR:
         # openpyxl with data_only=True gives the text Excel shows, e.g. #DIV/0!

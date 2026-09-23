@@ -506,6 +506,59 @@ def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     assert load_spreadsheet(xls_path) == load_spreadsheet(xlsx_path)
 
 
+class StubCell:
+    """Minimal stand-in for an xlrd cell, exposing only ``ctype`` / ``value``."""
+
+    def __init__(self, ctype: int, value: object) -> None:
+        self.ctype = ctype
+        self.value = value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        12.0,  # ordinary whole double, exactly representable
+        1e15,
+        float(2**53 - 1),  # largest exactly representable whole double
+    ],
+)
+def test_xls_cell_whole_numbers_in_safe_range_render_as_int(value) -> None:
+    """Whole doubles within the exactly-representable range render as int."""
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    cell = StubCell(xlrd.XL_CELL_NUMBER, value)
+    result = _xls_cell(cell, 0)
+    assert type(result) is int
+    assert result == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        float(2**53),  # first whole double that is not exactly representable
+        1e16,
+        1e20,
+    ],
+)
+def test_xls_cell_whole_numbers_above_safe_range_render_as_float(value) -> None:
+    """Whole doubles above 2**53 keep their float repr (GH #3695).
+
+    ``int()`` on an inexact double fabricates precision the cell never had --
+    1.2345678901234568e+17 became ``123456789012345680`` -- so these must not
+    be converted to int.
+    """
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    cell = StubCell(xlrd.XL_CELL_NUMBER, value)
+    result = _xls_cell(cell, 0)
+    assert type(result) is float
+    assert result == value
+
+
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:
     from headroom.transforms.spreadsheet_ingest import load_spreadsheet
 
