@@ -399,6 +399,71 @@ class TestConvertMessagesToolBlocks:
         assert converted[0]["content"] == "42"
 
 
+class TestConvertMessagesImageBlocks:
+    """Anthropic image blocks must survive _convert_messages_for_litellm."""
+
+    PNG_B64 = "iVBORw0KGgo="
+
+    def _make_backend(self):
+        with patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}):
+            return LiteLLMBackend(provider="bedrock")
+
+    def test_text_and_image_turn_keeps_image(self):
+        """The image reaches the Bedrock Converse body instead of being dropped."""
+        from litellm.litellm_core_utils.prompt_templates.factory import (
+            _bedrock_converse_messages_pt,
+        )
+
+        backend = self._make_backend()
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": self.PNG_B64},
+        }
+        messages = [
+            {"role": "user", "content": [image, {"type": "text", "text": "What color?"}]},
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+
+        assert converted[0]["content"] == [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.PNG_B64}"}},
+            {"type": "text", "text": "What color?"},
+        ]
+        converse = _bedrock_converse_messages_pt(
+            messages=converted, model="us.openai.gpt-6-sol", llm_provider="bedrock_converse"
+        )
+        assert [list(block) for block in converse[0]["content"]] == [["image"], ["text"]]
+
+    def test_image_only_turn_is_not_emptied(self):
+        """An image-only turn must not become "" (litellm then drops the turn)."""
+        backend = self._make_backend()
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Describe the next image."}]},
+            {"role": "assistant", "content": "Send it."},
+            {
+                "role": "user",
+                "content": [{"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}],
+            },
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+
+        # Text-only block lists still flatten to a string, as before.
+        assert converted[0]["content"] == "Describe the next image."
+        assert converted[2]["content"] == [
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"}},
+        ]
+
+    def test_assistant_turn_image_is_still_dropped(self):
+        """Assistant-turn images keep the old text-only content (litellm's Bedrock
+        transform raises on them)."""
+        backend = self._make_backend()
+        image = {"type": "image", "source": {"type": "url", "url": "https://x/a.png"}}
+        messages = [
+            {"role": "assistant", "content": [image, {"type": "text", "text": "Here is one."}]},
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["content"] == "Here is one."
+
+
 # =============================================================================
 # Streaming tool_calls (GitHub Issue — Bug 1)
 # =============================================================================
