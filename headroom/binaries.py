@@ -42,6 +42,19 @@ from headroom._subprocess import run
 
 logger = logging.getLogger(__name__)
 
+# Affirmative values for the sha256-verification bypass. This is a security
+# control (supply-chain integrity), so it must fail CLOSED: only an explicit
+# affirmative disables verification. A bare presence check treated
+# `HEADROOM_BINARIES_ALLOW_UNVERIFIED=0` / `=false` — the natural way to say
+# "keep verifying" — as truthy and silently skipped verification.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _allow_unverified_binaries() -> bool:
+    """Whether sha256 verification of fetched binaries is bypassed."""
+    return os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "").strip().lower() in _TRUTHY
+
+
 __all__ = [
     "BinaryError",
     "BinaryFetchError",
@@ -311,7 +324,7 @@ def _sha256_file(path: Path) -> str:
 
 
 def _verify_sha256(path: Path, expected: str | None) -> None:
-    if os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+    if _allow_unverified_binaries():
         logger.warning(
             "skipping sha256 verification for %s (HEADROOM_BINARIES_ALLOW_UNVERIFIED=1)",
             path.name,
@@ -347,7 +360,7 @@ def verify_download_bytes(data: bytes, *, url: str, name: str) -> None:
     the bytes against the tools.json pin for ``url`` and refuses an unpinned URL
     unless HEADROOM_BINARIES_ALLOW_UNVERIFIED=1.
     """
-    if os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED"):
+    if _allow_unverified_binaries():
         logger.warning(
             "skipping sha256 verification for %s (HEADROOM_BINARIES_ALLOW_UNVERIFIED=1)", name
         )
