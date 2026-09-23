@@ -32,6 +32,28 @@ from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 
 logger = logging.getLogger("headroom.proxy")
+STREAM_FAILURE_STATUS = 502
+
+
+def _stream_outcome_status(status_code: int, completed_normally: bool) -> int:
+    """Keep post-start stream failures out of the success counter."""
+    return status_code if completed_normally else STREAM_FAILURE_STATUS
+
+
+def _sse_contains_error_event(payload: bytes) -> bool:
+    for event in payload.split(b"\n\n"):
+        if b"event: error" in event:
+            return True
+        for line in event.splitlines():
+            if not line.startswith(b"data: "):
+                continue
+            try:
+                data = json.loads(line[6:])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(data, dict) and ("error" in data or data.get("type") == "error"):
+                return True
+    return False
 
 
 def _thinking_for_stream(payload: object) -> ThinkingTokens:
@@ -1323,6 +1345,7 @@ class StreamingMixin:
             # not corrupt downstream parsing.
             "sse_buffer": bytearray(),
             "ttfb_ms": None,  # Time to first byte from upstream
+            "stream_failed": False,
         }
 
         # Track if we need to handle memory tools
@@ -1615,6 +1638,8 @@ class StreamingMixin:
                         # are located in bytes; decoding happens per
                         # complete event in the SSE splitter helper.
                         stream_state["sse_buffer"].extend(chunk)
+                        if _sse_contains_error_event(bytes(stream_state["sse_buffer"])):
+                            stream_state["stream_failed"] = True
 
                         # Safety: prevent unbounded buffer growth.
                         if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
@@ -1768,7 +1793,7 @@ class StreamingMixin:
                         status_code=upstream_response.status_code,
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
-                completed_normally = True
+                completed_normally = not stream_state["stream_failed"]
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
@@ -1838,7 +1863,9 @@ class StreamingMixin:
                     parsed_response=parsed_response,
                     client=client,
                     waste_signals=waste_signals,
-                    status_code=upstream_response.status_code,
+                    status_code=_stream_outcome_status(
+                        upstream_response.status_code, completed_normally
+                    ),
                     conversation_key=conversation_key,
                     conversation_tokens_saved=conversation_tokens_saved,
                 )
@@ -1935,8 +1962,11 @@ class StreamingMixin:
         # stream closes (see finally: block below). Not on the hot path
         # for anything the client sees.
         full_sse_bytes = bytearray()
+        completed_normally = False
+        stream_failed = False
 
         async def generate():
+            nonlocal completed_normally, stream_failed
             try:
                 assert backend is not None
 
@@ -2012,7 +2042,10 @@ class StreamingMixin:
 
                     # Handle errors
                     if event.event_type == "error":
+                        stream_failed = True
                         logger.error(f"[{request_id}] Bedrock stream error: {event.data}")
+
+                completed_normally = not stream_failed
 
             except Exception as e:
                 logger.error(f"[{request_id}] Bedrock streaming error: {e}")
@@ -2090,6 +2123,7 @@ class StreamingMixin:
                     overhead_ms=optimization_latency,
                     tags=tags,
                     client=client,
+                    status_code=_stream_outcome_status(200, completed_normally),
                     log_full_messages=getattr(self.config, "log_full_messages", False),
                     cache_read_tokens=stream_state["cache_read_input_tokens"],
                     cache_write_tokens=stream_state["cache_creation_input_tokens"],
@@ -2178,6 +2212,8 @@ class StreamingMixin:
             # closes (cheap, no buffering of in-flight chunks back to
             # the client).
             full_sse_bytes = bytearray()
+            completed_normally = False
+            stream_failed = False
 
             def _absorb(usage: dict[str, int] | None) -> None:
                 if not usage:
@@ -2203,6 +2239,8 @@ class StreamingMixin:
                     if parsed is not None and not stream_state["output_tokens"]:
                         stream_state["output_tokens"] = parsed
                     yield chunk_bytes
+                stream_failed = _sse_contains_error_event(bytes(full_sse_bytes))
+                completed_normally = not stream_failed
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
                 error_data = {
@@ -2306,6 +2344,7 @@ class StreamingMixin:
                     overhead_ms=optimization_latency,
                     tags=tags,
                     client=client,
+                    status_code=_stream_outcome_status(200, completed_normally),
                     log_full_messages=getattr(self.config, "log_full_messages", False),
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
