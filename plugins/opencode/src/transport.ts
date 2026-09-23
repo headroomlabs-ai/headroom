@@ -7,9 +7,9 @@ const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
 const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
-const BASE_URL_HEADER = "x-headroom-base-url";
-const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-const PROJECT_HEADER = "x-headroom-project";
+export const BASE_URL_HEADER = "x-headroom-base-url";
+export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+export const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
@@ -66,7 +66,7 @@ function setState(state: TransportState | undefined): void {
 }
 
 // ponytail: the shim only exists next to the checkout build
-// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// (plugins/opencode/dist/). The wheel shipped the entry bundle alone, so
 // `--import=<missing file>` killed every Node child at startup — including
 // OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
 // children go direct instead of dying. Upgrade path is bundling the shim into
@@ -190,6 +190,14 @@ function shouldRoute(url: URL, proxy: URL): boolean {
     return false;
   }
   return true;
+}
+
+export function routesThroughProxy(upstream: string, proxyUrl: string): boolean {
+  try {
+    return shouldRoute(new URL(upstream), normalizeProxyUrl(proxyUrl));
+  } catch {
+    return false;
+  }
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {

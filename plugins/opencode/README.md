@@ -35,24 +35,28 @@ The generated provider uses `@ai-sdk/openai-compatible` and points model request
 
 ## Native OpenCode Plugin
 
-Use `HeadroomPlugin` when OpenCode should intercept provider traffic in-process and expose Headroom tooling from a plugin.
+The package's default export is an OpenCode plugin that loads on both OpenCode 1.x and 2.x. Register it in `opencode.json`:
 
-```ts
-import { HeadroomPlugin } from "headroom-opencode";
-
-export default async function plugin(input) {
-  return HeadroomPlugin(input, {
-    proxyUrl: process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787",
-  });
+```json
+{
+  "plugin": [
+    ["headroom-opencode", { "proxyUrl": "http://127.0.0.1:8787" }]
+  ]
 }
 ```
 
-`HeadroomPlugin`:
+OpenCode 2.x migrates the 1.x `plugin` key automatically. To configure it the 2.x way, use `"plugins": [{ "package": "headroom-opencode", "options": { ... } }]`.
 
-- installs Headroom transport interception for OpenCode provider traffic.
-- exposes the `headroom_retrieve` tool.
-- publishes `HEADROOM_PROXY_URL` in the plugin output env.
-- defaults to `http://127.0.0.1:8787` when no proxy URL is supplied.
+The default export is `{ id: "headroom", server, setup }`. OpenCode 1.x calls `server` (`HeadroomPlugin`) and 2.x calls `setup` (`headroomSetup`); each ignores the other's field. Both entry points:
+
+- install Headroom transport interception for OpenCode provider traffic.
+- expose the `headroom_retrieve` tool (a direct tool on 2.x, not only through code mode).
+- add `HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT` (and `HEADROOM_BACKEND` when set) to shell command environments.
+- default to `HEADROOM_PROXY_URL`, then `http://127.0.0.1:8787`, when no `proxyUrl` option is supplied.
+
+On 2.x, setup returns a cleanup that releases the transport, so hot reloads do not stack interceptors.
+
+OpenCode 2.x keeps its own reference to `fetch` from before plugins load, so patching `fetch` alone does not catch its model traffic. On 2.x the plugin also rewrites each remote model that uses the OpenAI chat-completions or responses format so that it points at the proxy. Headers name the real upstream, as the transport does. Models on other formats (Anthropic messages, Google) are left alone. `headroom wrap opencode` routes native Anthropic and OpenAI through the proxy separately, via their `baseURL`.
 
 ## Retrieve Tool
 

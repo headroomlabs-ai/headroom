@@ -448,8 +448,9 @@ def test_build_opencode_config_content_without_mcp(
 ) -> None:
     from headroom.providers.opencode.runtime import build_opencode_config_content
 
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
+    plugin = tmp_path / "headroom-plugin"
+    plugin.mkdir()
+    (plugin / "index.js").write_text("export default {}", encoding="utf-8")
     monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     config = build_opencode_config_content(port=8787, include_mcp=False)
@@ -466,7 +467,7 @@ def test_build_opencode_config_content_without_mcp(
     assert set(models) == {"gpt-4o", "gpt-4.1"}
     assert not any(model_id.startswith("claude-") for model_id in models)
     assert all(not model_id.startswith("headroom/") for model_id in models)
-    # The transport plugin is injected by absolute path (opencode loads it directly).
+    # The transport plugin directory is injected by absolute path (opencode loads it directly).
     assert config["plugin"] == [str(plugin)]
 
 
@@ -501,8 +502,9 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.delenv("HEADROOM_PROJECT", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
+    plugin = tmp_path / "headroom-plugin"
+    plugin.mkdir()
+    (plugin / "index.js").write_text("export default {}", encoding="utf-8")
     monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     env, display = build_launch_env(
@@ -558,3 +560,67 @@ def test_inject_provider_config_strips_existing_markers(
     second = config_file.read_text()
     assert "headroom" in second
     assert second.count("headroom") == first.count("headroom")
+
+
+# ---------------------------------------------------------------------------
+# OpenCode 2.x --standalone launch flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected"),
+    [
+        ("opencode v2.0.12\n", 0, 2),
+        ("1.18.32\n", 0, 1),
+        ("garbage\n", 0, None),
+        ("opencode v2.0.12\n", 1, None),
+    ],
+)
+def test_opencode_major_version_parses_both_cli_formats(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: int | None
+) -> None:
+    import subprocess
+
+    import headroom.providers.opencode.runtime as oc_runtime
+
+    def fake_run(*args, **kwargs):  # noqa: ANN002, ANN003
+        return subprocess.CompletedProcess(args[0], returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(oc_runtime, "run", fake_run)
+    assert oc_runtime.opencode_major_version("opencode") == expected
+
+
+def test_opencode_major_version_missing_binary_is_unknown(tmp_path: Path) -> None:
+    from headroom.providers.opencode.runtime import opencode_major_version
+
+    assert opencode_major_version(str(tmp_path / "no-such-opencode")) is None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        ((), ("--standalone",)),
+        (("--continue",), ("--standalone", "--continue")),
+        (("run", "fix it"), ("run", "--standalone", "fix it")),
+        (("--print-logs", "mini"), ("--print-logs", "mini", "--standalone")),
+        (("models",), ("models",)),
+        (("auth", "list"), ("auth", "list")),
+        (("--standalone",), ("--standalone",)),
+        (
+            ("run", "--server", "http://127.0.0.1:4096", "x"),
+            ("run", "--server", "http://127.0.0.1:4096", "x"),
+        ),
+        (("--server=http://127.0.0.1:4096",), ("--server=http://127.0.0.1:4096",)),
+    ],
+)
+def test_with_opencode_standalone_on_v2(args: tuple[str, ...], expected: tuple[str, ...]) -> None:
+    from headroom.providers.opencode.runtime import with_opencode_standalone
+
+    assert with_opencode_standalone(args, 2) == expected
+
+
+@pytest.mark.parametrize("major", [1, None])
+def test_with_opencode_standalone_leaves_v1_and_unknown_alone(major: int | None) -> None:
+    from headroom.providers.opencode.runtime import with_opencode_standalone
+
+    assert with_opencode_standalone(("run", "fix it"), major) == ("run", "fix it")
