@@ -94,7 +94,7 @@ def _json_array(tag: str) -> str:
 
 def _tool_msg(call_id: str, content: str) -> dict:
     # tool_call_id with no matching assistant tool_calls -> not excluded -> the
-    # non-frozen one reaches compression (matches Bash/shell output).
+    # non-frozen one reaches compression. A named Bash/shell result is excluded.
     return {"role": "tool", "tool_call_id": call_id, "content": content}
 
 

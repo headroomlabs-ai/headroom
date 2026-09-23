@@ -1118,7 +1118,7 @@ def _fresh_cc_turn1() -> list[dict]:
         {"role": "user", "content": "run the tests"},
         {
             "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+            "content": [{"type": "tool_use", "id": "t1", "name": "OtherTool", "input": {}}],
         },
         {
             "role": "user",
@@ -2046,7 +2046,7 @@ def test_newest_user_turn_keeps_text_but_compresses_tool_results(
         {"role": "user", "content": "run the tests"},
         {
             "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+            "content": [{"type": "tool_use", "id": "t1", "name": "OtherTool", "input": {}}],
         },
         {
             "role": "user",

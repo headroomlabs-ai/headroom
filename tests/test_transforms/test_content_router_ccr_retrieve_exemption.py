@@ -227,7 +227,7 @@ class TestContentRouterCcrRetrieveExemption:
         router = ContentRouter(ContentRouterConfig(min_section_tokens=10))
         tokenizer = _get_tokenizer()
 
-        messages = _anthropic_messages("Bash", content)
+        messages = _anthropic_messages("OtherTool", content)
         result = router.apply(messages, tokenizer)
 
         assert "router:excluded:ccr_retrieve" not in result.transforms_applied
@@ -307,7 +307,7 @@ class TestContentRouterCcrRetrieveExemption:
                     {
                         "type": "tool_use",
                         "id": "toolu_normal_mixed",
-                        "name": "Bash",
+                        "name": "OtherTool",
                         "input": {"command": "ls"},
                     },
                 ],

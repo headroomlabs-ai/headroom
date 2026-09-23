@@ -212,12 +212,25 @@ class AnchorConfig:
 # Read/Glob/Grep contain exact file contents/search results the agent needs for edits.
 # Write/Edit record what changes were made — compressing them causes duplicate/conflicting edits.
 # WebSearch/WebFetch results are large reference payloads that must remain verbatim.
-# Bash is NOT excluded — its outputs (build logs, test output) are ideal compression targets.
-# To protect Bash or other non-excluded tools from lossy compression, use
-# HEADROOM_PROTECT_TOOL_RESULTS=Bash or --protect-tool-results Bash.
+# Raw shell tools: columnar output (`ls -la`, `git status`, `docker ps`) is
+# bytes the agent will act on verbatim. Those rows classify as PLAIN_TEXT and
+# used to take the Kompress prose path, which dropped unmarked fields (#3652).
+# Every name in DEFAULT_BASH_TOOL_NAMES is excluded, plus Claude Code's "Bash"
+# spelling. ContentRouter matches tool_name.lower() against that set, and
+# is_tool_excluded folds case the same way, so Shell / LOCAL_SHELL / Local_Shell
+# are covered. Build logs still get information-preserving compaction via the
+# excluded-tool lossless fold.
+# To protect other non-excluded tools from lossy compression, use
+# HEADROOM_PROTECT_TOOL_RESULTS=ToolName or --protect-tool-results ToolName.
 # headroom_retrieve: its entire contract is returning already-retrieved, original
 # CCR content verbatim. Recompressing it writes a new <<ccr:hash>> marker the
 # agent can never redeem (#1077).
+# Lowercase spellings of raw-shell tools. ContentRouterConfig.bash_tool_names
+# is this set and matches with tool_name.lower(). The same names are listed in
+# DEFAULT_EXCLUDE_TOOLS (test-locked) so a shell alias cannot be routable and
+# still lossy.
+DEFAULT_BASH_TOOL_NAMES: frozenset[str] = frozenset({"bash", "shell", "local_shell"})
+
 DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "Read",
@@ -227,6 +240,7 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "Edit",
         "WebSearch",
         "WebFetch",
+        "Bash",
         "headroom_retrieve",
         # Copilot CLI's file-read tool (its `Read` equivalent): raw file bytes
         # the model byte-patches against.
@@ -251,7 +265,8 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         # small and the downside is unbounded. Named below as well, because
         # protecting a tool needs both halves.
         "Skill",
-        # Lowercase variants for case-insensitive matching
+        # Lowercase variants for case-insensitive matching.
+        # bash/shell/local_shell must match DEFAULT_BASH_TOOL_NAMES.
         "read",
         "glob",
         "grep",
@@ -260,6 +275,9 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "edit",
         "web_search",
         "web_fetch",
+        "bash",
+        "shell",
+        "local_shell",
     }
 )
 
