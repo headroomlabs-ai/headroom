@@ -1914,6 +1914,7 @@ class SavingsTracker:
         aggregated: dict[str, dict[str, Any]] = {}
         prev_total_tokens = 0
         prev_total_usd = 0.0
+        prev_cache_savings_usd = 0.0
         prev_total_input_tokens = 0
         prev_total_input_cost_usd = 0.0
         prev_output_tokens = 0
@@ -1929,12 +1930,14 @@ class SavingsTracker:
             bucket_key = _to_utc_iso(bucket_start)
             total_tokens_saved = _coerce_int(point.get("total_tokens_saved"))
             total_usd = _coerce_float(point.get("compression_savings_usd"))
+            cache_savings_usd = _coerce_float(point.get("cache_savings_usd"))
             total_input_tokens = _coerce_int(point.get("total_input_tokens"))
             total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
             total_output_tokens = _coerce_int(point.get("output_tokens_saved"))
             total_output_usd = _coerce_float(point.get("output_savings_usd"))
             delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
             delta_usd = max(total_usd - prev_total_usd, 0.0)
+            delta_cache_savings_usd = max(cache_savings_usd - prev_cache_savings_usd, 0.0)
             delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
             delta_input_cost_usd = max(
                 total_input_cost_usd - prev_total_input_cost_usd,
@@ -1946,6 +1949,7 @@ class SavingsTracker:
 
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
+            prev_cache_savings_usd = cache_savings_usd
             prev_total_input_tokens = total_input_tokens
             prev_total_input_cost_usd = total_input_cost_usd
             prev_output_tokens = total_output_tokens
@@ -1957,6 +1961,7 @@ class SavingsTracker:
                     "timestamp": bucket_key,
                     "tokens_saved": 0,
                     "compression_savings_usd_delta": 0.0,
+                    "cache_savings_usd_delta": 0.0,
                     "total_tokens_saved": total_tokens_saved,
                     "compression_savings_usd": total_usd,
                     "total_input_tokens_delta": 0,
@@ -1972,6 +1977,10 @@ class SavingsTracker:
             entry["tokens_saved"] += delta_tokens
             entry["compression_savings_usd_delta"] = round(
                 entry["compression_savings_usd_delta"] + delta_usd,
+                6,
+            )
+            entry["cache_savings_usd_delta"] = round(
+                entry["cache_savings_usd_delta"] + delta_cache_savings_usd,
                 6,
             )
             entry["total_input_tokens_delta"] += delta_input_tokens
@@ -1993,13 +2002,20 @@ class SavingsTracker:
             # it. Each checkpoint comes from a single request, so its delta is
             # wholly owned by one provider. Skip no-op checkpoints so providers
             # only appear in a bucket where they actually moved a counter.
-            if delta_tokens or delta_usd or delta_input_tokens or delta_input_cost_usd:
+            if (
+                delta_tokens
+                or delta_usd
+                or delta_cache_savings_usd
+                or delta_input_tokens
+                or delta_input_cost_usd
+            ):
                 provider = _normalize_provider(point.get("provider"))
                 prov = entry["by_provider"].setdefault(
                     provider,
                     {
                         "tokens_saved": 0,
                         "compression_savings_usd_delta": 0.0,
+                        "cache_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
                     },
@@ -2007,6 +2023,10 @@ class SavingsTracker:
                 prov["tokens_saved"] += delta_tokens
                 prov["compression_savings_usd_delta"] = round(
                     prov["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                prov["cache_savings_usd_delta"] = round(
+                    prov["cache_savings_usd_delta"] + delta_cache_savings_usd,
                     6,
                 )
                 prov["total_input_tokens_delta"] += delta_input_tokens
@@ -2021,6 +2041,7 @@ class SavingsTracker:
                     {
                         "tokens_saved": 0,
                         "compression_savings_usd_delta": 0.0,
+                        "cache_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
                     },
@@ -2028,6 +2049,10 @@ class SavingsTracker:
                 mod["tokens_saved"] += delta_tokens
                 mod["compression_savings_usd_delta"] = round(
                     mod["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                mod["cache_savings_usd_delta"] = round(
+                    mod["cache_savings_usd_delta"] + delta_cache_savings_usd,
                     6,
                 )
                 mod["total_input_tokens_delta"] += delta_input_tokens
