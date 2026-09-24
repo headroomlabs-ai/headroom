@@ -1,8 +1,18 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
-  compress: vi.fn(),
   delegateCompactionToRuntime: vi.fn(),
+  awaitTranscriptProjectionSettle: vi.fn(async () => ({ waited: true })),
+  runTranscriptReplaceHygiene: vi.fn(async () => ({
+    changed: true,
+    bytesFreed: 512,
+    rewrittenEntries: 2,
+    tokensBefore: 50_000,
+    tokensAfter: 44_000,
+  })),
   start: vi.fn(async () => "http://127.0.0.1:8787"),
   stop: vi.fn(async () => undefined),
   logger: {
@@ -14,11 +24,23 @@ const mocked = vi.hoisted(() => ({
 }));
 
 vi.mock("headroom-ai", () => ({
-  compress: mocked.compress,
+  compress: vi.fn(),
 }));
 
 vi.mock("../src/openclaw-compaction.js", () => ({
   delegateCompactionToRuntime: mocked.delegateCompactionToRuntime,
+}));
+
+vi.mock("../src/transcript-hygiene.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/transcript-hygiene.js")>();
+  return {
+    ...actual,
+    runTranscriptReplaceHygiene: mocked.runTranscriptReplaceHygiene,
+  };
+});
+
+vi.mock("../src/transcript-projection.js", () => ({
+  awaitTranscriptProjectionSettle: mocked.awaitTranscriptProjectionSettle,
 }));
 
 vi.mock("../src/proxy-manager.js", () => ({
@@ -29,12 +51,29 @@ vi.mock("../src/proxy-manager.js", () => ({
   defaultLogger: mocked.logger,
 }));
 
-import { HeadroomContextEngine } from "../src/engine.js";
+import {
+  DEFAULT_ASSEMBLE_RESERVE_TOKENS,
+  DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO,
+  HeadroomContextEngine,
+  resolveAssembleReserveTokens,
+  resolveAssembleSkipBudgetRatio,
+  resolveAssembleSkipThreshold,
+} from "../src/engine.js";
 import { compress } from "headroom-ai";
 
 afterEach(() => {
-    mocked.compress.mockReset();
-    mocked.delegateCompactionToRuntime.mockReset();
+  vi.mocked(compress).mockReset();
+  mocked.delegateCompactionToRuntime.mockReset();
+  mocked.awaitTranscriptProjectionSettle.mockReset();
+  mocked.awaitTranscriptProjectionSettle.mockResolvedValue({ waited: true });
+  mocked.runTranscriptReplaceHygiene.mockReset();
+  mocked.runTranscriptReplaceHygiene.mockResolvedValue({
+    changed: true,
+    bytesFreed: 512,
+    rewrittenEntries: 2,
+    tokensBefore: 50_000,
+    tokensAfter: 44_000,
+  });
   mocked.start.mockReset();
   mocked.start.mockResolvedValue("http://127.0.0.1:8787");
   mocked.stop.mockClear();
@@ -44,15 +83,191 @@ afterEach(() => {
   mocked.logger.warn.mockClear();
 });
 
-describe("HeadroomContextEngine compaction", () => {
-  it("delegates persistent compaction to OpenClaw without claiming ownership", async () => {
+describe("HeadroomContextEngine persistent compaction mode", () => {
+  it("defaults to openclaw compaction (OpenClaw owns durable compact)", () => {
     const engine = new HeadroomContextEngine();
+    expect(engine.info.ownsCompaction).toBe(false);
+    expect(engine.info.transcriptSemantics).toEqual({
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    });
+  });
+
+  it("skips hybrid compact pre-pass when transcript hygiene is disabled", async () => {
+    const engine = new HeadroomContextEngine({
+      persistentCompaction: "hybrid",
+      transcriptHygiene: { enabled: false },
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     const params = {
       sessionId: "session-1",
       sessionKey: "agent:main:session-1",
-      tokenBudget: 12_000,
+      sessionFile: "session.jsonl",
+      tokenBudget: 120_000,
       force: true,
-      runtimeContext: { workspaceDir: "/tmp/workspace" },
+    };
+    const delegatedResult = {
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 20_000, tokensAfter: 8_000 },
+    };
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
+
+    await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
+    expect(mocked.runTranscriptReplaceHygiene).not.toHaveBeenCalled();
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
+    expect(engine.getStats().hygieneRuns).toBe(0);
+  });
+
+  it("runs hygiene pre-pass then delegates when hybrid compact is requested", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "hybrid" });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const params = {
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+      tokenBudget: 120_000,
+      force: true,
+    };
+    const delegatedResult = {
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 20_000, tokensAfter: 8_000 },
+    };
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
+
+    await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledWith(
+      expect.objectContaining({ force: true, proxyUrl: "http://127.0.0.1:8787" }),
+    );
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
+    expect(engine.getStats().compactions).toBe(1);
+    expect(engine.getStats().hygieneRuns).toBe(1);
+  });
+
+  it("waits for transcript projection after a successful hygiene rewrite", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "hybrid" });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.maintain({
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+    });
+
+    expect(mocked.awaitTranscriptProjectionSettle).toHaveBeenCalledTimes(1);
+  });
+
+  it("debounces turn-end hygiene when a rewrite just ran", async () => {
+    const engine = new HeadroomContextEngine({
+      persistentCompaction: "hybrid",
+      transcriptHygiene: { debounceMs: 60_000 },
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.maintain({
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+    });
+    await expect(
+      engine.maintain({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        sessionFile: "session.jsonl",
+      }),
+    ).resolves.toEqual({
+      changed: false,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+      reason: "debounced",
+    });
+
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledTimes(1);
+  });
+
+  it("debounces hybrid compact pre-pass after recent turn-end hygiene", async () => {
+    const engine = new HeadroomContextEngine({
+      persistentCompaction: "hybrid",
+      transcriptHygiene: { debounceMs: 60_000 },
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce({
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 20_000, tokensAfter: 8_000 },
+    });
+
+    await engine.maintain({
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+    });
+    await engine.compact({
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+      force: true,
+    });
+
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledTimes(1);
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips turn-end hygiene in maintain() when transcript hygiene is disabled", async () => {
+    const engine = new HeadroomContextEngine({
+      persistentCompaction: "hybrid",
+      transcriptHygiene: { enabled: false },
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.maintain({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        sessionFile: "session.jsonl",
+      }),
+    ).resolves.toEqual({
+      changed: false,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+      reason: "transcript hygiene disabled",
+    });
+
+    expect(mocked.runTranscriptReplaceHygiene).not.toHaveBeenCalled();
+  });
+
+  it("runs turn-end hygiene in maintain() for hybrid mode", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "hybrid" });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.maintain({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        sessionFile: "session.jsonl",
+      }),
+    ).resolves.toEqual({
+      changed: true,
+      bytesFreed: 512,
+      rewrittenEntries: 2,
+      tokensBefore: 50_000,
+      tokensAfter: 44_000,
+    });
+
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledWith(
+      expect.objectContaining({ force: false }),
+    );
+  });
+
+  it("delegates persistent compaction to OpenClaw when configured", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
+    const params = {
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+      tokenBudget: 120_000,
+      force: false,
     };
     const delegatedResult = {
       ok: true,
@@ -65,15 +280,17 @@ describe("HeadroomContextEngine compaction", () => {
     mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
 
     expect(engine.info.ownsCompaction).toBe(false);
+    expect(engine.info.transcriptSemantics?.currentTurnFence).toBe(
+      "before-current-turn-entry-v1",
+    );
     await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
-
     expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
-    expect(mocked.compress).not.toHaveBeenCalled();
+    expect(compress).not.toHaveBeenCalled();
     expect(engine.getStats().compactions).toBe(1);
   });
 
   it("does not count a delegated no-op as a compaction", async () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
     mocked.delegateCompactionToRuntime.mockResolvedValueOnce({
       ok: true,
       compacted: false,
@@ -95,7 +312,7 @@ describe("HeadroomContextEngine compaction", () => {
   });
 
   it("propagates delegated compaction failures without reporting success", async () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
     const failure = new Error("native compaction failed");
     mocked.delegateCompactionToRuntime.mockRejectedValueOnce(failure);
 
@@ -273,6 +490,185 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     expect(mocked.start).toHaveBeenCalledTimes(1);
   });
 
+  it("skips proxy compression when context is clearly under token budget", async () => {
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const messages = [{ role: "user", content: "hello" }];
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages,
+        tokenBudget: 1_000_000,
+      }),
+    ).resolves.toMatchObject({
+      messages,
+      estimatedTokens: expect.any(Number),
+    });
+
+    expect(compress).not.toHaveBeenCalled();
+  });
+
+  it("compresses once history crosses the default skip threshold (below OpenClaw's overflow line)", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    // Default threshold = (200k − 20k reserve) × 0.7 = 126k tokens.
+    // ~4 chars/token → 520k chars ≈ 130k rough tokens. The old flat 85 % rule
+    // (170k) skipped this even though OpenClaw — which also counts the system
+    // prompt and its reserve — would already be compacting.
+    const messages = [{ role: "user", content: "x".repeat(520_000) }];
+
+    await engine.assemble({ sessionId: "session-1", messages, tokenBudget: 200_000 });
+
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("honours configured assembleSkipBudgetRatio / assembleReserveTokens and clamps invalid values", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const messages = [{ role: "user", content: "x".repeat(300_000) }]; // ≈75k tokens
+
+    // (100k − 20k) × 0.9 = 72k → 75k compresses.
+    const strict = new HeadroomContextEngine({ assembleSkipBudgetRatio: 0.9, assembleReserveTokens: 0 });
+    (strict as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    await strict.assemble({ sessionId: "s", messages, tokenBudget: 100_000 });
+    expect(compress).not.toHaveBeenCalled(); // reserve 0 → 90k threshold → skip
+
+    // A large system prompt is modelled via the reserve: (100k − 60k) × 0.7 = 28k → compress.
+    const bigSystemPrompt = new HeadroomContextEngine({ assembleReserveTokens: 60_000 });
+    (bigSystemPrompt as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    await bigSystemPrompt.assemble({ sessionId: "s", messages, tokenBudget: 100_000 });
+    expect(compress).toHaveBeenCalledTimes(1);
+
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 200_000 })).toBe(126_000);
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 100_000, ratio: 0.5, reserveTokens: 0 })).toBe(50_000);
+    // Reserve larger than the budget never disables compression entirely.
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 10_000, reserveTokens: 50_000 })).toBe(1);
+
+    expect(resolveAssembleSkipBudgetRatio(undefined)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(0)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(1.5)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(Number.NaN)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(1)).toBe(1);
+    expect(resolveAssembleSkipBudgetRatio(0.55)).toBe(0.55);
+
+    expect(resolveAssembleReserveTokens(undefined)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(-1)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(Number.NaN)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(0)).toBe(0);
+    expect(resolveAssembleReserveTokens(12_345.9)).toBe(12_345);
+  });
+
+  it("passes assembleCompressConfig to compress via headroom-ai SDK", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: 5000,
+      tokensAfter: 5000,
+      tokensSaved: 0,
+    });
+
+    const engine = new HeadroomContextEngine({
+      assembleCompressConfig: { protect_recent: 4, mode: "ccr" },
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({
+      sessionId: "session-1",
+      messages: [{ role: "user", content: "hello ".repeat(500) }],
+    });
+
+    expect(compress).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.objectContaining({
+        config: expect.objectContaining({
+          protect_recent: 4,
+          mode: "ccr",
+        }),
+      }),
+    );
+  });
+
+  it("skips assemble compression when skipAssembleWhenGatewayRouted is enabled", async () => {
+    const engine = new HeadroomContextEngine({
+      skipAssembleWhenGatewayRouted: true,
+      gatewayProviderIds: ["openrouter", "opencode-go"],
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages: [{ role: "user", content: "hello ".repeat(500) }],
+      }),
+    ).resolves.toMatchObject({
+      messages: [{ role: "user", content: expect.stringContaining("hello") }],
+      estimatedTokens: expect.any(Number),
+    });
+
+    expect(compress).not.toHaveBeenCalled();
+  });
+
+  it("omits CCR retrieve hint when compression saved tokens but produced no ccrHashes", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: true,
+      messages: [{ role: "user", content: "compressed hello" }],
+      tokensBefore: 5000,
+      tokensAfter: 2000,
+      tokensSaved: 3000,
+      ccrHashes: [],
+    });
+
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages: [{ role: "user", content: "hello ".repeat(500) }],
+      }),
+    ).resolves.toMatchObject({
+      estimatedTokens: 2000,
+      systemPromptAddition: undefined,
+    });
+  });
+
+  it("includes CCR retrieve hint only when compression saved tokens and ccrHashes exist", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: true,
+      messages: [{ role: "user", content: "compressed hello" }],
+      tokensBefore: 5000,
+      tokensAfter: 2000,
+      tokensSaved: 3000,
+      ccrHashes: ["abc123"],
+    });
+
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages: [{ role: "user", content: "hello ".repeat(500) }],
+      }),
+    ).resolves.toMatchObject({
+      estimatedTokens: 2000,
+      systemPromptAddition: expect.stringContaining("headroom_retrieve"),
+    });
+  });
+
   it("clears the request timeout after successful compression", async () => {
     vi.useFakeTimers();
     try {
@@ -323,5 +719,56 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     expect(mocked.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("Circuit breaker opened"),
     );
+  });
+
+  describe("commitTurn durable advancement", () => {
+    const tempDirs: string[] = [];
+
+    afterEach(() => {
+      for (const dir of tempDirs.splice(0)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    function makeEngine() {
+      const dir = mkdtempSync(join(tmpdir(), "headroom-engine-commit-"));
+      tempDirs.push(dir);
+      return new HeadroomContextEngine({
+        turnAdvancementStorePath: join(dir, "turn-advancements.json"),
+      });
+    }
+
+    const commitParams = {
+      sessionId: "session-1",
+      advancementKey: "turn-1",
+      messages: [{ role: "user", content: "hello" }],
+    };
+
+    it("returns committed on first write and duplicate on retry", async () => {
+      const engine = makeEngine();
+
+      await expect(engine.commitTurn(commitParams)).resolves.toEqual({
+        status: "committed",
+      });
+      await expect(engine.commitTurn(commitParams)).resolves.toEqual({
+        status: "duplicate",
+      });
+    });
+
+    it("persists across new engine instances after restart", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "headroom-engine-restart-"));
+      tempDirs.push(dir);
+      const storePath = join(dir, "turn-advancements.json");
+
+      const first = new HeadroomContextEngine({ turnAdvancementStorePath: storePath });
+      await expect(first.commitTurn(commitParams)).resolves.toEqual({
+        status: "committed",
+      });
+
+      const second = new HeadroomContextEngine({ turnAdvancementStorePath: storePath });
+      await expect(second.commitTurn(commitParams)).resolves.toEqual({
+        status: "duplicate",
+      });
+    });
   });
 });
