@@ -342,6 +342,10 @@ class PrometheusMetrics:
         # Cache bust tracking: how many tokens lost their cache discount due to compression
         self.cache_bust_tokens_lost: int = 0
         self.cache_bust_count: int = 0
+        # Edge-trigger latch for the net-negative warning: True once busts have
+        # overtaken savings, cleared when the net recovers. See
+        # _check_net_tokens_crossing_locked.
+        self._net_tokens_negative: bool = False
 
         # Cache-miss attribution (#1313): when a turn expected a prompt-cache
         # hit but got none, why? Bucketed by reason so operators can tell a
@@ -472,6 +476,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self._net_tokens_negative = False
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
@@ -1168,8 +1173,40 @@ class PrometheusMetrics:
         async with self._lock:
             self.cache_bust_tokens_lost += tokens_lost
             self.cache_bust_count += 1
+            crossed = self._check_net_tokens_crossing_locked()
+        if crossed is not None:
+            saved, lost = crossed
+            logger.warning(
+                "event=net_tokens_negative tokens_saved=%d tokens_lost_to_cache_bust=%d "
+                "net_tokens=%d busts=%d hint=%s",
+                saved,
+                lost,
+                saved - lost,
+                self.cache_bust_count,
+                "prompt-cache busts now outweigh compression savings for this "
+                "process; compression is a net loss on this traffic",
+            )
         self.savings_tracker.record_lifetime_cache_bust(tokens_lost=tokens_lost)
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
+
+    def _check_net_tokens_crossing_locked(self) -> tuple[int, int] | None:
+        """Return (saved, lost) the first time busts overtake savings, else None.
+
+        Edge-triggered, not level-triggered: a deployment that is losing is
+        losing on every bust, and a warning per bust would be noise. The flag
+        re-arms when the net returns to positive, so a deployment that crosses
+        back and forth warns on each crossing rather than once forever.
+
+        Caller must hold ``self._lock``.
+        """
+
+        net_negative = self.cache_bust_tokens_lost > self.tokens_saved_total
+        if net_negative and not self._net_tokens_negative:
+            self._net_tokens_negative = True
+            return self.tokens_saved_total, self.cache_bust_tokens_lost
+        if not net_negative:
+            self._net_tokens_negative = False
+        return None
 
     async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
         """Record why a turn that expected a prompt-cache hit missed instead.
