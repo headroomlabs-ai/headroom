@@ -1,6 +1,6 @@
 {
   "name": "headroom-ai",
-  "version": "0.37.0",
+  "version": "0.38.0",
   "description": "Compress LLM context. Save tokens. Fit more into every request.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -96,7 +96,7 @@
     "@ai-sdk/anthropic": "^4.0.53",
     "@ai-sdk/openai": "^4.0.60",
     "@ai-sdk/provider": "^4.0.14",
-    "@anthropic-ai/sdk": "^0.124.0",
+    "@anthropic-ai/sdk": "^0.125.0",
     "@types/node": "^26.5.0",
     "ai": "^7.0.59",
     "dotenv": "^17.3.1",

@@ -27,6 +27,20 @@ def test_plugin_manifests_share_core_metadata() -> None:
     assert copilot["hooks"] == "./hooks"
 
 
+def test_plugin_hooks_timeout_exceeds_cold_start_wait() -> None:
+    """The plugin's `ensure` hooks are killed by the host (Claude Code, etc.)
+    at their declared `timeout`, independent of anything inside the process.
+    Headroom's own cold-start path can take up to wait_ready's 45s ceiling
+    (headroom/cli/init.py), so a shorter external timeout makes the hook
+    unwinnable by construction on every session start (#3417)."""
+    hooks = _load_json("plugins/headroom-agent-hooks/hooks/hooks.json")
+    assert isinstance(hooks, dict)
+    for event in ("SessionStart", "PreToolUse"):
+        for entry in hooks["hooks"][event]:
+            for hook in entry["hooks"]:
+                assert hook["timeout"] > 45
+
+
 def test_marketplace_entry_points_to_plugin_root() -> None:
     marketplace = _load_json(".claude-plugin/marketplace.json")
     assert isinstance(marketplace, dict)
