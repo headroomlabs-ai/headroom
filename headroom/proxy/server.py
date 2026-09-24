@@ -2263,6 +2263,12 @@ class HeadroomProxy(
         logger.info(f"Total requests:        {m.requests_total}")
         logger.info(f"Cached responses:      {m.requests_cached}")
         logger.info(f"Rate limited:          {m.requests_rate_limited}")
+        if m.requests_rate_limited:
+            # The split an operator acts on differently: our limiter firing
+            # means raise the cap, the provider's means back off / shard keys.
+            by_source = m.requests_rate_limited_by_source
+            logger.info(f"  headroom limiter:    {by_source.get('headroom', 0)}")
+            logger.info(f"  upstream 429s:       {by_source.get('upstream', 0)}")
         logger.info(f"Failed:                {m.requests_failed}")
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
@@ -4572,7 +4578,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "total": m.requests_total,
                 "cached": m.requests_cached,
                 "rate_limited": m.requests_rate_limited,
+                # Who issued the 429: "headroom" is our own limiter, "upstream"
+                # is the provider (issue #3696). The totals above stay the
+                # unlabelled figures existing consumers read.
+                "rate_limited_by_source": dict(m.requests_rate_limited_by_source),
                 "failed": m.requests_failed,
+                "failed_by_provider": _remap_provider_counts(
+                    dict(m.requests_failed_by_provider), proxy.config
+                ),
                 "by_provider": _remap_provider_counts(dict(m.requests_by_provider), proxy.config),
                 "by_model": dict(m.requests_by_model),
                 "by_stack": dict(m.requests_by_stack),

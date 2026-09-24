@@ -22,7 +22,7 @@ from headroom.proxy.helpers import (
     claude_code_tool_search_inactive,
     format_tool_search_disabled_hint,
     reset_tool_search_hint_state,
-    take_tool_search_hint_slot,
+    take_tool_search_scan_slot,
     tool_search_hint_pending,
 )
 
@@ -159,11 +159,11 @@ def test_hint_slot_fires_once() -> None:
     reset_tool_search_hint_state()
     try:
         assert tool_search_hint_pending() is True
-        assert take_tool_search_hint_slot() is True
+        assert take_tool_search_scan_slot() is True
         # Once consumed, the cheap gate flips so the hot path stops scanning.
         assert tool_search_hint_pending() is False
-        assert take_tool_search_hint_slot() is False
-        assert take_tool_search_hint_slot() is False
+        assert take_tool_search_scan_slot() is False
+        assert take_tool_search_scan_slot() is False
     finally:
         reset_tool_search_hint_state()
 

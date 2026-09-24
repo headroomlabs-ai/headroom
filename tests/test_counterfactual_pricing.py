@@ -20,6 +20,7 @@ from tests._dotenv import (
     importorskip_no_env_leak,
     load_env_overrides,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 _env_overrides = load_env_overrides()
 apply_dotenv = autouse_apply_env(_env_overrides)
@@ -40,7 +41,7 @@ from headroom.pricing.counterfactual import (  # noqa: E402
     weakest_basis,
 )
 
-SONNET = "claude-sonnet-4-20250514"
+SONNET = anthropic_pricing_model()
 
 
 def _warm_anthropic() -> CacheMix:

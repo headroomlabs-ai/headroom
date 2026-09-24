@@ -126,8 +126,18 @@ def ensure_cbm() -> Path | None:
     if existing:
         return existing
 
+    # Local import to match this module's lazy-import style (see download_cbm).
+    from headroom.binaries import UnpinnedDownload
+
     try:
         return download_cbm()
     except RuntimeError as e:
         logger.warning("Failed to install codebase-memory-mcp: %s", e)
+        return None
+    except UnpinnedDownload as e:
+        # Documented contract is "path, or None if the download failed", and a
+        # refusal is a failure to install -- the feature is simply unavailable.
+        # Deliberately NOT widened to BinaryError: Sha256Mismatch is a tamper
+        # signal and must keep propagating rather than becoming a quiet None.
+        logger.warning("Refusing to install codebase-memory-mcp: %s", e)
         return None
