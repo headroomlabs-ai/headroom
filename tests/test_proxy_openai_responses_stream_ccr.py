@@ -15,12 +15,18 @@ def _unrelated_tool() -> dict[str, str]:
     return {"type": _TOOL_TYPE_FUNCTION, "name": _UNRELATED_TOOL_NAME}
 
 
-def _should_buffer(*, tools: list[dict[str, str]], is_chatgpt_auth: bool) -> bool:
+def _should_buffer(
+    *,
+    tools: list[dict[str, str]],
+    is_chatgpt_auth: bool,
+    upstream_base_url: str | None = None,
+) -> bool:
     return _should_buffer_openai_responses_stream_ccr(
         stream=True,
         ccr_response_handler_enabled=True,
         tools=tools,
         is_chatgpt_auth=is_chatgpt_auth,
+        upstream_base_url=upstream_base_url,
     )
 
 
@@ -34,3 +40,19 @@ def test_responses_ccr_keeps_chatgpt_oauth_requests_streaming() -> None:
 
 def test_responses_ccr_ignores_requests_without_retrieve_tool() -> None:
     assert not _should_buffer(tools=[_unrelated_tool()], is_chatgpt_auth=False)
+
+
+def test_responses_ccr_keeps_opencode_zen_requests_streaming() -> None:
+    assert not _should_buffer(
+        tools=[_ccr_tool()],
+        is_chatgpt_auth=False,
+        upstream_base_url="https://opencode.ai",
+    )
+
+
+def test_responses_ccr_still_buffers_other_custom_bases() -> None:
+    assert _should_buffer(
+        tools=[_ccr_tool()],
+        is_chatgpt_auth=False,
+        upstream_base_url="https://gateway.example.com",
+    )

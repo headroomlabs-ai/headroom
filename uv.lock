@@ -315,16 +315,16 @@ wheels = [
 
 [[package]]
 name = "anyio"
-version = "4.12.1"
+version = "4.14.2"
 source = { registry = "https://pypi.org/simple/" }
 dependencies = [
     { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "idna" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/96/f0/5eb65b2bb0d09ac6776f2eb54adee6abe8228ea05b20a5ad0e4945de8aac/anyio-4.12.1.tar.gz", hash = "sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703", size = 228685, upload-time = "2026-01-06T11:45:21.246Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/61/cc/a381afa6efea9f496eff839d4a6a1aed3bfafc7b3ab4b0d1b243a12573dd/anyio-4.14.2.tar.gz", hash = "sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f", size = 260176, upload-time = "2026-07-12T20:29:07.082Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/0e/27be9fdef66e72d64c0cdc3cc2823101b80585f8119b5c112c2e8f5f7dab/anyio-4.12.1-py3-none-any.whl", hash = "sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c", size = 113592, upload-time = "2026-01-06T11:45:19.497Z" },
+    { url = "https://files.pythonhosted.org/packages/da/35/f2287558c17e29fafc8ef3daf819bb9834061cfa43bff8014f7df7f63bdc/anyio-4.14.2-py3-none-any.whl", hash = "sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494", size = 125813, upload-time = "2026-07-12T20:29:05.763Z" },
 ]
 
 [[package]]
@@ -1847,7 +1847,7 @@ wheels = [
 
 [[package]]
 name = "headroom-ai"
-version = "0.37.0"
+version = "0.38.0"
 source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },
@@ -1947,6 +1947,8 @@ dev = [
     { name = "sqlite-vec" },
     { name = "uvicorn" },
     { name = "websockets" },
+    { name = "xlrd" },
+    { name = "xlwt" },
 ]
 evals = [
     { name = "anthropic" },
@@ -2205,7 +2207,9 @@ requires-dist = [
     { name = "watchdog", marker = "(python_full_version < '3.14' and extra == 'proxy') or (sys_platform != 'darwin' and extra == 'proxy')", specifier = ">=4.0.0" },
     { name = "websockets", marker = "extra == 'dev'", specifier = ">=13.0" },
     { name = "websockets", marker = "extra == 'proxy'", specifier = ">=13.0" },
+    { name = "xlrd", marker = "extra == 'dev'", specifier = ">=2.0.1" },
     { name = "xlrd", marker = "extra == 'spreadsheet'", specifier = ">=2.0.1" },
+    { name = "xlwt", marker = "extra == 'dev'", specifier = ">=1.3.0" },
     { name = "zstandard", marker = "extra == 'proxy'", specifier = ">=0.20.0" },
 ]
 provides-extras = ["proxy", "proxy-prod", "code", "ml", "memory", "vector", "memory-stack", "pytorch-mps", "relevance", "image", "reports", "spreadsheet", "otel", "anyllm", "langchain", "langgraph", "agno", "strands", "crewai", "autogen", "mcp", "voice", "voice-train", "evals", "bedrock", "html", "dev", "all", "sandbox"]
@@ -7778,6 +7782,15 @@ source = { registry = "https://pypi.org/simple/" }
 sdist = { url = "https://files.pythonhosted.org/packages/07/5a/377161c2d3538d1990d7af382c79f3b2372e880b65de21b01b1a2b78691e/xlrd-2.0.2.tar.gz", hash = "sha256:08b5e25de58f21ce71dc7db3b3b8106c1fa776f3024c54e45b45b374e89234c9", size = 100167, upload-time = "2025-06-14T08:46:39.039Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/62/c8d562e7766786ba6587d09c5a8ba9f718ed3fa8af7f4553e8f91c36f302/xlrd-2.0.2-py2.py3-none-any.whl", hash = "sha256:ea762c3d29f4cca48d82df517b6d89fbce4db3107f9d78713e48cd321d5c9aa9", size = 96555, upload-time = "2025-06-14T08:46:37.766Z" },
+]
+
+[[package]]
+name = "xlwt"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/97/56a6f56ce44578a69343449aa5a0d98eefe04085d69da539f3034e2cd5c1/xlwt-1.3.0.tar.gz", hash = "sha256:c59912717a9b28f1a3c2a98fd60741014b06b043936dcecbc113eaaada156c88", size = 153929, upload-time = "2017-08-22T06:47:16.498Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/48/def306413b25c3d01753603b1a222a011b8621aed27cd7f89cbc27e6b0f4/xlwt-1.3.0-py2.py3-none-any.whl", hash = "sha256:a082260524678ba48a297d922cc385f58278b8aa68741596a87de01a9c628b2e", size = 99981, upload-time = "2017-08-22T06:47:15.281Z" },
 ]
 
 [[package]]

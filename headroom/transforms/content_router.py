@@ -83,6 +83,7 @@ from .content_detector import (
     _try_detect_structured_config,
 )
 from .content_detector import detect_content_type as _regex_detect_content_type
+from .dense_line_elider import elide_dense_lines
 from .error_detection import content_has_strong_error_indicators
 from .lossless_provider import (
     get_lossless_generation,
@@ -1454,6 +1455,47 @@ class RoutingDecision:
         return self.compressed_tokens / self.original_tokens
 
 
+def _record_beacon_shapes(routing_log: list[RoutingDecision]) -> None:
+    """Report (content_type -> strategy -> yield) for one compress() call.
+
+    `RoutingDecision` already carries the content type the detector assigned
+    alongside the strategy that was picked for it, so the joint table costs
+    nothing to measure -- it has simply never been reported anywhere. The
+    beacon's `by_strategy` sees the strategy and its yield but not the input,
+    which leaves it able to rank compressors and unable to say which one suits
+    a given piece of content.
+
+    Deliberately NOT routed through `CompressionObserver`: that protocol is
+    implemented outside this repo as well, and widening it would break every
+    such implementation. This is a direct call to a function that is off by
+    default, cheap when off, and cannot raise.
+
+    Runs whether or not an observer is installed, since the beacon path and the
+    Prometheus path are independent -- an install with no observer still
+    reports token totals, and would otherwise report an empty shape table
+    against them.
+    """
+    if not routing_log:
+        return
+    try:
+        from ..telemetry.session import record_content_shapes
+
+        # One call, not one per decision: the beacon's staging lock is shared
+        # with `record_compression` on this same executor thread, and the note
+        # there is explicit that the contention is real.
+        record_content_shapes(
+            (
+                decision.content_type.value,
+                decision.strategy.value,
+                decision.original_tokens,
+                decision.compressed_tokens,
+            )
+            for decision in routing_log
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("beacon shape recording failed (non-fatal): %s", e)
+
+
 @dataclass
 class RouterCompressionResult:
     """Result from ContentRouter with routing metadata.
@@ -1561,6 +1603,10 @@ class ContentRouterConfig:
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
+    # Last-resort fallback for blocks no compressor could shrink: elide the
+    # middle of long, whitespace-free lines (minified JS/CSS, base64, RSC
+    # payloads). See ``dense_line_elider``.
+    enable_dense_line_elision: bool = True
     enable_image_optimizer: bool = True  # Image token optimization
 
     # Routing preferences
@@ -1820,6 +1866,13 @@ class _PerRequestRuntimeState:
     # a compression-policy misapplication.
     protect_read_tool_ids: set[str] = field(default_factory=set)
     protect_read_msg_indices: set[int] = field(default_factory=set)
+    # ``time.perf_counter()`` origin shared by every kompress call this
+    # request makes. ``HEADROOM_COMPRESSION_DEADLINE_MS`` is a deadline on
+    # kompress inference, but each ``compress()`` call started its own clock,
+    # so the budget bounded a BLOCK and a request with a dozen blocks could
+    # spend a dozen budgets. Set once per ``apply()``; see
+    # ``_try_ml_compressor``.
+    kompress_deadline_started_at: float | None = None
 
 
 # Monotonic counter so each ContentRouter instance gets a uniquely named
@@ -1891,6 +1944,21 @@ class ContentRouter(Transform):
     # the whole dict is dropped rather than evicted entry-by-entry, which keeps
     # the memo O(1) and unlockable at the cost of an occasional cold start.
     _LOSSLESS_FIRST_MEMO_MAX = 256
+
+    # Strategies whose result is still plain text, so dense-line elision can
+    # run on top of them (see ``_elide_dense``).
+    _DENSE_ELIDE_AFTER = frozenset(
+        {
+            CompressionStrategy.HTML,
+            CompressionStrategy.LOG,
+            CompressionStrategy.TEXT,
+            CompressionStrategy.CODE_AWARE,
+            # grep-style output is line-oriented (path, then ``N:match``), so a
+            # dense match line can be elided without breaking the format.
+            CompressionStrategy.SEARCH,
+            CompressionStrategy.PASSTHROUGH,
+        }
+    )
 
     def __init__(
         self,
@@ -2561,6 +2629,7 @@ class ContentRouter(Transform):
         anyway, swallow at debug level. Compression already succeeded;
         a buggy observer must not turn a 200 into a 500.
         """
+        _record_beacon_shapes(result.routing_log)
         if self._observer is None:
             return
         for d in result.routing_log:
@@ -3724,6 +3793,13 @@ class ContentRouter(Transform):
                         compressed = (
                             output.content if output is not None and output.compressed else None
                         )
+                        # A page that is all <script>/<style> extracts to "".
+                        # That is "nothing extracted" (fall through to the
+                        # passthrough / dense-line path), not a compression
+                        # to zero tokens: the unit layer rejects an empty
+                        # block and keeps the original verbatim.
+                        if compressed is not None and not compressed.strip():
+                            compressed = None
                         # Estimate tokens from extracted text (simple word count)
                         compressed_tokens = _estimate_tokens(compressed) if compressed else 0
                         decision_reason = "html_extractor"
@@ -3902,6 +3978,21 @@ class ContentRouter(Transform):
             # Re-narrow for mypy: all reassignments above produce str, but
             # mypy 1.14.x widens after nested try/except/else reassignments.
             assert compressed is not None
+            # Dense-line elision: whatever survived the chain, long
+            # whitespace-free lines (minified bundles, base64, RSC payloads)
+            # are still in it, because no structural compressor understands
+            # them. Runs on the RESULT so it composes with a partial win
+            # (code_aware at 0.95 on minified JS) as well as a no-op.
+            # Only after strategies that hand back the text AS TEXT. SmartCrusher,
+            # tabular, config and diff emit their own structured (and
+            # CCR-marked) forms; Kompress is lossy with its own marker. Eliding
+            # inside those would corrupt output another compressor owns.
+            if self.config.enable_dense_line_elision and actual_strategy in self._DENSE_ELIDE_AFTER:
+                dense = self._elide_dense(compressed, context)
+                if dense is not None and dense[1] < compressed_tokens:
+                    compressed, compressed_tokens = dense
+                    strategy_chain.append("dense_elide")
+                    decision_reason = f"{decision_reason}_dense_elide"
             if logger.isEnabledFor(logging.DEBUG):
                 _log_router_debug(
                     "content_router_strategy_result",
@@ -3936,6 +4027,21 @@ class ContentRouter(Transform):
             return compressed, compressed_tokens, strategy_chain
 
         # Fallback: return unchanged
+        if self.config.enable_dense_line_elision:
+            dense = self._elide_dense(content, context)
+            if dense is not None and dense[1] < original_tokens:
+                elided, elided_tokens = dense
+                strategy_chain.append("dense_elide")
+                self._record_to_toin(
+                    strategy=strategy,
+                    content=content,
+                    compressed=elided,
+                    original_tokens=original_tokens,
+                    compressed_tokens=elided_tokens,
+                    language=language,
+                    context=context,
+                )
+                return elided, elided_tokens, strategy_chain
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
         if logger.isEnabledFor(logging.DEBUG):
             _log_router_debug(
@@ -3958,6 +4064,40 @@ class ContentRouter(Transform):
                 error=error,
             )
         return content, original_tokens, strategy_chain
+
+    def _elide_dense(self, text: str, context: str) -> tuple[str, int] | None:
+        """Dense-line elision with a CCR retrieval marker; None when no line is dense.
+
+        The elided middle is lossy, so the pre-elision block is stored in the
+        CCR store and a ``Retrieve original: hash=`` marker is appended, the
+        same contract Kompress honours: the messages path discards a lossy
+        result that carries no marker (#1307), and the agent can get the
+        exact bytes back if it turns out to need them.
+        """
+        # Lossy by nature: never in lossless mode, where nothing may be dropped.
+        if self.config.lossless:
+            return None
+        elided, n_dense = elide_dense_lines(text)
+        if not n_dense:
+            return None
+        if self.config.ccr_inject_marker:
+            try:
+                from ..cache.compression_store import get_compression_store
+
+                key = get_compression_store().store(
+                    text,
+                    elided,
+                    original_tokens=_estimate_tokens(text),
+                    compressed_tokens=_estimate_tokens(elided),
+                    query_context=context or None,
+                    compression_strategy="dense_elide",
+                )
+                noun = "line" if n_dense == 1 else "lines"
+                elided += f"\n[{n_dense} dense machine-generated {noun} elided. Retrieve original: hash={key}]"
+            except Exception as exc:  # noqa: BLE001 - store optional; keep the block verbatim
+                logger.debug("dense-line elision: CCR store unavailable (%s); skipping", exc)
+                return None
+        return elided, _estimate_tokens(elided)
 
     def _try_ml_compressor(
         self,
@@ -4099,6 +4239,18 @@ class ContentRouter(Transform):
                         # don't accept the kwarg are unaffected on the common path.
                         if protected:
                             compress_kwargs["ccr_original"] = content
+                        # One deadline for the whole request, not one per
+                        # block. Without this a request with N compressible
+                        # blocks gets N full deadlines and can run far past
+                        # the pipeline's own compression timeout; the worker
+                        # that overruns cannot be preempted, so it opens the
+                        # timeout-debt quarantine and every request behind it
+                        # forwards with no compression at all.
+                        deadline_origin = self._runtime_state_var.get().kompress_deadline_started_at
+                        if deadline_origin is not None and getattr(
+                            compressor, "shares_request_deadline", False
+                        ):
+                            compress_kwargs["_deadline_started_at"] = deadline_origin
                         result = compressor.compress(text_to_compress, **compress_kwargs)
                         compressed = result.compressed
                         compressed_tokens = result.compressed_tokens
@@ -5008,7 +5160,12 @@ class ContentRouter(Transform):
         # call does. No `reset()` is needed: every `apply()` call installs
         # its own fresh object up front, so the next call on a reused worker
         # thread simply overwrites the ambient value before reading it.
-        self._runtime_state_var.set(_PerRequestRuntimeState())
+        # The kompress deadline origin is stamped HERE, with the rest of the
+        # per-request state, so every block this call compresses draws down one
+        # shared budget instead of restarting it.
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(kompress_deadline_started_at=time.perf_counter())
+        )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:

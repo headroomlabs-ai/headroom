@@ -49,6 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.turn_hooks import (
     TurnContext,
@@ -61,7 +62,9 @@ from headroom.proxy.turn_hooks import (
 logger = logging.getLogger(__name__)
 
 # Keys that steer Headroom itself and must never reach the provider.
-BODY_CONTROL_KEYS: frozenset[str] = frozenset({"config", "gateway", "token_budget"})
+BODY_CONTROL_KEYS: frozenset[str] = frozenset(
+    {"config", "gateway", "token_budget", GATEWAY_RESPONSES_VIEW_MARKER}
+)
 
 OBLIGATION_REDRIVE = "redrive"
 OBLIGATION_RELAY_USAGE = "relay_usage"
@@ -517,6 +520,21 @@ class PendingTurn:
     # config.mode="ccr" with markers inserted and re-drive allowed: the
     # response half answers headroom_retrieve calls itself (see arm_ccr_redrive).
     ccr_armed: bool = False
+    # The wire shape this turn arrived in, when it is not the one `provider`
+    # implies: "openai_responses" for a Codex body. Deliberately separate from
+    # `provider`, which picks pricing, tokenizer and the upstream the gateway
+    # is advised to call -- all three want "openai" for a Responses turn while
+    # the tool-call shape and the re-drive body want "openai_responses".
+    wire_shape: str | None = None
+
+    @property
+    def tool_call_provider(self) -> str:
+        """The shape the CCR helpers read and write tool calls in."""
+        return self.wire_shape or self.provider
+
+    @property
+    def responses_shape(self) -> bool:
+        return self.wire_shape == "openai_responses"
 
     @property
     def hooks_armed(self) -> bool:
@@ -929,6 +947,7 @@ def arm_ccr_redrive(
     caps: GatewayCapabilities,
     mode: str | None,
     ccr_hashes: list[str],
+    responses_shape: bool = False,
 ) -> bool:
     """``config.mode="ccr"`` on the gateway contract: inject ``headroom_retrieve``
     and make the response half answer it.
@@ -955,7 +974,9 @@ def arm_ccr_redrive(
         for t in tools
     )
     if not present:
-        tools.append(create_ccr_tool_definition(provider))
+        tools.append(
+            create_ccr_tool_definition("openai_responses" if responses_shape else provider)
+        )
         result.transforms.append("ccr_tool_injected")
     result.tools = tools
     if result.ctx is not None:
@@ -979,7 +1000,7 @@ def make_response_runner(proxy: Any, turn: PendingTurn) -> Callable[..., Any]:
         handler = getattr(proxy, "ccr_response_handler", None)
         if turn.ccr_armed and handler is not None:
             try:
-                if handler.has_ccr_tool_calls(current, turn.provider):
+                if handler.has_ccr_tool_calls(current, turn.tool_call_provider):
 
                     async def api_call_fn(messages: list[dict[str, Any]], tools: Any) -> Any:
                         # Mirrors the chat path's continuation closure: the
@@ -989,7 +1010,11 @@ def make_response_runner(proxy: Any, turn: PendingTurn) -> Callable[..., Any]:
                         return await call_model(messages)
 
                     current = await handler.handle_response(
-                        current, ctx.messages, ctx.tools, api_call_fn, provider=turn.provider
+                        current,
+                        ctx.messages,
+                        ctx.tools,
+                        api_call_fn,
+                        provider=turn.tool_call_provider,
                     )
             except asyncio.CancelledError:
                 raise
@@ -1006,9 +1031,38 @@ def build_provider_body(
     tools: Any,
 ) -> dict[str, Any]:
     """The complete provider request: every pass-through field, final
-    ``messages`` and ``tools``; never the Headroom control keys."""
+    ``messages`` and ``tools``; never the Headroom control keys.
+
+    A Responses body (Codex) reached the handler as ``input`` and was given a
+    chat-shaped view under ``messages`` so the pipeline could work on it. Here
+    that goes back: the compressed text is written into ``input`` and the view
+    is dropped, so the gateway forwards the shape its client actually sent. If
+    the view cannot be mapped back confidently the original ``input`` is
+    forwarded uncompressed -- a smaller request is worth nothing next to a
+    transcript the provider will reject.
+    """
+    from headroom.proxy.gateway_responses import apply_view as apply_responses_view
+    from headroom.proxy.gateway_responses import carries_view, is_responses_body
+
     out = {k: v for k, v in body.items() if k not in BODY_CONTROL_KEYS}
-    out["messages"] = messages
+    if carries_view(body):
+        out, applied = apply_responses_view(out, messages)
+        out.pop("messages", None)
+        if not applied and messages:
+            # The transcript goes out as it arrived while the answer's
+            # `tokens_after` says otherwise, so say so once rather than let a
+            # gateway quietly report a saving that was not taken.
+            logger.warning(
+                "gateway turn: Responses view did not map back; forwarding the original input"
+            )
+    elif is_responses_body(out):
+        # A Responses body that never got a view: the bypass header returns
+        # before one is built. Adding `messages` here is a guaranteed 400
+        # ("Unsupported parameter: 'messages'"), so the safest path in the
+        # handler would have been the one that broke every Codex request.
+        pass
+    else:
+        out["messages"] = messages
     if tools is not None:
         out["tools"] = tools
     return out
@@ -1186,6 +1240,7 @@ def register_pending_turn(
     tags: dict[str, Any],
     client: str | None,
     ccr_armed: bool = False,
+    wire_shape: str | None = None,
 ) -> PendingTurn | None:
     """Register the turn when there is something to wait for; ``None`` otherwise."""
     registry = getattr(proxy, "gateway_turns", None)
@@ -1208,6 +1263,7 @@ def register_pending_turn(
         tags=tags,
         client=client,
         ccr_armed=ccr_armed,
+        wire_shape=wire_shape,
     )
     registry.register(turn)
     return turn
@@ -1348,7 +1404,23 @@ def _redrive_payload(turn: PendingTurn, step: Step) -> dict[str, Any]:
     its (possibly reloaded) tools, everything else exactly as the gateway sent.
     """
     redrive_body = dict(turn.body)
-    redrive_body["messages"] = step.messages
+    if turn.responses_shape:
+        # `turn.body` is the provider body: a Responses turn's transcript lives
+        # in `input`, and writing `messages` beside it -- even a null one --
+        # hands the gateway the shape the provider rejects. Fold the hook's
+        # messages back the way the request half did, and when a step carries
+        # none, leave the transcript exactly as it is.
+        if step.messages is not None:
+            from headroom.proxy.gateway_responses import apply_view as apply_responses_view
+
+            redrive_body, applied = apply_responses_view(redrive_body, step.messages)
+            if not applied and step.messages:
+                logger.warning(
+                    "gateway turn %s: re-drive view did not map back; sending the original input",
+                    turn.turn_id,
+                )
+    else:
+        redrive_body["messages"] = step.messages
     if step.tools is not None:
         redrive_body["tools"] = step.tools
     return {

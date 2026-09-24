@@ -13,6 +13,7 @@ from headroom.models import (
     list_models,
     register_model,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 
 class TestModelInfo:
@@ -285,8 +286,9 @@ class TestBuiltInModels:
         info = get_model_info("claude-3-5-sonnet-20241022")
         assert info.provider == "anthropic"
         assert info.context_window == 200000
-        # Pricing fetched from LiteLLM (falls back to alias for retired models)
-        pricing = ModelRegistry.get_pricing("claude-sonnet-4-20250514")
+        # Pricing comes from litellm's live table, so name a model it currently
+        # prices; the retired-id path is the MODEL_ALIASES assertion below.
+        pricing = ModelRegistry.get_pricing(anthropic_pricing_model())
         assert pricing is not None
         assert pricing[0] == 3.00  # input cost per 1M
         assert pricing[1] == 15.00  # output cost per 1M

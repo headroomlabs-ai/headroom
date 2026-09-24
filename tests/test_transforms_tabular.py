@@ -7,6 +7,7 @@ ingestion (spreadsheet_ingest / compress_spreadsheet).
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 
 import pytest
@@ -201,6 +202,28 @@ def test_compress_passes_through_ragged_table(monkeypatch) -> None:
     assert result.compressed == ragged
 
 
+def _csv_with_an_oversized_cell() -> str:
+    # csv.field_size_limit is 128 KB per cell; one pasted document, log excerpt
+    # or base64 blob in a column goes past it.
+    return "id,title,body\nl,short,ok\n2,long,{}\n".format("x" * 200_000)
+
+
+def test_parse_csv_gives_up_on_a_cell_past_the_field_size_limit() -> None:
+    headers, rows = parse_csv(_csv_with_an_oversized_cell())
+
+    # csv.Error: field larger than field limit (131072) before this.
+    assert (headers, rows) == ([], [])
+
+
+def test_compress_passes_through_a_table_with_an_oversized_cell() -> None:
+    content = _csv_with_an_oversized_cell()
+
+    result = TabularCompressor().compress(content)
+
+    assert not result.was_modified
+    assert result.compressed == content
+
+
 def test_parse_tabular_returns_none_for_non_tabular() -> None:
     assert parse_tabular("just a normal paragraph here") is None
 
@@ -383,6 +406,207 @@ def test_compress_spreadsheet_empty_workbook_returns_empty(tmp_path) -> None:
     result = compress_spreadsheet(str(path))
     assert result.messages == []
     assert result.tokens_saved == 0
+
+
+def test_load_xls_renders_cells_like_the_xlsx_loader(tmp_path) -> None:
+    """xlrd hands back the raw storage, not the value.
+
+    A date is the serial number Excel keeps it as, a boolean is 1 or 0, and
+    every number is a double, so a whole number arrives as ``12.0``. The two
+    loaders then disagree about the same workbook, and the date is no longer
+    recoverable from the text.
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "YYYY-MM-DD"
+
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    for column, heading in enumerate(["When", "Active", "Units", "Rate", "Text"]):
+        sheet.write(0, column, heading)
+    sheet.write(1, 0, datetime.date(2024, 1, 1), date_style)
+    sheet.write(1, 1, True)
+    sheet.write(1, 2, 12)
+    sheet.write(1, 3, 1.5)
+    sheet.write(1, 4, "ok")
+    path = tmp_path / "legacy.xls"
+    book.save(path)
+
+    rows = load_spreadsheet(path)["Data"].splitlines()
+
+    assert rows[0] == "When,Active,Units,Rate,Text"
+    # 45292.0,1,12.0,1.5,ok before this.
+    assert rows[1] == "2024-01-01 00:00:00,True,12,1.5,ok"
+
+
+def test_load_xls_renders_a_time_only_cell_as_a_time(tmp_path) -> None:
+    """A time carries no date, so xlrd reports year, month and day as zero."""
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    time_style = xlwt.XFStyle()
+    time_style.num_format_str = "HH:MM:SS"
+
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    sheet.write(0, 0, "Starts")
+    sheet.write(1, 0, datetime.time(12, 0, 0), time_style)
+    xls_path = tmp_path / "legacy.xls"
+    book.save(xls_path)
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["Starts"])
+    worksheet.append([datetime.time(12, 0, 0)])
+    xlsx_path = tmp_path / "modern.xlsx"
+    workbook.save(xlsx_path)
+
+    # ValueError: year 0 is out of range before this.
+    assert load_spreadsheet(xls_path)["Data"] == load_spreadsheet(xlsx_path)["Data"]
+    assert load_spreadsheet(xls_path)["Data"].splitlines()[1] == "12:00:00"
+
+
+def test_load_xls_and_xlsx_agree_above_the_exact_integer_range(tmp_path) -> None:
+    """A double cannot hold consecutive integers past 2**53.
+
+    ``_xls_cell`` converted any integral double with ``int()``, so a sheet
+    holding 123456789012345678 rendered the double's exact value, 123456789012345680
+    -- two fabricated digits presented to an agent as a precise identifier. The
+    .xlsx loader has always rendered the float, which at least says
+    "approximate", so bounding the conversion to the exactly-representable range
+    keeps the ``12.0 -> 12`` fix from #3616 and restores agreement (#3695).
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    small, big = 12, 1.2345678901234568e17
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Small")
+    xls_sheet.write(0, 1, "Big")
+    xls_sheet.write(1, 0, small)
+    xls_sheet.write(1, 1, big)
+    xls_path = tmp_path / "legacy.xls"
+    xls_book.save(xls_path)
+
+    # openpyxl is the reference the .xls path is written against, so the expected
+    # rendering is the float repr it yields for the same value.
+    openpyxl_wb = openpyxl.Workbook()
+    openpyxl_sheet = openpyxl_wb.active
+    openpyxl_sheet.title = "Data"
+    openpyxl_sheet.append(["Small", "Big"])
+    openpyxl_sheet.append([small, big])
+    openpyxl_wb.save(tmp_path / "modern.xlsx")
+
+    xls_row = load_spreadsheet(xls_path)["Data"].splitlines()[1]
+    xlsx_row = load_spreadsheet(tmp_path / "modern.xlsx")["Data"].splitlines()[1]
+    small_field, big_field = xls_row.split(",")
+
+    # The #3616 win has to survive the bound: a small whole number is still an int.
+    assert small_field == "12"
+    # And the fabricated integer must be gone: the cell is rendered as the double
+    # it is, which reads as an approximation instead of an exact identifier.
+    assert big_field == repr(big)
+    assert big_field != str(int(big))
+    # Parity, asserted against the other loader rather than against my own
+    # expectation. Small values agree verbatim; above the range openpyxl writes a
+    # double with only 15 significant digits, so that side loses a digit on its
+    # own and the rows cannot be string-equal. The promise this fix makes is
+    # about magnitude: the two loaders agree to well within one unit in the last
+    # place of the stored value (16 here), and neither hands the agent the
+    # exact-looking decimal of the typed number.
+    xlsx_small, xlsx_big = xlsx_row.split(",")
+    assert small_field == xlsx_small == "12"
+    assert abs(float(big_field) - float(xlsx_big)) <= 16
+
+
+def test_load_xls_and_xlsx_agree_at_the_exact_integer_boundary(tmp_path) -> None:
+    """2**53 and -2**53 are exactly representable and openpyxl loads them as
+    integers, so the .xls path must convert them too - the bound is inclusive.
+    One step outside, the double cannot hold the value; what matters is that no
+    digits are invented, and the two loaders then differ only in the trailing
+    ``.0`` that marks a value as approximate.
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    boundary = 2**53
+    values = [boundary, -boundary, boundary - 2, boundary + 2]
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Value")
+    for row, value in enumerate(values, start=1):
+        xls_sheet.write(row, 0, float(value))
+    xls_path = tmp_path / "boundary.xls"
+    xls_book.save(xls_path)
+
+    xlsx_wb = openpyxl.Workbook()
+    xlsx_sheet = xlsx_wb.active
+    xlsx_sheet.title = "Data"
+    xlsx_sheet.append(["Value"])
+    for value in values:
+        xlsx_sheet.append([int(value)])
+    xlsx_path = tmp_path / "boundary.xlsx"
+    xlsx_wb.save(xlsx_path)
+
+    xls = [line.split(",")[0] for line in load_spreadsheet(xls_path)["Data"].splitlines()[1:]]
+    xlsx = [line.split(",")[0] for line in load_spreadsheet(xlsx_path)["Data"].splitlines()[1:]]
+
+    # Inside the range (and exactly on it) the two loaders agree verbatim.
+    assert xls[0] == xlsx[0] == "9007199254740992"
+    assert xls[1] == xlsx[1] == "-9007199254740992"
+    assert xls[2] == xlsx[2] == "9007199254740990"
+    # Above it the .xls side keeps the float marker, and the digits are the same.
+    assert xls[3].removesuffix(".0") == xlsx[3] == "9007199254740994"
+    assert all(not field.endswith(".0") or float(field) == int(float(field)) for field in xls)
+
+
+def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
+    """The reference: openpyxl is what the .xls path is matching."""
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "YYYY-MM-DD"
+    book = xlwt.Workbook()
+    sheet = book.add_sheet("Data")
+    sheet.write(0, 0, "When")
+    sheet.write(0, 1, "Active")
+    sheet.write(0, 2, "Units")
+    sheet.write(1, 0, datetime.date(2024, 1, 1), date_style)
+    sheet.write(1, 1, True)
+    sheet.write(1, 2, 12)
+    xls_path = tmp_path / "legacy.xls"
+    book.save(xls_path)
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Data"
+    worksheet.append(["When", "Active", "Units"])
+    worksheet.append([datetime.date(2024, 1, 1), True, 12])
+    xlsx_path = tmp_path / "modern.xlsx"
+    workbook.save(xlsx_path)
+
+    assert load_spreadsheet(xls_path) == load_spreadsheet(xlsx_path)
 
 
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:

@@ -123,18 +123,34 @@ class TestDeepSeekLiteLLMInjection:
         # get_llm_provider(). Bare model names without a provider prefix
         # would fail with BadRequestError.
         resolved = resolve_litellm_model("deepseek-v4-flash")
+        # The point of this test is RESOLUTION: an unprefixed name raises
+        # BadRequestError out of get_llm_provider(), so reaching a price at all
+        # is the assertion. Not raising is half of it.
         input_cost, output_cost = litellm.cost_per_token(
             model=resolved,
             prompt_tokens=1_000_000,
             completion_tokens=1_000_000,
         )
         active_pricing = litellm.model_cost["deepseek-v4-flash"]
-        assert input_cost == pytest.approx(
-            active_pricing["input_cost_per_token"] * 1_000_000,
-        )
-        assert output_cost == pytest.approx(
-            active_pricing["output_cost_per_token"] * 1_000_000,
-        )
+        list_input = active_pricing["input_cost_per_token"] * 1_000_000
+        list_output = active_pricing["output_cost_per_token"] * 1_000_000
+
+        # DeepSeek discounts 50% during its off-peak window (16:30-00:30 UTC),
+        # and litellm applies that inside cost_per_token
+        # (`apply_off_peak_pricing`) while leaving `model_cost` at list. So
+        # asserting equality with the catalog made this test pass for 16 hours a
+        # day and fail for the other 8 — it broke CI at 18:56 UTC having passed
+        # that morning. Wall-clock-dependent pricing has bitten this file before
+        # (#2428); assert the RELATIONSHIP that holds at every hour instead.
+        for cost, listed, label in (
+            (input_cost, list_input, "input"),
+            (output_cost, list_output, "output"),
+        ):
+            assert cost > 0, f"{label} cost should be priced, not zero"
+            assert cost == pytest.approx(listed) or cost == pytest.approx(listed * 0.5), (
+                f"{label} cost {cost} is neither list ({listed}) nor the "
+                f"documented off-peak half ({listed * 0.5})"
+            )
 
     def test_resolve_litellm_model_prefixes_deepseek(self):
         from headroom.pricing.litellm_pricing import resolve_litellm_model

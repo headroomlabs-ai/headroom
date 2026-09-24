@@ -28,6 +28,7 @@ from headroom.proxy.compress_turn import (
     register_compress_turn_extension,
     registered_compress_turn_extensions,
 )
+from headroom.proxy.gateway_responses import carries_view
 from headroom.proxy.gateway_turn import (
     OBLIGATION_RELAY_USAGE,
     GatewayCapabilities,
@@ -80,6 +81,10 @@ class GatewayTurn:
         self.caps = caps
         self.client = client
         self.provider = provider_for_model(str(body.get("model") or ""))
+        # The wire shape is a property of the body, not of the model name, and
+        # it is fixed for the life of the turn: the response half has to write
+        # a re-drive in the same shape the request half read.
+        self.responses_shape = carries_view(body)
         self.model_name = str(body.get("model") or "")
         self.tags: dict[str, Any] = {}
         self._transformer: RequestTransformer | None = None
@@ -158,6 +163,7 @@ class GatewayTurn:
             caps=self.caps,
             mode=mode,
             ccr_hashes=ccr_hashes,
+            responses_shape=self.responses_shape,
         )
         transforms = list(transforms_applied or ()) + list(result.transforms)
         # Gateway fields are built BEFORE the outcome: output shaping runs on
@@ -208,11 +214,16 @@ class GatewayTurn:
                 if provider_body.get("tools") is not None:
                     provider_body["tools"] = tools
                 transforms.append("cache_breakpoint_budget")
-        # I-BODY: top-level `messages` and `body.messages` are one list.
+        # I-BODY: top-level `messages` and `body.messages` are one list --
+        # `body.messages` is authoritative because the cache-breakpoint guard
+        # above may have replaced it. A Responses body has no `body.messages`
+        # at all (its transcript went back into `input`), so the top-level
+        # field falls back to the list this turn actually transformed: the two
+        # still describe the same content, which is what the invariant is for.
         return FinishedTurn(
             fields=self._fields,
             transforms=transforms,
-            messages=self._fields["body"]["messages"],
+            messages=self._fields["body"].get("messages", messages),
         )
 
     def commit(
@@ -242,6 +253,7 @@ class GatewayTurn:
             tags=self.tags,
             client=self.client,
             ccr_armed=self._ccr_armed,
+            wire_shape="openai_responses" if self.responses_shape else None,
         )
         return defer
 

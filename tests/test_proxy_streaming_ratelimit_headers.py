@@ -46,6 +46,7 @@ class TestStreamingRatelimitHeaderForwarding:
         proxy.metrics = MagicMock()
         proxy.metrics.record_request = AsyncMock(return_value=None)
         proxy.metrics.record_failed = AsyncMock(return_value=None)
+        proxy.metrics.record_rate_limited = AsyncMock(return_value=None)
         proxy.cost_tracker = MagicMock()
         proxy.cost_tracker.estimate_cost.return_value = 0.001
         proxy.cost_tracker.record_request.return_value = None

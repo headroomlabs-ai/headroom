@@ -210,7 +210,7 @@
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">
                     <section class="bg-surface rounded-lg p-4 border border-border">
                         <h3 class="mb-3 text-sm font-medium text-gray-300">Request Health</h3>
-                        <div class="grid grid-cols-2 gap-3 text-sm"><div>Completed <span class="float-right tabular-nums" x-text="formatNumber(stats.requests?.total || 0)"></span></div><div>Failed <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.requests?.failed || 0)"></span></div><div>Rate Limited <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.requests?.rate_limited || 0)"></span></div><div>Cached <span class="float-right tabular-nums text-cyan-400" x-text="formatNumber(stats.requests?.cached || 0)"></span></div></div>
+                        <div class="grid grid-cols-2 gap-3 text-sm"><div>Completed <span class="float-right tabular-nums" x-text="formatNumber(stats.requests?.total || 0)"></span></div><div title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.requests?.failed || 0)"></span></div><div title="Requests rejected with 429 — by Headroom&#39;s own rate limiter or by the upstream provider. /stats splits them under requests.rate_limited_by_source.">Rate Limited <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.requests?.rate_limited || 0)"></span></div><div>Cached <span class="float-right tabular-nums text-cyan-400" x-text="formatNumber(stats.requests?.cached || 0)"></span></div></div>
                     </section>
                     <section class="bg-surface rounded-lg p-4 border border-border">
                         <h3 class="mb-3 text-sm font-medium text-gray-300">Live Activity</h3>
@@ -418,7 +418,7 @@
                                 <span class="font-mono text-sm" x-text="((stats.ttfb?.min_ms || 0) / 1000).toFixed(2) + ' - ' + ((stats.ttfb?.max_ms || 0) / 1000).toFixed(2) + 's'"></span>
                             </div>
                             <div class="flex justify-between items-center">
-                                <span class="text-sm text-gray-400">Failed Requests</span>
+                                <span class="text-sm text-gray-400" title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed Requests</span>
                                 <span class="font-mono text-sm" x-text="stats.requests?.failed || 0"></span>
                             </div>
                             <!-- Per-transform timing breakdown -->
@@ -1470,14 +1470,14 @@
                 </div>
                 <div class="grid grid-cols-2 gap-4 mb-6 md:grid-cols-4">
                     <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Requests</div><div class="text-2xl tabular-nums" x-text="formatNumber(lifetimeStats.requests?.total || 0)"></div></div>
-                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Failed</div><div class="text-2xl tabular-nums text-red-400" x-text="formatNumber(lifetimeStats.requests?.failed || 0)"></div></div>
-                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Rate Limited</div><div class="text-2xl tabular-nums text-amber-400" x-text="formatNumber(lifetimeStats.requests?.rate_limited || 0)"></div></div>
+                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500" title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed</div><div class="text-2xl tabular-nums text-red-400" x-text="formatNumber(lifetimeStats.requests?.failed || 0)"></div></div>
+                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500" title="Requests rejected with 429 — by Headroom&#39;s own rate limiter or by the upstream provider. /stats splits them under requests.rate_limited_by_source.">Rate Limited</div><div class="text-2xl tabular-nums text-amber-400" x-text="formatNumber(lifetimeStats.requests?.rate_limited || 0)"></div></div>
                     <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Cached</div><div class="text-2xl tabular-nums text-cyan-400" x-text="formatNumber(lifetimeStats.requests?.cached || 0)"></div></div>
                 </div>
 
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-3">
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Tokens</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.input || 0)"></dd></div><div class="flex justify-between"><dt>Output</dt><dd x-text="formatNumber(lifetimeStats.tokens?.output || 0)"></dd></div><div class="flex justify-between"><dt>Attempted Input</dt><dd x-text="formatNumber(lifetimeStats.tokens?.attempted_input || 0)"></dd></div><div class="flex justify-between"><dt>Saved</dt><dd class="text-emerald-400" x-text="formatNumber(lifetimeStats.tokens?.saved || 0)"></dd></div><div class="flex justify-between"><dt>Token Savings</dt><dd x-text="lifetimeStats.tokens?.token_savings_percent == null ? '—' : lifetimeStats.tokens.token_savings_percent.toFixed(1) + '%'"></dd></div></dl></section>
-                    <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Cost</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input cost</dt><dd x-text="'$' + formatCurrency(lifetimeStats.cost?.input_usd || 0)"></dd></div><div class="flex justify-between"><dt>Compression saved</dt><dd class="text-emerald-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.compression_savings_usd || 0)"></dd></div><div class="flex justify-between"><dt>Prefix Cache saved</dt><dd class="text-cyan-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.cache_savings_usd || 0)"></dd></div></dl></section>
+                    <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Cost</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Input cost</dt><dd x-text="'$' + formatCurrency(lifetimeStats.cost?.input_usd || 0)"></dd></div><div class="flex justify-between"><dt title="What the removed tokens would actually have been billed at, given the cache mix of the requests they came out of.">Compression saved</dt><dd class="text-emerald-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.compression_savings_usd || 0)"></dd></div><div class="flex justify-between text-xs text-gray-500" x-show="showSavingsCeiling()"><dt title="The same tokens at flat list price. This is an upper bound: it assumes every removed token would have been a cache MISS, which is true only for the first request of a cache window.">at list price</dt><dd x-text="'$' + formatCurrency(lifetimeStats.cost?.compression_savings_list_usd || 0)"></dd></div><div class="flex justify-between text-xs text-amber-500" x-show="savingsBasisNote()"><dt>basis</dt><dd x-text="savingsBasisNote()"></dd></div><div class="flex justify-between"><dt>Prefix Cache saved</dt><dd class="text-cyan-400" x-text="'$' + formatCurrency(lifetimeStats.cost?.cache_savings_usd || 0)"></dd></div></dl></section>
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Prefix Cache</h3><dl class="space-y-2 text-sm"><div class="flex justify-between"><dt>Hits / requests</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.hit_requests || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.requests || 0)"></dd></div><div class="flex justify-between"><dt>Hit rate</dt><dd x-text="lifetimeStats.prefix_cache?.cache_hit_rate == null ? '—' : lifetimeStats.prefix_cache.cache_hit_rate.toFixed(1) + '%'"></dd></div><div class="flex justify-between"><dt>Read / write</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.cache_read_tokens || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.cache_write_tokens || 0)"></dd></div><div class="flex justify-between"><dt>TTL 1h / 5m</dt><dd x-text="(lifetimeStats.prefix_cache?.ttl_1h_percent == null ? '—' : lifetimeStats.prefix_cache.ttl_1h_percent.toFixed(0) + '%') + ' / ' + (lifetimeStats.prefix_cache?.ttl_5m_percent == null ? '—' : lifetimeStats.prefix_cache.ttl_5m_percent.toFixed(0) + '%')"></dd></div><div class="flex justify-between"><dt>Cache bust</dt><dd x-text="formatNumber(lifetimeStats.prefix_cache?.bust_count || 0) + ' / ' + formatNumber(lifetimeStats.prefix_cache?.bust_tokens || 0)"></dd></div></dl></section>
                 </div>
 
@@ -2295,6 +2295,33 @@
                     if (n >= 0.01) return n.toFixed(3);
                     if (n > 0) return n.toFixed(4);
                     return '0.00';
+                },
+
+                // Show the list-price ceiling only when it materially differs from
+                // the cache-aware headline. On a cold-cache workload the two
+                // legitimately coincide and a duplicate row is just noise.
+                showSavingsCeiling() {
+                    const eff = this.lifetimeStats.cost?.compression_savings_usd || 0;
+                    const list = this.lifetimeStats.cost?.compression_savings_list_usd || 0;
+                    if (list <= 0) return false;
+                    return Math.abs(list - eff) / list >= 0.01;
+                },
+
+                // Caveat the headline when it rests on something weaker than
+                // per-model catalog rates. A catalog-priced total needs none.
+                savingsBasisNote() {
+                    const basis = this.lifetimeStats.cost?.savings_basis;
+                    switch (basis) {
+                        case 'list':
+                        case 'no-mix':
+                            return 'list-priced (no cache data) — real saving likely lower';
+                        case 'provider-ratio':
+                            return 'provider ratio (model publishes no cache pricing)';
+                        case 'unpriced':
+                            return 'partly unpriced';
+                        default:
+                            return '';
+                    }
                 },
 
                 formatResetTime(seconds) {

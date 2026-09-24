@@ -4,6 +4,11 @@ path it blocked the event loop for ~10 minutes and zombified the server. The fix
 tries the local HF cache first (local_files_only=True), bounds the network attempt
 with HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS on a daemon thread, and fails open to
 estimation — caching the failure so the hub is probed at most once per process.
+
+The repo ids below are real shipped ones because _load_tokenizer now refuses
+anything off the tokenizer allowlist before it reaches the loading path at all
+(see test_huggingface_tokenizer_allowlist.py); a placeholder name would short
+out these tests by being rejected rather than exercising the timeout.
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ def test_local_cache_tried_before_network(monkeypatch: pytest.MonkeyPatch) -> No
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "5")
 
-    assert _load_tokenizer("some/model") == "network-tokenizer"
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "network-tokenizer"
     assert calls[0].get("local_files_only") is True, "first attempt must be cache-only"
     assert not calls[1].get("local_files_only")
 
@@ -64,7 +69,7 @@ def test_cache_hit_never_touches_network(monkeypatch: pytest.MonkeyPatch) -> Non
 
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
 
-    assert _load_tokenizer("some/model") == "cached-tokenizer"
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "cached-tokenizer"
     assert len(calls) == 1
     assert calls[0].get("local_files_only") is True
 
@@ -80,12 +85,12 @@ def test_slow_network_load_times_out_and_fails_open(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "0.2")
 
     start = time.monotonic()
-    assert _load_tokenizer("slow/model") is None
+    assert _load_tokenizer("Qwen/Qwen2-7B") is None
     assert time.monotonic() - start < 5, "load must unblock at the timeout, not the download"
 
     # Failure is cached (lru_cache) — the second call must not re-probe the hub.
     start = time.monotonic()
-    assert _load_tokenizer("slow/model") is None
+    assert _load_tokenizer("Qwen/Qwen2-7B") is None
     assert time.monotonic() - start < 0.05
 
 
@@ -98,7 +103,7 @@ def test_timeout_zero_disables_network_loading(monkeypatch: pytest.MonkeyPatch) 
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "0")
 
-    assert _load_tokenizer("offline/model") is None
+    assert _load_tokenizer("google/gemma-7b") is None
 
 
 def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch) -> None:

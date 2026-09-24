@@ -25,7 +25,8 @@ import json
 import logging
 import sys
 from collections import deque
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -80,6 +81,10 @@ def redact_image_base64(payload: Any) -> Any:
         with _redactions_lock:
             _redactions_total += result.redactions
     return result.value
+
+
+# Payload fields `get_recent` never returns and therefore must never walk.
+_HEAVY_FIELDS = frozenset({"request_messages", "compressed_messages", "response_content"})
 
 
 class RequestLogger:
@@ -147,19 +152,36 @@ class RequestLogger:
         """Get recent log entries (without request/compressed messages and response_content)."""
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
+        # Not asdict(): that deep-copies every field BEFORE the heavy ones are
+        # dropped, so each entry cost a full walk of its request_messages and
+        # compressed_messages (~3.4 ms for a 400 KB Claude Code transcript).
+        # /stats calls this with n=10_000 synchronously on the event loop, so
+        # a full deque made every /stats build take ~30 s and a dashboard
+        # polling it starved /v1/messages. The retained fields are still
+        # deep-copied, so callers cannot reach nested containers (tags,
+        # savings_breakdown) that the in-memory log owns.
         return [
-            {
-                k: v
-                for k, v in asdict(e).items()
-                if k not in ("request_messages", "compressed_messages", "response_content")
-            }
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
             for e in entries
         ]
 
-    def get_recent_with_messages(self, n: int = 20) -> list[dict]:
-        """Get recent log entries including full request/response messages."""
+    def get_recent_with_messages(self, n: int = 20, include_messages: bool = True) -> list[dict]:
+        """Get recent log entries including full request/response messages.
+
+        ``include_messages=False`` returns the same entries without
+        ``request_messages`` / ``compressed_messages`` / ``response_content``,
+        and without walking them: ``asdict`` deep-copies every field, so a
+        caller that only reads the per-request numbers otherwise pays for a
+        full copy of each transcript (~160 KB per Claude Code turn, ~44 MB per
+        ``limit=100`` feed pull) on the event loop.
+        """
         entries = list(self._logs)[-n:]
-        return [asdict(e) for e in entries]
+        if include_messages:
+            return [asdict(e) for e in entries]
+        return [
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
+            for e in entries
+        ]
 
     def stats(self) -> dict:
         """Get logging statistics."""
