@@ -4160,9 +4160,7 @@ class OpenAIHandlerMixin:
                         f"hashes_seen={len(injector.detected_hashes)})"
                     )
 
-        # Skip after a replay: the replayed prefix is the bytes the provider
-        # cached, and restoring raw originals over it busts that cache.
-        if is_cache_mode(self.config.mode) and not _final.replayed:
+        if is_cache_mode(self.config.mode):
             optimized_messages, restored_count = self._restore_frozen_prefix(
                 original_client_messages,
                 optimized_messages,
@@ -4173,6 +4171,17 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
                     "to preserve cache stability (openai)"
                 )
+            # The restore writes raw client originals, but the provider cached
+            # what we forwarded last turn. Replay that over the restored result;
+            # the overlay's own checks keep the originals wherever replay is not
+            # provably safe. Token counts are recomputed from the final body below.
+            optimized_messages = finalize_turn(
+                optimized_messages,
+                original_client_messages,
+                openai_prefix_tracker.get_last_original_messages(),
+                openai_prefix_tracker.get_last_forwarded_messages(),
+                confirmed_frozen_count=_openai_confirmed_frozen,
+            ).messages
 
         # Memory: inject context and tools for OpenAI requests.
         #

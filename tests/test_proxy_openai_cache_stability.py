@@ -634,3 +634,140 @@ def test_openai_cache_mode_keeps_replayed_prefix_over_frozen_restore() -> None:
         previous_forwarded[0],
         {"role": "user", "content": "new suffix"},
     ]
+
+
+def _forward_cache_mode_chat(
+    tracker: _FakePrefixTracker,
+    messages: list[dict],
+    *,
+    mutate_index: int | None = None,
+) -> list[dict]:
+    """Send one cache-mode chat turn and return the messages forwarded upstream.
+
+    ``mutate_index`` makes the fake pipeline rewrite that message, standing in
+    for a transform that touched a frozen position."""
+    captured: dict = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+        proxy.session_tracker_store.resolve_tracker = lambda *args, **kwargs: tracker
+
+        def _fake_apply(**kwargs):
+            out = list(kwargs["messages"])
+            if mutate_index is not None:
+                out[mutate_index] = {**out[mutate_index], "content": "MUTATED_BY_PIPELINE"}
+            return SimpleNamespace(
+                messages=out,
+                transforms_applied=[],
+                timing={},
+                tokens_before=20,
+                tokens_after=20,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_restore_replay",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={"model": "gpt-4o-mini", "messages": messages},
+        )
+    assert response.status_code == 200
+    return captured["body"]["messages"]
+
+
+def test_openai_cache_mode_replays_only_up_to_the_first_changed_message() -> None:
+    """Replay stops where the client's history diverges. Past that point the
+    frozen messages are restored to the client's bytes, so a pipeline rewrite
+    of a frozen message never reaches the provider, even on a replayed turn."""
+    previous_original = [
+        {"role": "user", "content": "first original " * 20},
+        {"role": "user", "content": "second original " * 20},
+    ]
+    previous_forwarded = [
+        {"role": "user", "content": "first comp"},
+        {"role": "user", "content": "second comp"},
+    ]
+    current = [
+        previous_original[0],
+        {"role": "user", "content": "second edited by the client"},
+        {"role": "user", "content": "new suffix"},
+    ]
+
+    forwarded = _forward_cache_mode_chat(
+        _FakePrefixTracker(2, previous_original, previous_forwarded),
+        current,
+        mutate_index=1,
+    )
+
+    assert forwarded == [previous_forwarded[0], current[1], current[2]]
+
+
+def test_openai_cache_mode_keeps_restored_originals_when_history_diverges() -> None:
+    """A rewritten history head has no safe replay: the restored originals go out."""
+    previous_original = [{"role": "user", "content": "original prefix"}]
+    previous_forwarded = [{"role": "user", "content": "comp"}]
+    current = [
+        {"role": "user", "content": "client rewrote the head"},
+        {"role": "user", "content": "new suffix"},
+    ]
+
+    forwarded = _forward_cache_mode_chat(
+        _FakePrefixTracker(1, previous_original, previous_forwarded),
+        current,
+        mutate_index=0,
+    )
+
+    assert forwarded == current
+
+
+def test_openai_cache_mode_block_append_replay_survives_the_restore() -> None:
+    """Blocks appended inside the last message: forwarded blocks, then new ones."""
+    previous_original = [{"role": "user", "content": [{"type": "text", "text": "block one " * 30}]}]
+    previous_forwarded = [{"role": "user", "content": [{"type": "text", "text": "[compacted]"}]}]
+    current = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "block one " * 30},
+                {"type": "text", "text": "block two"},
+            ],
+        }
+    ]
+
+    forwarded = _forward_cache_mode_chat(
+        _FakePrefixTracker(1, previous_original, previous_forwarded), current
+    )
+
+    assert forwarded == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "[compacted]"},
+                {"type": "text", "text": "block two"},
+            ],
+        }
+    ]
