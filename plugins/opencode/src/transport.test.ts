@@ -386,6 +386,31 @@ describe("Headroom OpenCode transport", () => {
     }
   });
 
+  it("hides child process windows on Windows", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({
+      on: vi.fn(),
+      once: vi.fn(),
+      emit: vi.fn(),
+      kill: vi.fn(),
+      killed: false,
+      pid: 123,
+    }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+      childProcess.spawn("node", ["agent.js"]);
+
+      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { windowsHide: boolean };
+      expect(options.windowsHide).toBe(true);
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
   it("sends x-headroom-project header on routed fetch calls when project is set", async () => {
     const originalFetch = globalThis.fetch;
     const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
