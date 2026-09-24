@@ -50,6 +50,7 @@ from threading import Lock
 
 import httpx
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, is_offline, note_refusal
 from headroom.subscription.base import QuotaTracker
 
 logger = logging.getLogger(__name__)
@@ -445,6 +446,7 @@ def _build_usage_headers(request_headers: dict[str, str]) -> dict[str, str] | No
 async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
     state = get_codex_rate_limit_state()
     try:
+        guard_egress("Codex rate-limit polling", url)
         async with httpx.AsyncClient(timeout=_USAGE_POLL_TIMEOUT_S) as client:
             resp = await client.get(url, headers=headers)
         if resp.status_code == 200:
@@ -454,6 +456,12 @@ async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
                 logger.debug("codex usage poll: 200 but no usable rate-limit data")
         else:
             logger.debug("codex usage poll: HTTP %s", resp.status_code)
+    except OfflineEgressBlocked as blocked:
+        # Background task: report the refusal as a sentence. Letting a
+        # BaseException out of a bare ``create_task`` surfaces as "Task
+        # exception was never retrieved" whenever the GC gets round to it,
+        # which is a traceback with no explanation in it.
+        note_refusal(blocked, logger)
     except Exception as exc:  # pragma: no cover - network/JSON defensive
         logger.debug("codex usage poll failed: %s", exc)
     finally:
@@ -474,6 +482,12 @@ def maybe_schedule_usage_poll(
     """
     headers = _build_usage_headers(request_headers)
     if headers is None:
+        return False
+    if is_offline():
+        # Cheap pre-check so an air-gapped proxy does not spawn (and log) a
+        # doomed task on every single Codex request. The guard inside
+        # _fetch_and_store_usage is still the thing that makes the refusal
+        # true; this only keeps the log and the event loop quiet.
         return False
     try:
         loop = asyncio.get_running_loop()

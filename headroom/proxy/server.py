@@ -96,7 +96,13 @@ from headroom.observability import (
     shutdown_headroom_tracing,
     shutdown_otel_metrics,
 )
-from headroom.offline import apply_offline_env, is_offline
+from headroom.offline import (
+    OFFLINE_ENV,
+    OfflineEgressBlocked,
+    apply_offline_env,
+    guard_egress,
+    is_offline,
+)
 from headroom.pipeline import PipelineExtensionManager, PipelineStage
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
@@ -660,6 +666,89 @@ def _check_rust_core() -> tuple[str, str | None]:
 
     logger.info("event=rust_core_loaded marker=%r", marker)
     return ("loaded", None)
+
+
+def _refuse_offline_egress(blocked: OfflineEgressBlocked, feature: str, fix: str) -> None:
+    """Turn a startup-time air-gap refusal into a clean exit, never a traceback.
+
+    ``OfflineEgressBlocked`` derives from ``BaseException``, so nothing in the
+    lifespan's own ``except Exception`` will catch it and it would otherwise
+    escape uvicorn as an unhandled error — killing a proxy that had been
+    serving traffic, with a stack trace instead of an explanation, and before
+    ``app.state.startup_error`` exists to record why. ``_check_rust_core``
+    above already settled the shape for a startup refusal: say what is wrong,
+    say how to fix it, exit 78 (``EX_CONFIG``).
+    """
+    msg = (
+        f"FATAL: {feature} needs outbound network access, but "
+        f"{OFFLINE_ENV}=1 forbids it.\n"
+        f"    refused: {blocked}\n"
+        f"    fix:     {fix}\n"
+    )
+    logger.error(
+        "event=offline_egress_refused feature=%r reason=%r action=exit_78",
+        feature,
+        str(blocked),
+    )
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(_EXIT_CONFIG)
+
+
+def _configure_observability_or_refuse() -> None:
+    """Install the metric/trace exporters, refusing cleanly under an air-gap.
+
+    Both exporters call ``guard_egress`` before they build a client, so under
+    ``HEADROOM_OFFLINE`` they raise rather than dial. Catching that here is what
+    keeps the refusal a refusal: these two calls sit OUTSIDE ``lifespan``'s own
+    ``try``/``except Exception``, and ``OfflineEgressBlocked`` is a
+    ``BaseException``, so an uncaught one escapes uvicorn as an unhandled error
+    — a proxy that had been serving traffic dies on a traceback with
+    ``app.state.startup_error`` never set.
+    """
+    _preflight_offline_egress()
+    try:
+        configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
+    except OfflineEgressBlocked as blocked:
+        _refuse_offline_egress(
+            blocked,
+            "OTLP metric export (HEADROOM_OTEL_METRICS_ENABLED)",
+            "set HEADROOM_OTEL_METRICS_EXPORTER=console or scrape /metrics "
+            "(both stay on-box), or unset HEADROOM_OTEL_METRICS_ENABLED",
+        )
+    try:
+        configure_langfuse_tracing(
+            LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
+        )
+    except OfflineEgressBlocked as blocked:
+        _refuse_offline_egress(
+            blocked,
+            "Langfuse OTLP trace export (HEADROOM_LANGFUSE_ENABLED)",
+            "unset HEADROOM_LANGFUSE_ENABLED; Langfuse ingestion has no on-box mode",
+        )
+
+
+def _preflight_offline_egress() -> None:
+    """Refuse, at startup, any configuration that asks for egress while offline.
+
+    Runs before the observability exporters are configured and before the
+    compressors are preloaded. Without it the same contradiction surfaces later
+    and worse: the OTLP exporter raised out of ``lifespan`` with a raw
+    traceback, and the remote Kompress endpoint was not noticed until a request
+    reached for the compressor.
+    """
+    if not is_offline():
+        return
+    endpoint = os.environ.get("HEADROOM_KOMPRESS_ENDPOINT", "").strip()
+    if endpoint:
+        try:
+            guard_egress("remote Kompress inference", endpoint)
+        except OfflineEgressBlocked as blocked:
+            _refuse_offline_egress(
+                blocked,
+                "remote Kompress compression (HEADROOM_KOMPRESS_ENDPOINT)",
+                "unset HEADROOM_KOMPRESS_ENDPOINT to use the local Kompress "
+                "model, or unset " + OFFLINE_ENV + " if this box is not air-gapped",
+            )
 
 
 # Compression pipeline timeout in seconds
@@ -2903,15 +2992,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
-    # it, force HF/transformers offline before any model code loads, and
-    # announce that every outbound path is disabled.
+    # it, force HF/transformers offline before any model code loads, and say
+    # what is covered.
+    #
+    # The banner names the exception rather than claiming a whole-process kill
+    # switch, and the exception is permanent rather than a to-do: a proxy that
+    # refused to forward the caller's request to the caller's own upstream
+    # would not be a proxy. Every connection Headroom itself initiates IS
+    # refused; tests/test_offline_egress_chokepoint.py fails the build if a new
+    # egress path appears that is neither guarded nor one of the four written
+    # exceptions. TestDocsMatchTheGuarantee scans this file for the absolute
+    # phrasings and fails while any remain.
     if config.offline:
         os.environ.setdefault("HEADROOM_OFFLINE", "1")
     if is_offline():
         apply_offline_env()
         logger.warning(
-            "event=proxy_offline_mode air-gap active — all outbound egress disabled "
-            "(telemetry, update check, license reporter, HuggingFace downloads)"
+            "event=proxy_offline_mode air-gap active — every connection Headroom "
+            "initiates is refused (telemetry, update check, license reporter, "
+            "model/tokenizer/binary/dataset downloads, remote Kompress, "
+            "OTLP/Langfuse export, Copilot auth, subscription polling, OpenAI "
+            "embedders, Headroom Cloud compression). Still allowed on purpose: "
+            "forwarding your requests to the upstream you configured, "
+            "operator-configured local endpoints, loopback health probes."
         )
 
     proxy = HeadroomProxy(config)
@@ -3003,10 +3106,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.rust_core_status = _rust_core_status
         app.state.rust_core_error = _rust_core_error
 
-        configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
-        configure_langfuse_tracing(
-            LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
-        )
+        _configure_observability_or_refuse()
 
         app.state.started_at = time.time()
         app.state.ready = False

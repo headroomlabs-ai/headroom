@@ -57,6 +57,7 @@ import logging
 
 import httpx
 
+from ..offline import guard_egress
 from .kompress_compressor import (
     KompressConfig,
     KompressResult,
@@ -139,6 +140,13 @@ class RemoteKompressCompressor:
         # without needing a separate auth-scheme setting.
         if headers:
             self._headers.update(headers)
+        # Air-gap chokepoint. HEADROOM_KOMPRESS_ENDPOINT points at a box that is
+        # by definition off this host, so under HEADROOM_OFFLINE this class must
+        # not exist at all. Guarding at construction (not at the POST) means the
+        # connection pool is never created and the operator hears about the
+        # contradictory configuration the first time the router reaches for
+        # Kompress, rather than discovering it in a packet capture.
+        guard_egress("remote Kompress inference", self._url)
         # httpx.Client is safe to share across the proxy's worker threads.
         self._client = httpx.Client(timeout=timeout)
 
@@ -211,6 +219,16 @@ class RemoteKompressCompressor:
         # instruction-like blocks. _MIN_WORDS stays the hard clamp.
         if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
+
+        # Re-check outside the fail-open try. __init__ already refused if the
+        # flag was set then, but the env can be flipped after this object was
+        # cached on the ContentRouter (the router builds it once per instance
+        # and reuses it for the process lifetime), and the security property we
+        # owe is "no socket", not "no construction". It is outside the try on
+        # purpose: the except below turns every exception into a silent
+        # pass-through, and a policy refusal that degrades silently is exactly
+        # the hole this guard closes.
+        guard_egress("remote Kompress inference", self._url)
 
         try:
             resp = self._client.post(

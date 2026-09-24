@@ -30,6 +30,8 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from headroom.offline import OfflineEgressBlocked, guard_egress
+
 from .base import RelevanceScore, RelevanceScorer
 
 # numpy is an optional dependency - import lazily
@@ -56,6 +58,50 @@ if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
 logger = logging.getLogger(__name__)
+
+
+def _load_text_embedding(kwargs: dict[str, str]) -> TextEmbedding:
+    """Build a fastembed ``TextEmbedding``, cache first and network second.
+
+    ``onnx_runtime.hf_hub_download_local_first`` can hang the air-gap guard on
+    an explicit ``local_files_only=True`` attempt because ``hf_hub_download``
+    takes that flag. fastembed's constructor does not, so the same cache-hit /
+    network-fallback split has to be made here: try the load with the whole
+    HuggingFace stack forced offline, and only reach for the guard when that
+    fails, which is exactly the case where a socket would have been opened.
+
+    This keeps the behaviour an air-gapped deployment actually wants — a
+    pre-seeded cache still loads under ``HEADROOM_OFFLINE`` — while making a
+    cold cache refuse instead of quietly dialling huggingface.co. A plain
+    unconditional guard would have broken the pre-seeded case, which is the
+    reason this path was left unguarded before.
+
+    The ``HF_HUB_OFFLINE`` flip is process-global for the duration of the
+    call. That is acceptable here because loading is one-shot and memoised by
+    the caller, and because the value it forces is *stricter* than whatever it
+    replaces, so a concurrent HuggingFace call can only be refused locally,
+    never sent somewhere it would not otherwise go.
+    """
+    from fastembed import TextEmbedding
+
+    previous = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        return TextEmbedding(**kwargs)
+    except Exception as cache_miss:  # noqa: BLE001 - any local-lookup failure
+        logger.debug("fastembed cache lookup failed, falling back to network: %s", cache_miss)
+    finally:
+        if previous is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous
+
+    guard_egress(
+        f"fastembed weight download for {kwargs['model_name']}",
+        "huggingface.co",
+    )
+    return TextEmbedding(**kwargs)
+
 
 # Default model name. Same string used by the Rust embedding scorer.
 DEFAULT_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -169,14 +215,24 @@ class EmbeddingScorer(RelevanceScorer):
             )
 
         if self._model is None:
-            from fastembed import TextEmbedding
-
             revision = _pinned_revision(self.model_name)
+            kwargs = {"model_name": self.model_name}
             if revision is not None:
                 # fastembed forwards **kwargs to snapshot_download(revision=...).
-                self._model = TextEmbedding(model_name=self.model_name, revision=revision)
-            else:
-                self._model = TextEmbedding(model_name=self.model_name)
+                kwargs["revision"] = revision
+            try:
+                self._model = _load_text_embedding(kwargs)
+            except OfflineEgressBlocked as blocked:
+                # Translate at the boundary that owns the degradation, the way
+                # the Kompress and ONNX loaders do. Public model weights are
+                # not data leaving the box, so what the caller needs to hear
+                # is "this model is not available here and why", not an
+                # air-gap type it has never seen.
+                raise RuntimeError(
+                    f"Embedding model {self.model_name!r} is unavailable: {blocked}. "
+                    "Pre-seed the fastembed/HuggingFace cache on this host, or "
+                    "use the BM25-only scorer."
+                ) from None
         return self._model
 
     def _encode(self, texts: list[str]):

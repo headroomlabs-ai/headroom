@@ -8,6 +8,8 @@ import os
 import sys
 from typing import Any
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 # Override for the CPU memory-arena default below: "1"/"true" forces the
@@ -117,6 +119,10 @@ def hf_hub_download_local_first(
         Absolute path to the local cached file.
 
     Raises:
+        OfflineEgressBlocked: when ``HEADROOM_OFFLINE`` is set and the file is
+            not already cached. A cache HIT still succeeds — the guard sits on
+            the network fallback only, so a pre-seeded air-gapped deployment
+            keeps working, which is the whole point of pre-seeding.
         Any exception raised by ``hf_hub_download`` on a genuine download failure,
         or the local-lookup error when ``allow_network`` is ``False`` and the
         file is not cached.
@@ -131,6 +137,17 @@ def hf_hub_download_local_first(
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
         if not allow_network:
             raise
+        # Air-gap chokepoint: this is the Python half of the HuggingFace fetch
+        # the Rust core already guards. ``apply_offline_env`` sets
+        # ``HF_HUB_OFFLINE=1``, but only with ``setdefault`` (an explicit
+        # ``HF_HUB_OFFLINE=0`` wins) and only inside the proxy process — the CLI
+        # and library entry points never call it, so the flag alone is not the
+        # guarantee. Guarding here is, and it costs nothing on the cache-hit
+        # path above.
+        guard_egress(
+            f"HuggingFace download of {repo_id}/{filename}",
+            "huggingface.co",
+        )
         return str(hf_hub_download(repo_id, filename, revision=revision))
 
 

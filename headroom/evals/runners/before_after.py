@@ -25,6 +25,7 @@ from headroom.evals.core import (
     EvalSuiteResult,
 )
 from headroom.evals.metrics import compute_semantic_similarity
+from headroom.offline import guard_egress
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.smart_crusher import SmartCrusherConfig
 
@@ -96,6 +97,7 @@ class BeforeAfterRunner:
 
     def _init_llm_client(self) -> Any:
         """Initialize the appropriate LLM client."""
+        guard_egress(f"{self.llm_config.provider} API for the before/after eval runner")
         if self.llm_config.provider == "anthropic":
             try:
                 import anthropic
@@ -128,6 +130,10 @@ class BeforeAfterRunner:
 
     def _init_proxy_client(self) -> Any:
         """Initialize an OpenAI client pointing at the Headroom proxy."""
+        guard_egress(
+            "LLM calls through the Headroom proxy for the before/after eval runner",
+            self.llm_config.headroom_proxy_url,
+        )
         import openai
 
         return openai.OpenAI(

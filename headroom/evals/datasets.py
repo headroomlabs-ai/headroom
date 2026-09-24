@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom.evals.core import EvalCase, EvalSuite
+from headroom.offline import guard_egress
 
 
 def _check_datasets_installed() -> None:
@@ -590,6 +591,7 @@ def load_bfcl(
     import urllib.request
 
     base_url = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+    guard_egress("BFCL eval-dataset download", base_url)
     data_file = f"BFCL_v3_{category}.json"
     gt_file = f"possible_answer/BFCL_v3_{category}.json"
 

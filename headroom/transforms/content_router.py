@@ -62,6 +62,7 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call_name,
 )
+from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from ..tokenizers.base import count_content_blocks
@@ -1036,7 +1037,7 @@ def _detect_content(content: str) -> DetectionResult:
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
         content_type = ContentType(rust_result.content_type)
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+    except (KeyboardInterrupt, SystemExit, GeneratorExit, OfflineEgressBlocked):
         raise
     except BaseException as exc:  # noqa: BLE001
         # A native Rust panic surfaces as pyo3_runtime.PanicException, which
@@ -1045,7 +1046,9 @@ def _detect_content(content: str) -> DetectionResult:
         # (panic, or an unrecognized content-type tag) degrades to the
         # pure-Python detector instead of aborting the request. See #1123.
         # Guard: don't swallow cancellation/control-flow BaseExceptions such
-        # as asyncio.CancelledError — keep them propagating.
+        # as asyncio.CancelledError — keep them propagating. OfflineEgressBlocked
+        # is in that list for the same reason: it is a policy refusal, not a
+        # detector failure, and degrading it here would hide the air-gap switch.
         if isinstance(exc, asyncio.CancelledError):
             raise
         if isinstance(exc, TimeoutError):

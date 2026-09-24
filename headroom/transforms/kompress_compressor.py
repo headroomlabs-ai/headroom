@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..config import TransformResult
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
@@ -165,6 +166,38 @@ class KompressModelNotCached(RuntimeError):
     defer the download to first use instead of blocking the proxy startup path
     on a network fetch.
     """
+
+
+def _hf_artifact(model_id: str, filename: str, *, allow_network: bool) -> str:
+    """``hf_hub_download_local_first`` with the air-gap refusal translated.
+
+    ``OfflineEgressBlocked`` is a ``BaseException`` so that no ``except
+    Exception:`` can silently degrade an air-gap refusal into "that feature
+    stopped working". At THIS boundary that degradation is the correct
+    behaviour and is written down rather than inherited: a model download is
+    not data leaving the box, every caller below already handles
+    "the model is not available locally", and failing a user's request because
+    an optional compressor could not fetch public weights would punish the
+    request for a decision the operator made about the host.
+
+    So the refusal is logged with the switch named and re-raised as
+    :class:`KompressModelNotCached`, which is exactly what it means: under
+    ``HEADROOM_OFFLINE`` the only artifacts that will ever be available are the
+    cached ones. The original refusal is chained, so it is still in the
+    traceback.
+    """
+    try:
+        return hf_hub_download_local_first(model_id, filename, allow_network=allow_network)
+    except OfflineEgressBlocked as blocked:
+        logger.warning(
+            "Kompress: %r for %s is not cached and %s forbids fetching it (%s). "
+            "Compression falls back to the non-ML path.",
+            filename,
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
+        raise KompressModelNotCached(model_id) from blocked
 
 
 # Model cache: model_id -> (model, tokenizer, backend)
@@ -676,9 +709,13 @@ def _create_onnx_session(
     ort: Any = None
     for filename in _onnx_filename_candidates():
         try:
-            onnx_path = hf_hub_download_local_first(
-                model_id, filename, allow_network=allow_download
-            )
+            onnx_path = _hf_artifact(model_id, filename, allow_network=allow_download)
+        except KompressModelNotCached:
+            # Only _hf_artifact's air-gap translation raises this here, and it
+            # is terminal for the whole loop: every remaining candidate would be
+            # refused for the same reason, so trying them just logs the same
+            # refusal four times and ends on a misleading FileNotFoundError.
+            raise
         except Exception as exc:
             last_err = exc
             cache_miss = cache_miss or isinstance(exc, _NOT_CACHED_ERRORS)
@@ -863,7 +900,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
     HuggingFace Hub's own cache of confirmed-404 lookups.
     """
     try:
-        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+        ckpt_path = _hf_artifact(model_id, "merged.pt", allow_network=allow_download)
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
             if not hf_entry_known_absent(model_id, "merged.pt"):
@@ -880,9 +917,7 @@ def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) ->
             # merged.pt genuinely does not exist in this repo (confirmed by a
             # real network lookup, not just a cache miss) - fall back to the
             # plain format instead of treating it as a download failure.
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
+            weights_path = _hf_artifact(model_id, "model.safetensors", allow_network=allow_download)
             _load_plain_state_dict(model, weights_path, model_id)
             return
         raise
@@ -1122,6 +1157,21 @@ def _background_download(model_id: str, device: str) -> None:
         logger.info("Kompress: downloading model %s in the background ...", model_id)
         _load_kompress(model_id, device, allow_download=True)
         logger.info("Kompress: background model download complete for %s", model_id)
+    except OfflineEgressBlocked as blocked:
+        # Explicit, because OfflineEgressBlocked is a BaseException and would
+        # otherwise reach threading.excepthook as a bare traceback on every
+        # air-gapped startup with a cold cache. This is a background *refresh*,
+        # not the request path: the refusal is reported once, at WARNING, and
+        # the compressor keeps whatever is already cached. Do NOT widen this to
+        # `except Exception` — that is the shape the guard exists to defeat.
+        _record_download_failure(model_id)
+        logger.warning(
+            "Kompress: background model download refused for %s (%s is set): %s. "
+            "The model will only load if its artifacts are already cached.",
+            model_id,
+            OFFLINE_ENV,
+            blocked,
+        )
     except Exception as exc:
         _record_download_failure(model_id)
         logger.warning("Kompress: background model download failed for %s: %s", model_id, exc)
@@ -1181,6 +1231,18 @@ def prefetch_kompress_artifacts(model_id: str = HF_MODEL_ID) -> bool:
         try:
             hf_hub_download_local_first(model_id, filename, allow_network=True)
             return True
+        except OfflineEgressBlocked as blocked:
+            # Same reasoning as _background_download: explicit because it is a
+            # BaseException, reported rather than swallowed, and terminal for
+            # the whole loop — every candidate would be refused for the same
+            # reason, so retrying them just logs the same refusal four times.
+            logger.warning(
+                "Kompress: artifact prefetch refused for %s (%s is set): %s",
+                model_id,
+                OFFLINE_ENV,
+                blocked,
+            )
+            return False
         except Exception as exc:
             logger.debug("Kompress prefetch: %r unavailable for %s: %s", filename, model_id, exc)
     return False
