@@ -1416,6 +1416,14 @@ class KompressCompressor(Transform):
 
     name: str = "kompress_compressor"
 
+    # ``compress()`` accepts ``_deadline_started_at``, so a caller that
+    # compresses many blocks for ONE request can hand every call the same
+    # origin and have the deadline bound the request. Duck-typed rather than
+    # isinstance-checked at the call site because ``RemoteKompressCompressor``
+    # is the other compressor the router may get back and its ``compress()``
+    # does not take the argument.
+    shares_request_deadline: bool = True
+
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
         # Set by the preload canary when inference is too slow to be useful, or by
