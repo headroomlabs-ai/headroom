@@ -395,3 +395,16 @@ def test_error_detection_keywords_patterns_and_indicator_helper() -> None:
 
     assert content_has_error_indicators("TRACEBACK: Fatal crash in worker") is True
     assert content_has_error_indicators("Everything completed successfully") is False
+
+
+def test_iso_timestamp_log_lines_are_not_search_results() -> None:
+    """``2026-01-01T09:57:59`` fits ``path:NN:`` and has a path-shaped prefix.
+
+    Routed to the SearchCompressor, a timestamped log keeps only its
+    ``path:line:`` matches and loses every other line.
+    """
+    assert not _is_search_result_line("2026-09-24T09:57:59.123Z INFO proxy started")
+    assert not _is_search_result_line("2026-09-24T09:57:59+00:00 WARN retry 2")
+    log = "\n".join(f"2026-09-24T09:57:{s:02d}.000Z INFO request {s} done" for s in range(20))
+    assert _try_detect_search(log) is None
+    assert _is_search_result_line("src/app.py:12:    return True")

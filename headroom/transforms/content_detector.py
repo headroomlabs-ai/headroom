@@ -49,6 +49,8 @@ class DetectionResult:
 _SEARCH_RESULT_PATTERN = re.compile(
     r"^[^\s:]+:\d+:"  # file:line: format (grep -n style)
 )
+# ISO-8601 log lines (``2026-01-01T09:57:59``) match the grep shape above.
+_ISO_TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 
 # ``path-NN-content`` shape of grep -A/-B/-C context lines (#3580). The path
 # group is non-greedy so the earliest ``-digits-`` marker wins, mirroring the
@@ -514,6 +516,8 @@ def _is_search_result_line(line: str) -> bool:
     accepted via the context predicates so code in them routes to the search
     compressor instead of the prose path (#3580).
     """
+    if _ISO_TIMESTAMP_PATTERN.match(line):
+        return False
     if _SEARCH_RESULT_PATTERN.match(line) or _GREP_COLON_DASH_PATTERN.match(line):
         return _prefix_looks_like_path(line.split(":", 1)[0])
     return _is_grep_context_line(line)
