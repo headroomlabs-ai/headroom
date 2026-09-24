@@ -284,6 +284,7 @@ html = [
 ]
 # Development dependencies
 dev = [
+    "google-genai>=1.0,<2.0",  # Maintained Gemini/Vertex protocol parser in socket tests.
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",

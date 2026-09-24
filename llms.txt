@@ -1,5 +1,15 @@
 # Headroom
 
+## Unified API gateway (draft)
+
+- Run: `headroom proxy --gateway --gateway-config PATH`.
+- Offline validation: add `--check-config`; no secret or network access occurs.
+- Pure mode disables transforms, payload logging, beacons, and settings mutation.
+- Admitted identities are configured API keys, Vertex/Bedrock workload
+  identities, and explicitly configured no-auth compatible origins.
+- Native subscription identities and interactive adapters remain unavailable.
+- Contract and qualification: `docs/proposals/unified-api-gateway/`.
+
 > Context optimization layer for LLM applications. Compress tool outputs, logs, files, and RAG chunks before they reach the model. Same answers, 60–95% fewer tokens. Library, proxy, and MCP server. Apache 2.0, local-first.
 
 Headroom is shipped as a Python package (`headroom-ai`), a TypeScript package (`headroom-ai`), an OpenAI + Anthropic-compatible HTTP proxy (`headroom proxy`), and an MCP server (`headroom_compress`, `headroom_retrieve`, `headroom_stats` tools). All four modes use the same compression pipeline: per-content-type compressors (JSON, code, logs, diffs, text) feed into a Compress-Cache-Retrieve (CCR) store so compression stays reversible — the LLM can ask for the original whenever it wants.

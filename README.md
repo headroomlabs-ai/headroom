@@ -84,6 +84,27 @@ file content is sent anywhere to be compressed.
 [CCR](https://docs.headroomlabs.ai/docs/ccr) ·
 [Kompress-v2-base model card](https://huggingface.co/chopratejas/kompress-v2-base)
 
+## Unified API gateway (draft)
+
+The Python proxy can run as a loopback-only, single-worker gateway exposing
+OpenAI, Anthropic, Gemini, Vertex, and Bedrock protocol routes from one versioned
+configuration. Gateway mode is authenticated, transform-free, and keeps provider
+credentials behind route-bound egress policy.
+
+```bash
+export HEADROOM_GATEWAY_CLIENT_TOKEN="choose-a-local-client-token"
+export OPENAI_API_KEY="your-provider-key"
+headroom proxy --gateway \
+  --gateway-config docs/proposals/unified-api-gateway/examples/gateway.api-keys.json
+```
+
+Validate configuration offline with
+`headroom proxy --gateway --gateway-config PATH --check-config`; this performs no
+credential, DNS, or provider lookup. Native subscription identities are
+deliberately unavailable in this draft. See the
+[retained proposal](docs/proposals/unified-api-gateway/README.md) and
+[local qualification](docs/proposals/unified-api-gateway/LOCAL_QUALIFICATION.md).
+
 ## Get started (60 seconds)
 
 ```bash

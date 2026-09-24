@@ -35,7 +35,7 @@ def _skip_proxy_dependency_gate_unless_exercised(
         # Native-wrapper jobs intentionally install only pytest and exercise the
         # installer scripts without importing Headroom's runtime dependencies.
         return
-    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
+    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda **_kwargs: None)
 
 
 @pytest.fixture(autouse=True)

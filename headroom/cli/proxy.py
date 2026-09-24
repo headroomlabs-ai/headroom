@@ -21,20 +21,17 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
-def ensure_proxy_dependencies() -> None:
+def ensure_proxy_dependencies(*, gateway: bool = False) -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
         "fastapi",
         "uvicorn",
         "httpx",
         "openai",
-        "mcp",
-        "magika",
-        "zstandard",
         "websockets",
-        "onnxruntime",
-        "transformers",
     ]
+    if not gateway:
+        required_modules.extend(["mcp", "magika", "zstandard", "onnxruntime", "transformers"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
@@ -1020,9 +1017,27 @@ def dashboard(port: int, no_open: bool) -> None:
         "the OpenAI endpoint (env: OPENAI_TARGET_API_HEADERS)"
     ),
 )
+@click.option(
+    "--gateway",
+    is_flag=True,
+    help="Run the authenticated unified API gateway profile.",
+)
+@click.option(
+    "--gateway-config",
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Versioned unified gateway JSON configuration.",
+)
+@click.option(
+    "--check-config",
+    is_flag=True,
+    help="Validate gateway configuration without resolving secrets or starting the server.",
+)
 @click.pass_context
 def proxy(
     ctx: click.Context,
+    gateway: bool,
+    gateway_config: Path | None,
+    check_config: bool,
     mode: str | None,
     target_ratio: float | None,
     host: str,
@@ -1129,7 +1144,40 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     _reexec_with_malloc_tuning()
-    ensure_proxy_dependencies()
+    ensure_proxy_dependencies(gateway=gateway)
+
+    if (gateway or check_config) and gateway_config is None:
+        raise click.UsageError("--gateway-config is required with --gateway or --check-config")
+    if gateway_config is not None and not gateway and not check_config:
+        raise click.UsageError("--gateway-config requires --gateway or --check-config")
+
+    gateway_snapshot = None
+    if gateway_config is not None:
+        from headroom.proxy.gateway.config import GatewayConfigSnapshot
+
+        try:
+            gateway_snapshot = GatewayConfigSnapshot.load(gateway_config)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"invalid gateway configuration: {exc}") from exc
+        incompatible_flags = [
+            name
+            for name, enabled in (
+                ("--memory", memory),
+                ("--code-graph", code_graph),
+                ("--lossless", lossless),
+                ("--learn", learn),
+                ("--read-maturation", read_maturation),
+                ("--intercept-tool-results", intercept_tool_results),
+            )
+            if enabled
+        ]
+        if incompatible_flags:
+            raise click.UsageError(
+                f"{', '.join(incompatible_flags)} incompatible with gateway pure mode"
+            )
+        if check_config:
+            click.echo("Gateway configuration valid")
+            return
 
     # Import here to avoid slow startup
     from headroom.proxy.server import (
@@ -1308,6 +1356,8 @@ def proxy(
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
     config = ProxyConfig(
+        gateway=gateway_snapshot,
+        gateway_config_path=gateway_config if gateway else None,
         host=host,
         port=port,
         rollout=rollout_snapshot,

@@ -21,6 +21,16 @@ from headroom.providers.openai import OpenAIProvider
 
 litellm = pytest.importorskip("litellm")
 
+# The gateway input must unwrap to a key present in both LiteLLM maps: CI
+# deliberately loads the bundled map, while local development may load live.
+GROQ_LITELLM_KEY = "groq/openai/gpt-oss-120b"
+GROQ_GATEWAY_PRICING_CASE = (f"gateway/{GROQ_LITELLM_KEY}", 0.15, 0.60)
+
+
+def test_groq_gateway_pricing_case_is_in_loaded_map() -> None:
+    assert GROQ_LITELLM_KEY in litellm.model_cost
+    assert GROQ_GATEWAY_PRICING_CASE[0] not in litellm.model_cost
+
 
 def test_unwrapped_model_forms_drops_leading_segments() -> None:
     """Pure function: no gateway-prefix list to maintain."""
@@ -41,12 +51,7 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         ("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("bedrock/us.anthropic.claude-3-5-sonnet-20241022-v2:0", 3.00, 15.00),
         ("vertex_ai/claude-sonnet-4-5", 3.00, 15.00),
-        # Any gateway-prefixed name here must be one litellm still prices:
-        # when it prunes a model the unwrap finds nothing and _get_pricing
-        # silently returns the $2.50/$10.00 GPT-4o default, which is what
-        # this test exists to catch. litellm dropped
-        # groq/llama-3.3-70b-versatile on 2026-09-23; see issue #3732.
-        ("groq/llama-guard-3-8b", 0.20, 0.20),
+        GROQ_GATEWAY_PRICING_CASE,
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
         ("deepseek-chat", 0.28, 0.42),

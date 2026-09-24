@@ -1959,9 +1959,16 @@ class HeadroomProxy(
         # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
         # is configured, else a strict-relaxed default context when
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
-        _verify = build_httpx_verify()
-        _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
-        self.http_client = httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        if self.config.gateway is not None:
+            from headroom.proxy.gateway.transport import http_client as gateway_http_client
+
+            self.http_client = gateway_http_client(self.config.gateway)
+            _http2 = False
+            _client_kwargs = {}
+        else:
+            _verify = build_httpx_verify()
+            _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
+            self.http_client = httpx.AsyncClient(http2=_http2, **_client_kwargs)
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
@@ -2802,22 +2809,64 @@ class WebSocketAuthMiddleware:
     logs and browser history.
     """
 
-    def __init__(self, app: Any, *, proxy_token: str | None = None) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        proxy_token: str | None = None,
+        gateway_authenticator: Any | None = None,
+        gateway_runtime: Any | None = None,
+    ) -> None:
         self.app = app
         self.proxy_token = proxy_token
+        self.gateway_authenticator = gateway_authenticator
+        self.gateway_runtime = gateway_runtime
         # Pre-encoded for constant-time comparison, mirroring the HTTP gate:
         # compare_digest on str raises TypeError for non-ASCII input, which
         # would turn a rejected handshake into a 500.
         self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "websocket" or not self.proxy_token:
+        if scope["type"] != "websocket" or (
+            not self.proxy_token
+            and self.gateway_authenticator is None
+            and self.gateway_runtime is None
+        ):
             await self.app(scope, receive, send)
             return
 
         client = scope.get("client")
         client_host = client[0] if client else None
-        if is_loopback_host(client_host):
+        if (
+            self.gateway_authenticator is None
+            and self.gateway_runtime is None
+            and is_loopback_host(client_host)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        if self.gateway_authenticator is not None or self.gateway_runtime is not None:
+            from starlette.datastructures import Headers as StarletteHeaders
+
+            from headroom.proxy.gateway.auth import validate_gateway_browser_request
+            from headroom.proxy.gateway.errors import GatewayPublicError
+
+            headers = StarletteHeaders(scope=scope)
+            try:
+                validate_gateway_browser_request(headers)
+                generation = self.gateway_runtime.capture() if self.gateway_runtime else None
+                authenticator = (
+                    generation.authenticator if generation else self.gateway_authenticator
+                )
+                if authenticator is None:
+                    raise RuntimeError("Gateway authentication requires an authenticator")
+                scope["gateway_principal"] = authenticator.authenticate(headers)
+                scope["gateway_generation"] = generation
+            except GatewayPublicError:
+                message = await receive()
+                if message["type"] == "websocket.connect":
+                    await send({"type": "websocket.close", "code": 1008})
+                return
             await self.app(scope, receive, send)
             return
 
@@ -3009,10 +3058,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.rust_core_status = _rust_core_status
         app.state.rust_core_error = _rust_core_error
 
-        configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
-        configure_langfuse_tracing(
-            LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
-        )
+        if proxy.config.gateway is None:
+            configure_otel_metrics(
+                OTelMetricsConfig.from_env(default_service_name="headroom-proxy")
+            )
+            configure_langfuse_tracing(
+                LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
+            )
 
         app.state.started_at = time.time()
         app.state.ready = False
@@ -3123,6 +3175,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             proxy._background_compression_executor.shutdown(wait=False)
             if proxy.code_graph_watcher:
                 proxy.code_graph_watcher.stop()
+            if config.gateway is not None:
+                await _timed(
+                    app.state.gateway_runtime.shutdown(),
+                    label="gateway_runtime.shutdown",
+                    timeout=(
+                        app.state.gateway_runtime.snapshot.limits.shutdown_drain_seconds
+                        + app.state.gateway_runtime.snapshot.limits.shutdown_cleanup_seconds
+                        + 1
+                    ),
+                )
             await _timed(proxy.shutdown(), label="proxy.shutdown", timeout=5.0)
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
@@ -3133,6 +3195,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    if config.gateway is not None:
+        from headroom.proxy.gateway.middleware import install_gateway_auth_middleware
+
+        install_gateway_auth_middleware(app, config.gateway, os.environ, config.gateway_config_path)
     app.add_middleware(WebSocketProjectPrefixMiddleware)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
@@ -3788,7 +3854,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # scope), so the same token rule is applied to the `websocket` scope here.
     # Added after it, which makes it the outermost layer — an unauthenticated
     # handshake is refused before any project-prefix or routing work happens.
-    app.add_middleware(WebSocketAuthMiddleware, proxy_token=_proxy_token)
+    app.add_middleware(
+        WebSocketAuthMiddleware,
+        proxy_token=_proxy_token,
+        gateway_runtime=getattr(app.state, "gateway_runtime", None),
+    )
 
     # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
     # the `headroom.proxy_extension` entry-point group, but **opt-in only**:
@@ -3824,6 +3894,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz():
+        if config.gateway is not None:
+            runtime = app.state.gateway_runtime
+            return JSONResponse(
+                status_code=200 if runtime.status().ready else 503,
+                content=runtime.status().as_dict(),
+            )
         await _check_upstream()
         payload = _health_payload(include_config=False)
         return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
@@ -5955,6 +6031,24 @@ def run_server(
     # incident could not see uvicorn's view of the traffic at all, with no env var
     # and no CLI flag to change it. Overridable now; the default is unchanged.
     uvicorn_log_level = _resolve_uvicorn_log_level()
+
+    if config.gateway is not None:
+        from headroom.proxy.gateway.lifecycle import GatewayServer
+
+        GatewayServer(
+            uvicorn.Config(
+                app_target,
+                host=config.host,
+                port=config.port,
+                log_level=uvicorn_log_level,
+                limit_concurrency=limit_concurrency,
+                proxy_headers=False,
+                timeout_graceful_shutdown=config.gateway.limits.shutdown_cleanup_seconds,
+                **uvicorn_kwargs,
+            ),
+            runtime=app_target.state.gateway_runtime,
+        ).run()
+        return
 
     uvicorn.run(
         app_target,

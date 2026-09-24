@@ -53,8 +53,10 @@ try:
     from pydantic import ConfigDict, Field, PrivateAttr
 
     LANGCHAIN_AVAILABLE = True
+    RUNNABLE_BINDING_AVAILABLE = True
 except ImportError:
     LANGCHAIN_AVAILABLE = False
+    RUNNABLE_BINDING_AVAILABLE = False
     BaseChatModel = object  # type: ignore[misc,assignment]
     BaseCallbackHandler = object  # type: ignore[misc,assignment]
     ConfigDict = lambda **kwargs: {}  # type: ignore[assignment,misc]  # noqa: E731
@@ -391,7 +393,7 @@ class HeadroomChatModel(BaseChatModel):
         pass them explicitly.
         """
         bound_kwargs: dict[str, Any] = {}
-        if not RunnableBinding:
+        if not RUNNABLE_BINDING_AVAILABLE:
             return model, bound_kwargs
         # isinstance, not hasattr: a Mock answers hasattr("bound") truthfully
         # and would be unwrapped into one of its own auto-created children.

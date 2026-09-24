@@ -328,29 +328,47 @@ class TestMissingProxyDepsError:
     def test_ensure_proxy_dependencies_exits_when_fastapi_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import builtins
+        from importlib import import_module as real_import_module
 
         from headroom.cli.proxy import ensure_proxy_dependencies
 
-        real_import = builtins.__import__
-
-        def fake_import(
-            name: str,
-            globals: dict | None = None,
-            locals: dict | None = None,
-            fromlist: tuple = (),
-            level: int = 0,
-        ):
+        def fake_import_module(name: str):
             if name == "fastapi":
                 raise ImportError("No module named 'fastapi'")
-            return real_import(name, globals, locals, fromlist, level)
+            return real_import_module(name)
 
-        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr("headroom.cli.proxy.import_module", fake_import_module)
 
         with pytest.raises(SystemExit) as exc_info:
             ensure_proxy_dependencies()
 
         assert exc_info.value.code == 1
+
+    @pytest.mark.proxy_dependency_gate
+    def test_gateway_dependency_gate_excludes_transform_and_mcp_extras(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from headroom.cli.proxy import ensure_proxy_dependencies
+
+        imported: list[str] = []
+
+        def fake_import_module(name: str):
+            imported.append(name)
+            if name in {"mcp", "magika", "zstandard", "onnxruntime", "transformers"}:
+                raise ImportError(f"No module named {name!r}")
+            return object()
+
+        monkeypatch.setattr("headroom.cli.proxy.import_module", fake_import_module)
+
+        ensure_proxy_dependencies(gateway=True)
+
+        assert not set(imported) & {
+            "mcp",
+            "magika",
+            "zstandard",
+            "onnxruntime",
+            "transformers",
+        }
 
 
 class TestKeyboardInterruptExitCode:
