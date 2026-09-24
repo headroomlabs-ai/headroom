@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1069,3 +1070,110 @@ def test_openai_cache_mode_block_append_replay_survives_the_restore() -> None:
             ],
         }
     ]
+
+
+def _compress_unfrozen_tool_results(**kwargs):
+    """Fake pipeline that, like the real one, only rewrites past the frozen count."""
+    frozen = kwargs.get("frozen_message_count") or 0
+    out = [
+        {**message, "content": f"[compressed {message['tool_call_id']}]"}
+        if i >= frozen and message.get("role") == "tool"
+        else message
+        for i, message in enumerate(kwargs["messages"])
+    ]
+    return SimpleNamespace(
+        messages=out,
+        transforms_applied=["fake:compressed"],
+        timing={},
+        tokens_before=2000,
+        tokens_after=30,
+        waste_signals=None,
+    )
+
+
+def _provider_reply(request: httpx.Request) -> httpx.Response:
+    usage = _chat_usage(prompt_tokens=4000, cached_tokens=2048)
+    if json.loads(request.content).get("stream"):
+        return httpx.Response(
+            200,
+            content="".join(_sse_chunks(4000, 2048)).encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+    return httpx.Response(
+        200,
+        json={
+            "id": "chatcmpl_lifecycle",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        },
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
+def test_openai_cache_mode_forwards_last_turns_bytes_unchanged(stream: bool) -> None:
+    """Cache mode, real tracker, three turns: every turn re-forwards the previous
+    turn's forwarded messages byte-for-byte, so the provider's prefix cache holds.
+
+    Needs both halves: the tracker must record the client's originals (else the
+    overlay cannot match the client prefix), and the frozen-prefix restore must
+    not undo the replay (else the compressed tool results revert to raw bytes).
+    """
+    from headroom.cache.prefix_tracker import PrefixCacheTracker
+
+    def tool_turn(n: int) -> list[dict]:
+        call_id = f"call_{n}"
+        return [
+            {"role": "user", "content": f"turn {n}: run the build"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": f"build {n} log line module m0 status OK\n" * 200,
+            },
+        ]
+
+    sent: list[list[dict]] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["messages"])
+        return _provider_reply(request)
+
+    history: list[dict] = []
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        _install_tracker(proxy, PrefixCacheTracker(provider="openai"))
+        proxy.openai_pipeline.apply = _compress_unfrozen_tool_results
+        proxy.http_client = httpx.AsyncClient(transport=httpx.MockTransport(provider))
+        for n in (1, 2, 3):
+            history += tool_turn(n)
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key"},
+                json={"model": "gpt-4o-mini", "stream": stream, "messages": history},
+            )
+            assert response.status_code == 200
+            response.read()
+            history.append({"role": "assistant", "content": "ok"})
+
+    assert len(sent) == 3
+    assert sent[0][2]["content"] == "[compressed call_1]"
+    assert sent[1][: len(sent[0])] == sent[0]
+    assert sent[2][: len(sent[1])] == sent[1]
