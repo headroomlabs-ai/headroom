@@ -30,6 +30,12 @@ def _mock_ensure_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(wrap_mod, "_ensure_proxy", fake_ensure_proxy)
 
 
+@pytest.fixture(autouse=True)
+def _unknown_opencode_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests use a fake `opencode` binary; never run whatever is on PATH."""
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: None)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -328,6 +334,43 @@ def test_wrap_opencode_sets_config_content_env(
     assert captured["tool_label"] == "OPENCODE"
     assert captured["agent_type"] == "opencode"
     assert captured["args"] == ("--model", "gpt-4o")
+
+
+@pytest.mark.parametrize(
+    ("major", "args", "expected"),
+    [
+        (2, (), ("--standalone",)),
+        (2, ("--model", "gpt-4o"), ("--standalone", "--model", "gpt-4o")),
+        (2, ("run", "fix it"), ("run", "--standalone", "fix it")),
+        (2, ("--server", "http://127.0.0.1:4096"), ("--server", "http://127.0.0.1:4096")),
+        (1, ("--model", "gpt-4o"), ("--model", "gpt-4o")),
+        (None, (), ()),
+    ],
+)
+def test_wrap_opencode_adds_standalone_on_v2(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    major: int | None,
+    args: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    """OpenCode 2.x must not attach to a background service that lacks Headroom's config."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: major)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "opencode", "--no-mcp", "--", *args])
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == expected
 
 
 def test_wrap_opencode_does_not_add_base_url_env_vars(

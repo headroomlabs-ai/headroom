@@ -179,6 +179,10 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.opencode.runtime import (
+    opencode_major_version,
+    with_opencode_standalone,
+)
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
 )
@@ -7757,6 +7761,8 @@ def opencode(
     Sets OPENCODE_CONFIG_CONTENT to route all OpenCode API calls through
     Headroom. Configures a headroom provider via @ai-sdk/openai-compatible.
     Also sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL as fallbacks.
+    On OpenCode 2.x, adds --standalone (unless --server is given) so a private
+    server loads that config instead of a running background service.
 
     \b
     Examples:
@@ -7899,11 +7905,17 @@ def opencode(
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
             )
 
+        # OpenCode 2.x otherwise attaches to an already-running background
+        # service that never sees this launch's OPENCODE_CONFIG_CONTENT.
+        launch_args = with_opencode_standalone(opencode_args, opencode_major_version(opencode_bin))
+        if verbose and launch_args != tuple(opencode_args):
+            click.echo("  OpenCode 2.x: adding --standalone so it loads Headroom's config")
+
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
         _launch_tool(
             binary=opencode_bin,
-            args=opencode_args,
+            args=launch_args,
             env=env,
             port=actual_port,
             no_proxy=True,

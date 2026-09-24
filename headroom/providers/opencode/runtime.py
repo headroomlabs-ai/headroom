@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+import re
+import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from headroom._subprocess import run
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
 from .config import HEADROOM_OPENCODE_PLUGIN, headroom_provider_entry
@@ -17,24 +20,98 @@ def proxy_base_url(port: int) -> str:
     return f"http://127.0.0.1:{port}/v1"
 
 
-def headroom_opencode_plugin_path() -> str | None:
-    """Return the absolute path to the built OpenCode transport plugin, or None.
+# OpenCode 2.x subcommands. Of these only the interactive ones (the root TUI,
+# ``run`` and ``mini``) get ``--standalone``; the rest are management commands.
+_OPENCODE_SUBCOMMANDS = frozenset(
+    {
+        "acp",
+        "api",
+        "auth",
+        "debug",
+        "mcp",
+        "mini",
+        "models",
+        "plugin",
+        "run",
+        "serve",
+        "service",
+        "session",
+        "stats",
+        "uninstall",
+        "update",
+        "upgrade",
+    }
+)
+_OPENCODE_STANDALONE_SUBCOMMANDS = frozenset({"run", "mini"})
 
-    OpenCode loads a plugin from an absolute file path (verified against
-    opencode 1.17). The plugin's loader entry exports ONLY the plugin function
-    (``plugins/opencode/dist/entry.opencode.js``) — the library barrel cannot
-    be loaded directly ("Plugin export is not a function").
+
+def opencode_major_version(binary: str) -> int | None:
+    """Return the major version of the ``opencode`` binary, or ``None``.
+
+    Parses ``opencode --version`` (1.x prints ``1.18.32``, 2.x prints
+    ``opencode v2.0.12``). Returns ``None`` on any failure — missing binary,
+    non-zero exit, timeout, unparseable output — so callers treat the version
+    as unknown and change nothing. Never raises.
+    """
+    try:
+        proc = run([binary, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 0) != 0:
+        return None
+    output = f"{getattr(proc, 'stdout', '') or ''} {getattr(proc, 'stderr', '') or ''}"
+    # Not `\b`: in "v2.0.12" the "v" and "2" are both word characters.
+    match = re.search(r"(?<!\d)(\d+)\.\d+\.\d+", output)
+    return int(match.group(1)) if match else None
+
+
+def with_opencode_standalone(args: Sequence[str], major_version: int | None) -> tuple[str, ...]:
+    """Add ``--standalone`` to an interactive OpenCode 2.x launch.
+
+    OpenCode 2.x attaches to a shared background service by default. When one
+    is already running, it was started with its own environment, so the
+    ``OPENCODE_CONFIG_CONTENT`` wrap sets (Headroom provider routing and the
+    transport plugin) never reaches it. ``--standalone`` runs a private server
+    that reads this launch's environment.
+
+    Leaves ``args`` alone for OpenCode 1.x or an unknown version, when the user
+    already chose ``--standalone`` or ``--server``, and for management
+    subcommands (``models``, ``auth``, ...). The flag goes right after ``run``
+    or ``mini``, and first for the root TUI.
+    """
+    args = tuple(args)
+    if major_version is None or major_version < 2:
+        return args
+    if any(arg in ("--standalone", "--server") or arg.startswith("--server=") for arg in args):
+        return args
+    for index, arg in enumerate(args):
+        if arg in _OPENCODE_SUBCOMMANDS:
+            if arg not in _OPENCODE_STANDALONE_SUBCOMMANDS:
+                return args
+            return (*args[: index + 1], "--standalone", *args[index + 1 :])
+    return ("--standalone", *args)
+
+
+def headroom_opencode_plugin_path() -> str | None:
+    """Return the absolute path to the built OpenCode transport plugin directory, or None.
+
+    OpenCode 2.x only loads a configured local plugin from a directory — a file
+    path is dropped with "configured plugin path must be a directory" — and
+    resolves ``<dir>/server.*`` then ``<dir>/index.*``. OpenCode 1.x resolves a
+    directory without ``package.json`` to its ``index.*`` as well. The
+    ``index.js`` in each candidate directory default-exports a plugin object
+    carrying both the 1.x ``server`` and the 2.x ``setup`` entry points.
 
     Resolution order:
 
-    1. ``HEADROOM_OPENCODE_PLUGIN_PATH`` env override.
-    2. A repo-checkout build (``plugins/opencode/dist/entry.opencode.js``) —
-       external-deps build, resolvable because the checkout has node_modules.
+    1. ``HEADROOM_OPENCODE_PLUGIN_PATH`` env override (a directory for 2.x).
+    2. A repo-checkout build (``plugins/opencode/dist/``) — external-deps
+       build, resolvable because the checkout has node_modules.
     3. The self-contained bundle shipped inside the wheel
-       (``headroom/providers/opencode/_dist/entry.opencode.js``, built by
+       (``headroom/providers/opencode/_dist/``, built by
        ``npm run build:standalone``) — every dependency inlined, so it loads
        from site-packages where no node_modules exists (verified against
-       opencode 1.18.5).
+       opencode 1.18.32 and 2.0.12).
 
     Returns ``None`` only when none of the three exist, in which case wrap
     falls back to the native-provider baseURL override, which already covers
@@ -42,15 +119,13 @@ def headroom_opencode_plugin_path() -> str | None:
     """
     override = os.environ.get("HEADROOM_OPENCODE_PLUGIN_PATH", "").strip()
     if override:
-        return override if Path(override).is_file() else None
+        return override if Path(override).exists() else None
     # runtime.py → opencode → providers → headroom → <repo root>
-    repo_candidate = (
-        Path(__file__).resolve().parents[3] / "plugins" / "opencode" / "dist" / "entry.opencode.js"
-    )
-    if repo_candidate.is_file():
+    repo_candidate = Path(__file__).resolve().parents[3] / "plugins" / "opencode" / "dist"
+    if (repo_candidate / "index.js").is_file():
         return str(repo_candidate)
-    packaged = Path(__file__).resolve().parent / "_dist" / "entry.opencode.js"
-    return str(packaged) if packaged.is_file() else None
+    packaged = Path(__file__).resolve().parent / "_dist"
+    return str(packaged) if (packaged / "index.js").is_file() else None
 
 
 def build_opencode_config_content(

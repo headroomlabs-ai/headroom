@@ -1,7 +1,7 @@
 // Dedicated entry for OpenCode's plugin loader.
 //
-// OpenCode loads a plugin module and treats its exports as plugin factories —
-// it rejects the module if a non-function export is present ("Plugin export is
-// not a function"). The library barrel (index.ts) re-exports helpers/constants,
-// so it cannot be loaded directly. This entry exports ONLY the plugin function.
-export { HeadroomPlugin as default } from "./plugin.js";
+// Both OpenCode loaders only read the default export: 1.x takes `{ id, server }`
+// and 2.x takes `{ id, setup }`, so the dual-shape plugin object loads on
+// either. The library barrel (index.ts) re-exports helpers the plugin does not
+// need, so this entry keeps the standalone wheel bundle to the plugin alone.
+export { default } from "./plugin.js";
