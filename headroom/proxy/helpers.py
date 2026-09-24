@@ -20,9 +20,11 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.proxy import (
     diagnostic_decode_policy,
@@ -1723,6 +1725,79 @@ def _headroom_log_dir() -> Path:
 _PROXY_LOG_HANDLER_NAME = "headroom.proxy.file"
 
 
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log file is only readable by its owner.
+
+    ``logging`` opens the stream itself — once at construction and again for
+    every rollover — so the process umask would otherwise decide the mode, and
+    there is no hook to pass one. ``_open`` is replaced outright (rather than
+    pre-creating the file and delegating) so that the descriptor the handler
+    writes through is the same one the mode was applied to, and so that
+    ``O_NOFOLLOW`` is in force on the open the stream actually uses.
+
+    Three paths, all of which have to hold the guarantee:
+
+    * first open — created 0600 instead of at the umask;
+    * an existing log — ``O_CREAT``'s mode does not apply to a file that
+      already exists, so the descriptor is tightened with ``fchmod``;
+    * rollover — ``_open`` runs again for the new base file, and ``rotate``
+      re-applies the mode to each backup, so ``proxy-8000.log.1`` is no more
+      readable than ``proxy-8000.log``. Backups left behind by an older,
+      unhardened build are tightened when the handler is constructed.
+
+    The mode bits carry this only on POSIX; see :mod:`headroom.fileperms` for
+    what is and is not claimed on Windows.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._restrict_existing_backups()
+
+    def _restrict_existing_backups(self) -> None:
+        for index in range(1, (self.backupCount or 0) + 1):
+            _fileperms.restrict_path_to_owner(
+                self.rotation_filename(f"{self.baseFilename}.{index}")
+            )
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return _fileperms.open_owner_only(
+            self.baseFilename,
+            self.mode,
+            encoding=self.encoding,
+            errors=getattr(self, "errors", None),
+        )
+
+    def rotate(self, source: str, dest: str) -> None:
+        super().rotate(source, dest)
+        # os.rename carries the mode across, but a configured ``rotator`` (or a
+        # copy-based one) need not, so the invariant is asserted on the result
+        # rather than assumed from how it got there.
+        _fileperms.restrict_path_to_owner(dest)
+
+
+_owner_only_warning_emitted = False
+
+
+def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
+    """Say plainly, once per process, when the file cannot be made owner-only.
+
+    A security control that quietly does nothing on a supported platform is
+    worse than no control, so Windows gets told rather than left to assume the
+    0600 in the docs applies to it.
+    """
+    global _owner_only_warning_emitted
+    if _fileperms.OWNER_ONLY_SUPPORTED or _owner_only_warning_emitted:
+        return
+    _owner_only_warning_emitted = True
+    logger.warning(
+        "Headroom cannot create %s owner-only on this platform: file modes do not "
+        "control read access here, and Headroom does not set an ACL. The runtime log "
+        "can contain request and response content (--log-messages, wire debug, "
+        "HEADROOM_LOG_PAYLOAD_PREVIEW) — protect the log directory itself.",
+        log_path,
+    )
+
+
 def _setup_file_logging(
     port: int | None = None,
     *,
@@ -1737,13 +1812,34 @@ def _setup_file_logging(
     The file is keyed by *port* so concurrent instances rotate separate logs.
     Multi-worker callers also pass *process_id* so same-port workers cannot
     race during rollover. When *port* is omitted the legacy shared name is used.
+
+    The log is **always** created owner-only, and so are its rotated backups —
+    not only when ``HEADROOM_LOG_PAYLOAD_PREVIEW`` is on. Payload previews are
+    one of several sources of request content in this file: ``--log-messages``
+    bodies, wire debug dumps and query logging land here too, each behind its
+    own switch, so keying the file's permissions off any one of them leaves the
+    others writing a sensitive file at the umask. On POSIX that is enforced;
+    on Windows it is not — see :mod:`headroom.fileperms`.
     """
-    from logging.handlers import RotatingFileHandler
+    handler_cls = _OwnerOnlyRotatingFileHandler
 
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = _paths.proxy_log_path(port, process_id=process_id)
+        if log_path.is_symlink():
+            # Fail closed. A symlink at the log path redirects both the write
+            # and the mode we set on it, so whoever planted it chooses where
+            # request content lands and who can read it. O_NOFOLLOW catches
+            # this in _open too; the explicit check is what carries the
+            # refusal on platforms without that flag, and lets us say why.
+            logger.warning(
+                "Refusing to write the Headroom runtime log: %s is a symlink. "
+                "Remove it (or point HEADROOM_WORKSPACE_DIR elsewhere) to restore logging.",
+                log_path,
+            )
+            return
+        _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
         # Disable propagation to root to avoid duplicate writes when
         # wrap.py redirects stderr to the same log file.
@@ -1763,7 +1859,7 @@ def _setup_file_logging(
         ]
         if any(Path(h.baseFilename) == log_path for h in existing):
             return
-        handler = RotatingFileHandler(
+        handler = handler_cls(
             log_path,
             maxBytes=10 * 1024 * 1024,  # 10 MB
             backupCount=5,

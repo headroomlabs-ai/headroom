@@ -969,13 +969,20 @@ class StreamingMixin:
             output_tokens, output_tokens_source = estimate_output_tokens(
                 sse_text=full_sse_data,
                 total_bytes=stream_state["total_bytes"],
+                # The provider body as sent, so a turn stopped by its output
+                # ceiling can be counted exactly instead of estimated. Matters
+                # most for a tool call truncated mid-arguments, whose dropped
+                # JSON leaves almost no text to count.
+                body=body,
             )
             # Name the actual basis. The old message always said "from N bytes"
             # even though that is now only true for the fallback rung, and an
             # operator reading it needs to know which estimate they are looking
             # at before trusting the number.
             basis = (
-                "counted from stream text"
+                "exact: turn hit its output-token ceiling"
+                if output_tokens_source == "exact_ceiling"
+                else "counted from stream text"
                 if output_tokens_source == "estimated_text"
                 else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
             )

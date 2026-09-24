@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
+from headroom import fileperms
 from headroom.proxy import request_log_redaction_policy
 from headroom.proxy.models import RequestLog
 
@@ -138,7 +139,12 @@ class RequestLogger:
 
         if self.log_file:
             try:
-                with open(self.log_file, "a") as f:
+                # Owner-only: with ``log_full_messages`` this file holds whole
+                # request and response bodies, and it is the caller's chosen
+                # path rather than one under ~/.headroom, so it must not be
+                # created at the umask. Symlinked paths fail the open and land
+                # in the graceful-degradation branch below.
+                with fileperms.open_owner_only(self.log_file, "a") as f:
                     log_dict = asdict(entry)
                     if not self.log_full_messages:
                         log_dict.pop("request_messages", None)

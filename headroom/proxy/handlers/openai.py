@@ -3687,13 +3687,18 @@ class OpenAIHandlerMixin:
 
         # Hook: pre_compress
         _hook_biases = None
+        # Hard per-message veto. Separate from ``_hook_biases`` because a bias is
+        # a soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        _hook_protect = None
         if self.config.hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             _hook_ctx = CompressContext(model=model, provider="openai")
             try:
                 messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
                 logger.debug(f"[{request_id}] Hook error: {e}")
 
@@ -3898,6 +3903,7 @@ class OpenAIHandlerMixin:
                             ),
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
@@ -3940,6 +3946,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode

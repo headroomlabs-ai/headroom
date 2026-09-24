@@ -1739,6 +1739,16 @@ class AnthropicHandlerMixin:
                         if self.config.hooks and _hook_ctx is not None
                         else None
                     )
+                    # Hard per-message veto. Separate from ``biases`` because a
+                    # bias is a soft multiplier that several strategies clamp or
+                    # ignore, so it cannot express "leave this one alone".
+                    from headroom.hooks import collect_protected
+
+                    protect = (
+                        collect_protected(self.config.hooks, messages, _hook_ctx)
+                        if self.config.hooks and _hook_ctx is not None
+                        else None
+                    )
 
                     # F2.1 c5/5: derive the per-request CompressionPolicy
                     # from the auth_mode classified at request entry. The
@@ -1807,6 +1817,7 @@ class AnthropicHandlerMixin:
                                     prefix_replay_guaranteed=True,
                                     idle_seconds=idle_seconds,
                                     biases=biases,
+                                    protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
@@ -1853,6 +1864,7 @@ class AnthropicHandlerMixin:
                                             prefix_replay_guaranteed=True,
                                             idle_seconds=idle_seconds,
                                             biases=biases,
+                                            protect=protect,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
@@ -1905,6 +1917,7 @@ class AnthropicHandlerMixin:
                                         prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
@@ -1948,6 +1961,7 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     prefix_replay_guaranteed=True,
                                     biases=biases,
+                                    protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
@@ -2010,6 +2024,7 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=frozen_message_count,
                                         prefix_replay_guaranteed=True,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         **proxy_pipeline_kwargs(self.config),
@@ -2082,6 +2097,7 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=prefix_n,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,

@@ -609,6 +609,59 @@ def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     assert load_spreadsheet(xls_path) == load_spreadsheet(xlsx_path)
 
 
+class _StubXlsCell:
+    """The whole surface ``_xls_cell`` reads: xlrd's ``ctype`` and ``value``."""
+
+    def __init__(self, ctype: int, value: object) -> None:
+        self.ctype = ctype
+        self.value = value
+
+
+@pytest.mark.parametrize("value", [12.0, 1e15, float(2**53 - 1), float(2**53), float(-(2**53))])
+def test_xls_cell_converts_exact_whole_numbers_to_int(value: float) -> None:
+    """At or below 2**53 every integer is representable, so ``int()`` loses nothing.
+
+    The bound is inclusive at both ends: +/-2**53 is exactly representable, and
+    openpyxl reads the same value from an .xlsx as an ``int``, so excluding it
+    would make the two loaders disagree at exactly the boundary.
+    """
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    rendered = _xls_cell(_StubXlsCell(xlrd.XL_CELL_NUMBER, value), 0)
+
+    assert isinstance(rendered, int)
+    assert rendered == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float(2**53 + 2), float(-(2**53) - 2), 1e16, 1e20, 123456789012345678.0],
+)
+def test_xls_cell_keeps_numbers_past_2_53_as_floats(value: float) -> None:
+    """Past 2**53 ``int()`` would fabricate digits the workbook never held.
+
+    ``2**53 + 2`` is the first whole number above the boundary (``2**53 + 1``
+    is not representable at all), and ``-(2**53) - 2`` its negative mirror.
+
+    xlrd hands back a double, and above 2**53 consecutive integers are no longer
+    representable, so ``int()`` renders the double's exact value rather than the
+    number that was typed: a cell holding 123456789012345678 prints as
+    123456789012345680 -- an identifier that reads as exact and is wrong in its
+    last two digits. The float repr says "approximate" out loud, and is also what
+    the .xlsx loader shows for the same workbook.
+    """
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    rendered = _xls_cell(_StubXlsCell(xlrd.XL_CELL_NUMBER, value), 0)
+
+    assert isinstance(rendered, float)
+    assert rendered == value
+
+
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:
     from headroom.transforms.spreadsheet_ingest import load_spreadsheet
 

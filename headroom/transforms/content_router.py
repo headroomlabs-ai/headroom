@@ -5258,6 +5258,15 @@ class ContentRouter(Transform):
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
+        # Per-message veto from a compression hook (``CompressionHooks.
+        # protect_messages``). Distinct from ``biases``, which is a soft
+        # multiplier on how aggressively a compressor prunes: several
+        # strategies clamp or ignore it, so a bias — however large — cannot
+        # express "leave this one alone". This can. Empty unless a hook is
+        # installed, so the default path is unchanged.
+        hook_protect: set[int] = {
+            int(i) for i in (kwargs.get("protect") or ()) if isinstance(i, (int, bool))
+        }
 
         # Build tool name map for exclusion checking
         tool_name_map = self._build_tool_name_map(messages)
@@ -5556,6 +5565,14 @@ class ContentRouter(Transform):
             role = message.get("role", "")
             content = message.get("content", "")
             bias = 1.0  # Default bias, may be overridden for tool messages
+
+            # Hook veto, checked before any routing decision so it covers both
+            # the content-block path and the string path below.
+            if i in hook_protect:
+                result_slots[i] = message
+                transforms_applied.append("router:protected:hook")
+                route_counts["hook_protected"] = route_counts.get("hook_protected", 0) + 1
+                continue
 
             messages_from_end = num_messages - i
             # The caller's own words stay verbatim on a replaying path even
