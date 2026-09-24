@@ -2103,13 +2103,14 @@ class OpenAIHandlerMixin:
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
         # ContentRouter._build_tool_name_map; the Responses payload carries the
-        # name on the `function_call` item and the originating call_id on the
-        # matching `function_call_output`, so we correlate them here.
+        # name on the `function_call` (or Codex `custom_tool_call`) item and
+        # the originating call_id on the matching output, so we correlate
+        # them here.
         function_name_by_call_id: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") != "function_call":
+            if item.get("type") not in ("function_call", "custom_tool_call"):
                 continue
             name = item.get("name")
             call_id = item.get("call_id")
