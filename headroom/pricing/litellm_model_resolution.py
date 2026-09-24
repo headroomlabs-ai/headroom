@@ -27,15 +27,29 @@ class LiteLLMModelPrefixRule:
 
 # Aliases for models removed from LiteLLM's cost database (retired/renamed).
 # Maps old model name -> current LiteLLM key that has equivalent pricing.
+# Retired model ids, aliased to a CURRENTLY PRICED model of the same tier.
+#
+# An alias target must itself still be in litellm's table. These pointed at
+# claude-sonnet-4-20250514 until litellm pruned it on 2026-09-23, at which point
+# all three aliases resolved to nothing and every one of these models fell
+# through to the unknown-model default (the GPT-4o tier, $2.50/$10.00) -- the
+# same class of silent mispricing the Haiku note below warns about. The guard
+# test fails the build if a target is pruned again, so this cannot rot quietly.
+#
+# The undated target is deliberate: it survives a dated release being retired.
 MODEL_ALIASES: dict[str, str] = {
-    # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired. It was a Sonnet-tier model ($3/$15 per 1M
-    # in/out) — same price as claude-sonnet-4-20250514 — so alias it there.
-    # The old target, claude-3-haiku-20240307 ($0.25/$1.25), is a different
-    # (Haiku) tier and underpriced every cost/savings figure ~12x.
-    "claude-3-sonnet-20240229": "claude-sonnet-4-20250514",
+    # All three retired here are Sonnet-tier ($3/$15 per 1M in/out), so they
+    # alias to the current Sonnet. Pick a target litellm still prices: these
+    # pointed at claude-sonnet-4-20250514 until litellm pruned it, after which
+    # they fell through to the unknown-model default and billed at the GPT-4o
+    # tier ($2.50/$10.00). test_model_alias_targets_are_priced.py fails if a
+    # target goes unpriced again.
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4-5",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4-5",
+    # claude-3-sonnet-20240229 previously aliased to claude-3-haiku-20240307
+    # ($0.25/$1.25) — a different (Haiku) tier that underpriced every cost and
+    # savings figure for it by ~12x.
+    "claude-3-sonnet-20240229": "claude-sonnet-4-5",
 }
 
 

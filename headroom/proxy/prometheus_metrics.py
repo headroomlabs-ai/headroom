@@ -30,6 +30,33 @@ logger = logging.getLogger("headroom.proxy")
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
 
+# Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
+# mean opposite things to an operator: "headroom" is OUR limiter refusing the
+# request (raise the cap), "upstream" is the provider refusing it (back off or
+# shard keys). Before #3615 only the first could ever increment this counter;
+# the outcome funnel now routes provider 429s here too, so the split has to be
+# queryable instead of silently merged. Closed set => bounded cardinality, and
+# both series are exported from startup so a rate() never goes from absent to
+# present mid-incident.
+RATE_LIMIT_SOURCE_HEADROOM = "headroom"
+RATE_LIMIT_SOURCE_UPSTREAM = "upstream"
+RATE_LIMIT_SOURCES = (RATE_LIMIT_SOURCE_HEADROOM, RATE_LIMIT_SOURCE_UPSTREAM)
+
+# Bucket for a failure with no attributed provider. Also seeded at zero so
+# headroom_requests_failed_total always exports at least one sample.
+_PROVIDER_UNKNOWN = "unknown"
+
+
+def _rate_limit_source(source: str | None) -> str:
+    """Clamp ``source`` to the closed label set, defaulting to Headroom's limiter.
+
+    Defaults to ``headroom`` because that is what this counter meant for its
+    whole life before the outcome funnel started feeding it upstream 429s: an
+    un-updated caller keeps the historical reading rather than inventing a new
+    label value.
+    """
+    return source if source in RATE_LIMIT_SOURCES else RATE_LIMIT_SOURCE_HEADROOM
+
 
 def _escape_label_value(value: str) -> str:
     # The /metrics body is emitted whole with .encode("utf-8") (server.py). A
@@ -100,7 +127,26 @@ class PrometheusMetrics:
         self.requests_by_stack: dict[str, int] = defaultdict(int)
         self.requests_cached = 0
         self.requests_rate_limited = 0
+        # Seeded with both sources at zero so /metrics exports the full series
+        # set from the first scrape; ``requests_rate_limited`` stays the
+        # unlabelled total that /stats and the session summary read.
+        self.requests_rate_limited_by_source: dict[str, int] = dict.fromkeys(RATE_LIMIT_SOURCES, 0)
         self.requests_failed = 0
+        # Per-provider failure attribution. #3615 moved 4xx out of the success
+        # funnel, which also took them out of ``requests_by_provider`` (only
+        # record_request touches that), leaving Prometheus with no way to tell
+        # which upstream was failing. Kept alongside the unlabelled total.
+        #
+        # Seeded with the "unknown" bucket at zero so the metric always exports
+        # at least one sample. Before this counter carried a label it was always
+        # present as a bare ``headroom_requests_failed_total 0``; a labelled map
+        # that starts empty would emit NO sample on a healthy proxy, which turns
+        # the documented failure-rate query into an empty vector (an empty
+        # numerator makes the whole expression empty, so the panel reads
+        # "No data" instead of 0%) and would make ``absent()`` alerts fire on
+        # healthy proxies. "unknown" is a real bucket -- record_failed uses it
+        # when no provider is attributed -- so seeding it invents no provider.
+        self.requests_failed_by_provider: dict[str, int] = defaultdict(int, {_PROVIDER_UNKNOWN: 0})
         self.inbound_requests_total = 0
         self.inbound_requests_completed = 0
         self.inbound_requests_active = 0
@@ -296,6 +342,10 @@ class PrometheusMetrics:
         # Cache bust tracking: how many tokens lost their cache discount due to compression
         self.cache_bust_tokens_lost: int = 0
         self.cache_bust_count: int = 0
+        # Edge-trigger latch for the net-negative warning: True once busts have
+        # overtaken savings, cleared when the net recovers. See
+        # _check_net_tokens_crossing_locked.
+        self._net_tokens_negative: bool = False
 
         # Cache-miss attribution (#1313): when a turn expected a prompt-cache
         # hit but got none, why? Bucketed by reason so operators can tell a
@@ -343,7 +393,11 @@ class PrometheusMetrics:
             self.requests_by_stack.clear()
             self.requests_cached = 0
             self.requests_rate_limited = 0
+            self.requests_rate_limited_by_source = dict.fromkeys(RATE_LIMIT_SOURCES, 0)
             self.requests_failed = 0
+            self.requests_failed_by_provider.clear()
+            # Re-seed so /metrics keeps exporting a sample after a reset.
+            self.requests_failed_by_provider[_PROVIDER_UNKNOWN] = 0
             self.inbound_requests_total = 0
             self.inbound_requests_completed = 0
             self.inbound_requests_active = 0
@@ -422,6 +476,7 @@ class PrometheusMetrics:
             self.prefix_freeze_compression_foregone = 0
             self.cache_bust_tokens_lost = 0
             self.cache_bust_count = 0
+            self._net_tokens_negative = False
             self.cache_miss_attribution_by_provider.clear()
             self.savings_history = []
 
@@ -1118,8 +1173,40 @@ class PrometheusMetrics:
         async with self._lock:
             self.cache_bust_tokens_lost += tokens_lost
             self.cache_bust_count += 1
+            crossed = self._check_net_tokens_crossing_locked()
+        if crossed is not None:
+            saved, lost = crossed
+            logger.warning(
+                "event=net_tokens_negative tokens_saved=%d tokens_lost_to_cache_bust=%d "
+                "net_tokens=%d busts=%d hint=%s",
+                saved,
+                lost,
+                saved - lost,
+                self.cache_bust_count,
+                "prompt-cache busts now outweigh compression savings for this "
+                "process; compression is a net loss on this traffic",
+            )
         self.savings_tracker.record_lifetime_cache_bust(tokens_lost=tokens_lost)
         self._get_otel_metrics().record_proxy_cache_bust(tokens_lost=tokens_lost)
+
+    def _check_net_tokens_crossing_locked(self) -> tuple[int, int] | None:
+        """Return (saved, lost) the first time busts overtake savings, else None.
+
+        Edge-triggered, not level-triggered: a deployment that is losing is
+        losing on every bust, and a warning per bust would be noise. The flag
+        re-arms when the net returns to positive, so a deployment that crosses
+        back and forth warns on each crossing rather than once forever.
+
+        Caller must hold ``self._lock``.
+        """
+
+        net_negative = self.cache_bust_tokens_lost > self.tokens_saved_total
+        if net_negative and not self._net_tokens_negative:
+            self._net_tokens_negative = True
+            return self.tokens_saved_total, self.cache_bust_tokens_lost
+        if not net_negative:
+            self._net_tokens_negative = False
+        return None
 
     async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
         """Record why a turn that expected a prompt-cache hit missed instead.
@@ -1175,15 +1262,38 @@ class PrometheusMetrics:
         if ms_val > self.ws_session_duration_max_ms[cause]:
             self.ws_session_duration_max_ms[cause] = ms_val
 
-    async def record_rate_limited(self, *, provider: str | None = None, model: str | None = None):
+    async def record_rate_limited(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        source: str = RATE_LIMIT_SOURCE_HEADROOM,
+    ):
+        """Record a 429.
+
+        ``source`` says WHO refused the request: ``headroom`` for our own
+        limiter (the handlers, which raise HTTPException and never emit an
+        outcome) or ``upstream`` for a provider 429 arriving through the
+        outcome funnel. Threaded to every sink — Prometheus, lifetime/persistent
+        and OTel — so no backend reports a differently-shaped counter.
+        """
+        source = _rate_limit_source(source)
         async with self._lock:
             self.requests_rate_limited += 1
-        self.savings_tracker.record_lifetime_rate_limited(provider=provider, model=model)
-        self._get_otel_metrics().record_proxy_rate_limited(provider=provider, model=model)
+            self.requests_rate_limited_by_source[source] = (
+                self.requests_rate_limited_by_source.get(source, 0) + 1
+            )
+        self.savings_tracker.record_lifetime_rate_limited(
+            provider=provider, model=model, source=source
+        )
+        self._get_otel_metrics().record_proxy_rate_limited(
+            provider=provider, model=model, source=source
+        )
 
     async def record_failed(self, *, provider: str | None = None, model: str | None = None):
         async with self._lock:
             self.requests_failed += 1
+            self.requests_failed_by_provider[provider or _PROVIDER_UNKNOWN] += 1
         self.savings_tracker.record_lifetime_failed(provider=provider, model=model)
         self._get_otel_metrics().record_proxy_failed(provider=provider, model=model)
 
@@ -1215,20 +1325,39 @@ class PrometheusMetrics:
                 help_text="Cached request count",
                 value=self.requests_cached,
             )
-            _append_metric(
-                lines,
-                name="headroom_requests_rate_limited_total",
-                metric_type="counter",
-                help_text="Rate limited requests",
-                value=self.requests_rate_limited,
+            # Labelled series only — an unlabelled sample alongside these would
+            # double-count under sum(). `sum without (source)` reproduces the
+            # pre-label value exactly.
+            lines.extend(
+                [
+                    "# HELP headroom_requests_rate_limited_total Requests rejected with 429, "
+                    "by who rejected them (headroom=our own limiter, upstream=the provider)",
+                    "# TYPE headroom_requests_rate_limited_total counter",
+                ]
             )
-            _append_metric(
-                lines,
-                name="headroom_requests_failed_total",
-                metric_type="counter",
-                help_text="Failed requests",
-                value=self.requests_failed,
+            for _source in RATE_LIMIT_SOURCES:
+                _count = self.requests_rate_limited_by_source.get(_source, 0)
+                lines.append(
+                    f'headroom_requests_rate_limited_total{{source="{_escape_label_value(_source)}"}}'
+                    f" {_count}"
+                )
+            lines.append("")
+
+            # Failures carry the provider that produced them. `sum without
+            # (provider)` reproduces the pre-label value.
+            lines.extend(
+                [
+                    "# HELP headroom_requests_failed_total Requests that failed upstream "
+                    "(4xx and 5xx, excluding 429), by provider",
+                    "# TYPE headroom_requests_failed_total counter",
+                ]
             )
+            for _provider, _count in self.requests_failed_by_provider.items():
+                lines.append(
+                    f'headroom_requests_failed_total{{provider="'
+                    f'{_escape_label_value(str(_provider))}"}} {_count}'
+                )
+            lines.append("")
             _append_metric(
                 lines,
                 name="headroom_inbound_requests_total",
