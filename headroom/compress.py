@@ -235,12 +235,12 @@ def compress(
         # express "leave this one alone".
         protect = None
         if hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             ctx = CompressContext(model=model)
             messages = hooks.pre_compress(messages, ctx)
             biases = hooks.compute_biases(messages, ctx)
-            protect = hooks.protect_messages(messages, ctx)
+            protect = collect_protected(hooks, messages, ctx)
 
         received_event = pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,

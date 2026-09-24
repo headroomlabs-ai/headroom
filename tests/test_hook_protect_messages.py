@@ -131,7 +131,7 @@ def test_the_seam_is_reachable_from_the_sdk() -> None:
 
 
 def test_hooks_that_do_not_implement_it_still_work() -> None:
-    """Hooks predating this method are duck-typed subclasses in the wild."""
+    """A subclass predating this method inherits the empty default."""
 
     class Legacy(CompressionHooks):
         def compute_biases(self, messages, ctx):
@@ -139,3 +139,42 @@ def test_hooks_that_do_not_implement_it_still_work() -> None:
 
     result = compress(openai_messages(LOG), model=MODEL, hooks=Legacy())
     assert result.tokens_after < result.tokens_before
+
+
+def test_a_hooks_object_that_is_not_a_subclass_still_compresses() -> None:
+    """The real compatibility case: ``hooks`` is duck-typed, not type-checked.
+
+    Nothing requires the object passed as ``hooks`` to subclass
+    CompressionHooks, so one written before ``protect_messages`` existed has no
+    such attribute. Calling it blind raises AttributeError inside the
+    compression block, which the proxy catches as a *compression failure* — so
+    the request would silently stop being compressed. That would make this
+    additive seam a regression for those callers.
+    """
+
+    class DuckTyped:  # deliberately not a CompressionHooks subclass
+        def pre_compress(self, messages, ctx):
+            return messages
+
+        def compute_biases(self, messages, ctx):
+            return {}
+
+        def post_compress(self, event):
+            pass
+
+        def on_pipeline_event(self, event):
+            return None
+
+    result = compress(openai_messages(LOG), model=MODEL, hooks=DuckTyped())
+    assert result.tokens_after < result.tokens_before
+
+
+def test_collect_protected_reports_a_missing_method_as_no_vetoes() -> None:
+    from headroom.hooks import CompressContext, collect_protected
+
+    class Without:
+        pass
+
+    ctx = CompressContext(model=MODEL)
+    assert collect_protected(Without(), [], ctx) is None
+    assert collect_protected(CompressionHooks(), [], ctx) == set()

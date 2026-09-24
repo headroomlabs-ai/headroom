@@ -1742,8 +1742,10 @@ class AnthropicHandlerMixin:
                     # Hard per-message veto. Separate from ``biases`` because a
                     # bias is a soft multiplier that several strategies clamp or
                     # ignore, so it cannot express "leave this one alone".
+                    from headroom.hooks import collect_protected
+
                     protect = (
-                        self.config.hooks.protect_messages(messages, _hook_ctx)
+                        collect_protected(self.config.hooks, messages, _hook_ctx)
                         if self.config.hooks and _hook_ctx is not None
                         else None
                     )

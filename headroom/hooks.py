@@ -176,3 +176,33 @@ class CompressionHooks:
         the three legacy compression-specific hooks.
         """
         return None
+
+
+def collect_protected(
+    hooks: Any,
+    messages: list[dict[str, Any]],
+    ctx: CompressContext,
+) -> set[int] | None:
+    """Ask a hooks object for its per-message vetoes, tolerating older ones.
+
+    ``hooks`` is duck-typed at every call site: nothing requires the object to
+    be a :class:`CompressionHooks` subclass, and objects written before
+    ``protect_messages`` existed will not have the attribute at all. Calling it
+    blind would raise ``AttributeError`` inside the compression block, which the
+    proxy catches as a compression failure — so adding this hook would silently
+    stop compressing for those callers, turning an additive seam into a
+    regression. A missing method means "no vetoes".
+
+    Returns None when the hook cannot be asked, which the router treats the same
+    as an empty set.
+    """
+    fn = getattr(hooks, "protect_messages", None)
+    if fn is None:
+        return None
+    protected = fn(messages, ctx)
+    if protected is None:
+        return None
+    # Normalise here rather than trusting the hook: ``hooks`` is duck-typed, so
+    # a set is a convention, not a guarantee, and a list of indices is the
+    # obvious thing for an implementer to return.
+    return {int(i) for i in protected}
