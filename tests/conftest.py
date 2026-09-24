@@ -164,10 +164,17 @@ def _null_binary_pins():
 
     Installer tests fetch small mock archives, whose digests can't match the
     real published pins. Nulling the pins lets those download/extract mechanics
-    tests run (verification then falls back to HTTPS trust); the tests that
-    specifically exercise verification set their own pin explicitly. Production
-    keeps the real pins (this fixture is test-only) and the tools-hash-refresh
-    CI gate guarantees they stay correct.
+    tests run; the tests that specifically exercise verification set their own
+    pin explicitly. Production keeps the real pins (this fixture is test-only)
+    and the tools-hash-refresh CI gate guarantees they stay correct.
+
+    Nulling a pin used to mean "fall back to HTTPS trust". It now means
+    "refuse", so the escape hatch has to be set alongside it or every test that
+    reaches a real download fails closed -- which is what happened to
+    test_bundled_tools_savings.py on a cold CI cache, while passing locally
+    against an already-populated one. Setting both together keeps this fixture
+    saying one thing: "verification is not what these tests are about."
+    Verification tests delenv it in their own fixture.
     """
     try:
         from headroom import binaries
@@ -185,9 +192,17 @@ def _null_binary_pins():
     ]
     for asset, _original in saved:
         asset["sha256"] = None
-    yield
-    for asset, original in saved:
-        asset["sha256"] = original
+    previous = os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED")
+    os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HEADROOM_BINARIES_ALLOW_UNVERIFIED", None)
+        else:
+            os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = previous
+        for asset, original in saved:
+            asset["sha256"] = original
 
 
 @pytest.fixture(autouse=True)

@@ -494,6 +494,11 @@ def build_prefix_cache_stats(
             "tokens_lost_to_cache_bust": metrics.cache_bust_tokens_lost,
             "cache_bust_count": metrics.cache_bust_count,
             "net_tokens": metrics.tokens_saved_total - metrics.cache_bust_tokens_lost,
+            # Explicit rather than left for each consumer to re-derive: this is
+            # the alerting condition (the proxy logs event=net_tokens_negative
+            # on the same crossing), and a boolean in the payload is what a
+            # scrape or a health check can key on without doing arithmetic.
+            "net_is_negative": (metrics.tokens_saved_total - metrics.cache_bust_tokens_lost < 0),
         },
         "attribution": (
             "Prefix caching is performed by the LLM provider (Anthropic, OpenAI). "

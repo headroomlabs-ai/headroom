@@ -45,7 +45,7 @@ use super::compaction::{
     CompactConfig, Compaction, CompactionStage,
 };
 use super::config::SmartCrusherConfig;
-use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
+use super::crushers::{compute_k_split, crush_number_array, crush_string_array};
 use super::planning::SmartCrusherPlanner;
 use super::traits::{Constraint, CrushEvent, Observer};
 use super::types::{CompressionPlan, CompressionStrategy, CrushResult};
@@ -634,7 +634,18 @@ impl SmartCrusher {
                 (Value::Array(processed), info_parts.join(","))
             }
             Value::Object(map) => {
-                // First pass: recurse into values to compress nested arrays.
+                // Object keys are never dropped. Object fields are
+                // independent named properties, not interchangeable
+                // sampled records, and the previous key-dropping
+                // implementation violated the CCR reversibility
+                // contract: it deleted keys (e.g. `tags`, `subtasks`
+                // on MCP task payloads) with no retrieval marker, so
+                // the data was unrecoverable (see #3650 / PR #3648).
+                //
+                // Recursing into the values is the whole job here:
+                // nested arrays still get large-array compaction and
+                // CCR-backed row offload, which stay reversible,
+                // without deleting their enclosing keys.
                 let mut processed = serde_json::Map::new();
                 for (k, v) in map {
                     let (p_val, p_info) =
@@ -642,19 +653,6 @@ impl SmartCrusher {
                     processed.insert(k.clone(), p_val);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
-                    }
-                }
-
-                // Second pass: crush_object preserves every property
-                // (object fields are not interchangeable sampled
-                // records). Nested arrays were already compacted above,
-                // so large-array compaction and CCR row offload still
-                // run without deleting their enclosing keys.
-                if processed.len() >= self.config.min_items_to_analyze {
-                    let (crushed_dict, strategy) = crush_object(&processed, &self.config, bias);
-                    if strategy != "object:passthrough" {
-                        info_parts.push(strategy);
-                        return (Value::Object(crushed_dict), info_parts.join(","));
                     }
                 }
 
@@ -1520,6 +1518,171 @@ mod tests {
     fn crusher_construction_default() {
         let c = SmartCrusher::new(SmartCrusherConfig::default());
         assert_eq!(c.config.max_items_after_crush, 15);
+    }
+
+    // ---------- object key preservation (#3650 / #3697) ----------
+    //
+    // Object fields are independent named properties, not interchangeable
+    // sampled records, so no object key may be dropped: the object path
+    // emits no CCR retrieval marker, and dropping a key there would make
+    // the value unrecoverable. These guard the invariant explicitly, so
+    // it does not rest on the mere absence of key-dropping code.
+
+    /// Wide object above every historical key-selection gate: >= 5 keys,
+    /// long string values, a nested dict, nulls, booleans, empty arrays.
+    /// `expensive_index` places the nested dict at begin / middle / end,
+    /// since boundary/stride selection used to drop the middle one.
+    fn wide_object(expensive_index: usize) -> Value {
+        let n = 15;
+        let expensive_index = expensive_index.min(n - 1);
+        let mut obj = serde_json::Map::new();
+        for i in 0..n {
+            if i == expensive_index {
+                obj.insert(
+                    format!("expensive_{i}"),
+                    json!({
+                        "nested": {"label": format!("nested-{i}"), "note": "x".repeat(120)},
+                        "items": [],
+                        "ok": true,
+                        "missing": null
+                    }),
+                );
+            } else {
+                obj.insert(
+                    format!("field_{i:02}"),
+                    json!(format!(
+                        "this is a relatively long value string for entry number {i} with content"
+                    )),
+                );
+            }
+        }
+        obj.insert("flag".to_string(), json!(false));
+        obj.insert("empty".to_string(), json!([]));
+        obj.insert("nada".to_string(), json!(null));
+        obj.insert(
+            "msg1".to_string(),
+            json!(format!("FATAL: {}", "x".repeat(200))),
+        );
+        obj.insert("tiny".to_string(), json!(1));
+        Value::Object(obj)
+    }
+
+    fn assert_every_key_round_trips(value: &Value, config: SmartCrusherConfig) {
+        let input = serde_json::to_string(value).expect("serialize");
+        let result = SmartCrusher::new(config).crush(&input, "", 1.0);
+        let out: Value = serde_json::from_str(&result.compressed)
+            .unwrap_or_else(|e| panic!("output is not JSON ({e}): {}", result.compressed));
+        assert_eq!(
+            &out, value,
+            "object keys must survive the crush path untouched"
+        );
+        let (expected, got) = (
+            value.as_object().expect("object"),
+            out.as_object().expect("object"),
+        );
+        assert_eq!(got.len(), expected.len(), "key count changed");
+        for (k, v) in expected {
+            assert_eq!(got.get(k), Some(v), "key {k} was dropped or altered");
+        }
+        assert!(
+            !result.strategy.contains("object:"),
+            "no object-level crush strategy may be reported: {}",
+            result.strategy
+        );
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_for_five_key_object() {
+        // Exactly at the old `min_items_to_analyze` gate: the smallest
+        // object the removed second pass used to touch.
+        let mut obj = serde_json::Map::new();
+        for i in 0..5 {
+            obj.insert(
+                format!("k{i}"),
+                json!(format!("value number {i} for the five key object")),
+            );
+        }
+        assert_every_key_round_trips(&Value::Object(obj), SmartCrusherConfig::default());
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_for_wide_mixed_object() {
+        for expensive_index in [0, 7, 14] {
+            assert_every_key_round_trips(
+                &wide_object(expensive_index),
+                SmartCrusherConfig::default(),
+            );
+            assert_every_key_round_trips(
+                &wide_object(expensive_index),
+                SmartCrusherConfig {
+                    lossless_only: true,
+                    ..SmartCrusherConfig::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_when_nested_arrays_compact() {
+        // The behaviour this refactor relies on: recursing into object VALUES
+        // still compacts a nested array, and the enclosing key survives that
+        // compaction. The array has to actually shrink for the test to mean
+        // anything -- an all-scalar object would pass even if recursion were
+        // removed from the object branch, which is the whole thing being
+        // guarded here.
+        let mut obj = serde_json::Map::new();
+        for i in 0..40 {
+            obj.insert(
+                format!("k{i:02}"),
+                json!(format!(
+                    "long description for entry {i}, above the small-value floor"
+                )),
+            );
+        }
+        let rows: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "name": format!("row-{i}"),
+                    "status": if i % 3 == 0 { "error" } else { "ok" },
+                    "detail": format!("detail text for row {i} padded out a bit"),
+                })
+            })
+            .collect();
+        let row_count = rows.len();
+        obj.insert("records".to_string(), Value::Array(rows));
+
+        let value = Value::Object(obj);
+        let input = serde_json::to_string(&value).expect("serialize");
+        let result = crusher().crush(&input, "", 1.0);
+        let out: Value = serde_json::from_str(&result.compressed).expect("valid JSON out");
+        let got = out.as_object().expect("object out");
+
+        assert_eq!(got.len(), 41, "all 40 scalar keys + `records` must survive");
+        for k in value.as_object().unwrap().keys() {
+            assert!(got.contains_key(k), "dropped key {k}");
+        }
+
+        // The nested array took a compaction path...
+        assert!(
+            result.was_modified,
+            "nested array should have been compacted; strategy={} out={}",
+            result.strategy, result.compressed
+        );
+        let compacted = got.get("records").expect("`records` key survived");
+        assert_ne!(
+            compacted,
+            value.as_object().unwrap().get("records").unwrap(),
+            "`records` should have been transformed, not passed through verbatim"
+        );
+        // ...and shrank, while its enclosing key stayed put.
+        if let Some(arr) = compacted.as_array() {
+            assert!(
+                arr.len() < row_count,
+                "compacted array should hold fewer than {row_count} items, got {}",
+                arr.len()
+            );
+        }
     }
 
     // ---------- top-level crush ----------

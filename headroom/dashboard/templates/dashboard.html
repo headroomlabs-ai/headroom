@@ -210,7 +210,7 @@
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-2">
                     <section class="bg-surface rounded-lg p-4 border border-border">
                         <h3 class="mb-3 text-sm font-medium text-gray-300">Request Health</h3>
-                        <div class="grid grid-cols-2 gap-3 text-sm"><div>Completed <span class="float-right tabular-nums" x-text="formatNumber(stats.requests?.total || 0)"></span></div><div>Failed <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.requests?.failed || 0)"></span></div><div>Rate Limited <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.requests?.rate_limited || 0)"></span></div><div>Cached <span class="float-right tabular-nums text-cyan-400" x-text="formatNumber(stats.requests?.cached || 0)"></span></div></div>
+                        <div class="grid grid-cols-2 gap-3 text-sm"><div>Completed <span class="float-right tabular-nums" x-text="formatNumber(stats.requests?.total || 0)"></span></div><div title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed <span class="float-right tabular-nums text-red-400" x-text="formatNumber(stats.requests?.failed || 0)"></span></div><div title="Requests rejected with 429 — by Headroom&#39;s own rate limiter or by the upstream provider. /stats splits them under requests.rate_limited_by_source.">Rate Limited <span class="float-right tabular-nums text-amber-400" x-text="formatNumber(stats.requests?.rate_limited || 0)"></span></div><div>Cached <span class="float-right tabular-nums text-cyan-400" x-text="formatNumber(stats.requests?.cached || 0)"></span></div></div>
                     </section>
                     <section class="bg-surface rounded-lg p-4 border border-border">
                         <h3 class="mb-3 text-sm font-medium text-gray-300">Live Activity</h3>
@@ -418,7 +418,7 @@
                                 <span class="font-mono text-sm" x-text="((stats.ttfb?.min_ms || 0) / 1000).toFixed(2) + ' - ' + ((stats.ttfb?.max_ms || 0) / 1000).toFixed(2) + 's'"></span>
                             </div>
                             <div class="flex justify-between items-center">
-                                <span class="text-sm text-gray-400">Failed Requests</span>
+                                <span class="text-sm text-gray-400" title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed Requests</span>
                                 <span class="font-mono text-sm" x-text="stats.requests?.failed || 0"></span>
                             </div>
                             <!-- Per-transform timing breakdown -->
@@ -1470,8 +1470,8 @@
                 </div>
                 <div class="grid grid-cols-2 gap-4 mb-6 md:grid-cols-4">
                     <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Requests</div><div class="text-2xl tabular-nums" x-text="formatNumber(lifetimeStats.requests?.total || 0)"></div></div>
-                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Failed</div><div class="text-2xl tabular-nums text-red-400" x-text="formatNumber(lifetimeStats.requests?.failed || 0)"></div></div>
-                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Rate Limited</div><div class="text-2xl tabular-nums text-amber-400" x-text="formatNumber(lifetimeStats.requests?.rate_limited || 0)"></div></div>
+                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500" title="Requests that failed upstream — 4xx and 5xx. 429s are counted under Rate Limited instead, and neither is included in Completed.">Failed</div><div class="text-2xl tabular-nums text-red-400" x-text="formatNumber(lifetimeStats.requests?.failed || 0)"></div></div>
+                    <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500" title="Requests rejected with 429 — by Headroom&#39;s own rate limiter or by the upstream provider. /stats splits them under requests.rate_limited_by_source.">Rate Limited</div><div class="text-2xl tabular-nums text-amber-400" x-text="formatNumber(lifetimeStats.requests?.rate_limited || 0)"></div></div>
                     <div class="bg-surface rounded-lg p-4 border border-border"><div class="text-xs text-gray-500">Cached</div><div class="text-2xl tabular-nums text-cyan-400" x-text="formatNumber(lifetimeStats.requests?.cached || 0)"></div></div>
                 </div>
 
