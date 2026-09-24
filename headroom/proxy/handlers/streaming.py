@@ -2111,6 +2111,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        original_messages: list[dict] | None = None,
         backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
@@ -2133,6 +2134,11 @@ class StreamingMixin:
         the FINAL usage frame can update the tracker for the next turn
         — mirroring the direct streaming path
         (``_stream_response``/``_finalize_stream_response``).
+        ``original_messages`` is the immutable pre-transform client
+        snapshot for the same update: the tracker must record what the
+        client SENT as its ``last_original_messages``, not what we
+        forwarded, or next turn's overlay never matches the client
+        prefix and cannot replay the cached bytes.
 
         NOTE: CCR request-level intercept on the streaming path is
         intentionally OUT OF SCOPE. Mirrors the Anthropic streaming
@@ -2256,6 +2262,7 @@ class StreamingMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
+                        original_messages=original_messages,
                     )
 
                 # CCR Feedback: record headroom_retrieve tool calls so

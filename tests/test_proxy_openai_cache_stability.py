@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.backends.base import BackendResponse
 from headroom.proxy.server import ProxyConfig, create_app
 
 
@@ -25,6 +27,7 @@ class _FakePrefixTracker:
         self._frozen_count = frozen_count
         self._previous_original = previous_original or []
         self._previous_forwarded = previous_forwarded or []
+        self.update_calls: list[dict] = []
 
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
@@ -40,10 +43,11 @@ class _FakePrefixTracker:
         return copy.deepcopy(self._previous_forwarded)
 
     def update_from_response(self, **kwargs):  # noqa: ANN003
+        self.update_calls.append(kwargs)
         return None
 
 
-def _make_proxy_client() -> TestClient:
+def _make_proxy_client(**config_overrides) -> TestClient:  # noqa: ANN003
     config = ProxyConfig(
         optimize=False,
         cache_enabled=False,
@@ -54,6 +58,7 @@ def _make_proxy_client() -> TestClient:
         ccr_handle_responses=False,
         ccr_context_tracking=False,
         image_optimize=False,
+        **config_overrides,
     )
     app = create_app(config)
     return TestClient(app)
@@ -564,6 +569,299 @@ def test_openai_handler_replays_the_provider_confirmed_prefix_even_when_it_infla
     assert response.status_code == 200
     assert captured["body"]["messages"][0] == previous_forwarded[0]
     assert captured["body"]["messages"][1] == {"role": "user", "content": "new suffix"}
+
+
+def _tool_history() -> list[dict]:
+    """A history whose big tool result the pipeline can compress."""
+    return [
+        {"role": "user", "content": "run the build and show me the log"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "build log line 0001 module m0 status OK\n" * 200,
+        },
+    ]
+
+
+def _compress_first_tool_result(**kwargs):
+    """Fake pipeline: compress the big tool result so forwarded ≠ client bytes."""
+    mutated = [dict(message) for message in kwargs["messages"]]
+    for i, message in enumerate(mutated):
+        if message.get("role") == "tool":
+            mutated[i] = {**message, "content": "[compressed build log]"}
+            break
+    return SimpleNamespace(
+        messages=mutated,
+        transforms_applied=["fake:mutated"],
+        timing={},
+        tokens_before=2000,
+        tokens_after=30,
+        waste_signals=None,
+    )
+
+
+def _install_tracker(proxy, tracker) -> None:
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+        "stable-session"
+    )
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+    proxy.session_tracker_store.resolve_tracker = lambda *args, **kwargs: tracker
+
+
+def _chat_usage(prompt_tokens: int, cached_tokens: int) -> dict:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": 3,
+        "total_tokens": prompt_tokens + 3,
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+    }
+
+
+def test_openai_streaming_chat_hands_client_originals_to_prefix_tracker() -> None:
+    """Direct streaming chat must give the stream finalizer the client's originals.
+
+    Without them the prefix tracker stores the forwarded (compressed) messages
+    as "original", so next turn's overlay never matches the client prefix and
+    cannot replay the cached bytes.
+    """
+    captured = {}
+    client_messages = _tool_history() + [{"role": "user", "content": "current turn"}]
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        _install_tracker(proxy, _FakePrefixTracker(frozen_count=0))
+        proxy.openai_pipeline.apply = _compress_first_tool_result
+
+        async def _fake_stream_response(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured.update(kwargs)
+            return httpx.Response(200, text="data: [DONE]\n\n")
+
+        proxy._stream_response = _fake_stream_response
+        client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={"model": "gpt-4o-mini", "stream": True, "messages": client_messages},
+        )
+
+    assert captured.get("original_messages") == client_messages
+
+
+def test_openai_buffered_chat_hands_client_originals_to_prefix_tracker() -> None:
+    """Direct buffered chat must record the client's originals, not its own output.
+
+    Token mode isolates the recording behavior: in cache mode the frozen-prefix
+    restore reverts prefix bytes before they are forwarded, which would make the
+    forwarded list coincidentally equal the originals. The originals plumbing
+    under test here is mode-independent.
+    """
+    client_messages = _tool_history() + [{"role": "user", "content": "current turn"}]
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "token"
+        tracker = _FakePrefixTracker(frozen_count=0)
+        _install_tracker(proxy, tracker)
+        proxy.openai_pipeline.apply = _compress_first_tool_result
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_originals_buffered",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": _chat_usage(30, 0),
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={"model": "gpt-4o-mini", "messages": client_messages},
+        )
+
+    assert response.status_code == 200
+    assert len(tracker.update_calls) == 1
+    call = tracker.update_calls[0]
+    # The tracker must store what the client SENT as "original", and the
+    # compressed form separately as what was forwarded.
+    assert call["original_messages"] == client_messages
+    assert call["messages"][2]["content"] == "[compressed build log]"
+
+
+def _mock_openai_backend_response() -> dict:
+    return {
+        "id": "chatcmpl-backend-originals",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": _chat_usage(30, 0),
+    }
+
+
+def _sse_chunks(prompt_tokens: int, cached_tokens: int) -> list[str]:
+    return [
+        'data: {"id":"c1","object":"chat.completion.chunk",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}\n\n',
+        'data: {"id":"c1","object":"chat.completion.chunk",'
+        '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        'data: {"id":"c1","object":"chat.completion.chunk","choices":[],'
+        f'"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":3,'
+        f'"total_tokens":{prompt_tokens + 3},'
+        f'"prompt_tokens_details":{{"cached_tokens":{cached_tokens}}}}}}}\n\n',
+        "data: [DONE]\n\n",
+    ]
+
+
+def _mock_streaming_backend(chunks: list[str]) -> MagicMock:
+    async def fake_stream(body, headers):  # noqa: ANN001
+        for chunk in chunks:
+            yield chunk
+
+    backend = MagicMock()
+    backend.name = "anyllm-openai"
+    backend.stream_openai_message = fake_stream
+    return backend
+
+
+def test_openai_backend_buffered_chat_hands_client_originals_to_prefix_tracker() -> None:
+    """Backend-routed buffered chat must record the client's originals too."""
+    client_messages = _tool_history() + [{"role": "user", "content": "current turn"}]
+    backend = MagicMock()
+    backend.name = "anyllm-openai"
+    backend.send_openai_message = AsyncMock(
+        return_value=BackendResponse(
+            body=_mock_openai_backend_response(),
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+    )
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=backend):
+        with _make_proxy_client(backend="anyllm", anyllm_provider="openai") as client:
+            proxy = client.app.state.proxy
+            proxy.config.optimize = True
+            proxy.config.mode = "token"
+            tracker = _FakePrefixTracker(frozen_count=0)
+            _install_tracker(proxy, tracker)
+            proxy.openai_pipeline.apply = _compress_first_tool_result
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key"},
+                json={"model": "gpt-4o-mini", "stream": False, "messages": client_messages},
+            )
+
+    assert response.status_code == 200
+    assert backend.send_openai_message.await_count == 1
+    assert len(tracker.update_calls) == 1
+    call = tracker.update_calls[0]
+    assert call["original_messages"] == client_messages
+    assert call["messages"][2]["content"] == "[compressed build log]"
+
+
+def test_openai_backend_streaming_chat_hands_client_originals_to_prefix_tracker() -> None:
+    """Backend-routed streaming chat must record the client's originals too."""
+    client_messages = _tool_history() + [{"role": "user", "content": "current turn"}]
+    backend = _mock_streaming_backend(_sse_chunks(prompt_tokens=30, cached_tokens=0))
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=backend):
+        with _make_proxy_client(backend="anyllm", anyllm_provider="openai") as client:
+            proxy = client.app.state.proxy
+            proxy.config.optimize = True
+            proxy.config.mode = "token"
+            tracker = _FakePrefixTracker(frozen_count=0)
+            _install_tracker(proxy, tracker)
+            proxy.openai_pipeline.apply = _compress_first_tool_result
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key"},
+                json={"model": "gpt-4o-mini", "stream": True, "messages": client_messages},
+            )
+
+    assert response.status_code == 200
+    assert "[DONE]" in response.text
+    assert len(tracker.update_calls) == 1
+    call = tracker.update_calls[0]
+    assert call["original_messages"] == client_messages
+    assert call["messages"][2]["content"] == "[compressed build log]"
+
+
+def test_openai_chat_real_tracker_stores_client_originals_across_turns() -> None:
+    """Real PrefixCacheTracker, two buffered turns (token mode).
+
+    Turn 2's stored "original" history must be the client's own messages
+    (including the new turn), not the compressed bytes that were forwarded —
+    otherwise next turn's overlay can never match the client prefix and
+    cannot replay the previously forwarded bytes.
+    """
+    from headroom.cache.prefix_tracker import PrefixCacheTracker
+
+    turn1_messages = _tool_history()
+    turn2_messages = turn1_messages + [
+        {"role": "assistant", "content": "the build passed"},
+        {"role": "user", "content": "and now?"},
+    ]
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "token"
+        tracker = PrefixCacheTracker(provider="openai")
+        _install_tracker(proxy, tracker)
+        proxy.openai_pipeline.apply = _compress_first_tool_result
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_real_tracker",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": _chat_usage(prompt_tokens=5000, cached_tokens=0),
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        for messages in (turn1_messages, turn2_messages):
+            response = client.post(
+                "/v1/chat/completions",
+                headers={"authorization": "Bearer test-key"},
+                json={"model": "gpt-4o-mini", "messages": messages},
+            )
+            assert response.status_code == 200
+
+    # The forwarded history is the compressed tool result...
+    forwarded = tracker.get_last_forwarded_messages()
+    assert forwarded[2]["content"] == "[compressed build log]"
+    # ...but the recorded "original" history must be exactly what the client
+    # sent on turn 2, byte-for-byte, new turns included.
+    assert tracker.get_last_original_messages() == turn2_messages
 
 
 def test_openai_cache_mode_keeps_replayed_prefix_over_frozen_restore() -> None:
