@@ -37,6 +37,33 @@ curl http://localhost:8787/health
 ps aux | grep headroom
 ```
 
+### Dashboard / doctor point at the wrong port
+
+**Symptom**: `headroom wrap ...` reports the proxy on `8788` (or another port), but
+`headroom dashboard` opens `http://127.0.0.1:8787/dashboard`, which shows nothing.
+
+`wrap` does not always use `8787`: a Copilot-subscription session takes a dedicated
+port so it never claims the shared one, and any wrap falls forward to the next free
+port when `8787` is already bound.
+
+`headroom dashboard`, `headroom doctor` and `headroom inspect` auto-detect the port of
+the most recently started live session, so this normally resolves itself. If you still
+land on the wrong port, an explicit value is overriding detection — check it:
+
+```bash
+# An exported HEADROOM_PORT always wins over auto-detection
+echo $HEADROOM_PORT
+
+# Which ports have live wrap sessions registered
+ls ~/.headroom/clients/
+
+# Confirm which one actually answers
+curl -s http://127.0.0.1:8788/health
+
+# Force a specific port
+headroom dashboard --port 8788
+```
+
 ### Proxy returns errors for some requests
 
 **Symptom**: Some requests work, others fail with 502/503.
