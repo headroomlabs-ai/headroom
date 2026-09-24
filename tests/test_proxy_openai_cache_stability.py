@@ -564,3 +564,54 @@ def test_openai_handler_replays_the_provider_confirmed_prefix_even_when_it_infla
     assert response.status_code == 200
     assert captured["body"]["messages"][0] == previous_forwarded[0]
     assert captured["body"]["messages"][1] == {"role": "user", "content": "new suffix"}
+
+
+def test_openai_streaming_chat_hands_client_originals_to_prefix_tracker() -> None:
+    """Streaming chat must give the stream finalizer the client's originals.
+
+    Without them the prefix tracker stores the forwarded (compressed) messages
+    as "original", so next turn's overlay never matches the client prefix and
+    cannot replay the cached bytes.
+    """
+    captured = {}
+    client_messages = [
+        {"role": "user", "content": "turn1 " * 40},
+        {"role": "user", "content": "current turn"},
+    ]
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.resolve_tracker = lambda *args, **kwargs: fake_tracker
+
+        def _fake_apply(**kwargs):
+            mutated = [dict(message) for message in kwargs["messages"]]
+            mutated[-1]["content"] = "compressed"
+            return SimpleNamespace(
+                messages=mutated,
+                transforms_applied=["fake:mutated"],
+                timing={},
+                tokens_before=70,
+                tokens_after=10,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_stream_response(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured.update(kwargs)
+            return httpx.Response(200, text="data: [DONE]\n\n")
+
+        proxy._stream_response = _fake_stream_response
+        client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={"model": "gpt-4o-mini", "stream": True, "messages": client_messages},
+        )
+
+    assert captured.get("original_messages") == client_messages

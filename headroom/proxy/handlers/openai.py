@@ -4973,6 +4973,7 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=openai_prefix_tracker,
+                    original_messages=original_client_messages,
                     outcome_provider=openai_chat_outcome_provider,
                 )
             else:
