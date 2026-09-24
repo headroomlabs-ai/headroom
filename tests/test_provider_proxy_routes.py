@@ -462,7 +462,11 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
     def install(name: str) -> None:
         async def fake(self, request, *args):  # type: ignore[no-untyped-def]
             delegated.append((name, request.url.path, tuple(str(arg) for arg in args)))
-            return JSONResponse({"handler": name, "path": request.url.path, "args": list(args)})
+            payload = {"handler": name, "path": request.url.path, "args": list(args)}
+            upstream_path = getattr(request.state, "upstream_path", None)
+            if upstream_path is not None:
+                payload["upstream_path"] = upstream_path
+            return JSONResponse(payload)
 
         monkeypatch.setattr(HeadroomProxy, name, fake)
 
@@ -509,6 +513,12 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/v2/chat/completions").json() == {
+            "handler": "handle_openai_chat",
+            "path": "/v2/chat/completions",
+            "args": [],
+            "upstream_path": "/v2/chat/completions",
+        }
         assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/responses").json()["handler"] == "handle_openai_responses"
