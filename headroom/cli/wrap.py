@@ -2906,6 +2906,7 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
 # Canonical casing for the proxy's per-project savings header (matched
 # case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
 _PROJECT_HEADER_NAME = "X-Headroom-Project"
+_PROJECT_CWD_HEADER_NAME = "X-Headroom-Cwd"
 
 
 def _project_name_from_cwd() -> str | None:
@@ -2921,29 +2922,52 @@ def _project_name_from_cwd() -> str | None:
     return urllib.parse.quote(name, safe="-_.() ")
 
 
+def _project_cwd_from_cwd() -> str | None:
+    """Return the canonical launch directory for X-Headroom-Cwd.
+
+    The full path is the collision-resistant project identity used by memory
+    and CCR routing. Percent-encoding keeps the value valid in an HTTP header;
+    the resolver decodes it before normalising and hashing the path.
+    """
+    cwd = str(Path.cwd().resolve()).strip()
+    if not cwd:
+        return None
+    return urllib.parse.quote(cwd, safe="/:._-~()")
+
+
 def _apply_project_header_env(env: dict[str, str]) -> None:
-    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+    """Inject project label and routing identity into custom headers.
 
     Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
     ``Name: value`` lines and attaches them to every API request; the
-    Headroom proxy uses the X-Headroom-Project header for per-project
-    savings attribution.  An existing user-supplied x-headroom-project
-    header (any casing) always wins — we never duplicate or overwrite it,
-    and any other user headers are preserved by appending.
+    Headroom proxy uses X-Headroom-Project for per-project savings
+    attribution and X-Headroom-Cwd for collision-resistant memory/CCR
+    routing. Existing user-supplied headers (any casing) always win — we
+    never duplicate or overwrite them, and all other user headers are
+    preserved by appending.
     """
     project = _project_name_from_cwd()
     if not project:
         return
-    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    cwd = _project_cwd_from_cwd()
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    existing_names: set[str] = set()
     if existing:
         for line in existing.splitlines():
             name = line.split(":", 1)[0].strip()
-            if name.lower() == _PROJECT_HEADER_NAME.lower():
-                return  # user override wins
-        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
-    else:
-        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+            existing_names.add(name.lower())
+
+    generated: list[str] = []
+    if _PROJECT_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_HEADER_NAME}: {project}")
+    if cwd and _PROJECT_CWD_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_CWD_HEADER_NAME}: {cwd}")
+    if not generated:
+        return
+
+    env["ANTHROPIC_CUSTOM_HEADERS"] = (
+        "\n".join([existing, *generated]) if existing else "\n".join(generated)
+    )
 
 
 # Codex's own built-in providers plus Headroom's injected one — never treated

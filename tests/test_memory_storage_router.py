@@ -77,6 +77,35 @@ def test_resolver_tier2_explicit_cwd_header() -> None:
     assert len(key.split("-")[-1]) == 16  # sha256 prefix length
 
 
+def test_resolver_project_label_alone_fails_closed() -> None:
+    r = ProjectResolver()
+    # X-Headroom-Project is a display/savings label, not a trusted identity.
+    assert r.resolve(_ctx(headers={"X-Headroom-Project": "wrapped-project"})) is None
+
+
+def test_resolver_project_label_does_not_collapse_distinct_cwds() -> None:
+    r = ProjectResolver()
+    out_a = r.resolve(
+        _ctx(
+            headers={
+                "X-Headroom-Project": "api",
+                "X-Headroom-Cwd": "/work/acme/api",
+            }
+        )
+    )
+    out_b = r.resolve(
+        _ctx(
+            headers={
+                "X-Headroom-Project": "api",
+                "X-Headroom-Cwd": "/work/other/api",
+            }
+        )
+    )
+    assert out_a is not None and out_b is not None
+    assert out_a[0] != out_b[0]
+    assert out_a[1] == out_b[1] == "api"
+
+
 def test_resolver_tier3_cli_override() -> None:
     r = ProjectResolver()
     out = r.resolve(_ctx(project_root_override="/Users/foo/code/project-c"))
@@ -411,3 +440,62 @@ def test_router_lru_eviction_drops_oldest(tmp_path: Path, monkeypatch: pytest.Mo
     for i in range(5):
         router.backend_for(_ctx(headers={"x-headroom-cwd": f"/code/p{i}"}))
     assert len(router.open_backends()) == 4
+
+
+# ---------------------------------------------------------------------------
+# Percent-decoding is a header-boundary concern only (#3597 review round 2)
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_literal_percent_path_distinct_via_cli_override() -> None:
+    """A literal ``%2F`` directory must not collapse onto the decoded path.
+
+    Only ``x-headroom-cwd`` is percent-encoded by the wrapper. The CLI
+    override carries a literal filesystem path, so decoding it would make
+    ``/work/acme%2Fapi`` and ``/work/acme/api`` share one memory store.
+    """
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(project_root_override="/work/acme%2Fapi"))
+    decoded = r.resolve(_ctx(project_root_override="/work/acme/api"))
+
+    assert literal is not None and decoded is not None
+    assert literal[0] != decoded[0]
+
+
+def test_resolver_literal_percent_path_distinct_via_system_prompt() -> None:
+    """Same guarantee for the ``cwd:`` system-prompt tier."""
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(system_prompt="Primary working directory: /work/acme%2Fapi"))
+    decoded = r.resolve(_ctx(system_prompt="Primary working directory: /work/acme/api"))
+
+    assert literal is not None and decoded is not None
+    assert literal[0] != decoded[0]
+
+
+def test_resolver_literal_percent_space_path_distinct_from_space() -> None:
+    """``%20`` in a real directory name stays distinct from a real space."""
+    r = ProjectResolver()
+    literal = r.resolve(_ctx(project_root_override="/work/my%20proj"))
+    spaced = r.resolve(_ctx(project_root_override="/work/my proj"))
+
+    assert literal is not None and spaced is not None
+    assert literal[0] != spaced[0]
+
+
+def test_resolver_encoded_cwd_header_matches_literal_cwd_identity() -> None:
+    """The wrapper's encoded header still resolves to the literal cwd identity.
+
+    This is the behaviour the encoding exists for, and it must survive the
+    boundary-only decode: ``quote(path)`` in the header and ``path`` from the
+    CLI override have to land on the same project key.
+    """
+    from urllib.parse import quote
+
+    path = "/work/acme/día-api"
+    r = ProjectResolver()
+    via_header = r.resolve(_ctx(headers={"x-headroom-cwd": quote(path, safe="/:._-~()")}))
+    via_override = r.resolve(_ctx(project_root_override=path))
+
+    assert via_header is not None and via_override is not None
+    assert via_header[0] == via_override[0]
+    assert via_header[1] == via_override[1] == "día-api"
