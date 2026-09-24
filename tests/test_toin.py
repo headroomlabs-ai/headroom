@@ -834,3 +834,27 @@ class TestTOINRecommendationUpdates:
         pattern = toin.get_pattern(sig_hash)
         # Field should be marked to preserve
         assert len(pattern.preserve_fields) > 0
+
+
+class TestPatternKeySigHash:
+    """`pattern_key_sig_hash` returns the signature component (issue #2928)."""
+
+    def test_extracts_third_component(self):
+        from headroom.telemetry.toin import pattern_key_sig_hash
+
+        assert pattern_key_sig_hash("payg|claude|deadbeef") == "deadbeef"
+        assert pattern_key_sig_hash("unknown|unknown|abc123") == "abc123"
+
+    def test_distinct_signatures_do_not_collide(self):
+        from headroom.telemetry.toin import pattern_key_sig_hash
+
+        a = pattern_key_sig_hash("unknown|unknown|aaaa1111")
+        b = pattern_key_sig_hash("unknown|unknown|bbbb2222")
+        assert a != b
+
+    def test_legacy_bare_hash_key(self):
+        # Pre-B5 dumps stored a bare sig_hash with no separator; the helper must
+        # return it unchanged rather than raising on the missing pipes.
+        from headroom.telemetry.toin import pattern_key_sig_hash
+
+        assert pattern_key_sig_hash("barehash123") == "barehash123"
