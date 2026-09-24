@@ -866,3 +866,43 @@ class TestRestartCurrentDeployment:
         assert result["restarted"] is True
         assert result["mode"] == "service"
         assert recorded["command"][-4:] == ["install", "restart", "--profile", "default"]
+
+
+def test_build_runtime_command_for_docker_allows_remote_compress(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The container must be able to serve /v1/compress (#3708).
+
+    The loopback guard cannot work inside a container: the port is published
+    on 127.0.0.1, so host loopback is the only way in, but the request reaches
+    the container from the bridge gateway -- not a loopback address -- so the
+    guard 404s every call, taking /v1/compress, /v1/compress/response and
+    /v1/usage with it, and with them the Kong and LiteLLM gateway paths.
+
+    The pairing with the loopback publish is the safety argument, so assert
+    both together: if the publish ever widens, this test should be revisited
+    rather than silently granting remote access on a public interface.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    assert "HEADROOM_COMPRESS_ALLOW_REMOTE=1" in command
+    assert "127.0.0.1:8787:8787" in " ".join(command), (
+        "remote compress is only safe while the port stays published on loopback"
+    )

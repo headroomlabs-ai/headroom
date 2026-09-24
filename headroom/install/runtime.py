@@ -142,6 +142,18 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         f"HOME={container_home}",
         "--env",
         "PYTHONUNBUFFERED=1",
+        # The loopback guard on /v1/compress, /v1/compress/response and
+        # /v1/usage cannot work inside a container: the port above is published
+        # on 127.0.0.1, so the ONLY way in is from host loopback -- but the
+        # request arrives at the container from the bridge gateway
+        # (172.17.0.1 / 192.168.65.1), which is not a loopback address, so the
+        # guard 404s every call (#3708). The network scoping is done by the
+        # `-p 127.0.0.1:...` publish above, not by the in-container source IP;
+        # inbound auth (HEADROOM_PROXY_TOKEN via _security_gate) is unchanged.
+        # Keep this coupled to that publish binding: if it ever publishes on a
+        # non-loopback interface, this must go with it.
+        "--env",
+        "HEADROOM_COMPRESS_ALLOW_REMOTE=1",
         # Canonical Headroom filesystem contract (issue #175).
         "--env",
         f"HEADROOM_WORKSPACE_DIR={container_home}/.headroom",

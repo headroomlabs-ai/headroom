@@ -745,3 +745,73 @@ def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
     assert client.get("/admin/upstream").status_code == 404
     assert client.get("/debug/tasks").status_code == 404
     assert client.post("/stats/reset").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# #3708: the loopback guard is invisible on the wire by design, which made a
+# broken Docker gateway indistinguishable from a typo'd URL. These pin the
+# two halves of the remedy: the opt-out actually opens the route, and a
+# rejection is recoverable from the server-side log.
+# --------------------------------------------------------------------------
+
+REMOTE_OPT_IN_GATED = [
+    ("post", "/v1/compress"),
+    ("post", "/v1/compress/response"),
+]
+
+
+@pytest.mark.parametrize("method,path", REMOTE_OPT_IN_GATED)
+def test_compress_opt_in_serves_non_loopback_callers(monkeypatch, method: str, path: str) -> None:
+    """HEADROOM_COMPRESS_ALLOW_REMOTE=1 must actually mount the route remotely.
+
+    This is what the Docker image and docker-compose now set. Without it every
+    Kong/LiteLLM sidecar call 404s (#3708). Anything but 404 proves the route
+    is reachable -- a 4xx about a missing body is the route running.
+    """
+    monkeypatch.setenv("HEADROOM_COMPRESS_ALLOW_REMOTE", "1")
+    resp = TestClient(_make_app()).request(method, path, json={})
+    assert resp.status_code != 404, (
+        f"{path} still 404s for a non-loopback caller with the opt-in set: {resp.text}"
+    )
+
+
+def test_loopback_rejection_is_logged_with_the_opt_in_hint() -> None:
+    """A 404'd gateway call must be diagnosable server-side.
+
+    The wire response stays an opaque 404 (scanners learn nothing); the log is
+    where the cause lives, and for the sidecar routes it names the env var so
+    the fix is one line instead of an afternoon.
+
+    Captured with a handler on the logger itself rather than ``caplog``:
+    ``create_app`` runs ``_setup_file_logging``, which sets
+    ``propagate = False`` on the ``headroom`` tree, so a root-attached caplog
+    handler never sees these records.
+    """
+    import logging
+
+    client = TestClient(_make_app())
+
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    logger = logging.getLogger("headroom.proxy")
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        resp = client.post("/v1/compress", json={})
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not Found"}, "wire response must stay opaque"
+
+    rejections = [message for message in records if "loopback guard rejected" in message]
+    assert rejections, f"no rejection logged; saw {records}"
+    assert "/v1/compress" in rejections[0]
+    assert "HEADROOM_COMPRESS_ALLOW_REMOTE=1" in rejections[0]

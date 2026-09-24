@@ -49,6 +49,15 @@ services:
       # A proxy token is required so the data plane is never open if you widen the
       # bind. Generate one with: openssl rand -hex 32
       - HEADROOM_PROXY_TOKEN=${HEADROOM_PROXY_TOKEN:?set HEADROOM_PROXY_TOKEN (see .env.example; e.g. openssl rand -hex 32)}
+      # /v1/compress, /v1/compress/response and /v1/usage are loopback-only by
+      # default. Inside a container that guard cannot work: the port is
+      # published on 127.0.0.1 (below), so host loopback is the only way in,
+      # but the request reaches the container from the bridge gateway, which is
+      # not a loopback address -- so the guard 404s every call, including the
+      # Kong and LiteLLM gateway paths (#3708). Network scoping here is the
+      # published port; the mandatory HEADROOM_PROXY_TOKEN above still
+      # authenticates every caller. Revisit if you publish beyond loopback.
+      - HEADROOM_COMPRESS_ALLOW_REMOTE=1
       - HOME=/home/nonroot
       # Keep all Headroom read/write state on the named volume below.
       - HEADROOM_WORKSPACE_DIR=/home/nonroot/.headroom

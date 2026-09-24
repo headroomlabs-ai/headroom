@@ -40,6 +40,7 @@ CSRF / DNS-rebinding guidance and the standard Starlette
 from __future__ import annotations
 
 import ipaddress
+import logging
 
 try:
     from fastapi import HTTPException, Request
@@ -170,6 +171,32 @@ def is_ip_literal_host_header(header_value: str | None) -> bool:
         return False
 
 
+logger = logging.getLogger("headroom.proxy")
+
+# Routes whose whole purpose is to be called by another process (a Kong or
+# LiteLLM sidecar), so a loopback rejection on them is nearly always a
+# misconfiguration rather than an attack. Naming the opt-out in the log turns
+# #3708 from an afternoon of debugging into a one-line fix.
+_REMOTE_OPT_IN_PATHS = ("/v1/compress", "/v1/usage")
+_REMOTE_OPT_IN_HINT = "set HEADROOM_COMPRESS_ALLOW_REMOTE=1 to allow non-loopback callers"
+
+
+def _log_rejection(request: Request, *, reason: str, detail: str) -> None:  # type: ignore[valid-type]
+    """Record a loopback rejection. Never raises -- this is a diagnostic."""
+    try:
+        path = getattr(getattr(request, "url", None), "path", "") or ""
+        hint = _REMOTE_OPT_IN_HINT if path.startswith(_REMOTE_OPT_IN_PATHS) else ""
+        logger.warning(
+            "loopback guard rejected request (404 on the wire): path=%s reason=%s value=%s%s",
+            path,
+            reason,
+            detail,
+            f" hint={hint}" if hint else "",
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never break the guard
+        pass
+
+
 def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     """FastAPI dependency: 404 any non-loopback caller.
 
@@ -192,6 +219,12 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
 
     Returning 404 (not 403) keeps debug endpoints invisible to
     external scanners — indistinguishable from "no such route".
+
+    That opacity is deliberate on the wire but costly in a log: a
+    gateway whose ``/v1/compress`` call is rejected here looks exactly
+    like a typo'd URL (#3708). Each rejection is logged at WARNING with
+    the path and the reason so the cause is recoverable from the
+    server side, where the scanner cannot see it.
     """
     if HTTPException is None:  # pragma: no cover - defensive
         raise RuntimeError("FastAPI is required for the loopback guard")
@@ -199,6 +232,7 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     client = getattr(request, "client", None)
     host = getattr(client, "host", None) if client is not None else None
     if not is_loopback_host(host):
+        _log_rejection(request, reason="client_not_loopback", detail=str(host))
         # No body: minimal FastAPI default, behaves like "no route".
         raise HTTPException(status_code=404)
 
@@ -213,6 +247,7 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
     except AttributeError:
         host_header = None
     if not is_loopback_host_header(host_header):
+        _log_rejection(request, reason="host_header_not_loopback", detail=str(host_header))
         raise HTTPException(status_code=404)
 
 
