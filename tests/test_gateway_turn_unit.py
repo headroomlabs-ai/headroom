@@ -434,7 +434,8 @@ def test_normalize_openai_chat_shape() -> None:
             "prompt_tokens_details": {"cached_tokens": 64},
         }
     )
-    assert u == NormalizedUsage(100, 20, 64, None)
+    # OpenAI-shaped: prompt_tokens already counts the cached prefix.
+    assert u == NormalizedUsage(100, 20, 64, None, input_includes_cache=True)
     assert u.has_cache_signal and u.should_apply
 
 
@@ -442,17 +443,19 @@ def test_normalize_openai_responses_shape() -> None:
     u = normalize_usage(
         {"input_tokens": 10, "output_tokens": 2, "input_tokens_details": {"cached_tokens": 8}}
     )
-    assert u == NormalizedUsage(10, 2, 8, None)
+    # Responses names the field ``input_tokens`` like Anthropic but, like the
+    # rest of OpenAI, already counts the cached prefix inside it.
+    assert u == NormalizedUsage(10, 2, 8, None, input_includes_cache=True)
 
 
 def test_normalize_kong_flat_shape() -> None:
     u = normalize_usage({"prompt_tokens": 50, "completion_tokens": 5, "cached_tokens": 40})
-    assert u == NormalizedUsage(50, 5, 40, None)
+    assert u == NormalizedUsage(50, 5, 40, None, input_includes_cache=True)
 
 
 def test_normalize_nested_usage_descends_once() -> None:
     u = normalize_usage({"id": "x", "usage": {"prompt_tokens": 7, "completion_tokens": 3}})
-    assert u == NormalizedUsage(7, 3, None, None)
+    assert u == NormalizedUsage(7, 3, None, None, input_includes_cache=True)
     assert not u.has_cache_signal and not u.should_apply
 
 
@@ -546,13 +549,62 @@ def test_complete_outcome_fills_only_existing_fields() -> None:
     draft = dataclasses.replace(_outcome(), total_latency_ms=5.0)
     done = gt.complete_outcome(draft, NormalizedUsage(120, 30, 80, 4), status=200, latency_ms=250)
     assert done.output_tokens == 30
-    assert done.provider_input_tokens == 120
+    # Anthropic shape: input_tokens is the uncached remainder, so the billed
+    # prompt is that plus the two cache counters.
+    assert done.provider_input_tokens == 204
+    assert done.uncached_input_tokens == 120
     assert done.optimized_tokens == 50  # never overwritten by the provider count
     assert (done.cache_read_tokens, done.cache_write_tokens) == (80, 4)
     assert done.total_latency_ms == 255.0
     assert done.status_code == 200
     failed = gt.complete_outcome(draft, None, status=529, latency_ms=None)
     assert failed.status_code == 529 and failed.output_tokens == 0
+
+
+def test_complete_outcome_bills_the_whole_prompt_on_a_cached_anthropic_turn() -> None:
+    """A warm agent turn is ~all cache read; billing only the uncached sliver
+    made ``/stats`` divide savings by a denominator tens of times too small."""
+    usage = normalize_usage(
+        {
+            "input_tokens": 3,
+            "output_tokens": 210,
+            "cache_read_input_tokens": 41_000,
+            "cache_creation_input_tokens": 1_200,
+        }
+    )
+    done = gt.complete_outcome(_outcome(), usage, status=200, latency_ms=100)
+    assert done.provider_input_tokens == 42_203
+    assert done.uncached_input_tokens == 3
+
+
+def test_complete_outcome_does_not_double_count_openai_responses_cached_tokens() -> None:
+    """The Responses shape uses Anthropic's field name for an OpenAI-style total."""
+    usage = normalize_usage(
+        {
+            "input_tokens": 12_000,
+            "output_tokens": 40,
+            "input_tokens_details": {"cached_tokens": 9_000},
+        }
+    )
+    done = gt.complete_outcome(_outcome(), usage, status=200, latency_ms=100)
+    assert done.provider_input_tokens == 12_000
+    assert done.uncached_input_tokens == 3_000
+
+
+def test_complete_outcome_does_not_double_count_openai_cached_tokens() -> None:
+    """OpenAI's prompt_tokens already contains cached_tokens."""
+    usage = normalize_usage(
+        {
+            "prompt_tokens": 12_000,
+            "completion_tokens": 40,
+            "prompt_tokens_details": {"cached_tokens": 9_000},
+        }
+    )
+    assert usage.input_includes_cache is True
+    done = gt.complete_outcome(_outcome(), usage, status=200, latency_ms=100)
+    assert done.provider_input_tokens == 12_000
+    assert done.uncached_input_tokens == 3_000
+    assert done.cache_read_tokens == 9_000
 
 
 def test_compact_gateway_tools_is_deterministic_and_isolated() -> None:

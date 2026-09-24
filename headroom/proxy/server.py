@@ -4448,6 +4448,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Build unified savings summary (all layers)
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
+        # Cache-aware dollar value of tool-schema deferral, the same figure the
+        # cost card uses. Exposed beside the token count because tokens alone
+        # mislead: deferred schemas would mostly have been cache reads, an order
+        # of magnitude cheaper than list input, so a big token number is a small
+        # dollar number. The token count without it invited "we removed 90% of
+        # the tokens, so we saved 90% of the cost".
+        _cost_tracker_stats = proxy.cost_tracker.stats() if proxy.cost_tracker else {}
+        tool_schema_usd = float(_cost_tracker_stats.get("tool_savings_usd", 0.0) or 0.0)
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
@@ -4576,6 +4584,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "tokens_saved": tool_schema_tokens,
                         "requests": tool_schema_requests,
                         "window": len(recent_request_logs),
+                        # Priced at what those tokens would actually have been
+                        # billed at (provider cache-read rate for the warm turns,
+                        # cache-write for the cold one), not at list input.
+                        "usd": round(tool_schema_usd, 4),
                         "description": (
                             "Tool-definition tokens kept out of the model's context "
                             "by deferring heavy tool schemas until they're searched "
@@ -4681,6 +4693,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     if total_tokens_before > 0
                     else 0,
                     2,
+                ),
+                # The same saving expressed in money rather than tokens, so a
+                # reader is never left to assume the two match. They don't, and
+                # not by a little: most tokens Headroom removes would have been
+                # prefix-cache reads, billed at roughly a tenth of list input
+                # (and less on some providers), so a large token share is a much
+                # smaller cost share. Mirrors summary.cost.savings_pct, which
+                # prices every layer at the rate its tokens would really have
+                # cost.
+                "cost_weighted_savings_percent": float(
+                    (summary.get("cost") or {}).get("savings_pct", 0.0) or 0.0
                 ),
             },
             "latency": {

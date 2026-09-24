@@ -375,7 +375,10 @@ def test_outcome_anthropic_cache_fields(headroom_client, outcome_spy) -> None:
     assert o.output_tokens == 12
     assert o.cache_read_tokens == 2000
     assert o.cache_write_tokens == 500
-    assert o.provider_input_tokens == 300
+    # Anthropic's input_tokens is the uncached remainder; the billed prompt is
+    # that plus both cache buckets, as the direct handler has always recorded.
+    assert o.provider_input_tokens == 2800
+    assert o.uncached_input_tokens == 300
 
 
 def test_outcome_recorded_immediately_without_relay(headroom_client, outcome_spy) -> None:
