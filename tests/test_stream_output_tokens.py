@@ -169,3 +169,116 @@ def test_falls_back_to_bytes_when_no_text_is_recoverable() -> None:
 def test_negative_or_zero_bytes_are_safe() -> None:
     assert estimate_output_tokens(sse_text="", total_bytes=0) == (0, "estimated_bytes")
     assert estimate_output_tokens(sse_text="", total_bytes=-5) == (0, "estimated_bytes")
+
+
+# --------------------------------------------------------------------------- #
+# A turn stopped by its output ceiling is counted exactly, never estimated.
+#
+# Measured against Anthropic while probing echo ratios: a Write tool call cut
+# off by ``max_tokens`` billed 1500 output tokens and left ~45 characters of
+# recoverable stream text. Tool arguments stream as ``input_json_delta``
+# fragments, and an upstream that stops mid-object drops the incomplete
+# remainder rather than emit unparseable JSON. The text rung reads that as ~11
+# tokens: a 100x under-count, on the most expensive turns there are. Repeated
+# at two ceilings, both exact:
+#
+#     max_tokens=1500  -> usage.output_tokens=1500
+#     max_tokens=4096  -> usage.output_tokens=4096
+#
+# Which is the fix: the ceiling is denominated in output tokens, so a turn that
+# stopped because it hit the ceiling produced exactly that many.
+# --------------------------------------------------------------------------- #
+
+
+def _truncated_anthropic_tool_call() -> str:
+    """An Anthropic tool call whose arguments were cut off mid-JSON."""
+    return _sse(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "Write", "input": {}},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"path"'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": ': "a/b.py"'},
+        },
+        {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}},
+        {"type": "message_stop"},
+        done=False,
+    )
+
+
+def test_truncated_tool_call_is_counted_from_the_ceiling_not_the_text() -> None:
+    sse = _truncated_anthropic_tool_call()
+    tokens, source = estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_tokens": 1500}
+    )
+    assert source == "exact_ceiling"
+    assert tokens == 1500
+
+    # What the text rung would have said, and why it cannot be trusted here.
+    text_tokens, text_source = estimate_output_tokens(sse_text=sse, total_bytes=len(sse.encode()))
+    assert text_source == "estimated_text"
+    assert text_tokens < 50
+
+
+def test_openai_chat_length_finish_reason_uses_max_completion_tokens() -> None:
+    sse = _sse(
+        _chat_delta("partial answer that ran out of room"),
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]},
+    )
+    tokens, source = estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_completion_tokens": 900}
+    )
+    assert (tokens, source) == (900, "exact_ceiling")
+
+
+def test_openai_responses_incomplete_uses_max_output_tokens() -> None:
+    sse = _sse(
+        {"type": "response.output_text.delta", "delta": "cut off"},
+        {
+            "type": "response.incomplete",
+            "response": {"incomplete_details": {"reason": "max_output_tokens"}},
+        },
+    )
+    tokens, source = estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_output_tokens": 256}
+    )
+    assert (tokens, source) == (256, "exact_ceiling")
+
+
+def test_a_turn_that_finished_normally_still_counts_its_text() -> None:
+    """The new rung must not swallow the common case."""
+    sse = _sse(
+        _chat_delta("a complete answer "),
+        _chat_delta("that stopped on its own"),
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+    )
+    tokens, source = estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_tokens": 4096}
+    )
+    assert source == "estimated_text"
+    assert tokens == len(extract_stream_text(sse)) // TEXT_CHARS_PER_TOKEN
+
+
+def test_ceiling_rung_falls_through_when_the_body_does_not_carry_one() -> None:
+    """A truncated turn with no usable ceiling must degrade, not guess."""
+    sse = _truncated_anthropic_tool_call()
+    for body in (None, {}, {"max_tokens": 0}, {"max_tokens": "1500"}):
+        _, source = estimate_output_tokens(sse_text=sse, total_bytes=len(sse.encode()), body=body)
+        assert source == "estimated_text", body
+
+
+def test_boolean_ceiling_is_not_mistaken_for_a_token_count() -> None:
+    """``bool`` is an ``int`` subclass; ``max_tokens: True`` is not 1 token."""
+    sse = _truncated_anthropic_tool_call()
+    _, source = estimate_output_tokens(
+        sse_text=sse, total_bytes=len(sse.encode()), body={"max_tokens": True}
+    )
+    assert source == "estimated_text"
