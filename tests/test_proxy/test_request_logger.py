@@ -132,3 +132,27 @@ def test_get_recent_never_walks_message_payloads():
     again = logger.get_recent(10)[0]
     assert again["tags"] == {"agent": "codex", "meta": {"depth": 1}}
     assert again["savings_breakdown"] == [{"tokens": 60}]
+
+
+def test_get_recent_with_messages_can_skip_payloads_without_walking_them():
+    """A feed poller that only reads the numbers passes include_messages=False;
+    the three body fields are absent and never traversed (asdict deep-copied
+    them). A leaf that refuses to be deep-copied proves the walk is gone."""
+
+    class _NoCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError("get_recent_with_messages walked a message payload")
+
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    logger.log(
+        _entry(
+            request_messages=[{"role": "user", "content": _NoCopy()}],
+            compressed_messages=[{"role": "user", "content": _NoCopy()}],
+            response_content="ok",
+        )
+    )
+
+    slim = logger.get_recent_with_messages(10, include_messages=False)
+    assert slim[0]["tokens_saved"] == 60
+    assert slim[0]["transforms_applied"] == ["kompress:user:0.4"]
+    assert not {"request_messages", "compressed_messages", "response_content"} & slim[0].keys()

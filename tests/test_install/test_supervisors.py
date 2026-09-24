@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import click
@@ -11,11 +12,13 @@ from headroom.install.supervisors import (
     _linux_service_unit,
     _linux_task_spec,
     _macos_launchd_plist,
+    _register_windows_task,
     _render_unix_runner,
     _render_windows_runner,
     _windows_boot_trigger,
     _windows_health_trigger,
     _windows_task_xml,
+    _WindowsTaskRegistrationError,
     install_supervisor,
     remove_supervisor,
     render_runner_scripts,
@@ -38,6 +41,20 @@ def test_windows_task_xml_user_scope_is_hidden_s4u() -> None:
     assert "<Command>C:\\tmp\\default\\ensure-headroom.cmd</Command>" in xml
 
 
+def test_windows_task_xml_user_scope_supports_interactive_token() -> None:
+    xml = _windows_task_xml(
+        "C:\\tmp\\default\\ensure-headroom.cmd",
+        trigger_xml=_windows_health_trigger(),
+        scope="user",
+        logon_type="InteractiveToken",
+    )
+
+    assert "<TimeTrigger>" in xml
+    assert "<LogonType>InteractiveToken</LogonType>" in xml
+    assert "<RunLevel>LeastPrivilege</RunLevel>" in xml
+    assert "<Interval>PT5M</Interval>" in xml
+
+
 def test_windows_task_xml_system_scope_uses_localsystem() -> None:
     xml = _windows_task_xml(
         "C:\\tmp\\default\\ensure-headroom.cmd",
@@ -47,6 +64,88 @@ def test_windows_task_xml_system_scope_uses_localsystem() -> None:
     assert "<UserId>S-1-5-18</UserId>" in xml
     assert "<LogonType>ServiceAccount</LogonType>" in xml
     assert "<BootTrigger>" in xml
+
+
+def test_register_windows_task_verifies_queried_logon_type(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        if command[1] == "/Query":
+            return _LaunchctlResult(
+                stdout=(
+                    '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                    "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+                    "</Task>"
+                )
+            )
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    _register_windows_task("headroom-default-health", "<Task />", expected_logon_type="S4U")
+
+    assert calls[0][:4] == [
+        "schtasks",
+        "/Create",
+        "/TN",
+        "headroom-default-health",
+    ]
+    assert calls[1] == ["schtasks", "/Query", "/TN", "headroom-default-health", "/XML"]
+
+
+def test_register_windows_task_rejects_logon_type_downgrade(monkeypatch) -> None:
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(
+                stdout=(
+                    '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                    "<Principals><Principal>"
+                    "<LogonType>InteractiveToken</LogonType>"
+                    "</Principal></Principals></Task>"
+                )
+            )
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(
+        _WindowsTaskRegistrationError, match="requested S4U.*InteractiveToken"
+    ) as exc_info:
+        _register_windows_task("headroom-default-health", "<Task />", expected_logon_type="S4U")
+
+    assert exc_info.value.task_created is True
+
+
+@pytest.mark.parametrize("failed_action", ["/Create", "/Query"])
+def test_register_windows_task_wraps_schtasks_failures(monkeypatch, failed_action: str) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        calls.append(command)
+        if command[1] == failed_action:
+            raise subprocess.CalledProcessError(1, command)
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(
+        _WindowsTaskRegistrationError, match="Could not register or verify"
+    ) as exc_info:
+        _register_windows_task("headroom-default-health", "<Task />", expected_logon_type="S4U")
+
+    assert calls[-1][1] == failed_action
+    assert exc_info.value.task_created is (failed_action == "/Query")
+
+
+def test_register_windows_task_rejects_malformed_queried_xml(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "headroom.install.supervisors.subprocess.run",
+        lambda command, **kwargs: _LaunchctlResult(stdout="<Task>"),
+    )
+
+    with pytest.raises(_WindowsTaskRegistrationError, match="Could not parse registered"):
+        _register_windows_task("headroom-default-health", "<Task />", expected_logon_type="S4U")
 
 
 def _manifest(
@@ -353,6 +452,239 @@ def test_install_supervisor_linux_service_and_tasks(monkeypatch, tmp_path: Path)
     assert "@reboot ensure" in calls[-1][1]["input"]
 
 
+def _stub_windows_task_install(monkeypatch, tmp_path: Path) -> None:
+    run_script = tmp_path / "run-headroom.cmd"
+    ensure_script = tmp_path / "ensure-headroom.cmd"
+    monkeypatch.setattr(
+        "headroom.install.supervisors.render_runner_scripts",
+        lambda manifest: [
+            type("Record", (), {"kind": "script", "path": str(run_script)})(),
+            type("Record", (), {"kind": "script", "path": str(ensure_script)})(),
+        ],
+    )
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "win32")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.windows_ensure_cmd_path",
+        lambda profile: ensure_script,
+    )
+
+
+def test_install_windows_user_tasks_prefers_verified_s4u(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registrations: list[tuple[str, str, str]] = []
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        registrations.append((name, xml, expected_logon_type))
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+
+    records = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert [(name, logon_type) for name, _xml, logon_type in registrations] == [
+        ("headroom-default-startup", "S4U"),
+        ("headroom-default-health", "S4U"),
+    ]
+    assert "<BootTrigger>" in registrations[0][1]
+    assert "<TimeTrigger>" in registrations[1][1]
+    assert [record.path for record in records if record.kind == "windows-task"] == [
+        "headroom-default-startup",
+        "headroom-default-health",
+    ]
+    assert "session-scoped" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failed_task", ["headroom-default-startup", "headroom-default-health"])
+def test_install_windows_user_task_failure_cleans_up_and_falls_back(
+    monkeypatch, tmp_path: Path, capsys, failed_task: str
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registrations: list[tuple[str, str, str]] = []
+    deletions: list[str] = []
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        registrations.append((name, xml, expected_logon_type))
+        if name == failed_task and expected_logon_type == "S4U":
+            raise _WindowsTaskRegistrationError("registration denied")
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+    monkeypatch.setattr(
+        "headroom.install.supervisors._cleanup_windows_tasks_for_fallback",
+        lambda names, must_delete: deletions.extend(names),
+    )
+
+    records = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert deletions == ["headroom-default-startup", "headroom-default-health"]
+    fallback_name, fallback_xml, fallback_logon_type = registrations[-1]
+    assert fallback_name == "headroom-default-health"
+    assert fallback_logon_type == "InteractiveToken"
+    assert "<TimeTrigger>" in fallback_xml
+    assert "<LogonType>InteractiveToken</LogonType>" in fallback_xml
+    assert "<RunLevel>LeastPrivilege</RunLevel>" in fallback_xml
+    assert "<Interval>PT5M</Interval>" in fallback_xml
+    assert [record.path for record in records if record.kind == "windows-task"] == [
+        "headroom-default-health"
+    ]
+    warning = capsys.readouterr().out
+    assert "session-scoped" in warning
+    assert "will not run while you are logged off" in warning
+
+
+def test_install_windows_user_task_silent_downgrade_uses_fallback(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registered_xml: dict[str, str] = {}
+    query_count = 0
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs):
+        nonlocal query_count
+        calls.append(command)
+        name = command[command.index("/TN") + 1]
+        if command[1] == "/Create":
+            registered_xml[name] = Path(command[command.index("/XML") + 1]).read_text(
+                encoding="utf-16"
+            )
+            return _LaunchctlResult()
+        if command[1] == "/Query":
+            if name not in registered_xml:
+                return _LaunchctlResult(
+                    1, stderr="ERROR: The system cannot find the file specified."
+                )
+            query_count += 1
+            xml = registered_xml[name]
+            if query_count == 1:
+                xml = xml.replace(
+                    "<LogonType>S4U</LogonType>", "<LogonType>InteractiveToken</LogonType>"
+                )
+            return _LaunchctlResult(stdout=xml)
+        registered_xml.pop(name, None)
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    records = install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    deletes = [call for call in calls if call[1] == "/Delete"]
+    assert [call[call.index("/TN") + 1] for call in deletes] == [
+        "headroom-default-startup",
+        "headroom-default-health",
+    ]
+    assert "headroom-default-startup" not in registered_xml
+    assert "<LogonType>InteractiveToken</LogonType>" in registered_xml["headroom-default-health"]
+    assert [record.path for record in records if record.kind == "windows-task"] == [
+        "headroom-default-health"
+    ]
+    assert "session-scoped" in capsys.readouterr().out
+
+
+def test_install_windows_user_task_fallback_failure_propagates(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        raise _WindowsTaskRegistrationError(f"{expected_logon_type} registration denied")
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+    monkeypatch.setattr(
+        "headroom.install.supervisors._cleanup_windows_tasks_for_fallback",
+        lambda names, must_delete: None,
+    )
+
+    with pytest.raises(_WindowsTaskRegistrationError, match="InteractiveToken registration denied"):
+        install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert "session-scoped" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("query_state", "error_match"),
+    [
+        ("survives", "remains registered"),
+        ("delete_denied", "Could not clean up"),
+    ],
+)
+def test_install_windows_user_task_cleanup_failure_prevents_fallback(
+    monkeypatch, tmp_path: Path, capsys, query_state: str, error_match: str
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registrations: list[str] = []
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        registrations.append(expected_logon_type)
+        raise _WindowsTaskRegistrationError("S4U registration denied", task_created=True)
+
+    def fake_run(command: list[str], **kwargs):
+        if query_state == "survives" and command[1] in ("/Delete", "/Query"):
+            return _LaunchctlResult(stdout="<Task />")
+        return _LaunchctlResult(1, stderr="ERROR: Access is denied.")
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    with pytest.raises(_WindowsTaskRegistrationError, match=error_match):
+        install_supervisor(_manifest(supervisor=SupervisorKind.TASK.value))
+
+    assert registrations == ["S4U"]
+    assert "session-scoped" not in capsys.readouterr().out
+
+
+def test_install_windows_system_tasks_use_verified_service_account(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registrations: list[tuple[str, str, str]] = []
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        registrations.append((name, xml, expected_logon_type))
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+
+    records = install_supervisor(_manifest(scope="system", supervisor=SupervisorKind.TASK.value))
+
+    assert [(name, logon_type) for name, _xml, logon_type in registrations] == [
+        ("headroom-default-startup", "ServiceAccount"),
+        ("headroom-default-health", "ServiceAccount"),
+    ]
+    assert "<BootTrigger>" in registrations[0][1]
+    assert "<TimeTrigger>" in registrations[1][1]
+    assert all(
+        "<LogonType>ServiceAccount</LogonType>" in xml for _name, xml, _type in registrations
+    )
+    assert all("<UserId>S-1-5-18</UserId>" in xml for _name, xml, _type in registrations)
+    assert all(
+        "<RunLevel>HighestAvailable</RunLevel>" in xml for _name, xml, _type in registrations
+    )
+    assert [record.path for record in records if record.kind == "windows-task"] == [
+        "headroom-default-startup",
+        "headroom-default-health",
+    ]
+    assert "session-scoped" not in capsys.readouterr().out
+
+
+def test_install_windows_system_task_failure_does_not_fall_back(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _stub_windows_task_install(monkeypatch, tmp_path)
+    registrations: list[tuple[str, str]] = []
+
+    def fake_register(name: str, xml: str, *, expected_logon_type: str) -> None:
+        registrations.append((name, expected_logon_type))
+        raise _WindowsTaskRegistrationError("system registration denied")
+
+    monkeypatch.setattr("headroom.install.supervisors._register_windows_task", fake_register)
+
+    with pytest.raises(_WindowsTaskRegistrationError, match="system registration denied"):
+        install_supervisor(_manifest(scope="system", supervisor=SupervisorKind.TASK.value))
+
+    assert registrations == [("headroom-default-startup", "ServiceAccount")]
+    assert "session-scoped" not in capsys.readouterr().out
+
+
 def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path: Path) -> None:
     run_script = tmp_path / "run-headroom.sh"
     ensure_script = tmp_path / "ensure-headroom.sh"
@@ -364,10 +696,20 @@ def test_install_supervisor_darwin_windows_and_unsupported(monkeypatch, tmp_path
         ],
     )
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        "headroom.install.supervisors.subprocess.run",
-        lambda command, **kwargs: calls.append(command) or _LaunchctlResult(0),
-    )
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if isinstance(command, list) and len(command) > 1 and command[1] == "/Query":
+            return _LaunchctlResult(
+                stdout=(
+                    '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+                    "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+                    "</Task>"
+                )
+            )
+        return _LaunchctlResult(0)
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
     monkeypatch.setattr("headroom.install.supervisors.os.getuid", lambda: 123, raising=False)
 
     plist_path = tmp_path / "com.headroom.default.plist"
