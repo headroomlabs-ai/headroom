@@ -25,6 +25,13 @@ from tests._dotenv import (
     importorskip_no_env_leak,
     load_env_overrides,
 )
+from tests._pricing_models import anthropic_pricing_model
+
+MODEL = anthropic_pricing_model(
+    "input_cost_per_token_above_200k_tokens",
+    "cache_creation_input_token_cost",
+    "cache_read_input_token_cost",
+)
 
 _env_overrides = load_env_overrides()
 apply_dotenv = autouse_apply_env(_env_overrides)
@@ -36,14 +43,14 @@ from headroom.proxy.savings_tracker import estimate_request_savings_usd  # noqa:
 # One warm turn per provider, in that provider's own reporting shape.
 WARM_TURNS = {
     "anthropic": {
-        "model": "claude-sonnet-4-20250514",
+        "model": MODEL,
         "cache_read_tokens": 180_000,
         "cache_write_tokens": 2_000,
         "cache_write_5m_tokens": 2_000,
         "uncached_input_tokens": 500,
     },
     "bedrock": {
-        "model": "claude-sonnet-4-20250514",
+        "model": MODEL,
         "cache_read_tokens": 180_000,
         "cache_write_tokens": 2_000,
         "cache_write_5m_tokens": 2_000,
@@ -132,7 +139,7 @@ def test_a_provider_that_reports_no_cache_data_prices_at_list_and_says_so():
     not presented as a measurement.
     """
     priced = estimate_request_savings_usd(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         compression_tokens_saved=5_000,
         tool_schema_tokens_saved=5_000,
     )
@@ -180,7 +187,7 @@ def test_the_headline_degrades_to_the_weakest_provider_in_a_mixed_session():
     not present its total as catalog-grade.
     """
     priced = estimate_request_savings_usd(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         # Priced against a real mix...
         compression_tokens_saved=5_000,
         cache_read_tokens=100_000,
@@ -193,7 +200,7 @@ def test_the_headline_degrades_to_the_weakest_provider_in_a_mixed_session():
 
     # ...but the same layers with nothing reported cannot claim the same.
     blind = estimate_request_savings_usd(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         compression_tokens_saved=5_000,
     )
     assert blind["basis"] == "no-mix"
@@ -206,7 +213,7 @@ def test_long_context_requests_price_at_the_above_200k_tier():
     request's savings at base rates understates them by half.
     """
     base = estimate_request_savings_usd(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         compression_tokens_saved=5_000,
         cache_write_tokens=50_000,
         cache_write_5m_tokens=50_000,
@@ -214,7 +221,7 @@ def test_long_context_requests_price_at_the_above_200k_tier():
         provider="anthropic",
     )
     long_ctx = estimate_request_savings_usd(
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         compression_tokens_saved=5_000,
         cache_write_tokens=250_000,
         cache_write_5m_tokens=250_000,

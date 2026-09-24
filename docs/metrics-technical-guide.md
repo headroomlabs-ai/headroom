@@ -103,20 +103,54 @@ rate(headroom_cache_bust_total[5m])
 
 | Metric | What it shows |
 |---|---|
-| `headroom_requests_total` | Requests handled. Unlabelled. |
-| `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… |
-| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. |
-| `headroom_requests_failed_total` | Upstream 5xx errors. |
-| `headroom_requests_rate_limited_total` | Requests **Headroom** rejected via its own rate limiter (not upstream 429s). |
+| `headroom_requests_total` | **Completed** requests — the denominator for success-side stats, not total traffic. A request that ended in a 4xx, 5xx or 429 never reaches it. Unlabelled. |
+| `headroom_inbound_requests_total` | Every inbound HTTP request the proxy accepted, whatever the outcome. This is the all-traffic counter. |
+| `headroom_requests_by_provider{provider}` | Traffic split by provider — `anthropic`, `openai`, `gemini`, `bedrock`… **Completed requests only**, same denominator as `headroom_requests_total`. Use `headroom_requests_failed_total{provider}` for the failure side. |
+| `headroom_requests_by_model{model}` | Traffic split by model. Capped at 1024 distinct; overflow lands in `model="other"`. Completed requests only. |
+| `headroom_requests_failed_total{provider}` | Requests that failed upstream — **4xx and 5xx**, excluding 429. Excluded from `headroom_requests_total`, so add it back when you compute a rate. |
+| `headroom_requests_rate_limited_total{source}` | Requests rejected with 429, by **either** Headroom's own rate limiter (`source="headroom"`) or the upstream provider (`source="upstream"`). Excluded from `headroom_requests_total`. |
 | `headroom_compression_failed_total{reason}` | Compression failures — `timeout` or `error`. Fails open, so traffic keeps flowing but savings quietly stop. **Worth an alert.** |
 | `headroom_compression_quarantine_total{event}` | Compression disabled after repeated timeouts — `activated`, `skipped`, `released`. |
 | `headroom_inbound_requests_active` | In-flight requests, gauge. Counts all HTTP including `/metrics`. |
 | `headroom_active_ws_sessions` | Live Codex WebSocket sessions, gauge. |
 
+### `headroom_requests_total` is a denominator, not traffic
+
+`headroom_requests_total` counts requests that **completed** — it has always been
+incremented only on the success path, and since the outcome funnel started short-circuiting
+at `>= 400`, every 4xx, 5xx and 429 drops out of it. So:
+
+- `headroom_requests_total` + `headroom_requests_failed_total` + `headroom_requests_rate_limited_total`
+  ≈ the requests the proxy forwarded upstream.
+- `headroom_inbound_requests_total` is the honest all-traffic counter (it also counts
+  `/metrics`, `/stats` and other non-proxy HTTP).
+
+That is why the failure-rate query below adds `failed` back into its own denominator, and
+why you should not "simplify" it to `… / rate(headroom_requests_total[5m])`: failures are
+not in `requests_total`, so that form divides failures by successes and over-reports the
+rate — badly, during exactly the incident you wrote it for (at 100% failures the denominator
+goes to zero).
+
 ```promql
-# Failure rate
+# Failure rate. The denominator deliberately re-adds `failed`: a failed request
+# is NOT in headroom_requests_total, so requests_total alone is successes-only.
 rate(headroom_requests_failed_total[5m])
   / clamp_min(rate(headroom_requests_total[5m]) + rate(headroom_requests_failed_total[5m]), 1)
+
+# Failure rate by provider — which upstream is actually broken.
+sum by (provider) (rate(headroom_requests_failed_total[5m]))
+  / clamp_min(
+      sum by (provider) (rate(headroom_requests_by_provider[5m]))
+        + sum by (provider) (rate(headroom_requests_failed_total[5m])),
+      1
+    )
+
+# Who is throttling you: your own limiter (raise the cap) vs the provider
+# (back off, shard keys). Alert on these separately — they are different actions.
+sum by (source) (rate(headroom_requests_rate_limited_total[5m]))
+
+# Provider throttling only — the one that means "slow down".
+rate(headroom_requests_rate_limited_total{source="upstream"}[5m])
 
 # Savings silently stopped
 sum by (reason) (rate(headroom_compression_failed_total[5m]))
@@ -124,6 +158,22 @@ sum by (reason) (rate(headroom_compression_failed_total[5m]))
 # Traffic mix
 sum by (provider) (rate(headroom_requests_by_provider[5m]))
 ```
+
+> **Migration — these two counters gained labels.** `headroom_requests_failed_total` is now
+> labelled by `provider` and `headroom_requests_rate_limited_total` by `source`, so an
+> unaggregated query that used to return one series now returns several, and a panel or
+> alert that graphed the bare counter will fan out into one line per label value.
+> `sum without (provider) (rate(headroom_requests_failed_total[5m]))` and
+> `sum without (source) (rate(headroom_requests_rate_limited_total[5m]))` reproduce the old
+> single-series behaviour exactly. Both `source` series are exported from process start
+> (including at zero); `failed` exports one series per provider that has actually failed, so
+> it has no series at all until the first failure.
+>
+> The same split is available outside Prometheus: `/stats` carries
+> `requests.rate_limited_by_source` and `requests.failed_by_provider` alongside the
+> unlabelled `requests.rate_limited` / `requests.failed` totals (which are unchanged), the
+> lifetime aggregate carries the same two maps, and the OTel counters
+> `headroom.proxy.requests.rate_limited` / `.failed` carry `source` / `provider` attributes.
 
 ---
 

@@ -207,12 +207,15 @@ class HeadroomOtelMetrics:
         )
         self._proxy_failed_requests = self._meter.create_counter(
             "headroom.proxy.requests.failed",
-            description="Proxy requests that failed.",
+            description="Proxy requests that failed upstream (4xx and 5xx, excluding 429).",
             unit="1",
         )
         self._proxy_rate_limited_requests = self._meter.create_counter(
             "headroom.proxy.requests.rate_limited",
-            description="Proxy requests rejected by rate limiting.",
+            description=(
+                "Proxy requests rejected with 429, by source "
+                "(headroom=our own limiter, upstream=the provider)."
+            ),
             unit="1",
         )
         self._proxy_input_tokens = self._meter.create_counter(
@@ -567,8 +570,15 @@ class HeadroomOtelMetrics:
         *,
         provider: str | None = None,
         model: str | None = None,
+        source: str = "headroom",
     ) -> None:
-        self._proxy_rate_limited_requests.add(1, self._attrs(provider=provider, model=model))
+        # ``source`` mirrors the headroom_requests_rate_limited_total{source}
+        # Prometheus label: "headroom" = our own limiter refused the request,
+        # "upstream" = the provider did. Same split in both backends so an
+        # operator's query means the same thing whichever one they scrape.
+        self._proxy_rate_limited_requests.add(
+            1, self._attrs(provider=provider, model=model, source=source)
+        )
 
     def record_proxy_cache_bust(self, *, tokens_lost: int) -> None:
         self._proxy_cache_busts.add(1)

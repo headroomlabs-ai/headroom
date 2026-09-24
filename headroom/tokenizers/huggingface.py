@@ -122,6 +122,56 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
 }
 
 
+# Every repository Headroom is willing to hand to the HuggingFace loader.
+#
+# The loader resolves a name against the Hub and, historically, ran repository
+# code while doing it (``trust_remote_code``). The model id reaching this module
+# can come straight off a client request body — the proxy routes ``model`` to a
+# tokenizer — so an unconstrained identifier is remote code execution in the
+# proxy process by way of "publish a repo, then ask for it by name". The
+# allowlist is derived from the mappings we actually ship, so adding a family to
+# MODEL_TO_TOKENIZER allows it and nothing else drifts in.
+ALLOWED_TOKENIZER_REPOS: frozenset[str] = frozenset(MODEL_TO_TOKENIZER.values())
+
+# The tokenizer an unrecognised model resolves to. Llama 3 is the canonical open
+# model vocabulary and is what the registry already routes bare ``llama*`` ids
+# to. The repository is gated on the Hub, so a deployment without HF credentials
+# simply fails the load and falls back to character estimation — which is what
+# an unknown model got before this allowlist existed.
+DEFAULT_TOKENIZER: str = MODEL_TO_TOKENIZER["llama-3"]
+
+# Operator escape hatch for self-hosted or private tokenizer repositories:
+# a comma-separated list of repo ids. This is deliberately environment-only —
+# server-side configuration an operator sets, never anything a client can
+# influence through a request body. Repositories added here are still loaded
+# with ``trust_remote_code=False``.
+_ALLOWLIST_ENV = "HEADROOM_HF_TOKENIZER_ALLOWLIST"
+
+
+@lru_cache(maxsize=8)
+def _allowlist_index(extra: str) -> dict[str, str]:
+    """Lowercased repo id -> canonical repo id, for the shipped list plus ``extra``.
+
+    Keyed on the raw environment value so the (tiny) index is built once per
+    distinct configuration rather than on every model resolution.
+    """
+    repos = set(ALLOWED_TOKENIZER_REPOS)
+    repos.update(part.strip() for part in extra.split(",") if part.strip())
+    return {repo.lower(): repo for repo in repos}
+
+
+def _resolve_allowed_repo(name: str) -> str | None:
+    """Return the canonical allowlisted repo id for ``name``, or None.
+
+    Matching is case-insensitive because Hub ids are commonly retyped with
+    different capitalisation, but the value returned is always *our* spelling
+    from the allowlist — the caller's string is never propagated to the loader.
+    """
+    if not name:
+        return None
+    return _allowlist_index(os.environ.get(_ALLOWLIST_ENV, "")).get(name.strip().lower())
+
+
 # Bound the first (network) load of a HuggingFace tokenizer. Without a bound,
 # huggingface_hub download retries can block for many minutes (GH #1701: 610s
 # on a restricted Windows network). 0 disables network loads entirely.
@@ -148,18 +198,42 @@ def _load_tokenizer(tokenizer_name: str):
     Failures are cached by ``lru_cache`` (returns ``None``), so a slow or
     offline hub is probed at most once per process per tokenizer.
 
+    Only repositories on the allowlist reach ``from_pretrained`` at all. This is
+    the chokepoint, not a second opinion: ``get_tokenizer_name`` already resolves
+    unrecognised models to DEFAULT_TOKENIZER, but this function is importable and
+    callable with an arbitrary string, and a name that is not on the allowlist
+    must never turn into a Hub lookup. Refusing here fails closed to estimation
+    rather than substituting a different vocabulary behind the caller's back.
+
     Args:
         tokenizer_name: HuggingFace model/tokenizer name.
 
     Returns:
         Loaded tokenizer, or None if unavailable.
     """
+    repo = _resolve_allowed_repo(tokenizer_name)
+    if repo is None:
+        logger.warning(
+            f"Refusing to load unallowlisted tokenizer {tokenizer_name!r}; using "
+            f"estimation (add it to {_ALLOWLIST_ENV} if this repository is trusted)"
+        )
+        return None
+    # Load the allowlist's own spelling, never the argument: matching is
+    # case-insensitive, so the string that reaches the Hub must be the one we
+    # vetted, not a variant the caller chose.
+    tokenizer_name = repo
+
     from transformers import AutoTokenizer
 
     try:
+        # trust_remote_code=False, always. A tokenizer repository can ship its own
+        # Python, and executing it is equivalent to running whatever the repo owner
+        # publishes inside the proxy. Every tokenizer we map is a plain vocabulary
+        # that loads fine without it; a repo that genuinely needs custom code is a
+        # repo we are not willing to execute.
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
-            trust_remote_code=True,
+            trust_remote_code=False,
             local_files_only=True,
         )
     except Exception:
@@ -181,7 +255,7 @@ def _load_tokenizer(tokenizer_name: str):
             result.append(
                 AutoTokenizer.from_pretrained(
                     tokenizer_name,
-                    trust_remote_code=True,
+                    trust_remote_code=False,  # see the cache-only attempt above
                 )
             )
         except BaseException as e:  # noqa: BLE001 — report any failure to the waiter
@@ -209,11 +283,15 @@ def _load_tokenizer(tokenizer_name: str):
 def get_tokenizer_name(model: str) -> str:
     """Get HuggingFace tokenizer name for a model.
 
+    Always returns an allowlisted repository. ``model`` is attacker-reachable —
+    it is the ``model`` field of a proxied request body — so this resolver must
+    never return a caller-controlled string for the loader to look up on the Hub.
+
     Args:
         model: Model name.
 
     Returns:
-        HuggingFace tokenizer identifier.
+        HuggingFace tokenizer identifier, from ALLOWED_TOKENIZER_REPOS.
     """
     model_lower = model.lower()
 
@@ -231,8 +309,26 @@ def get_tokenizer_name(model: str) -> str:
         if model_lower.startswith(key):
             return MODEL_TO_TOKENIZER[key]
 
-    # Assume model name is the tokenizer name
-    return model
+    # A caller may legitimately name a shipped repository outright
+    # ("meta-llama/Llama-3.1-8B") instead of using the short alias, and that has
+    # to keep counting exactly. Accepting it via the allowlist returns our own
+    # canonical spelling, so the caller's string still never reaches the loader.
+    allowed = _resolve_allowed_repo(model)
+    if allowed is not None:
+        return allowed
+
+    # Fail closed. This branch used to be "assume the model name is the
+    # tokenizer name", which handed an arbitrary client-supplied string to
+    # AutoTokenizer.from_pretrained -> a Hub fetch of whatever repository the
+    # caller named. An unrecognised model now resolves to the default vocabulary;
+    # the count is an approximation, which is what an unknown model already got
+    # when the made-up repo id failed to resolve.
+    logger.debug(
+        "No tokenizer mapping for model %r; using default tokenizer %s",
+        model,
+        DEFAULT_TOKENIZER,
+    )
+    return DEFAULT_TOKENIZER
 
 
 class HuggingFaceTokenizer(BaseTokenizer):
