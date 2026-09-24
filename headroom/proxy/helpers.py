@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -3238,13 +3238,44 @@ def compute_turn_id(
 # ---------------------------------------------------------------------------
 
 _TOOL_SEARCH_TOOL_TYPE_PREFIX = "tool_search_tool_"
+# Every wire spelling of "this client is already deferring its tool schemas".
+# Deferral is no longer an Anthropic-only feature: Codex and the Responses API
+# use a bare ``tool_search`` type that carries no ``name`` at all, GitHub
+# Copilot CLI ships ``tool_search_tool``, VS Code Copilot and Kiro use
+# ``tool_search``, and Codebuff uses ``composio_search_tools``. Matching only
+# Anthropic's versioned ``tool_search_tool_*`` prefix misses all of them --
+# including the exact string ``tool_search_tool``, which does not start with
+# ``tool_search_tool_``.
+_RESPONSES_TOOL_SEARCH_TYPE = "tool_search"
+_TOOL_SEARCH_META_TOOL_NAMES = frozenset(
+    {
+        _RESPONSES_TOOL_SEARCH_TYPE,
+        "tool_search_tool",
+        "tool_search_tool_regex",
+        "composio_search_tools",
+    }
+)
+# Responses lets a client group tools under one entry that carries the real
+# tools in a nested ``tools`` array; Codex ships its MCP servers that way.
+_NAMESPACE_TOOL_TYPE = "namespace"
 # Substrings of the ``anthropic-beta`` tokens that gate tool search:
 # ``advanced-tool-use-2025-11-20`` (firstParty/foundry) and
 # ``tool-search-tool-2025-10-19`` (vertex/bedrock/mantle/gateway).
 _TOOL_SEARCH_BETA_MARKERS = ("advanced-tool-use", "tool-search-tool")
 
 _tool_search_hint_lock = threading.Lock()
-_tool_search_hint_emitted = False
+#: Re-arm interval for the tool-search-disabled warning. It used to fire exactly
+#: once per process, which on a proxy that stays up for weeks means one line in
+#: the log at startup and silence thereafter — the condition it reports persists
+#: for the whole life of the deployment and costs tokens on every single request,
+#: so a single line is not proportionate to it. Hourly is frequent enough that an
+#: operator tailing logs will see it, rare enough that it is not noise.
+_TOOL_SEARCH_HINT_INTERVAL_S = 3600.0
+_tool_search_hint_last: float | None = None
+# Module-level indirection over the clock so tests can drive it without
+# monkeypatching stdlib ``time.monotonic``, which would freeze it for every
+# other thread in the process. Same pattern as savings_tracker.
+_monotonic = time.monotonic
 
 
 def claude_code_tool_search_inactive(
@@ -3270,11 +3301,8 @@ def claude_code_tool_search_inactive(
         return False
     if not isinstance(tools, list) or not tools:
         return False
-    for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
-        ):
-            return False
+    if request_already_defers_tools(tools):
+        return False
     beta = (anthropic_beta or "").lower()
     return not any(marker in beta for marker in _TOOL_SEARCH_BETA_MARKERS)
 
@@ -3301,36 +3329,46 @@ def format_tool_search_disabled_hint(tools: list[Any]) -> str:
 
 
 def tool_search_hint_pending() -> bool:
-    """Cheap, lock-free check of whether the one-time hint may still fire.
+    """Cheap, lock-free check of whether the detection scan may run now.
 
-    Lets the request hot path skip the (O(number-of-tools)) detection scan on
-    every request once the hint has already been emitted. A benign race here
-    only costs one extra detection scan, never a duplicate warning — the
-    actual one-shot guarantee lives in :func:`take_tool_search_hint_slot`.
+    Lets the request hot path skip the O(number-of-tools) scan while the hint
+    is throttled. A benign race here only costs one extra scan, never a
+    duplicate warning — the rate limit itself lives in
+    :func:`take_tool_search_scan_slot`.
     """
-    return not _tool_search_hint_emitted
+    last = _tool_search_hint_last
+    return last is None or (_monotonic() - last) >= _TOOL_SEARCH_HINT_INTERVAL_S
 
 
-def take_tool_search_hint_slot() -> bool:
-    """Return ``True`` exactly once per process, gating the one-time hint.
+def take_tool_search_scan_slot() -> bool:
+    """Claim the right to run the detection scan, at most once per interval.
 
-    Thread-safe so concurrent requests cannot each emit the warning.
+    The window governs SCANS, not emissions, and that distinction is
+    load-bearing. Stamping only when the hint actually fires means that once the
+    operator FIXES the condition the stamp stops advancing, ``pending`` stays
+    true forever, and every subsequent request pays the full scan over the
+    client's tool array for the life of the process — the opposite of the gate's
+    purpose, and worst on exactly the large tool surfaces this targets.
+
+    Claiming the slot before the scan also collapses the old two-call protocol
+    into one, so there is no window in which two threads both scan and both
+    emit.
     """
-    global _tool_search_hint_emitted
-    if _tool_search_hint_emitted:
+    global _tool_search_hint_last
+    if not tool_search_hint_pending():
         return False
     with _tool_search_hint_lock:
-        if _tool_search_hint_emitted:
+        if not tool_search_hint_pending():
             return False
-        _tool_search_hint_emitted = True
+        _tool_search_hint_last = _monotonic()
         return True
 
 
 def reset_tool_search_hint_state() -> None:
-    """Reset the one-time hint guard. Test helper only."""
-    global _tool_search_hint_emitted
+    """Reset the hint rate limit. Test helper only."""
+    global _tool_search_hint_last
     with _tool_search_hint_lock:
-        _tool_search_hint_emitted = False
+        _tool_search_hint_last = None
 
 
 # ---------------------------------------------------------------------------
@@ -3346,6 +3384,14 @@ def reset_tool_search_hint_state() -> None:
 # counting as input tokens until the model searches for one), while every tool
 # stays callable. Deterministic output → the tools prefix still prompt-caches.
 # ---------------------------------------------------------------------------
+
+# Resident no matter what the operator's override says. The client's own
+# tool-search tool is the one thing that must never be deferred: it is what
+# loads the tools it resolves, and Claude Code uses it to reach tools held in a
+# local registry (TaskCreate, WebFetch, ...) that nothing else can reach. An
+# override says which ORDINARY tools stay inline, so letting it drop this would
+# silently orphan a whole category rather than defer it.
+_CLIENT_SIDE_SEARCH_FLOOR = frozenset({"toolsearch"})
 
 # Core coding tools kept non-deferred so routine edit/read/run loops never pay a
 # search round-trip. Everything else (Slack/Linear/Sentry/Notion/Snowflake/…) is
@@ -3378,6 +3424,99 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "toolsearch",
     }
 )
+
+
+#: Canonical name for the resident-tool override, and the legacy name the
+#: tool-search plugin shipped for the same idea. Two variables for one knob is a
+#: trap: an operator sets the one they know, the other path silently keeps its
+#: own list, and the two providers disagree about which tools are visible. Both
+#: are read here so either spelling works everywhere; the canonical one wins.
+CORE_TOOLS_ENV = "HEADROOM_TOOL_SEARCH_CORE_TOOLS"
+CORE_TOOLS_ENV_LEGACY = "HEADROOM_TOOL_SEARCH_CORE"
+
+_core_tools_legacy_lock = threading.Lock()
+_core_tools_legacy_warned = False
+
+
+def reset_core_tools_legacy_warn_state() -> None:
+    """Re-arm the legacy-variable warning. Test helper only.
+
+    Without this the flag leaks between tests in a process, so a caplog
+    assertion on this warning passes alone and fails depending on ordering.
+    """
+    global _core_tools_legacy_warned
+    with _core_tools_legacy_lock:
+        _core_tools_legacy_warned = False
+
+
+def _core_tools_override() -> str | None:
+    """Return the resident-tool override from either env var, canonical first."""
+    global _core_tools_legacy_warned
+    raw = os.environ.get(CORE_TOOLS_ENV)
+    if raw is not None:
+        return raw
+    legacy = os.environ.get(CORE_TOOLS_ENV_LEGACY)
+    should_warn = False
+    if legacy is not None:
+        # Check-and-set under the lock: unguarded, two threads racing on their
+        # first request could both warn.
+        with _core_tools_legacy_lock:
+            if not _core_tools_legacy_warned:
+                _core_tools_legacy_warned = True
+                should_warn = True
+    if should_warn:
+        logger.warning(
+            "event=tool_search_core_env_legacy old=%s new=%s "
+            "hint=honoring the legacy variable; rename it, both paths read the new one",
+            CORE_TOOLS_ENV_LEGACY,
+            CORE_TOOLS_ENV,
+        )
+    return legacy
+
+
+def resolved_core_tools(extra: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Tools that stay resident, with a deployment override.
+
+    ``extra`` carries a provider's own additions to the default resident set
+    (the OpenAI Responses path keeps ``terminal`` resident alongside the shared
+    coding loop). It is folded into the DEFAULT only. An explicit
+    ``HEADROOM_TOOL_SEARCH_CORE_TOOLS`` replaces the whole set, additions
+    included -- otherwise the knob would silently fail to defer a tool the
+    operator had just asked to defer, and the two provider paths would honour
+    the same variable differently.
+
+    The default keeps the coding loop resident so routine edit/read/run never
+    pays a search round-trip. That default is now out of step with Claude Code,
+    which since v2.1.69 defers its built-ins too and thereby cuts built-in
+    schema context from roughly 14-16K tokens to under 1K. Behind a proxy the
+    client stops deferring, so Headroom carries those schemas in every request
+    while the direct-to-Anthropic baseline does not.
+
+    Deferring them here is NOT obviously right: our deferral is server-side, so
+    each first use of a deferred tool costs a search round trip, and the
+    accuracy and latency of that trade is unmeasured. The default therefore does
+    not change. ``HEADROOM_TOOL_SEARCH_CORE_TOOLS`` (comma-separated, or empty
+    to defer everything non-core) makes it an experiment a deployment can run
+    against real traffic instead of a guess shipped as a default.
+    """
+
+    raw = _core_tools_override()
+    if raw is None:
+        if not extra:
+            return _TOOL_SEARCH_CORE_TOOLS
+        return _TOOL_SEARCH_CORE_TOOLS | {_tool_search_resident_key(name) for name in extra}
+    # ``part.strip()`` before keying, not just for the emptiness test: the key
+    # function lowercases and strips leading underscores but NOT spaces, so the
+    # natural spelling "bash, read, terminal" used to resolve to {" read",
+    # " terminal", "bash"} and defer the two tools the operator asked to pin.
+    named = {_tool_search_resident_key(part.strip()) for part in raw.split(",") if part.strip()}
+    # The client's own tool-search tool survives every override. Deferring it
+    # hides the only thing that can load the tools it resolves -- including
+    # tools the client keeps in a local registry, which nothing else can reach
+    # -- so an override that omits it would silently orphan them.
+    return frozenset(named | _CLIENT_SIDE_SEARCH_FLOOR)
+
+
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
 _TOOL_SEARCH_DEFAULT_NAME = "tool_search_tool_regex"
 # Below this many tools the ~search round-trip isn't worth it (Anthropic's own
@@ -3454,6 +3593,168 @@ def _tool_search_resident_key(name: Any) -> str:
     return str(name or "").lower().lstrip("_")
 
 
+# Deliberately EMPTY by default. A client-side tool named ``ToolSearch`` does
+# NOT imply the client is deferring: Claude Code carries it to resolve tools it
+# keeps in a local registry (TaskCreate, WebFetch, ...), and real traffic shows
+# it riding alongside a fully inline MCP catalog. Standing down on that name
+# would disable Headroom precisely when the client is sending everything
+# eagerly, which is the case we exist for.
+#
+# When Claude Code genuinely defers, it sends the SERVER-SIDE shape
+# (``tool_search_tool_regex_20251119``), which is unambiguous and is what
+# ``request_already_defers_tools`` keys on. ``HEADROOM_CLIENT_TOOL_SEARCH_NAMES``
+# stays as an escape hatch for a future harness that signals deferral by name.
+_CLIENT_TOOL_SEARCH_NAMES: frozenset[str] = frozenset()
+
+
+def _client_tool_search_names() -> frozenset[str]:
+    """Extra tool names that mean "the client is already deferring".
+
+    Empty by default; see ``_CLIENT_TOOL_SEARCH_NAMES``. Comma-separated in
+    ``HEADROOM_CLIENT_TOOL_SEARCH_NAMES``, normalized the same way tool names
+    are, so a harness we have not seen can be handled without a release.
+    """
+
+    extra = os.environ.get("HEADROOM_CLIENT_TOOL_SEARCH_NAMES", "")
+    if not extra.strip():
+        return _CLIENT_TOOL_SEARCH_NAMES
+    return _CLIENT_TOOL_SEARCH_NAMES | {
+        _tool_search_resident_key(part.strip()) for part in extra.split(",") if part.strip()
+    }
+
+
+def iter_tool_entries(tools: Any) -> Iterator[dict[str, Any]]:
+    """Yield every tool dict in ``tools``, descending into namespace groups.
+
+    A Responses client may group tools under
+    ``{"type": "namespace", "name": ..., "tools": [...]}`` and Codex ships its
+    MCP servers that way. A scan that reads only top-level ``tools[].name``
+    sees the wrapper and none of the tools inside it, so every nested tool is
+    invisible to both deferral detection and the resident/defer decision --
+    and a namespace is exactly where a large MCP catalog lives.
+
+    One level is what the API defines, and that is all this descends; a nested
+    ``tools`` value that is not a list is skipped rather than trusted.
+    """
+
+    if not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        yield tool
+        if tool.get("type") != _NAMESPACE_TOOL_TYPE:
+            continue
+        for nested in tool.get("tools") or []:
+            if isinstance(nested, dict):
+                yield nested
+
+
+def _is_tool_search_meta_tool(tool: dict[str, Any]) -> bool:
+    """Whether one tool entry is a tool-search meta-tool, in any known spelling."""
+
+    ttype = str(tool.get("type", ""))
+    if ttype.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX) or ttype in _TOOL_SEARCH_META_TOOL_NAMES:
+        return True
+    name = _tool_search_resident_key(tool.get("name"))
+    return (
+        name.startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        or name in _TOOL_SEARCH_META_TOOL_NAMES
+        or name in _client_tool_search_names()
+    )
+
+
+def request_already_defers_tools(tools: Any) -> bool:
+    """Whether ``tools`` shows the CLIENT is already deferring tool schemas.
+
+    Keyed on wire shape, never on a client allowlist, so it generalizes to
+    harnesses we have not seen. Three independent signals, any of which is
+    conclusive:
+
+    * a tool-search meta-tool in any known spelling -- Anthropic's versioned
+      ``tool_search_tool_*``, the Responses/Codex bare ``tool_search`` type
+      (which carries no ``name`` at all), Copilot's ``tool_search_tool``;
+    * ``defer_loading`` already set on any tool, which is the client marking
+      its own catalog deferred and is shape-independent;
+    * either of the above on a tool nested inside a ``namespace`` entry.
+
+    NOT true for a bare client-side tool name such as ``ToolSearch``, which a
+    client may send whether or not it is deferring -- see
+    ``_CLIENT_TOOL_SEARCH_NAMES``.
+
+    Deferring on top of a client that already defers suppresses ITS mechanism
+    and inlines the catalog we were trying to keep out, so a miss here costs
+    real tokens. That is no longer a rare case: Codex, GitHub Copilot CLI, VS
+    Code Copilot, Kiro and Codebuff all ship their own tool search, and on
+    Copilot's Anthropic path the provider's server-side search can be a third
+    mechanism in the same request.
+
+    Upstream-independent on purpose: the question is what the client is doing,
+    not where the request is forwarded, so the same answer holds for first-party
+    Anthropic, Bedrock, Vertex and gateways. That matters because through Kong
+    or Bedrock the client usually is NOT deferring, and there Headroom's
+    deferral is the only one available.
+    """
+
+    deferred_without_search_tool = False
+    for tool in iter_tool_entries(tools):
+        if _is_tool_search_meta_tool(tool):
+            return True
+        if tool.get("defer_loading") is True:
+            deferred_without_search_tool = True
+    if deferred_without_search_tool:
+        # Tools marked deferred with no meta-tool we recognize that could
+        # resolve them. Two very different causes, and the operator wants to
+        # know which: a harness whose search tool is spelled in a way this
+        # survey missed (benign -- standing down is right, and the log names the
+        # tools so the spelling can be added), or an intermediary that stripped
+        # the search tool and left the marks behind, which upstream will reject.
+        # Headroom's own third-party strip clears both halves precisely so it
+        # cannot be the cause, so seeing this points outside us.
+        _warn_deferred_without_search_tool(tools)
+        return True
+    return False
+
+
+_DEFERRED_ORPHAN_WARN_INTERVAL_S = 3600.0
+_deferred_orphan_lock = threading.Lock()
+_deferred_orphan_last: float | None = None
+
+
+def reset_deferred_orphan_warn_state() -> None:
+    """Re-arm the orphaned-deferral warning. For tests."""
+    global _deferred_orphan_last
+    with _deferred_orphan_lock:
+        _deferred_orphan_last = None
+
+
+def _warn_deferred_without_search_tool(tools: Any) -> None:
+    """Warn, at most hourly, that deferred tools have nothing to resolve them."""
+
+    global _deferred_orphan_last
+    now = time.monotonic()
+    with _deferred_orphan_lock:
+        last = _deferred_orphan_last
+        if last is not None and (now - last) < _DEFERRED_ORPHAN_WARN_INTERVAL_S:
+            return
+        _deferred_orphan_last = now
+    names = [
+        str(t.get("name") or t.get("type") or "?")
+        for t in iter_tool_entries(tools)
+        if t.get("defer_loading") is True
+    ]
+    logger.warning(
+        "event=tool_search_deferred_orphan deferred=%d names=%s hint=%s",
+        len(names),
+        ",".join(sorted(names)[:8]),
+        "tools are marked defer_loading but no recognized tool-search tool can "
+        "resolve them; Headroom is standing down. Either this harness spells its "
+        "search tool in a way Headroom does not know (set "
+        "HEADROOM_CLIENT_TOOL_SEARCH_NAMES to teach it) or an intermediary "
+        "stripped the search tool and left the marks, which the upstream will reject",
+    )
+
+
 def anthropic_first_party_tool_search_supported(api_base_url: str | None) -> bool:
     """Return whether Anthropic server-side tool search is valid for this upstream."""
     from headroom.providers.claude.runtime import is_custom_anthropic_base_url
@@ -3465,24 +3766,58 @@ def strip_first_party_tool_search_tools_for_third_party_upstream(
     tools: Any,
     api_base_url: str | None,
 ) -> Any:
-    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream."""
+    """Remove first-party Anthropic tool-search tools when forwarding to a custom upstream.
+
+    Custom upstreams reject the first-party shape: Bedrock needs a different
+    beta token (``tool-search-tool-2025-10-19``, in the body's ``anthropic_beta``
+    array) and a different API (InvokeModel, never Converse); Vertex and
+    gateways 400 on the tool type.
+
+    ``defer_loading`` is cleared at the same time, and that half is
+    load-bearing. Removing only the search tool leaves every other tool marked
+    deferred with nothing left that can resolve it: the model has no mechanism
+    to load them, and a ``tool_reference`` naming one is a documented 400
+    ("Tool reference 'X' not found in available tools"). A closed tool schema
+    also rejects the unknown field outright ("Extra inputs are not permitted").
+    Either way the half-stripped request is worse than both coherent options,
+    so strip both halves and forward a plain, valid tools array.
+
+    Reached in practice through the obvious workaround for Claude Code
+    disabling its own tool search behind a custom base URL: forcing
+    ``ENABLE_TOOL_SEARCH=true`` makes the client send the deferred shape.
+    """
+
     if not isinstance(tools, list) or anthropic_first_party_tool_search_supported(api_base_url):
         return tools
-    filtered = [
-        tool
-        for tool in tools
-        if not (
-            isinstance(tool, dict)
-            and str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-        )
-    ]
-    return filtered if len(filtered) != len(tools) else tools
+    out: list[Any] = []
+    changed = False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        if str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX):
+            changed = True
+            continue
+        if tool.get("defer_loading"):
+            stripped = {k: v for k, v in tool.items() if k != "defer_loading"}
+            out.append(stripped)
+            changed = True
+            continue
+        out.append(tool)
+    if not changed:
+        return tools
+    logger.info(
+        "event=tool_search_downgraded reason=third_party_upstream tools=%d hint=%s",
+        len(out),
+        "client-side tool deferral cannot be forwarded to this upstream; tools are sent eagerly",
+    )
+    return out
 
 
 def inject_tool_search_deferral(
     tools: Any,
     *,
-    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    core_tools: frozenset[str] | None = None,
     search_type: str = _TOOL_SEARCH_DEFAULT_TYPE,
     search_name: str = _TOOL_SEARCH_DEFAULT_NAME,
 ) -> Any:
@@ -3498,14 +3833,15 @@ def inject_tool_search_deferral(
     tool, it is moved to the last non-deferred real tool so the (smaller) tools
     prefix still caches.
     """
+    if core_tools is None:
+        core_tools = resolved_core_tools()
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
-    for tool in tools:
-        if isinstance(tool, dict) and (
-            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
-        ):
-            return tools  # client already uses tool search — leave it alone
+    if request_already_defers_tools(tools):
+        # Client already defers (server-side tool_search_tool_*, or a client-side
+        # tool such as Claude Code's ToolSearch). Stand down entirely rather than
+        # deferring on top of it — see _CLIENT_TOOL_SEARCH_NAMES.
+        return tools
 
     search_tool = {"type": search_type, "name": search_name}
     out: list[Any] = [search_tool]
@@ -3850,7 +4186,7 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
 #   * No ``cache_control`` (OpenAI caches automatically), so no breakpoint move.
 # ---------------------------------------------------------------------------
 
-_OPENAI_TOOL_SEARCH_TYPE = "tool_search"
+_OPENAI_TOOL_SEARCH_TYPE = _RESPONSES_TOOL_SEARCH_TYPE
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
 _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
@@ -3895,7 +4231,7 @@ def inject_tool_search_deferral_openai(
     model: str | None,
     *,
     client: str | None = None,
-    core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
+    core_tools: frozenset[str] | None = None,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
@@ -3911,23 +4247,36 @@ def inject_tool_search_deferral_openai(
     so routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
+    if core_tools is None:
+        core_tools = resolved_core_tools(_OPENAI_TOOL_SEARCH_RESIDENT_NAMES)
     if not openai_tool_search_client_supported(client):
         return tools
     if not _model_supports_openai_tool_search(model):
         return tools
-    if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
+    if not isinstance(tools, list):
         return tools
-    for tool in tools:
-        if isinstance(tool, dict) and tool.get("type") == _OPENAI_TOOL_SEARCH_TYPE:
-            return tools  # client already uses tool search — leave it alone
+    # Count nested namespace members too. A client that groups a 30-tool MCP
+    # catalog under one namespace entry presents a handful of top-level entries,
+    # so a top-level-only count reads it as a small tool surface and skips
+    # exactly the request with the most schema to save.
+    if sum(1 for _ in iter_tool_entries(tools)) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:
+        return tools
+    if request_already_defers_tools(tools):
+        # Client already defers — its own Responses tool_search, Copilot's
+        # tool_search_tool, or defer_loading it set itself. Deferring on top of
+        # a client that is already deferring suppresses ITS mechanism and
+        # inlines the catalog we were trying to keep out.
+        return tools
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
     # Normalize for the same reason as the Anthropic path above: clients may use
     # different casing or a leading namespace marker for the same resident tool.
-    resident_keys = {_tool_search_resident_key(name) for name in core_tools} | {
-        _tool_search_resident_key(name) for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
-    }
+    # No unconditional union with _OPENAI_TOOL_SEARCH_RESIDENT_NAMES here: it is
+    # folded into the default by resolved_core_tools() above, so an explicit
+    # override drops it too. Unioning it in at this point would pin ``terminal``
+    # resident even when the operator set the core set to something without it.
+    resident_keys = {_tool_search_resident_key(name) for name in core_tools}
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)

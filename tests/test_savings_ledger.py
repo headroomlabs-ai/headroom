@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from headroom import savings_ledger as L
+from tests._pricing_models import anthropic_pricing_model
+
+MODEL = anthropic_pricing_model()
 
 UTC = timezone.utc
 
@@ -417,7 +420,7 @@ def test_v1_events_still_aggregate_alongside_v2(tmp_path):
                     "after": 6_000,
                     "saved": 4_000,
                     "cost_usd": 0.012,
-                    "model": "claude-sonnet-4-20250514",
+                    "model": MODEL,
                     "client": "claude-code",
                     "source": "proxy",
                 }
@@ -427,7 +430,7 @@ def test_v1_events_still_aggregate_alongside_v2(tmp_path):
     sl.record_savings_event(
         tokens_before=108_000,
         tokens_after=100_000,
-        model="claude-sonnet-4-20250514",
+        model=MODEL,
         client="claude-code",
         source="proxy",
         saved_compression=1_000,

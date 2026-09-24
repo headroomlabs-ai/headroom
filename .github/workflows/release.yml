@@ -1075,3 +1075,29 @@ jobs:
         run: |
           TAG="v${{ needs.detect-version.outputs.version }}"
           gh release upload "$TAG" release-assets/*.tgz --clobber
+
+  notify-release:
+    # This boundary intentionally means "the GitHub Release and its assets are
+    # ready", not "every registry publish succeeded". create-release owns that
+    # narrower contract and only runs after the release build/smoke gates.
+    needs: create-release
+    if: >-
+      ${{
+        github.event_name == 'release' &&
+        github.event.action == 'published' &&
+        needs.create-release.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Announce completed GitHub Release assets
+        uses: ./.github/actions/release-slack-notification
+        with:
+          release-name: ${{ github.event.release.name }}
+          tag: ${{ github.event.release.tag_name }}
+          url: ${{ github.event.release.html_url }}
+          repository: ${{ github.repository }}
+          actor: ${{ github.actor }}
+          webhook-url: ${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}

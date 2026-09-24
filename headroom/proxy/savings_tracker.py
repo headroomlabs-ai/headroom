@@ -14,6 +14,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,11 @@ DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
+# Throttle for the negative-savings warning. The first one is immediate; after
+# that a losing deployment gets one summary line per interval rather than one
+# per request. Module-level indirection over the clock so tests can drive it.
+NEGATIVE_SAVINGS_WARN_INTERVAL_S = 300.0
+_monotonic = time.monotonic
 DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
 # Blended output price used only when litellm cannot price the model.
 DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
@@ -189,6 +195,28 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
     return max(coerced, 0.0)
 
 
+def _coerce_signed_float(value: Any, default: float = 0.0) -> float:
+    """``_coerce_float`` without the zero floor, for quantities that can lose.
+
+    The floor in ``_coerce_float`` is right for the things it mostly guards --
+    token counts, input costs, cumulative totals -- none of which have a
+    meaningful negative value. It is wrong for per-request compression savings,
+    which genuinely go negative when a rewrite displaces tokens out of the
+    cached prefix and they come back billed at the fresh-input rate. Flooring
+    those reported a gain on a turn that lost money. Kept as a separate helper
+    rather than a flag on ``_coerce_float`` so the callers that want a floor
+    keep getting one by default.
+    """
+
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(coerced):
+        return default
+    return coerced
+
+
 PROVIDER_UNKNOWN = "unknown"
 
 
@@ -206,6 +234,19 @@ def _normalize_provider(value: Any) -> str:
 
 
 MODEL_UNKNOWN = "unknown"
+
+
+def _empty_cache_delta() -> dict[str, Any]:
+    """Zeroed cache fields for a rollup bucket or one of its breakdowns.
+
+    ``cache_read_cost_usd_delta`` is None when any contributing checkpoint's
+    reads could not be priced (see ``_build_rollup``).
+    """
+    return {
+        "cache_read_tokens_delta": 0,
+        "cache_savings_usd_delta": 0.0,
+        "cache_read_cost_usd_delta": 0.0,
+    }
 
 
 def _normalize_model(value: Any) -> str:
@@ -667,7 +708,7 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         normalized["compression_savings_usd"] = round(
-            _coerce_float(entry.get("compression_savings_usd")), 6
+            _coerce_signed_float(entry.get("compression_savings_usd")), 6
         )
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
@@ -702,7 +743,7 @@ def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
         # Absent in state files written before this field existed -> 0.
         normalized["tool_tokens_saved"] = _coerce_int(entry.get("tool_tokens_saved"))
         normalized["compression_savings_usd"] = round(
-            _coerce_float(entry.get("compression_savings_usd")), 6
+            _coerce_signed_float(entry.get("compression_savings_usd")), 6
         )
         normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
         normalized["total_input_cost_usd"] = round(
@@ -737,12 +778,12 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
     # cannot be recovered. Written out rather than inlined into the dict below:
     # a money path should not hinge on the reader parsing a nested ternary.
     is_pre_v6 = "compression_savings_list_usd" not in entry
-    savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+    savings_usd = _coerce_signed_float(entry.get("compression_savings_usd"))
     if is_pre_v6:
         savings_list_usd = savings_usd
         savings_basis = BASIS_LIST
     else:
-        savings_list_usd = _coerce_float(entry.get("compression_savings_list_usd"))
+        savings_list_usd = _coerce_signed_float(entry.get("compression_savings_list_usd"))
         savings_basis = str(entry.get("savings_basis") or BASIS_UNKNOWN)
 
     return {
@@ -814,10 +855,56 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        # Negative-savings warning state. A deployment that loses money loses it
+        # on most turns, not one, so warning per turn would bury the signal in
+        # its own repetition. Accumulate instead and emit a summary no more than
+        # once per NEGATIVE_SAVINGS_WARN_INTERVAL_S — except the first, which is
+        # immediate, because the operator should learn on turn one rather than a
+        # minute in.
+        self._negative_savings_count = 0
+        self._negative_savings_usd = 0.0
+        self._negative_savings_last_warn: float | None = None
 
     @property
     def storage_path(self) -> str:
         return str(self._path)
+
+    def _note_negative_savings(
+        self,
+        *,
+        model: str | None,
+        delta_usd: float,
+        compression: float,
+        tool_schema: float,
+    ) -> None:
+        """Warn that a request's measured savings came out negative.
+
+        Negative savings mean the rewrite cost more than it removed on that turn
+        — normally because it displaced tokens out of the cached prefix. It is
+        not an accounting artifact and it is not self-correcting, so it warrants
+        WARNING rather than a metric an operator has to go looking for.
+        """
+
+        self._negative_savings_count += 1
+        self._negative_savings_usd += delta_usd
+        now = _monotonic()
+        last = self._negative_savings_last_warn
+        if last is not None and (now - last) < NEGATIVE_SAVINGS_WARN_INTERVAL_S:
+            return
+        self._negative_savings_last_warn = now
+        logger.warning(
+            "event=savings_negative model=%s request_usd=%.6f compression_usd=%.6f "
+            "tool_schema_usd=%.6f negative_requests=%d negative_usd_total=%.6f "
+            "hint=%s",
+            model or "unknown",
+            delta_usd,
+            compression,
+            tool_schema,
+            self._negative_savings_count,
+            self._negative_savings_usd,
+            "compression is costing more than it saves on this traffic; "
+            "check prompt-cache busts in /stats prefix_cache.compression_vs_cache",
+        )
 
     def record_compression_savings(
         self,
@@ -953,18 +1040,33 @@ class SavingsTracker:
             # As of v6 these two arrive CACHE-AWARE and region-correct: the
             # compression bucket priced against the live zone (never a cache
             # read) and the tool-schema bucket against the prefix (on a warm
-            # turn, entirely a cache read). Neither is clamped at zero any more
-            # than it was — but note the floor below is load-bearing in a new
-            # way, since a live-zone token on a cold Anthropic turn is worth
-            # 1.25x list, not 1.0x, and that is real money rather than an
-            # artifact.
-            delta_savings_usd = max(_coerce_float(priced.get("compression")), 0.0) + max(
-                _coerce_float(priced.get("tool_schema")), 0.0
-            )
-            delta_savings_list_usd = max(_coerce_float(priced.get("compression_list")), 0.0) + max(
-                _coerce_float(priced.get("tool_schema_list")), 0.0
-            )
+            # turn, entirely a cache read).
+            #
+            # These two are NOT floored at zero. A negative value here is a real
+            # measurement, not an artifact: it says this turn's rewrite cost more
+            # than it removed — the usual cause being that the rewrite moved
+            # tokens out of the cached prefix (0.1x) and into the live zone,
+            # where a cold Anthropic turn bills them at 1.25x list. Flooring that
+            # at zero reported a gain on a turn that lost money, and the loss was
+            # unrecoverable downstream because it was discarded here rather than
+            # carried. The other two buckets below keep their floors: a provider
+            # cache read is cheaper than a fresh read by construction, and output
+            # shaping cannot lengthen the completion, so a negative there would
+            # be an artifact rather than a loss.
+            compression_usd = _coerce_signed_float(priced.get("compression"))
+            tool_schema_usd = _coerce_signed_float(priced.get("tool_schema"))
+            delta_savings_usd = compression_usd + tool_schema_usd
+            delta_savings_list_usd = _coerce_signed_float(
+                priced.get("compression_list")
+            ) + _coerce_signed_float(priced.get("tool_schema_list"))
             delta_basis = priced.get("basis")
+            if delta_savings_usd < 0:
+                self._note_negative_savings(
+                    model=model,
+                    delta_usd=delta_savings_usd,
+                    compression=compression_usd,
+                    tool_schema=tool_schema_usd,
+                )
         else:
             # No priced breakdown available: only message savings are known here,
             # so this path stays message-only exactly as before — and at list
@@ -1028,7 +1130,7 @@ class SavingsTracker:
                 6,
             )
             lifetime["compression_savings_list_usd"] = round(
-                _coerce_float(lifetime.get("compression_savings_list_usd"))
+                _coerce_signed_float(lifetime.get("compression_savings_list_usd"))
                 + delta_savings_list_usd,
                 6,
             )
@@ -1065,7 +1167,8 @@ class SavingsTracker:
                 6,
             )
             session["compression_savings_list_usd"] = round(
-                _coerce_float(session.get("compression_savings_list_usd")) + delta_savings_list_usd,
+                _coerce_signed_float(session.get("compression_savings_list_usd"))
+                + delta_savings_list_usd,
                 6,
             )
             session["savings_basis"] = _blend_basis(session.get("savings_basis"), delta_basis)
@@ -1263,7 +1366,7 @@ class SavingsTracker:
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
+            entry["compression_savings_usd"] + savings_usd_delta, 6
         )
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(
@@ -1303,7 +1406,7 @@ class SavingsTracker:
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
         entry["tool_tokens_saved"] += max(tool_tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
-            entry["compression_savings_usd"] + max(savings_usd_delta, 0.0), 6
+            entry["compression_savings_usd"] + savings_usd_delta, 6
         )
         entry["total_input_tokens"] += max(input_tokens_delta, 0)
         entry["total_input_cost_usd"] = round(
@@ -1918,6 +2021,45 @@ class SavingsTracker:
         prev_total_input_cost_usd = 0.0
         prev_output_tokens = 0
         prev_output_usd = 0.0
+        prev_cache_read_tokens = 0
+        prev_cache_savings_usd = 0.0
+        # What the bucket's cache reads actually COST, priced per checkpoint
+        # with the same function that put them into ``total_input_cost_usd``.
+        # Consumers need it to take reads out of the input bill, and cannot
+        # derive it from ``cache_savings_usd``: the read discount is not a
+        # fixed multiple of the read cost (reads bill at 0.1x on most models,
+        # 0.05x or 0.025x on others), so "discount / 9" misprices exactly the
+        # models with the steepest cache discount.
+        read_cost_per_token: dict[str, float] = {}
+
+        def _read_cost(model: str, reads: int) -> float | None:
+            if reads <= 0:
+                return 0.0
+            # Checkpoints written before per-model attribution carry no model,
+            # so their reads cannot be priced the way the request was. Report
+            # the bucket's read cost as unknown rather than guess.
+            if model == MODEL_UNKNOWN:
+                return None
+            if model not in read_cost_per_token:
+                read_cost_per_token[model] = (
+                    _estimate_input_cost_usd(model, 1_000_000, cache_read_tokens=1_000_000)
+                    / 1_000_000
+                )
+            return reads * read_cost_per_token[model]
+
+        def _add_cache(
+            target: dict[str, Any], reads: int, discount: float, cost: float | None
+        ) -> None:
+            target["cache_read_tokens_delta"] += reads
+            target["cache_savings_usd_delta"] = round(
+                target["cache_savings_usd_delta"] + discount, 6
+            )
+            if cost is None or target["cache_read_cost_usd_delta"] is None:
+                target["cache_read_cost_usd_delta"] = None
+            else:
+                target["cache_read_cost_usd_delta"] = round(
+                    target["cache_read_cost_usd_delta"] + cost, 6
+                )
 
         for point in history:
             timestamp = _parse_timestamp(point["timestamp"])
@@ -1944,6 +2086,15 @@ class SavingsTracker:
             delta_output_tokens = max(total_output_tokens - prev_output_tokens, 0)
             delta_output_usd = max(total_output_usd - prev_output_usd, 0.0)
 
+            total_cache_read_tokens = _coerce_int(point.get("cache_read_tokens"))
+            total_cache_savings_usd = _coerce_float(point.get("cache_savings_usd"))
+            delta_cache_read_tokens = max(total_cache_read_tokens - prev_cache_read_tokens, 0)
+            delta_cache_savings_usd = max(total_cache_savings_usd - prev_cache_savings_usd, 0.0)
+            prev_cache_read_tokens = total_cache_read_tokens
+            prev_cache_savings_usd = total_cache_savings_usd
+            model = _normalize_model(point.get("model"))
+            delta_cache_read_cost_usd = _read_cost(model, delta_cache_read_tokens)
+
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
             prev_total_input_tokens = total_input_tokens
@@ -1965,6 +2116,7 @@ class SavingsTracker:
                     "total_input_cost_usd": total_input_cost_usd,
                     "output_tokens_saved_delta": 0,
                     "output_savings_usd_delta": 0.0,
+                    **_empty_cache_delta(),
                     "by_provider": {},
                     "by_model": {},
                 },
@@ -1988,12 +2140,21 @@ class SavingsTracker:
                 entry["output_savings_usd_delta"] + delta_output_usd,
                 6,
             )
+            _add_cache(
+                entry, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+            )
 
             # Attribute this checkpoint's delta to the provider that produced
             # it. Each checkpoint comes from a single request, so its delta is
             # wholly owned by one provider. Skip no-op checkpoints so providers
             # only appear in a bucket where they actually moved a counter.
-            if delta_tokens or delta_usd or delta_input_tokens or delta_input_cost_usd:
+            if (
+                delta_tokens
+                or delta_usd
+                or delta_input_tokens
+                or delta_input_cost_usd
+                or delta_cache_read_tokens
+            ):
                 provider = _normalize_provider(point.get("provider"))
                 prov = entry["by_provider"].setdefault(
                     provider,
@@ -2002,7 +2163,14 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
                     },
+                )
+                _add_cache(
+                    prov,
+                    delta_cache_read_tokens,
+                    delta_cache_savings_usd,
+                    delta_cache_read_cost_usd,
                 )
                 prov["tokens_saved"] += delta_tokens
                 prov["compression_savings_usd_delta"] = round(
@@ -2015,7 +2183,6 @@ class SavingsTracker:
                     6,
                 )
 
-                model = _normalize_model(point.get("model"))
                 mod = entry["by_model"].setdefault(
                     model,
                     {
@@ -2023,7 +2190,11 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
                     },
+                )
+                _add_cache(
+                    mod, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
                 )
                 mod["tokens_saved"] += delta_tokens
                 mod["compression_savings_usd_delta"] = round(

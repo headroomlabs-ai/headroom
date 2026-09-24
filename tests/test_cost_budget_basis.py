@@ -22,13 +22,15 @@ from tests._dotenv import (
     importorskip_no_env_leak,
     load_env_overrides,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 _env_overrides = load_env_overrides()
 apply_dotenv = autouse_apply_env(_env_overrides)
 
 importorskip_no_env_leak("litellm")
 
-MODEL = "claude-sonnet-4-20250514"
+
+MODEL = anthropic_pricing_model()
 
 
 @pytest.fixture(autouse=True)

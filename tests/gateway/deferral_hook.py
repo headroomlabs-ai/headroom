@@ -25,9 +25,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.proxy.helpers import (
-    _TOOL_SEARCH_CORE_TOOLS,
     anthropic_model_is_first_party,
     inject_tool_search_deferral,
+    resolved_core_tools,
     tools_are_anthropic_shaped,
 )
 from headroom.proxy.turn_hooks import register_turn_hook
@@ -57,7 +57,12 @@ class DeferralHook:
             return
         if not tools_are_anthropic_shaped(ctx.tools):
             return
-        after = inject_tool_search_deferral(ctx.tools, core_tools=_TOOL_SEARCH_CORE_TOOLS)
+        # resolved_core_tools(), not the raw default: passing the constant
+        # ignored HEADROOM_TOOL_SEARCH_CORE_TOOLS entirely, so an operator who
+        # set it got the built-in list on this path and their own on the proxy
+        # path -- the two-paths-disagree failure the one-knob change exists to
+        # prevent, reintroduced by the reference hook.
+        after = inject_tool_search_deferral(ctx.tools, core_tools=resolved_core_tools())
         if after is ctx.tools:
             return
         ctx.tools = after
