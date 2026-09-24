@@ -230,12 +230,17 @@ def compress(
     try:
         # Compute biases from hooks if provided
         biases = None
+        # Hard per-message veto. Separate from ``biases`` because a bias is a
+        # soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        protect = None
         if hooks:
             from headroom.hooks import CompressContext
 
             ctx = CompressContext(model=model)
             messages = hooks.pre_compress(messages, ctx)
             biases = hooks.compute_biases(messages, ctx)
+            protect = hooks.protect_messages(messages, ctx)
 
         received_event = pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
@@ -257,6 +262,7 @@ def compress(
             model_limit=model_limit,
             context=context,
             biases=biases,
+            protect=protect,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
             compress_system_messages=cfg.compress_system_messages,

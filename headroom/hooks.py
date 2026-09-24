@@ -1,10 +1,11 @@
 """Compression hooks and pipeline lifecycle events.
 
-Three hooks at well-defined pipeline stages:
+Four hooks at well-defined pipeline stages:
 
 1. pre_compress: modify messages before compression (dedup, filter, inject)
 2. compute_biases: set per-message compression aggressiveness (position-aware, phase-aware)
-3. post_compress: observe results after compression (learning, analytics, logging)
+3. protect_messages: veto compression of specific messages outright
+4. post_compress: observe results after compression (learning, analytics, logging)
 
 The canonical pipeline also emits lifecycle events through ``on_pipeline_event``.
 That gives extensions one stable contract across SDK, ``compress()``, and proxy
@@ -39,7 +40,7 @@ from .pipeline import PipelineEvent
 
 @dataclass
 class CompressContext:
-    """Context passed to pre_compress and compute_biases hooks.
+    """Context passed to the pre_compress, compute_biases and protect_messages hooks.
 
     Provides enough information for hooks to make decisions without
     needing to understand the proxy's internals.
@@ -127,6 +128,32 @@ class CompressionHooks:
             Dict of {message_index: bias_float}. Empty dict = all default.
         """
         return {}
+
+    def protect_messages(
+        self,
+        messages: list[dict[str, Any]],
+        ctx: CompressContext,
+    ) -> set[int]:
+        """Return message indices that must not be compressed at all.
+
+        ``compute_biases`` is a *soft* lever: a multiplier on how aggressively
+        a compressor prunes. Several strategies clamp it against their own
+        floors or ignore it entirely, so no bias — however large — reliably
+        means "leave this one alone". A hook that has concluded a specific
+        message must survive verbatim needs to say so directly, and this is how.
+
+        The router honours these before any routing decision, so the message is
+        passed through untouched whatever its content type or role. Use
+        sparingly: a protected message is context the compressor cannot reclaim.
+
+        Args:
+            messages: The full message list.
+            ctx: Compression context.
+
+        Returns:
+            Set of message indices to pass through verbatim. Empty = no vetoes.
+        """
+        return set()
 
     def post_compress(self, event: CompressEvent) -> None:
         """Called after compression completes. Observational only.
