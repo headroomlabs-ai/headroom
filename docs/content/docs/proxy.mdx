@@ -962,14 +962,13 @@ gunicorn "headroom.proxy.server:create_app()" \
 
 ```dockerfile
 FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && pip install "headroom-ai[proxy]" \
-    && apt-get purge -y build-essential && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
+RUN pip install "headroom-ai[proxy]"
 EXPOSE 8787
 CMD ["headroom", "proxy", "--host", "0.0.0.0"]
 ```
 
 <Callout type="info" title="Build dependencies">
-`build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension compiled from source. It is removed after installation to keep the image slim.
+`headroom-ai[proxy]` does **not** need native build tools. Only the optional
+`[vector]` extra (`hnswlib`) needs a C++ toolchain and, on distro Python
+installs, Python development headers.
 </Callout>

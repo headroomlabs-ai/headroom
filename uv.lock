@@ -1925,7 +1925,6 @@ crewai = [
 dev = [
     { name = "anthropic" },
     { name = "fastapi" },
-    { name = "hnswlib" },
     { name = "httpx", extra = ["http2"] },
     { name = "langchain-ollama" },
     { name = "litellm" },
@@ -2124,7 +2123,6 @@ requires-dist = [
     { name = "headroom-ai", extras = ["proxy", "code", "ml", "memory", "relevance", "image", "reports", "otel", "evals", "voice", "html", "mcp", "spreadsheet"], marker = "extra == 'all'" },
     { name = "headroom-ai", extras = ["proxy", "code", "relevance", "reports", "otel", "html", "mcp", "spreadsheet"], marker = "extra == 'sandbox'" },
     { name = "headroom-ai", extras = ["voice"], marker = "extra == 'voice-train'" },
-    { name = "hnswlib", marker = "extra == 'dev'", specifier = ">=0.8.0" },
     { name = "hnswlib", marker = "extra == 'vector'", specifier = ">=0.8.0" },
     { name = "httpx", marker = "extra == 'mcp'", specifier = ">=0.24.0" },
     { name = "httpx", extras = ["http2"], marker = "extra == 'dev'", specifier = ">=0.24.0" },
