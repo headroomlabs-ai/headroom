@@ -59,6 +59,7 @@ def _config() -> ProxyConfig:
         cache_enabled=True,
         rate_limit_enabled=False,
         memory_enabled=False,
+        ccr_event_streaming=False,
     )
 
 
