@@ -426,23 +426,23 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
 
     Anthropic puts it on the top-level ``system`` field (string or list
     of content blocks); OpenAI/Gemini-style payloads put it as a message
-    with ``role=system``. Returns an empty string when nothing is found
-    rather than raising — the resolver tolerates an empty prompt and
-    will fall through to the configured fallback.
+    with ``role=system``. Some clients send both, so preserve all system
+    text for callers that need to find metadata in either location. Returns
+    an empty string when nothing is found rather than raising — the resolver
+    tolerates an empty prompt and will fall through to the configured fallback.
     """
 
+    parts: list[str] = []
     system_field = body.get("system")
     if isinstance(system_field, str):
-        return system_field
-    if isinstance(system_field, list):
-        parts: list[str] = []
+        if system_field:
+            parts.append(system_field)
+    elif isinstance(system_field, list):
         for block in system_field:
             if isinstance(block, dict):
                 text = block.get("text")
                 if isinstance(text, str):
                     parts.append(text)
-        if parts:
-            return "\n".join(parts)
 
     messages = body.get("messages")
     if isinstance(messages, list):
@@ -453,16 +453,17 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
                 continue
             content = msg.get("content")
             if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
+                if content:
+                    parts.append(content)
+            elif isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict):
                         text = block.get("text")
                         if isinstance(text, str):
                             parts.append(text)
-                if parts:
-                    return "\n".join(parts)
+
+        if parts:
+            return "\n".join(parts)
 
         for msg in messages:
             if not isinstance(msg, dict):
@@ -484,5 +485,8 @@ def extract_system_prompt(body: Mapping[str, Any]) -> str:
                     user_text = "\n".join(parts)
             if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
                 return user_text
+
+    if parts:
+        return "\n".join(parts)
 
     return ""

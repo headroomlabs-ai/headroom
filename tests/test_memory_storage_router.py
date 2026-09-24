@@ -166,6 +166,28 @@ def test_extract_system_prompt_openai_messages() -> None:
     assert extract_system_prompt(body) == "you are helpful"
 
 
+def test_extract_system_prompt_combines_top_level_and_system_messages() -> None:
+    body = {
+        "system": "You are a coding assistant.",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "# Environment\n - Primary working directory: /Users/foo/code/headroom\n"
+                ),
+            }
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert prompt.startswith("You are a coding assistant.\n")
+    assert resolved is not None
+    _, display = resolved
+    assert display == "headroom"
+
+
 def test_extract_system_prompt_missing_returns_empty() -> None:
     assert extract_system_prompt({"messages": []}) == ""
 
