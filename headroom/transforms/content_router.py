@@ -1959,14 +1959,14 @@ class ContentRouter(Transform):
 
     name: str = "content_router"
 
-    # Lossy summarizers that emit a CCR retrieve marker only when they store the
-    # original — a marker-less result from one of these is unrecoverable. Tool
-    # ground truth (role="tool") must not be replaced by such a result (#1307).
+    # Lossy transforms that discard source data need a CCR retrieval marker;
+    # without one, tool ground truth must remain unchanged (#1307).
     LOSSY_UNMARKED_STRATEGIES = frozenset(
         {
             CompressionStrategy.KOMPRESS,
             CompressionStrategy.TEXT,
             CompressionStrategy.CODE_AWARE,
+            CompressionStrategy.HTML,
         }
     )
 
@@ -6138,8 +6138,8 @@ class ContentRouter(Transform):
                 else:
                     accept_ratio = result.compression_ratio
                 if accept_ratio < min_ratio:
-                    # tool ground truth must stay reversible — a lossy summarizer
-                    # (kompress/text/code) that emitted no CCR retrieve marker is
+                    # tool ground truth must stay reversible — a lossy transform
+                    # (kompress/text/code/html) that emitted no CCR retrieve marker is
                     # unrecoverable, so the agent would act on a fabricated summary
                     # (#1307). Keep the original verbatim instead.
                     if (
@@ -7171,8 +7171,8 @@ class ContentRouter(Transform):
                 self._record_frozen_verdict(content_key, True)
             return result.compressed, True
         if result.compression_ratio < min_ratio:
-            # Tool ground truth must stay reversible: a lossy summarizer
-            # (kompress/text/code) that emitted no CCR retrieve marker is
+            # Tool ground truth must stay reversible: a lossy transform
+            # (kompress/text/code/html) that emitted no CCR retrieve marker is
             # unrecoverable, so the agent would act on a fabricated summary
             # (#1307). The string/`role=="tool"` path guards this; mirror it
             # here for tool_result blocks (never cached, so the Tier-2 path
