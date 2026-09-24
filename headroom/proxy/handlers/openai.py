@@ -4153,7 +4153,9 @@ class OpenAIHandlerMixin:
                         f"hashes_seen={len(injector.detected_hashes)})"
                     )
 
-        if is_cache_mode(self.config.mode):
+        # Skip after a replay: the replayed prefix is the bytes the provider
+        # cached, and restoring raw originals over it busts that cache.
+        if is_cache_mode(self.config.mode) and not _final.replayed:
             optimized_messages, restored_count = self._restore_frozen_prefix(
                 original_client_messages,
                 optimized_messages,

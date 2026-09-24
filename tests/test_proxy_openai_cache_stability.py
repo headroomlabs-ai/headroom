@@ -564,3 +564,73 @@ def test_openai_handler_replays_the_provider_confirmed_prefix_even_when_it_infla
     assert response.status_code == 200
     assert captured["body"]["messages"][0] == previous_forwarded[0]
     assert captured["body"]["messages"][1] == {"role": "user", "content": "new suffix"}
+
+
+def test_openai_cache_mode_keeps_replayed_prefix_over_frozen_restore() -> None:
+    """Cache mode: the frozen-prefix restore must not undo a replayed prefix.
+
+    The overlay replays last turn's forwarded bytes, which the provider cached.
+    Restoring the frozen prefix to the raw client original afterwards
+    re-forwards different bytes and busts the cache from message 0.
+    """
+    captured = {}
+    previous_original = [{"role": "user", "content": "original prefix"}]
+    previous_forwarded = [{"role": "user", "content": "comp"}]
+    fake_tracker = _FakePrefixTracker(1, previous_original, previous_forwarded)
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.resolve_tracker = lambda *args, **kwargs: fake_tracker
+
+        def _fake_apply(**kwargs):
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                transforms_applied=[],
+                timing={},
+                tokens_before=20,
+                tokens_after=20,
+                waste_signals=None,
+            )
+
+        proxy.openai_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_replay_restore",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "user", "content": "original prefix"},
+                    {"role": "user", "content": "new suffix"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["body"]["messages"] == [
+        previous_forwarded[0],
+        {"role": "user", "content": "new suffix"},
+    ]
