@@ -511,9 +511,24 @@ Configure context limits and pricing for new or custom models:
       "gpt-5": 256000,
       "ft:gpt-4o:my-org": 128000
     }
+  },
+  "custom_pricing": {
+    "my-custom-model": {
+      "input_per_1m": 2.50,
+      "output_per_1m": 10.00,
+      "cached_input_per_1m": 0.25
+    }
   }
 }
 ```
+
+### Upstream Cost & Fallback Estimation
+
+When upstream providers or gateways (Bedrock, Azure, Portkey, LiteLLM, internal proxies) process requests:
+1. **Provider-Supplied Cost**: If the provider returns a cost header (e.g. `X-Cost-USD`, `X-Request-Cost-USD`, `X-Portkey-Cost`, `X-LiteLLM-Response-Cost`) or JSON usage cost field, Headroom uses the exact reported cost.
+2. **Custom Model Pricing**: If provider cost is missing and a custom rate is configured in `custom_pricing`, Headroom calculates cost using your configured rates.
+3. **LiteLLM Database**: If no custom rate is configured, Headroom falls back to LiteLLM's 100+ model pricing database.
+4. **Unchanged Default**: If no pricing is available for an unknown model, cost defaults to missing/unmeasured without breaking request routing.
 
 Save as `${HEADROOM_CONFIG_DIR}/models.json` (defaults to
 `~/.headroom/config/models.json`), or set `HEADROOM_MODEL_LIMITS` to a

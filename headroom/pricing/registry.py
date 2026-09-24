@@ -1,7 +1,10 @@
 """Pricing registry for LLM model cost estimation."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -12,14 +15,37 @@ class ModelPricing:
     """
 
     model: str
-    provider: str
     input_per_1m: float
     output_per_1m: float
+    provider: str = ""
     cached_input_per_1m: float | None = None
     batch_input_per_1m: float | None = None
     batch_output_per_1m: float | None = None
     context_window: int | None = None
     notes: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ModelPricing:
+        """Create a ModelPricing instance from a dictionary."""
+        return cls(
+            model=str(data.get("model", "")),
+            input_per_1m=float(data.get("input_per_1m", 0.0)),
+            output_per_1m=float(data.get("output_per_1m", 0.0)),
+            provider=str(data.get("provider", "")),
+            cached_input_per_1m=float(data["cached_input_per_1m"])
+            if data.get("cached_input_per_1m") is not None
+            else None,
+            batch_input_per_1m=float(data["batch_input_per_1m"])
+            if data.get("batch_input_per_1m") is not None
+            else None,
+            batch_output_per_1m=float(data["batch_output_per_1m"])
+            if data.get("batch_output_per_1m") is not None
+            else None,
+            context_window=int(data["context_window"])
+            if data.get("context_window") is not None
+            else None,
+            notes=str(data["notes"]) if data.get("notes") is not None else None,
+        )
 
 
 @dataclass
@@ -41,23 +67,30 @@ class PricingRegistry:
 
     def __init__(
         self,
-        last_updated: date,
+        last_updated: date | None = None,
         source_url: str | None = None,
         prices: dict[str, ModelPricing] | None = None,
     ):
         """Initialize the pricing registry.
 
         Args:
-            last_updated: Date when pricing information was last verified.
+            last_updated: Date when pricing information was last verified (defaults to today).
             source_url: URL to the official pricing page.
             prices: Dictionary mapping model names to ModelPricing objects.
         """
-        self.last_updated = last_updated
+        self.last_updated = last_updated or date.today()
         self.source_url = source_url
         self.prices: dict[str, ModelPricing] = prices or {}
 
+    def register_price(self, pricing: ModelPricing) -> None:
+        """Register or override pricing for a model."""
+        self.prices[pricing.model] = pricing
+
     def get_price(self, model: str) -> ModelPricing | None:
         """Get pricing for a specific model.
+
+        Supports direct lookup, case-insensitive lookup, and provider prefix stripping
+        (e.g., 'azure/gpt-4o' -> 'gpt-4o').
 
         Args:
             model: The model name/identifier.
@@ -65,7 +98,41 @@ class PricingRegistry:
         Returns:
             ModelPricing if found, None otherwise.
         """
-        return self.prices.get(model)
+        if not model:
+            return None
+
+        # 1. Exact match
+        if model in self.prices:
+            return self.prices[model]
+
+        # 2. Case-insensitive match
+        model_lower = model.lower()
+        for k, v in self.prices.items():
+            if k.lower() == model_lower:
+                return v
+
+        # 3. Strip provider prefix (e.g. "azure/gpt-4" -> "gpt-4", "bedrock/us.anthropic..." -> "claude...")
+        if "/" in model:
+            stripped = model.split("/", 1)[1]
+            price = self.get_price(stripped)
+            if price:
+                return price
+
+        return None
+
+    @classmethod
+    def from_dict(cls, custom_pricing_dict: dict[str, Any]) -> PricingRegistry:
+        """Create a PricingRegistry from a dictionary of model pricing configs."""
+        registry = cls()
+        for key, val in custom_pricing_dict.items():
+            if isinstance(val, ModelPricing):
+                registry.register_price(val)
+            elif isinstance(val, dict):
+                data = dict(val)
+                if "model" not in data:
+                    data["model"] = key
+                registry.register_price(ModelPricing.from_dict(data))
+        return registry
 
     def is_stale(self) -> bool:
         """Check if pricing information is potentially outdated.

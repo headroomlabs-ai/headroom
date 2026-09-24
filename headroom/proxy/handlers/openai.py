@@ -4887,6 +4887,14 @@ class OpenAIHandlerMixin:
                         messages=optimized_messages,
                     )
 
+                    from headroom.proxy.helpers import extract_provider_cost
+
+                    provider_cost = extract_provider_cost(
+                        getattr(backend_response, "headers", None),
+                        backend_response.body if isinstance(backend_response.body, dict) else None,
+                        getattr(self.config, "provider_cost_headers", None),
+                    )
+
                     await self._record_request_outcome(
                         RequestOutcome(
                             request_id=request_id,
@@ -4918,6 +4926,7 @@ class OpenAIHandlerMixin:
                             if getattr(self.config, "log_full_messages", False)
                             else None,
                             client=client,
+                            provider_cost_usd=provider_cost,
                         )
                     )
 

@@ -220,6 +220,16 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="basic",
     ),
     SettingField(
+        "HEADROOM_COST_FALLBACK_ENABLED",
+        "cost_fallback_enabled",
+        "Cost Fallback Estimation",
+        "Budget",
+        "bool",
+        default=True,
+        help="Estimate request cost using user/LiteLLM model pricing when provider cost is missing.",
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_BUDGET_ESTIMATED_BASIS",
         "budget_estimated_basis",
         "Estimated-basis spend",

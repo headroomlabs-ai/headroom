@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -4328,3 +4329,69 @@ def inject_tool_search_deferral_openai(
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
+
+
+def extract_provider_cost(
+    headers: Any = None,
+    payload: dict | None = None,
+    header_names: list[str] | None = None,
+) -> float | None:
+    """Extract upstream provider-supplied cost from response headers or JSON payload safely.
+
+    Checks case-insensitively across configured cost headers (e.g. x-cost-usd, x-request-cost-usd)
+    and JSON payload fields (e.g. cost, request_cost, total_cost).
+    Returns cost as float if non-negative and finite, otherwise None.
+    """
+    targets = [
+        h.lower()
+        for h in (
+            header_names
+            or [
+                "x-cost-usd",
+                "x-request-cost-usd",
+                "x-portkey-cost",
+                "x-litellm-response-cost",
+                "x-proxy-cost-usd",
+            ]
+        )
+    ]
+
+    # 1. Check HTTP response headers
+    if headers:
+        try:
+            for key, val in headers.items():
+                if str(key).lower() in targets:
+                    try:
+                        cost_val = float(val)
+                        if math.isfinite(cost_val) and cost_val >= 0:
+                            return cost_val
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+    # 2. Check response JSON payload (usage / metadata / top-level)
+    if isinstance(payload, dict):
+        candidate_dicts = [payload]
+        for nested in ("usage", "metadata", "response_metadata"):
+            sub = payload.get(nested)
+            if isinstance(sub, dict):
+                candidate_dicts.append(sub)
+
+        for d in candidate_dicts:
+            for field in ("cost", "cost_usd", "total_cost", "request_cost", "response_cost"):
+                if field in d:
+                    val = d[field]
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        cost_val = float(val)
+                        if math.isfinite(cost_val) and cost_val >= 0:
+                            return cost_val
+                    elif isinstance(val, str):
+                        try:
+                            cost_val = float(val)
+                            if math.isfinite(cost_val) and cost_val >= 0:
+                                return cost_val
+                        except ValueError:
+                            pass
+
+    return None

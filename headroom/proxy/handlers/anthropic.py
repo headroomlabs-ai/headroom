@@ -4657,6 +4657,13 @@ class AnthropicHandlerMixin:
                         # that were showing 0% active-savings on non-
                         # streaming Anthropic traffic will now show the
                         # correct ratio.
+                        from headroom.proxy.helpers import extract_provider_cost
+
+                        provider_cost = extract_provider_cost(
+                            getattr(response, "headers", None),
+                            resp_json if isinstance(resp_json, dict) else None,
+                            getattr(self.config, "provider_cost_headers", None),
+                        )
                         await self._record_request_outcome(
                             RequestOutcome(
                                 request_id=request_id,
@@ -4687,6 +4694,7 @@ class AnthropicHandlerMixin:
                                 num_messages=len(messages),
                                 tags=tags,
                                 client=client,
+                                provider_cost_usd=provider_cost,
                                 turn_id=compute_turn_id(
                                     model, body.get("system"), body.get("messages")
                                 ),

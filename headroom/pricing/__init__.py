@@ -22,6 +22,7 @@ from .cache_ttl import (
     cache_write_multiplier,
     ttl_breakeven_share,
 )
+from .calculator import CostCalculator
 from .deepseek_prices import (
     DEEPSEEK_PRICES,
     get_deepseek_registry,
@@ -61,6 +62,7 @@ __all__ = [
     "get_model_pricing",
     "list_available_models",
     # Core classes
+    "CostCalculator",
     "CostEstimate",
     "ModelPricing",
     "PricingRegistry",

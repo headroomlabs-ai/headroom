@@ -884,6 +884,8 @@ class HeadroomProxy(
             CostTracker(
                 budget_limit_usd=config.budget_limit_usd,
                 budget_period=config.budget_period,
+                custom_pricing=config.custom_pricing,
+                cost_fallback_enabled=config.cost_fallback_enabled,
                 estimated_basis_policy=config.budget_estimated_basis,
             )
             if config.cost_tracking_enabled

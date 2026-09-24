@@ -345,6 +345,17 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    cost_fallback_enabled: bool = True
+    custom_pricing: dict[str, Any] | None = None
+    provider_cost_headers: list[str] = field(
+        default_factory=lambda: [
+            "x-cost-usd",
+            "x-request-cost-usd",
+            "x-portkey-cost",
+            "x-litellm-response-cost",
+            "x-proxy-cost-usd",
+        ]
+    )
     # What spend booked from Headroom's own token estimate (provider returned no
     # usage breakdown) does to budget enforcement. See budget_basis_policy.
     budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
