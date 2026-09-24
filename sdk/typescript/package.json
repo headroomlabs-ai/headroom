@@ -96,7 +96,7 @@
     "@ai-sdk/anthropic": "^4.0.53",
     "@ai-sdk/openai": "^4.0.60",
     "@ai-sdk/provider": "^4.0.14",
-    "@anthropic-ai/sdk": "^0.125.0",
+    "@anthropic-ai/sdk": "^0.127.0",
     "@types/node": "^26.5.0",
     "ai": "^7.0.59",
     "dotenv": "^17.3.1",
