@@ -1,0 +1,21 @@
+name: Release Slack notification smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Exercise production notification component
+        uses: ./.github/actions/release-slack-notification
+        with:
+          release-name: Release v0.9.2
+          tag: v0.9.2
+          url: https://github.com/headroomlabs-ai/headroom/releases/tag/v0.9.2
+          repository: headroomlabs-ai/headroom
+          actor: act-release-smoke
+          # Delivery is guarded by ACT=true. A deliberately invalid URL makes
+          # accidental network delivery fail closed instead of reaching Slack.
+          webhook-url: https://invalid.example/act-must-not-send

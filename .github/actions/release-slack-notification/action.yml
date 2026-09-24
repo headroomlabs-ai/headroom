@@ -1,0 +1,68 @@
+name: Build and post release notification
+description: Announce a completed GitHub Release asset publication through Slack
+
+inputs:
+  release-name:
+    description: Human-readable GitHub Release name
+    required: true
+  tag:
+    description: Exact GitHub Release tag
+    required: true
+  url:
+    description: GitHub Release URL
+    required: true
+  repository:
+    description: Repository in owner/name form
+    required: true
+  actor:
+    description: GitHub actor who triggered the release workflow
+    required: true
+  webhook-url:
+    description: Incoming webhook bound to the Slack release channel
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Build Slack release payload
+      shell: bash
+      env:
+        RELEASE_NAME: ${{ inputs.release-name }}
+        RELEASE_TAG: ${{ inputs.tag }}
+        RELEASE_URL: ${{ inputs.url }}
+        RELEASE_REPOSITORY: ${{ inputs.repository }}
+        RELEASE_ACTOR: ${{ inputs.actor }}
+      run: |
+        python "$GITHUB_ACTION_PATH/build_payload.py" \
+          --release-name "$RELEASE_NAME" \
+          --tag "$RELEASE_TAG" \
+          --url "$RELEASE_URL" \
+          --repository "$RELEASE_REPOSITORY" \
+          --actor "$RELEASE_ACTOR" \
+          --output "$RUNNER_TEMP/slack-release-payload.json"
+        python -m json.tool "$RUNNER_TEMP/slack-release-payload.json"
+
+    # act documents ACT=true as its guard for external side effects. Payload
+    # construction still executes so the exact hosted-run JSON is validated.
+    - name: Post release to Slack
+      if: ${{ !env.ACT }}
+      shell: bash
+      env:
+        SLACK_RELEASES_WEBHOOK_URL: ${{ inputs.webhook-url }}
+      run: |
+        if [ -z "$SLACK_RELEASES_WEBHOOK_URL" ]; then
+          echo "::error::SLACK_RELEASES_WEBHOOK_URL is not configured"
+          exit 1
+        fi
+
+        response="$(curl \
+          --silent \
+          --show-error \
+          --fail-with-body \
+          --header 'Content-Type: application/json' \
+          --data-binary @"$RUNNER_TEMP/slack-release-payload.json" \
+          "$SLACK_RELEASES_WEBHOOK_URL")"
+        if [ "$response" != "ok" ]; then
+          echo "::error::Slack incoming webhook returned an unexpected response"
+          exit 1
+        fi
