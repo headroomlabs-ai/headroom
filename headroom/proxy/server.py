@@ -1486,7 +1486,11 @@ class HeadroomProxy(
         successfully cancelled before a worker starts are removed from the
         queued gauge and do not activate the quarantine. If cancellation races
         with worker startup, the now-running job is tracked as timeout debt and
-        does activate it.
+        does activate it. A worker that has started when the deadline expires
+        logs ``event=compression_executor_timeout`` at WARNING, including the
+        cumulative ``leaked_threads_total`` (incremented only from this
+        wrapper's ``finally``) and the in-flight timed-out worker count. A
+        queue timeout that never starts a worker does not.
 
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
@@ -1550,6 +1554,9 @@ class HeadroomProxy(
             "finished": False,
             "timed_out": False,
             "timeout_debt_recorded": False,
+            # monotonic() when the worker actually began, so a timeout log can
+            # report elapsed run time. None until then (queue-only timeouts).
+            "started_at": None,
         }
         with self._compression_metrics_lock:
             self._compression_queued += 1
@@ -1586,18 +1593,70 @@ class HeadroomProxy(
                 self._compression_quarantine_activations += 1
             return was_clear
 
-        def _announce_quarantine() -> None:
-            self.metrics.record_compression_quarantine("activated")
-            logger.warning(
-                "Compression worker exceeded its request deadline and is still running; "
-                "new compression is quarantined until timed-out workers exit"
+        def _compression_timeout_fields_locked(
+            *, quarantine_activated: bool, now: float
+        ) -> dict[str, float | int | bool | None]:
+            """Snapshot timeout-log fields. Caller holds ``_compression_metrics_lock``.
+
+            ``leaked_threads_total`` stays the cumulative count of workers whose
+            ``finally`` already ran after a timeout. It does not include a worker
+            that is still inside the timed-out call.
+            """
+            deadline = self._compression_quarantine_deadline
+            remaining = (deadline - now) if deadline > 0.0 else None
+            started_at = state["started_at"]
+            run_seconds = (now - started_at) if isinstance(started_at, float) else None
+            return {
+                "worker_started": state["started"],
+                "quarantine_activated": quarantine_activated,
+                "run_seconds": run_seconds,
+                "timed_out_workers": self._compression_timed_out_in_flight,
+                "leaked_threads_total": self._compression_leaked_threads,
+                "quarantine_activations_total": self._compression_quarantine_activations,
+                "deadline_remaining_seconds": remaining,
+            }
+
+        def _emit_compression_timeout_warning(
+            fields: dict[str, float | int | bool | None],
+        ) -> None:
+            """Log one compression timeout. No-op for a queue timeout that did not quarantine."""
+            worker_started = bool(fields["worker_started"])
+            quarantine_activated = bool(fields["quarantine_activated"])
+            if not worker_started and not quarantine_activated:
+                return
+            run_seconds = fields["run_seconds"]
+            remaining = fields["deadline_remaining_seconds"]
+            timed_out_workers = int(fields["timed_out_workers"] or 0)
+            quarantine_active = (
+                timed_out_workers > 0 and isinstance(remaining, float) and remaining > 0.0
             )
+            logger.warning(
+                "event=compression_executor_timeout timeout_seconds=%.3f run_seconds=%s "
+                "quarantine_activated=%s quarantine_active=%s "
+                "leaked_threads_total=%d timed_out_workers=%d max_workers=%d "
+                "quarantine_activations_total=%d "
+                "quarantine_deadline_remaining_seconds=%s",
+                timeout,
+                "unknown" if not isinstance(run_seconds, float) else f"{run_seconds:.3f}",
+                "true" if quarantine_activated else "false",
+                "true" if quarantine_active else "false",
+                int(fields["leaked_threads_total"] or 0),
+                timed_out_workers,
+                self.compression_max_workers,
+                int(fields["quarantine_activations_total"] or 0),
+                "unknown" if not isinstance(remaining, float) else f"{max(0.0, remaining):.3f}",
+            )
+
+        def _announce_quarantine(fields: dict[str, float | int | bool | None]) -> None:
+            self.metrics.record_compression_quarantine("activated")
+            _emit_compression_timeout_warning(fields)
 
         def _wrapped():  # noqa: ANN202
             started_at = time.monotonic()
             queue_wait = started_at - queued_at
             with self._compression_metrics_lock:
                 state["started"] = True
+                state["started_at"] = started_at
                 if state["queued"]:
                     self._compression_queued -= 1
                     state["queued"] = False
@@ -1607,9 +1666,20 @@ class HeadroomProxy(
                 self._compression_in_flight += 1
                 if self._compression_in_flight > self._compression_in_flight_max:
                     self._compression_in_flight_max = self._compression_in_flight
+                debt_already_recorded = state["timeout_debt_recorded"]
                 quarantine_activated = _record_timeout_debt_locked()
+                # Awaiter timed out before ``started`` was visible, then this
+                # worker ran anyway. Log here when quarantine was already on;
+                # the clear-to-quarantined transition is announced below.
+                recorded_debt_here = state["timeout_debt_recorded"] and not debt_already_recorded
+                timeout_fields = _compression_timeout_fields_locked(
+                    quarantine_activated=quarantine_activated,
+                    now=time.monotonic(),
+                )
             if quarantine_activated:
-                _announce_quarantine()
+                _announce_quarantine(timeout_fields)
+            elif recorded_debt_here:
+                _emit_compression_timeout_warning(timeout_fields)
             try:
                 return fn()
             finally:
@@ -1642,8 +1712,18 @@ class HeadroomProxy(
                     state["queued"] = False
                     self._compression_queue_timeouts += 1
                 quarantine_activated = _record_timeout_debt_locked()
+                timeout_fields = _compression_timeout_fields_locked(
+                    quarantine_activated=quarantine_activated,
+                    now=time.monotonic(),
+                )
             if quarantine_activated:
-                _announce_quarantine()
+                _announce_quarantine(timeout_fields)
+            elif timeout_fields["worker_started"]:
+                # Already quarantined, or the worker finished in the window
+                # between wait_for firing and this handler. Still a timeout
+                # the awaiter observed — log it. Queue-only timeouts (worker
+                # never started) stay on queue_timeouts_total without this line.
+                _emit_compression_timeout_warning(timeout_fields)
             raise
 
     async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
