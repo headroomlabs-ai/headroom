@@ -165,10 +165,23 @@ class RequestLogger:
             for e in entries
         ]
 
-    def get_recent_with_messages(self, n: int = 20) -> list[dict]:
-        """Get recent log entries including full request/response messages."""
+    def get_recent_with_messages(self, n: int = 20, include_messages: bool = True) -> list[dict]:
+        """Get recent log entries including full request/response messages.
+
+        ``include_messages=False`` returns the same entries without
+        ``request_messages`` / ``compressed_messages`` / ``response_content``,
+        and without walking them: ``asdict`` deep-copies every field, so a
+        caller that only reads the per-request numbers otherwise pays for a
+        full copy of each transcript (~160 KB per Claude Code turn, ~44 MB per
+        ``limit=100`` feed pull) on the event loop.
+        """
         entries = list(self._logs)[-n:]
-        return [asdict(e) for e in entries]
+        if include_messages:
+            return [asdict(e) for e in entries]
+        return [
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
+            for e in entries
+        ]
 
     def stats(self) -> dict:
         """Get logging statistics."""
