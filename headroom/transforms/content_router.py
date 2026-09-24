@@ -868,9 +868,7 @@ def _contains_valid_json_span(content: str) -> bool:
 
     from .recursive_json import _spans
 
-    return any(
-        _content_is_valid_json(content[start:end]) for start, end in _spans(content)
-    )
+    return any(_content_is_valid_json(content[start:end]) for start, end in _spans(content))
 
 
 def _mixed_indicators(content: str) -> dict[str, bool]:
