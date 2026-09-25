@@ -26,7 +26,50 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
+
+
+def _wait_stopped_manifest() -> DeploymentManifest:
+    return DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        health_url="http://127.0.0.1:8787/readyz",
+    )
+
+
+def test_wait_stopped_waits_for_health_endpoint_to_go_down(monkeypatch) -> None:
+    """#3658: the old process keeps answering /readyz briefly after it is stopped."""
+
+    probe_results = iter([True, True, False])
+    sleeps: list[float] = []
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: next(probe_results))
+    monkeypatch.setattr(
+        "headroom.install.runtime.time.sleep", lambda seconds: sleeps.append(seconds)
+    )
+
+    assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=5) is True
+    assert len(sleeps) == 2
+
+
+def test_wait_stopped_times_out_when_endpoint_keeps_answering(monkeypatch) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: True)
+    monkeypatch.setattr("headroom.install.runtime.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "headroom.install.runtime.time.sleep",
+        lambda seconds: clock.update(now=clock["now"] + seconds),
+    )
+
+    assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=2) is False
 
 
 def test_build_runtime_command_for_docker_includes_deployment_env(
@@ -61,6 +104,56 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command
     assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in command
+
+
+def test_build_runtime_command_preserves_non_ascii_ambient_token(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    token = "tökén-安全-🔐"
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", token)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    token_env_index = command.index("HEADROOM_PROXY_TOKEN")
+    assert command[token_env_index - 1] == "--env"
+    assert token not in command
+
+    captured: dict[str, list[str] | dict[str, str]] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> None:
+        captured["command"] = command
+        container_env: dict[str, str] = {}
+        for index, arg in enumerate(command):
+            if arg != "--env":
+                continue
+            value = command[index + 1]
+            if "=" in value:
+                name, resolved = value.split("=", 1)
+                container_env[name] = resolved
+            else:
+                container_env[value] = os.environ[value]
+        captured["container_env"] = container_env
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.run", fake_run)
+    start_persistent_docker(manifest)
+    assert captured["container_env"]["HEADROOM_PROXY_TOKEN"] == token
+    assert token not in captured["command"]
 
 
 def test_build_runtime_command_for_docker_includes_gpu_passthrough(

@@ -175,6 +175,28 @@ Matching is on the parsed hostname and is exact — no wildcards — so
 `api.anthropic.com.evil.example` and `https://api.anthropic.com@evil.example`
 do not match `api.anthropic.com`.
 
+#### `x-headroom-base-url` is refused when an outbound proxy is in the way
+
+Because the destination is chosen by the client, the proxy validates it by
+resolving the hostname and rejecting non-public addresses — and then dials the
+address it validated, rather than resolving the name a second time at connect
+time. Without that second half, a hostname whose authoritative DNS is
+attacker-controlled can answer the check with a public address and the
+connection with `169.254.169.254` or an RFC1918 host (DNS rebinding).
+
+An outbound HTTP or SOCKS proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) is
+handed the target *by name* — in the request line, in `CONNECT`, in the SOCKS5
+address — and resolves it itself, from its own network, after the check ran.
+Headroom cannot enforce the validated address there, so a request carrying
+`x-headroom-base-url` that would route through the proxy is **refused** rather
+than forwarded on a verdict nothing enforces.
+
+This affects only client-supplied upstreams. Every operator-configured provider
+URL goes through the proxy exactly as before. If you need a specific endpoint
+reachable via `x-headroom-base-url` through an outbound proxy, name it in
+`HEADROOM_ALLOWED_BASE_URLS` — an explicit operator decision to admit that
+destination by name, which also turns off the resolve-and-pin check for it.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:
@@ -254,6 +276,24 @@ headroom wrap claude --1m
 
 `HEADROOM_1M_MODEL` is a fallback only: an explicit `--model` or `ANTHROPIC_MODEL` always wins. The value may be given with or without the `[1m]` suffix; both `claude-opus-5` and `claude-opus-5[1m]` are accepted, and the suffix is added when absent.
 
+For Claude Code's official VS Code extension, use the client-owned persisted
+setting instead of `ANTHROPIC_MODEL`:
+
+```bash
+headroom wrap vscode-claude --1m
+```
+
+This writes the resolved model with exactly one `[1m]` suffix to the top-level
+`model` setting in Claude Code's user settings and records the prior presence and
+value in Headroom's reversible sidecar. Running the command without `--1m`
+restores a model previously managed by Headroom; `headroom unwrap vscode-claude`
+restores the model and proxy environment values together. Use
+`--no-configure --1m` to print the setting without writing either file.
+
+Claude Code and Anthropic own model support and account eligibility. Local tests
+prove settings persistence and restoration, not a live entitled VS Code session
+or a resulting 1M context window.
+
 ## Pipeline Extensions
 
 Use a `headroom.pipeline_extension` entry point when you need to normalize or annotate requests before they leave Headroom. The `PRE_SEND` stage is the right place for provider-specific request cleanup, such as turning `content: null` into `content: ""` for upstreams that reject OpenAI-spec tool-call messages.
@@ -294,7 +334,7 @@ If the upstream base URL itself must vary per request, use the `x-headroom-base-
 ```bash
 headroom proxy \
   --port 8787 \              # Port to listen on
-  --host 0.0.0.0 \           # Host to bind to
+  --host 127.0.0.1 \         # Host to bind to
   --mode cache \             # default; freezes prior turns for prefix-cache stability
   --budget 10.00 \           # Daily budget limit in USD
   --log-file headroom.jsonl  # Log file path

@@ -2,7 +2,9 @@
 
 # CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
 # The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
+import logging
 import os
+import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -164,10 +166,17 @@ def _null_binary_pins():
 
     Installer tests fetch small mock archives, whose digests can't match the
     real published pins. Nulling the pins lets those download/extract mechanics
-    tests run (verification then falls back to HTTPS trust); the tests that
-    specifically exercise verification set their own pin explicitly. Production
-    keeps the real pins (this fixture is test-only) and the tools-hash-refresh
-    CI gate guarantees they stay correct.
+    tests run; the tests that specifically exercise verification set their own
+    pin explicitly. Production keeps the real pins (this fixture is test-only)
+    and the tools-hash-refresh CI gate guarantees they stay correct.
+
+    Nulling a pin used to mean "fall back to HTTPS trust". It now means
+    "refuse", so the escape hatch has to be set alongside it or every test that
+    reaches a real download fails closed -- which is what happened to
+    test_bundled_tools_savings.py on a cold CI cache, while passing locally
+    against an already-populated one. Setting both together keeps this fixture
+    saying one thing: "verification is not what these tests are about."
+    Verification tests delenv it in their own fixture.
     """
     try:
         from headroom import binaries
@@ -185,9 +194,17 @@ def _null_binary_pins():
     ]
     for asset, _original in saved:
         asset["sha256"] = None
-    yield
-    for asset, original in saved:
-        asset["sha256"] = original
+    previous = os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED")
+    os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HEADROOM_BINARIES_ALLOW_UNVERIFIED", None)
+        else:
+            os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = previous
+        for asset, original in saved:
+            asset["sha256"] = original
 
 
 @pytest.fixture(autouse=True)
@@ -426,3 +443,84 @@ def sample_request_metrics():
         turns_dropped=0,
         messages_hash="def456",
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kompress_model_cache():
+    """Keep one test's loaded Kompress model out of every later test's ``/readyz``.
+
+    ``KompressCompressor.preload()`` stores the loaded handle in a MODULE-LEVEL
+    dict keyed by model id (``kompress_compressor._kompress_cache``). Tests that
+    exercise preload patch the *loader* to return a fake model, but the fake is
+    still written to that real dict under the real ``HF_MODEL_ID`` -- and
+    nothing ever removed it.
+
+    The proxy health endpoint then found it. ``_reconcile_kompress_health``
+    asks each pipeline's ContentRouter for an already-instantiated compressor
+    and calls ``is_ready()`` / ``ready_backend()``, both of which are reads of
+    that same module dict, so a *brand-new* proxy in a later test reported
+    ``kompress: {ready: true, backend: "onnx", status: "healthy"}`` when nothing
+    had been loaded. Four ``tests/test_proxy_health.py`` cases failed in a full
+    run and passed in isolation, which is the signature of exactly this.
+
+    Snapshot/restore rather than an unconditional clear: a test that installs
+    its own cache (several ``monkeypatch.setattr(kc, "_kompress_cache", ...)``
+    do) must keep it for its own duration.
+
+    Costs nothing for the ~13k tests that never touch ML: the module is only
+    consulted through ``sys.modules``, so this never imports it.
+    """
+    module_name = "headroom.transforms.kompress_compressor"
+    before = sys.modules.get(module_name)
+    # None when the module has not been imported yet, so anything found at
+    # teardown was put there by this test.
+    snapshot = dict(getattr(before, "_kompress_cache", {})) if before is not None else None
+
+    yield
+
+    after = sys.modules.get(module_name)
+    if after is None:
+        return
+    cache = getattr(after, "_kompress_cache", None)
+    if cache is None:
+        return
+    cache.clear()
+    if snapshot:
+        cache.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _detach_leaked_proxy_log_handler():
+    """Stop one test's proxy file logger from following the whole session around.
+
+    ``_setup_file_logging`` attaches a named handler to the ``headroom`` logger
+    and nothing detaches it, so any test that builds a proxy app leaves it in
+    place for every later test. That broke
+    ``test_runtime_log_refuses_a_symlinked_path``, which asserts no such handler
+    is attached after a refused setup: the handler it found was a LEFTOVER from
+    ``tests/gateway/test_compress_turn_seam.py``, not one the refused call
+    created, so the test reported a security regression that had not happened.
+
+    The leaked handler also pointed at ``~/.headroom/logs/proxy-8787.log`` --
+    the developer's real home directory, not a tmp_path -- so the leak was
+    writing outside the test sandbox as well. That part is worth fixing at the
+    source; this only stops it leaking forward.
+
+    Detach rather than close-and-keep: a handler attached during a test belongs
+    to that test's app, and its file may live in a ``tmp_path`` that is about to
+    disappear underneath it.
+    """
+    yield
+
+    helpers = sys.modules.get("headroom.proxy.helpers")
+    handler_name = getattr(helpers, "_PROXY_LOG_HANDLER_NAME", None)
+    if handler_name is None:
+        return
+    logger = logging.getLogger("headroom")
+    for handler in list(logger.handlers):
+        if getattr(handler, "name", None) == handler_name:
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:  # pragma: no cover - a closed/rotated file is fine
+                pass

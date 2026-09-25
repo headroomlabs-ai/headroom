@@ -2,7 +2,10 @@
 
 from .runtime import (
     CLAUDE_AUTH_KEYS,
+    CONTEXT_1M_SUFFIX,
+    DEFAULT_1M_MODEL,
     DEFAULT_API_URL,
+    HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
     REMOTE_CONTROL_GATED_MIN_VERSION,
     REMOTE_CONTROL_NON_SUBSCRIPTION_ENV,
@@ -19,21 +22,29 @@ from .runtime import (
     remote_control_gate_active,
     remote_control_gate_message,
     remote_control_sibling_gate_note,
+    resolve_1m_model,
 )
 from .vscode import (
     claude_user_settings_path,
     configure_vscode_claude_settings,
     remove_vscode_claude_settings,
+    resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 
 __all__ = [
     "CLAUDE_AUTH_KEYS",
+    "CONTEXT_1M_SUFFIX",
     "claude_user_settings_path",
     "configure_vscode_claude_settings",
     "remove_vscode_claude_settings",
+    "resolve_vscode_claude_model",
+    "resolve_vscode_claude_model_for_instructions",
     "vscode_claude_proxy_url",
     "DEFAULT_API_URL",
+    "DEFAULT_1M_MODEL",
+    "HEADROOM_1M_MODEL_ENV",
     "REMOTE_CONTROL_BASE_URL_ENV",
     "REMOTE_CONTROL_GATED_MIN_VERSION",
     "REMOTE_CONTROL_NON_SUBSCRIPTION_ENV",
@@ -46,6 +57,7 @@ __all__ = [
     "is_custom_anthropic_base_url",
     "parse_claude_code_version",
     "proxy_base_url",
+    "resolve_1m_model",
     "remote_control_applies_to_auth",
     "remote_control_gate_active",
     "remote_control_gate_message",

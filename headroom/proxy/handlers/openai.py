@@ -2103,13 +2103,14 @@ class OpenAIHandlerMixin:
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
         # ContentRouter._build_tool_name_map; the Responses payload carries the
-        # name on the `function_call` item and the originating call_id on the
-        # matching `function_call_output`, so we correlate them here.
+        # name on the `function_call` (or Codex `custom_tool_call`) item and
+        # the originating call_id on the matching output, so we correlate
+        # them here.
         function_name_by_call_id: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") != "function_call":
+            if item.get("type") not in ("function_call", "custom_tool_call"):
                 continue
             name = item.get("name")
             call_id = item.get("call_id")
@@ -2195,19 +2196,22 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("action"))
                 elif item_type == "custom_tool_call":
                     # One script can run several commands; its single output is a
-                    # read when any of them is (over-protecting only costs savings).
+                    # read when any of them is, or when one's cmd is not a string
+                    # literal and so might be (over-protecting only costs savings).
+                    commands = _custom_tool_call_commands(item.get("input"))
                     command = next(
-                        (
-                            c
-                            for c in _custom_tool_call_commands(item.get("input"))
-                            if _is_read_command(c)
-                        ),
-                        "",
+                        (c for c in commands if c is not None and _is_read_command(c)),
+                        "exec_command(<cmd not a string literal>)" if None in commands else "",
                     )
                 else:
                     continue
                 call_id = item.get("call_id")
-                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                if (
+                    command
+                    and isinstance(call_id, str)
+                    and call_id
+                    and (item_type == "custom_tool_call" or _is_read_command(command))
+                ):
                     read_command_by_call_id[call_id] = command
         # Outputs protected by read-command detection. Also unioned into the
         # cross-turn dedup protection set below: a [↑…] fold of a read would
@@ -2938,12 +2942,19 @@ class OpenAIHandlerMixin:
                     for tool in _deferred_tools
                     if isinstance(tool, dict) and tool.get("defer_loading")
                 ]
+                # estimated, NOT realized — and the comment above this block
+                # already says so ("a transform tag but no tokens_saved claim").
+                # The deferred definitions still ride in the request body; the
+                # saving is provider-side context exclusion we cannot observe in
+                # any response field, so claiming it as realized overstates it.
                 record_savings(
                     savings_tags if savings_tags is not None else {},
                     "tool_search",
                     tokens=self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(deferred)
                     ),
+                    realized=False,
+                    estimated=True,
                 )
             except Exception:
                 logger.debug("tool-search savings attribution skipped", exc_info=True)
@@ -3551,7 +3562,9 @@ class OpenAIHandlerMixin:
             rate_key = headers.get("authorization", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
+                await self.metrics.record_rate_limited(
+                    provider=openai_chat_outcome_provider, source="headroom"
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -3676,15 +3689,29 @@ class OpenAIHandlerMixin:
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
         # Hook: pre_compress
         _hook_biases = None
+        # Hard per-message veto. Separate from ``_hook_biases`` because a bias is
+        # a soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        _hook_protect = None
         if self.config.hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             _hook_ctx = CompressContext(model=model, provider="openai")
             try:
                 messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
                 logger.debug(f"[{request_id}] Hook error: {e}")
 
@@ -3889,6 +3916,7 @@ class OpenAIHandlerMixin:
                             ),
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
@@ -3931,6 +3959,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
@@ -4155,6 +4184,17 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
                     "to preserve cache stability (openai)"
                 )
+            # The restore writes raw client originals, but the provider cached
+            # what we forwarded last turn. Replay that over the restored result;
+            # the overlay's own checks keep the originals wherever replay is not
+            # provably safe. Token counts are recomputed from the final body below.
+            optimized_messages = finalize_turn(
+                optimized_messages,
+                original_client_messages,
+                openai_prefix_tracker.get_last_original_messages(),
+                openai_prefix_tracker.get_last_forwarded_messages(),
+                confirmed_frozen_count=_openai_confirmed_frozen,
+            ).messages
 
         # Memory: inject context and tools for OpenAI requests.
         #
@@ -4627,6 +4667,7 @@ class OpenAIHandlerMixin:
                         waste_signals=waste_signals_dict,
                         prefix_tracker=openai_prefix_tracker,
                         optimized_messages=optimized_messages,
+                        original_messages=original_client_messages,
                         backend=request_backend,
                     )
                 else:
@@ -4866,6 +4907,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=optimized_messages,
+                        original_messages=original_client_messages,
                     )
 
                     await self._record_request_outcome(
@@ -4964,6 +5006,7 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=openai_prefix_tracker,
+                    original_messages=original_client_messages,
                     outcome_provider=openai_chat_outcome_provider,
                 )
             else:
@@ -5244,6 +5287,7 @@ class OpenAIHandlerMixin:
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     messages=optimized_messages,
+                    original_messages=original_client_messages,
                 )
 
                 # OpenAI has no write penalty — uncached = total - cached
@@ -5676,7 +5720,7 @@ class OpenAIHandlerMixin:
             rate_key = headers.get("authorization", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider="openai")
+                await self.metrics.record_rate_limited(provider="openai", source="headroom")
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -5699,6 +5743,15 @@ class OpenAIHandlerMixin:
         # the tools schema after compression, and shaper strata must not
         # shift when it does.
         message_input_tokens = original_tokens
+
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider="openai")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed
@@ -10936,6 +10989,12 @@ class OpenAIHandlerMixin:
                     separators=(",", ":"),
                     ensure_ascii=False,
                 ).encode("utf-8")
+                response_headers = _sanitize_forwarded_response_headers(
+                    response.headers,
+                    "etag",
+                    "last-modified",
+                    "cache-control",
+                )
                 response_headers["content-type"] = "application/json"
 
         # Passthrough request: forwarded upstream with no transforms.

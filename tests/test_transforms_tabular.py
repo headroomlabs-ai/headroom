@@ -474,6 +474,109 @@ def test_load_xls_renders_a_time_only_cell_as_a_time(tmp_path) -> None:
     assert load_spreadsheet(xls_path)["Data"].splitlines()[1] == "12:00:00"
 
 
+def test_load_xls_and_xlsx_agree_above_the_exact_integer_range(tmp_path) -> None:
+    """A double cannot hold consecutive integers past 2**53.
+
+    ``_xls_cell`` converted any integral double with ``int()``, so a sheet
+    holding 123456789012345678 rendered the double's exact value, 123456789012345680
+    -- two fabricated digits presented to an agent as a precise identifier. The
+    .xlsx loader has always rendered the float, which at least says
+    "approximate", so bounding the conversion to the exactly-representable range
+    keeps the ``12.0 -> 12`` fix from #3616 and restores agreement (#3695).
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    small, big = 12, 1.2345678901234568e17
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Small")
+    xls_sheet.write(0, 1, "Big")
+    xls_sheet.write(1, 0, small)
+    xls_sheet.write(1, 1, big)
+    xls_path = tmp_path / "legacy.xls"
+    xls_book.save(xls_path)
+
+    # openpyxl is the reference the .xls path is written against, so the expected
+    # rendering is the float repr it yields for the same value.
+    openpyxl_wb = openpyxl.Workbook()
+    openpyxl_sheet = openpyxl_wb.active
+    openpyxl_sheet.title = "Data"
+    openpyxl_sheet.append(["Small", "Big"])
+    openpyxl_sheet.append([small, big])
+    openpyxl_wb.save(tmp_path / "modern.xlsx")
+
+    xls_row = load_spreadsheet(xls_path)["Data"].splitlines()[1]
+    xlsx_row = load_spreadsheet(tmp_path / "modern.xlsx")["Data"].splitlines()[1]
+    small_field, big_field = xls_row.split(",")
+
+    # The #3616 win has to survive the bound: a small whole number is still an int.
+    assert small_field == "12"
+    # And the fabricated integer must be gone: the cell is rendered as the double
+    # it is, which reads as an approximation instead of an exact identifier.
+    assert big_field == repr(big)
+    assert big_field != str(int(big))
+    # Parity, asserted against the other loader rather than against my own
+    # expectation. Small values agree verbatim; above the range openpyxl writes a
+    # double with only 15 significant digits, so that side loses a digit on its
+    # own and the rows cannot be string-equal. The promise this fix makes is
+    # about magnitude: the two loaders agree to well within one unit in the last
+    # place of the stored value (16 here), and neither hands the agent the
+    # exact-looking decimal of the typed number.
+    xlsx_small, xlsx_big = xlsx_row.split(",")
+    assert small_field == xlsx_small == "12"
+    assert abs(float(big_field) - float(xlsx_big)) <= 16
+
+
+def test_load_xls_and_xlsx_agree_at_the_exact_integer_boundary(tmp_path) -> None:
+    """2**53 and -2**53 are exactly representable and openpyxl loads them as
+    integers, so the .xls path must convert them too - the bound is inclusive.
+    One step outside, the double cannot hold the value; what matters is that no
+    digits are invented, and the two loaders then differ only in the trailing
+    ``.0`` that marks a value as approximate.
+    """
+    xlwt = pytest.importorskip("xlwt")
+    pytest.importorskip("xlrd")
+    openpyxl = pytest.importorskip("openpyxl")
+
+    from headroom.transforms.spreadsheet_ingest import load_spreadsheet
+
+    boundary = 2**53
+    values = [boundary, -boundary, boundary - 2, boundary + 2]
+
+    xls_book = xlwt.Workbook()
+    xls_sheet = xls_book.add_sheet("Data")
+    xls_sheet.write(0, 0, "Value")
+    for row, value in enumerate(values, start=1):
+        xls_sheet.write(row, 0, float(value))
+    xls_path = tmp_path / "boundary.xls"
+    xls_book.save(xls_path)
+
+    xlsx_wb = openpyxl.Workbook()
+    xlsx_sheet = xlsx_wb.active
+    xlsx_sheet.title = "Data"
+    xlsx_sheet.append(["Value"])
+    for value in values:
+        xlsx_sheet.append([int(value)])
+    xlsx_path = tmp_path / "boundary.xlsx"
+    xlsx_wb.save(xlsx_path)
+
+    xls = [line.split(",")[0] for line in load_spreadsheet(xls_path)["Data"].splitlines()[1:]]
+    xlsx = [line.split(",")[0] for line in load_spreadsheet(xlsx_path)["Data"].splitlines()[1:]]
+
+    # Inside the range (and exactly on it) the two loaders agree verbatim.
+    assert xls[0] == xlsx[0] == "9007199254740992"
+    assert xls[1] == xlsx[1] == "-9007199254740992"
+    assert xls[2] == xlsx[2] == "9007199254740990"
+    # Above it the .xls side keeps the float marker, and the digits are the same.
+    assert xls[3].removesuffix(".0") == xlsx[3] == "9007199254740994"
+    assert all(not field.endswith(".0") or float(field) == int(float(field)) for field in xls)
+
+
 def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     """The reference: openpyxl is what the .xls path is matching."""
     xlwt = pytest.importorskip("xlwt")
@@ -504,6 +607,59 @@ def test_load_xls_and_xlsx_agree_on_the_same_values(tmp_path) -> None:
     workbook.save(xlsx_path)
 
     assert load_spreadsheet(xls_path) == load_spreadsheet(xlsx_path)
+
+
+class _StubXlsCell:
+    """The whole surface ``_xls_cell`` reads: xlrd's ``ctype`` and ``value``."""
+
+    def __init__(self, ctype: int, value: object) -> None:
+        self.ctype = ctype
+        self.value = value
+
+
+@pytest.mark.parametrize("value", [12.0, 1e15, float(2**53 - 1), float(2**53), float(-(2**53))])
+def test_xls_cell_converts_exact_whole_numbers_to_int(value: float) -> None:
+    """At or below 2**53 every integer is representable, so ``int()`` loses nothing.
+
+    The bound is inclusive at both ends: +/-2**53 is exactly representable, and
+    openpyxl reads the same value from an .xlsx as an ``int``, so excluding it
+    would make the two loaders disagree at exactly the boundary.
+    """
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    rendered = _xls_cell(_StubXlsCell(xlrd.XL_CELL_NUMBER, value), 0)
+
+    assert isinstance(rendered, int)
+    assert rendered == int(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float(2**53 + 2), float(-(2**53) - 2), 1e16, 1e20, 123456789012345678.0],
+)
+def test_xls_cell_keeps_numbers_past_2_53_as_floats(value: float) -> None:
+    """Past 2**53 ``int()`` would fabricate digits the workbook never held.
+
+    ``2**53 + 2`` is the first whole number above the boundary (``2**53 + 1``
+    is not representable at all), and ``-(2**53) - 2`` its negative mirror.
+
+    xlrd hands back a double, and above 2**53 consecutive integers are no longer
+    representable, so ``int()`` renders the double's exact value rather than the
+    number that was typed: a cell holding 123456789012345678 prints as
+    123456789012345680 -- an identifier that reads as exact and is wrong in its
+    last two digits. The float repr says "approximate" out loud, and is also what
+    the .xlsx loader shows for the same workbook.
+    """
+    xlrd = pytest.importorskip("xlrd")
+
+    from headroom.transforms.spreadsheet_ingest import _xls_cell
+
+    rendered = _xls_cell(_StubXlsCell(xlrd.XL_CELL_NUMBER, value), 0)
+
+    assert isinstance(rendered, float)
+    assert rendered == value
 
 
 def test_load_spreadsheet_rejects_unknown_extension(tmp_path) -> None:

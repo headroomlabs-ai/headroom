@@ -34,10 +34,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Keys that are JSON Schema annotations, not constraints.
 # Removing them does not change the set of valid inputs.
@@ -391,6 +394,29 @@ def compact_tool_descriptions(
     tools = payload.get("tools")
     if not isinstance(tools, list) or not tools:
         return payload, False, 0, 0
+
+    # NO cache_control guard here, deliberately. The obvious reasoning -- "a
+    # marker means the provider hashed these bytes, so rewriting them busts the
+    # prefix" -- does not survive contact with the API, because the provider
+    # never saw the client's bytes. It only ever sees ours. Compaction is a pure
+    # deterministic transform, so turn 2 sends exactly what turn 1 cached and
+    # hits. Measured against the real API, 30 pinned tools over 6 turns:
+    #
+    #     always raw        write 12,536  then read 12,536 x5   billed 21,938
+    #     always compacted  write  8,726  then read  8,726 x5   billed 15,270  (-30%)
+    #
+    # Skipping made the cached prefix 30% larger for the life of every session
+    # that pins its tools, to avoid a bust that never happened.
+    #
+    # The one real hazard is INCONSISTENCY -- compacting on some turns and not
+    # others, which ``_decision.should_compress`` can produce via a per-request
+    # bypass header or a license gate flipping. That is bounded too: Anthropic
+    # keeps both prefixes alive, so alternating turns each hit their own entry
+    # and the cost is one extra write, once, not a bust per flip.
+    #
+    # This reasoning is specific to a pure byte transform over a fixed key set.
+    # It does NOT extend to system-prompt compaction, whose compressor is
+    # pluggable and not established to be deterministic -- that guard stays.
 
     strip_sem = strip_semantic_params()
     key = _cache_key(tools, "L2", max_chars, strip_sem)

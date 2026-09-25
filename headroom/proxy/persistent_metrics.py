@@ -16,6 +16,9 @@ MAX_EXPOSED_MODELS = 100
 MAX_LABEL_LENGTH = 128
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
+# Mirrors RATE_LIMIT_SOURCES in prometheus_metrics: "headroom" is our own
+# limiter refusing the request, "upstream" is the provider refusing it.
+RATE_LIMIT_SOURCES = frozenset({"headroom", "upstream"})
 # Names must match ``WasteSignals.to_dict()`` in headroom/config.py — the
 # parser emits ``json_bloat``; an allowlist that says ``json_noise`` silently
 # shoves the largest waste category into the catch-all bucket.
@@ -91,6 +94,12 @@ def _empty_state() -> dict[str, Any]:
             "cached": 0,
             "failed": 0,
             "rate_limited": 0,
+            # Who produced the failure / who refused the request. The totals
+            # above stay the unlabelled figures the dashboard reads; these
+            # split them the same way the Prometheus labels do, so no backend
+            # reports a differently-shaped counter (issue #3696).
+            "failed_by_provider": {},
+            "rate_limited_by_source": {},
             "by_provider": {},
             "by_stack": {},
         },
@@ -181,6 +190,17 @@ class PersistentMetricsState:
             result["requests"][key] = _coerce_int(raw_requests.get(key))
         result["requests"]["by_provider"] = self._normalize_count_map(
             raw_requests.get("by_provider"), MAX_PROVIDER_VALUES
+        )
+        result["requests"]["failed_by_provider"] = self._normalize_count_map(
+            raw_requests.get("failed_by_provider"), MAX_PROVIDER_VALUES
+        )
+        # A state file written before #3696 has no split, and back-filling the
+        # legacy total into one bucket would invent history we never observed —
+        # so it loads empty and only new events populate it. The unlabelled
+        # ``rate_limited`` total is untouched and stays comparable across the
+        # upgrade.
+        result["requests"]["rate_limited_by_source"] = self._normalize_enum_map(
+            raw_requests.get("rate_limited_by_source"), RATE_LIMIT_SOURCES, fallback="headroom"
         )
         result["requests"]["by_stack"] = self._normalize_count_map(
             raw_requests.get("by_stack"), MAX_STACK_VALUES
@@ -474,12 +494,29 @@ class PersistentMetricsState:
 
         self._record_activity()
         self._state["requests"]["failed"] += 1
+        self._increment_count(
+            self._state["requests"]["failed_by_provider"], _label(provider), MAX_PROVIDER_VALUES
+        )
 
-    def record_rate_limited(self, *, provider: str | None = None, model: str | None = None) -> None:
-        """Record a rate-limited request without redefining total request semantics."""
+    def record_rate_limited(
+        self,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        source: str = "headroom",
+    ) -> None:
+        """Record a rate-limited request without redefining total request semantics.
+
+        ``source`` is ``headroom`` (our own limiter) or ``upstream`` (the
+        provider's 429); anything else is clamped to ``headroom``, which is what
+        this counter meant before upstream 429s started reaching it.
+        """
 
         self._record_activity()
         self._state["requests"]["rate_limited"] += 1
+        bucket = source if source in RATE_LIMIT_SOURCES else "headroom"
+        by_source = self._state["requests"]["rate_limited_by_source"]
+        by_source[bucket] = by_source.get(bucket, 0) + 1
 
     def record_cache_bust(self, *, tokens_lost: Any = 0) -> None:
         self._record_activity()

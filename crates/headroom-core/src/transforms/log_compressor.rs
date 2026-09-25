@@ -896,6 +896,140 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
+/// Extract an exception-type / error-code label from a single line, if the
+/// line looks like an exception header or error declaration. Conservative:
+/// returns `None` rather than guessing on ambiguous lines, so a generic log
+/// line like `ERROR: something failed` (all-caps `ERROR`, not a language
+/// exception name) is deliberately excluded — `ends_with("Error")` is a
+/// case-sensitive suffix check that `"ERROR"` fails.
+///
+/// Covers two shapes seen in practice:
+/// - Python: `KeyError: 'port'` / pytest's `E       KeyError: 'port'`
+/// - Rust/cargo: `error[E0425]: cannot find value ...`
+fn extract_error_label(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if let Some(rest) = trimmed.strip_prefix("error[") {
+        if let Some(end) = rest.find(']') {
+            let code = &rest[..end];
+            if !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    let after_marker = trimmed
+        .strip_prefix("E ")
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let colon = after_marker.find(':')?;
+    let head = &after_marker[..colon];
+    let looks_like_exception_type = !head.is_empty()
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && (head.ends_with("Error") || head.ends_with("Exception") || head.ends_with("Warning"));
+    looks_like_exception_type.then(|| head.to_string())
+}
+
+/// Extract a source file name referenced by a single line, if any, via the
+/// common `File "..."` (Python) or `--> file:line:col` (Rust/cargo, also
+/// covers similar `at f (file:line:col)` shapes) patterns.
+fn extract_source_file(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if let Some(rest) = trimmed.strip_prefix("File \"") {
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+
+    let arrow = trimmed.find("--> ")?;
+    let rest = &trimmed[arrow + 4..];
+    let file_part = rest.split(':').next().unwrap_or("");
+    (!file_part.is_empty() && file_part.contains('.')).then(|| file_part.to_string())
+}
+
+/// Summarize what got dropped: distinct exception-type/error-code labels
+/// and distinct source files referenced by the lines in `all_lines` that
+/// are NOT present (by `line_number`) in `selected`, excluding any label or
+/// file that is *also* extractable from a kept line — those are already
+/// visible in the surviving text, so restating them would describe nothing
+/// retrieval could add. `BTreeSet` keeps the output deterministic (same
+/// input -> same marker text, no `HashMap` iteration-order dependence).
+///
+/// Returns `""` when nothing extractable was found — callers append this
+/// directly after the lines-compressed count, so an empty descriptor
+/// leaves the marker exactly as it was before this was added.
+fn summarize_omitted(all_lines: &[LogLine], selected: &[LogLine]) -> String {
+    let kept: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
+
+    let mut kept_error_types: BTreeSet<String> = BTreeSet::new();
+    let mut kept_files: BTreeSet<String> = BTreeSet::new();
+    for line in selected {
+        if let Some(label) = extract_error_label(&line.content) {
+            kept_error_types.insert(label);
+        }
+        if let Some(file) = extract_source_file(&line.content) {
+            kept_files.insert(file);
+        }
+    }
+
+    let mut error_types: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for line in all_lines {
+        if kept.contains(&line.line_number) {
+            continue;
+        }
+        if let Some(label) = extract_error_label(&line.content) {
+            if !kept_error_types.contains(&label) {
+                error_types.insert(label);
+            }
+        }
+        if let Some(file) = extract_source_file(&line.content) {
+            if !kept_files.contains(&file) {
+                files.insert(file);
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !files.is_empty() {
+        parts.push(format!(
+            "{} file{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !error_types.is_empty() {
+        const MAX_NAMES_SHOWN: usize = 5;
+        let names: Vec<&str> = error_types
+            .iter()
+            .take(MAX_NAMES_SHOWN)
+            .map(String::as_str)
+            .collect();
+        let overflow = if error_types.len() > MAX_NAMES_SHOWN {
+            ", ..."
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{} exception type{} ({}{})",
+            error_types.len(),
+            if error_types.len() == 1 { "" } else { "s" },
+            names.join(", "),
+            overflow
+        ));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(", "))
+    }
+}
+
 // ─── Compressor ─────────────────────────────────────────────────────────
 
 pub struct LogCompressor {
@@ -966,10 +1100,15 @@ impl LogCompressor {
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
                 store.put(&key, content);
+                // Descriptive so the reader/agent can tell whether the
+                // dropped content is relevant before deciding whether to
+                // retrieve it (rather than just "how much" vanished).
+                let descriptor = summarize_omitted(&log_lines, &selected);
                 let marker = format!(
-                    "\n[{} lines compressed to {}. Retrieve more: hash={}]",
+                    "\n[{} lines compressed to {}{}. Retrieve more: hash={}]",
                     original_line_count,
                     selected.len(),
+                    descriptor,
                     key
                 );
                 compressed.push_str(&marker);
@@ -1577,6 +1716,110 @@ mod tests {
         assert!(stats.ccr_emitted);
         let key = result.cache_key.as_ref().unwrap();
         assert_eq!(store.get(key).unwrap(), content);
+    }
+
+    #[test]
+    fn ccr_marker_includes_error_types_and_files_when_available() {
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_total_lines: 15,
+            max_errors: 2,
+            min_lines_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("INFO line {}\n", i));
+        }
+        // 15 distinct error codes across 15 distinct files -- well beyond
+        // max_total_lines=15 and max_errors=2, so most must be dropped and
+        // should surface in the marker's descriptor.
+        let codes = [
+            "E0425", "E0308", "E0599", "E0382", "E0502", "E0106", "E0433", "E0603", "E0507",
+            "E0716", "E0499", "E0658", "E0308", "E0596", "E0277",
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            content.push_str(&format!(
+                "error[{code}]: real distinct compile error #{i}\n"
+            ));
+            content.push_str(&format!(" --> src/module_{i}.rs:{}:1\n", i + 1));
+        }
+
+        let store = InMemoryCcrStore::new();
+        let (result, stats) = c.compress_with_store(&content, 1.0, Some(&store));
+        assert!(stats.ccr_emitted, "expected a CCR marker to be emitted");
+        let compressed = &result.compressed;
+        assert!(
+            compressed.contains("exception type"),
+            "marker should describe dropped exception types: {compressed}"
+        );
+        assert!(
+            compressed.contains("file"),
+            "marker should describe dropped files: {compressed}"
+        );
+        // The retrieval contract must survive unchanged: downstream marker
+        // detection (Python `CCR_RETRIEVAL_MARKER_RE`, `tool_injection.py`)
+        // keys off this exact substring.
+        assert!(compressed.contains("Retrieve more: hash="));
+    }
+
+    #[test]
+    fn summarize_omitted_excludes_error_type_and_file_visible_in_kept_lines() {
+        // KeyError/foo.py appear in both a kept line and a dropped line;
+        // ValueError/bar.py appear only in a dropped line. The descriptor
+        // must describe only what retrieval would actually add, so the
+        // dropped-but-also-visible pair should not be repeated. File names
+        // themselves are never printed (the marker only counts distinct
+        // files), so this is checked via the file count, not file text.
+        let all_lines = vec![
+            LogLine::new(0, "KeyError: 'port'"),
+            LogLine::new(1, "File \"foo.py\", line 3"),
+            LogLine::new(2, "KeyError: 'port'"),
+            LogLine::new(3, "File \"foo.py\", line 9"),
+            LogLine::new(4, "ValueError: bad literal"),
+            LogLine::new(5, "File \"bar.py\", line 1"),
+        ];
+        // Lines 0 and 1 survive compression; 2-5 are dropped.
+        let selected = vec![all_lines[0].clone(), all_lines[1].clone()];
+
+        let descriptor = summarize_omitted(&all_lines, &selected);
+
+        assert!(
+            !descriptor.contains("KeyError"),
+            "KeyError is already visible in a kept line, should not repeat: {descriptor}"
+        );
+        assert!(
+            descriptor.contains("ValueError"),
+            "ValueError only appears in dropped lines, should be described: {descriptor}"
+        );
+        // Only bar.py should count: foo.py is excluded because it's also
+        // extractable from a kept line (line 1), so the dropped-file count
+        // must be 1, not 2.
+        assert_eq!(descriptor, ": 1 file, 1 exception type (ValueError)");
+    }
+
+    #[test]
+    fn ccr_marker_descriptor_empty_when_nothing_extractable() {
+        // Plain INFO/ERROR content with no exception-type or file-path
+        // shaped lines: the descriptor must stay empty rather than
+        // fabricate a label, and the pre-existing marker shape must be
+        // unchanged for content this feature has nothing to say about.
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_total_lines: 5,
+            min_lines_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 0..50 {
+            content.push_str(&format!("INFO line {}\n", i));
+        }
+        content.push_str("ERROR boom\n");
+        let store = InMemoryCcrStore::new();
+        let (result, _stats) = c.compress_with_store(&content, 1.0, Some(&store));
+        assert!(result.compressed.contains("lines compressed to"));
+        assert!(!result.compressed.contains("exception type"));
+        assert!(!result.compressed.contains(" file"));
     }
 
     #[test]

@@ -230,7 +230,8 @@ Pre-built images are published to GitHub Container Registry on every release.
 
 ```bash
 docker pull ghcr.io/headroomlabs-ai/headroom:latest
-docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest
+docker run --rm -p 127.0.0.1:8787:8787 \
+  ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0
 ```
 
 <Callout type="info" title="Running Headroom without installing Python or Node?">

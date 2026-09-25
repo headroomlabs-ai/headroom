@@ -947,34 +947,15 @@ class StreamingMixin:
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
         # When upstream truncates mid-event (client disconnect, network
-        # drop, connection reset), the message_start (cache_read /
-        # cache_creation) or message_delta (output_tokens) usage events
-        # can sit in the residual buffer and never be parsed — surfacing
-        # as cache_read=cache_write=0 in PERF logs and poisoning the
-        # downstream freeze heuristic for the next request. Append the
-        # terminator so the buffer parser drains whatever's there. The
-        # per-event try/except in the parser swallows incomplete JSON,
-        # so this is safe even when the truncation cut mid-payload.
+        # drop, connection reset), the residual bytes are not a complete
+        # SSE event. Do not append a synthetic terminator here: doing so
+        # turns a partial UTF-8 sequence or partial event into input for
+        # the strict decoder and can raise while finalizing the stream.
+        # Complete usage events have already been parsed in the read loop;
+        # discard the incomplete tail instead of treating it as authoritative.
         sse_buffer = stream_state.get("sse_buffer")
         if isinstance(sse_buffer, bytearray) and len(sse_buffer) > 0:
-            sse_buffer.extend(b"\n\n")
-            late_usage = self._parse_sse_usage_from_buffer(stream_state, provider) or {}
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-                "cache_creation_ephemeral_5m_input_tokens",
-                "cache_creation_ephemeral_1h_input_tokens",
-            ):
-                if key not in late_usage:
-                    continue
-                current = stream_state.get(key)
-                # Only fill in unset (None) or default-zero slots so a
-                # real cache_read=0 from earlier in the stream isn't
-                # clobbered by a later partial event.
-                if current is None or current == 0:
-                    stream_state[key] = late_usage[key]
+            sse_buffer.clear()
 
         output_tokens = stream_state["output_tokens"]
         output_tokens_source = "provider"
@@ -988,13 +969,20 @@ class StreamingMixin:
             output_tokens, output_tokens_source = estimate_output_tokens(
                 sse_text=full_sse_data,
                 total_bytes=stream_state["total_bytes"],
+                # The provider body as sent, so a turn stopped by its output
+                # ceiling can be counted exactly instead of estimated. Matters
+                # most for a tool call truncated mid-arguments, whose dropped
+                # JSON leaves almost no text to count.
+                body=body,
             )
             # Name the actual basis. The old message always said "from N bytes"
             # even though that is now only true for the fallback rung, and an
             # operator reading it needs to know which estimate they are looking
             # at before trusting the number.
             basis = (
-                "counted from stream text"
+                "exact: turn hit its output-token ceiling"
+                if output_tokens_source == "exact_ceiling"
+                else "counted from stream text"
                 if output_tokens_source == "estimated_text"
                 else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
             )
@@ -1583,6 +1571,21 @@ class StreamingMixin:
             or k.lower().startswith("x-codex")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
+        # Headroom's own compression metrics, as the buffered path stamps them.
+        # Every counted value is known before the first byte, and streaming is
+        # how real coding agents talk to the proxy, so without these a client
+        # (or a metering layer in front of it) never learns what its request
+        # saved.
+        forwarded_headers["x-headroom-tokens-before"] = str(original_tokens)
+        forwarded_headers["x-headroom-tokens-after"] = str(optimized_tokens)
+        forwarded_headers["x-headroom-tokens-saved"] = str(tokens_saved)
+        forwarded_headers["x-headroom-model"] = model
+        if transforms_applied:
+            from headroom.proxy.cost import header_safe_transforms
+
+            forwarded_headers["x-headroom-transforms"] = ",".join(
+                header_safe_transforms(transforms_applied)
+            )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
@@ -2123,6 +2126,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        original_messages: list[dict] | None = None,
         backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
@@ -2145,6 +2149,11 @@ class StreamingMixin:
         the FINAL usage frame can update the tracker for the next turn
         — mirroring the direct streaming path
         (``_stream_response``/``_finalize_stream_response``).
+        ``original_messages`` is the immutable pre-transform client
+        snapshot for the same update: the tracker must record what the
+        client SENT as its ``last_original_messages``, not what we
+        forwarded, or next turn's overlay never matches the client
+        prefix and cannot replay the cached bytes.
 
         NOTE: CCR request-level intercept on the streaming path is
         intentionally OUT OF SCOPE. Mirrors the Anthropic streaming
@@ -2215,14 +2224,13 @@ class StreamingMixin:
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
-                # Late-flush: if upstream truncated the stream mid-event,
-                # the buffer parser hasn't seen the closing ``\n\n`` yet.
-                # Mirror _finalize_stream_response: append the terminator
-                # and drain anything still parseable.
+                # A residual buffer without an SSE terminator is an
+                # incomplete event. Complete usage frames were parsed in
+                # the read loop; never synthesize ``\n\n`` here, because
+                # that can make partial UTF-8 look like a complete event.
                 buf = stream_state["sse_buffer"]
                 if len(buf) > 0:
-                    buf.extend(b"\n\n")
-                    _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
+                    buf.clear()
 
                 # Mirror the non-streaming sibling (``_extract_responses_usage``
                 # in handlers/openai.py): only infer cache metrics when
@@ -2269,6 +2277,7 @@ class StreamingMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
+                        original_messages=original_messages,
                     )
 
                 # CCR Feedback: record headroom_retrieve tool calls so
