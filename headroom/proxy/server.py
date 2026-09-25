@@ -3548,6 +3548,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # reports the proxy's policy, not the calling shell's.
                 "tls": describe_trust_policy(),
                 "backend": config.backend,
+                # Boot-time proxy mode; `headroom wrap` compares it to the
+                # session's requested mode when reusing this proxy.
+                "mode": config.mode,
                 "optimize": config.optimize,
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
