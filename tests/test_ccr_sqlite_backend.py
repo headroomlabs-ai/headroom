@@ -213,6 +213,10 @@ class TestSQLiteBackend:
         assert expired is not None
         expired.created_at = time.time() - 11
         backend.set(expired_hash, expired)
+        # The setup stores above intentionally exercised the periodic purge and
+        # advanced its 60-second throttle. Make the insertion under test eligible
+        # to purge the row we only just backdated.
+        backend._last_purge = 0.0
 
         monkeypatch.setattr(
             backend,
