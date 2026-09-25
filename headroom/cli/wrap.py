@@ -4215,6 +4215,7 @@ def _ensure_proxy_unlocked(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to
                 # the non-persistent path which handles proxy restart.
@@ -4427,6 +4428,7 @@ def _ensure_proxy_unlocked(
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                _warn_proxy_mode_mismatch(running_config)
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -8249,6 +8251,28 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
+def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy runs a different mode than this session asked for.
+
+    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
+    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
+    other clients may be attached to the running proxy.
+    """
+    requested = os.environ.get("HEADROOM_MODE")
+    running = (running_config or {}).get("mode")
+    if not requested or not isinstance(running, str):
+        return
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
+
+    decision = normalize_proxy_mode_decision(requested, default=running)
+    if not decision.unknown and decision.normalized != running:
+        click.echo(
+            f"  Warning: this session requested {decision.normalized!r} mode but the "
+            f"running proxy is in {running!r} mode (mode is fixed at proxy startup). "
+            "Restart the proxy, or use --port for a separate one."
+        )
+
+
 # =============================================================================
 # Registry-generated wrap commands
 # =============================================================================
@@ -8279,6 +8303,11 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             click.echo(target.install_hint)
             raise SystemExit(1)
 
+        # Exported before proxy startup so _start_proxy forwards it as --mode;
+        # an explicit HEADROOM_MODE always wins.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
+
         env, env_vars_display = _build_registry_launch_env(
             target,
             port,
@@ -8301,6 +8330,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
+            openai_api_url=target.openai_api_url,
         )
 
     _run.__doc__ = target.help_text

@@ -3468,6 +3468,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
             payload["config"] = {
                 "backend": config.backend,
+                # Boot-time proxy mode; `headroom wrap` compares it to the
+                # session's requested mode when reusing this proxy.
+                "mode": config.mode,
                 "optimize": config.optimize,
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
