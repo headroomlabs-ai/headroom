@@ -43,11 +43,19 @@ _DELTA_FIELDS: dict[str, frozenset[str]] = {
     "citations_delta": frozenset({"type", "citation"}),
 }
 _MESSAGE_DELTA_FIELDS = ("stop_reason", "stop_sequence", "stop_details")
-# Delta types whose payload is concatenated onto a string field of the block.
-_STRING_DELTA_FIELDS = {
-    "text_delta": ("text", "text"),
-    "input_json_delta": ("partial_json", "_partial_json"),
-    "thinking_delta": ("thinking", "thinking"),
+# The payload member each known delta type must carry, and its JSON type.
+_DELTA_PAYLOADS: dict[str, tuple[str, type]] = {
+    "text_delta": ("text", str),
+    "input_json_delta": ("partial_json", str),
+    "thinking_delta": ("thinking", str),
+    "signature_delta": ("signature", str),
+    "citations_delta": ("citation", dict),
+}
+# The block field each string delta is concatenated onto.
+_ACCUMULATED_FIELDS = {
+    "text_delta": "text",
+    "input_json_delta": "_partial_json",
+    "thinking_delta": "thinking",
 }
 _KNOWN_MESSAGE_FIELDS = frozenset(
     {
@@ -351,33 +359,29 @@ def _response_from_events(frames: list[_SSEFrame]) -> _Reconstruction:
             dtype = delta.get("type")
             if target is None or not isinstance(dtype, str) or dtype not in _DELTA_FIELDS:
                 continue
-            if dtype in _STRING_DELTA_FIELDS:
-                source, accumulated = _STRING_DELTA_FIELDS[dtype]
-                if not isinstance(delta.get(source) or "", str) or not isinstance(
-                    target.get(accumulated, ""), str
-                ):
-                    continue
+            # Validate the raw member: a missing, null or falsy non-string value
+            # is not an empty delta, and must not be consumed as one.
+            member, member_type = _DELTA_PAYLOADS[dtype]
+            payload = delta.get(member)
+            if not isinstance(payload, member_type):
+                continue
+            accumulated = _ACCUMULATED_FIELDS.get(dtype)
+            if accumulated is not None and not isinstance(target.get(accumulated, ""), str):
+                continue
+            if dtype == "citations_delta" and not isinstance(target.get("citations", []), list):
+                continue
             consumed.add(position)
             event_extensions, delta_extensions = block_extensions[id(target)].deltas.setdefault(
                 dtype, ({}, {})
             )
             event_extensions.update(_extensions(data, _EVENT_FIELDS[event_type]))
             delta_extensions.update(_extensions(delta, _DELTA_FIELDS[dtype]))
-            if dtype == "text_delta":
-                target["text"] = target.get("text", "") + (delta.get("text") or "")
-            elif dtype == "input_json_delta":
-                target["_partial_json"] = target.get("_partial_json", "") + (
-                    delta.get("partial_json") or ""
-                )
-            elif dtype == "thinking_delta":
-                target["thinking"] = target.get("thinking", "") + (delta.get("thinking") or "")
+            if accumulated is not None:
+                target[accumulated] = target.get(accumulated, "") + payload
             elif dtype == "signature_delta":
-                if "signature" in delta:
-                    target["signature"] = delta["signature"]
+                target["signature"] = payload
             elif dtype == "citations_delta":
-                citation = delta.get("citation")
-                if citation is not None:
-                    target.setdefault("citations", []).append(citation)
+                target.setdefault("citations", []).append(payload)
         elif event_type == "content_block_stop":
             raw_index = data.get("index")
             block_index = _wire_index(raw_index)

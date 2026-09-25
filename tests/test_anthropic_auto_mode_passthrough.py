@@ -315,6 +315,68 @@ data: {"type":"message_stop"}
     assert rendered.count(bad_frames) == 1
 
 
+_DELTA_PAYLOAD_CASES = {
+    "text_delta": ("text", {"type": "text", "text": ""}),
+    "thinking_delta": ("thinking", {"type": "thinking", "thinking": ""}),
+    "input_json_delta": (
+        "partial_json",
+        {"type": "tool_use", "id": "toolu_1", "name": "run", "input": {}},
+    ),
+    "signature_delta": ("signature", {"type": "thinking", "thinking": ""}),
+    "citations_delta": ("citation", {"type": "text", "text": ""}),
+}
+_MISSING = object()
+
+
+def _single_delta_stream(block: dict, delta: dict) -> tuple[bytes, bytes]:
+    def event(payload: dict) -> bytes:
+        return f"event: {payload['type']}\ndata: {json.dumps(payload)}\n\n".encode()
+
+    frame = event({"type": "content_block_delta", "index": 0, "delta": delta})
+    raw = (
+        event(
+            {
+                "type": "message_start",
+                "message": {"id": "msg_d", "type": "message", "role": "assistant", "content": []},
+            }
+        )
+        + event({"type": "content_block_start", "index": 0, "content_block": block})
+        + frame
+        + event({"type": "content_block_stop", "index": 0})
+        + event({"type": "message_stop"})
+    )
+    return raw, frame
+
+
+@pytest.mark.parametrize(
+    "value", [0, False, None, _MISSING], ids=["zero", "false", "null", "missing"]
+)
+@pytest.mark.parametrize("delta_type", _DELTA_PAYLOAD_CASES)
+def test_falsy_non_string_delta_payload_is_replayed_not_consumed(
+    delta_type: str, value: object
+) -> None:
+    member, block = _DELTA_PAYLOAD_CASES[delta_type]
+    delta = {"type": delta_type} if value is _MISSING else {"type": delta_type, member: value}
+    raw, frame = _single_delta_stream(block, delta)
+
+    envelope = AnthropicSSEEnvelope.parse(raw)
+
+    assert envelope.is_complete()
+    assert not envelope.is_message_reconstructable()
+    assert b"".join(envelope.render()).count(frame) == 1
+
+
+@pytest.mark.parametrize("delta_type", ["text_delta", "thinking_delta", "input_json_delta"])
+def test_empty_string_delta_payload_is_still_reconstructed(delta_type: str) -> None:
+    member, block = _DELTA_PAYLOAD_CASES[delta_type]
+    raw, frame = _single_delta_stream(block, {"type": delta_type, member: ""})
+
+    envelope = AnthropicSSEEnvelope.parse(raw)
+
+    assert envelope.is_message_reconstructable()
+    assert frame not in b"".join(envelope.render())
+
+
 def test_non_object_message_usage_is_replayed_not_merged() -> None:
     bad_start = (
         b"event: message_start\n"
