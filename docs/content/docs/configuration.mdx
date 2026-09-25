@@ -175,6 +175,28 @@ Matching is on the parsed hostname and is exact — no wildcards — so
 `api.anthropic.com.evil.example` and `https://api.anthropic.com@evil.example`
 do not match `api.anthropic.com`.
 
+#### `x-headroom-base-url` is refused when an outbound proxy is in the way
+
+Because the destination is chosen by the client, the proxy validates it by
+resolving the hostname and rejecting non-public addresses — and then dials the
+address it validated, rather than resolving the name a second time at connect
+time. Without that second half, a hostname whose authoritative DNS is
+attacker-controlled can answer the check with a public address and the
+connection with `169.254.169.254` or an RFC1918 host (DNS rebinding).
+
+An outbound HTTP or SOCKS proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`) is
+handed the target *by name* — in the request line, in `CONNECT`, in the SOCKS5
+address — and resolves it itself, from its own network, after the check ran.
+Headroom cannot enforce the validated address there, so a request carrying
+`x-headroom-base-url` that would route through the proxy is **refused** rather
+than forwarded on a verdict nothing enforces.
+
+This affects only client-supplied upstreams. Every operator-configured provider
+URL goes through the proxy exactly as before. If you need a specific endpoint
+reachable via `x-headroom-base-url` through an outbound proxy, name it in
+`HEADROOM_ALLOWED_BASE_URLS` — an explicit operator decision to admit that
+destination by name, which also turns off the resolve-and-pin check for it.
+
 ## SmartCrusher Configuration
 
 Fine-tune JSON compression behavior:

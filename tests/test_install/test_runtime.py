@@ -26,7 +26,50 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
+
+
+def _wait_stopped_manifest() -> DeploymentManifest:
+    return DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        health_url="http://127.0.0.1:8787/readyz",
+    )
+
+
+def test_wait_stopped_waits_for_health_endpoint_to_go_down(monkeypatch) -> None:
+    """#3658: the old process keeps answering /readyz briefly after it is stopped."""
+
+    probe_results = iter([True, True, False])
+    sleeps: list[float] = []
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: next(probe_results))
+    monkeypatch.setattr(
+        "headroom.install.runtime.time.sleep", lambda seconds: sleeps.append(seconds)
+    )
+
+    assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=5) is True
+    assert len(sleeps) == 2
+
+
+def test_wait_stopped_times_out_when_endpoint_keeps_answering(monkeypatch) -> None:
+    clock = {"now": 0.0}
+    monkeypatch.setattr("headroom.install.runtime.probe_ready", lambda url: True)
+    monkeypatch.setattr("headroom.install.runtime.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "headroom.install.runtime.time.sleep",
+        lambda seconds: clock.update(now=clock["now"] + seconds),
+    )
+
+    assert wait_stopped(_wait_stopped_manifest(), timeout_seconds=2) is False
 
 
 def test_build_runtime_command_for_docker_includes_deployment_env(

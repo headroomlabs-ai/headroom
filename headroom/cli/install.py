@@ -33,6 +33,7 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
 from headroom.install.state import (
     ManifestError,
@@ -191,6 +192,15 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         stop_supervisor(manifest)
     stop_runtime(manifest)
+    # Stopping returns before the old process has finished shutting down, so it
+    # can keep answering /readyz. `_start_deployment` treats a ready endpoint as
+    # "already running" and would skip the start, leaving the deployment stopped
+    # once the old process exits. Block until it is really gone.
+    if not wait_stopped(manifest):
+        raise click.ClickException(
+            f"Deployment '{manifest.profile}' is still answering on "
+            f"{manifest.health_url} after stop."
+        )
 
 
 def _deactivate_deployment_mutations(

@@ -198,7 +198,12 @@ def build_urlopen_context() -> ssl.SSLContext | None:
     """
 
     verify = build_httpx_verify()
-    return verify if isinstance(verify, ssl.SSLContext) else None
+    if not isinstance(verify, ssl.SSLContext):
+        return None
+    # urllib.request/http.client only implements HTTP/1.1 framing. Offering h2
+    # can make a TLS-inspecting MITM negotiate a protocol it cannot parse.
+    verify.set_alpn_protocols(["http/1.1"])
+    return verify
 
 
 def apply_global_tls_relaxation() -> bool:

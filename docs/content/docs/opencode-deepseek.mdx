@@ -132,15 +132,21 @@ Edit `~/.config/opencode/opencode.json`:
 
 **Important:** Only include model IDs that appear in the proxy's `/v1/models`
 response. OpenCode validates config models against the proxy's model list.
-The current DeepSeek model names are `deepseek-v4-pro` and `deepseek-v4-flash`.
-`deepseek-chat` and `deepseek-reasoner` are deprecated compatibility aliases.
+The current DeepSeek model names are `deepseek-flash` and `deepseek-v4-pro`.
+The retired `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are still
+accepted and billed at the Flash price; `deepseek-chat` and `deepseek-reasoner`
+are deprecated compatibility aliases.
 
 ### Model comparison
 
-| Model | Input / Output (per 1M) | Context | Max Output |
-|---|---|---|---|
-| `deepseek-v4-pro` | $0.435 / $0.87 | 1M | 384K |
-| `deepseek-v4-flash` | $0.14 / $0.28 | 1M | 384K |
+All prices are USD per 1M tokens, at DeepSeek's **off-peak** tier. Peak hours —
+Beijing 09:00-12:00 and 14:00-18:00, i.e. 01:00-04:00 and 06:00-10:00 UTC — cost
+exactly twice these rates.
+
+| Model | Input / Output (per 1M, off-peak) | Context | Max Output | Vision |
+|---|---|---|---|---|
+| `deepseek-flash` (V4.1-Flash) | $0.15 / $0.60 | 1M | 384K | yes |
+| `deepseek-v4-pro` | $0.66 / $1.98 | 1M | 384K | no |
 
 Both models support **thinking mode** for step-by-step reasoning (see below).
 
@@ -155,7 +161,7 @@ opencode
 ```
 
 Run `/models` to confirm both DeepSeek models appear under "Headroom Proxy".
-Select one with `/model deepseek-v4-flash` or `/model deepseek-v4-pro`.
+Select one with `/model deepseek-flash` or `/model deepseek-v4-pro`.
 
 ---
 

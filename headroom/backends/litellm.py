@@ -588,6 +588,23 @@ def _parse_tool_arguments(arguments: Any) -> Any:
     return arguments
 
 
+def _anthropic_image_to_openai(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert an Anthropic ``image`` block to an OpenAI ``image_url`` part.
+
+    Same mapping as ``AnyLLMBackend._convert_content_blocks``. Returns None for a
+    source type it does not know, so that block is skipped as before.
+    """
+    source = block.get("source") or {}
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/png")
+        url = f"data:{media_type};base64,{source.get('data', '')}"
+    elif source.get("type") == "url":
+        url = source.get("url", "")
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _is_anthropic_family_model(litellm_model: str) -> bool:
     """True when the resolved litellm target speaks the Anthropic Messages
     dialect: the Anthropic API, Bedrock-Claude, Vertex-Claude, Azure-Claude.
@@ -884,6 +901,9 @@ class LiteLLMBackend(Backend):
                 tool_use_blocks = []
                 tool_result_blocks = []
                 thinking_blocks: list[dict[str, Any]] = []
+                # Ordered text + image parts; only used when the turn has an image.
+                parts: list[dict[str, Any]] = []
+                has_image = False
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -891,6 +911,12 @@ class LiteLLMBackend(Backend):
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
+                        parts.append({"type": "text", "text": block.get("text", "")})
+                    elif block_type == "image":
+                        image_part = _anthropic_image_to_openai(block)
+                        if image_part:
+                            parts.append(image_part)
+                            has_image = True
                     elif block_type == "tool_use":
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
@@ -966,6 +992,10 @@ class LiteLLMBackend(Backend):
                     "role": role,
                     "content": "\n".join(text_parts) if text_parts else "",
                 }
+                # User turns only: litellm's Bedrock transform raises on an
+                # assistant-turn image, which this code has always dropped.
+                if has_image and role == "user":
+                    simple_msg["content"] = parts
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
                 converted.append(simple_msg)
