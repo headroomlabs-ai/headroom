@@ -7,17 +7,16 @@ that split after a restart with zero session traffic.
 
 from __future__ import annotations
 
-import copy
 import json
 from urllib.parse import urlsplit
 
 import pytest
 
 from headroom.dashboard import get_dashboard_html
+from headroom.proxy.savings_tracker import _empty_display_session
 from tests.test_dashboard_cache_ttl_playwright import (
     _fulfill_static_asset,
     _sample_history,
-    _sample_stats,
 )
 
 playwright = pytest.importorskip("playwright.sync_api")
@@ -28,10 +27,30 @@ sync_playwright = playwright.sync_playwright
 
 def _session_stats_no_cache() -> dict:
     """Post-restart session payload: zero current-process cache traffic."""
-    stats = copy.deepcopy(_sample_stats())
-    totals = stats.setdefault("prefix_cache", {}).setdefault("totals", {})
-    totals.update({"requests": 0, "cache_read_tokens": 0, "cache_write_tokens": 0})
-    return stats
+    return {
+        "cost": {},
+        "requests": {},
+        "tokens": {},
+        "overhead": {},
+        "ttfb": {},
+        "latency": {},
+        "waste_signals": {},
+        "savings_history": [],
+        "persistent_savings": {"display_session": {}, "lifetime": {}},
+        "pipeline_timing": {},
+        "compression_cache": {},
+        "prefix_cache": {
+            "by_provider": {},
+            "totals": {
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "requests": 0,
+                "hit_requests": 0,
+                "observed_ttl_buckets": {},
+                "observed_ttl_mix": {"active_buckets": []},
+            },
+        },
+    }
 
 
 def _lifetime_cache_payload(
@@ -124,4 +143,25 @@ def test_card_hidden_when_no_session_and_no_lifetime_data() -> None:
 
         expect(page.get_by_text("Prefix Cache Impact", exact=True)).to_have_count(0)
 
+        browser.close()
+
+
+def test_expired_display_session_preserves_session_lifetime_fallback() -> None:
+    stats = _session_stats_no_cache()
+    stats["persistent_savings"]["display_session"] = _empty_display_session()
+    stats["persistent_savings"]["lifetime"] = {
+        "cache_read_tokens": 629_537_547,
+        "cache_savings_usd": 7.2,
+    }
+    lifetime = _lifetime_cache_payload()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 1600})
+        _open_dashboard(page, stats, lifetime)
+        expect(page.get_by_test_id("rolling-display-session-economics")).to_have_count(0)
+        expect(page.get_by_text("Prefix Cache Impact", exact=True)).to_be_visible()
+        expect(page.get_by_text("Cache Reads (lifetime)", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Lifetime", exact=True).click()
+        expect(page.get_by_text("$7.20", exact=True)).to_be_visible()
         browser.close()

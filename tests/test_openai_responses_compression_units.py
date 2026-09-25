@@ -1194,3 +1194,109 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_openai_responses_adapter_preserves_excluded_custom_tool_outputs():
+    """Codex freeform tools pair ``custom_tool_call`` with its output by call_id.
+
+    The exclude check must resolve their names exactly like ``function_call``.
+    """
+    router = ContentRouter()
+    router.config.exclude_tools = {"serena.find_symbol", "find_symbol"}
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="should not be used",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = " ".join(f"sym{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "serena.find_symbol",
+                "input": "find_symbol main",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": output,
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert transforms == []
+    assert new_payload == payload
+
+
+def test_openai_responses_adapter_excludes_custom_tool_beside_compressed_function_call():
+    """An excluded custom tool stays raw while a non-excluded function call compresses."""
+    router = ContentRouter()
+    router.config.exclude_tools = {"exec"}
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed tool output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    excluded_output = " ".join(f"line{i}" for i in range(180))
+    other_output = " ".join(f"word{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "cat build.log",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": excluded_output,
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_other",
+                "name": "some.other_tool",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_other",
+                "output": other_output,
+            },
+        ],
+    }
+
+    new_payload, modified, _saved, _transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == excluded_output
+    assert new_payload["input"][3]["output"] == "compressed tool output"

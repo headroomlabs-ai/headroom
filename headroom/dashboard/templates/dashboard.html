@@ -111,6 +111,13 @@
         /* Light mode: fix hardcoded dark card backgrounds */
         .bg-card-alt { background: var(--card-alt-bg); }
         .hover-bg-surface:hover { background: var(--color-surface); }
+        .rolling-provider-label, .rolling-provider-value { color: #0e7490; }
+        .rolling-compression-label, .rolling-compression-value { color: #047857; }
+        .rolling-scope-copy { color: #334155; }
+        .prefix-cache-current-label { color: #047857; }
+        html.dark .rolling-provider-label, html.dark .rolling-provider-value { color: #67e8f9; }
+        html.dark .rolling-compression-label, html.dark .rolling-compression-value { color: #6ee7b7; }
+        html.dark .rolling-scope-copy, html.dark .prefix-cache-current-label { color: #cbd5e1; }
     </style>
 </head>
 <!-- No x-init: Alpine already calls the x-data object's own init(). Naming it
@@ -118,12 +125,12 @@
      the R shortcut twice, doubling every request the dashboard makes. -->
 <body class="text-gray-200 min-h-screen" x-data="dashboard()">
     <!-- Header -->
-    <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+    <header class="border-b border-border px-6 py-4 flex flex-col gap-3 md:flex-row md:flex-wrap md:items-center md:justify-between">
         <div class="flex items-center gap-4">
             <h1 class="text-xl font-semibold tracking-tight">HEADROOM</h1>
             <span class="text-xs text-gray-500 font-mono" x-text="formatVersion(version)"></span>
         </div>
-        <div class="flex flex-col gap-3 md:flex-row md:items-center md:gap-6">
+        <div class="flex min-w-0 max-w-full flex-col gap-3 md:flex-row md:flex-wrap md:items-center md:gap-6">
             <div class="inline-flex rounded-lg border border-border bg-surface p-1">
                     <button type="button" :aria-pressed="viewMode === 'session'" class="px-3 py-1.5 text-sm rounded-md transition-colors"
                             :class="viewMode === 'session' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
@@ -143,7 +150,7 @@
             </div>
             <template x-if="stats.anon_telemetry_shipping">
                 <div class="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1"
-                     title="Anonymous aggregate telemetry is enabled. Disable with HEADROOM_TELEMETRY=off or --no-telemetry.">
+                     title="The anonymous telemetry beacon is on: compression stats only, never prompts, code, or file paths. Turn it off with HEADROOM_BEACON=off or DO_NOT_TRACK=1.">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"
                          class="w-3 h-3 text-amber-400 shrink-0">
                         <path fill-rule="evenodd"
@@ -225,19 +232,21 @@
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
                         <div class="flex items-baseline gap-2">
                             <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
-                            <!-- Active compression ratio: savings as a fraction of tokens we
-                                 *attempted* to compress (extracted units + tool schema). When
-                                 the attempted denominator is missing (backend-routed paths
-                                 that don't yet wire per-message live-zone tracking), fall back
-                                 to the whole-request ratio so the headline doesn't collapse to
-                                 0% while compression is happening (issue #455). -->
+                            <!-- Headline ratio: whole wire, savings as a fraction of ALL
+                                 forwarded input (#1653). That is the honest answer to "what
+                                 share of my billed input did Headroom remove", because
+                                 without Headroom the session's cached history would have
+                                 been billed too (as cache reads) and so belongs in the
+                                 denominator. The new-input basis, which is what compression
+                                 can actually touch, sits on the line below; it reads much
+                                 higher on long sessions and must not take this slot. -->
                             <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                             <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                         </div>
-                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
-                            <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed" x-show="(stats.tokens?.new_input_tokens || 0) > 0">
+                            <span x-text="'Of new input: ' + (stats.tokens?.new_input_savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of the tokens that newly entered context (uncached + cache write), which is what compression can touch. The headline above recounts the session's cached history on every turn, so it reads low on a long session even when compression is working."></span>
                         </div>
                         <div class="mt-2 h-8">
                             <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
@@ -522,14 +531,36 @@
                     </div>
                 </div>
 
+                <!-- Rolling display-session economics: provider and Headroom owners stay separate -->
+                <template x-if="rollingSessionActive">
+                    <div data-testid="rolling-display-session-economics" class="bg-surface rounded-lg p-4 border border-border mb-6">
+                        <div class="text-sm font-medium text-gray-300">Rolling display session economics</div>
+                        <div class="rolling-scope-copy text-xs mt-1 mb-4">Values cover the active persisted display session.</div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div data-testid="rolling-provider-cache" class="rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-4">
+                                <div class="rolling-provider-label text-xs uppercase tracking-wide">Provider cache discount</div>
+                                <div class="rolling-provider-value text-2xl font-light tabular-nums mt-2"
+                                     x-text="'$' + formatCurrency(rollingSession.cache_savings_usd || 0)"></div>
+                                <div class="rolling-scope-copy text-xs mt-1">provider-observed, rolling display session</div>
+                            </div>
+                            <div data-testid="rolling-compression-savings" class="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-4">
+                                <div class="rolling-compression-label text-xs uppercase tracking-wide">Headroom compression savings</div>
+                                <div class="rolling-compression-value text-2xl font-light tabular-nums mt-2"
+                                     x-text="'$' + formatCurrency(rollingSession.compression_savings_usd || 0)"></div>
+                                <div class="rolling-scope-copy text-xs mt-1">Headroom-attributable, rolling display session</div>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Prefix Cache Impact: current process plus durable cache reads after restart -->
                 <template x-if="cacheCardAvailable">
                     <div class="bg-surface rounded-lg p-4 border border-border mb-6">
-                        <div class="flex justify-between items-center mb-3">
+                        <div class="flex flex-col items-start gap-2 mb-3 sm:flex-row sm:items-center sm:justify-between">
                             <div class="text-sm font-medium text-gray-300">Prefix Cache Impact</div>
-                            <div class="text-xs text-emerald-400 font-mono"
+                            <div class="prefix-cache-current-label text-xs font-mono"
                                  x-show="cacheSessionActive"
-                                 x-text="'Net savings: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
+                                 x-text="'Provider cache discount, current process: $' + formatCurrency(stats.prefix_cache?.totals?.net_savings_usd || 0)"></div>
                             <div class="text-xs text-gray-500 font-mono"
                                  x-show="!cacheSessionActive">no activity since restart</div>
                         </div>
@@ -2707,6 +2738,14 @@
                     return (this.stats.prefix_cache?.totals?.requests || 0) > 0;
                 },
 
+                get rollingSession() {
+                    return this.stats.persistent_savings?.display_session || {};
+                },
+
+                get rollingSessionActive() {
+                    return Boolean(this.rollingSession.last_activity_at);
+                },
+
                 get lifetimeCacheReadTokens() {
                     return this.stats.persistent_savings?.lifetime?.cache_read_tokens || 0;
                 },
@@ -2858,7 +2897,7 @@
                 },
 
                 get headlineSavingsTitle() {
-                    return 'Of total wire input tokens';
+                    return 'Of total wire input tokens: all forwarded input, cached history included';
                 },
 
                 // --- Expandable Rows ---

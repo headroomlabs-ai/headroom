@@ -210,3 +210,7 @@ harness = false
 [[bench]]
 name = "auth_mode"
 harness = false
+
+[[bench]]
+name = "bm25_scoring"
+harness = false

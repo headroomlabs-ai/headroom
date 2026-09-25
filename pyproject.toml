@@ -287,7 +287,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff==0.16.7",
+    "ruff==0.16.8",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
@@ -295,7 +295,11 @@ dev = [
     "litellm>=1.96.2,<2.0",       # see core deps note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
-    "httpx[http2]>=0.24.0",
+    # socks: test_upstream_guard proves a guarded upstream is refused on EVERY
+    # supported proxy transport. Without the extra, httpcore substitutes a stub
+    # AsyncSOCKSProxy that cannot be constructed, and the SOCKS case degrades to
+    # asserting on a type rather than a real pool.
+    "httpx[http2,socks]>=0.24.0",
     "websockets>=13.0",
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
@@ -308,6 +312,11 @@ dev = [
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
     "xlrd>=2.0.1",      # exercises spreadsheet_ingest (.xls) in the test suite
     "xlwt>=1.3.0",      # writes the legacy .xls fixtures for spreadsheet_ingest tests
+    # test_upstream_guard builds a self-signed cert to prove the pinned connection
+    # still presents the original hostname for SNI and still verifies the cert.
+    # The floor in the security-pins block below is a *version* constraint on a
+    # transitive dep, not a guarantee it is installed -- CI had neither.
+    "cryptography>=50.0.0",
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
 # All optional dependencies (everything you need).

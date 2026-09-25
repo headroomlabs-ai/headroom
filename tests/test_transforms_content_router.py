@@ -368,6 +368,7 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
 def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
     router._runtime_force_kompress = True
+    monkeypatch.setattr(router, "_force_kompress_ready", lambda: True)
     pure_result = RouterCompressionResult(
         compressed="pure",
         original="pure",

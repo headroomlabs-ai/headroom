@@ -25,7 +25,7 @@ services:
       - ./captures:/captures
       - mitm_direct_ca:/mitmproxy
     ports:
-      - "${DIRECT_MITM_PORT:-18080}:8080"
+      - "127.0.0.1:${DIRECT_MITM_PORT:-18080}:8080"
 
   mitm-headroom-client:
     image: mitmproxy/mitmproxy:12
@@ -43,12 +43,12 @@ services:
       CAPTURE_LANE: headroom-client
       CAPTURE_OUTPUT: /captures/headroom-client.jsonl
       CAPTURE_INCLUDE_HOSTS: ${CAPTURE_CLIENT_INCLUDE_HOSTS:-mitm-headroom-client,headroom-proxy,api.anthropic.com}
+      CAPTURE_PROXY_TOKEN_HOSTS: headroom-proxy
       CAPTURE_BODY_BYTES: ${CAPTURE_BODY_BYTES:-262144}
+      CAPTURE_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}
     volumes:
       - ./mitm_capture.py:/capture/mitm_capture.py:ro
       - ./captures:/captures
-    ports:
-      - "${HEADROOM_CLIENT_MITM_PORT:-18082}:8080"
     depends_on:
       - headroom-proxy
 
@@ -76,7 +76,7 @@ services:
       - ./captures:/captures
       - mitm_headroom_ca:/mitmproxy
     ports:
-      - "${HEADROOM_MITM_PORT:-18081}:8080"
+      - "127.0.0.1:${HEADROOM_MITM_PORT:-18081}:8080"
 
   headroom-proxy:
     build:
@@ -84,6 +84,7 @@ services:
       dockerfile: Dockerfile
     command: ["--host", "0.0.0.0", "--port", "8787", "--backend", "anthropic"]
     environment:
+      HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:?Set HEADROOM_PROXY_TOKEN}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}
       ANTHROPIC_TARGET_API_URL: ${ANTHROPIC_TARGET_API_URL:-https://api.anthropic.com}
       HTTPS_PROXY: http://mitm-headroom-upstream:8080
