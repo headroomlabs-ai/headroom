@@ -3953,6 +3953,17 @@ _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
 _CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
+def _tool_entry_name(entry: dict[str, Any]) -> str | None:
+    """Return the name a tool-search entry carries, or ``None``.
+
+    Server-side blocks use ``tool_name``; be liberal about ``name``. The one
+    precedence rule for this file, so every reader agrees on an entry that
+    carries both keys.
+    """
+    name = entry.get("tool_name") or entry.get("name")
+    return str(name) if name else None
+
+
 def _tool_search_reference_names(content: Any) -> list[str]:
     """Return the ``tool_reference`` names carried by a tool-search result block.
 
@@ -3965,10 +3976,9 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     names = []
     for entry in entries:
         if isinstance(entry, dict) and entry.get("type") == "tool_reference":
-            # Server-side blocks use ``tool_name``; be liberal about ``name``.
-            name = entry.get("tool_name") or entry.get("name")
+            name = _tool_entry_name(entry)
             if name:
-                names.append(str(name))
+                names.append(name)
     return names
 
 
@@ -3998,13 +4008,15 @@ def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
     if not isinstance(tools, list):
         return tools, 0
 
-    # The search mechanisms present on THIS request, identified by type.
+    # The search mechanisms present on THIS request, identified by type. Names
+    # on both sides go through _tool_entry_name, so a mechanism shaped like a
+    # server-side block (``tool_name``) registers too.
     mechanism_names = {
-        str(t["name"])
+        name
         for t in tools
         if isinstance(t, dict)
-        and t.get("name")
         and str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        and (name := _tool_entry_name(t))
     }
     if not mechanism_names:
         return tools, 0
@@ -4015,7 +4027,7 @@ def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
         if not (
             isinstance(t, dict)
             and t.get("type") == "tool_reference"
-            and str(t.get("name") or t.get("tool_name") or "") in mechanism_names
+            and _tool_entry_name(t) in mechanism_names
         )
     ]
     removed = len(tools) - len(kept)

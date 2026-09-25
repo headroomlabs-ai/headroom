@@ -398,6 +398,7 @@ def test_core_tools_match_leading_underscore_namespace() -> None:
 
 from headroom.proxy.helpers import (  # noqa: E402
     _CLIENT_TOOL_REF_PLACEHOLDER,
+    _tool_search_reference_names,
     strip_unsupported_tool_search_blocks,
     strip_unsupported_tool_search_references,
 )
@@ -892,3 +893,35 @@ def test_reference_repair_matches_mechanism_name_exactly() -> None:
     assert removed == 1
     kept_names = [t.get("name") for t in repaired if t.get("type") == "tool_reference"]
     assert kept_names == [_TOOL_SEARCH_DEFAULT_NAME + "_other"]
+
+
+def test_reference_repair_uses_the_file_wide_name_precedence() -> None:
+    # One precedence rule for the file: ``tool_name`` wins over ``name``, as in
+    # _tool_search_reference_names. An entry carrying both keys is judged by
+    # ``tool_name``, so these two readers can never disagree about it.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": _TOOL_SEARCH_DEFAULT_NAME, "name": "Bash"},
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert repaired == [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    # Same answer from the history-side reader for the same entries.
+    assert _tool_search_reference_names(tools[1:]) == [_TOOL_SEARCH_DEFAULT_NAME, "Bash"]
+
+
+def test_reference_repair_registers_a_mechanism_named_by_tool_name() -> None:
+    # A mechanism shaped like a server-side block (``tool_name``, no ``name``)
+    # must still register, symmetric with the liberal reference matching.
+    tools = [
+        {"type": _TOOL_SEARCH_DEFAULT_TYPE, "tool_name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired
