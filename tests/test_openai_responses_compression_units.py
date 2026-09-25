@@ -220,11 +220,12 @@ def test_openai_responses_adapter_compresses_array_input_text_output():
     assert modified is True
     assert saved > 0
     output = new_payload["input"][0]["output"]
-    assert output[0]["text"] == metadata
-    assert output[1]["text"] == "custom output summary"
-    assert output[2] == image_part
+    assert output == [
+        {"type": "input_text", "text": "custom output summary"},
+        image_part,
+    ]
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
-    assert units_by_category == {"size_floor": 1, "applied": 1}
+    assert units_by_category == {"applied": 1}
     assert strategy_chain == []
 
 
@@ -270,7 +271,7 @@ def test_openai_responses_adapter_compresses_output_text_content_parts():
     assert strategy_chain == []
 
 
-def test_openai_responses_adapter_batches_small_outputs_once():
+def test_openai_responses_adapter_routes_small_outputs_independently():
     router = ContentRouter()
     calls: list[str] = []
     floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
@@ -311,8 +312,7 @@ def test_openai_responses_adapter_batches_small_outputs_once():
         )
     )
 
-    assert len(calls) == 1
-    assert all(output in calls[0] for output in outputs)
+    assert sorted(calls) == sorted(outputs)
     assert modified is True
     assert saved > 0
     assert attempted == 120
@@ -320,7 +320,106 @@ def test_openai_responses_adapter_batches_small_outputs_once():
     assert [item["output"] for item in new_payload["input"]] == ["x"] * 4
 
 
-def test_openai_responses_adapter_batches_small_array_parts_without_touching_images():
+def test_openai_responses_adapter_routes_small_outputs_independently_after_aggregate_floor():
+    router = ContentRouter()
+    calls: list[str] = []
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(f"unit{index}_{token}" for token in range(30)) for index in range(4)]
+    assert all(len(output.encode("utf-8")) < floor for output in outputs)
+    assert sum(len(output.encode("utf-8")) for output in outputs) >= floor
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        if "<headroom-batch-" in content:
+            return RouterCompressionResult(
+                compressed=content,
+                original=content,
+                strategy_used=CompressionStrategy.PASSTHROUGH,
+            )
+        return RouterCompressionResult(
+            compressed="x",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": f"c{index}",
+                "output": output,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, _, units_by_category, _, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_small_independent",
+        )
+    )
+
+    assert len(calls) == len(outputs)
+    assert modified is True
+    assert saved > 0
+    assert [item["output"] for item in new_payload["input"]] == ["x"] * len(outputs)
+    assert units_by_category == {"applied": len(outputs)}
+    assert attempted == sum(len(output.split()) for output in outputs)
+
+
+def test_openai_responses_adapter_uses_utf8_bytes_for_cjk_aggregate_floor():
+    router = ContentRouter()
+    calls: list[str] = []
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(["汉"] * 100), " ".join(["界"] * 100)]
+    assert all(len(output) < floor for output in outputs)
+    assert all(len(output.encode("utf-8")) < floor for output in outputs)
+    assert sum(len(output) for output in outputs) < floor
+    assert sum(len(output.encode("utf-8")) for output in outputs) >= floor
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="简",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"c{index}",
+                "output": output,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, _, units_by_category, _, _ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_cjk_aggregate_floor",
+        )
+    )
+
+    assert sorted(calls) == sorted(outputs)
+    assert modified is True
+    assert saved > 0
+    assert units_by_category == {"applied": len(outputs)}
+    assert [item["output"] for item in new_payload["input"]] == ["简"] * len(outputs)
+
+
+def test_openai_responses_adapter_compresses_small_array_parts_as_one_logical_output():
     router = ContentRouter()
     calls = {"count": 0}
 
@@ -344,9 +443,9 @@ def test_openai_responses_adapter_batches_small_array_parts_without_touching_ima
                 "output": [
                     {"type": "input_text", "text": "word " * 30},
                     image_part,
+                    {"type": "output_text", "text": "word " * 30},
                     {"type": "input_text", "text": "word " * 30},
-                    {"type": "input_text", "text": "word " * 30},
-                    {"type": "input_text", "text": "word " * 30},
+                    {"type": "output_text", "text": "word " * 30},
                 ],
             }
         ],
@@ -364,8 +463,61 @@ def test_openai_responses_adapter_batches_small_array_parts_without_touching_ima
     assert modified is True
     assert saved > 0
     output = new_payload["input"][0]["output"]
-    assert [output[index]["text"] for index in (0, 2, 3, 4)] == ["x"] * 4
-    assert output[1] == image_part
+    assert output == [
+        {"type": "input_text", "text": "x\nx\nx\nx"},
+        image_part,
+    ]
+
+
+def test_openai_responses_adapter_excludes_opaque_part_text_from_logical_output():
+    router = ContentRouter()
+    calls: list[str] = []
+    long_text = " ".join(f"word{index}" for index in range(180))
+    image_part = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,AA==",
+        "text": "opaque image metadata",
+    }
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        return RouterCompressionResult(
+            compressed="summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [
+                    {"type": "input_text", "text": long_text},
+                    image_part,
+                ],
+            }
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_opaque_part_text",
+        )
+    )
+
+    assert calls == [long_text]
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["output"] == [
+        {"type": "input_text", "text": "summary"},
+        image_part,
+    ]
 
 
 def test_openai_responses_adapter_skips_under_floor_small_batch():
@@ -742,7 +894,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
             {
                 "type": "function_call_output",
                 "call_id": "call_1",
-                "output": [{"type": "output_text", "text": grep_out}],
+                "output": [{"type": "input_text", "text": grep_out}],
             },
         ],
     }
@@ -762,7 +914,7 @@ def test_openai_responses_adapter_losslessly_folds_excluded_output_content_parts
     # Output must remain a list (content-part array) — not replaced with a string
     assert isinstance(folded, list), f"expected list, got {type(folded).__name__}"
     assert len(folded) == 1
-    assert isinstance(folded[0], dict) and folded[0].get("type") == "output_text"
+    assert isinstance(folded[0], dict) and folded[0].get("type") == "input_text"
     assert len(folded[0]["text"]) < len(grep_out)
     assert search_unheading(folded[0]["text"]) == grep_out
 
@@ -1088,7 +1240,7 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
     assert any(t.startswith("router:openai:responses:") for t in transforms)
 
 
-def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
+def test_openai_responses_adapter_routes_small_tool_outputs_after_aggregate_floor():
     """Regression for #2050: many individually-small tool outputs whose combined
     size clears the floor must still reach the router.
 
@@ -1144,8 +1296,7 @@ def test_openai_responses_adapter_batches_small_tool_outputs_before_floor():
         )
     )
 
-    assert len(calls) == 1
-    assert all(output in calls[0] for output in outputs)
+    assert sorted(calls) == sorted(outputs)
     assert modified is True
     assert saved > 0
     # No unit should be size-floored; every extracted unit is compressed.
