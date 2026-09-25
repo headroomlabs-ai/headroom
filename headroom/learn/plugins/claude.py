@@ -88,9 +88,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                 if _path_exists(claude_md):
                     context_file = claude_md
 
+            # `entry` itself stats fine (its parent is ours) but a project dir
+            # left behind by a root-run session is not traversable, so stat-ing
+            # anything under it raises PermissionError. Treat that as absent.
             memory_dir = entry / "memory"
-            memory_file = memory_dir / "MEMORY.md" if memory_dir.exists() else None
-            if memory_file and not memory_file.exists():
+            memory_file = memory_dir / "MEMORY.md" if _path_exists(memory_dir) else None
+            if memory_file and not _path_exists(memory_file):
                 memory_file = None
 
             jsonl_files = list(entry.glob("*.jsonl"))

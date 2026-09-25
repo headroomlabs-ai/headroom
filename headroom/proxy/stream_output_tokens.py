@@ -123,15 +123,88 @@ def extract_stream_text(sse: str) -> str:
     return "".join(parts)
 
 
-def estimate_output_tokens(*, sse_text: str, total_bytes: int) -> tuple[int, str]:
+# Terminal stop reasons that mean "the output-token ceiling cut this turn off".
+# Anthropic messages say ``max_tokens``; OpenAI chat completions say ``length``.
+_CEILING_STOP_REASONS = frozenset({"max_tokens", "length", "max_output_tokens"})
+
+# Request fields that carry that ceiling, per surface. All three are denominated
+# in OUTPUT tokens (reasoning included, where a model emits it), which is what
+# makes the ceiling an exact count rather than a lower bound.
+_CEILING_FIELDS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def _hit_output_ceiling(sse_text: str) -> bool:
+    """Whether the stream ended because it hit the request's output ceiling."""
+    for obj in _iter_sse_payloads(sse_text):
+        if not isinstance(obj, dict):
+            continue
+
+        # OpenAI chat completions — choices[].finish_reason
+        choices = obj.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if isinstance(choice, dict) and choice.get("finish_reason") in (
+                    _CEILING_STOP_REASONS
+                ):
+                    return True
+            continue
+
+        # Anthropic messages — message_delta.delta.stop_reason
+        delta = obj.get("delta")
+        if isinstance(delta, dict) and delta.get("stop_reason") in _CEILING_STOP_REASONS:
+            return True
+
+        # OpenAI responses — response.incomplete_details.reason
+        response = obj.get("response")
+        if isinstance(response, dict):
+            details = response.get("incomplete_details")
+            if isinstance(details, dict) and details.get("reason") in _CEILING_STOP_REASONS:
+                return True
+    return False
+
+
+def _requested_ceiling(body: Any) -> int | None:
+    """The output-token ceiling the request asked for, or ``None``."""
+    if not isinstance(body, dict):
+        return None
+    for field in _CEILING_FIELDS:
+        value = body.get(field)
+        # bool is an int subclass and would sail through as 0/1.
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def estimate_output_tokens(*, sse_text: str, total_bytes: int, body: Any = None) -> tuple[int, str]:
     """Return ``(tokens, source)`` for a stream with no provider usage chunk.
 
     ``source`` names which rung of the ladder produced the number so the caller
     can log it honestly rather than implying the provider reported it:
 
+    * ``exact_ceiling``   — the turn hit its output-token ceiling (exact)
     * ``estimated_text``  — counted from the generated text (good)
     * ``estimated_bytes`` — the raw-wire fallback (poor, last resort)
+
+    The top rung exists because counting the stream's text is catastrophically
+    wrong for exactly one shape of turn: a TOOL CALL cut off by ``max_tokens``.
+    The arguments stream as ``input_json_delta`` fragments, and an upstream that
+    stops mid-object drops the incomplete remainder rather than emit unparseable
+    JSON — while still billing every token it generated. Measured against
+    Anthropic: a turn billed 1500 output tokens left ~45 characters of
+    recoverable text, which the text rung reads as ~11 tokens. A 100x
+    under-count, landing on the most expensive turns there are.
+
+    Nothing needs estimating there. The ceiling is denominated in output tokens,
+    so a turn that stopped *because* it hit the ceiling produced exactly that
+    many. ``body`` is the provider request as sent, so the value read here is
+    the ceiling the upstream actually enforced — not whatever the client
+    originally asked for before the proxy's own levers touched it.
     """
+    if _hit_output_ceiling(sse_text):
+        ceiling = _requested_ceiling(body)
+        if ceiling is not None:
+            return ceiling, "exact_ceiling"
+
     text = extract_stream_text(sse_text)
     if text:
         # At least one token for any non-empty answer: integer division would

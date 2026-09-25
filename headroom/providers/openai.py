@@ -109,9 +109,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o3-mini": 200000,
     "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
-    # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
-    # aliases). LiteLLM lookup is still attempted first in get_context_limit;
-    # these are the manual fallback when LiteLLM doesn't know the model.
+    # against api-docs.deepseek.com (V4.1-Flash / V4-Pro-0813) and LiteLLM
+    # model_cost (deprecated aliases). LiteLLM lookup is still attempted first in
+    # get_context_limit; these are the manual fallback when LiteLLM doesn't know
+    # the model.
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v3.2": 128_000,

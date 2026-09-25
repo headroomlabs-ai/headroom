@@ -60,7 +60,8 @@ def _capture_headroom_retrieve_events():
         logger.setLevel(previous_level)
 
 
-def test_retrieve_logs_payload_preview():
+def test_retrieve_logs_payload_preview(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="secret-ish payload for operator debugging",
@@ -85,7 +86,8 @@ def test_retrieve_logs_payload_preview():
     assert events[0]["tool_name"] == "tool_a"
 
 
-def test_retrieve_log_redacts_secret_payload_values():
+def test_retrieve_log_redacts_secret_payload_values(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HEADROOM_LOG_PAYLOAD_PREVIEW", "1")
     store = CompressionStore(enable_feedback=False)
     hash_key = store.store(
         original="OPENAI_API_KEY=sk-proj-secret1234567890 Authorization: Bearer token123456789",

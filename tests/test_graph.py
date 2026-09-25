@@ -65,6 +65,7 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
     installed = tmp_path / installer.CBM_BIN_NAME
     installed.write_text("bin")
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
+    monkeypatch.setattr(installer.platform, "system", lambda: "Linux")
     monkeypatch.setattr(installer.shutil, "which", lambda name: str(on_path))
     assert installer.get_cbm_path() == on_path
 

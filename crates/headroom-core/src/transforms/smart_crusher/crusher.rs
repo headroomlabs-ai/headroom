@@ -595,20 +595,31 @@ impl SmartCrusher {
                             let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                             let (crushed, strategy) = crush_string_array(&strs, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            let crushed_values: Vec<Value> =
+                            let mut crushed_values: Vec<Value> =
                                 crushed.into_iter().map(Value::String).collect();
+                            // #3650: dropped strings get a retrievable
+                            // sentinel — silent truncation is a data-loss
+                            // bug even when the marker gate is on.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
                             return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::NumberArray => {
                             let (crushed, strategy) = crush_number_array(arr, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            // #3650: same sentinel contract as StringArray.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::MixedArray => {
                             let (crushed, strategy) =
                                 self.crush_mixed_array(arr, query_context, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            // #3650: same sentinel contract as the
+                            // StringArray/NumberArray arms.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         // NestedArray, BoolArray, Empty → fall through
                         // to recursive descent.
@@ -1107,6 +1118,30 @@ impl SmartCrusher {
         );
         (result, strategy)
     }
+
+    /// Appends a visible, retrievable CCR sentinel to `kept` when items were
+    /// dropped from `original` and the marker gate is on.
+    ///
+    /// Mirrors the dict-array path: the full original array is serialized
+    /// once (`canonical_array_json`), hashed with the shared
+    /// `hash_canonical` (SHA256, first 12 hex chars — the same scheme the
+    /// Python bridge and retrieval use), and stored in the CCR store so
+    /// the marker round-trips through retrieval. No-op when nothing was
+    /// dropped or `enable_ccr_marker` is false.
+    fn append_scalar_drop_sentinel(&self, kept: &mut Vec<Value>, original: &[Value]) {
+        let dropped = original.len().saturating_sub(kept.len());
+        if dropped == 0 || !self.config.enable_ccr_marker {
+            return;
+        }
+        let canonical = canonical_array_json(original);
+        let hash = hash_canonical(&canonical);
+        if let Some(store) = &self.ccr_store {
+            store.put(&hash, &canonical);
+        }
+        kept.push(Value::String(format!(
+            "… {dropped} more items <<ccr:{hash} {dropped}_items_offloaded>>"
+        )));
+    }
 }
 
 // ---------- helpers ----------
@@ -1274,6 +1309,166 @@ fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Extracts the CCR hash from a scalar drop sentinel produced by
+    /// `append_scalar_drop_sentinel`.
+    fn scalar_sentinel_hash(s: &str) -> &str {
+        let start = s.find("<<ccr:").expect("sentinel must carry a CCR marker") + 6;
+        let end = s[start..].find(' ').expect("marker must have a tag") + start;
+        &s[start..end]
+    }
+
+    /// Crushes a JSON array string and returns the parsed compressed array.
+    fn crush_array_values(crusher: &SmartCrusher, items: &[Value]) -> Vec<Value> {
+        let out = crusher.crush(&serde_json::to_string(items).unwrap(), "", 1.0);
+        serde_json::from_str::<Value>(&out.compressed)
+            .expect("compressed output is JSON")
+            .as_array()
+            .expect("output stays an array")
+            .clone()
+    }
+
+    /// Looks up the stored original array for a sentinel's CCR hash.
+    fn stored_original(crusher: &SmartCrusher, sentinel: &str) -> Vec<Value> {
+        let hash = scalar_sentinel_hash(sentinel);
+        let raw = crusher
+            .ccr_store()
+            .and_then(|store| store.get(hash))
+            .expect("sentinel hash must be in the CCR store");
+        serde_json::from_str(&raw).expect("stored payload is a JSON array")
+    }
+
+    // Regression tests for headroomlabs-ai/headroom#3650: scalar
+    // (string/number/mixed) array crushers dropped items silently. They
+    // must now emit a visible, retrievable CCR sentinel.
+
+    #[test]
+    fn string_array_drops_emit_retrievable_sentinel() {
+        // The issue's repro shape: 120 short slugs.
+        let items: Vec<Value> = (0..120).map(|i| json!(format!("r{i}"))).collect();
+        let config = SmartCrusherConfig {
+            enable_ccr_marker: true,
+            ..Default::default()
+        };
+        let crusher = SmartCrusher::new(config);
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item string array"
+        );
+        let sentinel = kept
+            .last()
+            .and_then(|v| v.as_str())
+            .expect("last element is the string sentinel");
+        assert!(
+            sentinel.starts_with(&format!("… {dropped} more items ")),
+            "sentinel shows the visible drop count, got: {sentinel}"
+        );
+        assert!(
+            sentinel.contains("<<ccr:")
+                && sentinel.ends_with(&format!("{dropped}_items_offloaded>>")),
+            "sentinel carries a CCR marker, got: {sentinel}"
+        );
+        // The marker hash must retrieve the FULL original array.
+        let stored = stored_original(&crusher, sentinel);
+        assert_eq!(stored.len(), 120);
+        assert_eq!(stored[119], json!("r119"));
+    }
+
+    #[test]
+    fn string_array_sentinel_suppressed_when_marker_gate_off() {
+        let items: Vec<Value> = (0..120).map(|i| json!(format!("r{i}"))).collect();
+        let config = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..Default::default()
+        };
+        let crusher = SmartCrusher::new(config);
+
+        let kept = crush_array_values(&crusher, &items);
+        assert!(
+            !kept
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("<<ccr:"))),
+            "no sentinel when the marker gate is off"
+        );
+    }
+
+    #[test]
+    fn string_array_no_sentinel_when_nothing_dropped() {
+        let items: Vec<Value> = (0..5).map(|i| json!(format!("r{i}"))).collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        assert_eq!(kept.len(), items.len());
+        assert!(
+            !kept
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("<<ccr:"))),
+            "no sentinel when nothing was dropped"
+        );
+    }
+
+    #[test]
+    fn number_array_drops_emit_retrievable_sentinel() {
+        let items: Vec<Value> = (0..120).map(|i| json!(i)).collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item number array"
+        );
+        let sentinel = kept
+            .last()
+            .and_then(|v| v.as_str())
+            .expect("last element is the string sentinel");
+        assert!(sentinel.starts_with(&format!("… {dropped} more items ")));
+        let stored = stored_original(&crusher, sentinel);
+        assert_eq!(stored.len(), 120);
+    }
+
+    #[test]
+    fn mixed_array_drops_emit_single_sentinel() {
+        let items: Vec<Value> = (0..120)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!(format!("entry-{i}"))
+                } else {
+                    json!(i)
+                }
+            })
+            .collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item mixed array"
+        );
+        let sentinels: Vec<&str> = kept
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| s.contains("_items_offloaded>>"))
+            .collect();
+        assert_eq!(
+            sentinels.len(),
+            1,
+            "exactly one sentinel, got {sentinels:?}"
+        );
+        assert!(sentinels[0].starts_with(&format!("… {dropped} more items ")));
+        let stored = stored_original(&crusher, sentinels[0]);
+        assert_eq!(stored.len(), 120);
+    }
 
     #[test]
     fn default_crush_ignores_opt_in_prose_hook() {

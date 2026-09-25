@@ -153,7 +153,13 @@ from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
 from headroom.proxy.model_router import ModelRouter, ModelRouterConfig
-from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
+from headroom.proxy.models import (  # noqa: F401
+    CacheEntry,
+    ProxyConfig,
+    RateLimitState,
+    RequestLog,
+    default_periodic_malloc_trim,
+)
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
     PROXY_MODE_TOKEN,
@@ -173,6 +179,7 @@ from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
+from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
@@ -183,7 +190,7 @@ from headroom.subscription.tracker import (
     get_subscription_tracker,
 )
 from headroom.telemetry import get_telemetry_collector
-from headroom.telemetry.beacon import is_telemetry_enabled
+from headroom.telemetry.beacon import is_beacon_enabled, is_telemetry_enabled
 from headroom.telemetry.toin import get_toin
 from headroom.transforms import (
     CacheAligner,
@@ -1955,11 +1962,23 @@ class HeadroomProxy(
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
         _verify = build_httpx_verify()
         _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
-        self.http_client = httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        # `install_upstream_pinning` is what makes the SSRF guard's verdict
+        # binding: a caller-supplied upstream that passed `is_safe_upstream_url`
+        # is dialled at the address that was checked, instead of being resolved
+        # a second time here (DNS rebinding). It swaps the pool's DNS layer for
+        # direct routes, and refuses guarded upstreams on routes that cannot
+        # honour a pin at all — a proxy resolves the target itself, on its own
+        # network. Operator-configured upstreams have no pin and are untouched,
+        # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
+        self.http_client = install_upstream_pinning(
+            httpx.AsyncClient(http2=_http2, **_client_kwargs)
+        )
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
-            self.http_client if not _http2 else httpx.AsyncClient(http2=False, **_client_kwargs)
+            self.http_client
+            if not _http2
+            else install_upstream_pinning(httpx.AsyncClient(http2=False, **_client_kwargs))
         )
         logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -2197,9 +2216,13 @@ class HeadroomProxy(
             )
 
         # Log local telemetry status so operators can see it in the log stream.
-        # Nothing is sent externally — telemetry is collected locally only (the
-        # anonymous telemetry beacon was removed); operational metrics export
-        # only to your own OTEL collector via HEADROOM_OTEL_METRICS_*.
+        # This is HEADROOM_TELEMETRY only (local aggregate stats; nothing
+        # sent externally). It is NOT a statement about the anonymous upload
+        # beacon (HEADROOM_BEACON), which is a separate, ON-by-default switch
+        # (telemetry/beacon.py) still present in this codebase — the previous
+        # wording here ("the anonymous telemetry beacon was removed") was
+        # false and predates this fix. See is_beacon_enabled() below for the
+        # accurate beacon-shipping status.
         if is_telemetry_enabled():
             logger.info(
                 "Local telemetry: ENABLED (aggregate stats, local only — nothing sent "
@@ -2210,6 +2233,13 @@ class HeadroomProxy(
                 "Local telemetry: DISABLED (off by default — opt in: "
                 "HEADROOM_TELEMETRY=on or --telemetry)"
             )
+        if is_beacon_enabled():
+            logger.info(
+                "Anonymous upload beacon: ENABLED (default — session summaries are sent to "
+                "Headroom Labs). Opt out: HEADROOM_BEACON=off or DO_NOT_TRACK=1"
+            )
+        else:
+            logger.info("Anonymous upload beacon: DISABLED")
 
         self.pipeline_extensions.emit(
             PipelineStage.POST_START,
@@ -3838,8 +3868,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.debug_introspection import (
         collect_tasks as _collect_tasks,
     )
-    from headroom.proxy.loopback_guard import require_loopback as _require_loopback
-    from headroom.proxy.loopback_guard import require_same_origin as _require_same_origin
+    from headroom.proxy.loopback_guard import (
+        require_loopback as _require_loopback,
+    )
+    from headroom.proxy.loopback_guard import (
+        require_loopback_or_container_gateway as _require_loopback_or_container_gateway,
+    )
+    from headroom.proxy.loopback_guard import (
+        require_same_origin as _require_same_origin,
+    )
 
     def _require_loopback_or_trusted_dashboard_client(request: Request) -> None:
         """Allow loopback callers, or gateway-forwarded dashboard clients.
@@ -4390,9 +4427,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # any power over. Tokens Headroom removed never reached the
         # provider at all, so they're added back to form the baseline.
         _pc_totals = prefix_cache_stats.get("totals", {})
-        new_input_tokens = int(_pc_totals.get("uncached_input_tokens", 0) or 0) + int(
-            _pc_totals.get("cache_write_tokens", 0) or 0
-        )
+        new_input_tokens = int(_pc_totals.get("new_input_tokens", 0) or 0)
+        # Paired numerator: savings from the SAME requests that supplied the
+        # denominator, accumulated on one predicate in record_request.
+        # tokens_saved_total also counts requests with no usage breakdown
+        # (Bedrock, MCP tools), which would lend savings to a denominator they
+        # never entered: one qualified request at 50 percent plus one
+        # unqualified 10,000-token saving read as 99 percent.
+        new_input_saved_tokens = int(_pc_totals.get("new_input_saved_tokens", 0) or 0)
 
         # Build human-readable summary
         summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
@@ -4645,14 +4687,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # 200x into the denominator and long-running sessions
                 # (1M-context models never compact) read as ~0% no
                 # matter how well compression performs on new content.
-                # Guarded on new_input_tokens > 0 (not the full sum): the
-                # cache accumulators only see requests with cache
-                # activity, so a deployment with no cache metrics (e.g.
-                # Bedrock) would otherwise divide savings by themselves
-                # and report ~100%. No usage data -> report 0, not a lie.
+                # Guarded on new_input_tokens > 0 (not the full sum): a
+                # deployment that reports no usage breakdown at all (e.g.
+                # Bedrock) contributes to neither side, and would
+                # otherwise divide savings by themselves and report
+                # ~100%. No usage data -> report 0, not a lie. This is
+                # the same cohort `headroom savings` reports from the
+                # ledger, so the two figures cannot disagree.
                 "new_input_tokens": new_input_tokens,
                 "new_input_savings_percent": round(
-                    (proxy_compression_tokens / (new_input_tokens + proxy_compression_tokens) * 100)
+                    (new_input_saved_tokens / (new_input_tokens + new_input_saved_tokens) * 100)
                     if new_input_tokens > 0
                     else 0,
                     2,
@@ -4791,9 +4835,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # Per-language AST compression pauses. Empty on a healthy install;
             # non-empty is the explanation for a savings drop in one language.
             "code_syntax_breaker": _code_syntax_breaker_status(),
-            # Always False: the anonymous telemetry beacon was removed, so no
-            # telemetry is ever shipped externally (local collection only).
-            "anon_telemetry_shipping": False,
+            # Reflects the actual live state of the anonymous upload beacon
+            # (HEADROOM_BEACON, on by default — see telemetry/beacon.py).
+            # This field previously hardcoded False on the incorrect premise
+            # that the beacon had been removed from the codebase; it had not,
+            # so an operator polling /stats to confirm nothing ships
+            # externally was given a false assurance regardless of their
+            # actual HEADROOM_BEACON setting.
+            "anon_telemetry_shipping": is_beacon_enabled(),
             "telemetry": {
                 "enabled": telemetry_stats.get("enabled", False),
                 "total_compressions": telemetry_stats.get("total_compressions", 0),
@@ -5607,7 +5656,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _compress_dependencies = (
         []
         if _get_env_bool("HEADROOM_COMPRESS_ALLOW_REMOTE", False)
-        else [Depends(_require_loopback)]
+        else [Depends(_require_loopback_or_container_gateway)]
     )
 
     @app.post("/v1/compress", dependencies=_compress_dependencies)
@@ -5723,7 +5772,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         http_proxy=os.environ.get("HEADROOM_HTTP_PROXY") or None,
         periodic_toin_stats_enabled=_get_env_bool("HEADROOM_PERIODIC_TOIN_STATS", True),
         periodic_malloc_trim_enabled=_get_env_bool(
-            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+            "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         proxy_token=os.environ.get("HEADROOM_PROXY_TOKEN") or None,

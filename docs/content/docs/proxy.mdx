@@ -296,18 +296,43 @@ Rewrite the upstream model per request — for example, send small, tool-free ca
 | `--telemetry` / `HEADROOM_TELEMETRY` | off | **Local-only** usage stats for your own `/stats`, `/metrics`, and dashboard. Nothing leaves the machine. |
 | `--log-file` / `HEADROOM_LOG_FILE` | none | JSONL request/response log. |
 | `--log-messages` | `false` | Include full message bodies in the log (may contain sensitive data). |
+| `HEADROOM_LOG_PAYLOAD_PREVIEW` | `off` | Include up to 4 KB of the retrieved [CCR](/docs/ccr) payload in each `headroom_retrieve` line of the runtime log (`~/.headroom/logs/proxy-<port>.log`). Off by default: the payload is verbatim tool-result content and can carry source code, credentials the redactor does not recognize, or customer data; the log otherwise records byte counts only. Turn it on with `1`/`true`/`yes`/`on`. Do not share a log captured with this on. |
 | `HEADROOM_LOG_LEVEL` | `warning` | uvicorn's log level (`critical`, `error`, `warning`, `info`, `debug`, `trace`). Raise to `info` for the per-request access log when diagnosing a deployed proxy. An unrecognized value warns and falls back to `warning`. |
 | `HEADROOM_OTEL_METRICS_ENABLED` | `false` | Export OpenTelemetry metrics (`HEADROOM_OTEL_METRICS_ENDPOINT`, …). See [OTLP export](/docs/metrics#opentelemetry-otlp-export). |
 | `HEADROOM_LANGFUSE_ENABLED` | `false` | Emit Langfuse traces (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`). |
 
 See [Metrics](/docs/metrics) for the Prometheus and Grafana setup.
 
+#### Who can read the logs
+
+Headroom writes the runtime log (`~/.headroom/logs/proxy-<port>.log`) and, when
+`--log-file` is set, the JSONL request log. Both can hold request and response
+content — `--log-messages` bodies, wire-debug dumps, and CCR payload previews
+when they are enabled.
+
+- **Linux and macOS:** every log file Headroom creates is `0600`, owner-read/write
+  only, and so is every rotated backup (`proxy-8000.log.1`, …). This is not
+  conditional on which content switch is on. If the log path already exists as a
+  symlink, Headroom refuses to log rather than write through it, and says so.
+- **Windows:** **Headroom does not restrict the log file.** Read access on NTFS is
+  decided by the file's ACL; `chmod` there only toggles the read-only attribute,
+  and Python has no API for setting an ACL, so Headroom does not claim a
+  protection it cannot establish. The log inherits the ACL of the directory it
+  is written into, and the proxy logs a warning at startup saying so. Keep
+  `%USERPROFILE%\.headroom` (or your chosen `--log-file` path) off shared
+  volumes and out of directories with broadened permissions.
+
+A log shipper or sidecar running as a different user or group cannot read the
+runtime log on Linux/macOS. Run the collector as the same user, or copy the file
+with a privileged job.
+
+
 ### Security and networking
 
 | Flag / env | Default | Effect |
 |---|---|---|
 | `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
-| `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress). Required to run Headroom as a gateway/sidecar; without it remote callers get `404`. |
+| `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
@@ -435,7 +460,7 @@ If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTT
 <Callout type="warning" title="Loopback-only by default">
 This route is restricted to loopback callers and answers everyone else with **`404`**, not `403` — deliberately, so it stays invisible to external scanners. A gateway calling it from another host or pod therefore sees what looks like a missing route.
 
-Both the client IP and the inbound `Host:` header must name loopback. To allow remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set.
+Both the client IP and the inbound `Host:` header must name loopback. In container environments (Docker/Podman), requests forwarded from the container host gateway are also admitted under loopback `Host:` headers. To allow arbitrary remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set. The same policy applies to [`POST /v1/usage`](#relaying-provider-usage-post-v1usage).
 </Callout>
 
 #### Message format

@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from .lossless_compaction import _TIMESTAMP_ROW_RE
+
 
 class ContentType(Enum):
     """Types of content that can be compressed."""
@@ -167,6 +169,13 @@ _LOG_PATTERNS = [
     re.compile(r"^\s*at .+\) in .+:line \d+"),  # .NET frame with PDB info
     re.compile(r"^Caused by: "),  # Java exception chain head
     re.compile(r"^\s*\.\.\. \d+ more$"),  # Java elided-frames summary
+    # CMTrace record opener -- the log format SCCM, MDT and Intune Win32
+    # app/script deployments write on Windows. Every record is
+    # `<![LOG[message]LOG]!><time="..." date="..." ...>`, which matches none of
+    # the patterns above: the timestamp sits in an attribute *after* the
+    # message, so the anchored date/time/separator patterns cannot fire, and a
+    # record need not contain ERROR/WARN/INFO.
+    re.compile(r"^<!\[LOG\["),  # CMTrace (SCCM/Intune) log record
 ]
 
 
@@ -509,11 +518,20 @@ def _is_search_result_line(line: str) -> bool:
     a file path: no angle brackets and no ``=`` (rules out markup tags and
     ``key=value:12:`` log lines).
 
+    A timestamped log row is never grep output: since #3419 the lossless
+    fold skips those rows, so a payload classified as search here falls
+    through to the lossy SearchCompressor, which keeps 5 rows per "file"
+    and prints the minute back as an integer (#3736). Reject any line the
+    lossless fold already knows is a timestamp row, reusing the same regex
+    so the two guards cannot drift apart.
+
     ``grep -A``/``-B``/``-C`` context lines — both the real GNU shape
     (``path-NN-content``) and the reported ``path:NN-content`` shape — are
     accepted via the context predicates so code in them routes to the search
     compressor instead of the prose path (#3580).
     """
+    if _TIMESTAMP_ROW_RE.match(line):
+        return False
     if _SEARCH_RESULT_PATTERN.match(line) or _GREP_COLON_DASH_PATTERN.match(line):
         return _prefix_looks_like_path(line.split(":", 1)[0])
     return _is_grep_context_line(line)

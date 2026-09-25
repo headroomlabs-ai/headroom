@@ -368,6 +368,7 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
 def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
     router._runtime_force_kompress = True
+    monkeypatch.setattr(router, "_force_kompress_ready", lambda: True)
     pure_result = RouterCompressionResult(
         compressed="pure",
         original="pure",
@@ -2151,3 +2152,102 @@ def test_prompt_text_compresses_without_replay_guarantee(monkeypatch: pytest.Mon
         min_tokens_to_compress=1,
     )
     assert _TASK in calls
+
+
+def _html_doc_with_embedded_json(*, padded: bool = True) -> str:
+    """A whole HTML document with one embedded JSON array-of-objects.
+
+    The JSON sits in a single-line ``<script>`` so the mixed-content regex
+    heuristics do not fire: the block detects as pure HTML and takes the
+    ``_compress_pure`` path. ``padded`` keeps the default ``json.dumps``
+    separators so the array is minifiable — a compact array gives the JSON
+    route no benefit and both passes no-op.
+    """
+    rows = [
+        {
+            "id": i,
+            "name": f"item-{i}",
+            "tags": ["alpha", "beta"],
+            "score": i * 3,
+            "description": "a routine record with repeated descriptive fields",
+        }
+        for i in range(60)
+    ]
+    embedded = json.dumps(rows) if padded else json.dumps(rows, separators=(",", ":"))
+    paras = "".join(
+        f"<p>Paragraph {i}: distributed systems rely on consensus protocols to "
+        f"agree on state. Raft separates leader election from log replication, "
+        f"which makes it easier to reason about.</p>\n"
+        for i in range(30)
+    )
+    return (
+        "<!DOCTYPE html>\n<html><head><title>Raft Notes</title></head>\n<body>\n"
+        "<article><h1>Raft consensus notes</h1>\n"
+        + paras
+        + '<script type="application/json">'
+        + embedded
+        + "</script>\n"
+        + paras
+        + "</article>\n</body></html>\n"
+    )
+
+
+def test_html_with_embedded_json_runs_extractor_not_json_shortcut() -> None:
+    """#3609: the embedded-JSON pre-pass must not short-circuit HTML extraction.
+
+    Before the fix, a small local JSON minify (~10% win) returned immediately
+    from ``_apply_strategy_to_content`` and whole-document extraction (~36%
+    win on this document) never ran; the issue reported the same shape at
+    2% vs 95.5%. The splice is now deferred for HTML: extraction gets first
+    refusal and the JSON route only fires when extraction finds nothing.
+    """
+    pytest.importorskip("trafilatura")
+    doc = _html_doc_with_embedded_json()
+    assert _detect_content(doc).content_type is ContentType.HTML
+    assert not is_mixed_content(doc)
+
+    result = ContentRouter().compress(doc)
+
+    assert result.strategy_used is CompressionStrategy.HTML
+    assert result.strategy_chain == ["html"]
+    # extraction ran: markup is gone and the document collapsed hard
+    # (the pre-fix JSON shortcut left <html> in place at ~10% reduction)
+    assert "<html>" not in result.compressed
+    assert len(result.compressed) < len(doc) * 3 // 5
+
+
+def test_html_extraction_miss_still_gets_deferred_json_splice() -> None:
+    """Deferring must not LOSE the embedded-JSON win when extraction finds nothing.
+
+    A shell-only HTML document makes the extractor come back empty; the
+    deferred splice then still compresses the embedded array. Before the fix
+    this shape short-circuited at the top (chain ``["embedded_json"]``); now
+    the block first proves the HTML strategy is a miss (chain
+    ``["html", "embedded_json"]``) with the same spliced output.
+    """
+    pytest.importorskip("trafilatura")
+    embedded = json.dumps(
+        [
+            {"id": i, "name": f"item-{i}", "tags": ["alpha", "beta"], "score": i * 3}
+            for i in range(40)
+        ]
+    )
+    shell = (
+        "<!DOCTYPE html>\n<html><head><title>t</title></head>\n<body>\n"
+        '<script type="application/json">' + embedded + "</script>\n"
+        "</body></html>\n"
+    )
+    router = ContentRouter()
+    # sanity: extraction finds nothing on this shell (empty or None)
+    extractor = router._get_html_extractor()
+    assert extractor is not None
+    assert not (extractor.extract(shell).extracted or "").strip()
+
+    text, _tokens, chain = router._apply_strategy_to_content(
+        shell, CompressionStrategy.HTML, "", None, 1.0
+    )
+
+    assert chain == ["html", "embedded_json"]
+    assert len(text) < len(shell)
+    json_marker = '"id":'
+    assert json_marker not in text  # the array was compressed away

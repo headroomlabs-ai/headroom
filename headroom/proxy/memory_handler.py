@@ -675,6 +675,21 @@ class MemoryHandler:
         return self._backend, scope, composed
 
     @staticmethod
+    def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
+        if (
+            scope is not None
+            and scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+        ):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Memory operation refused because the project could not be resolved",
+                }
+            )
+        return None
+
+    @staticmethod
     def _format_memory_block_header(scope: ResolvedScope | None) -> str:
         """Workspace / scope provenance header for the injected memory block.
 
@@ -1239,6 +1254,8 @@ your responses, not to drive new actions."""
         extracted_relationships = input_data.get("extracted_relationships")
 
         backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(scope):
+            return error
 
         # Agent provenance metadata. Workspace lineage is recorded on
         # the memory itself so cross-project leaks (if any ever
@@ -1332,6 +1349,8 @@ your responses, not to drive new actions."""
         entities_filter = input_data.get("entities")
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         results = await backend.search_memories(
             query=query,
@@ -1388,6 +1407,8 @@ your responses, not to drive new actions."""
         }
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Check if backend has update_memory method
         if hasattr(backend, "update_memory"):
@@ -1448,6 +1469,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
         backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
         deleted = await backend.delete_memory(memory_id)
 
         return json.dumps(
@@ -1486,6 +1509,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "Memory backend not initialized"})
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Prefer a native list_memories if the backend has one (LocalBackend
         # does); fall back to a recency-keyed search when not available.

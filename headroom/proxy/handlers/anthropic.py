@@ -1032,7 +1032,6 @@ class AnthropicHandlerMixin:
             # Check request body size
             content_length = request.headers.get("content-length")
             if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
-                await _finalize_pre_upstream()
                 return JSONResponse(
                     status_code=413,
                     content={
@@ -1055,7 +1054,6 @@ class AnthropicHandlerMixin:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
             except (json.JSONDecodeError, ValueError) as e:
-                await _finalize_pre_upstream()
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -1132,7 +1130,6 @@ class AnthropicHandlerMixin:
 
             # Validate message array size
             if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
-                await _finalize_pre_upstream()
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -1424,9 +1421,6 @@ class AnthropicHandlerMixin:
                         f"hits={cached.hit_count}"
                     )
 
-                    # Unit 4: release the pre-upstream semaphore on cache
-                    # hit — no upstream call will happen.
-                    await _finalize_pre_upstream()
                     return Response(
                         content=cached.response_body,
                         headers=response_headers,
@@ -1455,9 +1449,6 @@ class AnthropicHandlerMixin:
                     if hasattr(e, "reason"):
                         from fastapi.responses import JSONResponse as _JSONResp
 
-                        # Unit 4: release the pre-upstream semaphore on
-                        # security block — no upstream call will happen.
-                        await _finalize_pre_upstream()
                         return _JSONResp(
                             status_code=403,
                             content={
@@ -1739,6 +1730,16 @@ class AnthropicHandlerMixin:
                         if self.config.hooks and _hook_ctx is not None
                         else None
                     )
+                    # Hard per-message veto. Separate from ``biases`` because a
+                    # bias is a soft multiplier that several strategies clamp or
+                    # ignore, so it cannot express "leave this one alone".
+                    from headroom.hooks import collect_protected
+
+                    protect = (
+                        collect_protected(self.config.hooks, messages, _hook_ctx)
+                        if self.config.hooks and _hook_ctx is not None
+                        else None
+                    )
 
                     # F2.1 c5/5: derive the per-request CompressionPolicy
                     # from the auth_mode classified at request entry. The
@@ -1807,6 +1808,7 @@ class AnthropicHandlerMixin:
                                     prefix_replay_guaranteed=True,
                                     idle_seconds=idle_seconds,
                                     biases=biases,
+                                    protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
@@ -1853,6 +1855,7 @@ class AnthropicHandlerMixin:
                                             prefix_replay_guaranteed=True,
                                             idle_seconds=idle_seconds,
                                             biases=biases,
+                                            protect=protect,
                                             request_id=request_id,
                                             compression_policy=compression_policy,
                                             cache_ttl_seconds=_cc_ttl,
@@ -1905,6 +1908,7 @@ class AnthropicHandlerMixin:
                                         prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
@@ -1948,6 +1952,7 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     prefix_replay_guaranteed=True,
                                     biases=biases,
+                                    protect=protect,
                                     request_id=request_id,
                                     compression_policy=compression_policy,
                                     cache_ttl_seconds=_cc_ttl,
@@ -2010,6 +2015,7 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=frozen_message_count,
                                         prefix_replay_guaranteed=True,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         **proxy_pipeline_kwargs(self.config),
@@ -2082,6 +2088,7 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=prefix_n,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
+                                        protect=protect,
                                         request_id=request_id,
                                         compression_policy=compression_policy,
                                         cache_ttl_seconds=_cc_ttl,
@@ -2953,15 +2960,15 @@ class AnthropicHandlerMixin:
                             model=model,
                             request_id=request_id,
                         )
-                    if _sys_modified:
-                        transforms_applied.append("anthropic:system_prompt_compaction")
-                        logger.debug(
-                            "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
-                            request_id,
-                            _sys_before,
-                            _sys_after,
-                            (1 - _sys_after / max(_sys_before, 1)) * 100,
-                        )
+                        if _sys_modified:
+                            transforms_applied.append("anthropic:system_prompt_compaction")
+                            logger.debug(
+                                "[%s] system prompt compaction: %d -> %d bytes (%.0f%% saved)",
+                                request_id,
+                                _sys_before,
+                                _sys_after,
+                                (1 - _sys_after / max(_sys_before, 1)) * 100,
+                            )
             except Exception as _sys_compaction_exc:
                 _sys_modified = False
                 logger.warning(
@@ -3667,8 +3674,6 @@ class AnthropicHandlerMixin:
                         )
                 except Exception as e:
                     logger.error(f"[{request_id}] Bedrock backend error: {e}")
-                    # Unit 4: release the pre-upstream semaphore on error.
-                    await _finalize_pre_upstream()
                     return JSONResponse(
                         status_code=500,
                         content={
@@ -4155,9 +4160,13 @@ class AnthropicHandlerMixin:
                         # ``stream`` is what the *client* asked for, not what
                         # went upstream: a buffered CCR turn deliberately
                         # requests JSON on behalf of a streaming client and
-                        # re-emits SSE further down, and must keep doing so.
+                        # re-emits SSE further down. That same flip means the
+                        # upstream's stream contract is JSON, so its SSE reply
+                        # must still be reconstructed before CCR processing;
+                        # otherwise a keepalive-only stream can be relayed as a
+                        # successful but contentless response (#3266).
                         if should_recover_sse_reply(
-                            client_requested_stream=bool(stream),
+                            client_requested_stream=bool(stream and not buffered_stream_ccr),
                             status_code=response.status_code,
                             content_type=response.headers.get("content-type"),
                             body_is_event_stream=_looks_like_sse_response(response),
@@ -5015,12 +5024,6 @@ class AnthropicHandlerMixin:
                 await self.metrics.record_failed(provider=provider_name)
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
-
-                # Try fallback if enabled
-                if self.config.fallback_enabled and self.config.fallback_provider == "openai":
-                    logger.info(f"[{request_id}] Attempting fallback to OpenAI")
-                    # Convert to OpenAI format and retry
-                    # (simplified - would need message format conversion)
 
                 # Return sanitized error message to client (don't expose internal details)
                 return JSONResponse(

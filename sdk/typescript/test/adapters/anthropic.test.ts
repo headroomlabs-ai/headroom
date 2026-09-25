@@ -190,6 +190,140 @@ describe("withHeadroom (Anthropic)", () => {
     expect(createArgs.messages.length).toBeGreaterThan(0);
   });
 
+  it("preserves image blocks instead of dropping them during compression", async () => {
+    mockFetch.mockResolvedValueOnce(mockCompressSuccess());
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAAA" },
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    });
+
+    // The image must not be silently dropped from the compression request.
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.messages).toHaveLength(1);
+    expect(body.messages[0].content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ]);
+  });
+
+  it("converts a retained image_url back to an Anthropic image block for the final messages.create call (image-only turn)", async () => {
+    // Proxy retains the image through compression (successful-compression path).
+    mockFetch.mockResolvedValueOnce(
+      mockCompressSuccess([
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+      ]),
+    );
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAAA" },
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    });
+
+    expect(mockCreate).toHaveBeenCalledOnce();
+    const createArgs = mockCreate.mock.calls[0][0];
+    expect(createArgs.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+        ],
+      },
+    ]);
+  });
+
+  it("converts a retained mixed text/image turn back to Anthropic blocks, order preserved, for the final messages.create call", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockCompressSuccess([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } },
+          ],
+        },
+      ]),
+    );
+
+    const mockCreate = vi.fn().mockResolvedValue({});
+    const fakeClient = { messages: { create: mockCreate } };
+
+    const wrapped = withHeadroom(fakeClient as any, {
+      baseUrl: "http://localhost:8787",
+    });
+
+    await wrapped.messages.create({
+      model: "claude-sonnet-4-5-20250929",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this?" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/jpeg", data: "BBBB" },
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    });
+
+    expect(mockCreate).toHaveBeenCalledOnce();
+    const createArgs = mockCreate.mock.calls[0][0];
+    expect(createArgs.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "BBBB" } },
+        ],
+      },
+    ]);
+  });
+
   it("returns original messages on compression fallback", async () => {
     // Simulate proxy unreachable
     mockFetch.mockRejectedValueOnce(new TypeError("fetch failed"));

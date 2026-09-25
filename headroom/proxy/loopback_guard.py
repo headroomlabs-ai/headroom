@@ -40,6 +40,9 @@ CSRF / DNS-rebinding guidance and the standard Starlette
 from __future__ import annotations
 
 import ipaddress
+import os
+import socket
+import struct
 
 try:
     from fastapi import HTTPException, Request
@@ -50,10 +53,14 @@ except ImportError:  # pragma: no cover - fastapi is a hard dep in practice
 
 __all__ = [
     "LOOPBACK_HOSTS",
+    "get_container_host_gateway",
+    "is_container_environment",
+    "is_container_host_gateway",
     "is_ip_literal_host_header",
     "is_loopback_host",
     "is_loopback_host_header",
     "require_loopback",
+    "require_loopback_or_container_gateway",
     "require_same_origin",
 ]
 
@@ -207,6 +214,125 @@ def require_loopback(request: Request) -> None:  # type: ignore[valid-type]
         # Manual ``Request`` stub with no ``headers`` attribute — used
         # by older unit tests that pre-date this gate. Treat the same
         # way as the IP-only path did and accept.
+        return
+    try:
+        host_header = headers.get("host")
+    except AttributeError:
+        host_header = None
+    if not is_loopback_host_header(host_header):
+        raise HTTPException(status_code=404)
+
+
+def is_container_environment() -> bool:
+    """Return True if running inside a container or containerized deployment."""
+    if os.environ.get("HEADROOM_CONTAINER_HOST_GATEWAY"):
+        return True
+    if os.environ.get("HEADROOM_DEPLOYMENT_RUNTIME") in ("docker", "podman", "container"):
+        return True
+    if os.environ.get("HEADROOM_DEPLOYMENT_PRESET") == "persistent-docker":
+        return True
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+            if any(marker in content for marker in ("docker", "containerd", "kubepods", "libpod")):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _read_linux_default_gateway() -> str | None:
+    """Read the default IPv4 gateway address from /proc/net/route."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as f:
+            for line in f:
+                fields = line.strip().split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    gw_hex = fields[2]
+                    if len(gw_hex) == 8:
+                        gw_int = int(gw_hex, 16)
+                        if gw_int != 0:
+                            return socket.inet_ntoa(struct.pack("<L", gw_int))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_container_host_gateway() -> str | None:
+    """Return the container host gateway IP if running in a container.
+
+    Checks ``HEADROOM_CONTAINER_HOST_GATEWAY`` first, and falls back to
+    resolving the default gateway from ``/proc/net/route`` when running
+    inside a container environment. Returns None when not in a container or
+    if no gateway can be determined.
+    """
+    env_gw = os.environ.get("HEADROOM_CONTAINER_HOST_GATEWAY")
+    if env_gw:
+        env_gw = env_gw.strip()
+        if env_gw:
+            return env_gw
+    if not is_container_environment():
+        return None
+    return _read_linux_default_gateway()
+
+
+def _normalize_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def is_container_host_gateway(host: str | None) -> bool:
+    """Return True if ``host`` matches the container host gateway IP.
+
+    Always returns False if not in a container environment or if ``host``
+    is empty. Correctly handles IPv4-mapped IPv6 addresses (e.g.
+    ``::ffff:172.17.0.1``).
+    """
+    if not host or not is_container_environment():
+        return False
+    gateway = get_container_host_gateway()
+    if not gateway:
+        return False
+    parsed_host = _normalize_ip(host)
+    parsed_gw = _normalize_ip(gateway)
+    if parsed_host is not None and parsed_gw is not None:
+        return parsed_host == parsed_gw
+    return host.strip() == gateway.strip()
+
+
+def require_loopback_or_container_gateway(request: Request) -> None:  # type: ignore[valid-type]
+    """FastAPI dependency: allow loopback callers or container host gateway.
+
+    Used by routes like ``/v1/compress`` and ``/v1/usage``. When running inside
+    a container environment (Docker / Podman), incoming host traffic forwarded
+    over the container bridge arrives with the host gateway IP (e.g. 172.17.0.1)
+    rather than a loopback interface.
+
+    Enforces two gates:
+    1. Client address must be either loopback (:func:`is_loopback_host`) or
+       the container host default gateway (:func:`is_container_host_gateway`).
+       Arbitrary peer containers on the same bridge network are rejected.
+    2. The inbound ``Host:`` header must name a loopback host
+       (:func:`is_loopback_host_header`). This blocks DNS-rebinding attacks and
+       rejects callers addressing the container's bridge IP or hostname directly.
+    """
+    if HTTPException is None:  # pragma: no cover - defensive
+        raise RuntimeError("FastAPI is required for the loopback guard")
+
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None) if client is not None else None
+    if not (is_loopback_host(host) or is_container_host_gateway(host)):
+        raise HTTPException(status_code=404)
+
+    headers = getattr(request, "headers", None)
+    if headers is None:
         return
     try:
         host_header = headers.get("host")

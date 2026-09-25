@@ -969,13 +969,20 @@ class StreamingMixin:
             output_tokens, output_tokens_source = estimate_output_tokens(
                 sse_text=full_sse_data,
                 total_bytes=stream_state["total_bytes"],
+                # The provider body as sent, so a turn stopped by its output
+                # ceiling can be counted exactly instead of estimated. Matters
+                # most for a tool call truncated mid-arguments, whose dropped
+                # JSON leaves almost no text to count.
+                body=body,
             )
             # Name the actual basis. The old message always said "from N bytes"
             # even though that is now only true for the fallback rung, and an
             # operator reading it needs to know which estimate they are looking
             # at before trusting the number.
             basis = (
-                "counted from stream text"
+                "exact: turn hit its output-token ceiling"
+                if output_tokens_source == "exact_ceiling"
+                else "counted from stream text"
                 if output_tokens_source == "estimated_text"
                 else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
             )
@@ -1564,6 +1571,21 @@ class StreamingMixin:
             or k.lower().startswith("x-codex")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
+        # Headroom's own compression metrics, as the buffered path stamps them.
+        # Every counted value is known before the first byte, and streaming is
+        # how real coding agents talk to the proxy, so without these a client
+        # (or a metering layer in front of it) never learns what its request
+        # saved.
+        forwarded_headers["x-headroom-tokens-before"] = str(original_tokens)
+        forwarded_headers["x-headroom-tokens-after"] = str(optimized_tokens)
+        forwarded_headers["x-headroom-tokens-saved"] = str(tokens_saved)
+        forwarded_headers["x-headroom-model"] = model
+        if transforms_applied:
+            from headroom.proxy.cost import header_safe_transforms
+
+            forwarded_headers["x-headroom-transforms"] = ",".join(
+                header_safe_transforms(transforms_applied)
+            )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
@@ -2104,6 +2126,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        original_messages: list[dict] | None = None,
         backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
@@ -2126,6 +2149,11 @@ class StreamingMixin:
         the FINAL usage frame can update the tracker for the next turn
         — mirroring the direct streaming path
         (``_stream_response``/``_finalize_stream_response``).
+        ``original_messages`` is the immutable pre-transform client
+        snapshot for the same update: the tracker must record what the
+        client SENT as its ``last_original_messages``, not what we
+        forwarded, or next turn's overlay never matches the client
+        prefix and cannot replay the cached bytes.
 
         NOTE: CCR request-level intercept on the streaming path is
         intentionally OUT OF SCOPE. Mirrors the Anthropic streaming
@@ -2249,6 +2277,7 @@ class StreamingMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
+                        original_messages=original_messages,
                     )
 
                 # CCR Feedback: record headroom_retrieve tool calls so

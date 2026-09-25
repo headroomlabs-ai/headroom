@@ -38,6 +38,9 @@ class _FakeRequest:
     async def body(self):
         return self._raw
 
+    async def stream(self):
+        yield self._raw
+
 
 def _has_fallback(messages):
     for msg in messages:
