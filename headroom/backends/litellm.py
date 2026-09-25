@@ -21,6 +21,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.message_contract import preserve_message_fields
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -945,7 +947,7 @@ class LiteLLMBackend(Backend):
 
             # Handle string content directly
             if isinstance(content, str):
-                converted.append({"role": role, "content": content})
+                converted.append(preserve_message_fields(msg, {"role": role, "content": content}))
                 continue
 
             # Handle content blocks (Anthropic style)
@@ -1032,6 +1034,7 @@ class LiteLLMBackend(Backend):
                         }
                         for tu in tool_use_blocks
                     ]
+                    preserve_message_fields(msg, assistant_msg)
                     # Anthropic 400s a tool continuation whose assistant turn
                     # carried thinking but lost it here. litellm's Anthropic /
                     # Bedrock transforms read thinking_blocks off the message and
@@ -1052,7 +1055,7 @@ class LiteLLMBackend(Backend):
                     simple_msg["content"] = parts
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
-                converted.append(simple_msg)
+                converted.append(preserve_message_fields(msg, simple_msg))
 
         return converted
 
