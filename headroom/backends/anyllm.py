@@ -12,6 +12,8 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -305,7 +307,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm error: {e}")
+            logger.error(f"any-llm error: {format_exception_message(e)}")
             return self._error_response(e)
 
     async def stream_message(
@@ -497,12 +499,13 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": error_message},
                 },
             )
 
@@ -590,7 +593,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI error: {e}")
+            logger.error(f"any-llm OpenAI error: {format_exception_message(e)}")
             return self._error_response(e, openai_format=True)
 
     def _error_response(self, e: Exception, openai_format: bool = False) -> BackendResponse:
@@ -598,6 +601,7 @@ class AnyLLMBackend(Backend):
         error_type = "api_error"
         status_code = 500
 
+        error_message = format_exception_message(e)
         error_str = str(e).lower()
         if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
@@ -611,11 +615,11 @@ class AnyLLMBackend(Backend):
 
         body: dict[str, Any]
         if openai_format:
-            body = {"error": {"message": str(e), "type": error_type, "code": error_type}}
+            body = {"error": {"message": error_message, "type": error_type, "code": error_type}}
         else:
-            body = {"type": "error", "error": {"type": error_type, "message": str(e)}}
+            body = {"type": "error", "error": {"type": error_type, "message": error_message}}
 
-        return BackendResponse(body=body, status_code=status_code, error=str(e))
+        return BackendResponse(body=body, status_code=status_code, error=error_message)
 
     async def stream_openai_message(
         self,
@@ -661,10 +665,11 @@ class AnyLLMBackend(Backend):
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": error_message,
                     "type": "api_error",
                     "code": "backend_error",
                 }

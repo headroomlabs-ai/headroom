@@ -21,6 +21,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -1261,7 +1263,8 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM error: {error_message}")
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1281,10 +1284,10 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "type": "error",
-                    "error": {"type": error_type, "message": str(e)},
+                    "error": {"type": error_type, "message": error_message},
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_message(
@@ -1671,12 +1674,13 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": error_message},
                 },
             )
 
@@ -1871,7 +1875,8 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI error: {error_message}")
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1891,13 +1896,13 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "error": {
-                        "message": str(e),
+                        "message": error_message,
                         "type": error_type,
                         "code": error_type,
                     }
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_openai_message(
@@ -1970,10 +1975,11 @@ class LiteLLMBackend(Backend):
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": error_message,
                     "type": "api_error",
                     "code": "backend_error",
                 }

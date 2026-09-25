@@ -1300,3 +1300,53 @@ def test_openai_responses_adapter_excludes_custom_tool_beside_compressed_functio
     assert modified is True
     assert new_payload["input"][1]["output"] == excluded_output
     assert new_payload["input"][3]["output"] == "compressed tool output"
+
+
+def test_openai_responses_cache_mode_never_batches_old_small_outputs():
+    """Cache mode: an appended output must not pull earlier outputs into a batch.
+
+    Turn 1 forwards four small outputs raw (under the batch floor). Turn 2
+    appends two more, crossing the floor. Batching then would rewrite the
+    four outputs already in the provider's cached prefix.
+    """
+    router = ContentRouter()
+    calls: list[str] = []
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(f"unit{index}_{token}" for token in range(12)) for index in range(6)]
+    assert sum(len(output.encode("utf-8")) for output in outputs[:4]) < floor
+    assert sum(len(output.encode("utf-8")) for output in outputs) >= floor
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        compressed = content
+        for output in outputs:
+            compressed = compressed.replace(output, "x")
+        return RouterCompressionResult(
+            compressed=compressed,
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config = SimpleNamespace(mode="cache")
+
+    def turn(count: int) -> dict:
+        return {
+            "model": "gpt-5",
+            "input": [
+                {"type": "local_shell_call_output", "call_id": f"c{index}", "output": output}
+                for index, output in enumerate(outputs[:count])
+            ],
+        }
+
+    first, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        turn(4), model="gpt-5", request_id="req_turn_1"
+    )
+    second, modified, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        turn(6), model="gpt-5", request_id="req_turn_2"
+    )
+
+    assert calls == []
+    assert modified is False
+    assert second["input"][:4] == first["input"]

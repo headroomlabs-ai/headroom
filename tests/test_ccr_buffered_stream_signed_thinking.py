@@ -314,6 +314,7 @@ def test_cache_hit_never_replays_a_foreign_content_type() -> None:
         key = proxy.cache._compute_key(
             body["messages"],
             body["model"],
+            upstream_base_url=None,
             system=None,
             tools=None,
             tool_choice=None,

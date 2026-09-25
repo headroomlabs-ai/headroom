@@ -151,13 +151,13 @@ jobs:
 
       - name: Export digest
         id: digest
-        env:
-          BAKE_METADATA: ${{ steps.bake.outputs.metadata }}
         run: |
           # Bake's metadata is one entry per target; for a single-target
           # single-platform build it has exactly one digest. Pipe the
           # JSON through a file (same ARG_MAX rationale as before) and
-          # extract that digest.
+          # extract that digest. Do NOT also pass it via `env:` -- the
+          # runner exports every env entry at bash spawn, so a large
+          # metadata blob fails the step with E2BIG before it runs.
           cat > "${RUNNER_TEMP}/bake_meta.json" <<'__HEADROOM_BAKE_META_EOF__'
           ${{ steps.bake.outputs.metadata }}
           __HEADROOM_BAKE_META_EOF__

@@ -1173,10 +1173,16 @@ def _read_output_should_be_protected(text: Any) -> bool:
     if not isinstance(text, str) or not text:
         return False
     try:
-        return _detect_content(text).content_type not in _RELEASABLE_READ_TYPES
+        detection = _detect_content(text)
     except Exception:
         # Detection failure → protect (preserve the byte-exact default).
         return True
+    if detection.metadata.get("format") == "fixed_width":
+        # Space-aligned columns are also what hand-aligned files look like
+        # (/etc/fstab, a block of C #defines), so a READ of one stays
+        # byte-exact. Only delimited and markdown tables are released.
+        return True
+    return detection.content_type not in _RELEASABLE_READ_TYPES
 
 
 def _create_content_signature(
@@ -3941,10 +3947,13 @@ class ContentRouter(Transform):
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
+            # TABULAR is deliberately absent: a table the tabular compressor
+            # declined (ragged rows, #1652) or could not shrink stays verbatim.
+            # Kompress drops words inside rows, so it would remove fields from
+            # some rows and not others with nothing marking which (#3652).
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
-                CompressionStrategy.TABULAR,
                 CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
@@ -4024,8 +4033,8 @@ class ContentRouter(Transform):
             # actually shorter — never inflating, never doing worse than the
             # strategy output. DIFF is excluded (Kompress corrupts ``git
             # apply``); TEXT/KOMPRESS already ran Kompress; CODE_AWARE has its
-            # own inline no-shrink fallback; SMART_CRUSHER/TABULAR use the
-            # zero-savings fallback above.
+            # own inline no-shrink fallback; SMART_CRUSHER uses the
+            # zero-savings fallback above; TABULAR never goes to Kompress.
             if (
                 self._lossless_then_lossy
                 and compressed is not None

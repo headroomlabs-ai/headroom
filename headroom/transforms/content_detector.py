@@ -245,7 +245,13 @@ def detect_content_type(content: str) -> DetectionResult:
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 9. Fallback to plain text
+    # 9. Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last,
+    #    so it only claims content that would otherwise be plain text.
+    fixed_width_result = _try_detect_fixed_width(content)
+    if fixed_width_result:
+        return fixed_width_result
+
+    # 10. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
@@ -714,6 +720,82 @@ def _try_detect_tabular(content: str) -> DetectionResult | None:
         return md_result
 
     return _try_detect_delimited(lines)
+
+
+# Fixed-width (space-aligned) command output: `ls -l`, `ps aux`, `df -h`,
+# `docker ps`, `kubectl get`. These rows have no delimiter, so without this
+# check they fall through to PLAIN_TEXT and the prose compressor drops fields
+# out of individual rows with nothing marking which row lost what (#3652).
+_FIXED_WIDTH_LIST_RE = re.compile(r"^\s*(?:[-*+•]|\d{1,3}[.)])\s")
+_FIXED_WIDTH_PROSE_END_RE = re.compile(r"[A-Za-z][.!?][\"')\]]?$")
+_FIXED_WIDTH_CODE_ENDS = ("{", "}", ";", "(", ")", ",", ":", "\\")
+_FIXED_WIDTH_CODE_STARTS = ("#", "//", "/*", "--")
+_FIXED_WIDTH_MAX_COLS = 400
+
+
+def _fixed_width_gutters(lines: list[str]) -> int:
+    """Count the column gaps shared by at least 90% of ``lines``.
+
+    A gutter is a character position that holds a space strictly inside the
+    text (after the first non-space character; lines are right-stripped) on
+    nearly every line. Adjacent gutter positions count as one gap, so a table
+    with N columns has N - 1 gaps. Prose and code line up by accident on one
+    position at most, not on several.
+    """
+    need = -(-9 * len(lines) // 10)  # ceil(0.9 * n)
+    hits = [0] * _FIXED_WIDTH_MAX_COLS
+    for ln in lines:
+        start = len(ln) - len(ln.lstrip(" "))
+        for i in range(start, min(len(ln), _FIXED_WIDTH_MAX_COLS)):
+            if ln[i] == " ":
+                hits[i] += 1
+    gaps = 0
+    in_gap = False
+    for count in hits:
+        is_gutter = count >= need
+        if is_gutter and not in_gap:
+            gaps += 1
+        in_gap = is_gutter
+    return gaps
+
+
+def _try_detect_fixed_width(content: str) -> DetectionResult | None:
+    """Detect space-aligned columns (>= 3 of them) in command output.
+
+    Runs last, only for content that would otherwise be PLAIN_TEXT, so it
+    never takes content away from another detector. A false positive costs
+    savings, not correctness: the tabular compressor passes rows it cannot
+    split cleanly through verbatim.
+    """
+    lines = [ln.rstrip() for ln in content.split("\n") if ln.strip()][:50]
+    if len(lines) < 4 or any("\t" in ln for ln in lines):
+        return None
+
+    n = len(lines)
+    if sum(1 for ln in lines if _FIXED_WIDTH_LIST_RE.match(ln)) / n >= 0.5:
+        return None
+    if sum(1 for ln in lines if _FIXED_WIDTH_PROSE_END_RE.search(ln)) / n >= 0.3:
+        return None
+    code_like = sum(
+        1
+        for ln in lines
+        if ln.endswith(_FIXED_WIDTH_CODE_ENDS) or ln.lstrip().startswith(_FIXED_WIDTH_CODE_STARTS)
+    )
+    if code_like / n >= 0.3:
+        return None
+
+    gaps = _fixed_width_gutters(lines)
+    if gaps < 2 and n >= 5:
+        # A one-line preamble (`total 480` above `ls -l` rows) has no gaps of
+        # its own; measure the rows without it.
+        gaps = _fixed_width_gutters(lines[1:])
+    if gaps < 2:
+        return None
+    return DetectionResult(
+        ContentType.TABULAR,
+        0.7,
+        {"format": "fixed_width", "columns": gaps + 1},
+    )
 
 
 def _try_parse_toml(content: str) -> bool:

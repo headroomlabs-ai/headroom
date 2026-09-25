@@ -43,6 +43,14 @@ The callback compresses messages in LiteLLM's `async_pre_call_hook` before they 
 
 This works with every provider LiteLLM supports: OpenAI, Anthropic, Bedrock, Azure, Vertex AI, Cohere, Groq, Mistral, Together, Ollama, and more.
 
+<Callout type="warning" title="Claude Code auto mode">
+LiteLLM and other schema-translating routes are not claimed to preserve Claude
+Code's server-side auto-mode classifier protocol. Requests continue to fail
+open as ordinary model traffic, but Claude Code may use its billable
+client-side classifier fallback. Native Anthropic transport is the supported
+path until an adapter has an end-to-end safeguard fixture.
+</Callout>
+
 ## With LiteLLM Proxy
 
 If you run LiteLLM as a proxy server, use the ASGI middleware:
