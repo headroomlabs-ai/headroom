@@ -100,6 +100,11 @@ is_mixed_content = _mixed_content.is_mixed_content
 split_into_sections = _mixed_content.split_into_sections
 
 
+def _structured_config_compression_enabled() -> bool:
+    value = os.environ.get("HEADROOM_CONFIG_COMPRESSION", "")
+    return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
 _detect_backend_warned = False
 _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
@@ -1642,7 +1647,9 @@ class ContentRouterConfig:
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
-    enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
+    enable_config_compressor: bool = field(
+        default_factory=_structured_config_compression_enabled
+    )  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
     # Last-resort fallback for blocks no compressor could shrink: elide the
     # middle of long, whitespace-free lines (minified JS/CSS, base64, RSC
