@@ -4,8 +4,8 @@ Default backend for the CCR store. Two properties the in-memory backend
 cannot provide, both load-bearing for the no-accuracy-loss guarantee:
 
 - **Restart survival.** A proxy restart no longer destroys every
-  retrievable original mid-session. With the session-scale 30-minute
-  TTL, entries are expected to outlive any single process.
+  retrievable original mid-session. With the session-scale idle TTL,
+  entries are expected to outlive any single process.
 - **Multi-worker sharing.** The database file (WAL mode) is shared
   across worker processes, so a `headroom_retrieve` call served by a
   different worker than the one that compressed still finds the entry.
@@ -46,6 +46,23 @@ CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + 
 DROP INDEX IF EXISTS idx_ccr_expiry;
 """
 
+# `expires_at` is CompressionEntry.expires_at at write time: the earlier of
+# (last access + idle TTL) and (creation + max lifetime). Every access
+# rewrites the row, so the stored value is always current. Added after the
+# original schema, hence the ALTER-on-open migration.
+_MIGRATIONS = (
+    "ALTER TABLE ccr_entries ADD COLUMN expires_at REAL",
+    "CREATE INDEX IF NOT EXISTS idx_ccr_expires_at ON ccr_entries (expires_at)",
+)
+
+# Rows written before the expires_at migration have NULL there. Fall back to
+# the legacy created_at + ttl predicate for those instead of purging them
+# blindly (NULL comparisons are never true, so they would otherwise leak).
+_PURGE_SQL = (
+    "DELETE FROM ccr_entries WHERE "
+    "CASE WHEN expires_at IS NULL THEN created_at + ttl ELSE expires_at END < ?"
+)
+
 # Purge expired rows at most this often (seconds). Purging is hygiene,
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
@@ -64,9 +81,9 @@ def default_db_path() -> Path:
 class SQLiteBackend:
     """Thread-safe SQLite storage backend (WAL mode).
 
-    Entries are serialized as one JSON blob per row; ``created_at`` and
-    ``ttl`` are duplicated into columns so expired rows can be purged
-    with one DELETE. TTL *enforcement* on reads stays in
+    Entries are serialized as one JSON blob per row; ``created_at``,
+    ``ttl`` and ``expires_at`` are duplicated into columns so expired
+    rows can be purged with one DELETE. TTL *enforcement* on reads stays in
     CompressionStore, matching the backend protocol contract.
 
     Deserialization is field-filtered: unknown keys in stored JSON are
@@ -92,14 +109,18 @@ class SQLiteBackend:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        for statement in _MIGRATIONS:
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" on an already-migrated database.
+                if "duplicate column" not in str(e).lower():
+                    raise
         # Startup hygiene: expired rows are only purged opportunistically
         # on writes, so a quiet store could otherwise hold expired
         # originals (which may contain sensitive tool output) on disk
         # indefinitely. Sweep them on every open.
-        conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (time.time(),),
-        )
+        conn.execute(_PURGE_SQL, (time.time(),))
         conn.commit()
         # Originals can contain sensitive tool output (file contents,
         # command output) — keep the database private to the user.
@@ -158,10 +179,7 @@ class SQLiteBackend:
 
     def _purge_expired(self, now: float) -> int:
         """Delete expired rows using metadata; caller holds ``_lock``."""
-        cursor = self._conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (now,),
-        )
+        cursor = self._conn.execute(_PURGE_SQL, (now,))
         self._conn.commit()
         self._last_purge = now
         return cursor.rowcount
@@ -202,8 +220,8 @@ class SQLiteBackend:
             try:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
-                    "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
-                    (hash_key, payload, entry.created_at, entry.ttl),
+                    "(hash, entry_json, created_at, ttl, expires_at) VALUES (?, ?, ?, ?, ?)",
+                    (hash_key, payload, entry.created_at, entry.ttl, entry.expires_at),
                 )
                 self._conn.commit()
                 self._maybe_purge()
