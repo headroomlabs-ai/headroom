@@ -171,9 +171,9 @@ fastembed = { version = "5", default-features = false, optional = true, features
     "ort-load-dynamic",
     "image-models",
 ] }
-# Direct dependency for Kompress inference (`ort::session::Session` /
-# `ort::value::Tensor`). Keep this pinned to the lock entry and optional so
-# `default-features = false` consumers can still build without ONNX Runtime.
+# Kompress and the ONNX-backed relevance/detection paths share the same ORT
+# singleton. Pin to the exact lock entry and load ONNX Runtime dynamically so
+# main's optional-ML/no-default-features build remains valid.
 ort = { version = "=2.0.0-rc.12", default-features = false, optional = true, features = ["load-dynamic"] }
 
 [features]
