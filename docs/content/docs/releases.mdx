@@ -66,20 +66,27 @@ The release PR is the place where version and changelog changes are reviewed bef
 
 The `release.yml` workflow runs when a GitHub Release is published, which normally happens when the release-please PR is merged. It also supports manual `workflow_dispatch` and PR dry-runs for release-critical workflow/package changes.
 
+`release.yml` calls the read-only `release-build.yml` workflow for version
+resolution, npm packaging, the wheel matrix, artifact collection, and smoke
+imports. Every publisher waits for that complete build group to succeed;
+`create-release` also waits for the publish jobs.
+
 ```
-detect-version → build → build-wheels ─┬→ collect-dist ─┐
-                       │               └→ smoke-import-wheels ─┬→ publish-pypi ─┐
-                       ├──────────────────────────────────────┼→ publish-docker ┤
-                       ├→ publish-npm ──────────────────────────────────────────┤
-                       └→ publish-github-packages ──────────────────────────────┴→ create-release
+release-build.yml:
+  detect-version -> build -> build-wheels -> collect-dist
+                                         -> smoke-import-wheels
+
+release.yml:
+  build-and-smoke -> publish-pypi            --+
+                 -> publish-npm             --+
+                 -> publish-github-packages --+-> create-release
+                 -> publish-docker          --+
 ```
 
-`build-wheels` fans out to `collect-dist` and `smoke-import-wheels` in
-parallel (both only need the wheel artifacts, not each other).
-`publish-npm` and `publish-github-packages` only need `detect-version` +
-`build` -- they do not wait on the wheel matrix at all. `publish-pypi` and
-`publish-docker` both gate on `smoke-import-wheels`. `create-release` is the
-only job that waits on everything (`.github/workflows/release.yml:78-1004`).
+The immutable candidate workflow calls the same build-only workflow directly.
+Its entire call tree has read-only repository permissions and contains no
+publishing jobs. This separation is required because GitHub validates nested
+workflow permissions before evaluating job conditions.
 
 The workflow never commits back to the repo.
 
@@ -94,7 +101,7 @@ Resolves the release version from the trigger. On `release: published`, it uses 
 5. Uploads release asset artifacts for downstream publish jobs
 
 ### build-wheels
-Builds the Python wheel matrix for Linux x86_64, Linux arm64, Apple Silicon macOS, Intel macOS, and Windows x86_64, plus one source distribution (`.github/workflows/release.yml:214-264`). Linux wheels are audited for glibc symbol compatibility.
+Builds the Python wheel matrix for Linux x86_64, Linux arm64, Apple Silicon macOS, Intel macOS, and Windows x86_64, plus one source distribution in `.github/workflows/release-build.yml`. Linux wheels are audited for glibc symbol compatibility.
 
 ### collect-dist
 Collects the wheel matrix, source distribution, and npm tarballs into the canonical artifacts used by publishing and GitHub Release asset upload.
@@ -272,7 +279,9 @@ cp .env.act.example .env.act
 
 | File | Purpose |
 |------|---------|
-| `.github/workflows/release.yml` | Main release pipeline |
+| `.github/workflows/release.yml` | Release orchestration and publishing |
+| `.github/workflows/release-build.yml` | Shared read-only build and smoke gates |
+| `.github/workflows/candidate-artifact.yml` | Immutable candidate bundle and verification |
 | `.github/workflows/release-please.yml` | Release PR aggregation from conventional commits |
 | `.github/workflows/ci.yml` | CI — lint, test, commitlint |
 | `.github/workflows/publish.yml` | Manual-only PyPI fallback (superseded by `release.yml`) |
