@@ -157,6 +157,117 @@ class TestClaudeCodeWriter:
         # Only one Environment section in the final block
         assert content.count("### Environment") == 1
 
+    def test_opt_in_same_section_merge_preserves_prior_pattern_items(self, tmp_path):
+        context_file = tmp_path / "AGENTS.md"
+        context_file.write_text(
+            "<!-- headroom:learn:start -->\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Learned: preference\n"
+            "- Keep the established queue <!-- headroom:pattern-id:queue -->\n"
+            "- Keep local reviews\n\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+        recommendation = _rec(
+            RecommendationTarget.CONTEXT_FILE,
+            "Learned: preference",
+            "- Use the updated queue <!-- headroom:pattern-id:queue -->\n"
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->",
+        )
+        recommendation.preserve_prior_items = True
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert "Use the updated queue" in final
+        assert "Keep the established queue" not in final
+        assert final.count("Keep local reviews") == 1
+
+    def test_active_ids_keep_unbatched_items_and_drop_expired_ones(self, tmp_path):
+        """The removal invariant: preservation is bounded by the active id set.
+
+        ``ripgrep`` is active but was left out of this batch (ranking/top-N),
+        so it must survive. ``vendored`` is no longer active, so it must be
+        deleted rather than pinned into the file forever.
+        """
+        context_file = tmp_path / "AGENTS.md"
+        context_file.write_text(
+            "<!-- headroom:learn:start -->\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Learned: preference\n"
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->\n"
+            "- Prefer ripgrep over grep <!-- headroom:pattern-id:ripgrep -->\n"
+            "- Build against the vendored SDK <!-- headroom:pattern-id:vendored -->\n\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+        recommendation = _rec(
+            RecommendationTarget.CONTEXT_FILE,
+            "Learned: preference",
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->",
+        )
+        recommendation.preserve_prior_items = True
+        recommendation.active_item_ids = frozenset({"reviews", "ripgrep"})
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final.count("Keep local reviews") == 1
+        assert "Prefer ripgrep over grep" in final
+        assert "Build against the vendored SDK" not in final
+        assert "headroom:pattern-id:vendored" not in final
+
+    def test_active_ids_drop_untagged_legacy_items(self, tmp_path):
+        """Untagged prior items pre-date id tagging and are not a lifecycle signal.
+
+        The still-active one comes back with an id from the current run and
+        collapses into a single bullet; the one the learner dropped goes away.
+        """
+        context_file = tmp_path / "AGENTS.md"
+        context_file.write_text(
+            "<!-- headroom:learn:start -->\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Learned: preference\n"
+            "- Keep local reviews\n"
+            "- Build against the vendored SDK\n\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+        recommendation = _rec(
+            RecommendationTarget.CONTEXT_FILE,
+            "Learned: preference",
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->",
+        )
+        recommendation.preserve_prior_items = True
+        recommendation.active_item_ids = frozenset({"reviews"})
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final.count("Keep local reviews") == 1
+        assert "headroom:pattern-id:reviews" in final
+        assert "Build against the vendored SDK" not in final
+
+    def test_without_active_ids_prior_items_are_unioned(self, tmp_path):
+        """No lifecycle signal — every producer that predates it keeps the union."""
+        context_file = tmp_path / "AGENTS.md"
+        context_file.write_text(
+            "<!-- headroom:learn:start -->\n"
+            "## Headroom Learned Patterns\n\n"
+            "### Learned: preference\n"
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->\n"
+            "- Build against the vendored SDK <!-- headroom:pattern-id:vendored -->\n"
+            "- Untagged leftover\n\n"
+            "<!-- headroom:learn:end -->\n"
+        )
+        recommendation = _rec(
+            RecommendationTarget.CONTEXT_FILE,
+            "Learned: preference",
+            "- Keep local reviews <!-- headroom:pattern-id:reviews -->",
+        )
+        recommendation.preserve_prior_items = True
+        assert recommendation.active_item_ids is None
+
+        final = _merge_into_file(context_file, [recommendation])
+
+        assert final.count("Keep local reviews") == 1
+        assert "Build against the vendored SDK" in final
+        assert "Untagged leftover" in final
+
     def test_replacing_existing_block_handles_literal_backslash_escapes(self, tmp_path):
         """LLM text with backslash escapes must not be interpreted as a regex replacement."""
         proj = _project(tmp_path)
