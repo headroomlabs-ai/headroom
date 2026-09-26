@@ -2491,3 +2491,97 @@ class TestExtractPreferencesSentenceBoundary:
         assert not out[0].content.endswith(".")
         assert not out[0].content.endswith("!")
         assert not out[0].content.endswith("?")
+
+
+# =============================================================================
+# Pending-state persistence across restarts
+# =============================================================================
+
+
+class TestPendingStatePersistence:
+    """Sub-threshold evidence must survive process restarts (sidecar JSON)."""
+
+    _PATTERN_KWARGS = {
+        "category": PatternCategory.ENVIRONMENT,
+        "content": "Use /usr/bin/python3 for system scripts.",
+        "importance": 0.6,
+    }
+
+    @pytest.mark.asyncio
+    async def test_pending_evidence_survives_restart(self, tmp_path):
+        """2 sightings before restart + 1 after = saved with evidence_count 3."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(2):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await first.stop()
+
+        sidecar = tmp_path / "pending_patterns.json"
+        assert sidecar.exists()
+        assert _read_traffic_rows(db) == []  # still below threshold
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 1
+        await second._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(second, 1, db)
+        await second.stop()
+
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_corrupt_pending_file_is_ignored(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        (tmp_path / "pending_patterns.json").write_text("{not json")
+
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await learner.start()  # must not raise
+        assert learner.get_stats()["pending_patterns"] == 0
+        await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_already_saved_pattern_not_rehydrated_as_pending(self, tmp_path):
+        """A sidecar entry whose hash is already persisted is skipped on load."""
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(3):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(first, 1, db)
+        await first.stop()
+
+        # Handcraft a stale sidecar claiming the saved pattern is still pending.
+        h = ExtractedPattern(**self._PATTERN_KWARGS).content_hash
+        (tmp_path / "pending_patterns.json").write_text(
+            _json.dumps(
+                {
+                    "version": 1,
+                    "patterns": [
+                        {
+                            "category": "environment",
+                            "content": self._PATTERN_KWARGS["content"],
+                            "importance": 0.6,
+                            "count": 2,
+                            "entity_refs": [],
+                            "metadata": {},
+                            "content_hash": h,
+                        }
+                    ],
+                }
+            )
+        )
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 0
+        await second.stop()
