@@ -67,6 +67,18 @@ def test_vertex_target_for_location_derives_regional_hosts_from_default_target()
     )
 
 
+def test_vertex_target_for_location_uses_rep_hostname_for_multi_region() -> None:
+    assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "us") == (
+        "https://aiplatform.us.rep.googleapis.com"
+    )
+    assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "eu") == (
+        "https://aiplatform.eu.rep.googleapis.com"
+    )
+    assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "asia") == (
+        "https://aiplatform.asia.rep.googleapis.com"
+    )
+
+
 def test_vertex_target_for_location_honors_explicit_gateway() -> None:
     assert vertex_target_for_location("https://vertex-gateway.internal", "europe-west1") == (
         "https://vertex-gateway.internal"

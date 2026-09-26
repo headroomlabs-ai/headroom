@@ -55,4 +55,7 @@ def vertex_target_for_location(configured_target: str, location: str) -> str:
         return configured_target
     if not location or location == "global":
         return "https://aiplatform.googleapis.com"
+    if "-" not in location:
+        # multi-region ("us", "eu"): bare word, unlike hyphenated regions
+        return f"https://aiplatform.{location}.rep.googleapis.com"
     return f"https://{location}-aiplatform.googleapis.com"
