@@ -233,6 +233,23 @@ def _normalize_provider(value: Any) -> str:
     return cleaned or PROVIDER_UNKNOWN
 
 
+AGENT_UNKNOWN = "unknown"
+
+
+def _normalize_agent(value: Any) -> str:
+    """Normalize a client/agent label, falling back to a stable sentinel.
+
+    The agent is the harness classified from User-Agent / X-Client
+    (claude-code, codex, opencode, grok_build, ...). Checkpoints persisted
+    before per-agent attribution existed have no agent field and collapse
+    into ``AGENT_UNKNOWN``.
+    """
+    if not isinstance(value, str):
+        return AGENT_UNKNOWN
+    cleaned = value.strip()
+    return cleaned or AGENT_UNKNOWN
+
+
 MODEL_UNKNOWN = "unknown"
 
 
@@ -615,6 +632,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
+    agent = AGENT_UNKNOWN
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
@@ -632,6 +650,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
+        agent = _normalize_agent(entry.get("agent"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
@@ -651,6 +670,7 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "timestamp": _to_utc_iso(timestamp),
         "provider": provider,
         "model": model,
+        "agent": agent,
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
         "cache_read_tokens": cache_read_tokens,
@@ -926,6 +946,7 @@ class SavingsTracker:
         model: str,
         tokens_saved: int,
         provider: str | None = None,
+        agent: str | None = None,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
         timestamp: datetime | str | None = None,
@@ -978,6 +999,7 @@ class SavingsTracker:
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "provider": _normalize_provider(provider),
+                    "agent": _normalize_agent(agent),
                     "model": _normalize_model(model),
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -1007,6 +1029,7 @@ class SavingsTracker:
         # into ``lifetime["total_output_cost_usd"]``; see the delta below.
         output_tokens: int = 0,
         provider: str | None = None,
+        agent: str | None = None,
         project: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
@@ -1258,6 +1281,7 @@ class SavingsTracker:
                     {
                         "timestamp": _to_utc_iso(timestamp_dt),
                         "provider": _normalize_provider(provider),
+                        "agent": _normalize_agent(agent),
                         "model": _normalize_model(model),
                         "total_tokens_saved": lifetime["tokens_saved"],
                         "compression_savings_usd": lifetime["compression_savings_usd"],
@@ -2186,6 +2210,7 @@ class SavingsTracker:
                     "total_output_cost_usd": total_output_cost_usd,
                     **_empty_cache_delta(),
                     "by_provider": {},
+                    "by_agent": {},
                     "by_model": {},
                 },
             )
@@ -2253,6 +2278,39 @@ class SavingsTracker:
                 prov["total_input_tokens_delta"] += delta_input_tokens
                 prov["total_input_cost_usd_delta"] = round(
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+
+                # Same single-owner attribution by agent. Providers cannot
+                # separate clients that share an upstream (Claude Code vs
+                # OpenCode both hit anthropic; Codex vs OpenCode both hit
+                # openai), so dashboards need this dimension for honest
+                # per-connector rows.
+                agent = _normalize_agent(point.get("agent"))
+                agent_entry = entry["by_agent"].setdefault(
+                    agent,
+                    {
+                        "tokens_saved": 0,
+                        "compression_savings_usd_delta": 0.0,
+                        "total_input_tokens_delta": 0,
+                        "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
+                    },
+                )
+                _add_cache(
+                    agent_entry,
+                    delta_cache_read_tokens,
+                    delta_cache_savings_usd,
+                    delta_cache_read_cost_usd,
+                )
+                agent_entry["tokens_saved"] += delta_tokens
+                agent_entry["compression_savings_usd_delta"] = round(
+                    agent_entry["compression_savings_usd_delta"] + delta_usd,
+                    6,
+                )
+                agent_entry["total_input_tokens_delta"] += delta_input_tokens
+                agent_entry["total_input_cost_usd_delta"] = round(
+                    agent_entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
 
