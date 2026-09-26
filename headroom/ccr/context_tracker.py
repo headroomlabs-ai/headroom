@@ -115,6 +115,9 @@ class ContextTrackerConfig:
     # Maximum age for contexts (seconds) - older contexts less likely to expand
     max_context_age_seconds: float = 300.0  # 5 minutes
 
+    # Maximum number of compressing turns before a context is stale
+    max_turn_distance: int = 10
+
     # Whether to proactively expand based on query analysis
     proactive_expansion: bool = True
 
@@ -284,12 +287,30 @@ class ContextTracker:
             if age > self.config.max_context_age_seconds:
                 continue
 
+            # Fast agentic sessions can advance through many compressing turns
+            # before the wall-clock limit expires. Conversational distance is
+            # therefore an independent staleness boundary.
+            turn_distance = 0
+            if current_turn is not None:
+                turn_distance = max(0, current_turn - context.turn_number)
+                if turn_distance > self.config.max_turn_distance:
+                    continue
+
             # Calculate relevance
             relevance = self._calculate_relevance(query, context)
 
             # Age discount: older contexts get lower scores
             age_factor = 1.0 - (age / self.config.max_context_age_seconds) * 0.5
-            relevance *= age_factor
+            turn_factor = 1.0
+            if current_turn is not None:
+                if self.config.max_turn_distance <= 0:
+                    turn_factor = 1.0 if turn_distance == 0 else 0.0
+                else:
+                    turn_factor = max(
+                        0.2,
+                        1.0 - (turn_distance / self.config.max_turn_distance) * 0.8,
+                    )
+            relevance *= age_factor * turn_factor
 
             if relevance >= self.config.relevance_threshold:
                 recommendations.append(
