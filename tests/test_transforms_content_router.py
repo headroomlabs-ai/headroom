@@ -877,6 +877,59 @@ def test_source_code_code_aware_enabled_uses_code_aware(
     assert strategy is CompressionStrategy.CODE_AWARE
 
 
+# ---------------------------------------------------------------------------
+# MIXED false-positive on a complete HTML document: embedded JSON or ordinary
+# body prose triggers ``has_json_blocks``/``has_prose`` in ``is_mixed_content``,
+# misclassifying a page with a clear DOCTYPE/``<html>`` root as MIXED.  The
+# detector confidently says HTML.  ``_determine_strategy`` must trust it over
+# the regex heuristics, same as the SOURCE_CODE case above. See #3608, #3609.
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_false_positive_on_html_overridden_by_detector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DOCTYPE HTML page with embedded JSON must not be routed to MIXED.
+
+    ``is_mixed_content`` returns True (embedded JSON → has_json_blocks, body
+    text → has_prose), but the detector says HTML with high confidence.  The
+    detector must win, same as it already does for SOURCE_CODE.
+    """
+    router = ContentRouter(ContentRouterConfig())
+
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: True)
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.HTML, 1.0, {}),
+    )
+
+    strategy = router._determine_strategy("<!DOCTYPE html><html>...</html>")
+    assert strategy is CompressionStrategy.HTML
+    assert strategy is not CompressionStrategy.MIXED
+
+
+def test_mixed_still_used_when_html_confidence_below_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Low-confidence HTML detection does not override MIXED.
+
+    If the detector is uncertain (confidence < 0.7), keep the MIXED path
+    rather than risking a false override — same guard as SOURCE_CODE's 0.8.
+    """
+    router = ContentRouter(ContentRouterConfig())
+
+    monkeypatch.setattr(content_router_module, "is_mixed_content", lambda content: True)
+    monkeypatch.setattr(
+        content_router_module,
+        "_detect_content",
+        lambda content: DetectionResult(ContentType.HTML, 0.5, {}),
+    )
+
+    strategy = router._determine_strategy("uncertain html-ish content")
+    assert strategy is CompressionStrategy.MIXED
+
+
 def test_source_code_passthrough_does_not_invoke_kompress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
