@@ -204,6 +204,105 @@ def test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress(
     assert captured["target_ratio"] == 0.10
 
 
+def test_diagnostics_content_blocks_unchanged_reports_protected_not_compressed(router, tokenizer):
+    """Regression for PR #3058 review: a content-block (Anthropic-shape)
+    message where every block is protected/passed through must be diagnosed
+    as unchanged -- not falsely reported as "compressed:content_blocks" just
+    because it took the content-blocks route.
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_small_1",
+                    # Far below any min_chars compression threshold, so
+                    # _process_content_blocks passes it through untouched.
+                    "content": "ok",
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "protected:content_blocks_unchanged"
+    assert decision.tokens_before == decision.tokens_after
+    assert decision.tokens_before > 0
+
+
+def test_diagnostics_content_blocks_compressed_reports_accurate_tokens(
+    router, tokenizer, monkeypatch
+):
+    """Regression for PR #3058 review: a genuinely-compressed content-block
+    message must report real before/after token counts (via the content-block
+    tokenizer), not the previous hard-coded 0s that only counted string
+    content.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def ensure_background_load(self) -> None:
+            pass
+
+        def compress(self, content, **kwargs):
+            captured.update(kwargs)
+            compressed = " ".join(content.split()[:20]) + " Retrieve more: hash=deadbeef"
+            return SimpleNamespace(
+                compressed=compressed,
+                compressed_tokens=len(compressed.split()),
+            )
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: FakeKompress())
+    tool_content = " ".join(
+        f'{{"file":"src/module_{i}.py","line":{i},"text":"repeated search payload"}}'
+        for i in range(160)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_search_1",
+                    "content": tool_content,
+                }
+            ],
+        }
+    ]
+
+    result = router.apply(
+        messages,
+        tokenizer,
+        collect_diagnostics=True,
+        force_kompress=True,
+        target_ratio=0.10,
+        compress_user_messages=True,
+        min_tokens_to_compress=10,
+        read_protection_window=0,
+    )
+
+    assert len(result.message_decisions) == 1
+    decision = result.message_decisions[0]
+    assert decision.action == "compressed:content_blocks"
+    assert decision.tokens_before > 0
+    assert decision.tokens_after > 0
+    assert decision.tokens_after < decision.tokens_before
+
+
 def test_skip_kompress_routes_around_ml_stage(router, tokenizer, monkeypatch):
     """skip_kompress (cold-start fast pass) must never invoke the Kompress ML
     stage — units that would route there take the same fallback as when the
