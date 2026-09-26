@@ -49,3 +49,25 @@ def test_is_opencode_zen_base_rejects_other_or_missing_bases() -> None:
     assert not is_opencode_zen_base("https://custom.example")
     assert not is_opencode_zen_base("https://opencode.ai.evil.example")
     assert not is_opencode_zen_base("://bad-url")
+
+
+def test_custom_base_passthrough_telemetry_recognizes_xai_chat() -> None:
+    # Grok Build routes plain OpenAI chat completions through custom-base
+    # routing with base_url https://api.x.ai; attribute the provider as xai
+    # so savings rollups separate grok traffic from OpenAI's.
+    assert custom_base_passthrough_telemetry(
+        "POST",
+        "/v1/chat/completions",
+        "https://api.x.ai",
+    ) == ("chat/completions", "xai")
+    # Other xai paths and methods stay unlabelled.
+    assert custom_base_passthrough_telemetry(
+        "GET",
+        "/v1/chat/completions",
+        "https://api.x.ai",
+    ) == ("", "")
+    assert custom_base_passthrough_telemetry(
+        "POST",
+        "/v1/models",
+        "https://api.x.ai",
+    ) == ("", "")
