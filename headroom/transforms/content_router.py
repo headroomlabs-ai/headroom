@@ -164,6 +164,71 @@ def _estimate_tokens(text: str) -> int:
     return max(1, _TOKEN_ESTIMATOR.count_text(text))
 
 
+#: Share of the outer compression timeout the ML stage may consume. The
+#: remainder has to cover this request's non-ML work AND the overrun of the one
+#: ML call that can still be running when the ceiling is reached -- the worker
+#: is not preemptible, so the ceiling can only stop the NEXT call.
+_ML_STAGE_BUDGET_FRACTION = 0.5
+
+#: Projected seconds per estimated token for the first ML call of a process,
+#: before any real measurement exists. Only used to decide whether a block can
+#: start; every later projection uses this request's own observed worst case.
+_ML_SECONDS_PER_TOKEN_SEED = 0.0
+
+
+def _ml_stage_deadline_seconds() -> float:
+    """Wall-clock ceiling for ALL ML (Kompress) work inside one request.
+
+    ``_kompress_max_tokens`` bounds a single block. It cannot bound a request:
+    the mixed-content path splits a payload into sections and calls
+    ``_try_ml_compressor`` once per section (see ``_compress_mixed``), so every
+    section can sit under the per-block ceiling while their sum runs for
+    minutes. #3711 reported ~70s on a 1.4MB tool_result of prose blocks
+    separated by small JSON objects -- with the size gate recording only
+    ``within`` -- which blew the 30s compression budget and then quarantined
+    compression for every following request.
+
+    So the guard has to match the budget's granularity: once this much time
+    has gone into ML for this request, remaining blocks take the same fallback
+    the size gate uses (TextCrusher / LogCompressor / passthrough).
+
+    The point of the ceiling is to degrade to a partial compression *before*
+    the executor abandons a non-preemptible worker, so it is worthless unless
+    it sits below the deadline that does the abandoning. A bare default could
+    not promise that: an operator who lowers
+    ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS`` below 15s got a guard that could
+    never fire first -- exactly the failure this exists to prevent. The budget
+    is therefore clamped to :data:`_ML_STAGE_BUDGET_FRACTION` of the effective
+    outer timeout, leaving the remainder for the non-ML work in the same
+    request (lossless transforms, assembly) plus the overrun of the one ML call
+    already in flight when the ceiling is reached.
+
+    The outer budget read here is ``HEADROOM_COMPRESSION_TIMEOUT_SECONDS``, the
+    executor timeout that quarantines the stage -- NOT
+    ``HEADROOM_COMPRESSION_DEADLINE_MS``, which bounds a different, softer
+    in-router deadline (see ``_compression_deadline_seconds``).
+
+    ``0`` disables the ceiling (previous behavior), and an explicit request
+    below the clamp is honoured -- the clamp only ever lowers.
+    """
+    try:
+        configured = max(
+            0.0,
+            float(os.environ.get("HEADROOM_ML_STAGE_DEADLINE_SECONDS", "15")),
+        )
+    except ValueError:
+        configured = 15.0
+    if configured <= 0.0:
+        return 0.0
+    try:
+        outer = float(os.environ.get("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", "30"))
+    except ValueError:
+        outer = 30.0
+    if outer <= 0.0:
+        return configured
+    return min(configured, outer * _ML_STAGE_BUDGET_FRACTION)
+
+
 def _compression_deadline_seconds() -> float:
     try:
         return max(
@@ -1898,6 +1963,22 @@ class _PerRequestRuntimeState:
 
     compression_policy: Any = None
     target_ratio: float | None = None
+    # Whether an `apply()` call owns this state and the ML budget therefore
+    # applies. False on the INSTANCE-SCOPED DEFAULT that direct `compress()`
+    # callers read (see `ContentRouter.__init__`): that object is shared by
+    # every such call for the life of the router, so charging it would
+    # accumulate across unrelated calls until ML switched itself off forever.
+    # Direct callers keep the old unbounded behaviour.
+    ml_budget_active: bool = False
+    # Seconds this request has spent INSIDE the ML compressor (#3711).
+    # Cumulative rather than a wall-clock deadline stamped at `apply()` entry:
+    # the budget is a statement about ML work, so time spent on lifecycle,
+    # classification and lossless transforms must not draw it down.
+    ml_elapsed: float = 0.0
+    # Longest single ML call observed in THIS request, seconds per estimated
+    # token. Used to project whether the next block can finish inside what is
+    # left; see `_try_ml_compressor`.
+    ml_seconds_per_token: float = 0.0
     force_kompress: bool = False
     skip_kompress: bool = False
     kompress_model: str | None = None
@@ -4198,6 +4279,28 @@ class ContentRouter(Transform):
                 return None
         return elided, _estimate_tokens(elided)
 
+    def _charge_ml_time(self, elapsed: float, text: str) -> None:
+        """Bill *elapsed* seconds of ML work to this request's budget.
+
+        Also records the worst seconds-per-token seen so far, which is what the
+        admission check in :meth:`_try_ml_compressor` projects the NEXT block
+        with. Worst case rather than an average: the ceiling exists to stop a
+        single long call from overrunning the outer timeout, and an average
+        would let one slow block hide behind several fast ones.
+
+        Best-effort -- accounting must never break a compression that worked.
+        """
+        try:
+            state = self._runtime_state_var.get()
+            if not state.ml_budget_active:
+                return
+            state.ml_elapsed += max(0.0, elapsed)
+            tokens = _estimate_tokens(text)
+            if tokens > 0 and elapsed > 0.0:
+                state.ml_seconds_per_token = max(state.ml_seconds_per_token, elapsed / tokens)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("ML budget accounting failed", exc_info=True)
+
     def _embedded_json_route(
         self, content: str, context: str, question: str | None, bias: float
     ) -> str | None:
@@ -4280,12 +4383,60 @@ class ContentRouter(Transform):
         # (under the 50,000 cap, gate silent) but 55,557 estimator tokens, 11%
         # over. That is exactly the >30s non-preemptible ONNX inference this gate
         # exists to prevent (#1171).
-        if (
+        # Request-scoped ML ceiling (#3711). The size check below bounds ONE
+        # block; this bounds the request. Without it a payload split into many
+        # individually-small sections calls this function once per section, each
+        # passing the size gate, until the sum blows the compression budget and
+        # quarantines the stage for every later request. Checked before the size
+        # gate so an over-budget request stops paying the estimator too.
+        # An admission check that only asks "is the budget gone yet?" lets a
+        # call start at 14.9s of a 15s budget and run for another minute: the
+        # ONNX worker is not preemptible, so nothing stops it once it begins,
+        # and it can overrun the outer executor timeout the ceiling exists to
+        # protect. So project this block's cost and refuse it unless it can
+        # plausibly FINISH inside what is left.
+        #
+        # The projection uses the worst seconds-per-token this request has
+        # actually measured. The first block of a request has no measurement
+        # and is admitted on the seed rate (0 ⇒ admit): it is still bounded by
+        # the per-block token cap below and by the outer timeout, and refusing
+        # it would mean never compressing anything.
+        _ml_state = self._runtime_state_var.get()
+        _ml_budget = _ml_stage_deadline_seconds() if _ml_state.ml_budget_active else 0.0
+        _remaining = (_ml_budget - _ml_state.ml_elapsed) if _ml_budget > 0 else None
+        # Exhausted is decided before any estimator work, so an over-budget
+        # request stops paying for tokenization too.
+        _over_budget = _remaining is not None and _remaining <= 0.0
+        _block_tokens = -1
+        _projected = 0.0
+        if _remaining is not None and not _over_budget:
+            _rate = _ml_state.ml_seconds_per_token or _ML_SECONDS_PER_TOKEN_SEED
+            if _rate > 0.0:
+                _block_tokens = _estimate_tokens(text_to_compress)
+                _projected = _block_tokens * _rate
+                _over_budget = _projected > _remaining
+        if _over_budget:
+            self._observe_kompress_size_gate("deadline")
+            if _block_tokens < 0:
+                _block_tokens = _estimate_tokens(text_to_compress)
+            logger.info(
+                "ML stage budget spent (%.1fs of %.1fs used, ~%.1fs projected for a "
+                "~%d tok block, %.1fs left); routing remaining blocks off ML. "
+                "Partial compression beats a blown budget.",
+                _ml_state.ml_elapsed,
+                _ml_budget,
+                _projected,
+                _block_tokens,
+                max(0.0, _remaining or 0.0),
+            )
+
+        if _over_budget or (
             self._kompress_max_tokens > 0
             and _estimate_tokens(text_to_compress) > self._kompress_max_tokens
         ):
-            self._kompress_gate_fires += 1
-            self._observe_kompress_size_gate("exceeded")
+            if not _over_budget:
+                self._kompress_gate_fires += 1
+                self._observe_kompress_size_gate("exceeded")
             logger.info(
                 "kompress size-gate fired: ~%d tok (>%d) routed off ML (fire #%d)",
                 len(text_to_compress) // 4,
@@ -4376,7 +4527,16 @@ class ContentRouter(Transform):
                             compressor, "shares_request_deadline", False
                         ):
                             compress_kwargs["_deadline_started_at"] = deadline_origin
-                        result = compressor.compress(text_to_compress, **compress_kwargs)
+                        _ml_started = time.monotonic()
+                        try:
+                            result = compressor.compress(text_to_compress, **compress_kwargs)
+                        finally:
+                            # In a `finally` so a call that RAISES still draws
+                            # down the budget: a failing compressor burns the
+                            # same non-preemptible wall clock as a passing one,
+                            # and not charging for it let a request retry its
+                            # way past the ceiling.
+                            self._charge_ml_time(time.monotonic() - _ml_started, text_to_compress)
                         compressed = result.compressed
                         compressed_tokens = result.compressed_tokens
                     except Exception as e:
@@ -5288,8 +5448,18 @@ class ContentRouter(Transform):
         # The kompress deadline origin is stamped HERE, with the rest of the
         # per-request state, so every block this call compresses draws down one
         # shared budget instead of restarting it.
+        #
+        # The ML ceiling (#3711) is deliberately NOT armed here. It used to be,
+        # which meant lifecycle work, message classification, lossless
+        # transforms and task preparation all ran down a budget whose log line
+        # claimed to measure time "in ML". `_try_ml_compressor` accumulates the
+        # time it actually spends inside the compressor instead, so the number
+        # means what it says.
         self._runtime_state_var.set(
-            _PerRequestRuntimeState(kompress_deadline_started_at=time.perf_counter())
+            _PerRequestRuntimeState(
+                kompress_deadline_started_at=time.perf_counter(),
+                ml_budget_active=True,
+            )
         )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
