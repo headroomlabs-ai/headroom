@@ -407,12 +407,12 @@ jobs:
         with:
           name: headroom-wheel
           path: dist
-      - name: Install (CPU torch + wheel[dev,relevance])
+      - name: Install (CPU torch + wheel[dev,relevance,html])
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev,relevance]"
+          pip install "${WHEEL}[dev,relevance,html]"
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
@@ -433,6 +433,11 @@ jobs:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
         run: pytest tests/test_relevance.py -v
+
+      - name: Run HTML extraction and tool reversibility tests
+        run: |
+          python -c "import trafilatura; print('trafilatura import OK')"
+          pytest tests/test_transforms/test_html_extractor.py tests/test_html_tool_reversibility.py -q
 
   test-agno:
     needs: [changes, build-wheel]
