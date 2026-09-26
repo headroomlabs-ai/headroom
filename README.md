@@ -125,6 +125,12 @@ Headroom. Serena is registered at user scope (for Claude Code, in
 `~/.claude.json`), so it stays available in your other projects until you run
 `headroom unwrap`. Skip it with `--code-memory none`.
 
+`headroom wrap ...` is session-scoped: its proxy exits with the wrapped agent.
+For a proxy that survives reboots, use the turnkey `headroom deploy` command.
+Use `headroom install apply` when you need to choose a specific persistent
+service, scheduled task, Docker runtime, scope, or provider target; see the
+[persistent installs guide](https://docs.headroomlabs.ai/docs/persistent-installs).
+
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
 (`import { compress } from 'headroom-ai'`) — and provides no `headroom` command.
