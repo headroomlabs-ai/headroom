@@ -1841,11 +1841,10 @@ def _setup_file_logging(
             return
         _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
+        # Keep root propagation enabled for container stdout/stderr while
+        # this handler writes the separate port/worker-specific proxy log.
         headroom_logger = logging.getLogger("headroom")
         headroom_logger.setLevel(logging.INFO)
-        headroom_logger.propagate = False
         # Decide BEFORE constructing the handler: constructing a
         # RotatingFileHandler opens (creates) the file, so building one only to
         # discard it would leave an empty stray worker log and leak
