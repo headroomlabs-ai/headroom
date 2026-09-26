@@ -186,6 +186,8 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
+from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
 )
@@ -4213,6 +4215,7 @@ def _ensure_proxy_unlocked(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to
                 # the non-persistent path which handles proxy restart.
@@ -4425,6 +4428,7 @@ def _ensure_proxy_unlocked(
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                _warn_proxy_mode_mismatch(running_config)
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -6628,86 +6632,6 @@ def aider(
 
 
 # =============================================================================
-# OpenClaude
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openclaude_args", nargs=-1, type=click.UNPROCESSED)
-def openclaude(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openclaude_args: tuple,
-) -> None:
-    """Launch OpenClaude through Headroom proxy.
-
-    \b
-    OpenClaude is a prose-format coding CLI (like Aider / Cline); it speaks
-    OpenAI- and Anthropic-compatible HTTP, so wrap routes both base URLs
-    through the local proxy — same env shape as `wrap aider`.
-
-    \b
-    Examples:
-        headroom wrap openclaude                         # Start proxy + openclaude
-        headroom wrap openclaude -- --model gpt-4o       # Pass args to openclaude
-    """
-    if prepare_only:
-        return
-
-    openclaude_bin = shutil.which("openclaude")
-    if not openclaude_bin:
-        click.echo("Error: 'openclaude' not found in PATH.")
-        click.echo("Install OpenClaude before running `headroom wrap openclaude`.")
-        raise SystemExit(1)
-
-    env, env_vars_display = _build_aider_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
-
-    _launch_tool(
-        binary=openclaude_bin,
-        args=openclaude_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENCLAUDE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openclaude",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
 # Mistral Vibe
 # =============================================================================
 
@@ -7338,190 +7262,6 @@ def continue_dev(
         memory=memory,
         agent_type="continue",
         print_setup_lines=_print_continue_setup,
-    )
-
-
-# =============================================================================
-# Goose (Block)
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
-def goose(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    goose_args: tuple,
-) -> None:
-    """Launch Goose (Block) CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls
-    through Headroom.
-
-    \b
-    Uninstall: there is no ``headroom unwrap goose`` subcommand — nothing is
-    written to the project.
-
-    \b
-    Examples:
-        headroom wrap goose                          # Start proxy + goose
-        headroom wrap goose -- session               # Start a Goose session
-        headroom wrap goose -- --provider anthropic  # Pass args to goose
-    """
-    if prepare_only:
-        return
-
-    goose_bin = shutil.which("goose")
-    if not goose_bin:
-        click.echo("Error: 'goose' not found in PATH.")
-        click.echo("Install Goose: https://block.github.io/goose/")
-        raise SystemExit(1)
-
-    # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-    ]
-
-    _launch_tool(
-        binary=goose_bin,
-        args=goose_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="GOOSE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="goose",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
-# OpenHands
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openhands_args", nargs=-1, type=click.UNPROCESSED)
-def openhands(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openhands_args: tuple,
-) -> None:
-    """Launch OpenHands CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL / ANTHROPIC_BASE_URL to route OpenHands' API calls
-    through Headroom. Nothing is written to disk, so there is nothing to undo.
-
-    \b
-    Examples:
-        headroom wrap openhands                # Start proxy + openhands
-        headroom wrap openhands -- --task ...  # Pass args to openhands
-    """
-    if prepare_only:
-        return
-
-    openhands_bin = shutil.which("openhands")
-    if not openhands_bin:
-        click.echo("Error: 'openhands' not found in PATH.")
-        click.echo("Install OpenHands: https://docs.all-hands.dev/")
-        raise SystemExit(1)
-
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    # Also set LLM_BASE_URL for OpenHands' generic LLM provider config.
-    env["LLM_BASE_URL"] = openai_base
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-        f"LLM_BASE_URL={openai_base}",
-    ]
-    _launch_tool(
-        binary=openhands_bin,
-        args=openhands_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENHANDS",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openhands",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
     )
 
 
@@ -8509,3 +8249,129 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy runs a different mode than this session asked for.
+
+    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
+    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
+    other clients may be attached to the running proxy.
+    """
+    requested = os.environ.get("HEADROOM_MODE")
+    running = (running_config or {}).get("mode")
+    if not requested or not isinstance(running, str):
+        return
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
+
+    decision = normalize_proxy_mode_decision(requested, default=running)
+    if not decision.unknown and decision.normalized != running:
+        click.echo(
+            f"  Warning: this session requested {decision.normalized!r} mode but the "
+            f"running proxy is in {running!r} mode (mode is fixed at proxy startup). "
+            "Restart the proxy, or use --port for a separate one."
+        )
+
+
+# =============================================================================
+# Registry-generated wrap commands
+# =============================================================================
+# Env-var tools are described declaratively in headroom.providers.wrap_registry;
+# one click command per WrapTarget is generated here.
+
+
+def _make_registry_command(target: WrapTarget) -> click.Command:
+    def _run(
+        port: int,
+        code_graph: bool,
+        no_proxy: bool,
+        learn: bool,
+        memory: bool,
+        backend: str | None,
+        anyllm_provider: str | None,
+        region: str | None,
+        verbose: bool,
+        prepare_only: bool,
+        tool_args: tuple,
+    ) -> None:
+        if prepare_only:
+            return
+
+        tool_bin = shutil.which(target.binary)
+        if not tool_bin:
+            click.echo(f"Error: '{target.binary}' not found in PATH.")
+            click.echo(target.install_hint)
+            raise SystemExit(1)
+
+        # Exported before proxy startup so _start_proxy forwards it as --mode;
+        # an explicit HEADROOM_MODE always wins.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
+
+        env, env_vars_display = _build_registry_launch_env(
+            target,
+            port,
+            os.environ,
+            project=_project_name_from_cwd() if target.project_prefix else None,
+        )
+
+        _launch_tool(
+            binary=tool_bin,
+            args=tool_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label=target.name.upper(),
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type=target.name,
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            openai_api_url=target.openai_api_url,
+        )
+
+    _run.__doc__ = target.help_text
+    command: Any = _run
+    # Same option surface as the hand-written commands these replaced.
+    for decorator in (
+        click.argument(
+            "tool_args",
+            nargs=-1,
+            type=click.UNPROCESSED,
+            metavar=f"[{target.name.upper()}_ARGS]...",
+        ),
+        click.option("--prepare-only", is_flag=True, hidden=True),
+        click.option("--verbose", "-v", is_flag=True, help="Verbose output"),
+        click.option("--region", default=None, help="Cloud region for Bedrock/Vertex"),
+        click.option("--anyllm-provider", default=None, help="Provider for any-llm backend"),
+        click.option(
+            "--backend",
+            default=None,
+            help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc.",
+        ),
+        click.option("--memory", is_flag=True, help="Enable persistent cross-session memory"),
+        click.option("--learn", is_flag=True, help="Enable live traffic learning"),
+        click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)"),
+        click.option(
+            "--code-graph",
+            is_flag=True,
+            help="Enable code graph indexing via codebase-memory-mcp (optional)",
+        ),
+        click.option(
+            "--port",
+            "-p",
+            default=8787,
+            type=click.IntRange(1, 65535),
+            help="Proxy port (default: 8787)",
+        ),
+        _retired_context_tool_option,
+    ):
+        command = decorator(command)
+    return click.command(target.name, context_settings={"ignore_unknown_options": True})(command)
+
+
+for _target in WRAP_TARGETS.values():
+    wrap.add_command(_make_registry_command(_target))
