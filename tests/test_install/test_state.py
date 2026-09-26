@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from headroom.install.models import ArtifactRecord, DeploymentManifest, ManagedMutation
+from headroom.install.paths import manifest_path, profile_root
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
@@ -154,3 +156,45 @@ def test_delete_manifest_removes_profile_root(monkeypatch, tmp_path: Path) -> No
 
     assert load_manifest("default") is None
     assert not extra_file.parent.exists()
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_save_manifest_writes_owner_only(monkeypatch, tmp_path: Path) -> None:
+    """`base_env` can hold a provider API key, so the manifest is 0600/0700.
+
+    `headroom install --env ANTHROPIC_API_KEY=...` is the supported way to give
+    a supervised proxy a credential (supervisors start from a bare
+    environment), and the value is serialized verbatim. At the common 022 umask
+    a plain write would leave a live key world-readable.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _manifest()
+    manifest.base_env = {"ANTHROPIC_API_KEY": "sk-ant-api03-not-a-real-key"}
+
+    save_manifest(manifest)
+
+    path = manifest_path("default")
+    assert "sk-ant-api03-not-a-real-key" in path.read_text(encoding="utf-8")
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_save_manifest_narrows_a_profile_directory_created_before_this_change(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An upgrade must fix an existing 0755 profile directory, not only new ones."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = profile_root("default")
+    root.mkdir(parents=True)
+    root.chmod(0o755)
+
+    save_manifest(_manifest())
+
+    assert root.stat().st_mode & 0o777 == 0o700

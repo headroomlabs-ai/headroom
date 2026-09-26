@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -1078,3 +1079,54 @@ def test_remove_supervisor_darwin_and_windows(monkeypatch, tmp_path: Path) -> No
         ["schtasks", "/Delete", "/TN", "headroom-default-startup", "/F"],
         ["schtasks", "/Delete", "/TN", "headroom-default-health", "/F"],
     ]
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_render_runner_scripts_are_owner_only_because_they_export_secrets(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """0700, not 0755: the export lines can carry a provider API key.
+
+    `headroom install --env ANTHROPIC_API_KEY=...` lands in `base_env`, and
+    these scripts `export` every entry in cleartext because launchd/systemd
+    hand the process a bare environment. At 0755 that put a live key in a
+    world-readable file. The supervisor runs the script as the installing user
+    (user scope) or as root (system scope), so neither needs the other bits.
+    """
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    monkeypatch.setattr(
+        "headroom.install.supervisors.resolve_headroom_command", lambda: ["headroom"]
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _manifest(base_env={"ANTHROPIC_API_KEY": "sk-ant-api03-not-a-real-key"})
+
+    records = render_runner_scripts(manifest)
+
+    assert records
+    for record in records:
+        path = Path(record.path)
+        content = path.read_text(encoding="utf-8")
+        assert "export ANTHROPIC_API_KEY=sk-ant-api03-not-a-real-key" in content
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o700, f"{path.name} is {mode:04o}, exposing an API key"
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are advisory on Windows, where access is governed by ACLs",
+)
+def test_render_unix_runner_narrows_a_script_written_by_an_earlier_version(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Re-running `install apply` must fix an existing 0755 runner script."""
+    monkeypatch.setattr("headroom.install.supervisors.sys.platform", "linux")
+    path = tmp_path / "run-headroom.sh"
+    path.write_text("#!/usr/bin/env bash\n")
+    path.chmod(0o755)
+
+    _render_unix_runner(path, ["headroom", "proxy"], {"ANTHROPIC_API_KEY": "sk-ant-x"})
+
+    assert path.stat().st_mode & 0o777 == 0o700

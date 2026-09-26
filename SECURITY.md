@@ -4,8 +4,8 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.27.x (latest) | :white_check_mark: |
-| < 0.27.x | :x:              |
+| 0.38.x (latest) | :white_check_mark: |
+| < 0.38.x | :x:              |
 
 ## Reporting a Vulnerability
 
@@ -57,7 +57,38 @@ The following are out of scope:
 
 Headroom includes several security features:
 
-- **No credential storage**: We never store or log API keys
+- **Credential handling**: In interactive use (`headroom proxy`, `headroom
+  wrap`) provider API keys are read from the process environment and forwarded
+  upstream; that path writes no credential to disk. Two paths do persist
+  credentials, both deliberately:
+  - `headroom copilot login` stores the GitHub Copilot OAuth refresh token in
+    `~/.headroom/copilot_auth.json`, created with mode `0600`.
+  - A persistent install stores every value passed to `headroom install --env
+    KEY=VALUE`, verbatim and in cleartext. Supervisors (launchd, systemd, Task
+    Scheduler, cron) start the proxy from a bare environment, so `--env` is the
+    only channel by which a provider API key reaches a supervised proxy — and
+    if you pass one, it is written to
+    `~/.headroom/deploy/<profile>/manifest.json` (mode `0600`) and `export`ed in
+    cleartext by the generated runner scripts `run-headroom.sh` /
+    `ensure-headroom.sh` (mode `0700`) in the same directory (mode `0700`).
+    The installer sets those modes and then reads them back: where the
+    platform enforces POSIX permission bits it refuses to leave behind a runner
+    script it could not restrict, and warns if the profile directory could not
+    be narrowed. On Windows the bits are advisory — access is governed by ACLs —
+    so the modes above are requested but not enforced there, and protection
+    comes from the account's own profile directory instead. Where they do hold,
+    the files are owner-only, not encrypted: anything that can read the account
+    — the user themself, root, a home-directory backup or sync — can read the
+    key, and rotating it requires re-running `headroom install apply`.
+    With the Docker runtime the same values are additionally passed as `docker
+    run --env NAME=VALUE`, which places them in the container process's command
+    line and so in `ps` output for other users on the host. Prefer a
+    supervisor-native secret facility (systemd `LoadCredential=` /
+    `EnvironmentFile=` on an owner-only file, a macOS keychain helper) over
+    `--env` for long-lived provider keys.
+
+  Request and response bodies may be written to the runtime log when logging is
+  enabled, so treat that log as sensitive.
 - **Passthrough mode**: Sensitive content passes through unchanged by default
 - **Input validation**: All inputs are validated before processing
 - **Safe defaults**: Security-conscious defaults out of the box

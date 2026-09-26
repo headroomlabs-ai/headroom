@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -11,7 +13,87 @@ import click
 
 from headroom import paths as _paths
 
+logger = logging.getLogger(__name__)
+
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# A deployment profile directory holds secrets. `headroom install --env
+# KEY=VALUE` is the supported way to give a supervised proxy a provider API key
+# — supervisors (launchd, systemd, Task Scheduler, cron) start from a bare
+# environment, so nothing else reaches the process — and every such value is
+# persisted verbatim, both into `manifest.json` and into the generated runner
+# scripts that `export` it before the exec. Those files are therefore written
+# owner-only rather than at the process umask (which leaves them world-readable
+# at the common 022). The supervisor always runs them as the installing user
+# (user scope) or as root (system scope), and neither needs the group/other
+# bits, so this is not a functional restriction.
+#
+# SECURITY.md documents these modes; `tests/test_packaging_extras_and_security_docs.py`
+# reads the octal values back out of that document and compares them with what
+# an install actually writes, so the policy and the code cannot drift apart.
+# Named for what they ARE -- a permission mode -- not for what the files they
+# protect contain. The previous SECRET_* spelling read as a credential to
+# CodeQL's sensitive-data heuristic, so `logger.warning("... 0o%o", mode)`
+# tripped py/clear-text-logging-sensitive-data on a diagnostic that logs a
+# permission bitmask and no secret at all.
+OWNER_ONLY_FILE_MODE = 0o600
+OWNER_ONLY_SCRIPT_MODE = 0o700
+OWNER_ONLY_DIR_MODE = 0o700
+
+
+#: Whether this platform actually enforces POSIX permission bits. On Windows
+#: access is governed by ACLs and ``chmod`` only toggles the read-only flag, so
+#: it SUCCEEDS without establishing the requested mode — which is why the check
+#: below reads the mode back rather than trusting the call not to raise.
+POSIX_MODES_ENFORCED = os.name == "posix"
+
+
+def chmod_owner_only(path: Path, mode: int) -> bool:
+    """Narrow ``path`` to an owner-only ``mode``. Returns whether that took.
+
+    This used to swallow every ``OSError`` and return nothing, so a caller had
+    no way to tell a restricted file from an unrestricted one and continued as
+    if the documented mode had been established. That is the wrong default for
+    the two places it matters, because both NARROW A PRE-EXISTING INODE rather
+    than create one: a profile directory made before these modes existed is
+    0755, and a runner script rewritten through ``O_TRUNC`` keeps whatever mode
+    it already had. In both cases this chmod is the only thing standing between
+    a provider API key and every local user, and a silent failure left the
+    caller asserting a guarantee it did not have.
+
+    The result is verified with ``stat`` instead of inferred from ``chmod`` not
+    raising, because on Windows it does not raise and does not work either.
+
+    Returns ``True`` only when the mode is now exactly ``mode``. A caller
+    holding secret-bearing content must act on ``False``; see
+    :func:`headroom.install.supervisors._write_private_text`, which refuses to
+    leave the file behind.
+    """
+    try:
+        path.chmod(mode)
+        actual = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        logger.warning(
+            "Could not restrict %s to mode 0o%o (%s); it may be readable by other local users.",
+            path,
+            mode,
+            exc,
+        )
+        return False
+    if actual != mode:
+        # Expected on Windows, where the bits are advisory -- noise there, a
+        # real finding on POSIX.
+        logger.log(
+            logging.WARNING if POSIX_MODES_ENFORCED else logging.DEBUG,
+            "%s is mode 0o%o after asking for 0o%o; this platform does not "
+            "enforce POSIX permission bits, so the file's protection comes "
+            "from its directory and the system ACLs instead.",
+            path,
+            actual,
+            mode,
+        )
+        return False
+    return True
 
 
 def validate_profile_name(profile: str) -> str:

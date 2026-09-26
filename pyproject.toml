@@ -331,8 +331,13 @@ dev = [
 all = [
     "headroom-ai[proxy,code,ml,memory,relevance,image,reports,otel,evals,voice,html,mcp,spreadsheet]",
 ]
-# Sandbox: a lean proxy with ALL torch-free capability — for running Headroom in
-# a locked-down/low-resource sandbox and offloading heavy ML elsewhere.
+# Lean: a proxy with ALL torch-free capability — for running Headroom in a
+# constrained or low-resource environment and offloading heavy ML elsewhere.
+#
+# This is a DEPENDENCY PROFILE. It provides no isolation, no confinement and
+# no privilege reduction of any kind. It was previously named `sandbox`, which
+# invited exactly that assumption; `sandbox` is retained below as a
+# deprecated alias for one release so existing installs keep resolving.
 #
 # = [all] MINUS:
 #   - image  (SigLIP/OCR — excluded by request)
@@ -343,12 +348,17 @@ all = [
 #   - memory + evals  (both pull sentence-transformers -> torch, i.e. the very
 #             ML weight a sandbox avoids; evals is a dev/test harness, not a
 #             runtime feature). Opt back in explicitly if you accept torch:
-#             pip install headroom-ai[sandbox,memory]
+#             pip install headroom-ai[lean,memory]
 #
 # Everything kept here is torch-free: code-aware compression (tree-sitter),
 # embedding relevance (fastembed), HTML/spreadsheet ingestion, reports, OTel.
-sandbox = [
+lean = [
     "headroom-ai[proxy,code,relevance,reports,otel,html,mcp,spreadsheet]",
+]
+# Deprecated alias for `lean`, kept for one release. The name implied an
+# isolation guarantee the extra never provided. Remove after 0.39.x.
+sandbox = [
+    "headroom-ai[lean]",
 ]
 
 [project.scripts]

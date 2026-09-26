@@ -673,7 +673,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
         "--env HEADROOM_WORKSPACE_DIR=/path. Supervisors (launchd, systemd, cron) "
         "start with a bare environment and do not inherit the interactive shell's "
         "exports, so anything the runtime needs beyond the flags above must be set "
-        "here. Repeatable."
+        "here. Repeatable. Values are stored in cleartext in the profile's "
+        "manifest and runner scripts under ~/.headroom/deploy/<profile>/ "
+        "(owner-only, not encrypted); see SECURITY.md before passing a provider "
+        "API key this way."
     ),
 )
 def install_apply(

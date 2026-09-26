@@ -215,11 +215,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --profile ci --out dist --interpreter python3.14
-      - name: Install headroom-ai[sandbox] from prebuilt wheels only
+      - name: Install headroom-ai[lean] from prebuilt wheels only
         run: |
           python -m pip install --upgrade pip
           WHEEL="$(ls dist/*.whl)"
-          python -m pip install --only-binary=:all: "${WHEEL}[sandbox]"
+          python -m pip install --only-binary=:all: "${WHEEL}[lean]"
       - name: Proxy dependencies and LiteLLM pricing are available
         working-directory: ${{ runner.temp }}
         run: |
