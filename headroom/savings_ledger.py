@@ -306,6 +306,9 @@ def record_savings_event(
     zero-saving request is skipped exactly as before.
     """
 
+    if _paths.process_is_stateless():
+        return False
+
     try:
         before = max(int(tokens_before), 0)
         after = max(int(tokens_after), 0)

@@ -604,6 +604,11 @@ def install_id() -> str:
         # outside the lock in read_install_id().
         if _install_id is not None:
             return _install_id
+        from headroom import paths
+
+        if paths.process_is_stateless():
+            _install_id = uuid.uuid4().hex
+            return _install_id
         path = _install_id_path()
         _install_id = uuid.uuid4().hex
         try:
