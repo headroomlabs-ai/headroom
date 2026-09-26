@@ -59,10 +59,20 @@ and are unaffected, so proxied deployments keep working exactly as before unless
 they also accept ``x-headroom-base-url`` -- in which case the refusal is the
 honest answer, and ``HEADROOM_ALLOWED_BASE_URLS`` is the supported way to admit
 specific internal endpoints through a proxy.
+
+A single-user deployment whose ``x-headroom-base-url`` callers are local agent
+integrations (OpenCode, Grok) cannot use that allowlist: it switches the guard
+to allow-only mode, and those callers target whatever provider the user
+configured. ``HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS=1`` opts such a
+deployment back into the pre-pinning behaviour on proxy routes only: the guard
+still judges the name and refuses internal answers, and the request then leaves
+through the proxy, which resolves the target itself. Direct routes stay pinned,
+and every other refusal below is unchanged. Off by default.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -70,6 +80,18 @@ import httpcore
 import httpx
 
 from headroom.proxy.upstream_guard import guarded_pin
+
+PROXIED_GUARDED_UPSTREAMS_ENV = "HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS"
+
+
+def proxied_guarded_upstreams_allowed() -> bool:
+    """Whether a guarded upstream may leave through a proxy on its name verdict.
+
+    Read per request, like the guard's own allowlist, so a test or an operator
+    flipping the environment does not need a new client.
+    """
+    raw = os.environ.get(PROXIED_GUARDED_UPSTREAMS_ENV, "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class UnpinnableUpstreamError(RuntimeError):
@@ -181,13 +203,18 @@ class GuardedUpstreamRefusingTransport(httpx.AsyncBaseTransport):
     the task whose contextvar scope holds the guard's verdict.
     """
 
-    def __init__(self, inner: httpx.AsyncBaseTransport, reason: str) -> None:
+    def __init__(
+        self, inner: httpx.AsyncBaseTransport, reason: str, *, via_proxy: bool = False
+    ) -> None:
         self._inner = inner
         self._reason = reason
+        self._via_proxy = via_proxy
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
-        if guarded_pin(host) is not None:
+        if guarded_pin(host) is not None and not (
+            self._via_proxy and proxied_guarded_upstreams_allowed()
+        ):
             raise _refusal(host, self._reason)
         return await self._inner.handle_async_request(request)
 
@@ -247,6 +274,7 @@ def _install(transport: Any) -> tuple[Any, bool]:
                 transport,
                 "it routes through a proxy, which resolves the target hostname "
                 "itself and cannot be told which address the guard accepted",
+                via_proxy=True,
             ),
             False,
         )

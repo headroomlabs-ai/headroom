@@ -846,6 +846,81 @@ async def test_a_guarded_upstream_through_a_proxy_is_refused(
     assert "proxy" in str(refused.value)
 
 
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.hosts: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.hosts.append(request.url.host)
+        return httpx.Response(200)
+
+
+async def test_opt_in_forwards_a_guarded_upstream_through_a_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS restores the name verdict on proxy routes.
+
+    A single-user proxy whose ``x-headroom-base-url`` callers are local agent
+    integrations cannot allowlist every provider its user configures, so behind
+    a corporate proxy the refusal broke them outright. The opt-in forwards the
+    request through the proxy once the guard has judged the name.
+    """
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_pinning import (
+        GuardedUpstreamRefusingTransport,
+        install_upstream_pinning,
+    )
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("8.8.8.8", 443))]
+    )
+    monkeypatch.setenv("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "1")
+    upstream_guard.clear_validated_addresses()
+
+    client = install_upstream_pinning(_client_through_proxy("http://proxy.internal:3128"))
+    try:
+        transport = client._transport_for_url(httpx.URL("https://api.example/v1"))
+        assert isinstance(transport, GuardedUpstreamRefusingTransport)
+        recorder = _RecordingTransport()
+        transport._inner = recorder
+
+        assert is_safe_upstream_url("https://api.example/v1") is True
+        response = await transport.handle_async_request(
+            httpx.Request("POST", "https://api.example/v1")
+        )
+    finally:
+        await client.aclose()
+
+    assert response.status_code == 200
+    assert recorder.hosts == ["api.example"]
+
+
+async def test_opt_in_keeps_every_other_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The opt-in covers proxy routes only, and never admits an internal answer."""
+    from headroom.proxy import upstream_guard
+    from headroom.proxy.upstream_pinning import (
+        GuardedUpstreamRefusingTransport,
+        UnpinnableUpstreamError,
+    )
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("8.8.8.8", 443))]
+    )
+    monkeypatch.setenv("HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS", "1")
+    upstream_guard.clear_validated_addresses()
+
+    assert is_safe_upstream_url("https://api.example/v1") is True
+    poolless = GuardedUpstreamRefusingTransport(_RecordingTransport(), "no pool")
+    with pytest.raises(UnpinnableUpstreamError):
+        await poolless.handle_async_request(httpx.Request("POST", "https://api.example/v1"))
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *a, **k: [(None, None, None, None, ("10.0.0.5", 443))]
+    )
+    upstream_guard.clear_validated_addresses()
+    assert is_safe_upstream_url("https://internal.example/v1") is False
+
+
 async def test_a_proxied_client_still_pins_its_direct_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
