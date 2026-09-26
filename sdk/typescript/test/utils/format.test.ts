@@ -367,6 +367,27 @@ describe("anthropicToOpenAI", () => {
     ]);
     expect(result).toEqual([]);
   });
+
+  it("flattens array-content tool_result blocks to newline-joined text", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [
+              { type: "text", text: "row 1" },
+              { type: "text", text: "row 2" },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      { role: "tool", content: "row 1\nrow 2", tool_call_id: "tu_1" },
+    ]);
+  });
 });
 
 describe("openAIToAnthropic", () => {
