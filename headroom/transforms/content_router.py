@@ -895,6 +895,23 @@ def _content_is_valid_json(content: str) -> bool:
     return True
 
 
+def _contains_valid_json_span(content: str) -> bool:
+    """Return True when the block is, or contains, a parseable JSON container.
+
+    Kompress is a prose model, so any JSON bytes in its input are at risk of a
+    destructive span around ``},{``. Whole-block checks miss prefixed tool
+    output and fragments cut through a larger JSON document. Reuse the
+    deterministic balanced-span scan used by embedded-JSON routing and validate
+    each candidate span with ``json.loads``.
+    """
+    if _content_is_valid_json(content):
+        return True
+
+    from .recursive_json import _spans
+
+    return any(_content_is_valid_json(content[start:end]) for start, end in _spans(content))
+
+
 def _mixed_indicators(content: str) -> dict[str, bool]:
     return mixed_content_indicators(content)
 
@@ -4248,6 +4265,14 @@ class ContentRouter(Transform):
         Returns:
             Tuple of (compressed, token_count).
         """
+        # Kompress is a prose model: dropping a span around ``},{`` can remove
+        # an entire JSON record while leaving the remaining document valid
+        # (#3673). This boundary sees the final Kompress input, which may be a
+        # prefixed block or a fragment rather than a whole JSON document, so
+        # guard every parseable JSON span before the prose model runs.
+        if _contains_valid_json_span(content):
+            return content, _estimate_tokens(content)
+
         from .tag_protector import protect_tags, restore_tags
 
         # Protect custom tags before any ML compression
@@ -4590,6 +4615,10 @@ class ContentRouter(Transform):
         normal path when the scorer is unavailable, the query is empty, nothing
         is dropped, or the split doesn't beat plain compaction. Never raises.
 
+        JSON is excluded from windowed splitting. Without that route guard, a
+        JSON payload misclassified as LOG/SEARCH can be cut at arbitrary offsets
+        before the JSON guard sees it (#3673).
+
         Embedding cost is bounded two ways: the model is pre-warmed off the
         request thread (BM25 until it's ready, see _get_relevance_scorer) and
         outputs segmenting into more than ``relevance_max_records`` records skip
@@ -4597,6 +4626,8 @@ class ContentRouter(Transform):
         """
         scorer = self._get_relevance_scorer()
         if scorer is None or not query.strip():
+            return None
+        if _contains_valid_json_span(content):
             return None
         from .lossless_compaction import compact_lossless
 

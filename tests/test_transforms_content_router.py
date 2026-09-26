@@ -705,6 +705,161 @@ def test_smart_crusher_log_fallback_skipped_for_invalid_json(
     assert CompressionStrategy.KOMPRESS.value in strategy_chain
 
 
+def test_smart_crusher_fallback_skips_kompress_for_valid_json_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kompress must not delete records from parseable single-line JSON (#3673).
+
+    SmartCrusher passes a compact JSON object through when it has no applicable
+    array transform. The no-savings fallback used to hand the whole document to
+    Kompress; when Kompress dropped a span around ``},{``, the result remained
+    valid JSON but silently lost a record.
+    """
+    router = ContentRouter(ContentRouterConfig())
+    payload = json.dumps(
+        {
+            "domains": [
+                {"name": "first", "description": "First collection description"},
+                {"name": "second", "description": "Second collection description"},
+                {"name": "third", "description": "Third collection description"},
+            ]
+        },
+        separators=(",", ":"),
+    )
+    kompress_calls: list[str] = []
+
+    class NoopSmartCrusher:
+        def crush(self, content: str, query: str = "", bias: float = 1.0) -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_calls.append("kompress")
+            return SimpleNamespace(
+                compressed='{"domains":["record deleted"]}',
+                compressed_tokens=1,
+            )
+
+    monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
+    monkeypatch.setattr(router, "_get_log_compressor", lambda: None)
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert result.compressed == payload
+    assert kompress_calls == []
+
+
+def test_force_kompress_skips_valid_json_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forced-Kompress fast path keeps the same parseable-JSON guard."""
+    router = ContentRouter(ContentRouterConfig(force_kompress_all=True))
+    router._runtime_force_kompress = True
+    payload = json.dumps({"items": [{"id": 1}, {"id": 2}]}, separators=(",", ":"))
+    calls: list[str] = []
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            calls.append("kompress")
+            return SimpleNamespace(compressed='{"items":[{"id":1}]}', compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert calls == []
+    assert result.compressed == payload
+
+
+def test_prefixed_same_line_json_skips_kompress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Embedded JSON must be guarded even when the block itself is not JSON.
+
+    The mixed splitter gives a JSON span its own section only when a line starts
+    with ``{``/``[``. With ``Tool result:`` on the same line, embedded routing
+    finds the span but SmartCrusher may produce no savings; the full block then
+    reaches the Kompress fallback. That final input still contains JSON and must
+    not reach the prose model (#3673).
+    """
+    router = ContentRouter(ContentRouterConfig())
+    payload = 'Tool result: {"items":[{"id":1},{"id":2},{"id":3}]}'
+    kompress_calls: list[str] = []
+
+    class NoopSmartCrusher:
+        def crush(self, content: str, query: str = "", bias: float = 1.0) -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_calls.append("kompress")
+            return SimpleNamespace(
+                compressed='Tool result: {"items":[{"id":1}]}',
+                compressed_tokens=1,
+            )
+
+    monkeypatch.setattr(router, "_get_smart_crusher", lambda: NoopSmartCrusher())
+    monkeypatch.setattr(router, "_get_log_compressor", lambda: None)
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    result = router.compress(payload)
+
+    assert kompress_calls == []
+    assert result.compressed == payload
+
+
+def test_relevance_split_does_not_fragment_json_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Relevance windowing must not cut JSON before the Kompress guard.
+
+    A detector can misclassify JSON as LOG/SEARCH. Windowing such a payload at
+    blank-line-free boundaries produces fragments that no longer parse, so a
+    whole-block JSON check cannot help. Skip the split and let the structural
+    JSON boundary preserve the document (#3673).
+    """
+    router = ContentRouter(ContentRouterConfig(relevance_split=True))
+    payload = json.dumps(
+        {
+            "items": [
+                {"id": index, "value": f"record {index} with prose-like description"}
+                for index in range(8)
+            ]
+        },
+        indent=2,
+    )
+    kompress_inputs: list[str] = []
+
+    class DeterministicScorer:
+        def score_batch(self, items: list[str], _context: str) -> list[SimpleNamespace]:
+            return [SimpleNamespace(score=0.0) for _ in items]
+
+    def record_kompress(
+        content: str,
+        _context: str,
+        question: str | None = None,
+    ) -> tuple[str, int]:
+        kompress_inputs.append(content)
+        return content, _estimate_tokens(content)
+
+    router._relevance_scorer = DeterministicScorer()
+    router._relevance_scorer_tried = True
+    monkeypatch.setattr(router, "_try_ml_compressor", record_kompress)
+
+    assert router._relevance_split_compress(payload, "log", "find record 3") is None
+    assert kompress_inputs == []
+
+
 def test_smart_crusher_log_fallback_runs_for_valid_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
