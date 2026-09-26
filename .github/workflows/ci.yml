@@ -139,7 +139,7 @@ jobs:
           python-version: ${{ env.PY_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.98.1 # Keep in sync with rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -164,6 +164,8 @@ jobs:
         with:
           python-version: ${{ env.PY_VERSION }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -532,7 +534,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-build-
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.98.1 # Keep in sync with rust-toolchain.toml.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
