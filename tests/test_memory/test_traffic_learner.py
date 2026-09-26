@@ -116,6 +116,23 @@ class TestCommandsRelatedAsRetry:
         )
         assert not _commands_related_as_retry(failed, success)
 
+    def test_shared_cd_prefix_alone_is_not_retry(self):
+        # Agents prefix most commands with the same `cd <repo> &&`; that shared
+        # prefix used to satisfy both the binary and the token-overlap checks.
+        cd = 'cd "C:\\Users\\dev\\my-project" && '
+        assert not _commands_related_as_retry(
+            cd + "npx vitest run src/form.test.tsx", cd + "git add -A && git commit -F -"
+        )
+        assert not _commands_related_as_retry(
+            "cd /home/dev/my-project && sed -n '90,130p' app/actions.ts",
+            "cd /home/dev/my-project && cat components/icons.ts",
+        )
+
+    def test_cd_prefixed_retry_still_matches(self):
+        assert _commands_related_as_retry(
+            "cd /home/dev/proj && cargo build", "cd /home/dev/proj && cargo build --release"
+        )
+
     def test_empty_or_equal_commands_rejected(self):
         assert not _commands_related_as_retry("", "ls")
         assert not _commands_related_as_retry("ls", "")
@@ -1842,7 +1859,15 @@ class TestNormalizeBashForHash:
 
     def test_cuts_at_first_chain(self):
         # && boundary collapses to just the primary command
-        assert _normalize_bash_for_hash("cd /tmp && ls") == "cd /tmp"
+        assert _normalize_bash_for_hash("make build && ls") == "make build"
+
+    def test_strips_leading_cd(self):
+        # A `cd` prefix is not the primary command; keeping it collapsed every
+        # cd-prefixed recovery in a project onto one hash key.
+        assert _normalize_bash_for_hash("cd /tmp && ls") == "ls"
+        assert _normalize_bash_for_hash('cd "C:\\a b"; cd sub && cargo check') == "cargo check"
+        assert _normalize_bash_for_hash(r"cd /home/dev/my\ project && cargo check") == "cargo check"
+        assert _normalize_bash_for_hash("cd /tmp") == "cd /tmp"
 
 
 class TestParseIsoTimestamp:
