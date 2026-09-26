@@ -226,6 +226,12 @@ def _load_tokenizer(tokenizer_name: str):
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
 
+    from headroom.offline import apply_offline_env, is_offline
+
+    offline = is_offline()
+    if offline:
+        apply_offline_env()
+
     from transformers import AutoTokenizer
 
     try:
@@ -241,6 +247,13 @@ def _load_tokenizer(tokenizer_name: str):
         )
     except Exception:
         pass  # Not in the local cache — try the network below, bounded.
+
+    if offline:
+        logger.warning(
+            f"Tokenizer {tokenizer_name} not in local HF cache and network "
+            f"loading is disabled (HEADROOM_OFFLINE); using estimation"
+        )
+        return None
 
     timeout = _load_timeout_secs()
     if timeout <= 0:
