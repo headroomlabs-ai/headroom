@@ -216,6 +216,108 @@ def test_convert_content_blocks_and_messages(monkeypatch: pytest.MonkeyPatch) ->
     ]
 
 
+def test_convert_messages_preserves_tool_use_and_tool_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool turn must survive conversion: tool_use -> assistant tool_calls and
+    tool_result -> a 'tool' role message. Previously both were dropped (routed to
+    _convert_content_blocks, which has no tool branch), emptying the turns and
+    breaking every agent loop on the second round-trip."""
+    import json
+
+    backend, _instance = make_backend(monkeypatch)
+
+    converted = backend._convert_messages(
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me read it."},
+                    {
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "read_file",
+                        "input": {"path": "a.py"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": [{"type": "text", "text": "FILE BODY"}],
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert converted == [
+        {
+            "role": "assistant",
+            "content": "Let me read it.",
+            "tool_calls": [
+                {
+                    "id": "tu_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": json.dumps({"path": "a.py"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "tu_1", "content": "FILE BODY"},
+    ]
+
+    # A tool_use turn with no accompanying text yields content=None (valid OpenAI).
+    only_tool = backend._convert_messages(
+        [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t2", "name": "ls", "input": {}}],
+            }
+        ]
+    )
+    assert only_tool[0]["content"] is None
+    assert only_tool[0]["tool_calls"][0]["id"] == "t2"
+
+
+def test_system_text_flattens_str_and_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The streaming path used to drop a list-shaped system prompt entirely; both
+    paths now flatten str and list-of-blocks through the same helper."""
+    backend, _instance = make_backend(monkeypatch)
+
+    assert backend._system_text("be terse") == "be terse"
+    assert (
+        backend._system_text(
+            [{"type": "text", "text": "rule A"}, {"type": "text", "text": "rule B"}]
+        )
+        == "rule A rule B"
+    )
+    assert backend._system_text(None) is None
+
+
+@pytest.mark.asyncio
+async def test_stream_message_prepends_list_shaped_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the streaming path dropped a list-shaped `system` prompt (it
+    handled only str), while the non-streaming path kept it. Both now flatten it."""
+    backend, fake = make_backend(monkeypatch)
+    fake.response = FakeAsyncStream([])
+
+    body = {
+        "model": "x",
+        "system": [{"type": "text", "text": "sys A"}, {"type": "text", "text": "sys B"}],
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    async for _ in backend.stream_message(body, {}):
+        pass
+
+    sent_messages = fake.calls[0]["messages"]
+    assert sent_messages[0] == {"role": "system", "content": "sys A sys B"}
+
+
 def test_to_anthropic_response_maps_tool_calls_and_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)
     response = make_response(

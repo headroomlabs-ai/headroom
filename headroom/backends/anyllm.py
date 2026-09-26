@@ -124,25 +124,92 @@ class AnyLLMBackend(Backend):
                 converted.append({"role": role, "content": content})
                 continue
 
-            if isinstance(content, list):
-                text_parts = []
-                has_complex_content = False
+            if not isinstance(content, list):
+                continue
 
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "text":
-                            text_parts.append(block.get("text", ""))
-                        elif block.get("type") in ("tool_use", "tool_result", "image"):
-                            has_complex_content = True
-                            break
+            text_parts: list[str] = []
+            tool_use_blocks: list[dict[str, Any]] = []
+            tool_result_blocks: list[dict[str, Any]] = []
+            has_image = False
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text_parts.append(block.get("text", ""))
+                elif block_type == "tool_use":
+                    tool_use_blocks.append(block)
+                elif block_type == "tool_result":
+                    tool_result_blocks.append(block)
+                elif block_type == "image":
+                    has_image = True
 
-                if not has_complex_content and text_parts:
-                    converted.append({"role": role, "content": "\n".join(text_parts)})
-                else:
-                    openai_content = self._convert_content_blocks(content)
-                    converted.append({"role": role, "content": openai_content})
+            # tool_result blocks → OpenAI "tool" role messages. Previously these
+            # (and tool_use) fell through to _convert_content_blocks, which has no
+            # tool branch, so the tool call and its result were dropped entirely
+            # and every agent/tool loop broke on the second turn.
+            if tool_result_blocks:
+                for tr in tool_result_blocks:
+                    tr_content = tr.get("content", "")
+                    if isinstance(tr_content, list):
+                        tr_content = "\n".join(
+                            b.get("text", "")
+                            for b in tr_content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    converted.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", ""),
+                            "content": str(tr_content),
+                        }
+                    )
+                continue
+
+            # tool_use blocks → OpenAI assistant message with tool_calls.
+            if tool_use_blocks:
+                converted.append(
+                    {
+                        "role": "assistant",
+                        "content": "\n".join(text_parts) if text_parts else None,
+                        "tool_calls": [
+                            {
+                                "id": tu.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": tu.get("name", ""),
+                                    "arguments": json.dumps(tu.get("input", {})),
+                                },
+                            }
+                            for tu in tool_use_blocks
+                        ],
+                    }
+                )
+                continue
+
+            # Multimodal (image) content keeps the OpenAI content-block form.
+            if has_image:
+                converted.append({"role": role, "content": self._convert_content_blocks(content)})
+                continue
+
+            # Plain text.
+            converted.append({"role": role, "content": "\n".join(text_parts)})
 
         return converted
+
+    @staticmethod
+    def _system_text(system: Any) -> str | None:
+        """Flatten an Anthropic ``system`` (str, or list of content blocks) to text.
+
+        Claude Code and the Anthropic SDK send ``system`` as a list of
+        ``{"type": "text", ...}`` blocks; the streaming path used to handle only
+        the ``str`` form and silently dropped the whole system prompt otherwise.
+        """
+        if isinstance(system, str):
+            return system
+        if isinstance(system, list):
+            return " ".join(s.get("text", "") if isinstance(s, dict) else str(s) for s in system)
+        return None
 
     def _convert_content_blocks(self, blocks: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
         """Convert Anthropic content blocks to OpenAI format."""
@@ -269,15 +336,10 @@ class AnyLLMBackend(Backend):
         try:
             messages = self._convert_messages(body.get("messages", []))
 
-            # Add system message if present
+            # Add system message if present (str or list-of-blocks).
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    messages.insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
+                system_text = self._system_text(body["system"])
+                if system_text is not None:
                     messages.insert(0, {"role": "system", "content": system_text})
 
             kwargs: dict[str, Any] = {"model": original_model, "messages": messages}
@@ -322,9 +384,9 @@ class AnyLLMBackend(Backend):
             messages = self._convert_messages(body.get("messages", []))
 
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    messages.insert(0, {"role": "system", "content": system})
+                system_text = self._system_text(body["system"])
+                if system_text is not None:
+                    messages.insert(0, {"role": "system", "content": system_text})
 
             kwargs: dict[str, Any] = {
                 "model": original_model,
