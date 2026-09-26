@@ -90,10 +90,10 @@ from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -3547,7 +3547,12 @@ class OpenAIHandlerMixin:
             handler_path,
             upstream_base_url or "",
         )
-        openai_chat_outcome_provider = custom_chat_provider or "openai"
+        # Fixed taxonomy from the shared helper (zen, zai, meta, openai); any
+        # other custom base is the shared "custom" bucket. Never derive the
+        # label from the request-controlled hostname — see the review on #3759.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            CUSTOM_BASE_PROVIDER if upstream_base_url else "openai"
+        )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
+import pathlib
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,9 +15,13 @@ import pytest
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from headroom.backends.base import BackendResponse
+from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
 from headroom.proxy.server import ProxyConfig, create_app
+from tests.test_observability_metrics import _collect_metrics
 
 
 class _FakePrefixTracker:
@@ -1177,3 +1183,221 @@ def test_openai_cache_mode_forwards_last_turns_bytes_unchanged(stream: bool) -> 
     assert sent[0][2]["content"] == "[compressed call_1]"
     assert sent[1][: len(sent[0])] == sent[0]
     assert sent[2][: len(sent[1])] == sent[1]
+
+
+def test_openai_chat_custom_base_reports_zai_as_outcome_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An OpenAI-compatible ``x-headroom-base-url`` upstream is not ``openai``."""
+    # Allowlist the host so the SSRF guard does not need live DNS.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "api.z.ai")
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_stream_response(*args, **kwargs):  # noqa: ANN002, ANN003
+            captured.update(kwargs)
+            return httpx.Response(200, text="data: [DONE]\n\n")
+
+        proxy._stream_response = _fake_stream_response
+        client.post(
+            "/v1/chat/completions",
+            headers={
+                "authorization": "Bearer test-key",
+                "x-headroom-base-url": "https://api.z.ai/api/coding/paas/v4",
+            },
+            json={
+                "model": "glm-5",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert captured.get("outcome_provider") == "zai"
+
+
+def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Buffered chat labels each custom base from the fixed set, never the host."""
+    # Keep the SSRF guard out of the way: these hosts are deliberately
+    # unresolvable, and a DNS miss makes the handler ignore the override.
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    # Keep the lifetime savings store out of the user's real on-disk state.
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        def _chat(base: str | None) -> None:
+            headers = {"authorization": "Bearer test-key"}
+            if base is not None:
+                headers["x-headroom-base-url"] = base
+            response = client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={"model": "glm-5", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert response.status_code == 200
+
+        _chat("https://api.meta.ai/v1")
+        _chat("https://api.meta.ai/v1/sub")
+        _chat("https://llm.example.internal/v1")
+        # No header: the plain OpenAI path keeps its own label (control).
+        _chat(None)
+
+        by_provider = proxy.metrics.requests_by_provider
+        assert by_provider["meta"] == 2
+        assert by_provider["custom"] == 1
+        assert by_provider["openai"] == 1
+
+
+def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Regression for the #3759 review: a host flood stays inside the fixed set.
+
+    The old code derived the outcome provider from the request-controlled
+    ``x-headroom-base-url`` hostname, so one fresh hostname per request grew
+    the provider stores and exported series without bound. 980 distinct flood
+    hosts plus 20 z.ai requests cover success, upstream failure, local 429 and
+    upstream 429, and every sink must count exactly ``zai`` and ``custom``.
+    """
+    fixed_providers = {"openai", "zen", "zai", "meta", "custom"}
+    zai_base = "https://api.z.ai/api/coding/paas/v4"
+    limited_auth = "Bearer rate-limited"
+    # The flood hosts are unresolvable on purpose; without this stub the SSRF
+    # guard would drop the override and relabel the flood as "openai".
+    monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    # Isolated sinks: a fresh lifetime store and workspace, so the exact
+    # counts below are this test's traffic and nothing reaches ~/.headroom.
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    reader = InMemoryMetricReader()
+    set_otel_metrics(HeadroomOtelMetrics(meter_provider=MeterProvider(metric_readers=[reader])))
+
+    class _LimitOneKey:
+        """Headroom's own limiter, refusing only ``limited_auth``."""
+
+        async def check_request(self, key: str = "default") -> tuple[bool, float]:
+            return key != limited_auth, 1.0
+
+        async def check_tokens(self, key: str, tokens: int) -> tuple[bool, float]:
+            return True, 0.0
+
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if "flood-down-" in url:
+            raise httpx.ConnectError("flood host down")
+        if "flood-upstream429-" in url:
+            return httpx.Response(429, json={"error": {"message": "slow down"}})
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_flood",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            },
+        )
+
+    expected_status = {"ok": 200, "down": 502, "limited": 429, "upstream429": 429}
+    sent: dict[tuple[str, str], int] = {}
+    flood_hosts: set[str] = set()
+    try:
+        with _make_proxy_client() as client:
+            proxy = client.app.state.proxy
+            proxy._retry_request = _fake_retry
+            proxy.rate_limiter = _LimitOneKey()
+
+            for i in range(1000):
+                if i % 50 == 0:
+                    provider, kind = "zai", ("ok" if i % 100 == 0 else "limited")
+                    base = zai_base
+                else:
+                    provider, kind = "custom", ("limited", "upstream429", "down", "ok")[i % 4]
+                    host = f"flood-{kind}-{i}.example.invalid"
+                    flood_hosts.add(host)
+                    base = f"https://{host}/v1"
+                sent[provider, kind] = sent.get((provider, kind), 0) + 1
+                auth = limited_auth if kind == "limited" else "Bearer test-key"
+                response = client.post(
+                    "/v1/chat/completions",
+                    headers={"authorization": auth, "x-headroom-base-url": base},
+                    json={"model": "glm-5", "messages": [{"role": "user", "content": f"turn {i}"}]},
+                )
+                assert response.status_code == expected_status[kind], (i, base)
+
+            # The traffic this test sends, pinned so the claim stays exact.
+            assert len(flood_hosts) == 980
+            assert sent == {
+                ("zai", "ok"): 10,
+                ("zai", "limited"): 10,
+                ("custom", "ok"): 250,
+                ("custom", "down"): 240,
+                ("custom", "limited"): 240,
+                ("custom", "upstream429"): 250,
+            }
+
+            metrics = proxy.metrics
+            # In-memory stores: exact counts; "unknown" is the seeded zero bucket.
+            assert dict(metrics.requests_by_provider) == {"zai": 10, "custom": 250}
+            assert dict(metrics.requests_failed_by_provider) == {"unknown": 0, "custom": 240}
+            assert metrics.requests_rate_limited_by_source == {"headroom": 250, "upstream": 250}
+
+            # Lifetime store, isolated under tmp_path.
+            lifetime = metrics.savings_tracker.lifetime_response()["requests"]
+            assert lifetime["by_provider"] == {"zai": 10, "custom": 250}
+            assert lifetime["failed_by_provider"] == {"custom": 240}
+            assert lifetime["rate_limited_by_source"] == {"headroom": 250, "upstream": 250}
+
+            # Prometheus export: every provider series is from the fixed set.
+            export = client.get("/metrics").text
+            assert set(re.findall(r'provider="([^"]+)"', export)) <= fixed_providers | {"unknown"}
+            assert 'headroom_requests_by_provider{provider="zai"} 10' in export
+            assert 'headroom_requests_by_provider{provider="custom"} 250' in export
+
+        # OTel: every proxy data point carries a fixed provider attribute, and
+        # z.ai stays its own series on the success and local-429 paths.
+        otel = _collect_metrics(reader)
+        otel_points: dict[tuple[str, str, str], float] = {}
+        for name, metric in otel.items():
+            if not name.startswith("headroom.proxy."):
+                continue
+            for point in metric.data.data_points:
+                label = point.attributes.get("provider")
+                assert label in fixed_providers, (name, label)
+                if name.startswith("headroom.proxy.requests"):
+                    key = (name, label, point.attributes.get("source", ""))
+                    otel_points[key] = otel_points.get(key, 0) + point.value
+        assert otel_points == {
+            ("headroom.proxy.requests", "zai", ""): 10,
+            ("headroom.proxy.requests", "custom", ""): 250,
+            ("headroom.proxy.requests.failed", "custom", ""): 240,
+            ("headroom.proxy.requests.rate_limited", "zai", "headroom"): 10,
+            ("headroom.proxy.requests.rate_limited", "custom", "headroom"): 240,
+            ("headroom.proxy.requests.rate_limited", "custom", "upstream"): 250,
+        }
+    finally:
+        reset_otel_metrics()
