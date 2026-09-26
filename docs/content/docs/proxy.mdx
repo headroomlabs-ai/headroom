@@ -127,7 +127,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools |
+| `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools. When `--mode cache` is active, context injection is skipped because prefix stability takes precedence; use `--mode token` if you need memory recall. |
 | `--memory-db-path` | `{cwd}/.headroom/memory.db` | Override the memory SQLite path |
 | `--no-memory-tools` | `false` | Disable automatic memory tool injection |
 | `--no-memory-context` | `false` | Disable automatic memory context injection |
