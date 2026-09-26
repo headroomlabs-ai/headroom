@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
@@ -48,9 +49,59 @@ WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
 
-_LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
+# The loopback host forms a proxy URL can take: IPv4, the ``localhost`` alias,
+# and the IPv6 literal ``::1`` (``urlsplit`` strips the ``[...]`` brackets and
+# lowercases the host, so ``HTTP://Localhost`` and ``http://[::1]`` normalize
+# into this set).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# Codex TOML routes via a quoted ``base_url``. Capture the quoted value only and
+# classify it with the shared URL parser below — a prefix/regex match on the URL
+# would accept userinfo and hostname-suffix lookalikes such as
+# ``http://localhost:8787@evil.example`` as loopback. Anchored to a line start so
+# an indented key is matched consistently, and paired with the active
+# ``model_provider`` so only the routed provider's block is inspected.
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
+
+
+def _loopback_route_port(url: str) -> int | None:
+    """Return the port if ``url`` is a well-formed loopback proxy route.
+
+    Classifies by parsing the URL rather than prefix-matching it: the scheme
+    must be http(s), there must be no userinfo, the host must be *exactly* a
+    loopback literal, and the port must be present and valid. This is what makes
+    ``doctor`` a URL classifier rather than a string matcher, so lookalikes that
+    a prefix match accepts are correctly rejected:
+
+    * userinfo — ``http://localhost:8787@evil.example/v1`` parses to host
+      ``evil.example`` (the ``localhost:8787`` is credentials), and any URL
+      carrying userinfo is refused outright;
+    * hostname suffix — ``http://localhost.evil.example:8787`` and
+      ``http://127.0.0.1.evil.example:8787`` are not exact loopback hosts.
+
+    A correctly-routed loopback URL (including ``[::1]`` and an upper-cased
+    scheme/host) still classifies, preserving the #3205 / #3213 fix.
+    """
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https"):
+        return None
+    # Reject any credentials in the authority: a real Headroom route never
+    # carries userinfo, and userinfo is the vector that masks the true host.
+    if parts.username is not None or parts.password is not None:
+        return None
+    try:
+        host = parts.hostname  # lowercased, brackets stripped
+        port = parts.port  # raises ValueError on an out-of-range port
+    except ValueError:
+        return None
+    if host is None or host not in _LOOPBACK_HOSTS or port is None:
+        return None
+    return port
+
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -430,6 +481,9 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
             summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
+    # base_url is the active provider's, already extracted and None-checked
+    # above. Classify it through the shared URL parser so a lookalike or remote
+    # base_url (userinfo, hostname suffix, non-loopback) is a WARN, not a PASS.
     routing = _classify_routing_url(name, base_url, port, source=str(config_path))
     if routing.status != PASS:
         return routing
@@ -498,14 +552,13 @@ def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
 
 
 def _classify_routing_url(name: str, url: str, port: int, *, source: str) -> CheckResult:
-    match = _LOOPBACK_URL_RE.match(url.strip())
-    if match is None:
+    found_port = _loopback_route_port(url)
+    if found_port is None:
         return CheckResult(
             name=name,
             status=WARN,
             summary=f"points at {url}, not the local Headroom proxy ({source})",
         )
-    found_port = int(match.group(1))
     if found_port != port:
         if found_port == _OLLAMA_DEFAULT_PORT:
             # Not a mis-probed Headroom port — this is Ollama's endpoint, so
