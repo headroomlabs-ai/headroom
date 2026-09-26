@@ -231,6 +231,7 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
     parsed = tomllib.loads(content)
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+    assert parsed["model_providers"]["headroom"]["name"] == "OpenAI"
     assert "codex_hooks" not in content
 
 
