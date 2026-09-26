@@ -15,7 +15,11 @@ if TYPE_CHECKING:
     from fastapi.responses import Response
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    _headroom_bypass_enabled,
+    extract_tags,
+)
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -94,6 +98,22 @@ class BatchHandlerMixin:
         requests_wrapper = input_config.get("requests", {})
         requests_list = requests_wrapper.get("requests", [])
 
+        # Same bypass contract as the OpenAI batch path below, and it has to sit
+        # above the empty-requests return — a file-input batch carries no inline
+        # `requests`, and that return hands the helper the parsed dict, which
+        # re-serializes canonically. Kept below the extraction so a later
+        # CompressionDecision migration can pass `requests_list` as messages.
+        # Skipping the compression loop also skips the CCR context store, which
+        # is correct: that store only exists to resolve markers left BY
+        # compression, and handle_google_batch_results already passes through on
+        # a missing one.
+        if _headroom_bypass_enabled(request.headers):
+            logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
+            # Pass body=None so the helper forwards the original wire bytes.
+            # Handing it the parsed dict would re-serialize canonically and log
+            # body_mutated=True, which is the opposite of what bypass promises.
+            return await self._google_batch_passthrough(request, model, None, "bypass_header")
+
         if not requests_list:
             # No inline requests - might be using file input, pass through
             logger.debug(f"[{request_id}] Google batch: No inline requests, passing through")
@@ -116,6 +136,17 @@ class BatchHandlerMixin:
             request_id=request_id,
         )
 
+        # Commercial gate — the other half of the conjunction the shared decision
+        # factory applies. Fails open: no reporter configured, or no license info
+        # yet, both mean compress. `is not None` rather than truthiness so this
+        # cannot drift from compression_decision.py:120, which spells it that way.
+        license_ok = (
+            self.usage_reporter.should_compress if self.usage_reporter is not None else True
+        )
+        if not license_ok:
+            logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
+            tags["passthrough_reason"] = "license_denied"
+
         # Track compression stats
         total_original_tokens = 0
         total_optimized_tokens = 0
@@ -129,8 +160,8 @@ class BatchHandlerMixin:
             metadata = batch_req.get("metadata", {})
             contents = req_content.get("contents", [])
 
-            if not contents or not self.config.optimize:
-                # No contents or optimization disabled - pass through unchanged
+            if not contents or not self.config.optimize or not license_ok:
+                # No contents, optimization disabled, or license denied
                 compressed_requests.append(batch_req)
                 continue
 
@@ -377,6 +408,7 @@ class BatchHandlerMixin:
         request: Request,
         model: str,
         body: dict | None = None,
+        passthrough_reason: str | None = None,
     ) -> Response:
         """Pass through Google batch request without modification."""
         from fastapi.responses import Response
@@ -388,6 +420,9 @@ class BatchHandlerMixin:
         headers.pop("content-length", None)
         client = classify_client(headers)
         tags = extract_tags(headers)
+        # Same slice label the non-batch handlers get from apply_to_tags.
+        if passthrough_reason:
+            tags["passthrough_reason"] = passthrough_reason
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -466,6 +501,7 @@ class BatchHandlerMixin:
                 request_id=request_id_files,
                 provider="google",
                 model=f"passthrough:batch:{model}",
+                status_code=response.status_code,
                 original_tokens=0,
                 optimized_tokens=0,
                 output_tokens=0,
@@ -858,6 +894,14 @@ class BatchHandlerMixin:
             # Pass through for other endpoints
             return await self._batch_passthrough(request, body)
 
+        # The client's explicit "don't touch my bytes" contract. Compressing
+        # would re-serialize every JSONL line and upload a NEW file id, so
+        # skipping compression alone isn't enough — route to the byte-faithful
+        # passthrough before the download/upload pair runs.
+        if _headroom_bypass_enabled(request.headers):
+            logger.info(f"[{request_id}] Compression skipped: reason=bypass_header")
+            return await self._batch_passthrough(request, body, "bypass_header")
+
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
@@ -894,6 +938,8 @@ class BatchHandlerMixin:
             # Step 2: Parse and compress each line
             logger.info(f"[{request_id}] Batch: Compressing JSONL content")
             compressed_lines, stats = await self._compress_batch_jsonl(file_content, request_id)
+            if stats.get("passthrough_reason"):
+                tags["passthrough_reason"] = stats["passthrough_reason"]
 
             if stats["total_requests"] == 0:
                 return JSONResponse(
@@ -1089,6 +1135,14 @@ class BatchHandlerMixin:
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
+        # Same commercial gate as handle_google_batch_create — see there for why
+        # it fails open and why `is not None` matches the decision factory.
+        license_ok = (
+            self.usage_reporter.should_compress if self.usage_reporter is not None else True
+        )
+        if not license_ok:
+            logger.info(f"[{request_id}] Compression skipped: reason=license_denied")
+
         lines = content.strip().split("\n")
         compressed_lines = []
         total_original_tokens = 0
@@ -1126,7 +1180,7 @@ class BatchHandlerMixin:
                     continue
 
                 # Compress messages using the OpenAI pipeline
-                if self.config.optimize:
+                if self.config.optimize and license_ok:
                     try:
                         context_limit = self.openai_provider.get_context_limit(model)
                         # Offload off the event loop (#1701); timeouts fall to
@@ -1204,11 +1258,19 @@ class BatchHandlerMixin:
             "total_tokens_saved": total_tokens_saved,
             "savings_percent": savings_percent,
             "errors": errors,
+            # Surfaced so the caller can tag the outcome — the license is read
+            # here, but only the caller holds the tags the funnel sees.
+            "passthrough_reason": None if license_ok else "license_denied",
         }
 
         return compressed_lines, stats
 
-    async def _batch_passthrough(self, request: Request, body: dict) -> Response:
+    async def _batch_passthrough(
+        self,
+        request: Request,
+        body: dict,
+        passthrough_reason: str | None = None,
+    ) -> Response:
         """Pass through batch request to OpenAI without compression.
 
         Byte-faithful (PR-A3, fixes P0-2). The original request bytes are
@@ -1224,9 +1286,18 @@ class BatchHandlerMixin:
             log_outbound_request,
         )
 
+        start_time = time.time()
+
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        client = classify_client(headers)
+        tags = extract_tags(headers)
+        # What CompressionDecision.apply_to_tags stamps everywhere else, so the
+        # dashboard can slice passthrough traffic by cause instead of guessing
+        # why a batch reported zero savings.
+        if passthrough_reason:
+            tags["passthrough_reason"] = passthrough_reason
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         _pre_strip_count_obp = sum(1 for k in headers if k.lower().startswith("x-headroom-"))
         headers = _strip_internal_headers(headers)
@@ -1264,6 +1335,28 @@ class BatchHandlerMixin:
         )
         response = await self.http_client.post(  # type: ignore[union-attr]
             url, content=outbound_bytes, headers=outbound_headers
+        )
+
+        # No compression here, just an upstream forward. Funnel records via
+        # zero defaults so the request still shows up in dashboards, matching
+        # _google_batch_passthrough — otherwise a bypassed batch create
+        # disappears from the funnel entirely.
+        latency_ms = (time.time() - start_time) * 1000
+        await self._record_request_outcome(
+            RequestOutcome(
+                request_id=await self._next_request_id(),
+                provider="openai",
+                model="passthrough:batch",
+                status_code=response.status_code,
+                original_tokens=0,
+                optimized_tokens=0,
+                output_tokens=0,
+                tokens_saved=0,
+                attempted_input_tokens=0,
+                total_latency_ms=latency_ms,
+                tags=tags,
+                client=client,
+            )
         )
 
         response_headers = dict(response.headers)
