@@ -544,6 +544,36 @@ impl SmartCrusher {
                             // compressed / marker-substituted by the hook.
                             let result =
                                 self.crush_array_with_source(&rows, arr, query_context, bias);
+                            // Adaptive sizing can decide to keep every row even after the
+                            // analysis threshold is crossed. Match the below-threshold path
+                            // so nested values still receive their own safe transforms.
+                            if result.strategy_info == "none:adaptive_at_limit" {
+                                info_parts.push(format!(
+                                    "{}({}->{})",
+                                    result.strategy_info,
+                                    n,
+                                    result.items.len()
+                                ));
+                                if prose_hook.is_some() {
+                                    return (Value::Array(rows), info_parts.join(","));
+                                }
+
+                                let mut processed: Vec<Value> = Vec::with_capacity(n);
+                                for item in arr {
+                                    let (p_item, p_info) = self.process_value_with_hook(
+                                        item,
+                                        depth + 1,
+                                        query_context,
+                                        bias,
+                                        prose_hook,
+                                    );
+                                    processed.push(p_item);
+                                    if !p_info.is_empty() {
+                                        info_parts.push(p_info);
+                                    }
+                                }
+                                return (Value::Array(processed), info_parts.join(","));
+                            }
                             // Lossless path won → substitute the array
                             // with the compacted string in place. This
                             // makes the lossless win visible to the
@@ -2036,6 +2066,40 @@ mod tests {
             parsed.get("data").is_some(),
             "enclosing array property must survive"
         );
+    }
+
+    #[test]
+    fn crush_recurses_into_object_arrays_at_adaptive_limit() {
+        let c = crusher();
+        let description =
+            "Curated collection of business tables covering customer, product, ".repeat(12);
+
+        for n in 5..=8 {
+            let rows: Vec<Value> = (0..n)
+                .map(|i| {
+                    json!({
+                        "name": format!("domain_{i}"),
+                        "description": description,
+                        "tables": 12 + i,
+                        "owner": "data-platform"
+                    })
+                })
+                .collect();
+            let input = json!({"domains": rows}).to_string();
+            let result = c.crush(&input, "list the available domains", 1.0);
+
+            assert!(
+                result.strategy.contains("string_ccr:"),
+                "n={n} should recurse into rows at the adaptive limit: strategy={} output={}",
+                result.strategy,
+                result.compressed
+            );
+            assert!(
+                result.compressed.contains("<<ccr:"),
+                "n={n} should offload long row strings: {}",
+                result.compressed
+            );
+        }
     }
 
     /// Issue #3634 MCP `saga-mcp_task_get` payload (813 bytes, original
