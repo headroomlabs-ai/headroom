@@ -28,6 +28,7 @@ from typing import Any, Literal
 from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
+    _resolve_revision,
     create_cpu_session_options,
     hf_entry_known_absent,
     hf_hub_download_local_first,
@@ -539,7 +540,13 @@ def _get_model_class() -> type:
 
         def __init__(self, model_name: str = "answerdotai/ModernBERT-base"):
             super().__init__()
-            self.encoder = AutoModel.from_pretrained(model_name, attn_implementation="eager")
+            # Same pin as the tokenizer: the fine-tuned heads were trained on
+            # this encoder snapshot. Unknown repos resolve to None (floating).
+            self.encoder = AutoModel.from_pretrained(
+                model_name,
+                attn_implementation="eager",
+                revision=_resolve_revision(model_name, None),
+            )
             hidden_size = self.encoder.config.hidden_size  # 768
 
             # Head 1: Token keep/discard
@@ -768,6 +775,9 @@ def _load_kompress_onnx(
         return model, tokenizer, backend
 
 
+_MODERNBERT_TOKENIZER_REPO = "answerdotai/ModernBERT-base"
+
+
 def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> Any:
     """Load the ModernBERT tokenizer, cache-only when ``allow_download`` is False.
 
@@ -782,14 +792,25 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
     changes whether the Hub is consulted to confirm what is already on disk.
     Mirrors ``onnx_runtime.hf_hub_download_local_first``, which the ONNX half of
     this loader already uses.
+
+    The load is pinned to the same immutable revision as the model artifacts
+    (``onnx_runtime._PINNED_REVISIONS``): the ONNX export was produced against
+    that tokenizer snapshot, so a floating ``main`` could shift token ids under
+    the shipped weights without any code change. ``HEADROOM_HF_PIN=off`` floats
+    it, exactly as for the weights.
     """
+    revision = _resolve_revision(_MODERNBERT_TOKENIZER_REPO, None)
     try:
-        return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=True)
+        return auto_tokenizer.from_pretrained(
+            _MODERNBERT_TOKENIZER_REPO, revision=revision, local_files_only=True
+        )
     except _NOT_CACHED_ERRORS as exc:
         if not allow_download:
-            raise KompressModelNotCached("answerdotai/ModernBERT-base") from exc
-    # Genuine cache miss and downloading is permitted: fetch it.
-    return auto_tokenizer.from_pretrained("answerdotai/ModernBERT-base", local_files_only=False)
+            raise KompressModelNotCached(_MODERNBERT_TOKENIZER_REPO) from exc
+    # Genuine cache miss and downloading is permitted: fetch it at the pin.
+    return auto_tokenizer.from_pretrained(
+        _MODERNBERT_TOKENIZER_REPO, revision=revision, local_files_only=False
+    )
 
 
 # Sub-state-dict keys inside a merged v2-style checkpoint (see
