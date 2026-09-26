@@ -195,7 +195,13 @@ class _FakeWebSocket:
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = dict(headers or {"authorization": "Bearer test"})
+        self.headers = dict(
+            headers
+            or {
+                "authorization": "Bearer test",
+                "user-agent": "codex-cli/0.5",
+            }
+        )
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends

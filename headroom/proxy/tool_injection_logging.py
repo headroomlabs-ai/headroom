@@ -12,6 +12,7 @@ ToolInjectionDecision = Literal[
     # tool definition is re-injected even without fresh compression (#2440).
     "inject_history_reference",
     "skip",
+    "skip_no_client_tools",
     "skip_disabled_via_env",
 ]
 

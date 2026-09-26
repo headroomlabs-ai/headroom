@@ -72,6 +72,24 @@ def _turn(text: str) -> str:
     return json.dumps({"type": "response.create", "response": {"input": text}})
 
 
+def _turn_with_tools(text: str, tools: list[dict[str, object]] | None) -> str:
+    response: dict[str, object] = {"input": text}
+    if tools is not None:
+        response["tools"] = tools
+    return json.dumps({"type": "response.create", "response": response})
+
+
+def _client_response_tools() -> list[dict[str, object]]:
+    return [
+        {
+            "type": "function",
+            "name": "client_tool",
+            "description": "client tool",
+            "parameters": {"type": "object", "properties": {}},
+        }
+    ]
+
+
 def _direct_turn(text: str) -> str:
     return json.dumps({"input": text})
 
@@ -152,9 +170,9 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
     first_turn, later_turn = _issue_2059_turns()
     first_input, later_input = _issue_2059_inputs()
     client_frames = [
-        first_turn,
+        _turn_with_tools(json.loads(first_turn)["response"]["input"], _client_response_tools()),
         json.dumps({"type": "response.cancel"}),
-        later_turn,
+        _turn_with_tools(json.loads(later_turn)["response"]["input"], _client_response_tools()),
     ]
     client_ws = _FakeWebSocket(frames=client_frames)
     handler = _DummyOpenAIHandler()
@@ -171,10 +189,34 @@ async def test_memory_lookup_runs_for_each_issue_artifact_frame_and_preserves_no
     ]
     assert f"current memory: {first_input}" in forwarded_turns[0]["response"]["input"]
     assert f"current memory: {later_input}" in forwarded_turns[1]["response"]["input"]
-    expected_tools = _expected_memory_response_tools()
+    expected_tools = [*_client_response_tools(), *_expected_memory_response_tools()]
     for frame in forwarded_turns:
         assert frame["response"]["tools"] == expected_tools
     assert forwarded_turns[0]["response"]["tools"] == forwarded_turns[1]["response"]["tools"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [None, []], ids=["omitted", "empty"])
+async def test_ws_responses_do_not_inject_memory_tools_without_client_tools(tools):
+    upstream = _FakeUpstream(
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_no_tools"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_no_tools"}}),
+        ]
+    )
+    client_ws = _FakeWebSocket(
+        frames=[_turn_with_tools("no tools requested", tools)],
+        headers={"authorization": "Bearer test", "x-client": "unknown-client"},
+    )
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryHandler()
+
+    with patch.dict(sys.modules, {"websockets": _make_fake_websockets_module(upstream)}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded = [json.loads(frame) for frame in upstream.sent if "response" in json.loads(frame)]
+    assert forwarded
+    assert forwarded[0]["response"].get("tools", []) == []
 
 
 @pytest.mark.asyncio

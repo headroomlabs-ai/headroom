@@ -3648,6 +3648,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # hard connection failure. Mutating scope["headers"] before call_next
         # makes every downstream classify_client(headers) read "codex".
         if should_stamp_codex_client(path, headers):
+            request.scope["headroom_codex_client_stamped"] = True
             request.scope["headers"].append((b"x-client", b"codex"))
         client = getattr(request, "client", None)
         client_addr = ""
