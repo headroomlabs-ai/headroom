@@ -178,6 +178,59 @@ jobs:
           path: dist/*.whl
           retention-days: 1
 
+  test-windows-newline:
+    # No unit test has ever run on Windows (the `test` shards are
+    # ubuntu-only), which is how a Windows-only newline bug shipped twice
+    # (#3594, #3698). A full Windows shard is not worth the minutes; this
+    # runs only the handful of tests marked `windows_newline` against the
+    # wheel `build-wheel-windows` already produced. The marker keeps the set
+    # greppable — add `@pytest.mark.windows_newline` to a test and it runs
+    # here, no workflow edit needed.
+    #
+    # Gated on `packaging` because that is what builds the wheel this job
+    # consumes; on a pure-Python PR the ubuntu `test` shards still run the
+    # same marked tests (they assert the `newline=` kwarg, which fails on any
+    # platform), so this job is the Windows-side backstop, not the only guard.
+    needs: [changes, build-wheel-windows]
+    if: needs.changes.outputs.packaging == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Download Windows wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: headroom-wheel-windows
+          path: dist
+      - name: Install wheel + dev deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]"
+      - name: Drop the source tree so the wheel is what gets tested
+        shell: bash
+        # `actions/checkout` leaves ./headroom/ on sys.path ahead of the
+        # installed wheel, and the source tree has no compiled
+        # `headroom/_core.abi3.so` -- so every module that reaches the Rust
+        # extension dies with `ModuleNotFoundError: No module named
+        # 'headroom._core'` (203 collection errors on the first run of this
+        # job). The release workflow's smoke-import sidesteps this by running
+        # from RUNNER_TEMP; here we need ./tests/, so remove the shadow
+        # instead. Testing the installed artifact rather than the source tree
+        # is the point of consuming the wheel anyway.
+        run: rm -rf headroom
+      - name: Run newline-contract tests
+        shell: bash
+        # Scoped to the trees that hold the marked tests rather than all of
+        # ./tests: collecting ~10k modules on Windows took 91s and pulled in
+        # unrelated import failures. Add a directory here if you mark a test
+        # outside these paths.
+        run: pytest tests/test_learn tests/test_memory tests/test_memory_sync.py -m windows_newline --tb=short -q
+
   python-314-wheels:
     # Partners on centrally managed machines cannot choose their Python, and
     # many have no compiler. Install the proxy extras on the newest supported

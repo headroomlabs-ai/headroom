@@ -528,6 +528,7 @@ markers = [
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
     "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
     "proxy_dependency_gate: exercises ensure_proxy_dependencies() without mocking",
+    "windows_newline: newline-contract tests (#3698); also run on windows-latest in CI",
 ]
 
 [tool.coverage.run]
