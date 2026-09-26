@@ -648,7 +648,10 @@ impl SearchCompressor {
 ///    practically never contains one (the Windows drive colon is
 ///    already skipped above), so the leftmost is the right one. The
 ///    no-whitespace guard keeps a `foo.rs:12:` reference *inside the
-///    body* of a `-`-separated context line from hijacking the parse.
+///    body* of a `-`-separated context line from hijacking the parse. A
+///    whitespace-free body reference (`a:7:b`) still slips past it, so
+///    [`parse_match_line`] hands priority back to the dash tier for that
+///    one shape; see the comment there.
 /// 2. **Dash tier** — `-` is grep's *context*-line separator, and unlike
 ///    `:` it appears inside real paths (`2026-05-03`, `CVE-2021-44228`,
 ///    `20240101-002-add_users.sql`), so the leftmost triplet is often
@@ -684,9 +687,38 @@ impl SearchCompressor {
 ///    Only reached when neither tier matched (e.g. a path containing a
 ///    space), so behaviour for those lines is exactly as before.
 fn parse_match_line(line: &str) -> Option<(&str, u64, &str)> {
-    scan_match_line(line, ScanTier::Colon)
-        .or_else(|| scan_match_line(line, ScanTier::Dash))
-        .or_else(|| scan_match_line(line, ScanTier::Permissive))
+    let colon = scan_marker(line, ScanTier::Colon);
+    let dash = scan_marker(line, ScanTier::Dash);
+
+    // The colon tier keeps priority: `path:line:content` is what grep emits for
+    // matches and a path practically never contains a colon. It yields in
+    // exactly one shape — a `-`-separated context line whose body carries a
+    // whitespace-free `name:N:` reference (`app.py-476-a:7:b`). The dash tier
+    // proved a boundary *before* the colon marker and nothing path-like sits
+    // between the two, so that colon triplet is body text, not a marker.
+    //
+    // Without the hand-off the body's number is read as the line number, the
+    // path swallows the real `-N-`, and the model is shown a file that does not
+    // exist holding content attributed to a line it never came from
+    // (issue #3545). The whitespace guard inside the colon tier cannot catch
+    // this, because the body ahead of the reference need not contain any.
+    let dash_overrides = match (colon, dash) {
+        (Some((colon_marker, _)), Some((dash_marker, true))) => {
+            colon_marker.0 > dash_marker.2
+                && !path_structure_between(line, dash_marker.2 + 1, colon_marker.0)
+        }
+        _ => false,
+    };
+
+    let marker = if dash_overrides {
+        dash
+    } else {
+        colon
+            .or(dash)
+            .or_else(|| scan_marker(line, ScanTier::Permissive))
+    };
+
+    build_match(line, marker?.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -752,7 +784,36 @@ fn path_continues(rest: &str) -> bool {
         .is_some_and(|tok| tok.contains('/') || tok.contains('\\') || has_extension_dot(tok))
 }
 
-fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
+/// Byte offsets of one `<sep><digits><sep>` marker: where the path ends, where
+/// the digits start, and where the closing separator sits.
+type Marker = (usize, usize, usize);
+
+/// Assemble `(file, line_number, content)` from a marker's byte offsets.
+fn build_match(line: &str, marker: Marker) -> Option<(&str, u64, &str)> {
+    let (path_end, digits_start, digits_end) = marker;
+    let line_no = std::str::from_utf8(&line.as_bytes()[digits_start..digits_end])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())?;
+    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
+}
+
+/// True when `line[from..to]` still reads as path structure — a separator or an
+/// extension dot — rather than as body text.
+fn path_structure_between(line: &str, from: usize, to: usize) -> bool {
+    let (from, to) = if from <= to { (from, to) } else { (to, from) };
+    match line.get(from..to) {
+        Some(segment) => {
+            segment.contains('/') || segment.contains('\\') || has_extension_dot(segment)
+        }
+        None => false,
+    }
+}
+
+/// Scan `line` under `tier`, returning the marker it settled on plus whether
+/// that marker was a *positively confirmed* boundary (`chosen`) rather than the
+/// leftmost fallback (`first`). Callers need that flag to tell a proven boundary
+/// from a guess.
+fn scan_marker(line: &str, tier: ScanTier) -> Option<(Marker, bool)> {
     let bytes = line.as_bytes();
     // Windows drive prefix: starts with [A-Za-z]:[\\/]
     let scan_start = if bytes.len() >= 3
@@ -865,11 +926,7 @@ fn scan_match_line(line: &str, tier: ScanTier) -> Option<(&str, u64, &str)> {
     // is genuinely ambiguous (`Makefile-7-include-2-src/foo.mk`). Fall back
     // to the leftmost marker — precisely what the leftmost-wins rule this
     // tier refines would have returned.
-    let (path_end, digits_start, digits_end) = chosen.or(first)?;
-    let line_no = std::str::from_utf8(&bytes[digits_start..digits_end])
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())?;
-    Some((&line[..path_end], line_no, &line[digits_end + 1..]))
+    Some((chosen.or(first)?, chosen.is_some()))
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
@@ -916,6 +973,39 @@ mod tests {
         assert!(b.contains("认证") && b.contains("证令") && b.contains("令牌") && b.len() == 3);
         assert!(cjk_bigrams("hello").is_empty());
         assert!(cjk_bigrams("a认b证").is_empty()); // isolated CJK chars -> no pair
+    }
+
+    #[test]
+    fn dash_context_line_wins_over_a_colon_marker_in_its_body() {
+        // A whitespace-free `name:N:` reference in the body of a `-`-separated
+        // context line used to be read as the line-number marker: the path
+        // absorbed the real `-N-` and the body's number was reported as the
+        // line number, inventing both a file that does not exist and a
+        // line<->content pair that never existed (issue #3545).
+        assert_eq!(
+            parse_line("app/settings.py-476-a:7:b:8:c"),
+            Some(("app/settings.py".into(), 476, "a:7:b:8:c".into()))
+        );
+        // Extension-less paths reach the dash tier through its negative stop
+        // rather than the extension rule, and must keep resolving.
+        assert_eq!(
+            parse_line("CHANGELOG-12-a:99:b"),
+            Some(("CHANGELOG".into(), 12, "a:99:b".into()))
+        );
+        // A colon row whose *path* holds the dash triplet is untouched: the
+        // dash tier never confirmed a boundary there, so the colon tier wins.
+        assert_eq!(
+            parse_line("logs/2026-05-03/app.log:12:ERROR"),
+            Some(("logs/2026-05-03/app.log".into(), 12, "ERROR".into()))
+        );
+        assert_eq!(
+            parse_line("migrations/20240101-002-add_users.sql:12:SELECT"),
+            Some((
+                "migrations/20240101-002-add_users.sql".into(),
+                12,
+                "SELECT".into()
+            ))
+        );
     }
 
     #[test]
