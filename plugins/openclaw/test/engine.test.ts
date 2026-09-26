@@ -428,3 +428,84 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
     expect(entries["turn-1"].messages).toEqual(messages);
   });
 });
+
+describe("HeadroomContextEngine assemble() compression notice", () => {
+  const HEADROOM_COMPRESSION_NOTICE =
+    "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
+  const messages = [{ role: "user", content: "hello" }];
+
+  function mockCompressResult(overrides: Partial<{
+    compressed: boolean;
+    tokensSaved: number;
+    tokensBefore: number;
+    tokensAfter: number;
+  }>) {
+    const tokensSaved = overrides.tokensSaved ?? 0;
+    return {
+      compressed: overrides.compressed ?? tokensSaved > 0,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: overrides.tokensBefore ?? 1000,
+      tokensAfter: overrides.tokensAfter ?? 1000 - tokensSaved,
+      tokensSaved,
+    };
+  }
+
+  function readyEngine(config?: { announceCompression?: boolean }) {
+    const engine = new HeadroomContextEngine(config);
+    (engine as unknown as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    return engine;
+  }
+
+  it("returns the static notice, with no interpolated count, once tokensSaved crosses the threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("returns byte-identical notices across turns with different tokensSaved amounts", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 9000 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(first.systemPromptAddition);
+  });
+
+  it("keeps the notice present on a later turn that has nothing to compress", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("never returns a notice when announceCompression is false", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 500 }));
+
+    const engine = readyEngine({ announceCompression: false });
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBeUndefined();
+  });
+
+  it("does not announce for compression below the noise threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 50 }));
+
+    const engine = readyEngine();
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBeUndefined();
+  });
+});

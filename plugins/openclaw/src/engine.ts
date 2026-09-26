@@ -28,6 +28,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// Must stay static — OpenClaw prepends it to the cached system prompt.
+const HEADROOM_COMPRESSION_NOTICE =
+  "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
+
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
@@ -36,6 +40,7 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   /** Where to durably record committed turn-advancement keys (see
    * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
   commitLogPath?: string;
+  announceCompression?: boolean;
 }
 
 export class HeadroomContextEngine {
@@ -69,6 +74,7 @@ export class HeadroomContextEngine {
     compactions: 0,
   };
   private circuit = { errors: 0, openUntilMs: 0 };
+  private hasAnnouncedCompression = false;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -153,11 +159,19 @@ export class HeadroomContextEngine {
         this.config.requestTimeoutMs ?? 30_000,
       );
 
+      const shouldAnnounceCompression =
+        (this.hasAnnouncedCompression || result.tokensSaved > 100) &&
+        this.config.announceCompression !== false;
+      if (shouldAnnounceCompression) {
+        this.hasAnnouncedCompression = true;
+      }
+
       if (!result.compressed || result.tokensSaved === 0) {
         this.resetCircuit();
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
+          systemPromptAddition: shouldAnnounceCompression ? HEADROOM_COMPRESSION_NOTICE : undefined,
         };
       }
 
@@ -177,10 +191,7 @@ export class HeadroomContextEngine {
       return {
         messages: compressedAgentMessages,
         estimatedTokens: result.tokensAfter,
-        systemPromptAddition:
-          result.tokensSaved > 100
-            ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
-            : undefined,
+        systemPromptAddition: shouldAnnounceCompression ? HEADROOM_COMPRESSION_NOTICE : undefined,
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
