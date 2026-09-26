@@ -146,12 +146,18 @@ _HARNESS = textwrap.dedent(
     with open(sys.argv[1], "w") as fh:
         fh.write(str(proxy.pid))
 
-    wrap._ensure_proxy = lambda *a, **k: (proxy, port)
+    def _ensure_proxy(*a, **k):
+        # Signal "ready" from inside _launch_tool, after it has installed its
+        # SIGHUP handler. Writing it before the call raced the handler: a
+        # SIGHUP landing in that gap killed the wrapper via the default action.
+        with open(sys.argv[2], "w"):
+            pass
+        return proxy, port
+
+    wrap._ensure_proxy = _ensure_proxy
     wrap._live_proxy_clients = lambda *a, **k: []   # no other clients -> may reap
     wrap._push_runtime_env = lambda *a, **k: None
 
-    with open(sys.argv[2], "w"):                    # ready
-        pass
     wrap._launch_tool(
         binary=sys.executable,
         args=("-c", "import time; time.sleep(300)"),
@@ -206,7 +212,7 @@ def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
         start_new_session=True,
     )
     try:
-        assert _wait_for(ready.exists), "harness never reached _launch_tool"
+        assert _wait_for(ready.exists), "harness never reached _ensure_proxy inside _launch_tool"
         proxy_pid = int(pid_file.read_text())
         assert _pid_alive(proxy_pid), "stand-in proxy should be running"
 
