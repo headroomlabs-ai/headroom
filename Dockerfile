@@ -145,6 +145,13 @@ PY
 RUN cd /tmp && python -c "from headroom._core import DiffCompressor, SmartCrusher; \
     print(f'build-stage rust core verify OK: {DiffCompressor.__name__}, {SmartCrusher.__name__}')"
 
+# Build-stage smoke check for the ast-grep binary (issue #3649). Both runtime
+# stages COPY it out of /usr/local/bin, so a wheel that stopped shipping the
+# executable would otherwise surface as a confusing "not found" deep in the
+# runtime build instead of failing here. Executing it also proves this base
+# image satisfies the binary's glibc floor.
+RUN /usr/local/bin/ast-grep --version
+
 # Build the native Rust reverse proxy binary and stage it for the runtime
 # images (issue #976). These images already run "the proxy"; bundling the
 # native `headroom-proxy` binary lets operators front the Python proxy with
@@ -171,6 +178,16 @@ COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 COPY --from=builder /usr/local/bin/headroom /usr/local/bin/headroom
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# ast-grep binary from the ast-grep-cli wheel (issue #3649). That wheel ships
+# real executables through the .data/scripts install scheme, so they land in
+# /usr/local/bin and never inside site-packages: the site-packages COPY above
+# drags the dist-info across and leaves the binaries behind. Nothing fails at
+# build time, so the tool is only discovered missing when a feature that needs
+# it refuses to start (`--intercept-tool-results`, issue #3649).
+# The wheel's `sg` alias is deliberately not copied -- it would shadow Debian's
+# /usr/bin/sg (shadow-utils set-group) and headroom resolves the tool by the
+# name `ast-grep`.
+COPY --from=builder /usr/local/bin/ast-grep /usr/local/bin/ast-grep
 
 RUN mkdir -p /home/nonroot /data && \
     if [ "$RUNTIME_USER" = "nonroot" ]; then \
@@ -212,6 +229,16 @@ ARG PYTHON_SITE_PACKAGES
 COPY --from=builder ${PYTHON_SITE_PACKAGES} ${PYTHON_SITE_PACKAGES}
 # Native Rust reverse proxy binary (issue #976).
 COPY --from=builder /usr/local/bin/headroom-proxy /usr/local/bin/headroom-proxy
+# ast-grep binary from the ast-grep-cli wheel (issue #3649). That wheel ships
+# real executables through the .data/scripts install scheme, so they land in
+# /usr/local/bin and never inside site-packages: the site-packages COPY above
+# drags the dist-info across and leaves the binaries behind. Nothing fails at
+# build time, so the tool is only discovered missing when a feature that needs
+# it refuses to start (`--intercept-tool-results`, issue #3649).
+# The wheel's `sg` alias is deliberately not copied -- it would shadow Debian's
+# /usr/bin/sg (shadow-utils set-group) and headroom resolves the tool by the
+# name `ast-grep`.
+COPY --from=builder /usr/local/bin/ast-grep /usr/local/bin/ast-grep
 
 USER ${RUNTIME_USER}
 WORKDIR /app
