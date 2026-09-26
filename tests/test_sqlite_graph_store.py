@@ -14,6 +14,7 @@ Tests verify:
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 
 import pytest
@@ -24,6 +25,20 @@ from headroom.memory.adapters.graph_models import (
     RelationshipDirection,
 )
 from headroom.memory.adapters.sqlite_graph import SQLiteGraphStore
+
+
+@pytest.mark.asyncio
+async def test_read_only_store_queries_without_permitting_mutation(tmp_path) -> None:
+    db_path = tmp_path / "graph.db"
+    writable = SQLiteGraphStore(db_path)
+    entity = Entity(user_id="user1", name="Existing", entity_type="test")
+    await writable.add_entity(entity)
+
+    read_only = SQLiteGraphStore(db_path, initialize=False, read_only=True)
+    assert [item.id for item in await read_only.get_entities_for_user("user1")] == [entity.id]
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        await read_only.add_entity(Entity(user_id="user1", name="Blocked", entity_type="test"))
 
 
 class TestSQLiteGraphStoreEntityOperations:
@@ -197,6 +212,31 @@ class TestSQLiteGraphStoreRelationshipOperations:
         assert rels[0].relation_type == "knows"
         assert rels[0].weight == 0.9
         assert rels[0].properties == {"since": "2020"}
+
+    @pytest.mark.asyncio
+    async def test_get_relationships_for_user(self, store_with_entities):
+        """Test listing all relationships scoped to a user."""
+        store, alice, bob, charlie = store_with_entities
+
+        rel1 = Relationship(
+            user_id="user1",
+            source_id=alice.id,
+            target_id=bob.id,
+            relation_type="knows",
+        )
+        rel2 = Relationship(
+            user_id="user1",
+            source_id=bob.id,
+            target_id=charlie.id,
+            relation_type="works_with",
+        )
+
+        await store.add_relationship(rel1)
+        await store.add_relationship(rel2)
+
+        user_relationships = await store.get_relationships_for_user("user1")
+        assert {rel.id for rel in user_relationships} == {rel1.id, rel2.id}
+        assert await store.get_relationships_for_user("missing-user") == []
 
     @pytest.mark.asyncio
     async def test_get_relationships_by_direction(self, store_with_entities):
