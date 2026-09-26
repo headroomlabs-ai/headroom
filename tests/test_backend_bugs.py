@@ -274,6 +274,33 @@ class TestConvertMessagesToolBlocks:
         assert converted[0]["role"] == "tool"
         assert converted[0]["content"] == "Line 1\nLine 2"
 
+    def test_tool_result_list_content_with_bare_string_block(self):
+        """A tool_result content list may contain a bare string, not just
+        ``{"type":"text",...}`` blocks. ``b.get`` on a str raised AttributeError
+        and 500'd the whole request; bare strings must be accepted and other
+        block types skipped."""
+        backend = self._make_backend()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_03",
+                        "content": [
+                            "bare string result",
+                            {"type": "text", "text": "typed block"},
+                            {"type": "image", "source": {"type": "base64", "data": "x"}},
+                        ],
+                    },
+                ],
+            },
+        ]
+        converted = backend._convert_messages_for_litellm(messages)
+        assert converted[0]["role"] == "tool"
+        # bare string + text block joined; the image block is skipped.
+        assert converted[0]["content"] == "bare string result\ntyped block"
+
     def test_assistant_tool_use_with_text(self):
         """Assistant message with both text and tool_use blocks."""
         backend = self._make_backend()

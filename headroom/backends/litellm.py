@@ -997,9 +997,18 @@ class LiteLLMBackend(Backend):
                     for tr in tool_result_blocks:
                         tr_content = tr.get("content", "")
                         if isinstance(tr_content, list):
-                            tr_content = "\n".join(
-                                b.get("text", "") for b in tr_content if b.get("type") == "text"
-                            )
+                            # A tool_result content list is usually
+                            # ``{"type":"text",...}`` blocks, but a client may put
+                            # a bare string in the list. ``b.get`` on a str raised
+                            # AttributeError and 500'd the whole request; accept
+                            # bare strings and skip non-text/other blocks.
+                            text_pieces: list[str] = []
+                            for b in tr_content:
+                                if isinstance(b, str):
+                                    text_pieces.append(b)
+                                elif isinstance(b, dict) and b.get("type") == "text":
+                                    text_pieces.append(b.get("text", ""))
+                            tr_content = "\n".join(text_pieces)
                         tool_msg: dict[str, Any] = {
                             "role": "tool",
                             "tool_call_id": tr["tool_use_id"],
