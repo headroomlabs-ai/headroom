@@ -1,5 +1,6 @@
 """Tests for recommendation writer — marker-based file updates."""
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -570,3 +571,125 @@ class TestEncodingResilience:
         raw = memory_md.read_bytes()
         assert b"\r\r" not in raw
         assert raw.count(b"\r") == raw.count(b"\r\n")
+
+
+def _git(proj: ProjectInfo, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run git against the test repo, under the isolated config below."""
+    return subprocess.run(["git", *args], cwd=proj.project_path, check=check, capture_output=True)
+
+
+def _git_project(tmp_path: Path) -> ProjectInfo:
+    """A project whose directory is a real git repo."""
+    proj = _project(tmp_path)
+    _git(proj, "init", "-q")
+    return proj
+
+
+def _exclude(proj: ProjectInfo) -> Path:
+    return proj.project_path / ".git" / "info" / "exclude"
+
+
+def _exclude_entries(proj: ProjectInfo) -> list[str]:
+    """The repo-local exclude rules this PR is responsible for, one per line."""
+    path = _exclude(proj)
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def _is_ignored(proj: ProjectInfo, name: str) -> bool:
+    return _git(proj, "check-ignore", "-q", "--", name, check=False).returncode == 0
+
+
+class TestClaudeLocalMdStaysOutOfGit:
+    """CLAUDE.local.md is only personal if git actually ignores it (#1070)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_git_config(self, monkeypatch, tmp_path):
+        """Decide these tests on the repository alone, on every machine.
+
+        ``git check-ignore`` consults ``core.excludesFile`` from the developer's
+        global and system config, and the writer shells out to it too (it skips
+        adding a rule when one already covers the file). So a contributor whose
+        global ignore lists CLAUDE.md or CLAUDE.local.md saw this suite fail
+        while the writer was behaving correctly. Patching the environment rather
+        than a helper covers the writer's own subprocess as well as ours.
+        """
+        absent = tmp_path / "absent-gitconfig"
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(absent))
+        monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(absent))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    def test_apply_adds_exclude_entry(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert "CLAUDE.local.md" in _exclude(proj).read_text()
+        # The point is the effect, not the file contents.
+        assert _is_ignored(proj, "CLAUDE.local.md")
+        assert result.warnings == []
+
+    def test_second_run_does_not_duplicate_the_entry(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+        writer = ClaudeCodeWriter()
+
+        writer.write(recs, proj, dry_run=False)
+        writer.write(recs, proj, dry_run=False)
+
+        assert _exclude(proj).read_text().count("CLAUDE.local.md") == 1
+
+    def test_existing_gitignore_rule_is_left_alone(self, tmp_path):
+        proj = _git_project(tmp_path)
+        (proj.project_path / ".gitignore").write_text("CLAUDE.local.md\n")
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_tracked_file_warns_instead_of_excluding(self, tmp_path):
+        proj = _git_project(tmp_path)
+        local = proj.project_path / "CLAUDE.local.md"
+        local.write_text("# prior\n")
+        _git(proj, "add", "CLAUDE.local.md")
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        # An ignore rule does nothing for a tracked file, so say so rather than
+        # staging a deletion in the user's repo on their behalf.
+        assert len(result.warnings) == 1
+        assert "git rm --cached CLAUDE.local.md" in result.warnings[0]
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_dry_run_does_not_touch_exclude(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter().write(recs, proj, dry_run=True)
+
+        assert not _exclude(proj).exists() or "CLAUDE.local.md" not in _exclude(proj).read_text()
+
+    def test_explicit_shared_target_is_never_excluded(self, tmp_path):
+        proj = _git_project(tmp_path)
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        ClaudeCodeWriter(context_target="CLAUDE.md").write(recs, proj, dry_run=False)
+
+        # --target CLAUDE.md is a deliberate opt-in to the team-shared file, so
+        # the writer must not add a rule for it. Assert the side effect this PR
+        # actually owns - the repo's own exclude file - as well as the effect.
+        assert "CLAUDE.md" not in _exclude_entries(proj)
+        assert not _is_ignored(proj, "CLAUDE.md")
+
+    def test_outside_a_git_repo_is_a_no_op(self, tmp_path):
+        proj = _project(tmp_path)  # no git init
+        recs = [_rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")]
+
+        result = ClaudeCodeWriter().write(recs, proj, dry_run=False)
+
+        assert (proj.project_path / "CLAUDE.local.md").exists()
+        assert result.warnings == []
