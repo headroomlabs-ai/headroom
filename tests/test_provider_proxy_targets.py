@@ -78,3 +78,21 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+
+
+def test_select_passthrough_base_url_routes_grok_session_login_to_session_host() -> None:
+    proxy = _proxy(OPENAI_API_URL="https://api.x.ai")
+    session = {
+        "authorization": "Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y",
+        "x-xai-token-auth": "xai-grok-cli",
+        "user-agent": "grok-shell/0.2.112 (macos; aarch64)",
+    }
+    assert select_passthrough_base_url(proxy, session) == "https://cli-chat-proxy.grok.com"
+
+    keyed = {"authorization": "Bearer xai-abc", "user-agent": "grok-shell/0.2.112"}
+    assert select_passthrough_base_url(proxy, keyed) == "https://api.x.ai"
+
+    # A configured target that is not xAI (an internal gateway) is never
+    # bypassed, however Grok-like the request looks.
+    gateway = _proxy(OPENAI_API_URL="https://gateway.internal")
+    assert select_passthrough_base_url(gateway, session) == "https://gateway.internal"

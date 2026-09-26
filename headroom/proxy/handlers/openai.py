@@ -74,6 +74,7 @@ from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
 from headroom.providers.copilot import model_prefers_responses_api
+from headroom.providers.grok import session_upstream as grok_session_upstream
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -405,10 +406,14 @@ def _resolve_openai_handler_path(
     return parsed.path
 
 
-def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+def _resolve_openai_upstream_base(
+    request_headers: dict[str, str], configured_target: str | None
+) -> str | None:
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
     if raw_base_url is None:
-        return None
+        # A `grok login` session token is only valid at the Grok CLI's own
+        # session host; the Grok CLI cannot set x-headroom-base-url itself.
+        return grok_session_upstream(request_headers, configured_target)
 
     normalized = _normalize_origin(raw_base_url)
     if normalized is None:
@@ -1958,7 +1963,10 @@ class OpenAIHandlerMixin:
         not just the generic passthrough route that already honors it. Falls
         back to the configured ``OPENAI_API_URL`` (``OPENAI_TARGET_API_URL``).
         """
-        return _resolve_openai_upstream_base(request.headers) or self.OPENAI_API_URL
+        return (
+            _resolve_openai_upstream_base(request.headers, self.OPENAI_API_URL)
+            or self.OPENAI_API_URL
+        )
 
     @staticmethod
     def _strict_previous_turn_frozen_count(
@@ -3392,7 +3400,9 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
-        custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        custom_upstream_base_url = _resolve_openai_upstream_base(
+            request.headers, self.OPENAI_API_URL
+        )
         upstream_base_url = self._resolve_openai_upstream(request)
         handler_path_suffix = _resolve_openai_chat_handler_path(
             upstream_base_url,
@@ -3533,7 +3543,7 @@ class OpenAIHandlerMixin:
             stripped_count=_pre_strip_count_chat,
             request_id=request_id,
         )
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        upstream_base_url = _resolve_openai_upstream_base(request.headers, self.OPENAI_API_URL)
         handler_path = (
             _resolve_openai_handler_path(
                 request.headers,
@@ -5664,7 +5674,7 @@ class OpenAIHandlerMixin:
         # real destination rather than merged before it is known.
         # Resolve the client-supplied upstream once: the secret-header gate,
         # the routing decision, and the CCR streaming decision all need it.
-        upstream_base_url = _resolve_openai_upstream_base(request.headers)
+        upstream_base_url = _resolve_openai_upstream_base(request.headers, self.OPENAI_API_URL)
         headers = merge_extra_headers(
             headers,
             self.config.openai_extra_headers,
