@@ -32,7 +32,9 @@
         @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
     </style>
 </head>
-<body class="text-gray-800 dark:text-gray-100 min-h-screen" x-data="settingsPage()" x-init="init()">
+<!-- No x-init: Alpine already calls the x-data object's own init(). Naming it
+     here too fetched /settings/schema twice on every load. -->
+<body class="text-gray-800 dark:text-gray-100 min-h-screen" x-data="settingsPage()">
     <div class="max-w-3xl mx-auto px-4 py-8">
         <div class="flex items-center justify-between mb-6">
             <div>

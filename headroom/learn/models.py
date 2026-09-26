@@ -67,10 +67,10 @@ class ToolCall:
             return cmd[:100] + "..." if len(cmd) > 100 else cmd
         if self.name in ("Read", "read"):
             return str(self.input_data.get("file_path", "?"))
-        if self.name in ("Grep", "grep"):
-            return str(self.input_data.get("pattern", "?"))
-        if self.name in ("Glob", "glob"):
-            return str(self.input_data.get("pattern", "?"))
+        if self.name in ("Grep", "grep", "Glob", "glob"):
+            pattern = self.input_data.get("pattern", "?")
+            path = self.input_data.get("path", "?")
+            return f"{pattern} in {path}"
         if self.name in ("Edit", "edit", "Write", "write"):
             return str(self.input_data.get("file_path", "?"))
         return str(self.input_data)[:80]

@@ -22,7 +22,7 @@ from headroom.proxy.helpers import (
     claude_code_tool_search_inactive,
     format_tool_search_disabled_hint,
     reset_tool_search_hint_state,
-    take_tool_search_hint_slot,
+    take_tool_search_scan_slot,
     tool_search_hint_pending,
 )
 
@@ -159,11 +159,11 @@ def test_hint_slot_fires_once() -> None:
     reset_tool_search_hint_state()
     try:
         assert tool_search_hint_pending() is True
-        assert take_tool_search_hint_slot() is True
+        assert take_tool_search_scan_slot() is True
         # Once consumed, the cheap gate flips so the hot path stops scanning.
         assert tool_search_hint_pending() is False
-        assert take_tool_search_hint_slot() is False
-        assert take_tool_search_hint_slot() is False
+        assert take_tool_search_scan_slot() is False
+        assert take_tool_search_scan_slot() is False
     finally:
         reset_tool_search_hint_state()
 
@@ -397,6 +397,7 @@ def test_core_tools_match_leading_underscore_namespace() -> None:
 # ---------------------------------------------------------------------------
 
 from headroom.proxy.helpers import (  # noqa: E402
+    _CLIENT_TOOL_REF_PLACEHOLDER,
     strip_unsupported_tool_search_blocks,
 )
 
@@ -433,7 +434,7 @@ def _poisoned_transcript() -> list[dict]:
     ]
 
 
-def test_repair_drops_blocks_the_hook_evaluator_cannot_resolve() -> None:
+def test_repair_neutralizes_blocks_the_hook_evaluator_cannot_resolve() -> None:
     # The Stop hook evaluator replays the transcript with a small tools array
     # that has neither the search tool nor AskUserQuestion -> upstream 400.
     messages, removed = strip_unsupported_tool_search_blocks(
@@ -441,7 +442,11 @@ def test_repair_drops_blocks_the_hook_evaluator_cannot_resolve() -> None:
     )
     assert removed == 2  # server_tool_use + tool_search_tool_result
     kinds = [b["type"] for b in messages[1]["content"]]
-    assert kinds == ["text", "text"]  # surrounding assistant text survives
+    assert kinds == ["text", "text", "text", "text"]  # both swapped for text in place
+    assert messages[1]["content"][0]["text"] == "Searching for a tool."
+    assert messages[1]["content"][3]["text"] == "Found it."  # index preserved
+    assert "tool search omitted" in messages[1]["content"][1]["text"]
+    assert "tool search omitted" in messages[1]["content"][2]["text"]
     assert messages[0]["content"][0]["text"] == "ask the user"
 
 
@@ -458,15 +463,18 @@ def test_repair_is_noop_on_the_main_loop() -> None:
     assert messages is transcript
 
 
-def test_repair_drops_a_turn_left_with_no_blocks() -> None:
-    # An assistant turn that was ONLY the search round-trip must be removed, not
-    # forwarded with an empty content array (which Anthropic also rejects).
+def test_repair_keeps_a_turn_that_was_only_bookkeeping() -> None:
+    # An assistant turn that was ONLY the search round-trip keeps its message
+    # slot (an all-text turn is valid, an empty content array is not). Dropping
+    # the message would shift every later message index and so move any signed
+    # thinking block, which makes select_outbound_body discard the repair (#3456).
     transcript = _poisoned_transcript()
     transcript[1]["content"] = transcript[1]["content"][1:3]
     messages, removed = strip_unsupported_tool_search_blocks(transcript, [])
     assert removed == 2
-    assert len(messages) == 1
-    assert messages[0]["role"] == "user"
+    assert len(messages) == 2
+    assert messages[1]["role"] == "assistant"
+    assert [b["type"] for b in messages[1]["content"]] == ["text", "text"]
 
 
 def test_repair_leaves_other_server_tools_alone() -> None:
@@ -507,6 +515,78 @@ def test_repair_strips_search_history_when_only_the_tool_is_missing() -> None:
         _poisoned_transcript(), [{"name": "AskUserQuestion", "input_schema": {}}]
     )
     assert removed == 2
+
+
+# ---------------------------------------------------------------------------
+# Client-side tool search: Claude Code (and any custom implementation) stores
+# discovered tools as tool_reference blocks inside a PLAIN tool_result, not a
+# tool_search_tool_result. Anthropic validates those references too, so a stale
+# one (e.g. an MCP server that disconnected mid-session) 400s the same way.
+# ---------------------------------------------------------------------------
+
+
+def _client_side_transcript(*referenced: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Searching."},
+                {"type": "tool_use", "id": "toolu_cs", "name": "ToolSearch", "input": {"q": "x"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_cs",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": name} for name in referenced
+                    ],
+                }
+            ],
+        },
+    ]
+
+
+def test_repair_neutralizes_client_side_reference_to_absent_tool() -> None:
+    # Absent tool: drop the reference, and because it was the whole result,
+    # replace the content with a placeholder so the paired tool_use is kept
+    # (an orphaned tool_use 400s on its own).
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "Read", "input_schema": {}}],
+    )
+    assert removed == 1
+    assert messages[0]["content"][1]["type"] == "tool_use"  # search call preserved
+    result = messages[1]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["content"] == _CLIENT_TOOL_REF_PLACEHOLDER
+
+
+def test_repair_keeps_client_side_reference_to_present_deferred_tool() -> None:
+    # A deferred-but-present tool is valid; keep it and return by identity.
+    transcript = _client_side_transcript("CronCreate")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_keeps_present_client_side_reference_and_drops_absent() -> None:
+    # Mixed result: keep the present reference, drop only the absent one.
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("CronCreate", "mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["CronCreate"]
 
 
 # ---------------------------------------------------------------------------
@@ -613,10 +693,10 @@ def test_repair_drops_search_tool_self_reference_when_inject_ran() -> None:
         {"name": "mcp_tool_x", "input_schema": {}, "defer_loading": True},
     ]
     messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
-    assert removed == 2  # server_tool_use + tool_search_tool_result both dropped
-    # The assistant turn is entirely stripped (only search blocks were present).
-    assert len(messages) == 1
-    assert messages[0]["role"] == "user"
+    assert removed == 2  # server_tool_use + tool_search_tool_result both repaired
+    # The assistant turn keeps its slot; both search blocks became text.
+    assert len(messages) == 2
+    assert [b["type"] for b in messages[1]["content"]] == ["text", "text"]
 
 
 def test_repair_noop_when_referenced_tool_is_regular_deferred_tool() -> None:
@@ -645,3 +725,89 @@ def test_repair_drops_when_referenced_tool_absent_despite_search_tool_present() 
     ]
     messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
     assert removed == 2
+
+
+def test_repair_keeps_custom_client_side_references_without_a_builtin_search_tool() -> None:
+    """Anthropic supports a custom client-side search: a normal tool_use /
+    tool_result pair returning tool_reference blocks that point at the
+    top-level tools array. No ``tool_search_tool_*`` server tool is involved,
+    so gating the client-side branch on one deleted every valid reference."""
+    transcript = _client_side_transcript("Calendar")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_still_drops_an_absent_reference_without_a_builtin_search_tool() -> None:
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("Calendar", "mcp__x__ghost"),
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["Calendar"]
+
+
+def test_repair_does_not_move_signed_thinking_blocks() -> None:
+    # Production failure (#3456): the unsupportable block sat in the SAME
+    # assistant message as signed thinking blocks. Removing it moved the
+    # thinking block that followed it, thinking_blocks_survived_mutation went
+    # False, and select_outbound_body forwarded the client's ORIGINAL bytes --
+    # discarding the repair, so upstream 400'd on the very reference we found.
+    # Repairing in place must leave the thinking fingerprint byte-identical.
+    from headroom.proxy.body_forwarding import thinking_block_fingerprint
+
+    transcript = [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                {"type": "text", "text": "Checking."},
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_01ABC",
+                    "name": _TOOL_SEARCH_DEFAULT_NAME,
+                    "input": {},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_01ABC",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {"type": "tool_reference", "tool_name": "mcp__gone__tool"}
+                        ],
+                    },
+                },
+                {"type": "thinking", "thinking": "second", "signature": "sig-2"},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "next"}]},
+    ]
+    before = thinking_block_fingerprint({"messages": transcript})
+
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript, [_SEARCH_TOOL, {"name": "Bash", "input_schema": {}}]
+    )
+
+    assert removed == 2
+    assert thinking_block_fingerprint({"messages": messages}) == before
+    assert not [
+        block
+        for message in messages
+        for block in message["content"]
+        if block["type"] in ("tool_search_tool_result", "server_tool_use")
+    ]

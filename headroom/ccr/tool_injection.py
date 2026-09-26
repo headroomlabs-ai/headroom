@@ -97,6 +97,35 @@ def create_ccr_tool_definition(
             },
         }
 
+    elif provider == "openai_responses":
+        # Responses API: the same function, declared flat. `name` and
+        # `parameters` sit directly on the tool rather than nested under
+        # "function" as chat completions wants, and the nested shape is
+        # rejected -- so falling through to `openai_definition` here would
+        # inject a tool the provider refuses, on exactly the turns where
+        # compression markers made the tool necessary.
+        return {
+            "type": "function",
+            "name": CCR_TOOL_NAME,
+            "description": (
+                "Retrieve original uncompressed content that was compressed to save tokens. "
+                "Use this when you need more data than what's shown in compressed tool results. "
+                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": (
+                            "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)"
+                        ),
+                    },
+                },
+                "required": ["hash"],
+            },
+        }
+
     elif provider == "google":
         # Google/Gemini format
         return {

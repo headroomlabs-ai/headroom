@@ -10,6 +10,7 @@
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import { DurableAdvancementKeyStore, defaultCommitLogPath } from "./advancement-key-store.js";
 import {
   delegateCompactionToRuntime,
   type OpenClawCompactParams,
@@ -32,6 +33,9 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
+  /** Where to durably record committed turn-advancement keys (see
+   * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
+  commitLogPath?: string;
 }
 
 export class HeadroomContextEngine {
@@ -40,7 +44,16 @@ export class HeadroomContextEngine {
     name: "Headroom Context Compression",
     version: "0.1.0",
     ownsCompaction: false,
+    transcriptSemantics: {
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    },
   };
+
+  // Durable, restart-safe record of committed advancement keys, for
+  // commitTurn's idempotent-retry check. See advancement-key-store.ts for
+  // why this must survive a process restart and must not evict entries.
+  private advancementKeyStore: DurableAdvancementKeyStore;
 
   private proxyManager: ProxyManager;
   private proxyUrl: string | null = null;
@@ -61,6 +74,9 @@ export class HeadroomContextEngine {
     this.config = config;
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
+    this.advancementKeyStore = new DurableAdvancementKeyStore(
+      config.commitLogPath ?? defaultCommitLogPath(),
+    );
   }
 
   // === ContextEngine Lifecycle ===
@@ -187,6 +203,23 @@ export class HeadroomContextEngine {
     );
 
     return result;
+  }
+
+  /**
+   * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
+   * contract. Called only for the accepted, successful turn; failed or aborted
+   * turns never reach here. Must be an atomic, idempotent write of the
+   * accepted `messages` keyed by `advancementKey` so a host retry with the
+   * same key reports "duplicate" instead of re-applying the advancement —
+   * including a retry that arrives after this process restarted, which is
+   * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
+   * than in memory, and includes the messages rather than just the key.
+   */
+  async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
+    status: "committed" | "duplicate";
+  }> {
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey, params.messages);
+    return { status };
   }
 
   async afterTurn?(params: {
