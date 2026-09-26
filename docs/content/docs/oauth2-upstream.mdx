@@ -1,0 +1,35 @@
+---
+title: OAuth2 Upstream Auth
+description: Client-credentials bearer tokens for OpenAI-compatible enterprise backends, via the headroom-oauth2 proxy extension.
+---
+
+Enterprise AI gateways (Azure AD / Entra, Okta, Auth0, Keycloak, Cognito, …) often protect their OpenAI-compatible endpoints with an OAuth2 client-credentials flow. The [`headroom-oauth2`](https://github.com/chopratejas/headroom/tree/main/plugins/headroom-oauth2) extension mints a bearer token from a configurable token endpoint, caches and refreshes it (single-flight), and injects `Authorization: Bearer <token>` on each upstream request. It is fully vendor-neutral — no provider is hard-coded.
+
+It plugs into Headroom's public `headroom.proxy_extension` entry-point seam, so it is fully out-of-tree and opt-in.
+
+## Install & enable
+
+```bash
+pip install headroom-oauth2
+headroom proxy --backend litellm-openai --proxy-extension oauth2
+```
+
+## Configuration
+
+Environment variables (no-op unless `HEADROOM_OAUTH2_TOKEN_URL` is set):
+
+| Env | Meaning |
+|-----|---------|
+| `HEADROOM_OAUTH2_TOKEN_URL` | token endpoint (client_credentials grant) |
+| `HEADROOM_OAUTH2_CLIENT_ID` / `_CLIENT_SECRET` | credentials |
+| `HEADROOM_OAUTH2_SCOPES` | space/comma-separated scopes |
+| `HEADROOM_OAUTH2_AUDIENCE` | optional audience |
+| `HEADROOM_OAUTH2_GRANT_TYPE` | default `client_credentials` |
+| `HEADROOM_OAUTH2_AUTH_STYLE` | `post` (form creds) or `basic` (HTTP Basic) |
+| `HEADROOM_OAUTH2_HEADERS` | static upstream headers, `K=V,K2=V2` |
+
+## Notes
+
+- **Effective backends**: the injected bearer reaches the upstream only for OpenAI-compatible / passthrough litellm providers. `bedrock` / `vertex` / `sagemaker` authenticate from env and ignore it — the extension is a no-op there (it logs a warning at startup).
+- **Transport**: `token_url` must be `https` (loopback `http` allowed for tests; set `HEADROOM_OAUTH2_ALLOW_INSECURE=1` to override).
+- **TLS**: tokens are minted with the standard library (`urllib`, system cert store), so a corporate-injected CA is trusted without bundling roots — this works behind corporate SSL-inspection where bundled-root TLS stacks fail.
