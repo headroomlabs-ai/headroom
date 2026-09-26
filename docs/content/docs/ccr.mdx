@@ -163,6 +163,97 @@ you're integrating CCR outside the proxy.
 </Tab>
 </Tabs>
 
+## Storage backends
+
+The compression store is pluggable. Which backend you run decides whether a `headroom_retrieve`
+call still resolves after a restart, and whether it resolves when it lands on a different worker
+than the one that did the compressing.
+
+The table below describes the **Rust core's** backends (`CcrBackendConfig`). The Python proxy path
+has its own, narrower set — see [Python proxy path](#python-proxy-path) below, and note that it is
+the Python path that serves proxy traffic today.
+
+| Backend | Survives restart | Shared across workers | Use it when |
+|---|---|---|---|
+| In-memory | No | No | Single-process library use, tests |
+| SQLite (default) | Yes | Same host only | The default proxy deployment |
+| Redis-compatible <br/>*(not yet operator-selectable)* | Yes | Across hosts | Multiple proxy workers, more than one host |
+
+The default is SQLite, at `ccr_store.db` under the workspace directory. That is deliberate: the
+30-minute retention window assumes a store that outlives a single request, and a file-backed store
+is shared by every worker on the host for free.
+
+The reason the third row exists is that SQLite stops being enough as soon as the workers are spread
+over more than one machine. Compression happens on whichever worker received the request, but the
+LLM's follow-up `headroom_retrieve` call can arrive at any of them. With a host-local store, that
+either forces sticky sessions at the load balancer or produces retrieval misses. A Redis-compatible
+store removes the constraint — every worker reads and writes the same keyspace.
+
+### Running CCR on Redis or Valkey
+
+Either server works, with no Headroom-side difference between them. [Redis](https://redis.io/) is the
+original; [Valkey](https://valkey.io/) is a BSD-licensed, RESP-compatible fork of it. Pick on
+licensing and operational grounds, not on Headroom compatibility.
+
+The reason that choice is genuinely free is how little of either server the backend uses. Its entire
+server-side surface is five commands — `PING`, `SETEX`, `GET`, `EXPIRE` and `DEL` — plus the
+`CLIENT SETINFO` handshake the client library sends when it connects. No Lua scripting, no module
+dependency, no cluster-specific command. That makes compatibility a narrow, checkable question rather
+than an open-ended one: all six commands were exercised against **Redis 8.2** and **Valkey 9.1**,
+with identical observed behavior on both.
+
+To run either locally:
+
+```bash
+# Bound to loopback: the store holds uncompressed tool output, and both
+# containers ship with no authentication.
+docker run -d --name redis  -p 127.0.0.1:6379:6379 redis:8.2-alpine
+# ...or
+docker run -d --name valkey -p 127.0.0.1:6379:6379 valkey/valkey:9.1.1-alpine
+```
+
+<Callout type="warning" title="Securing a shared server">
+  That loopback binding is doing real work. The store holds **uncompressed** tool output — file
+  contents, logs, API responses — so anything beyond a local container needs the transport and the
+  server locked down: connect with `rediss://` for TLS, set `requirepass` or an ACL user, and keep
+  the server on a private network rather than a public interface. Note that the `rediss://` path is
+  not yet covered by the test suite; CI exercises `redis://` against both servers.
+</Callout>
+
+Because the dependency is optional, the backend is only compiled when the `redis` Cargo feature is
+enabled. The same flag gates its test suite, which needs a server URL to run against — the URL scheme
+is `redis://` for both servers, since Valkey speaks the same protocol:
+
+```bash
+HEADROOM_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo test -p headroom-core --features redis --test ccr_backends
+```
+
+Without `HEADROOM_TEST_REDIS_URL` those tests report themselves as skipped and the rest of the suite
+still runs, so a contributor with no server available is never blocked. CI runs the suite **twice, once
+against each server**, alongside `cargo clippy --features redis` — so the two-server claim above is
+re-checked on every change rather than being a one-off measurement.
+
+<Callout type="warning" title="Not yet selectable from configuration">
+  The Redis-compatible backend is implemented and tested, but `CcrBackendConfig` is not yet read
+  from operator-facing configuration — so there is currently no environment variable or config key
+  that switches the Rust core onto it. Until that wiring lands, the backend is reachable only by
+  constructing the store directly. Treat this section as a description of the backend's state, not
+  as a deployment recipe.
+</Callout>
+
+### Python proxy path
+
+The Python path resolves its backend from `HEADROOM_CCR_BACKEND`, which accepts `memory`,
+`sqlite` (the default when unset), or the name of a backend registered under the
+`headroom.ccr_backend` setuptools entry point.
+
+No Redis-compatible adapter ships in the box. Setting `HEADROOM_CCR_BACKEND=redis` without having
+installed a package that registers that entry-point name logs a warning and falls back to the
+in-process store, which means retrieval quietly stops surviving restarts. An out-of-tree adapter
+receives its connection URL from `HEADROOM_REDIS_URL` and an optional key namespace from
+`HEADROOM_CCR_TENANT_PREFIX`.
+
 ## Retention
 
 Proxy CCR originals are kept for 1800 seconds (30 minutes) by default. For longer autonomous
@@ -174,6 +265,15 @@ HEADROOM_CCR_TTL_SECONDS=7200 headroom proxy
 
 Check the effective setting at `/v1/retrieve/stats` under
 `store.default_ttl_seconds`.
+
+That figure is an **idle** window, not a wall-clock deadline. Every successful retrieval re-arms it,
+so an entry the agent keeps coming back to stays available through a long run instead of expiring
+mid-session. To stop constant access from pinning an entry forever, each original also carries an
+absolute ceiling of eight times the idle TTL, measured from when it was first stored; once that
+ceiling passes, the entry is purged on its next access rather than served. This is what the
+`GET`, `EXPIRE` and `DEL` commands in the Redis-compatible backend's surface are doing — reading the
+stored birth instant to work out what is left of the ceiling, re-arming the idle window against it,
+and purging once it runs out.
 
 ## Message-level CCR
 
