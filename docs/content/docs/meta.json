@@ -36,6 +36,7 @@
     "autogen",
     "litellm",
     "claude-code-vertex",
+    "claude-code-bedrock",
     "claude-code-azure-foundry",
     "vscode-claude-code",
     "vscode-copilot",
