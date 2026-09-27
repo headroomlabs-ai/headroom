@@ -139,9 +139,9 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
     \b
     By default this installs into every agent that has a registrar and is
-    detected on this system (Claude Code today; Cursor / Codex / Continue /
-    others added in subsequent releases). Pass ``--agent NAME`` one or more
-    times to restrict the installation.
+    detected on this system (Antigravity IDE, Claude Code, Codex, Grok CLI,
+    OpenCode today; Cursor / Continue / others added in subsequent releases).
+    Pass ``--agent NAME`` one or more times to restrict the installation.
 
     \b
     Examples:
