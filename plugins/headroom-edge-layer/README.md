@@ -31,6 +31,12 @@ pinned-commit setup, and the plan doc for the full protocol.
 - `scripts/census.py` — Phase 0's token census over your own Claude Code
   session logs. **You run this yourself** against `~/.claude/projects/*/*.jsonl`
   — this sandbox has no real session history to test against.
+- `scripts/census_copilot.py` — the same Phase-0 census, but for GitHub
+  Copilot Chat (VS Code) sessions, which store data completely differently
+  (SQLite-adjacent JSONL under `<workspaceStorage>/<hash>/chatSessions/`, not
+  Claude Code's own transcript format). See "Copilot Chat census" below —
+  its bucket-level numbers carry a real, documented double-counting risk
+  that the Claude Code census doesn't have; the total-cost number does not.
 - `replay/` — Phase 1's offline replay harness, and Phase 3's *unexecuted*
   agent-runner scaffold (no live API calls are made by anything in this repo).
 
@@ -48,6 +54,49 @@ Per-edge flags (`HEADROOM_EDGE_INTENT_QUERY`, `HEADROOM_EDGE_GREP`,
 `HEADROOM_EDGE_FILE_READ`, `HEADROOM_EDGE_RERANK`) default to on; set any to
 `0`/`false`/`off` to isolate one edge at a time in the replay harness, per the
 protocol's "one flag at a time, then all together" scoring.
+
+## Copilot Chat census
+
+GitHub Copilot Chat (in VS Code) doesn't keep session logs anywhere near
+Claude Code's format. Each session is one `.jsonl` file at
+`<workspaceStorage>/<hash>/chatSessions/<uuid>.jsonl` (on Windows:
+`%APPDATA%\Code\User\workspaceStorage\<hash>\chatSessions\`), but despite the
+extension, every *line* is a full re-saved snapshot of the whole session
+state, not an appended delta — `census_copilot.py` reads every line and
+keeps whichever one has the most requests.
+
+```bash
+python3 scripts/census_copilot.py --root "/mnt/c/Users/<you>/AppData/Roaming/Code/User/workspaceStorage"
+# native Windows path (not via WSL): %APPDATA%\Code\User\workspaceStorage
+```
+
+This was reverse-engineered from one real user's actual session history
+(Copilot Chat extension v0.59.0 through v0.65.0), and the schema visibly
+moved between versions — `census_copilot.py`'s module docstring has the
+full list of what's checked in more than one place because of that. Two
+concrete asymmetries versus `census.py`:
+
+- **The total cost figure is solid.** Each request carries real
+  `promptTokens`/`outputTokens` (checked in both schema locations that were
+  observed), priced from your own account's model catalog, embedded right
+  in the session file itself (GitHub's "AI Credits" — 1 AIC = $0.01, per
+  GitHub's billing docs) — not a third-party pricing database. Local Ollama
+  models (`ollama-models/*`) price at real $0; anything else missing from
+  every scanned catalog is flagged as unpriced, never silently $0.
+- **The bucket-level split is approximate, not solid.** Tool-call output
+  lives in a VS Code-internal rich-text AST
+  (`toolCallResults[id].content`), extracted here by recursively collecting
+  every `"text"` value found in the tree, and terminal output specifically
+  can double-count across schema versions (sometimes a standalone
+  `"terminal"` response part, sometimes folded into a tool-invocation
+  wrapper's `toolSpecificData`, with no reliable shared ID to dedupe on
+  between the two forms). `census_copilot.py` prints this limitation in its
+  own output every time — treat the bucket percentages as directional, and
+  the total-cost number as the trustworthy one.
+
+Never reads `toolCallRounds[].thinking` — that's Claude's own raw thinking
+block content, passed through Copilot's metadata when the underlying model
+is Claude, and this script has no legitimate reason to touch it.
 
 ## Known limitations (see the plan doc's corrections section for detail)
 
