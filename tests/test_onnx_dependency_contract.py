@@ -5,14 +5,25 @@ from __future__ import annotations
 from pathlib import Path
 
 import tomllib
+from packaging.markers import default_environment
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_shipping_ort_dependencies_require_api24_where_wheels_exist() -> None:
+def test_shipping_ort_dependencies_match_supported_platforms() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     optional = project["optional-dependencies"]
+
+    cases = [
+        ("3.11", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
+        ("3.13", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
+        ("3.11", "darwin", "arm64", SpecifierSet(">=1.24.0")),
+        ("3.11", "linux", "x86_64", SpecifierSet(">=1.24.0")),
+        ("3.10", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
+        ("3.10", "linux", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
+    ]
 
     for extra in ("proxy", "voice"):
         requirements = [
@@ -21,15 +32,28 @@ def test_shipping_ort_dependencies_require_api24_where_wheels_exist() -> None:
             if Requirement(value).name == "onnxruntime"
         ]
         assert len(requirements) == 2
-        modern = next(
-            req
-            for req in requirements
-            if req.marker and req.marker.evaluate({"python_version": "3.11"})
-        )
-        legacy = next(
-            req
-            for req in requirements
-            if req.marker and req.marker.evaluate({"python_version": "3.10"})
-        )
-        assert modern.specifier.contains("1.24.0")
-        assert not legacy.specifier.contains("1.24.0")
+        for python_version, sys_platform, platform_machine, expected in cases:
+            environment = default_environment()
+            environment.update(
+                python_version=python_version,
+                python_full_version=f"{python_version}.0",
+                sys_platform=sys_platform,
+                platform_machine=platform_machine,
+                extra="",
+            )
+            selected = [
+                req for req in requirements if req.marker and req.marker.evaluate(environment)
+            ]
+            assert len(selected) == 1
+            assert selected[0].specifier == expected
+
+
+def test_all_extra_includes_proxy_and_voice() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    all_requirements = project["optional-dependencies"]["all"]
+
+    assert any(
+        requirement.name == "headroom-ai" and {"proxy", "voice"} <= set(requirement.extras)
+        for raw_requirement in all_requirements
+        if (requirement := Requirement(raw_requirement))
+    )

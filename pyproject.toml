@@ -83,11 +83,11 @@ proxy = [
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
-    # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
-    # returning an initialization error; 1.24+ no longer ships Python 3.10
-    # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    # ORT <1.24 deadlocks in Rust fastembed instead of returning an init error.
+    # Python 3.10 keeps Python-only ORT and bypasses native detection. Intel
+    # macOS also needs older ORT because newer releases have no x86_64 wheels.
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     # File watcher for live code graph reindexing (--code-graph). watchdog 6.0.0
     # publishes no macOS wheel for Python 3.14, so installing it there needs a C
@@ -248,8 +248,8 @@ mcp = [
 ]
 # Voice filler detection
 voice = [
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
