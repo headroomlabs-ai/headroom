@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "headroom-edge-layer"
+version = "0.1.0"
+description = "Compression SaaS edge-layer test protocol: pipeline extension that compresses content Headroom's engine skips by default (file reads, grep, web pages), plus the census/replay tooling used to prove or kill the idea in dollars per solved task."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff"]
+test = ["pytest>=7"]
+
+# Registers with Headroom's opt-in pipeline-extension seam (headroom/pipeline.py).
+# Enable at runtime with HEADROOM_PIPELINE_EXTENSIONS=edge-layer (installing this
+# package alone does NOT turn it on). The target MUST be the class itself (not a
+# factory function): headroom.pipeline.discover_pipeline_extensions() calls
+# entry.load() (a plain attribute lookup, never invokes a callable) and only
+# instantiates the result when isinstance(result, type) is true.
+[project.entry-points."headroom.pipeline_extension"]
+edge-layer = "headroom_edge_layer:EdgeLayerExtension"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
