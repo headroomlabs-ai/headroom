@@ -29,6 +29,7 @@ from headroom.providers.cortex_code.install import (
     build_install_env as _build_cortex_code_install_env,
 )
 from headroom.providers.cursor.install import build_install_env as _build_cursor_install_env
+from headroom.providers.dsh.install import build_install_env as _build_dsh_install_env
 from headroom.providers.grok.install import build_install_env as _build_grok_install_env
 from headroom.providers.grok_build.install import build_install_env as _build_grok_build_install_env
 from headroom.providers.openclaw.install import (
@@ -59,6 +60,7 @@ _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
     "grok_build": _build_grok_build_install_env,
     "grok": _build_grok_install_env,
     "opencode": _build_opencode_install_env,
+    "dsh": _build_dsh_install_env,
 }
 
 _PROVIDER_SCOPE_HANDLERS: dict[str, tuple[_ProviderScopeApplier, _ProviderScopeReverter]] = {
