@@ -81,7 +81,6 @@ class BedrockHandlerMixin:
             _headroom_bypass_enabled,
             _strip_internal_headers,
             extract_tags,
-            read_cached_request_body,
             read_request_json_with_bytes,
         )
         from headroom.proxy.modes import is_cache_mode
@@ -160,11 +159,12 @@ class BedrockHandlerMixin:
                 LOG_TAG,
                 err,
             )
-            # The raw bytes were already fully read (and cached) by
-            # read_request_json_with_bytes before it failed decoding them;
-            # request.body() here would re-drain an already-consumed stream
-            # and raise RuntimeError("Stream consumed").
-            raw_only = read_cached_request_body(request) or b""
+            # The raw bytes were already fully read by
+            # read_request_json_with_bytes before it failed decoding them,
+            # and it caches them onto request._body the same way Starlette's
+            # own Request.body() would, so this returns the cached bytes
+            # instead of re-draining an already-consumed stream.
+            raw_only = await request.body()
             return await self._forward_bedrock(
                 url=url,
                 headers=verbatim_headers,

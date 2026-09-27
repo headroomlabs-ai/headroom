@@ -485,8 +485,14 @@ class SQLiteGraphStore:
                         rel_query = "SELECT * FROM relationships WHERE target_id = ?"
                         rel_params = [current_id]
                     else:  # BOTH
+                        # The OR must be parenthesized: a later ``AND relation_type
+                        # IN (...)`` binds tighter than ``OR`` in SQL, so without
+                        # the parens the type filter would apply only to the
+                        # ``target_id`` (incoming) side, letting outgoing edges of
+                        # every type leak into the subgraph. (``get_relationships``
+                        # already groups this correctly.)
                         rel_query = (
-                            "SELECT * FROM relationships WHERE source_id = ? OR target_id = ?"
+                            "SELECT * FROM relationships WHERE (source_id = ? OR target_id = ?)"
                         )
                         rel_params = [current_id, current_id]
 

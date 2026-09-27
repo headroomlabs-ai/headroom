@@ -316,6 +316,27 @@ class MemoryHandler:
             self._initialized = False
             logger.info(f"Memory: backend initialization cancelled (backend={self.config.backend})")
             raise
+        except Exception as exc:
+            # Fail-open for ANY init failure, not just timeout. Memory is an
+            # optional subsystem: a backend that cannot open (e.g. a SQLite
+            # ``unable to open database file`` on a Docker Desktop macOS
+            # bind-mount, issue #3251) must NOT propagate and 500 the whole
+            # request — the docstring's fail-open contract has to hold here too.
+            # Null the possibly-half-assigned backend (same reasoning as the
+            # timeout branch) and leave ``_initialized=False`` so a later
+            # request can retry once the environment recovers.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="init_error")
+            self._backend = None
+            self._initialized = False
+            logger.error(
+                "Memory: backend initialization failed (backend=%s); "
+                "serving requests without memory context. Subsequent requests will retry: %s",
+                self.config.backend,
+                exc,
+            )
+            return
 
     async def _init_backend_locked(self) -> None:
         """Actual backend-init body. Must be called with ``_init_lock`` held."""
@@ -652,6 +673,21 @@ class MemoryHandler:
             else f"{base_user_id}::{scope.project_key}"
         )
         return self._backend, scope, composed
+
+    @staticmethod
+    def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
+        if (
+            scope is not None
+            and scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+        ):
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": "Memory operation refused because the project could not be resolved",
+                }
+            )
+        return None
 
     @staticmethod
     def _format_memory_block_header(scope: ResolvedScope | None) -> str:
@@ -1218,6 +1254,8 @@ your responses, not to drive new actions."""
         extracted_relationships = input_data.get("extracted_relationships")
 
         backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(scope):
+            return error
 
         # Agent provenance metadata. Workspace lineage is recorded on
         # the memory itself so cross-project leaks (if any ever
@@ -1311,6 +1349,8 @@ your responses, not to drive new actions."""
         entities_filter = input_data.get("entities")
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         results = await backend.search_memories(
             query=query,
@@ -1367,6 +1407,8 @@ your responses, not to drive new actions."""
         }
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Check if backend has update_memory method
         if hasattr(backend, "update_memory"):
@@ -1427,6 +1469,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "memory_id is required"})
 
         backend, _scope, _effective = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
         deleted = await backend.delete_memory(memory_id)
 
         return json.dumps(
@@ -1465,6 +1509,8 @@ your responses, not to drive new actions."""
             return json.dumps({"status": "error", "error": "Memory backend not initialized"})
 
         backend, _scope, effective_user_id = self._resolve_for_request(user_id, request_context)
+        if error := self._unresolved_project_error(_scope):
+            return error
 
         # Prefer a native list_memories if the backend has one (LocalBackend
         # does); fall back to a recency-keyed search when not available.

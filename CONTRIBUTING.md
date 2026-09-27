@@ -89,7 +89,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## Development setup
 
 ```bash
-git clone https://github.com/chopratejas/headroom.git
+git clone https://github.com/headroomlabs-ai/headroom.git
 cd headroom
 python -m venv .venv && source .venv/bin/activate
 node --version  # Node 18+ required for commitlint hooks

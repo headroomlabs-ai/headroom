@@ -21,9 +21,15 @@ import logging
 import os
 import re
 import warnings
+from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.deepseek_tiers import (
+    LEGACY_MODEL_IDS,
+    OFF_PEAK_RATES_PER_1M,
+    off_peak_rates,
+)
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -222,10 +228,33 @@ _UNKNOWN_CLAUDE_DEFAULT = {
 }
 
 
-# DeepSeek fallback pricing for --anthropic-api-url deepseek routing
+def _deepseek_fallback_row(model_id: str) -> dict[str, float]:
+    """Off-peak fallback rates for ``model_id``, from the shared tier table.
+
+    This table has no request instant, so it carries the cheaper published tier;
+    per-request costing applies the peak window in
+    :func:`headroom.pricing.litellm_pricing.estimate_cost_from_tokens`.
+    """
+    rates = off_peak_rates(model_id)
+    if rates is None:  # pragma: no cover - the ids below are all in the tier table
+        raise ValueError(f"no DeepSeek tier for {model_id!r}")
+    return {
+        "input": rates.input_per_1m,
+        "output": rates.output_per_1m,
+        "cached_input": rates.cache_hit_per_1m,
+    }
+
+
+# DeepSeek fallback pricing for --anthropic-api-url deepseek routing.
+#
+# While the tier seam in ``headroom.pricing.litellm_pricing`` claims these four
+# ids first, ``estimate_cost`` never reaches this table on a live request: it is a
+# safety net for the flat-consumer invariant (anything without a request instant
+# carries the off-peak figure) and the only pricing left if that seam is ever
+# bypassed. ``_get_pricing`` therefore reaches it only when called directly.
 _DEEPSEEK_FALLBACK_PRICING: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"input": 0.14, "output": 0.28, "cached_input": 0.0028},
-    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cached_input": 0.003625},
+    model_id: _deepseek_fallback_row(model_id)
+    for model_id in (*OFF_PEAK_RATES_PER_1M, *LEGACY_MODEL_IDS)
 }
 
 
@@ -287,6 +316,31 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["context_limits"].update(anthropic_config["context_limits"])
             if "pricing" in anthropic_config:
                 config["pricing"].update(anthropic_config["pricing"])
+            # Another provider's namespaced section ({"openai": {"context_limits":
+            # ...}}) is a correctly shaped config that this loader is simply not
+            # meant to consume, so it must not trip the no-effect warning below.
+            other_provider_section = "anthropic" not in loaded and any(
+                isinstance(section, dict)
+                and any(key in section for key in ("context_limits", "pricing", "encodings"))
+                for section in loaded.values()
+            )
+            if (
+                "context_limits" not in anthropic_config
+                and "pricing" not in anthropic_config
+                and not other_provider_section
+            ):
+                # Valid JSON object, but none of the keys we consume. Previously
+                # this was a SILENT no-op: the unknown-model warning tells the
+                # operator to "set HEADROOM_MODEL_LIMITS", they set the obvious
+                # flat shape {"my-model": 262144}, nothing happens, and there is
+                # no diagnostic anywhere. Name the expected shape instead.
+                logger.warning(
+                    "HEADROOM_MODEL_LIMITS parsed but contained no 'context_limits' "
+                    "or 'pricing' key, so it had NO EFFECT. Expected shape: "
+                    '{"context_limits": {"<model>": <int>}, "pricing": {...}} '
+                    '(optionally nested under an "anthropic" key). '
+                    f"Got top-level keys: {sorted(map(str, anthropic_config))[:10]}"
+                )
 
             logger.debug(f"Loaded custom model config from HEADROOM_MODEL_LIMITS: {loaded}")
         except (ValueError, OSError) as e:
@@ -750,6 +804,7 @@ class AnthropicProvider(Provider):
         output_tokens: int,
         model: str,
         cached_tokens: int = 0,
+        now: datetime | None = None,
     ) -> float | None:
         """Estimate cost for a request.
 
@@ -757,6 +812,9 @@ class AnthropicProvider(Provider):
         Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
         family a prompt over 200K re-prices the whole request (see
         ``_LONG_CONTEXT_PREMIUM``).
+
+        ``now`` selects a DeepSeek peak/off-peak tier (see
+        :mod:`headroom.pricing.deepseek_tiers`); ``None`` reads the wall clock.
         """
         model = sanitize_anthropic_model_id(model)
         # LiteLLM knows per-model cache and long-context rates, so let it price
@@ -766,6 +824,7 @@ class AnthropicProvider(Provider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            now=now,
         )
         if cost is not None:
             return cost

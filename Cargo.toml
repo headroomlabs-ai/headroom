@@ -23,7 +23,7 @@ default-members = [
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/chopratejas/headroom"
+repository = "https://github.com/headroomlabs-ai/headroom"
 authors = ["Headroom Maintainers"]
 
 [workspace.dependencies]

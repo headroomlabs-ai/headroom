@@ -20,6 +20,7 @@ from headroom.cli.doctor import (
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_kompress_health,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
@@ -43,6 +44,38 @@ STATS_OK = {
     },
     "cost": {"budget_limit_usd": 10.0, "budget_period": "daily"},
 }
+
+
+class TestKompressHealth:
+    def test_missing_health_endpoint_skips(self):
+        result = check_kompress_health(None)
+        assert result.status == SKIP
+        assert "health endpoint" in result.summary
+
+    def test_older_proxy_without_component_warns(self):
+        result = check_kompress_health({"checks": {}})
+        assert result.status == WARN
+        assert "readiness" in result.summary
+
+    def test_disabled_passes(self):
+        result = check_kompress_health({"checks": {"kompress": {"enabled": False}}})
+        assert result.status == PASS
+        assert result.summary == "disabled"
+
+    def test_ready_reports_backend(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": True, "backend": "onnx"}}}
+        )
+        assert result.status == PASS
+        assert result.summary == "ready (onnx)"
+
+    def test_cold_model_warns_with_action(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": False, "status": "degraded"}}}
+        )
+        assert result.status == WARN
+        assert "passing through" in result.summary
+        assert "/debug/warmup" in (result.hint or "")
 
 
 class TestProxyLiveness:
@@ -468,6 +501,44 @@ class TestCodexRouting:
         )
         assert check_codex_routing(path, 8787).status == PASS
 
+    def test_preserved_provider_id_right_port_passes(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == PASS
+        assert result.hint is None
+
+    def test_preserved_provider_id_port_mismatch_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://localhost:9999/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "9999" in result.summary
+
+    def test_active_provider_takes_precedence_over_headroom_block(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "corp"\n'
+            "[model_providers.corp]\n"
+            'base_url = "https://gateway.corp.example/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "gateway.corp.example" in result.summary
+
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text(
@@ -525,6 +596,20 @@ class TestCodexRouting:
         self._chatgpt_auth(tmp_path)
 
         assert check_codex_routing(path, 8787).status == PASS
+
+    def test_preserved_provider_id_without_requires_openai_auth_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        self._chatgpt_auth(tmp_path)
+
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "Authorization" in result.summary
 
     def test_api_key_user_without_requires_openai_auth_still_passes(self, tmp_path):
         """API-key users must not be nagged -- the flag would break them (#406)."""
