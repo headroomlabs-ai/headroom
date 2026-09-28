@@ -212,7 +212,8 @@ def test_select_dedupe_add_context_and_format_output(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.parametrize(
     ("keep_summary_lines", "expected"),
-    [(True, [4, 5, 6]), (False, [0, 1, 4])],
+    # True: the totals line (7) is reserved, and entries win the remaining ties.
+    [(True, [4, 5, 7]), (False, [0, 1, 4])],
 )
 def test_short_summary_global_cap_precedence_matches_rust(
     monkeypatch: pytest.MonkeyPatch, keep_summary_lines: bool, expected: list[int]
@@ -244,6 +245,32 @@ def test_short_summary_global_cap_precedence_matches_rust(
     )
 
     assert [line.line_number for line in compressor._select_lines(parsed)] == expected
+
+
+def test_legacy_cap_reserves_totals_and_first_error_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    compressor = LogCompressor(
+        LogCompressorConfig(max_errors=10, error_context_lines=0, max_total_lines=4)
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "headroom.transforms.adaptive_sizer",
+        SimpleNamespace(compute_optimal_k=lambda items, **kwargs: 4),
+    )
+    parsed = compressor._parse_lines(
+        [
+            "E       AssertionError: first",
+            "E       AssertionError: second",
+            "=== short test summary info ===",
+            "FAILED t.py::a",
+            "FAILED t.py::b",
+            "FAILED t.py::c",
+            "FAILED t.py::d",
+            "=== 4 failed in 0.1s ===",
+        ]
+    )
+
+    # The first E line (0) and the totals line (7) are reserved; entries fill the rest.
+    assert [line.line_number for line in compressor._select_lines(parsed)] == [0, 3, 4, 7]
 
 
 @pytest.mark.parametrize(
@@ -380,6 +407,52 @@ def test_real_compress_preserves_or_names_issue_3814_middle_failures(
     for i in range(first_regression, last_regression + 1):
         node_id = f"tests/test_generated.py::test_case{i}"
         assert _retained_or_named(result.compressed, node_id), node_id
+
+
+def _pytest_issue_log(failure_count: int) -> str:
+    """Build the issue #3814 reproduction with a distinct E message per failure."""
+    lines = [
+        "============================= test session starts =============================",
+        "collected 400 items",
+        "",
+    ]
+    lines += [
+        f"tests/test_module_{i:02d}.py ..........................  [ {i:2d}%]" for i in range(40)
+    ]
+    lines.append("=================================== FAILURES ==================================")
+    for i in range(1, failure_count + 1):
+        lines += [
+            f"____________________ test_case{i:03d} ____________________",
+            "",
+            ">       assert result == expected",
+            f"E       AssertionError: mismatch in test_case{i:03d}",
+            "",
+            "tests/t.py:42: AssertionError",
+        ]
+    lines.append("=========================== short test summary info ===========================")
+    lines += [
+        f"FAILED tests/t.py::test_case{i:03d} - AssertionError: mismatch"
+        for i in range(1, failure_count + 1)
+    ]
+    lines.append(f"=============== {failure_count} failed, 380 passed in 41.02s ==============")
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize("failure_count", [60, 200])
+def test_real_compress_binding_cap_keeps_totals_and_first_error_line(failure_count: int) -> None:
+    out = LogCompressor(LogCompressorConfig(enable_ccr=False)).compress(
+        _pytest_issue_log(failure_count)
+    )
+    compressed = out.compressed
+
+    assert f"{failure_count} failed, 380 passed" in compressed
+    assert "E       AssertionError: mismatch in test_case001" in compressed
+    # Every entry is still kept or named: kept + listed + K == total.
+    kept = sum(1 for line in compressed.splitlines() if line.startswith("FAILED tests/t.py::"))
+    named = compressed.splitlines()[-1].split("; omitted: ", 1)[1].removesuffix("]").split(", ")
+    overflow = int(named[-1][1:].removesuffix(" more")) if named[-1].startswith("+") else 0
+    listed = len(named) - (1 if overflow else 0)
+    assert kept + listed + overflow == failure_count
 
 
 def test_real_compress_keeps_all_crlf_short_summary_entries_with_non_binding_cap() -> None:

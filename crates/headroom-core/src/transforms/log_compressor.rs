@@ -896,24 +896,45 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
-/// Map line number -> node id for pytest's one-line `FAILED <nodeid>` /
-/// `ERROR <nodeid>` entries inside the "short test summary info" section.
+/// What a scan of pytest's "short test summary info" sections found, keyed by
+/// line number.
+struct PytestShortSummary {
+    /// One-line `FAILED <nodeid>` / `ERROR <nodeid>` entries -> node id.
+    entries: BTreeMap<usize, String>,
+    /// The `===` line closing each section, i.e. pytest's run totals
+    /// (`=== 20 failed, 380 passed in 41.02s ===`).
+    totals_lines: BTreeSet<usize>,
+    /// The first section header, if any section was found.
+    first_header: Option<usize>,
+}
+
+/// Scan for pytest's "short test summary info" sections.
 ///
-/// The section opens on a complete `=== ... short test summary info ... ===`
+/// A section opens on a complete `=== ... short test summary info ... ===`
 /// separator (a trailing `\r` is ignored, so CRLF logs work) and closes at
 /// the next `===` line or EOF, so a diagnostic line that merely mentions the
 /// phrase does not open one. For `FAILED <nodeid> - <msg>` the id is the text
 /// before ` - `. `parse_lines`, `select_lines` and `format_output` all use it,
 /// so retention and omission naming agree on which lines are entries.
-fn pytest_short_summary_entries(lines: &[&str]) -> BTreeMap<usize, String> {
-    let mut entries = BTreeMap::new();
+fn scan_pytest_short_summary(lines: &[&str]) -> PytestShortSummary {
+    let mut scan = PytestShortSummary {
+        entries: BTreeMap::new(),
+        totals_lines: BTreeSet::new(),
+        first_header: None,
+    };
     let mut in_short_summary = false;
 
     for (line_number, line) in lines.iter().enumerate() {
         let recognition_line = line.strip_suffix('\r').unwrap_or(line);
         if recognition_line.starts_with("===") {
-            in_short_summary = recognition_line.ends_with("===")
+            let opens = recognition_line.ends_with("===")
                 && recognition_line.contains("short test summary info");
+            if opens {
+                scan.first_header.get_or_insert(line_number);
+            } else if in_short_summary {
+                scan.totals_lines.insert(line_number);
+            }
+            in_short_summary = opens;
             continue;
         }
         if !in_short_summary {
@@ -925,11 +946,33 @@ fn pytest_short_summary_entries(lines: &[&str]) -> BTreeMap<usize, String> {
             .or_else(|| line.strip_prefix("ERROR "))
             .map(|rest| rest.split_once(" - ").map_or(rest, |(id, _)| id).trim());
         if let Some(node_id) = node_id.filter(|id| !id.is_empty()) {
-            entries.insert(line_number, node_id.to_string());
+            scan.entries.insert(line_number, node_id.to_string());
         }
     }
 
-    entries
+    scan
+}
+
+/// Map line number -> node id for pytest's short-summary `FAILED` / `ERROR`
+/// entries; see [`scan_pytest_short_summary`].
+fn pytest_short_summary_entries(lines: &[&str]) -> BTreeMap<usize, String> {
+    scan_pytest_short_summary(lines).entries
+}
+
+/// Lines the global cap must keep while a pytest short summary competes for
+/// it: each section's totals line and the first `E ` assertion line before
+/// the summary. Short-summary entries win equal-score ties, so without this
+/// reserve a long summary crowds out the run totals and every error message.
+fn pytest_cap_reserve(log_lines: &[LogLine], scan: &PytestShortSummary) -> BTreeSet<usize> {
+    let mut reserved = scan.totals_lines.clone();
+    let first_error_detail = log_lines
+        .iter()
+        .take_while(|line| scan.first_header.map_or(true, |h| line.line_number < h))
+        .find(|line| line.content.starts_with("E "));
+    if let Some(line) = first_error_detail {
+        reserved.insert(line.line_number);
+    }
+    reserved
 }
 
 /// Extract an exception-type / error-code label from a single line, if the
@@ -1244,7 +1287,8 @@ impl LogCompressor {
         stats: &mut LogCompressorStats,
     ) -> Vec<LogLine> {
         let all_strings: Vec<&str> = log_lines.iter().map(|l| l.content.as_str()).collect();
-        let short_summary_entries = pytest_short_summary_entries(&all_strings);
+        let short_summary = scan_pytest_short_summary(&all_strings);
+        let short_summary_entries = &short_summary.entries;
         let adaptive_max =
             compute_optimal_k(&all_strings, bias, 10, Some(self.config.max_total_lines));
 
@@ -1359,12 +1403,34 @@ impl LogCompressor {
 
         let mut ordered: Vec<LogLine> = selected.into_iter().collect();
         if ordered.len() > adaptive_max {
+            let reserved = if self.config.keep_summary_lines && !short_summary_entries.is_empty() {
+                pytest_cap_reserve(log_lines, &short_summary)
+            } else {
+                BTreeSet::new()
+            };
+            for line in log_lines
+                .iter()
+                .filter(|l| reserved.contains(&l.line_number))
+            {
+                if !ordered
+                    .iter()
+                    .any(|kept| kept.line_number == line.line_number)
+                {
+                    ordered.push(line.clone());
+                }
+            }
             stats.lines_dropped_by_global_cap += ordered.len() - adaptive_max;
-            // Sort by score desc, take top adaptive_max, restore line order.
+            // Sort reserved lines first, then by score desc; take top adaptive_max,
+            // restore line order.
             ordered.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                reserved
+                    .contains(&b.line_number)
+                    .cmp(&reserved.contains(&a.line_number))
+                    .then_with(|| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| {
                         if self.config.keep_summary_lines {
                             short_summary_entries
@@ -1912,6 +1978,84 @@ mod tests {
         }
     }
 
+    /// The issue #3814 reproduction shape, with a distinct `E ` message per
+    /// failure so tests can tell which failure's detail survived.
+    fn pytest_issue_log(failure_count: usize) -> String {
+        let mut lines = vec![
+            "============================= test session starts ============================="
+                .to_string(),
+            "collected 400 items".to_string(),
+            String::new(),
+        ];
+        lines.extend(
+            (0..40).map(|i| {
+                format!("tests/test_module_{i:02}.py ..........................  [ {i:2}%]")
+            }),
+        );
+        lines.push(
+            "=================================== FAILURES =================================="
+                .into(),
+        );
+        for i in 1..=failure_count {
+            lines.extend([
+                format!("____________________ test_case{i:03} ____________________"),
+                String::new(),
+                ">       assert result == expected".to_string(),
+                format!("E       AssertionError: mismatch in test_case{i:03}"),
+                String::new(),
+                "tests/t.py:42: AssertionError".to_string(),
+            ]);
+        }
+        lines.push(
+            "=========================== short test summary info ==========================="
+                .into(),
+        );
+        lines.extend(
+            (1..=failure_count)
+                .map(|i| format!("FAILED tests/t.py::test_case{i:03} - AssertionError: mismatch")),
+        );
+        lines.push(format!(
+            "=============== {failure_count} failed, 380 passed in 41.02s =============="
+        ));
+        lines.join("\n")
+    }
+
+    #[test]
+    fn binding_cap_reserves_pytest_totals_and_first_error_line() {
+        for failure_count in [60, 200] {
+            let (result, stats) = cmp().compress(&pytest_issue_log(failure_count), 1.0);
+            assert!(stats.lines_dropped_by_global_cap > 0, "{failure_count}");
+            let out = &result.compressed;
+            assert!(
+                out.contains(&format!("{failure_count} failed, 380 passed")),
+                "totals line dropped at {failure_count}: {out}"
+            );
+            assert!(
+                out.contains("E       AssertionError: mismatch in test_case001"),
+                "first failure's E line dropped at {failure_count}: {out}"
+            );
+
+            // Every entry is still kept or named: kept + listed + K == total.
+            let kept = out
+                .lines()
+                .filter(|l| l.starts_with("FAILED tests/t.py::"))
+                .count();
+            let marker = out.lines().last().unwrap();
+            let named = marker
+                .split("; omitted: ")
+                .nth(1)
+                .expect("omitted entries must be named")
+                .trim_end_matches(']');
+            let listed = named.split(", ").filter(|p| !p.starts_with('+')).count();
+            let overflow = named
+                .rsplit(", +")
+                .next()
+                .and_then(|tail| tail.strip_suffix(" more"))
+                .map_or(0, |k| k.parse::<usize>().unwrap());
+            assert_eq!(kept + listed + overflow, failure_count, "{marker}");
+        }
+    }
+
     #[test]
     fn global_cap_precedence_is_flag_dependent_and_deterministic() {
         let mut contents = (0..10)
@@ -1923,8 +2067,10 @@ mod tests {
         contents.push("================ 10 failed in 0.1s ================\r".into());
         let lines = contents.iter().map(String::as_str).collect::<Vec<_>>();
 
+        // keep_summary_lines=true: the totals line (21) is reserved, and the
+        // short-summary entries win the remaining equal-score ties.
         for (keep_summary_lines, expected) in [
-            (true, (11..21).collect::<Vec<_>>()),
+            (true, (11..20).chain([21]).collect::<Vec<_>>()),
             (false, (0..10).collect::<Vec<_>>()),
         ] {
             let c = LogCompressor::new(LogCompressorConfig {
