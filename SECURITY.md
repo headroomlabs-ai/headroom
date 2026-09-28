@@ -29,9 +29,8 @@ Use whichever channel you prefer:
 1. **GitHub Private Vulnerability Reporting (preferred)** — open a private report at
    <https://github.com/headroomlabs-ai/headroom/security/advisories/new>. This keeps the
    discussion, fix, and advisory in one place.
-2. **Email** — <security@headroomlabs.ai>. For sensitive details or exploit code, please
-   encrypt with our PGP key (fingerprint and key published at
-   <https://headroomlabs.ai/.well-known/security.txt>).
+2. **Email** — <security@headroomlabs.ai>. We do not currently publish a PGP key, so for
+   sensitive details or exploit code please prefer GitHub Private Vulnerability Reporting.
 
 Please include as much of the following as you can:
 
@@ -97,8 +96,9 @@ users, physical attacks, and accessing or exfiltrating data that is not yours.
 ## Security Best Practices for Operators
 
 - **API keys**: pass credentials via environment variables or a secrets manager; never
-  commit them. Headroom redacts known key patterns from its logs and does not persist
-  them, but treat any host running the proxy as sensitive.
+  commit them. Headroom redacts known key patterns from its logs, but some flows do
+  store credentials on disk (see *Credential handling* below), so treat any host running
+  Headroom, and its `~/.headroom` workspace, as sensitive.
 - **Proxy exposure**: do not expose the proxy to untrusted networks without an
   authentication layer in front of it. It is designed to run alongside your agent, not as
   a public endpoint.
@@ -109,10 +109,19 @@ users, physical attacks, and accessing or exfiltrating data that is not yours.
 
 ## Security Design
 
-- **Credential handling**: API keys are redacted from logs by pattern and are not written
-  to disk by Headroom itself.
-- **Passthrough by default**: message content is forwarded unchanged unless a
-  transformation is explicitly enabled.
+- **Credential handling**: API keys are redacted from logs by pattern. Headroom does
+  write some credentials to disk:
+  - `headroom copilot-auth login` stores the GitHub Copilot OAuth refresh token in
+    `copilot_auth.json` in the Headroom workspace (`~/.headroom` by default, or
+    `$HEADROOM_COPILOT_AUTH_FILE`). The file is written atomically via a new temp file
+    created with mode `0600` (owner-only), so it is never group- or world-readable.
+  - `headroom install` saves the environment it is given (including any extra variables
+    you pass) in its deployment manifest in the workspace, and `headroom wrap` edits
+    client configuration files that may already contain credentials. Protect these files
+    like any other secrets file.
+- **Compression on by default**: the proxy compresses request content by default
+  (`optimize=True`). Run it with `--no-optimize` for passthrough mode, where content is
+  forwarded unchanged.
 - **Input validation**: requests are validated against the provider schema before
   processing.
 - **Fail open, not wide**: malformed routing and compression rules are skipped rather
