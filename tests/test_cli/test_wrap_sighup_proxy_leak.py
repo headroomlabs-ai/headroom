@@ -8,9 +8,12 @@ every other wrapped tool goes through did not:
 * ``_run_proxy_only_watcher`` -- Pattern-B (cursor, cline, continue)
 
 Unhandled SIGHUP kills the wrapper outright, so the ``finally: cleanup()`` that
-terminates the proxy never runs. The proxy is in its own session, survives, and
-is reparented to PID 1 -- a leaked listener that no later wrap invocation will
-ever reap.
+unregisters its client marker never runs and the marker goes stale. Since #3202
+the wrapper no longer terminates the proxy directly: the wrap-owned proxy's
+orphan watchdog exits it once no live client markers remain. The end-to-end
+test below drives that whole chain -- SIGHUP, ``SystemExit``, the ``finally``
+that unregisters the marker, and the watchdog's reap decision -- using a
+stand-in proxy that runs the watchdog's real ``live_client_pids`` logic.
 """
 
 from __future__ import annotations
@@ -132,22 +135,53 @@ def test_proxy_only_watcher_installs_sighup_handler(
     assert signal.getsignal(signal.SIGTERM) is handler
 
 
+# Stand-in for a wrap-owned proxy: instead of sleeping forever, it runs the
+# orphan watchdog's real reap decision (`live_client_pids`, which also prunes
+# stale markers) and exits once no live wrap clients have been seen for a
+# grace period. This models the `HEADROOM_WRAP_OWNED` proxy behaviour from
+# #3202: the production watchdog counts the grace from proxy start (its 60s
+# floor is what keeps a proxy alive while its wrapper is still registering),
+# so the stand-in does not wait for a first client either -- starting the
+# grace at process start is what makes this immune to import-order races.
+_STANDIN_PROXY = textwrap.dedent(
+    """
+    import sys, time
+
+    from headroom.paths import proxy_clients_dir
+    from headroom.proxy.orphan_watchdog import live_client_pids
+
+    port = int(sys.argv[1])
+    clients = proxy_clients_dir(port)
+    grace_seconds = 2.0
+
+    empty_since = time.monotonic()
+    while True:
+        if live_client_pids(clients):
+            empty_since = None
+        elif empty_since is not None and time.monotonic() - empty_since >= grace_seconds:
+            break
+        time.sleep(0.05)
+    """
+)
+
+
 # Harness driving the real `_launch_tool` under a real SIGHUP. Only
 # `_ensure_proxy` is stubbed -- to a live child process standing in for the
-# proxy -- so the signal handler, the `finally`, and `_make_cleanup`'s
-# terminate are all the shipping implementations.
+# proxy -- so the signal handler, the `finally`, and `_make_cleanup`'s marker
+# unregistration are all the shipping implementations. The stand-in proxy
+# script (written next to this harness) owns the reap side of the contract.
 _HARNESS = textwrap.dedent(
     """
     import os, subprocess, sys
     from headroom.cli import wrap
 
     port = 18787
-    proxy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    standin = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])), "standin_proxy.py")
+    proxy = subprocess.Popen([sys.executable, standin, str(port)])
     with open(sys.argv[1], "w") as fh:
         fh.write(str(proxy.pid))
 
     wrap._ensure_proxy = lambda *a, **k: (proxy, port)
-    wrap._live_proxy_clients = lambda *a, **k: []   # no other clients -> may reap
     wrap._push_runtime_env = lambda *a, **k: None
 
     with open(sys.argv[2], "w"):                    # ready
@@ -186,9 +220,15 @@ def _pid_alive(pid: int) -> bool:
 
 @requires_sighup
 def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
-    """End-to-end: real SIGHUP to a real wrapper must not leak the proxy."""
+    """End-to-end: real SIGHUP to a real wrapper must not leak the proxy.
+
+    The wrapper unregisters its client marker from the SIGHUP-unwound
+    ``finally``; the stand-in proxy, running the watchdog's real reap logic,
+    sees no live clients and exits instead of being reparented to PID 1.
+    """
     harness = tmp_path / "harness.py"
     harness.write_text(_HARNESS, encoding="utf-8")
+    (tmp_path / "standin_proxy.py").write_text(_STANDIN_PROXY, encoding="utf-8")
     pid_file = tmp_path / "proxy.pid"
     ready = tmp_path / "ready"
 
