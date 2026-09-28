@@ -274,7 +274,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 | `--connect-timeout-seconds` | `10` | Upstream connect timeout (seconds). |
 | `--retry-max-attempts` | `3` | Upstream retries on transient failure. |
 | `--limit-concurrency` | `1000` | Concurrent connections before returning 503. |
-| `--rpm` / `--tpm` | `60` / `100000` | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
+| `--rpm` / `--tpm` | `60` / unlimited | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
 | `--budget` / `--budget-period` | none / `daily` | Spend cap in USD per period; over-budget requests get 429. |
 | `--workers` / `HEADROOM_WORKERS` | `1` | Uvicorn worker processes. |
 
