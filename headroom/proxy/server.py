@@ -5912,7 +5912,7 @@ def run_server(
 ║  FEATURES:                                                           ║
 ║    Optimization:    {"ENABLED " if config.optimize else "DISABLED"}                                       ║
 ║    Caching:         {"ENABLED " if config.cache_enabled else "DISABLED"}   (TTL: {config.cache_ttl_seconds}s)                          ║
-║    Rate Limiting:   {"ENABLED " if config.rate_limit_enabled else "DISABLED"}   ({config.rate_limit_requests_per_minute} req/min, {config.rate_limit_tokens_per_minute:,} tok/min)       ║
+║    Rate Limiting:   {"ENABLED " if config.rate_limit_enabled else "DISABLED"}   ({config.rate_limit_requests_per_minute} req/min, {f"{config.rate_limit_tokens_per_minute:,}" if config.rate_limit_tokens_per_minute else "unlimited"} tok/min)       ║
 ║    Retry:           {"ENABLED " if config.retry_enabled else "DISABLED"}   (max {config.retry_max_attempts} attempts)                       ║
 ║    Cost Tracking:   {"ENABLED " if config.cost_tracking_enabled else "DISABLED"}   (budget: {"$" + str(config.budget_limit_usd) + "/" + config.budget_period if config.budget_limit_usd else "unlimited"})          ║
 ║    Code-Aware:      {code_aware_status:<52}║
@@ -6398,7 +6398,9 @@ if __name__ == "__main__":
     # Rate limiting
     parser.add_argument("--no-rate-limit", action="store_true", help="Disable rate limiting")
     parser.add_argument("--rpm", type=int, default=60, help="Requests per minute")
-    parser.add_argument("--tpm", type=int, default=100000, help="Tokens per minute")
+    parser.add_argument(
+        "--tpm", type=int, default=None, help="Tokens per minute (default: unlimited)"
+    )
 
     # Cost
     parser.add_argument("--budget", type=float, help="Budget limit in USD")

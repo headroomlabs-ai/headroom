@@ -14,6 +14,9 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 def test_anthropic_request_over_tpm_is_rejected_before_upstream(monkeypatch) -> None:
+    # The first request finds a full bucket and is admitted even though it is
+    # larger than the whole bucket (otherwise it could never pass); it is
+    # charged in full, so the second one is refused before upstream.
     monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
     config = ProxyConfig(
         optimize=False,
@@ -29,26 +32,32 @@ def test_anthropic_request_over_tpm_is_rejected_before_upstream(monkeypatch) -> 
         image_optimize=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(create_app(config), raise_server_exceptions=False) as client:
         proxy = client.app.state.proxy
         tokenizer = MagicMock()
         proxy._count_tokens_offloaded = AsyncMock(return_value=(tokenizer, 5_000))
-        proxy._retry_request = AsyncMock(side_effect=AssertionError("upstream must not be called"))
+        proxy._retry_request = AsyncMock(side_effect=RuntimeError("upstream stub"))
 
-        response = client.post(
-            "/v1/messages",
-            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
-            json={
-                "model": "claude-haiku-4-5",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "large request"}],
-                "stream": False,
-            },
-        )
+        def post():
+            return client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "large request"}],
+                    "stream": False,
+                },
+            )
+
+        assert post().status_code != 429
+        assert proxy._retry_request.await_count == 1
+
+        response = post()
 
         assert response.status_code == 429
         assert response.json()["detail"].startswith("Token rate limited.")
-        proxy._retry_request.assert_not_awaited()
+        assert proxy._retry_request.await_count == 1
         assert len(proxy.rate_limiter._token_buckets) == 1
 
 
@@ -100,15 +109,20 @@ def test_other_handlers_reject_request_over_tpm_before_upstream(
         image_optimize=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(create_app(config), raise_server_exceptions=False) as client:
         proxy = client.app.state.proxy
         tokenizer = MagicMock()
         proxy._count_tokens_offloaded = AsyncMock(return_value=(tokenizer, 5_000))
-        proxy._retry_request = AsyncMock(side_effect=AssertionError("upstream must not be called"))
+        proxy._retry_request = AsyncMock(side_effect=RuntimeError("upstream stub"))
+
+        assert client.post(path, headers=headers, json=body).status_code != 429
+        (bucket,) = proxy.rate_limiter._token_buckets.values()
+        assert bucket.tokens < 0  # admitted and charged in full
+        upstream_calls = proxy._retry_request.await_count
 
         response = client.post(path, headers=headers, json=body)
 
         assert response.status_code == 429
         assert response.json()["detail"].startswith("Token rate limited.")
-        proxy._retry_request.assert_not_awaited()
+        assert proxy._retry_request.await_count == upstream_calls
         assert len(proxy.rate_limiter._token_buckets) == 1

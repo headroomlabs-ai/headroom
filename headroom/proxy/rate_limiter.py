@@ -24,7 +24,7 @@ class TokenBucketRateLimiter:
     def __init__(
         self,
         requests_per_minute: int = 60,
-        tokens_per_minute: int = 100000,
+        tokens_per_minute: int | None = None,
     ):
         self.requests_per_minute = requests_per_minute
         self.tokens_per_minute = tokens_per_minute
@@ -55,10 +55,10 @@ class TokenBucketRateLimiter:
             self._request_buckets[key] = state
         return state
 
-    def _token_bucket(self, key: str) -> RateLimitState:
+    def _token_bucket(self, key: str, capacity: int) -> RateLimitState:
         state = self._token_buckets.get(key)
         if state is None:
-            state = RateLimitState(tokens=self.tokens_per_minute, last_update=time.time())
+            state = RateLimitState(tokens=capacity, last_update=time.time())
             self._token_buckets[key] = state
         return state
 
@@ -89,16 +89,19 @@ class TokenBucketRateLimiter:
             return allowed, wait_seconds
 
     async def check_tokens(self, key: str, token_count: int) -> tuple[bool, float]:
-        """Check if token usage is allowed."""
+        """Check if token usage is allowed. ``tokens_per_minute=None`` never limits."""
+        tpm = self.tokens_per_minute
+        if tpm is None:
+            return True, 0.0
         async with self._lock:
             self._touch_bucket(key)
-            state = self._token_bucket(key)
-            available = self._refill(state, self.tokens_per_minute)
+            state = self._token_bucket(key, tpm)
+            available = self._refill(state, tpm)
 
             allowed, state.tokens, wait_seconds = consume_from_bucket(
                 available_tokens=available,
                 requested_tokens=token_count,
-                rate_per_minute=self.tokens_per_minute,
+                rate_per_minute=tpm,
             )
             return allowed, wait_seconds
 

@@ -372,7 +372,7 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     type=click.IntRange(min=1),
     envvar="HEADROOM_TPM",
-    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: unlimited.",
 )
 @click.option(
     "--no-ccr",
@@ -1324,7 +1324,7 @@ def proxy(
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
-        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
+        rate_limit_tokens_per_minute=tpm,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         periodic_malloc_trim_enabled=_get_env_bool(
             "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
