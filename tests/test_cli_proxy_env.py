@@ -1337,7 +1337,7 @@ class TestCLIProxyRpmTpm:
         assert captured_config["config"].rate_limit_requests_per_minute == 20
 
     def test_tpm_default(self, runner):
-        """Without --tpm, rate_limit_tokens_per_minute defaults to 100000."""
+        """Without --tpm, there is no token limit (the pre-0.39.0 behaviour)."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
@@ -1347,7 +1347,7 @@ class TestCLIProxyRpmTpm:
             result = runner.invoke(main, ["proxy"], catch_exceptions=False)
 
         assert result.exit_code == 0, result.output
-        assert captured_config["config"].rate_limit_tokens_per_minute == 100000
+        assert captured_config["config"].rate_limit_tokens_per_minute is None
 
     def test_tpm_flag(self, runner):
         """--tpm 50000 should set rate_limit_tokens_per_minute to 50000."""
