@@ -13,6 +13,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
+from headroom.ccr.retrieval_content import is_retrieval_result
+
 from .content_router import (
     CompressionStrategy,
     ContentRouter,
@@ -59,6 +61,7 @@ class CompressionUnit:
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
+    "protected_retrieval_result": "protected_role",
     "protected_system_message": "protected_role",
     "protected_assistant_message": "protected_role",
     "immutable": "immutable",
@@ -253,6 +256,8 @@ def compress_unit_with_router(
             kw["reason_category"] = _categorize_reason(reason_val)
         return replace(base, **kw)  # type: ignore[arg-type]
 
+    if is_retrieval_result(unit.text):
+        return _with_reason(reason="protected_retrieval_result")
     if not unit.mutable:
         return _with_reason(reason="immutable")
     if unit.role == "user":

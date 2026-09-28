@@ -587,7 +587,8 @@ def test_openai_responses_adapter_accepts_empty_input_list():
     assert strategy_chain == []
 
 
-def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_openai_responses_adapter_preserves_headroom_retrieve_outputs(wrapped):
     router = ContentRouter()
 
     def compress(self, content: str, **_kwargs):
@@ -606,8 +607,8 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
             {
                 "type": "function_call",
                 "call_id": "call_retrieve",
-                "name": "mcp__headroom__headroom_retrieve",
-                "arguments": "{}",
+                "name": "mcp_daemon" if wrapped else "mcp__headroom__headroom_retrieve",
+                "arguments": '{"action":"call","selector":"headroom.headroom_retrieve"}',
             },
             {
                 "type": "function_call_output",
