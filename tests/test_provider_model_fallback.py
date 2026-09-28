@@ -1,6 +1,7 @@
 """Tests for provider model fallback and configuration."""
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -237,6 +238,70 @@ class TestAnthropicConfigLoading:
                     # Env var should win
                     assert loaded["context_limits"]["test-model"] == 100000
 
+    @pytest.mark.parametrize("raw", ["[1, 2, 3]", '"gpt-4"', "42", "true", "null"])
+    def test_non_object_env_var_falls_back_to_defaults(self, raw):
+        """A valid-JSON-but-not-an-object env var must warn and use defaults,
+        not crash provider init with AttributeError on ``loaded.get``."""
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": raw}):
+            loaded = anthropic_load_config()
+            assert loaded == {"context_limits": {}, "pricing": {}}
+
+    def test_flat_shape_env_var_warns_that_it_had_no_effect(self, caplog):
+        """A JSON *object* using the intuitive-but-wrong flat shape
+        ``{"my-model": 262144}`` is silently ignored by the loader.
+
+        The unknown-model warning tells operators to "set HEADROOM_MODEL_LIMITS",
+        so the flat shape is the natural first guess. Without a diagnostic the
+        operator sees the conservative default silently persist and has no way
+        to tell the config was never applied. Assert we now say so explicitly.
+        """
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": '{"qwen3.8": 262144}'}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                loaded = anthropic_load_config()
+        assert loaded == {"context_limits": {}, "pricing": {}}
+        assert "NO EFFECT" in caplog.text
+        assert "context_limits" in caplog.text
+
+    def test_correct_shape_env_var_does_not_warn(self, caplog):
+        """The documented nested shape must apply cleanly and stay silent."""
+        cfg = '{"context_limits": {"qwen3.8": 262144}}'
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": cfg}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                loaded = anthropic_load_config()
+        assert loaded["context_limits"]["qwen3.8"] == 262144
+        assert "NO EFFECT" not in caplog.text
+
+    def test_other_provider_namespaced_env_var_does_not_warn(self, caplog):
+        """``{"openai": {"context_limits": ...}}`` is the documented shape for the
+        OpenAI loader. The Anthropic loader consumes nothing from it, which is
+        correct, so it must not claim the config had no effect."""
+        cfg = '{"openai": {"context_limits": {"gpt-x": 400000}}}'
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": cfg}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                loaded = anthropic_load_config()
+        assert loaded == {"context_limits": {}, "pricing": {}}
+        assert "NO EFFECT" not in caplog.text
+
+    def test_anthropic_section_without_known_keys_still_warns(self, caplog):
+        """An explicit ``anthropic`` section that carries none of the consumed
+        keys is the same silent no-op as the flat shape, so it warns."""
+        cfg = '{"anthropic": {"qwen3.8": 262144}}'
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": cfg}):
+            with caplog.at_level(logging.WARNING, logger="headroom.providers.anthropic"):
+                anthropic_load_config()
+        assert "NO EFFECT" in caplog.text
+
+    def test_non_object_config_file_falls_back_to_defaults(self):
+        """A models.json whose top level is not an object must not crash."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_dir = Path(tmpdir) / ".headroom"
+            config_dir.mkdir()
+            (config_dir / "models.json").write_text("[1, 2, 3]")
+
+            with patch.object(Path, "home", return_value=Path(tmpdir)):
+                loaded = anthropic_load_config()
+                assert loaded == {"context_limits": {}, "pricing": {}}
+
 
 class TestOpenAIModelFallback:
     """Tests for OpenAI provider model fallback."""
@@ -276,9 +341,23 @@ class TestOpenAIModelFallback:
         """Test fallback for unknown models."""
         provider = OpenAIProvider()
 
-        # Unknown model should get 128K default
-        limit = provider.get_context_limit("gpt-5-future")
+        # Unknown model should get 128K default. Deliberately a name that
+        # matches no known family prefix -- this used to say "gpt-5-future",
+        # which stopped being unknown once gpt-5 was added to _CONTEXT_LIMITS.
+        limit = provider.get_context_limit("gpt-9-imaginary")
         assert limit == 128000
+
+    def test_unknown_variant_inherits_its_family_limit(self):
+        """An unrecognized variant of a *known* family takes that family's limit.
+
+        This is the same prefix inheritance that gives "gpt-4o-2024-11-20" the
+        gpt-4o limit, and it is strictly better than dropping such a model to
+        the generic 128K default.
+        """
+        provider = OpenAIProvider()
+
+        assert provider.get_context_limit("gpt-5-future") == 272000
+        assert provider.get_context_limit("gpt-4.1-preview") == 1_047_576
 
     def test_no_exception_for_unknown_model(self):
         """Test that unknown models don't raise exceptions."""
@@ -338,6 +417,14 @@ class TestOpenAIConfigLoading:
             with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": str(config_path)}):
                 loaded = openai_load_config()
                 assert loaded["pricing"]["test-model"] == [5.0, 15.0]
+
+    @pytest.mark.parametrize("raw", ["[1, 2, 3]", '"gpt-4"', "42", "true", "null"])
+    def test_non_object_env_var_falls_back_to_defaults(self, raw):
+        """A valid-JSON-but-not-an-object env var must warn and use defaults,
+        not crash provider init with AttributeError on ``loaded.get``."""
+        with patch.dict(os.environ, {"HEADROOM_MODEL_LIMITS": raw}):
+            loaded = openai_load_config()
+            assert loaded == {"context_limits": {}, "pricing": {}, "encodings": {}}
 
 
 class TestCrossProviderConsistency:

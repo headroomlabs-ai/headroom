@@ -162,9 +162,13 @@ def test_config_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) 
         _CONFIG, CompressionStrategy.CONFIG, context, bias=bias
     )
     assert out == direct
-    # CONFIG's historical metric is len(text.split()), NOT _estimate_tokens; the
-    # flip must preserve that exact metric.
-    assert tokens == len(direct.split())
+    # CONFIG's historical metric was len(text.split()) — a WORD count, which this
+    # assertion was written to preserve across the registry-dispatch flip. That
+    # was right for the flip and wrong as a metric: the value is divided by
+    # `original_tokens`, which comes from _estimate_tokens, so a word numerator
+    # over a token denominator made a byte-identical no-op score ~0.36 and get
+    # accepted as a large saving. Now measured in the denominator's unit.
+    assert tokens == _estimate_tokens(direct)
     assert chain == [CompressionStrategy.CONFIG.value]
     assert len(out) < len(_CONFIG)
 

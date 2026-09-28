@@ -87,7 +87,6 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # real ``uvx`` — neutralise them so these registration-focused tests stay
     # hermetic (covered directly in test_wrap_serena_boost.py).
     monkeypatch.setattr(wrap_cli, "_inject_serena_instructions", lambda *a, **k: True)
-    monkeypatch.setattr(wrap_cli, "_scope_serena_languages", lambda *a, **k: None)
     monkeypatch.setattr(wrap_cli, "_index_serena_project", lambda *a, **k: None)
 
 

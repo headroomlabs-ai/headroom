@@ -5,16 +5,16 @@ chat message history that automatically compresses conversation history
 when it exceeds a token threshold.
 
 Example:
-    from langchain.memory import ConversationBufferMemory
-    from langchain_community.chat_message_histories import ChatMessageHistory
+    from langchain_core.chat_history import InMemoryChatMessageHistory
+    from langchain_core.runnables.history import RunnableWithMessageHistory
     from headroom.integrations import HeadroomChatMessageHistory
 
-    # Wrap any chat message history
-    base_history = ChatMessageHistory()
+    # Wrap any BaseChatMessageHistory
+    base_history = InMemoryChatMessageHistory()
     compressed_history = HeadroomChatMessageHistory(base_history)
 
-    # Use with ConversationBufferMemory (zero code changes to chain)
-    memory = ConversationBufferMemory(chat_memory=compressed_history)
+    # Use anywhere a chat history is accepted
+    chain = RunnableWithMessageHistory(llm, lambda sid: compressed_history)
 """
 
 from __future__ import annotations
@@ -67,30 +67,26 @@ class HeadroomChatMessageHistory(BaseChatMessageHistory):
     refactor in PR-B1+ replaces the old RollingWindow strategy with).
 
     This works with ANY memory type because it wraps at the storage layer:
-    - ConversationBufferMemory
-    - ConversationSummaryMemory
-    - ConversationBufferWindowMemory
+    - InMemoryChatMessageHistory
+    - RunnableWithMessageHistory, and LangGraph checkpointers
     - Redis, PostgreSQL, or any custom history
 
     Example:
-        from langchain.memory import ConversationBufferMemory
-        from langchain_community.chat_message_histories import ChatMessageHistory
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+        from langchain_core.runnables.history import RunnableWithMessageHistory
         from headroom.integrations import HeadroomChatMessageHistory
 
         # Wrap base history
-        base = ChatMessageHistory()
+        base = InMemoryChatMessageHistory()
         compressed = HeadroomChatMessageHistory(
             base,
             compress_threshold_tokens=4000,
             keep_recent_turns=5,
         )
 
-        # Use with any memory class
-        memory = ConversationBufferMemory(chat_memory=compressed)
-
         # Messages are compressed automatically when accessed
-        chain = ConversationChain(llm=llm, memory=memory)
-        chain.invoke({"input": "Hello!"})
+        chain = RunnableWithMessageHistory(llm, lambda sid: compressed)
+        chain.invoke({"input": "Hello!"}, config={"configurable": {"session_id": "s1"}})
 
     Attributes:
         base_history: The underlying chat message history

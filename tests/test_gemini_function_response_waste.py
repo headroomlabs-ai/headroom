@@ -124,6 +124,45 @@ class TestFunctionResponseConversion:
         assert "loop" in text
 
 
+class TestMalformedPartsToleration:
+    """A request-controlled `parts` that is null or carries non-dict elements
+    must not crash the compression-path conversion helpers."""
+
+    def test_null_parts_does_not_crash(self, proxy):
+        contents = [
+            {"role": "user", "parts": None},
+            {"role": "user", "parts": [{"text": "real"}]},
+        ]
+        messages, preserved = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "real"}]
+        assert preserved == set()
+
+    def test_string_part_elements_do_not_crash(self, proxy):
+        # A client that treats `parts` as a string array sends bare strings;
+        # they carry no `text` key, so they contribute nothing but must not
+        # crash `.get`.
+        contents = [{"role": "user", "parts": ["bare string", {"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
+
+    def test_null_part_element_is_skipped(self, proxy):
+        contents = [{"role": "user", "parts": [None, {"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
+
+    def test_has_non_text_parts_tolerates_null_parts(self, proxy):
+        assert proxy._has_non_text_parts({"role": "user", "parts": None}) is False
+        assert proxy._has_non_text_parts({"role": "user", "parts": ["str"]}) is False
+        assert proxy._has_non_text_parts({"parts": [{"inlineData": {"data": "x"}}]}) is True
+
+    def test_non_dict_content_entry_is_tolerated(self, proxy):
+        # A non-dict entry in contents[] is treated as an empty user turn rather
+        # than crashing content.get / the parts iteration.
+        contents = ["not a dict", {"role": "user", "parts": [{"text": "kept"}]}]
+        messages, _ = proxy._gemini_contents_to_messages(contents)
+        assert messages == [{"role": "user", "content": "kept"}]
+
+
 class TestFunctionResponseWasteParsing:
     def test_function_response_payload_reaches_waste_signals(self, proxy, tokenizer):
         contents = [

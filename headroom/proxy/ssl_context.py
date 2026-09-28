@@ -188,6 +188,24 @@ def build_httpx_verify() -> ssl.SSLContext | bool:
     return True
 
 
+def build_urlopen_context() -> ssl.SSLContext | None:
+    """Return Headroom's configured TLS context for ``urllib.request.urlopen``.
+
+    ``urlopen`` already handles Python's default trust configuration when no
+    explicit context is passed. Return only a custom context here so callers
+    retain that default while sharing Headroom's corporate CA and strict-mode
+    handling when it is configured.
+    """
+
+    verify = build_httpx_verify()
+    if not isinstance(verify, ssl.SSLContext):
+        return None
+    # urllib.request/http.client only implements HTTP/1.1 framing. Offering h2
+    # can make a TLS-inspecting MITM negotiate a protocol it cannot parse.
+    verify.set_alpn_protocols(["http/1.1"])
+    return verify
+
+
 def apply_global_tls_relaxation() -> bool:
     """Strip ``VERIFY_X509_STRICT`` from urllib3's context builder when opted in.
 

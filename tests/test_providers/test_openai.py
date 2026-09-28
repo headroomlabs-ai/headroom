@@ -130,3 +130,52 @@ class TestEncodingSelection:
         # Unknown models now get a fallback encoding instead of raising
         encoding = _get_encoding_name_for_model("completely-unknown")
         assert encoding == "o200k_base"  # Default fallback
+
+
+class TestGuardedEncodingLoad:
+    """The provider must never hang on tiktoken's unbounded vocab download.
+
+    Regression for the OpenAI-provider hole in GH #956: `_get_encoding` called
+    `tiktoken.get_encoding` directly, so a stalled vocab download blocked the
+    calling thread (proxy startup included) forever instead of timing out.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_encoding_cache(self):
+        from headroom.providers import openai as openai_module
+
+        openai_module._get_encoding.cache_clear()
+        yield
+        openai_module._get_encoding.cache_clear()
+
+    def test_get_encoding_routes_through_bounded_loader(self, monkeypatch):
+        from headroom.providers.openai import OpenAITokenCounter
+        from headroom.tokenizers import tiktoken_counter
+
+        seen: list[str] = []
+
+        def fake_load_encoding(name: str):
+            seen.append(name)
+            raise tiktoken_counter.TiktokenLoadError(f"{name} load timed out")
+
+        monkeypatch.setattr(tiktoken_counter, "load_encoding", fake_load_encoding)
+        with pytest.raises(tiktoken_counter.TiktokenLoadError):
+            OpenAITokenCounter(model="gpt-4o")
+        assert seen == ["o200k_base"]
+
+    def test_get_token_counter_falls_back_to_estimation(self, monkeypatch):
+        from headroom.providers.openai import OpenAIProvider
+        from headroom.tokenizers import tiktoken_counter
+        from headroom.tokenizers.estimator import EstimatingTokenCounter
+
+        def fake_load_encoding(name: str):
+            raise tiktoken_counter.TiktokenLoadError(f"{name} load timed out")
+
+        monkeypatch.setattr(tiktoken_counter, "load_encoding", fake_load_encoding)
+        provider = OpenAIProvider()
+        counter = provider.get_token_counter("gpt-4o")
+        assert isinstance(counter, EstimatingTokenCounter)
+        assert counter.count_text("hello world") > 0
+        # Cached per model: later requests reuse the fallback instead of
+        # re-blocking on the failed download.
+        assert provider.get_token_counter("gpt-4o") is counter

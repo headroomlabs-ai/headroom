@@ -92,7 +92,11 @@ No re-scoping needed; revisit after Phase D lands.
 
 ## Q9. RTK proxy-side invocation — ever revisit?
 
-**Recommendation:** **No, document the decision in `docs/rtk-architecture.md`** (Phase G PR-G3). The argument:
+**Resolved — moot.** RTK was removed from Headroom outright (see
+`09-phase-G-rtk-observability.md`), so there is no proxy-side invocation to
+revisit. The original recommendation was "no, document the decision in
+`docs/rtk-architecture.md`" (that doc was deleted with the feature). The argument
+is kept because reasons 1–3 apply to any future shell-output rewriter:
 1. Cache hot zone risk: shell-out + buffer per tool result is correctness-fragile.
 2. Parallel implementation: `crates/headroom-core/src/transforms/log_compressor.rs` covers post-hoc log/output compression; RTK rewrites *commands* (different value).
 3. RTK itself is a third-party binary the team doesn't control; an upstream version change silently busts cache.

@@ -8,16 +8,20 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.responses import StreamingResponse
 
-from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin, _is_googleapis_endpoint
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _decode_openai_bearer_payload,
     _passthrough_usage_from_json,
     _prefers_http1_passthrough,
 )
-from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.helpers import (
+    _headroom_bypass_enabled,
+    relocate_system_messages_to_top_level,
+)
 from headroom.proxy.server import HeadroomProxy
 
 
@@ -29,6 +33,23 @@ def _jwt(payload: object) -> str:
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
     return f"{encode(header)}.{encode(payload)}."
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://us-central1-aiplatform.googleapis.com/v1", True),
+        ("https://googleapis.com/v1", True),
+        ("https://AIPLATFORM.GOOGLEAPIS.COM./v1", True),
+        ("https://googleapis.com.example.test/v1", False),
+        ("https://notgoogleapis.com/v1", False),
+        ("https://googleapis.com@attacker.test/v1", False),
+        ("not a url", False),
+        ("", False),
+    ],
+)
+def test_googleapis_endpoint_gate_uses_hostname_boundary(url: str, expected: bool) -> None:
+    assert _is_googleapis_endpoint(url) is expected
 
 
 class _ImageCompressor:
@@ -114,10 +135,14 @@ class _VertexGeminiImageRequest:
     method = "POST"
     headers = {}
     query_params = {}
+    scope: dict = {"type": "http", "method": "POST"}
     url = SimpleNamespace(
         path="/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent",
         query="",
     )
+
+    async def stream(self):
+        yield await self.body()
 
     async def body(self) -> bytes:
         return json.dumps(
@@ -268,6 +293,205 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     assert changed == 1
 
 
+def test_relocate_system_messages_moves_stray_system_into_top_level() -> None:
+    # Issue #765: compression relocated the harness system block into
+    # messages[0] as a role="system" entry, which Anthropic rejects with a 400.
+    # The forwarder guard must move it back to the top-level `system` parameter.
+    messages = [
+        {"role": "system", "content": "You are a harness."},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None)
+
+    assert changed is True
+    # No role="system" entry may survive in messages[] — that is the wire-contract violation.
+    assert all(m.get("role") != "system" for m in clean)
+    assert clean == [{"role": "user", "content": "hi"}]
+    # The relocated content lands in the top-level system parameter.
+    assert system == [{"type": "text", "text": "You are a harness."}]
+
+
+def test_relocate_system_messages_appends_to_existing_system() -> None:
+    messages = [
+        {"role": "system", "content": [{"type": "text", "text": "B"}]},
+        {"role": "user", "content": "hi"},
+    ]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "hi"}]
+    # Existing system first, relocated content after — wire order preserved.
+    assert system == [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]
+
+
+def test_relocate_system_messages_noop_without_system_entry() -> None:
+    messages = [{"role": "user", "content": "hi"}]
+    clean, system, changed = relocate_system_messages_to_top_level(messages, "A")
+
+    assert changed is False
+    assert clean is messages
+    assert system == "A"
+
+
+def test_relocate_system_messages_preserves_valid_mid_conversation_section() -> None:
+    messages = [
+        {"role": "user", "content": "Run the tests."},
+        {
+            "role": "system",
+            "content": "The user added: update the changelog too.",
+        },
+        {"role": "assistant", "content": "I will do both."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, "base", "claude-opus-5"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system == "base"
+
+
+def test_relocate_system_messages_preserves_consecutive_valid_section_at_end() -> None:
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]},
+        {"role": "system", "content": "First update."},
+        {"role": "system", "content": "Second update."},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "global.anthropic.claude-sonnet-5-v1:0"
+    )
+
+    assert changed is False
+    assert clean is messages
+    assert system is None
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "assistant", "content": "answer"},
+            {"role": "system", "content": "bad predecessor"},
+        ],
+        [
+            {"role": "user", "content": "question"},
+            {"role": "system", "content": "bad successor"},
+            {"role": "user", "content": "another question"},
+        ],
+    ],
+)
+def test_relocate_system_messages_still_moves_invalid_mid_conversation_placement(
+    messages: list[dict],
+) -> None:
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, "claude-fable-5")
+
+    assert changed is True
+    assert all(message.get("role") != "system" for message in clean)
+    assert system == [{"type": "text", "text": messages[1]["content"]}]
+
+
+def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": "mid-turn instruction"},
+    ]
+
+    clean, system, changed = relocate_system_messages_to_top_level(
+        messages, None, "claude-sonnet-4-6"
+    )
+
+    assert changed is True
+    assert clean == [{"role": "user", "content": "question"}]
+    assert system == [{"type": "text", "text": "mid-turn instruction"}]
+
+
+def test_relocate_system_messages_keeps_image_blocks_out_of_top_level_system() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look at this"}]},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "<system-reminder>image attached</system-reminder>"},
+                image_block,
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ]
+    system = [{"type": "text", "text": "You are Claude Code."}]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is True
+    assert isinstance(new_system, list)
+    assert all(not isinstance(block, dict) or block.get("type") == "text" for block in new_system)
+    retained = [
+        message.get("content")
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert any(image_block in (content or []) for content in retained)
+
+
+def test_relocate_system_messages_hoists_only_text_from_mixed_sections() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "system",
+            "content": [
+                "plain string section",
+                {"type": "text", "text": "structured note"},
+                {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            ],
+        },
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, None, None)
+
+    assert changed is True
+    assert new_system == [
+        {"type": "text", "text": "plain string section"},
+        {"type": "text", "text": "structured note"},
+    ]
+    retained = [
+        message
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert retained == [
+        {
+            "role": "system",
+            "content": [{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}],
+        }
+    ]
+
+
+def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": [image_block]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    system = "base"
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is False
+    assert clean == messages
+    assert new_system == system
+
+
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
     assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
@@ -379,6 +603,51 @@ def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
         "output_tokens": 7,
         "cache_read_input_tokens": 3,
     }
+
+
+def test_gemini_output_tokens_includes_thinking_when_exclusive() -> None:
+    """Gemini 2.5 thinking: when prompt + candidates != total, thoughtsTokenCount
+    is a separate output bucket and must be added, or output cost undercounts."""
+    from headroom.proxy.token_counting import gemini_output_tokens
+
+    exclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 200,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(exclusive) == 700  # 200 visible + 500 thinking
+
+    # Inclusive: candidatesTokenCount already covers thoughts (prompt+cand==total).
+    inclusive = {
+        "promptTokenCount": 1000,
+        "candidatesTokenCount": 700,
+        "thoughtsTokenCount": 500,
+        "totalTokenCount": 1700,
+    }
+    assert gemini_output_tokens(inclusive) == 700
+
+    # No thinking tokens: just the candidates count (common non-2.5 case).
+    assert gemini_output_tokens({"candidatesTokenCount": 42, "totalTokenCount": 100}) == 42
+    # Robust to empty / missing fields.
+    assert gemini_output_tokens({}) == 0
+
+
+def test_passthrough_usage_counts_gemini_thinking_tokens() -> None:
+    """_passthrough_usage_from_json must include thinking tokens in output_tokens."""
+    usage = _passthrough_usage_from_json(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 200,
+                "thoughtsTokenCount": 500,
+                "totalTokenCount": 1700,
+                "cachedContentTokenCount": 100,
+            }
+        }
+    )
+    assert usage["output_tokens"] == 700
+    assert usage["input_tokens"] == 1000
 
 
 def test_vertex_passthrough_records_usage_metadata_for_dashboard() -> None:
@@ -721,10 +990,13 @@ def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn()
     ) == [compressed]
 
 
-def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
+def test_proxy_helper_reuses_a_singleton_image_compressor(monkeypatch) -> None:
+    # #2513: the compressor caches heavyweight models, so it must be a
+    # process-wide singleton rather than a fresh instance per request.
     from headroom.proxy import helpers
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     _FreshCompressor.instances = 0
 
     with patch("headroom.image.ImageCompressor", _FreshCompressor):
@@ -732,9 +1004,9 @@ def test_proxy_helper_creates_fresh_image_compressors(monkeypatch) -> None:
         second = helpers._get_image_compressor()
 
     assert isinstance(first, _FreshCompressor)
-    assert isinstance(second, _FreshCompressor)
-    assert first is not second
-    assert _FreshCompressor.instances == 2
+    assert first is second
+    assert first._is_singleton is True
+    assert _FreshCompressor.instances == 1
 
 
 def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
@@ -751,6 +1023,7 @@ def test_proxy_helper_caches_image_stack_import_failure(monkeypatch) -> None:
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(helpers, "_image_compressor_available", None)
+    monkeypatch.setattr(helpers, "_image_compressor_instance", None)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
     assert helpers._get_image_compressor() is None
@@ -846,8 +1119,9 @@ def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
     """x-headroom-project-id is the highest-priority signal."""
     request = _fake_request({"x-headroom-project-id": "my-cool-project"})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
-    assert key == "my-cool-project"
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
+    assert key.startswith("my-cool-project-")
+    assert len(key.split("-")[-1]) == 16
     assert label == "my-cool-project"
 
 
@@ -855,19 +1129,31 @@ def test_resolve_ccr_workspace_cwd_header() -> None:
     """x-headroom-cwd produces a stable per-cwd key + basename label."""
     request = _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     # Key format: "{basename}-{sha256[:16]}" — stable per absolute cwd.
     assert key.startswith("daphni-rails-")
     assert len(key) >= len("daphni-rails-") + 16
     assert label == "daphni-rails"
 
 
+def test_resolve_ccr_workspace_uses_configured_project_root_override() -> None:
+    """The CLI project-root override reaches CCR workspace resolution."""
+    handler = AnthropicHandlerMixin()
+    handler.config = SimpleNamespace(memory_project_root_override="/home/user/code/project-c")
+
+    key, label = handler._resolve_ccr_workspace(_fake_request({}), {})
+
+    assert key.startswith("project-c-")
+    assert label == "project-c"
+
+
 def test_resolve_ccr_workspace_two_cwds_get_distinct_keys() -> None:
     """Two different cwds produce different workspace keys (cross-leak prevention)."""
-    key_a, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+    handler = AnthropicHandlerMixin()
+    key_a, _ = handler._resolve_ccr_workspace(
         _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"}), {}
     )
-    key_b, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+    key_b, _ = handler._resolve_ccr_workspace(
         _fake_request({"x-headroom-cwd": "/home/user/code/tamag0"}), {}
     )
     assert key_a != key_b, "different cwds must yield different workspace keys"
@@ -877,7 +1163,7 @@ def test_resolve_ccr_workspace_no_signal_returns_empty() -> None:
     """No project-id, no cwd header, no system prompt → fail-closed signal."""
     request = _fake_request({})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
 
@@ -888,7 +1174,7 @@ def test_resolve_ccr_workspace_system_prompt_cwd_fallback() -> None:
     body = {
         "system": [{"type": "text", "text": "You are helpful.\ncwd: /home/u/code/my-project\nGo."}]
     }
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     # The label is the basename of the cwd extracted from the prompt.
     assert label == "my-project"
     assert key.startswith("my-project-")
@@ -906,7 +1192,7 @@ def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
     # The helper catches the exception, logs it, and returns the fail-
     # closed sentinel ("", None). Critically, it does NOT raise — the
     # proxy must continue serving the request even if CCR scoping fails.
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
 

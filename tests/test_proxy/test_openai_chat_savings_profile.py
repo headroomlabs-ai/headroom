@@ -50,6 +50,67 @@ def _make_mock_backend() -> MagicMock:
     return backend
 
 
+def _make_mock_backend_with_usage(usage: dict) -> MagicMock:
+    backend = MagicMock()
+    backend.name = "anyllm-openai"
+    backend.send_openai_message = AsyncMock(
+        return_value=BackendResponse(
+            body={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            },
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+    )
+    return backend
+
+
+def test_chat_completions_survives_null_usage_token_counts():
+    """A backend that reports present-but-null token counts must not 500.
+
+    `.get(key, default)` returns None for a null value, and the chat path
+    feeds those counts into `max(...)`/int-typed metrics. Without coercion a
+    single such response crashes the request and its outcome recording
+    (same class as the gemini fix in #2347).
+    """
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="openai",
+    )
+
+    # prompt_tokens / completion_tokens present but explicitly null.
+    mock_backend = _make_mock_backend_with_usage(
+        {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+    )
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock_backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert resp.status_code == 200, resp.text
+
+
 def test_chat_completions_threads_savings_profile_kwargs_into_apply():
     """With HEADROOM_SAVINGS_PROFILE=agent-90, the chat path must pass the
     profile knobs (compress_user_messages, target_ratio, ...) to apply()."""

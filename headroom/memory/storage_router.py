@@ -160,7 +160,15 @@ class ProjectResolver:
         if explicit:
             safe = self._sanitize_basename(explicit)
             if safe:
-                return safe, explicit
+                # Append a digest of the raw id like `_identity_from_cwd` does:
+                # `_sanitize_basename` maps every disallowed character to a dash
+                # and truncates to 64 chars, so distinct ids such as "acme/api"
+                # and "acme api" both collapse to "acme-api" and would otherwise
+                # share one project store (cross-project memory leak). The digest
+                # keeps distinct ids on distinct keys while the sanitized prefix
+                # stays human-readable on disk.
+                digest = hashlib.sha256(explicit.encode("utf-8")).hexdigest()[:16]
+                return f"{safe}-{digest}", explicit
 
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
@@ -294,12 +302,20 @@ class BackendRouter:
 
         if mode is MemoryStorageMode.USER:
             user_safe = ProjectResolver._sanitize_basename(ctx.base_user_id) or "default"
-            db_path = self._config.root_dir / "users" / user_safe / "memory.db"
+            # Append a digest of the raw user id for the same reason as the
+            # project keys above: `_sanitize_basename` collapses distinct ids
+            # ("alice/qa", "alice qa", "alice@qa") to the same "alice-qa", which
+            # in USER mode would pool two different users into one memory.db —
+            # a cross-user data-isolation leak, the one thing USER mode exists to
+            # prevent. The digest keeps distinct users on distinct stores.
+            digest = hashlib.sha256(ctx.base_user_id.encode("utf-8")).hexdigest()[:16]
+            user_key = f"{user_safe}-{digest}"
+            db_path = self._config.root_dir / "users" / user_key / "memory.db"
             return ResolvedScope(
                 mode=MemoryStorageMode.USER,
                 db_path=db_path,
                 display_name=ctx.base_user_id,
-                project_key=user_safe,
+                project_key=user_key,
             )
 
         # PROJECT mode.
@@ -405,68 +421,97 @@ class BackendRouter:
             return list(self._backends.keys())
 
 
+def _text_from_blocks(content: Any) -> str:
+    """Join the ``text`` of every dict block in a content list."""
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _system_field_text(system_field: Any) -> str:
+    """Text of the Anthropic top-level ``system`` field (string or blocks)."""
+    if isinstance(system_field, str):
+        return system_field
+    return _text_from_blocks(system_field)
+
+
+def _first_role_system_text(messages: list[Any]) -> str:
+    """Text of the first ``role="system"`` message (OpenAI/Gemini shape)."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content:
+                return content
+            continue
+        text = _text_from_blocks(content)
+        if text:
+            return text
+    return ""
+
+
+def _first_user_text_with_cwd(messages: list[Any]) -> str:
+    """Text of the first user message carrying a ``cwd:``-family line.
+
+    Claude Code 2.x sends its ``<env>`` block as an ``isMeta`` *user*
+    message rather than inside ``system`` (#3595), and Trae puts it in a
+    user reminder (#1737). Only text that actually contains one of
+    ``_CWD_PREFIXES`` is returned, so ordinary user content never leaks
+    into the system prompt.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        user_text = content if isinstance(content, str) else _text_from_blocks(content)
+        if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
+            return user_text
+    return ""
+
+
 def extract_system_prompt(body: Mapping[str, Any]) -> str:
     """Best-effort extraction of the system prompt across providers.
 
     Anthropic puts it on the top-level ``system`` field (string or list
     of content blocks); OpenAI/Gemini-style payloads put it as a message
     with ``role=system``. Returns an empty string when nothing is found
-    rather than raising — the resolver tolerates an empty prompt and
+    rather than raising -- the resolver tolerates an empty prompt and
     will fall through to the configured fallback.
-    """
 
-    system_field = body.get("system")
-    if isinstance(system_field, str):
-        return system_field
-    if isinstance(system_field, list):
-        parts: list[str] = []
-        for block in system_field:
-            if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        if parts:
-            return "\n".join(parts)
+    Every source is *concatenated* rather than first-match-wins. The
+    previous early return on a non-empty ``system`` field made the
+    ``messages[]`` scan unreachable for every client that sends a system
+    prompt at all -- which is every Claude Code request -- so the
+    ``cwd:`` line in a 2.x ``isMeta`` user message was never seen and
+    project resolution fell through to the fail-closed fallback (#3595).
+    """
+    parts: list[str] = []
+
+    system_text = _system_field_text(body.get("system"))
+    if system_text:
+        parts.append(system_text)
 
     messages = body.get("messages")
     if isinstance(messages, list):
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "system":
-                continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                if parts:
-                    return "\n".join(parts)
+        role_system_text = _first_role_system_text(messages)
+        if role_system_text:
+            parts.append(role_system_text)
 
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            user_text: str | None = None
-            if isinstance(content, str):
-                user_text = content
-            elif isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                if parts:
-                    user_text = "\n".join(parts)
-            if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
-                return user_text
+        # User content is client-controlled, so it is only a *fallback*: a
+        # cwd already present in a trusted source (top-level ``system`` or a
+        # ``role="system"`` message) wins, otherwise a user turn could
+        # redirect this request at another project's memory store by pasting
+        # its own ``cwd:`` line.
+        trusted = "\n".join(parts)
+        if not any(prefix in trusted for prefix in _CWD_PREFIXES):
+            cwd_text = _first_user_text_with_cwd(messages)
+            if cwd_text:
+                parts.append(cwd_text)
 
-    return ""
+    return "\n".join(parts)

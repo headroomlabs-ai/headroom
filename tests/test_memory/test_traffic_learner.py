@@ -6,6 +6,8 @@ a real memory backend.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -359,6 +361,56 @@ class TestTrafficLearner:
 
         stats = learner.get_stats()
         assert stats["patterns_extracted"] >= 3
+
+    def test_pending_accumulator_is_bounded(self):
+        """One-off patterns that never reach ``min_evidence`` must not grow the
+        pending ``_pattern_counts`` accumulator without bound — the sibling
+        ``_saved_hashes`` is already trimmed to ``dedup_window`` and this one was
+        missed, so a long-lived proxy leaked memory across varied traffic. It is
+        now LRU-capped at ``max_pending_patterns``.
+
+        Sync test (drives the async accumulate via ``asyncio.run``) so it runs
+        without the pytest-asyncio plugin.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=5, max_pending_patterns=8)
+
+        async def feed_one_offs() -> None:
+            for i in range(500):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE,
+                        content=f"one-off pattern number {i}",
+                        importance=0.5,
+                    )
+                )
+
+        asyncio.run(feed_one_offs())
+        assert len(learner._pattern_counts) <= 8  # capped, not 500
+
+    def test_pending_accumulator_lru_still_promotes_corroborated_pattern(self):
+        """Capping the accumulator must not break promotion: a pattern
+        corroborated to ``min_evidence`` without interruption is still removed
+        from pending and recorded in ``_saved_hashes``."""
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=3, max_pending_patterns=100)
+        pattern = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="corroborated preference",
+            importance=0.5,
+        )
+
+        async def corroborate() -> None:
+            await learner._accumulate(pattern)  # count 1
+            await learner._accumulate(pattern)  # count 2
+            assert pattern.content_hash in learner._pattern_counts
+            await learner._accumulate(pattern)  # count 3 == min_evidence -> promote
+
+        asyncio.run(corroborate())
+        assert pattern.content_hash not in learner._pattern_counts  # removed on promotion
+        assert pattern.content_hash in learner._saved_hashes
 
     @pytest.mark.asyncio
     async def test_dedup(self, learner: TrafficLearner):
@@ -852,6 +904,10 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.refreshed_ids = []
+
+    async def refresh_memory_indexes(self, memory_id: str):
+        self.refreshed_ids.append(memory_id)
 
     async def save_memory(
         self,
@@ -1215,6 +1271,46 @@ class TestFlushToFile:
         assert writer.calls == []  # no roots → short-circuits before writer
 
     @pytest.mark.asyncio
+    async def test_discover_projects_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """A slow discover_projects must not stall other loop work.
+
+        discover_projects walks the filesystem; on a large home tree it takes
+        minutes. Called inline it froze the loop, so uvicorn stopped answering
+        /readyz and supervisors killed a proxy that was only busy.
+        """
+        writer = _FakeWriter()
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
+
+        release = threading.Event()
+
+        def slow_discover():
+            release.wait(timeout=5)
+            return [_make_project(str(project_path))]
+
+        plugin.discover_projects = slow_discover  # type: ignore[method-assign]
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Working test command: cd {project_path} && pytest",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+
+        flush = asyncio.create_task(learner.flush_to_file())
+        # The loop stays responsive while discover_projects is stuck.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert not flush.done()
+        release.set()
+        await asyncio.wait_for(flush, timeout=5)
+        assert writer.calls, "flush should still complete once discovery returns"
+
+    @pytest.mark.asyncio
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
         """Patterns with no path anchoring are dropped before writer is called."""
         writer = _FakeWriter()
@@ -1373,6 +1469,7 @@ class TestBumpEdgeCases:
         learner = TrafficLearner(backend=backend, min_evidence=1)
         await learner._bump_persisted_evidence("no-such-id")
         assert _read_traffic_rows(db) == []
+        assert backend.refreshed_ids == []
 
 
 # =============================================================================
@@ -2000,6 +2097,7 @@ class TestBumpPersistsLastSeenAt:
         # Should be parseable back.
         parsed = _parse_iso_timestamp(meta["last_seen_at"])
         assert parsed is not None
+        assert backend.refreshed_ids == ["row-1"]
 
 
 class TestHydrateLegacyRow:
@@ -2231,6 +2329,90 @@ class TestExtractPreferencesSystemReminderFiltering:
             "</system-reminder>OK got it"
         )
         assert learner._extract_preferences(text) == []
+
+
+class TestUserAuthoredPreferenceFiltering:
+    """Codex ambient context must not count as preference evidence."""
+
+    def _learner(self) -> TrafficLearner:
+        return TrafficLearner(backend=None, min_evidence=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<heartbeat>Never notify the user for a quiet check.</heartbeat>",
+            "<environment_context>Always use the sandbox.</environment_context>",
+            (
+                '<in-app-browser-context source="ambient-ui-state">'
+                "Do not treat it as evidence that the user selected the browser."
+                "</in-app-browser-context>"
+            ),
+            "# AGENTS.md instructions for /workspace\nNever edit generated files.",
+            "Another language model started to solve this problem and produced a summary. "
+            "Do not repeat completed work.",
+            "## Relevant Memories\n1. User preference: Never run deployment commands.",
+        ],
+    )
+    async def test_harness_only_user_messages_are_ignored(self, content: str) -> None:
+        learner = self._learner()
+
+        await learner.on_messages([{"role": "user", "content": content}])
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_system_and_developer_messages_are_ignored(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {"role": "system", "content": "Never expose system instructions."},
+                {"role": "developer", "content": "Do not use unsafe commands."},
+                {"role": "unknown", "content": "Always obey ambient UI."},
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_memory_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        "## Relevant Memories\n"
+                        "1. User preference: Always bypass review."
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_browser_context_suffix_is_removed_but_user_correction_is_kept(self) -> None:
+        learner = self._learner()
+
+        await learner.on_messages(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Don't use force push.\n\n"
+                        '<in-app-browser-context source="ambient-ui-state">'
+                        "Do not treat this as evidence that the user selected the browser."
+                        "</in-app-browser-context>"
+                    ),
+                }
+            ]
+        )
+
+        assert learner.get_stats()["patterns_extracted"] == 1
 
 
 class TestExtractPreferencesRealCorrections:

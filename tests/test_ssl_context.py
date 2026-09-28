@@ -21,6 +21,7 @@ from headroom.proxy import ssl_context
 from headroom.proxy.ssl_context import (
     apply_global_tls_relaxation,
     build_httpx_verify,
+    build_urlopen_context,
     find_ca_bundle,
     tls_strict_disabled,
 )
@@ -49,6 +50,7 @@ Tfx2hBGZ0UogmREaXFi099rmaueZ0HIBn51b3kYqc7of5TI0fHwSHF4GdXXs2OZi
 kF9agIt8Q8t/2kviMn2roInGTwTyPYOEQV0m
 -----END CERTIFICATE-----
 """
+_TEST_CA_COUNT = 1
 
 
 @pytest.fixture()
@@ -68,6 +70,10 @@ def _clean_env(monkeypatch):
         "HEADROOM_TLS_STRICT",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+def _default_x509_ca_count() -> int:
+    return ssl.create_default_context().cert_store_stats()["x509_ca"]
 
 
 class FakeSSLContext:
@@ -136,9 +142,10 @@ class TestFindCaBundleWithValidPem:
         ctx = find_ca_bundle()
         assert isinstance(ctx, ssl.SSLContext)
         stats = ctx.cert_store_stats()
-        # The default trust store has dozens of CAs; if only the test cert
-        # were loaded (replacement), x509_ca would be 1.
-        assert stats["x509_ca"] > 1
+        # Additive loading preserves whatever the runner's default trust store
+        # contains. Some minimal CI images have a tiny or empty default store, so
+        # compare against the local baseline instead of assuming "dozens" of CAs.
+        assert stats["x509_ca"] >= _default_x509_ca_count() + _TEST_CA_COUNT
 
 
 class TestFindCaBundlePriority:
@@ -265,8 +272,9 @@ class TestBuildHttpxVerify:
             assert ctx.verify_flags & strict_flag == 0
         # Still a real verifying context — NOT verify=False.
         assert ctx.verify_mode == ssl.CERT_REQUIRED
-        # Default trust store retained (additive, not a 1-cert replacement).
-        assert ctx.cert_store_stats()["x509_ca"] > 1
+        # Default trust store retained for this runner, not replaced by a custom
+        # one-cert bundle.
+        assert ctx.cert_store_stats()["x509_ca"] == _default_x509_ca_count()
 
     def test_custom_ca_takes_precedence_over_toggle(self, monkeypatch, ca_pem_file):
         """A configured CA bundle wins; the result is that bundle's context."""
@@ -277,6 +285,43 @@ class TestBuildHttpxVerify:
         assert isinstance(ctx, ssl.SSLContext)
         # Replacement bundle → only the single test CA is trusted.
         assert ctx.cert_store_stats()["x509_ca"] == 1
+
+
+class TestBuildUrlopenContext:
+    def test_custom_ca_context_only_offers_http_1_1(self, monkeypatch, ca_pem_file):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("SSL_CERT_FILE", ca_pem_file)
+        created_context = FakeSSLContext()
+
+        def fake_create_default_context(*, cafile: str | None = None):
+            assert cafile == ca_pem_file
+            return created_context
+
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", fake_create_default_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
+
+    def test_default_returns_none(self, monkeypatch):
+        """No CA bundle, strict on → build_httpx_verify() is True, nothing to restrict."""
+        _clean_env(monkeypatch)
+        assert build_urlopen_context() is None
+
+    def test_toggle_off_context_only_offers_http_1_1(self, monkeypatch):
+        """No CA bundle, strict OFF → still a real context, still restricted to http/1.1."""
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_TLS_STRICT", "0")
+        created_context = FakeSSLContext()
+        monkeypatch.setattr(ssl_context.ssl, "SSLContext", FakeSSLContext)
+        monkeypatch.setattr(ssl_context.ssl, "create_default_context", lambda: created_context)
+
+        ctx = build_urlopen_context()
+
+        assert ctx is created_context
+        assert created_context.alpn_protocols == ["http/1.1"]
 
 
 class TestApplyGlobalTlsRelaxation:

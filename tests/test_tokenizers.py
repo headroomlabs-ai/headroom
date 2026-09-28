@@ -363,9 +363,15 @@ class TestTokenizerRegistry:
         assert isinstance(tokenizer, TiktokenCounter)
 
     def test_get_anthropic_model(self):
-        """Test getting tokenizer for Anthropic model."""
+        """Anthropic (Claude) has no public tokenizer, so it is priced against a
+        real BPE proxy (tiktoken o200k_base) rather than a character estimate —
+        for consistent, monotone before/after counts. Falls back to the estimator
+        only when the tiktoken vocab can't be loaded."""
         tokenizer = get_tokenizer("claude-3-sonnet")
-        assert isinstance(tokenizer, EstimatingTokenCounter)
+        if isinstance(tokenizer, TiktokenCounter):
+            assert tokenizer.encoding_name == "o200k_base"
+        else:  # vocab unavailable in this environment → documented fallback
+            assert isinstance(tokenizer, EstimatingTokenCounter)
 
     def test_get_unknown_model_fallback(self):
         """Test fallback for unknown model."""
@@ -721,3 +727,47 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestThinkingBlockCounting:
+    """Thinking blocks price their text plus the decoded signature bytes."""
+
+    def test_signature_prices_between_zero_and_the_json_catch_all(self):
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        block = {"type": "thinking", "thinking": text, "signature": "A" * 4000}
+        signed = {"role": "assistant", "content": [block]}
+        unsigned = {"role": "assistant", "content": [{"type": "thinking", "thinking": text}]}
+        # The signature is encrypted reasoning the server replays as billed
+        # input, so it adds to the text at decoded bytes / 4 (4000 * 3/4 / 4)...
+        delta = counter.count_messages([signed]) - counter.count_messages([unsigned])
+        assert delta == 750
+        # ...which is well under the JSON catch-all's base64-as-prose price.
+        assert delta < counter._count_serialized(block)
+
+    def test_omitted_display_block_is_not_free(self):
+        # display: "omitted" (the 5.x default) returns an empty thinking field
+        # and carries the whole reasoning in the signature.
+        counter = EstimatingTokenCounter()
+        omitted = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "", "signature": "A" * 4000}],
+        }
+        empty = {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}
+        assert counter.count_messages([omitted]) > counter.count_messages([empty])
+
+    def test_provider_walker_shares_the_thinking_rule(self):
+        from headroom.tokenizers.base import count_content_blocks
+
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        signed = [{"type": "thinking", "thinking": text, "signature": "A" * 4000}]
+        unsigned = [{"type": "thinking", "thinking": text}]
+        assert count_content_blocks(signed, counter.count_text) == counter._count_content_parts(
+            signed
+        )
+        assert (
+            count_content_blocks(signed, counter.count_text)
+            - count_content_blocks(unsigned, counter.count_text)
+            == 750
+        )

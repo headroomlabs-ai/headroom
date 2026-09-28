@@ -218,10 +218,10 @@ async fn run_ws_pump(
 
 fn ax_to_tg(m: AxMsg) -> Option<TgMsg> {
     Some(match m {
-        AxMsg::Text(t) => TgMsg::Text(t.to_string()),
-        AxMsg::Binary(b) => TgMsg::Binary(b.to_vec()),
-        AxMsg::Ping(p) => TgMsg::Ping(p.to_vec()),
-        AxMsg::Pong(p) => TgMsg::Pong(p.to_vec()),
+        AxMsg::Text(t) => TgMsg::Text(t.to_string().into()),
+        AxMsg::Binary(b) => TgMsg::Binary(b.to_vec().into()),
+        AxMsg::Ping(p) => TgMsg::Ping(p.to_vec().into()),
+        AxMsg::Pong(p) => TgMsg::Pong(p.to_vec().into()),
         AxMsg::Close(Some(cf)) => TgMsg::Close(Some(TgCloseFrame {
             code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::from(cf.code),
             reason: cf.reason.to_string().into(),
@@ -232,10 +232,10 @@ fn ax_to_tg(m: AxMsg) -> Option<TgMsg> {
 
 fn tg_to_ax(m: TgMsg) -> Option<AxMsg> {
     Some(match m {
-        TgMsg::Text(t) => AxMsg::Text(t.as_str().to_string()),
-        TgMsg::Binary(b) => AxMsg::Binary(b.to_vec()),
-        TgMsg::Ping(p) => AxMsg::Ping(p.to_vec()),
-        TgMsg::Pong(p) => AxMsg::Pong(p.to_vec()),
+        TgMsg::Text(t) => AxMsg::Text(t.as_str().to_string().into()),
+        TgMsg::Binary(b) => AxMsg::Binary(b.to_vec().into()),
+        TgMsg::Ping(p) => AxMsg::Ping(p.to_vec().into()),
+        TgMsg::Pong(p) => AxMsg::Pong(p.to_vec().into()),
         TgMsg::Close(Some(cf)) => AxMsg::Close(Some(CloseFrame {
             code: cf.code.into(),
             reason: cf.reason.to_string().into(),

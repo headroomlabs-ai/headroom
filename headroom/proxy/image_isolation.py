@@ -16,27 +16,42 @@ logger = logging.getLogger("headroom.proxy")
 _IMAGE_POOL_LOCK = threading.Lock()
 _IMAGE_POOL: ProcessPoolExecutor | None = None
 
+# Per-worker-process cached compressor. The image pool is a persistent
+# single-worker ProcessPoolExecutor, so building a fresh ImageCompressor (and,
+# inside it, a fresh ONNX router loading native ort.InferenceSession models) on
+# every call accumulated native memory in the worker and grew RSS to 1+ GB over
+# a day (#2513). Load the models once per worker and reuse them.
+_WORKER_COMPRESSOR: Any = None
+
+
+def _get_worker_compressor() -> Any:
+    global _WORKER_COMPRESSOR
+    if _WORKER_COMPRESSOR is None:
+        from headroom.image import ImageCompressor
+
+        instance = ImageCompressor()
+        # Shared across calls in this worker: don't let a per-call close() unload
+        # the models the next call reuses.
+        instance._is_singleton = True
+        _WORKER_COMPRESSOR = instance
+    return _WORKER_COMPRESSOR
+
 
 def _compress_messages_worker(
     messages: list[dict[str, Any]],
     provider: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    from headroom.image import ImageCompressor
-
-    compressor = ImageCompressor()
-    try:
-        compressed = compressor.compress(messages, provider=provider)
-        if compressor.last_result is None:
-            return compressed, None
-        return compressed, {
-            "technique": compressor.last_result.technique.value,
-            "original_tokens": compressor.last_result.original_tokens,
-            "compressed_tokens": compressor.last_result.compressed_tokens,
-            "confidence": compressor.last_result.confidence,
-            "savings_percent": compressor.last_result.savings_percent,
-        }
-    finally:
-        compressor.close()
+    compressor = _get_worker_compressor()
+    compressed = compressor.compress(messages, provider=provider)
+    if compressor.last_result is None:
+        return compressed, None
+    return compressed, {
+        "technique": compressor.last_result.technique.value,
+        "original_tokens": compressor.last_result.original_tokens,
+        "compressed_tokens": compressor.last_result.compressed_tokens,
+        "confidence": compressor.last_result.confidence,
+        "savings_percent": compressor.last_result.savings_percent,
+    }
 
 
 def _success_worker(

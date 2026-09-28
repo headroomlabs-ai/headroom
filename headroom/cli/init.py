@@ -41,6 +41,7 @@ from headroom.install.runtime import (
 from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom
 
@@ -62,6 +63,12 @@ _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
+# External kill timeout Claude/Copilot/Codex apply to the `headroom init hook
+# ensure` command itself. Must stay above the internal wait_ready(45s) call in
+# _ensure_profile_running for a cold start (measured 15.9-36.9s in #3417) --
+# otherwise the host kills the hook before a first-ever proxy start can ever
+# report ready, and every session is permanently cold.
+_HOOK_ENSURE_TIMEOUT_SECONDS = 60
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
 _TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
@@ -113,9 +120,9 @@ def _enable_verbose_logging() -> None:
 
 def _local_profile(cwd: Path | None = None) -> str:
     root = (cwd or Path.cwd()).resolve()
-    slug = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in root.name.lower()).strip(
-        "-"
-    )
+    slug = "".join(
+        ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
+    ).strip("-")
     digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
@@ -181,7 +188,12 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
     # all into its context window — overflowing it (breaks sub-agent spawns,
     # forces constant compaction). Keep deferral on; respect a user-set value.
     # Shares the TOOL_SEARCH_* constants with `wrap` and `install`.
-    env_map.setdefault(TOOL_SEARCH_ENV, TOOL_SEARCH_DEFAULT)
+    tool_search_default = (
+        TOOL_SEARCH_FOUNDRY_DEFAULT
+        if os.environ.get("CLAUDE_CODE_USE_FOUNDRY")
+        else TOOL_SEARCH_DEFAULT
+    )
+    env_map.setdefault(TOOL_SEARCH_ENV, tool_search_default)
     payload["env"] = env_map
 
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
@@ -215,7 +227,7 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
                     {
                         "type": "command",
                         "command": f"{command} --marker {_CLAUDE_HOOK_MARKER}",
-                        "timeout": 15,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
                     }
                 ],
             }
@@ -239,7 +251,14 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
                 isinstance(entry, dict) and _COPILOT_HOOK_MARKER in str(entry.get("command", ""))
             )
         ]
-        retained.append({"type": "command", "command": command, "cwd": ".", "timeout": 15})
+        retained.append(
+            {
+                "type": "command",
+                "command": command,
+                "cwd": ".",
+                "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+            }
+        )
         hooks[event] = retained
     payload["hooks"] = hooks
     _write_json(path, payload)
@@ -518,7 +537,13 @@ def _ensure_codex_hooks(path: Path, profile: str) -> None:
         retained.append(
             {
                 "matcher": matcher,
-                "hooks": [{"type": "command", "command": command, "timeout": 15}],
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+                    }
+                ],
             }
         )
         hooks[event] = retained
@@ -650,7 +675,7 @@ def _marketplace_source() -> str:
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / ".claude-plugin" / "marketplace.json").exists():
         return str(repo_root)
-    return "chopratejas/headroom"
+    return "headroomlabs-ai/headroom"
 
 
 def _run_checked(command: list[str], *, action: str) -> None:

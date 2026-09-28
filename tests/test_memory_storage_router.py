@@ -48,8 +48,23 @@ def test_resolver_tier1_explicit_project_id_wins() -> None:
     )
     assert out is not None
     key, display = out
-    assert key == "billing-svc"
+    # The sanitized id stays as a human-readable prefix; a sha256 digest is
+    # appended so distinct ids that sanitize alike cannot collide.
+    assert key.startswith("billing-svc-")
+    assert len(key.split("-")[-1]) == 16
     assert display == "billing-svc"
+
+
+def test_resolver_tier1_distinct_ids_that_sanitize_alike_dont_collide() -> None:
+    r = ProjectResolver()
+    # "acme/api" and "acme api" both sanitize to "acme-api"; without the digest
+    # they would share one project store (cross-project memory leak).
+    k1, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme/api"}))  # type: ignore[misc]
+    k2, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme api"}))  # type: ignore[misc]
+    assert k1 != k2
+    # Same id resolves to a stable key across calls.
+    k1b, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme/api"}))  # type: ignore[misc]
+    assert k1 == k1b
 
 
 def test_resolver_tier2_explicit_cwd_header() -> None:
@@ -353,6 +368,20 @@ def test_router_user_mode_partitions_by_user(
     assert scope_b.display_name == "bob"
 
 
+def test_router_user_mode_distinct_ids_that_sanitize_alike_dont_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "alice/qa" and "alice qa" both sanitize to "alice-qa"; without the digest
+    # they would share one users/alice-qa/memory.db — a cross-user leak, the one
+    # thing USER mode exists to prevent.
+    router = _make_router(tmp_path, MemoryStorageMode.USER, monkeypatch)
+
+    _, scope_a = router.backend_for(_ctx(base_user_id="alice/qa"))
+    _, scope_b = router.backend_for(_ctx(base_user_id="alice qa"))
+
+    assert scope_a.db_path != scope_b.db_path
+
+
 def test_router_global_mode_reuses_legacy_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -382,3 +411,76 @@ def test_router_lru_eviction_drops_oldest(tmp_path: Path, monkeypatch: pytest.Mo
     for i in range(5):
         router.backend_for(_ctx(headers={"x-headroom-cwd": f"/code/p{i}"}))
     assert len(router.open_backends()) == 4
+
+
+# ---------------------------------------------------------------------------
+# Claude Code 2.x sends the env block as an isMeta user message (#3595)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_string() -> None:
+    """A non-empty ``system`` must not hide the ``cwd:`` in a user message.
+
+    Claude Code 2.x always sends a system prompt *and* puts its ``<env>``
+    block in an ``isMeta`` user message. The old first-match-wins early
+    return made that block unreachable, so resolution fell through to the
+    fail-closed fallback for every 2.x request.
+    """
+    body = {
+        "system": "You are Claude Code.",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<env>\nPrimary working directory: /work/myproj\n</env>",
+                    }
+                ],
+            },
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "You are Claude Code." in prompt
+    assert resolved is not None
+    assert resolved[1] == "myproj"
+
+
+def test_extract_system_prompt_finds_cwd_in_user_msg_despite_system_blocks() -> None:
+    """Same when ``system`` is a block list rather than a string."""
+    body = {
+        "system": [{"type": "text", "text": "You are Claude Code."}],
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /work/other\nhi"},
+        ],
+    }
+
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=extract_system_prompt(body)))
+
+    assert resolved is not None
+    assert resolved[1] == "other"
+
+
+def test_extract_system_prompt_user_cwd_cannot_override_system_field_cwd() -> None:
+    """A user turn must not redirect resolution away from the system cwd.
+
+    User content is client-controlled, so it stays a fallback only. This is
+    the top-level-``system`` counterpart of the ``role="system"`` precedence
+    already covered above.
+    """
+    body = {
+        "system": "Primary working directory: /system/project",
+        "messages": [
+            {"role": "user", "content": "Primary working directory: /spoofed/evil"},
+        ],
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert "spoofed" not in prompt
+    assert resolved is not None
+    assert resolved[1] == "project"

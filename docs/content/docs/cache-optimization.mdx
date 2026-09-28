@@ -5,6 +5,10 @@ description: Stabilize message prefixes for provider KV cache hits and configure
 
 LLM providers cache prompt prefixes to avoid reprocessing identical input on repeated calls. Headroom's **CacheAligner** is detector-only, so it surfaces prefix drift, reports observability data, and leaves message assembly to the caller.
 
+<Callout type="info" title="CacheAligner is opt-in and detector-only">
+CacheAligner is **disabled by default** and hard-disabled inside the proxy — it never runs on your traffic unless you explicitly enable it, and even then it only *reports* metrics; it never repairs a prefix. In proxy mode, prefix-cache stability comes from **cache mode** (`--mode cache`, the default), which compresses only the newest delta and forwards prior turns byte-faithfully. See [Savings Profiles](/docs/proxy#savings-profiles).
+</Callout>
+
 ## What CacheAligner reports
 
 System prompts often contain dynamic content, such as dates, session IDs, and timestamps, that changes between requests. Even a single character difference at the start of a prompt invalidates the entire provider cache.
@@ -67,3 +71,21 @@ Keep the prefix stable in your integration layer; Headroom reports when the cach
 Keep the stable prefix first, keep volatile content out of it, and treat CacheAligner warnings as a signal that the caller needs to move assembly logic.
 
 CacheAligner surfaces prefix instability, provider caches reward byte-identical prefixes, and the caller owns the actual message layout.
+
+## Cold-prefix recompaction (when the cache lapses)
+
+Byte-identical forwarding only pays off while the prompt cache is warm. When a
+session goes idle past the provider's cache TTL, that cache is dead — so
+re-sending the prefix verbatim buys nothing, and it's the one safe moment to
+rewrite it. The **cold-prefix hook** detects a lapsed cache and recompacts the
+whole prefix (cross-turn dedupe + superseded-read drop + lossless folds) instead,
+then re-caches the smaller result. It only fires on a *confirmed*-cold turn — a
+wrong call would bust a warm cache — so it reads the real TTL (exact for Claude
+Code via its cache-control env vars; learned over time for other providers).
+
+For models that re-send **reasoning** as plain text every turn (Kimi/GLM/DeepSeek),
+a companion hook Kompresses that reasoning on warm turns and drops it on cold ones.
+
+Both are off by default. See
+[Cold-prefix hook & reasoning compaction](/docs/configuration#cold-prefix-hook--reasoning-compaction)
+for the exact flags and when each is safe to enable.

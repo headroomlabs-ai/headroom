@@ -417,6 +417,35 @@ def test_ensure_proxy_starts_isolated_ephemeral_proxy_for_copilot_subscription_s
     assert calls[1][2]["copilot_api_token_expires_at"] == 456.5
 
 
+def test_ensure_proxy_isolates_copilot_subscription_seed_with_api_token_only(monkeypatch) -> None:
+    calls: list[object] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: None)
+    monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: port == 8787)
+    monkeypatch.setattr(
+        wrap_cli,
+        "_find_available_port",
+        lambda start_port, **kw: calls.append(("find_port", start_port)) or 8788,
+    )
+    monkeypatch.setattr(
+        wrap_cli,
+        "_start_proxy",
+        lambda *args, **kwargs: calls.append(("start", args, kwargs)),
+    )
+
+    proc, actual_port = wrap_cli._ensure_proxy(
+        8787,
+        False,
+        copilot_api_token="direct-token-only",
+    )
+
+    assert proc is None
+    assert actual_port == 8788
+    assert calls[0] == ("find_port", 8788)
+    assert calls[1][0] == "start"
+    assert calls[1][2]["copilot_api_token"] == "direct-token-only"
+
+
 def test_ensure_proxy_starts_isolated_ephemeral_proxy_when_subscription_seed_targets_persistent_port(
     monkeypatch,
 ) -> None:
