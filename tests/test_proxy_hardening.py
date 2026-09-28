@@ -37,6 +37,11 @@ def _make_app(**overrides):
     return create_app(config)
 
 
+def test_create_app_accepts_test_net_host_without_transport_validation() -> None:
+    app = _make_app(host="203.0.113.5", proxy_token=None)
+    assert app is not None
+
+
 # ───────────────────────────── 2.1 inbound auth token ─────────────────────
 
 

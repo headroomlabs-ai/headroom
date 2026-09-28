@@ -121,3 +121,30 @@ def test_opencode_discover_projects_survives_permission_error(
     projects = plugin.discover_projects()
     assert len(projects) == 1
     assert projects[0].context_file is None
+
+
+def test_claude_discover_projects_survives_unreadable_memory_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.learn.plugins.claude import ClaudeCodePlugin
+
+    # A project dir left behind by a root-run session: the entry itself stats
+    # (its parent is ours) but nothing under it is traversable.
+    projects_dir = tmp_path / "projects"
+    entry = projects_dir / "-"
+    entry.mkdir(parents=True)
+    (entry / "session.jsonl").write_text("{}\n", encoding="utf-8")
+
+    real_exists = Path.exists
+
+    def _boom_under_entry(self: Path) -> bool:
+        if self.name == "memory" or self.parent.name == "memory":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _boom_under_entry)
+
+    plugin = ClaudeCodePlugin(claude_dir=tmp_path)
+    projects = plugin.discover_projects()
+    assert [p.data_path for p in projects] == [entry]
+    assert projects[0].memory_file is None

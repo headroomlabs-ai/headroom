@@ -316,3 +316,40 @@ def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
         )
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "input_data"),
+    [
+        ("memory_save", {"content": "must not persist"}),
+        ("memory_search", {"query": "must not read"}),
+        ("memory_update", {"memory_id": "m1", "new_content": "must not update"}),
+        ("memory_delete", {"memory_id": "m1"}),
+        ("memory_list", {}),
+    ],
+)
+def test_unresolved_project_memory_tools_fail_closed(
+    tmp_path: Path, tool_name: str, input_data: dict[str, Any]
+) -> None:
+    cfg = MemoryConfig(
+        enabled=True,
+        backend="local",
+        db_path=str(tmp_path / "memory.db"),
+        mode=MemoryMode.TOOL,
+        storage_mode=sr_mod.MemoryStorageMode.PROJECT,
+    )
+    handler = MemoryHandler(cfg, agent_type="test")
+
+    async def run() -> None:
+        await handler._ensure_initialized()
+        ctx = sr_mod.RequestContext(
+            headers={}, system_prompt="You are helpful.", base_user_id="alice"
+        )
+        result = await handler._execute_memory_tool(
+            tool_name, input_data, "alice", request_context=ctx
+        )
+        payload = __import__("json").loads(result)
+        assert payload["status"] == "error"
+        assert "project" in payload["error"].lower()
+
+    asyncio.run(run())

@@ -549,3 +549,24 @@ class TestEncodingResilience:
 
         assert "Use uv" in merged
         assert "Notes — existing" in merged
+
+    def test_read_text_tolerant_normalizes_crlf_and_cr(self, tmp_path):
+        path = tmp_path / "AGENTS.md"
+        path.write_bytes(b"line1\r\nline2\rline3\n")
+        text = _read_text_tolerant(path)
+        assert text == "line1\nline2\nline3\n"
+
+    def test_apply_does_not_accumulate_carriage_returns_on_crlf_file(self, tmp_path):
+        proj = _project(tmp_path)
+        writer = ClaudeCodeWriter()
+        memory_md = proj.data_path / "memory" / "MEMORY.md"
+        # Simulate existing Windows CRLF file
+        memory_md.write_bytes(b"# Memory Index\r\n\r\n- bullet 1\r\n")
+
+        recs = [_rec(RecommendationTarget.MEMORY_FILE, "Errors", "- rule 1")]
+        writer.write(recs, proj, dry_run=False)
+        writer.write(recs, proj, dry_run=False)
+
+        raw = memory_md.read_bytes()
+        assert b"\r\r" not in raw
+        assert raw.count(b"\r") == raw.count(b"\r\n")

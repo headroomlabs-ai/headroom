@@ -42,6 +42,16 @@ def _qdrant_env_port_or_default() -> int:
         return qdrant_env.DEFAULT_QDRANT_PORT
 
 
+def default_periodic_malloc_trim() -> bool:
+    """Platforms where the periodic allocator trim is on unless opted out.
+
+    Shared by ``ProxyConfig``'s default and by the two call sites that build a
+    config explicitly (``headroom proxy`` and ``_proxy_config_from_env``), so the
+    platform scope cannot drift between them.
+    """
+    return sys.platform in ("darwin", "linux")
+
+
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -319,7 +329,10 @@ class ProxyConfig:
     # Rate limiting
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 60
-    rate_limit_tokens_per_minute: int = 100000
+    # None = no token limit. Before 0.39.0 the token bucket was never consumed,
+    # so an implicit default here throttled every large-context agent session
+    # the moment #3350 started enforcing it. Opt in with --tpm / HEADROOM_TPM.
+    rate_limit_tokens_per_minute: int | None = None
 
     # Retry
     retry_enabled: bool = True
@@ -360,10 +373,6 @@ class ProxyConfig:
     # `headroom.compressor` registry). CLI: --compressor <name1,name2>
     # (repeatable); env: HEADROOM_COMPRESSORS.
     compressors: set[str] | None = None
-
-    # Fallback
-    fallback_enabled: bool = False
-    fallback_provider: str | None = None
 
     # Timeouts
     request_timeout_seconds: int = 300
@@ -470,12 +479,13 @@ class ProxyConfig:
     # Periodic allocator trim. Long-lived proxies processing large concurrent
     # request bodies ratchet RSS through freed-but-retained allocator pages;
     # this returns them to the OS (malloc_zone_pressure_relief on macOS,
-    # malloc_trim on glibc). Default-on only on macOS, where the retained-page
-    # ratchet is the documented failure (#2820); an opt-in elsewhere via
-    # HEADROOM_MALLOC_TRIM=1 so glibc deployments do not silently take on a
-    # once-a-minute allocator purge they did not ask for. Envs:
-    # HEADROOM_MALLOC_TRIM=0/1, HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
-    periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
+    # malloc_trim on glibc). Default-on where a trim call exists: macOS, where
+    # the retained-page ratchet was first documented (#2820), and glibc Linux,
+    # which ratchets the same way (a coding-agent session took one proxy to
+    # 100 GB RSS on a 128 GB host with the trim off). Platforms without a trim
+    # call disable the task themselves. Envs: HEADROOM_MALLOC_TRIM=0/1,
+    # HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = field(default_factory=default_periodic_malloc_trim)
     malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments

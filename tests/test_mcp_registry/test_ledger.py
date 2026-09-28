@@ -55,6 +55,28 @@ def test_mutation_preflight_rejects_unsafe_shapes(tmp_path, value):
         validate_ledger_for_mutation(ledger)
 
 
+@pytest.mark.parametrize("contents", ["{}", '{"agents": {}}'])
+def test_mutation_preflight_accepts_empty_ledger(tmp_path, contents):
+    """An empty ledger must not be rejected as malformed.
+
+    ``clear_install`` pops the ``agents`` section once its last entry is removed,
+    so a fully-unwrapped ledger is exactly ``{}``. Rejecting it made the next
+    mutation (``headroom mcp adopt``) fail with a bogus "malformed" error.
+    """
+    ledger = tmp_path / "mcp_installs.json"
+    ledger.write_text(contents)
+    validate_ledger_for_mutation(ledger)  # must not raise
+
+
+def test_mutation_preflight_accepts_ledger_after_clearing_last_install(tmp_path):
+    ledger = tmp_path / "mcp_installs.json"
+    spec = _spec()
+    record_install("claude", spec, path=ledger)
+    clear_install("claude", "serena", path=ledger)
+    assert ledger.read_text().strip() == "{}"
+    validate_ledger_for_mutation(ledger)  # must not raise
+
+
 def test_mutation_preflight_rejects_unreadable_ledger(monkeypatch, tmp_path):
     ledger = tmp_path / "mcp_installs.json"
     ledger.write_text('{"agents": {}}')

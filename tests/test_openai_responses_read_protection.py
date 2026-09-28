@@ -529,3 +529,192 @@ def test_responses_read_scan_tolerates_non_dict_and_missing_call_id(monkeypatch)
     assert modified is True
     assert new_payload["input"][0] == "a bare string item"
     assert new_payload["input"][3]["output"] == "kept words"
+
+
+def _codex_exec_call(call_id: str, *commands: str) -> dict:
+    """Codex code-mode `exec` custom tool call, as Codex 0.15x sends it."""
+    import json as _json
+
+    script = "".join(
+        "const r{i} = await tools.exec_command({args});\ntext(r{i}.output);\n".format(
+            i=i,
+            args=_json.dumps({"cmd": cmd, "workdir": "/repo", "yield_time_ms": 10000}),
+        )
+        for i, cmd in enumerate(commands)
+    )
+    return {"type": "custom_tool_call", "call_id": call_id, "name": "exec", "input": script}
+
+
+def _codex_exec_output(call_id: str, text: str) -> dict:
+    return {
+        "type": "custom_tool_call_output",
+        "call_id": call_id,
+        "output": [
+            {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type": "input_text", "text": text},
+        ],
+    }
+
+
+def test_custom_tool_call_commands_parses_codex_exec_input():
+    from headroom.transforms.content_router import _custom_tool_call_commands
+
+    call = _codex_exec_call("c", "sed -n '1,80p' tenacity/wait.py", "rg -n 'def f' src")
+    assert _custom_tool_call_commands(call["input"]) == [
+        "sed -n '1,80p' tenacity/wait.py",
+        "rg -n 'def f' src",
+    ]
+    # Braces and quotes inside the command must not break the JSON scan.
+    awk = _codex_exec_call("c", "awk 'NR >= 3 {printf \"%4d: %s\\n\", NR, $0}' f.py")
+    assert _custom_tool_call_commands(awk["input"]) == [
+        "awk 'NR >= 3 {printf \"%4d: %s\\n\", NR, $0}' f.py"
+    ]
+
+
+def test_custom_tool_call_commands_ignores_other_shapes():
+    from headroom.transforms.content_router import _custom_tool_call_commands
+
+    assert _custom_tool_call_commands(None) == []
+    assert _custom_tool_call_commands({"cmd": "cat f"}) == []
+    assert _custom_tool_call_commands("*** Begin Patch\n*** Update File: f.py\n") == []
+
+
+def test_custom_tool_call_commands_marks_non_literal_cmd_unknown():
+    """A cmd that is not a whole string literal may still be a read: None, not skipped."""
+    from headroom.transforms.content_router import _custom_tool_call_commands
+
+    for script in (
+        "tools.exec_command(notJson)",
+        "tools.exec_command({cmd: someVariable})",
+        "tools.exec_command({cmd: `cat ${f}`})",
+        'tools.exec_command({cmd:"c"+"at f"})',
+        "tools.exec_command({cmd: 'c' + 'at f', workdir: '/repo'})",
+        'tools.exec_command({cmd: "cat f".trim()})',
+        'tools.exec_command({cmd: "c\\x61t f"})',
+        'tools.exec_command({cmd: "c\\u0061t f"})',
+    ):
+        assert _custom_tool_call_commands(script) == [None], script
+    # The known commands around an unknown one are still returned, in order.
+    assert _custom_tool_call_commands(
+        'tools.exec_command({cmd: "ls"}); tools.exec_command({cmd: "c" + "at f"});'
+    ) == ["ls", None]
+
+
+def test_custom_tool_call_commands_parses_javascript_object_literals():
+    """Codex usually writes the argument as a JS literal, not JSON (bare `cmd` key)."""
+    from headroom.transforms.content_router import _custom_tool_call_commands
+
+    script = (
+        'const a = await tools.exec_command({cmd:"cat /tmp/app.js","workdir":"/tmp"});\n'
+        "const b = await tools.exec_command({cmd: 'sed -n \\'1,80p\\' f.py', workdir: '/repo'});\n"
+        "const c = await tools.exec_command({ workdir: '/repo', cmd: `nl -ba f.py` });\n"
+        'const d = await tools.exec_command({cmd: "rg -n \\"def f\\" src", yield_time_ms: 1000});\n'
+        "const e = await tools.exec_command({'cmd': 'head -n 5 f.py'});\n"
+    )
+    assert _custom_tool_call_commands(script) == [
+        "cat /tmp/app.js",
+        "sed -n '1,80p' f.py",
+        "nl -ba f.py",
+        'rg -n "def f" src',
+        "head -n 5 f.py",
+    ]
+
+
+def test_responses_codex_exec_javascript_literal_read_stays_verbatim(monkeypatch):
+    """The same read with Codex's usual bare-key argument must also stay verbatim."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    output = _codex_exec_output("call_exec", _NL_OUTPUT)
+    call = {
+        "type": "custom_tool_call",
+        "call_id": "call_exec",
+        "name": "exec",
+        "input": (
+            'const r = await tools.exec_command({cmd: "nl -ba tenacity/wait.py | '
+            'sed -n \'20,115p\'", workdir: "/repo", yield_time_ms: 10000});\n'
+            "text(r.output);\n"
+        ),
+    }
+    payload = {"model": "gpt-5", "input": [call, output]}
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_concatenated_cmd_stays_verbatim(monkeypatch):
+    """`"c" + "at f"` runs `cat f`: an unparsed cmd must not release the read."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    output = _codex_exec_output("call_exec", _NL_OUTPUT)
+    call = {
+        "type": "custom_tool_call",
+        "call_id": "call_exec",
+        "name": "exec",
+        "input": (
+            'const r = await tools.exec_command({cmd: "c" + "at tenacity/wait.py", '
+            'workdir: "/repo"});\n'
+            "text(r.output);\n"
+        ),
+    }
+    payload = {"model": "gpt-5", "input": [call, output]}
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_read_stays_verbatim(monkeypatch):
+    """Codex's `exec` custom tool: a sed/nl file read must reach the model verbatim."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    output = _codex_exec_output("call_exec", _NL_OUTPUT)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            _codex_exec_call("call_exec", "nl -ba tenacity/wait.py | sed -n '20,115p'"),
+            output,
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_script_with_a_read_among_commands_stays_verbatim(monkeypatch):
+    """One script, one output: protect it when any command in the script is a read."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    output = _codex_exec_output("call_multi", _NL_OUTPUT)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            _codex_exec_call(
+                "call_multi", "git status --short", "sed -n '1,130p' tenacity/wait.py"
+            ),
+            output,
+        ],
+    }
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_test_output_still_compresses(monkeypatch):
+    """Control: a Codex `exec` running tests is not a read and stays compressible."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            _codex_exec_call("call_pytest", "python3 -m pytest -q tests/test_wait.py"),
+            _codex_exec_output("call_pytest", _NL_OUTPUT),
+        ],
+    }
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert modified is True
+    assert new_payload["input"][1] != _codex_exec_output("call_pytest", _NL_OUTPUT)

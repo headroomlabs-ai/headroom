@@ -368,6 +368,7 @@ def test_content_router_strategy_and_compress_paths(monkeypatch: pytest.MonkeyPa
 def test_force_kompress_bypasses_content_detection(monkeypatch: pytest.MonkeyPatch) -> None:
     router = ContentRouter()
     router._runtime_force_kompress = True
+    monkeypatch.setattr(router, "_force_kompress_ready", lambda: True)
     pure_result = RouterCompressionResult(
         compressed="pure",
         original="pure",
@@ -1991,3 +1992,262 @@ def test_datetime_prefixed_user_prompt_survives_router() -> None:
     result = ContentRouter().compress(prompt)
     assert result.strategy_used is not CompressionStrategy.SEARCH
     assert "Please update the PR desc" in result.compressed
+
+
+# --- The caller's prompt stays verbatim on replaying paths -----------------
+#
+# The proxy's coding profile turns user-message compression on so tool
+# observations inside user messages shrink. On a replaying path (proxy
+# handlers, the /v1/compress session turn) that used to reach the prompt text
+# too, and only a cache_control marker stopped it: Claude Code sets one, a
+# plain agent does not, and its task statement went out with stop words
+# stripped and pytest node ids mangled.
+
+_TASK = "Fix this bug in the library source. " * 60
+
+
+def _prompt_router(monkeypatch: pytest.MonkeyPatch) -> tuple[ContentRouter, list[str]]:
+    return _fresh_cc_router(monkeypatch)
+
+
+def test_opening_task_text_block_is_verbatim_under_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    router, _ = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": [{"type": "text", "text": _TASK}]}]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[0]["content"][0]["text"] == _TASK
+
+
+def test_opening_task_string_is_verbatim_under_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    router, _ = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": _TASK}]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[0]["content"] == _TASK
+
+
+def test_newest_user_turn_keeps_text_but_compresses_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router, calls = _prompt_router(monkeypatch)
+    follow_up = "Now also handle the async path. " * 60
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": _FRESH_CC_OUTPUT},
+                {"type": "text", "text": follow_up},
+            ],
+        },
+    ]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    blocks = out.messages[2]["content"]
+    assert blocks[0]["content"].endswith("[compressed]")
+    assert blocks[1]["text"] == follow_up
+    assert follow_up not in calls
+
+
+def test_text_harness_observation_string_still_compresses_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A text harness returns its tool output as a role:user string after the
+    # assistant turn. That is an observation, not the prompt.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "```bash\npytest -q\n```"},
+        {"role": "user", "content": _FRESH_CC_OUTPUT},
+    ]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _FRESH_CC_OUTPUT in calls
+
+
+def test_follow_up_prompt_string_after_assistant_turn_is_verbatim_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A plain-string follow-up after an assistant reply is the caller's new
+    # instruction, the same as the list-content case above.
+    router, calls = _prompt_router(monkeypatch)
+    follow_up = "Now also handle the async path in tenacity/asyncio. " * 60
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "All 167 tests pass on the sync path."},
+        {"role": "user", "content": follow_up},
+    ]
+    out = router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert out.messages[2]["content"] == follow_up
+    assert follow_up not in calls
+
+
+def test_text_harness_observation_text_block_still_compresses_under_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The list-content twin of the string observation above: both shapes
+    # decide "prompt or observation" the same way.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run the tests"},
+        {"role": "assistant", "content": "```bash\npytest -q\n```"},
+        {"role": "user", "content": [{"type": "text", "text": _FRESH_CC_OUTPUT}]},
+    ]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        prefix_replay_guaranteed=True,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _FRESH_CC_OUTPUT in calls
+
+
+def test_prompt_text_compresses_without_replay_guarantee(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SDK / document callers that opt into user compression keep it: a
+    # spreadsheet or pasted document in a user message is the payload.
+    router, calls = _prompt_router(monkeypatch)
+    messages = [{"role": "user", "content": [{"type": "text", "text": _TASK}]}]
+    router.apply(
+        messages,
+        _ChurnTokenizer(),
+        model_limit=100_000,
+        compress_user_messages=True,
+        min_tokens_to_compress=1,
+    )
+    assert _TASK in calls
+
+
+def _html_doc_with_embedded_json(*, padded: bool = True) -> str:
+    """A whole HTML document with one embedded JSON array-of-objects.
+
+    The JSON sits in a single-line ``<script>`` so the mixed-content regex
+    heuristics do not fire: the block detects as pure HTML and takes the
+    ``_compress_pure`` path. ``padded`` keeps the default ``json.dumps``
+    separators so the array is minifiable — a compact array gives the JSON
+    route no benefit and both passes no-op.
+    """
+    rows = [
+        {
+            "id": i,
+            "name": f"item-{i}",
+            "tags": ["alpha", "beta"],
+            "score": i * 3,
+            "description": "a routine record with repeated descriptive fields",
+        }
+        for i in range(60)
+    ]
+    embedded = json.dumps(rows) if padded else json.dumps(rows, separators=(",", ":"))
+    paras = "".join(
+        f"<p>Paragraph {i}: distributed systems rely on consensus protocols to "
+        f"agree on state. Raft separates leader election from log replication, "
+        f"which makes it easier to reason about.</p>\n"
+        for i in range(30)
+    )
+    return (
+        "<!DOCTYPE html>\n<html><head><title>Raft Notes</title></head>\n<body>\n"
+        "<article><h1>Raft consensus notes</h1>\n"
+        + paras
+        + '<script type="application/json">'
+        + embedded
+        + "</script>\n"
+        + paras
+        + "</article>\n</body></html>\n"
+    )
+
+
+def test_html_with_embedded_json_runs_extractor_not_json_shortcut() -> None:
+    """#3609: the embedded-JSON pre-pass must not short-circuit HTML extraction.
+
+    Before the fix, a small local JSON minify (~10% win) returned immediately
+    from ``_apply_strategy_to_content`` and whole-document extraction (~36%
+    win on this document) never ran; the issue reported the same shape at
+    2% vs 95.5%. The splice is now deferred for HTML: extraction gets first
+    refusal and the JSON route only fires when extraction finds nothing.
+    """
+    pytest.importorskip("trafilatura")
+    doc = _html_doc_with_embedded_json()
+    assert _detect_content(doc).content_type is ContentType.HTML
+    assert not is_mixed_content(doc)
+
+    result = ContentRouter().compress(doc)
+
+    assert result.strategy_used is CompressionStrategy.HTML
+    assert result.strategy_chain == ["html"]
+    # extraction ran: markup is gone and the document collapsed hard
+    # (the pre-fix JSON shortcut left <html> in place at ~10% reduction)
+    assert "<html>" not in result.compressed
+    assert len(result.compressed) < len(doc) * 3 // 5
+
+
+def test_html_extraction_miss_still_gets_deferred_json_splice() -> None:
+    """Deferring must not LOSE the embedded-JSON win when extraction finds nothing.
+
+    A shell-only HTML document makes the extractor come back empty; the
+    deferred splice then still compresses the embedded array. Before the fix
+    this shape short-circuited at the top (chain ``["embedded_json"]``); now
+    the block first proves the HTML strategy is a miss (chain
+    ``["html", "embedded_json"]``) with the same spliced output.
+    """
+    pytest.importorskip("trafilatura")
+    embedded = json.dumps(
+        [
+            {"id": i, "name": f"item-{i}", "tags": ["alpha", "beta"], "score": i * 3}
+            for i in range(40)
+        ]
+    )
+    shell = (
+        "<!DOCTYPE html>\n<html><head><title>t</title></head>\n<body>\n"
+        '<script type="application/json">' + embedded + "</script>\n"
+        "</body></html>\n"
+    )
+    router = ContentRouter()
+    # sanity: extraction finds nothing on this shell (empty or None)
+    extractor = router._get_html_extractor()
+    assert extractor is not None
+    assert not (extractor.extract(shell).extracted or "").strip()
+
+    text, _tokens, chain = router._apply_strategy_to_content(
+        shell, CompressionStrategy.HTML, "", None, 1.0
+    )
+
+    assert chain == ["html", "embedded_json"]
+    assert len(text) < len(shell)
+    json_marker = '"id":'
+    assert json_marker not in text  # the array was compressed away
