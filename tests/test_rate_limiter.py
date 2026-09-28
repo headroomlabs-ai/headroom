@@ -104,3 +104,13 @@ async def test_request_and_token_limits_still_debit_independently() -> None:
     assert (await limiter.check_request("client"))[0] is False
     assert (await limiter.check_tokens("client", 5))[0] is True
     assert (await limiter.check_tokens("client", 1))[0] is False
+
+
+@pytest.mark.asyncio
+async def test_token_limit_is_off_unless_configured() -> None:
+    # 0.39.0 started enforcing an implicit 100k default and 429'd every
+    # large-context agent turn; the default is now no token limit.
+    limiter = TokenBucketRateLimiter()
+
+    assert await limiter.check_tokens("client", 900_000) == (True, 0.0)
+    assert not limiter._token_buckets

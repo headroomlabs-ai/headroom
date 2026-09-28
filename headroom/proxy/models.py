@@ -329,7 +329,10 @@ class ProxyConfig:
     # Rate limiting
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 60
-    rate_limit_tokens_per_minute: int = 100000
+    # None = no token limit. Before 0.39.0 the token bucket was never consumed,
+    # so an implicit default here throttled every large-context agent session
+    # the moment #3350 started enforcing it. Opt in with --tpm / HEADROOM_TPM.
+    rate_limit_tokens_per_minute: int | None = None
 
     # Retry
     retry_enabled: bool = True
