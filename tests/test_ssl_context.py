@@ -62,14 +62,21 @@ def ca_pem_file(tmp_path):
 
 
 def _clean_env(monkeypatch):
-    """Remove all CA-bundle env vars + the strict toggle for a clean state."""
+    """Remove all CA-bundle env vars + the strict toggle for a clean state.
+
+    Pins ``HEADROOM_CERT_STORE=bundled`` so these tests keep covering the
+    certifi / env-bundle resolution without the OS trust store in front of it;
+    the OS-store default is covered in ``test_corporate_tls.py``.
+    """
     for var in (
         "SSL_CERT_FILE",
         "REQUESTS_CA_BUNDLE",
         "NODE_EXTRA_CA_CERTS",
+        "HEADROOM_CA_BUNDLE",
         "HEADROOM_TLS_STRICT",
     ):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HEADROOM_CERT_STORE", "bundled")
 
 
 def _default_x509_ca_count() -> int:
@@ -256,10 +263,20 @@ class TestTlsStrictDisabled:
 
 
 class TestBuildHttpxVerify:
-    def test_default_returns_true(self, monkeypatch):
-        """No CA bundle, strict on → httpx's own default verification."""
+    def test_default_is_httpx_equivalent_certifi_context(self, monkeypatch):
+        """No CA bundle, strict on → what httpx builds for verify=True (certifi).
+
+        Always a concrete verifying context, never a boolean.
+        """
+        import certifi
+
         _clean_env(monkeypatch)
-        assert build_httpx_verify() is True
+        ctx = build_httpx_verify()
+        assert isinstance(ctx, ssl.SSLContext)
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+        expected = ssl.create_default_context(cafile=certifi.where())
+        assert ctx.cert_store_stats()["x509_ca"] == expected.cert_store_stats()["x509_ca"]
 
     def test_toggle_off_returns_relaxed_context(self, monkeypatch):
         """No CA bundle, strict OFF → default trust store with strict cleared."""
@@ -306,7 +323,7 @@ class TestBuildUrlopenContext:
         assert created_context.alpn_protocols == ["http/1.1"]
 
     def test_default_returns_none(self, monkeypatch):
-        """No CA bundle, strict on → build_httpx_verify() is True, nothing to restrict."""
+        """No CA bundle, strict on → no configured context; urlopen keeps its default."""
         _clean_env(monkeypatch)
         assert build_urlopen_context() is None
 

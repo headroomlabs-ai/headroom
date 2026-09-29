@@ -97,7 +97,13 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        // Corporate roots handed over as PEM files, added on top of the
+        // bundled + OS roots (see `crate::tls`).
+        for cert in crate::tls::extra_root_certificates() {
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .connect_timeout(config.upstream_connect_timeout)
             .timeout(config.upstream_timeout)
             // Don't auto-follow redirects: pass them through verbatim.

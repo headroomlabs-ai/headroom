@@ -1057,13 +1057,20 @@ class StreamingMixin:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
             self.metrics.record_upstream_connection_error(provider)
+            # A corporate TLS-inspection root the proxy does not trust shows up
+            # here as CERTIFICATE_VERIFY_FAILED. Name the issuer and the fix so
+            # the agent's error line is actionable instead of a bare 502.
+            from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+            tls_hint = await describe_upstream_failure_async(e, url)
+            client_message = tls_hint or f"Failed to connect to upstream API: {error_msg}"
 
             async def _error_gen():
                 error_event = {
                     "type": "error",
                     "error": {
                         "type": "connection_error",
-                        "message": f"Failed to connect to upstream API: {error_msg}",
+                        "message": client_message,
                     },
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
