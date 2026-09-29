@@ -166,6 +166,11 @@ from headroom.proxy.modes import (
     is_token_mode,
     normalize_proxy_mode,
 )
+from headroom.proxy.orphan_watchdog import (
+    orphan_grace_seconds,
+    orphan_watchdog_enabled,
+    orphan_watchdog_loop,
+)
 from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
@@ -177,7 +182,11 @@ from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
-from headroom.proxy.ssl_context import build_httpx_verify
+from headroom.proxy.ssl_context import (
+    build_httpx_verify,
+    describe_trust_policy,
+    ensure_process_trust_if_owned,
+)
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
@@ -1275,6 +1284,8 @@ class HeadroomProxy(
         # Request counter for IDs
         self._request_counter = 0
         self._request_counter_lock = asyncio.Lock()
+        self._active_requests = 0
+        self._activity_generation = 0
 
         # CCR tool injectors (one per provider)
         self.anthropic_tool_injector = CCRToolInjector(
@@ -1957,9 +1968,14 @@ class HeadroomProxy(
             operation="proxy.startup",
             metadata={"port": self.config.port, "host": self.config.host},
         )
-        # Resolve TLS verification: a custom CA bundle (corporate PKI) if one
-        # is configured, else a strict-relaxed default context when
+        # Resolve TLS verification: the OS trust store (where IT installs a
+        # corporate TLS-inspection root) plus certifi by default, else a custom
+        # CA bundle, else a strict-relaxed default context when
         # HEADROOM_TLS_STRICT=0, else httpx's default strict verification.
+        # Injection covers the third-party clients that build their own
+        # contexts; it also runs here because uvicorn workers can import the
+        # app without going through the CLI (they inherit the CLI's marker).
+        ensure_process_trust_if_owned()
         _verify = build_httpx_verify()
         _http2, _client_kwargs = _provider_httpx_client_options(self.config, _verify)
         # `install_upstream_pinning` is what makes the SSRF guard's verdict
@@ -2366,6 +2382,16 @@ class HeadroomProxy(
         async with self._request_counter_lock:
             self._request_counter += 1
             return f"hr_{int(time.time())}_{self._request_counter:06d}"
+
+    @property
+    def active_request_count(self) -> int:
+        """Number of active HTTP and WebSocket ASGI scopes."""
+        return self._active_requests
+
+    @property
+    def activity_generation(self) -> int:
+        """Monotonic generation advanced at request entry and completion."""
+        return self._activity_generation
 
     def _extract_tags(self, headers: dict) -> dict[str, str]:
         """Backwards-compat wrapper around :func:`extract_tags`.
@@ -2890,6 +2916,27 @@ class WebSocketProjectPrefixMiddleware:
         await self.app(scope, receive, send)
 
 
+class ActivityMiddleware:
+    """Track HTTP and WebSocket scopes through their complete ASGI lifetime."""
+
+    def __init__(self, app: Any, *, proxy: HeadroomProxy) -> None:
+        self.app = app
+        self.proxy = proxy
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] not in {"http", "websocket"}:
+            await self.app(scope, receive, send)
+            return
+
+        self.proxy._active_requests += 1
+        self.proxy._activity_generation += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.proxy._active_requests -= 1
+            self.proxy._activity_generation += 1
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -3022,6 +3069,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        # Arm the C-level liveness watchdog before anything that can touch
+        # native code: a GIL seized during startup freezes the process just as
+        # thoroughly as one seized while serving (#3178). Per worker, because
+        # the timer and the GIL are both process-local.
+        from headroom.proxy.hard_watchdog import start_hard_watchdog
+
+        start_hard_watchdog()
+
         # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
         # traffic if the Rust extension is missing unless the operator
         # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
@@ -3043,6 +3098,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.startup_error = None
         app.state.periodic_toin_stats_task = None
         app.state.periodic_malloc_trim_task = None
+        app.state.orphan_watchdog_task = None
 
         try:
             try:
@@ -3058,6 +3114,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 if config.periodic_malloc_trim_enabled:
                     app.state.periodic_malloc_trim_task = asyncio.create_task(
                         trim_periodically(config.malloc_trim_interval_seconds)
+                    )
+                # Only wrap-spawned proxies carry the env marker; standalone
+                # `headroom proxy` and persistent installs never self-exit.
+                # Multi-worker runs (HEADROOM_PROXY_CONFIG_JSON is set before
+                # forking workers) are excluded: WS sessions are per-worker,
+                # so no single worker can observe "zero active sessions", and
+                # wrap never requests multiple workers anyway.
+                if orphan_watchdog_enabled() and _MULTI_WORKER_CONFIG_ENV not in os.environ:
+                    app.state.orphan_watchdog_task = asyncio.create_task(
+                        orphan_watchdog_loop(proxy, grace_seconds=orphan_grace_seconds()),
+                        name="headroom-orphan-watchdog",
                     )
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
@@ -3127,6 +3194,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     timeout=3.0,
                 )
                 app.state.periodic_malloc_trim_task = None
+
+            orphan_watchdog_task = app.state.orphan_watchdog_task
+            if orphan_watchdog_task is not None:
+                orphan_watchdog_task.cancel()
+                await _timed(
+                    asyncio.gather(orphan_watchdog_task, return_exceptions=True),
+                    label="orphan_watchdog.stop",
+                    timeout=3.0,
+                )
+                app.state.orphan_watchdog_task = None
 
             if _cc_reconciler is not None:
                 await _timed(_cc_reconciler.stop(), label="cc_reconciler.stop", timeout=3.0)
@@ -3467,6 +3544,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 profile_kwargs.get("target_ratio", config.target_ratio),
             )
             payload["config"] = {
+                # What *this* process trusts upstream; doctor reads it so it
+                # reports the proxy's policy, not the calling shell's.
+                "tls": describe_trust_policy(),
                 "backend": config.backend,
                 "optimize": config.optimize,
                 "cache": config.cache_enabled,
@@ -5681,6 +5761,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _install_gateway_contract(app, config, route_dependencies=_compress_dependencies)
 
     register_provider_routes(app, proxy)
+    # Register last so this raw ASGI middleware is outermost and covers the
+    # complete response body, including responses produced by other middleware.
+    app.add_middleware(ActivityMiddleware, proxy=proxy)
 
     return app
 

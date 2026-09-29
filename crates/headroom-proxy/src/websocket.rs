@@ -151,9 +151,15 @@ async fn run_ws_pump(
         }
     }
 
-    let (upstream_ws, _resp) = tokio_tungstenite::connect_async(req)
-        .await
-        .map_err(|e| format!("upstream ws connect: {e}"))?;
+    // Explicit TLS config: corporate roots (OS store + HEADROOM_CA_BUNDLE) and
+    // a named crypto provider. tokio-tungstenite's default path calls
+    // `rustls::ClientConfig::builder()`, which panics in this binary because
+    // two rustls providers are compiled in.
+    let connector = tokio_tungstenite::Connector::Rustls(crate::tls::websocket_tls_config());
+    let (upstream_ws, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
+            .await
+            .map_err(|e| format!("upstream ws connect: {e}"))?;
 
     let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
     let (mut client_sink, mut client_stream) = client_ws.split();

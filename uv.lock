@@ -1847,7 +1847,7 @@ wheels = [
 
 [[package]]
 name = "headroom-ai"
-version = "0.38.0"
+version = "0.39.1"
 source = { editable = "." }
 dependencies = [
     { name = "ast-grep-cli" },
@@ -1860,6 +1860,7 @@ dependencies = [
     { name = "tiktoken" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "tomlkit" },
+    { name = "truststore" },
 ]
 
 [package.optional-dependencies]
@@ -2203,6 +2204,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'voice'", specifier = ">=5.5.0,<6.0" },
     { name = "tree-sitter", marker = "extra == 'code'", specifier = ">=0.25.2,<0.27" },
     { name = "tree-sitter-language-pack", marker = "extra == 'code'", specifier = ">=0.10.0,<1.0" },
+    { name = "truststore", specifier = ">=0.10.0" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.23.0,<1.0" },
     { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.23.0,<1.0" },
     { name = "uvicorn", marker = "extra == 'proxy'", specifier = ">=0.23.0,<1.0" },
@@ -7278,6 +7280,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/09/5683146fda6a2b569deb78ccfd8fbfea8bfe55f726b081c0a6bb18dd6f28/triton-3.7.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:2020153b08280415ec0da6607834e79166442147e78e144df06b508c75b186d2", size = 197729537, upload-time = "2026-06-17T19:53:35.516Z" },
     { url = "https://files.pythonhosted.org/packages/e9/f8/448220c3092019f9fdfab39ec47985968181d67da34b44f6a7f6280a5cbb/triton-3.7.1-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c58e4c61f0c73b5dba3b5d19b4a7093c32f90dc18b2a7f121a7c16ccd31107b7", size = 184814760, upload-time = "2026-06-17T20:04:04.984Z" },
     { url = "https://files.pythonhosted.org/packages/f0/ac/229b7d4589d2e5937310e72c6d46e89599d16a4a12b479ffa1499fee8eb8/triton-3.7.1-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:10ba85fa2cca4a2fbdeb36bf1cb082f2c252bda55bf9fccd74f65ec5bc647e68", size = 197824404, upload-time = "2026-06-17T19:53:42.772Z" },
+]
+
+[[package]]
+name = "truststore"
+version = "0.10.4"
+source = { registry = "https://pypi.org/simple/" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/a3/1585216310e344e8102c22482f6060c7a6ea0322b63e026372e6dcefcfd6/truststore-0.10.4.tar.gz", hash = "sha256:9d91bd436463ad5e4ee4aba766628dd6cd7010cf3e2461756b3303710eebc301", size = 26169, upload-time = "2025-08-12T18:49:02.73Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/97/56608b2249fe206a67cd573bc93cd9896e1efb9e98bce9c163bcdc704b88/truststore-0.10.4-py3-none-any.whl", hash = "sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981", size = 18660, upload-time = "2025-08-12T18:49:01.46Z" },
 ]
 
 [[package]]

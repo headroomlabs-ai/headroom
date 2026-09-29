@@ -482,6 +482,167 @@ def _codex_block_missing_openai_auth(
         return False
 
 
+def check_trust_policy(policy: Mapping[str, Any]) -> CheckResult:
+    """Which certificates the proxy trusts for its upstream connections.
+
+    Corporate TLS inspection (Zscaler, Netskope, ...) re-signs every upstream
+    certificate with a company root that IT installs in the OS store. The proxy
+    only accepts it when the OS store is in use or the root is supplied as a
+    bundle, so this line answers "will Headroom trust what my network presents?"
+    """
+    replacement = policy.get("replacement_bundle")
+    additive = policy.get("additive_bundles") or []
+    extras = ", ".join(f"{b['env_var']}={b['path']}" for b in additive)
+    if replacement:
+        return CheckResult(
+            name="tls trust",
+            status=PASS,
+            summary=f"only {replacement['env_var']}={replacement['path']}",
+            hint=(
+                f"{replacement['env_var']} replaces every other trust source; the OS "
+                "certificate store is not consulted. Unset it to trust the OS store."
+            ),
+        )
+    if policy.get("system_store_active"):
+        sources = "OS certificate store" + (
+            " + certifi" if "bundled" in policy.get("cert_store", []) else ""
+        )
+        return CheckResult(
+            name="tls trust",
+            status=PASS,
+            summary=sources + (f" + {extras}" if extras else ""),
+        )
+    reason = (
+        "HEADROOM_CERT_STORE excludes 'system'"
+        if policy.get("system_store_available")
+        else "the truststore package is not installed"
+    )
+    return CheckResult(
+        name="tls trust",
+        status=WARN,
+        summary="certifi bundle only" + (f" + {extras}" if extras else ""),
+        hint=(
+            f"The OS certificate store is not used ({reason}), so a corporate "
+            "TLS-inspection root is only trusted if you pass it via HEADROOM_CA_BUNDLE."
+        ),
+    )
+
+
+def check_proxy_env(environ: Mapping[str, str]) -> CheckResult | None:
+    """Warn when an HTTP(S) proxy would capture the agent's loopback traffic."""
+    from headroom.proxy.tls_diagnostics import loopback_no_proxy_gap
+
+    gap = loopback_no_proxy_gap(environ)
+    if gap is None:
+        return None
+    return CheckResult(
+        name="proxy env",
+        status=WARN,
+        summary=f"{gap} is set but NO_PROXY does not exempt 127.0.0.1/localhost",
+        hint=(
+            "Agents may send their requests to Headroom through the corporate proxy, "
+            "which cannot reach this machine. `headroom wrap` fixes this for the "
+            "processes it launches; for other setups add "
+            "NO_PROXY=127.0.0.1,localhost,::1."
+        ),
+    )
+
+
+# (label, url, required). Required endpoints fail the check; the rest only warn
+# because Headroom degrades (no ML compression, estimated token counts) rather
+# than breaking when they are unreachable.
+NETWORK_ENDPOINTS: tuple[tuple[str, str, bool], ...] = (
+    ("api.anthropic.com", "https://api.anthropic.com/v1/models", True),
+    ("api.openai.com", "https://api.openai.com/v1/models", True),
+    ("api.githubcopilot.com", "https://api.githubcopilot.com/models", False),
+    ("huggingface.co (models)", "https://huggingface.co/api/models?limit=1", False),
+    (
+        "openaipublic (tiktoken)",
+        "https://openaipublic.blob.core.windows.net/encodings/",
+        False,
+    ),
+)
+
+
+def check_network_endpoints(reports: Sequence[Any], required: set[str]) -> list[CheckResult]:
+    """Turn :class:`EndpointReport`s into doctor rows, plus an IT summary row."""
+    results: list[CheckResult] = []
+    vendors: set[str] = set()
+    failing_hosts: list[str] = []
+    for report in reports:
+        vendor = report.chain.inspection_vendor
+        if vendor:
+            vendors.add(vendor)
+        inspected = f"; TLS inspected by {vendor}" if vendor else ""
+        host = urlsplit_host(report.url)
+        if report.ok:
+            results.append(
+                CheckResult(
+                    name=f"net {report.name}",
+                    status=PASS,
+                    summary=(
+                        f"reachable, certificate trusted (HTTP {report.status}, "
+                        f"{report.elapsed_ms:.0f} ms){inspected}"
+                    ),
+                )
+            )
+            continue
+        failing_hosts.append(host)
+        status = FAIL if report.name in required else WARN
+        if report.block_page:
+            summary = f"blocked by a network gateway (HTTP {report.status}){inspected}"
+        elif report.chain.issuer and "verify" in (report.error or "").lower():
+            summary = f"certificate not trusted (issued by {report.chain.issuer})"
+        else:
+            summary = (report.error or "unreachable").split(". ")[0][:160]
+        results.append(
+            CheckResult(
+                name=f"net {report.name}", status=status, summary=summary, hint=report.error
+            )
+        )
+    if failing_hosts:
+        who = " / ".join(sorted(vendors)) or "your TLS-inspection gateway"
+        results.append(
+            CheckResult(
+                name="it request",
+                status=WARN,
+                summary=f"{len(failing_hosts)} endpoint(s) need a network change",
+                hint=(
+                    f"Text for your IT team: Headroom (a local AI coding proxy) needs HTTPS "
+                    f"access to {', '.join(failing_hosts)}. Either confirm the {who} root "
+                    "certificate is deployed to the operating system certificate store on "
+                    "developer machines, or exempt these domains from TLS inspection and "
+                    "cloud-app blocking. Please do not exempt 'python' as a process; the "
+                    "certificate fix is sufficient."
+                ),
+            )
+        )
+    return results
+
+
+def urlsplit_host(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).hostname or url
+
+
+def run_network_probes(extra_urls: Sequence[str]) -> tuple[list[Any], set[str]]:
+    """Probe every endpoint concurrently; returns (reports, required names)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from headroom.proxy.tls_diagnostics import probe_endpoint
+
+    targets = [(label, url) for label, url, _ in NETWORK_ENDPOINTS]
+    required = {label for label, _, req in NETWORK_ENDPOINTS if req}
+    for url in extra_urls:
+        label = urlsplit_host(url)
+        targets.append((label, url))
+        required.add(label)
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        reports = list(pool.map(lambda t: probe_endpoint(*t), targets))
+    return reports, required
+
+
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
     """Is the *current shell* pointed at the proxy for ad-hoc runs?"""
     name = "shell env"
@@ -751,7 +912,23 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
-def doctor(port: int, emit_json: bool) -> None:
+@click.option(
+    "--network",
+    is_flag=True,
+    help=(
+        "Also test HTTPS to the provider APIs and model hosts: who signed the "
+        "certificate (Zscaler, Netskope, ...), whether Headroom trusts it, and "
+        "whether a gateway block page is in the way."
+    ),
+)
+@click.option(
+    "--network-url",
+    "network_urls",
+    multiple=True,
+    metavar="URL",
+    help="Extra upstream URL to test with --network (repeatable), e.g. a custom gateway.",
+)
+def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, ...]) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -783,6 +960,21 @@ def doctor(port: int, emit_json: bool) -> None:
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    from headroom.proxy.ssl_context import describe_trust_policy
+
+    # Prefer the running proxy's own policy (its env can differ from this
+    # shell's under launchd/systemd); fall back to what this shell would use.
+    proxy_tls = ((health or {}).get("config") or {}).get("tls")
+    trust_row = check_trust_policy(proxy_tls or describe_trust_policy())
+    if not proxy_tls:
+        trust_row.summary += " (this shell; proxy not reporting)"
+    checks.append(trust_row)
+    proxy_env_check = check_proxy_env(os.environ)
+    if proxy_env_check is not None:
+        checks.append(proxy_env_check)
+    if network or network_urls:
+        reports, required = run_network_probes(network_urls)
+        checks.extend(check_network_endpoints(reports, required))
     auth_conflict_check = check_claude_auth_conflict(
         claude_settings_path(),
         project_claude_settings,
