@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
+import random
 
 import pytest
 
@@ -25,6 +26,7 @@ from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
+    _read_output_should_be_protected,
 )
 from headroom.transforms.tabular_ingest import (
     TabularCompressionResult,
@@ -90,6 +92,107 @@ def test_detects_tabular(content: str, fmt: str) -> None:
     ],
 )
 def test_does_not_misroute_to_tabular(content: str, expected: ContentType) -> None:
+    assert detect_content_type(content).content_type is expected
+
+
+# Detection: fixed-width command output (#3652) ------------------------------
+
+
+def _ls_issue_payload() -> str:
+    # The exact payload from issue #3652.
+    rng = random.Random(1)
+    rows = [
+        f"-rw-r--r--  1 tejas staff {rng.randint(1000, 99999)} Sep {d} 09:{d:02d} file_{d}.py"
+        for d in range(1, 60)
+    ]
+    return "total 480\n" + "\n".join(rows)
+
+
+LS_MACOS = (
+    "total 64\n"
+    "drwxr-xr-x  12 tejas  staff    384 Sep 18 09:01 .\n"
+    "drwxr-xr-x   5 tejas  staff    160 Sep 17 11:20 ..\n"
+    "-rw-r--r--   1 tejas  staff   1834 Sep 18 09:01 README.md\n"
+    "-rw-r--r--   1 tejas  staff  18611 Sep 18 09:01 setup.py\n"
+    "drwxr-xr-x   8 tejas  staff    256 Sep 18 09:01 src"
+)
+KUBECTL = (
+    "NAME                     READY   STATUS    RESTARTS   AGE\n"
+    "api-7d9f8b6c4-2xkqp      1/1     Running   0          3d\n"
+    "api-7d9f8b6c4-9wz7m      1/1     Running   0          3d\n"
+    "worker-5c8d7f9b8-lq2vx   1/1     Running   2          5h\n"
+    "redis-0                  1/1     Running   0          12d"
+)
+PS_AUX = (
+    "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+    "root         1  0.0  0.1 168100 11520 ?        Ss   Sep17   0:04 /sbin/init\n"
+    "root         2  0.0  0.0      0     0 ?        S    Sep17   0:00 [kthreadd]\n"
+    "tejas     4121  1.2  2.3 912344 190220 pts/0  Sl+  09:01   0:12 python app.py\n"
+    "tejas     4188  0.0  0.0  10072  3300 pts/1    R+   09:05   0:00 ps aux"
+)
+DF_H = (
+    "Filesystem      Size  Used Avail Use% Mounted on\n"
+    "/dev/nvme0n1p2  468G  201G  244G  46% /\n"
+    "tmpfs            16G  1.2M   16G   1% /dev/shm\n"
+    "/dev/nvme0n1p1  511M  6.1M  505M   2% /boot/efi\n"
+    "tmpfs           3.2G  2.4M  3.2G   1% /run/user/1000"
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [_ls_issue_payload(), LS_MACOS, KUBECTL, PS_AUX, DF_H],
+    ids=["ls_issue", "ls_macos", "kubectl", "ps_aux", "df_h"],
+)
+def test_detects_fixed_width_command_output(content: str) -> None:
+    result = detect_content_type(content)
+    assert result.content_type is ContentType.TABULAR
+    assert result.metadata["format"] == "fixed_width"
+    assert result.metadata["columns"] >= 3
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        pytest.param(
+            "- first item in the list\n- second item in the list\n- third item in the list\n- fourth item in the list",
+            ContentType.PLAIN_TEXT,
+            id="bullets",
+        ),
+        pytest.param(
+            "1. install the package\n2. run the proxy\n3. wrap the agent\n4. check the stats",
+            ContentType.PLAIN_TEXT,
+            id="numbered",
+        ),
+        pytest.param(
+            "SELECT id, name\nFROM users\nWHERE active = 1\nORDER BY name;\n-- comment\nLIMIT 10;",
+            ContentType.PLAIN_TEXT,
+            id="sql",
+        ),
+        pytest.param(
+            "#define FOO 1\n#define BAR 2\n#define BAZ 3\n#define QUX 4",
+            ContentType.PLAIN_TEXT,
+            id="c_defines",
+        ),
+        pytest.param(
+            'On branch main\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n'
+            + "\n".join(f"\tmodified:   src/m_{i}.py" for i in range(10)),
+            ContentType.PLAIN_TEXT,
+            id="git_status",
+        ),
+        pytest.param(
+            "3aa5012 perf(memory/budget): precompute word sets once\nc81378c fix(grok): preserve xAI model context metadata\nb0c19a2 fix(security): reject unauthenticated public proxy binds\n871bbde fix(proxy): reject Anthropic batch operations on Copilot\na29162b fix(dashboard): separate rolling cache economics by owner",
+            ContentType.PLAIN_TEXT,
+            id="git_log",
+        ),
+        pytest.param(
+            "Headroom compresses tool output before it reaches the model, which saves\ntokens on long agent sessions. The router picks a compressor per content\ntype, and plain prose goes to Kompress, an ML model that drops words it\npredicts the reader can do without. That is fine for prose and wrong for\nrecords, where every field matters to whatever command runs next, so the\ndetector has to tell the two apart before anything is dropped at all.",
+            ContentType.PLAIN_TEXT,
+            id="wrapped_prose",
+        ),
+    ],
+)
+def test_fixed_width_does_not_claim_non_tables(content: str, expected: ContentType) -> None:
     assert detect_content_type(content).content_type is expected
 
 
@@ -251,8 +354,8 @@ def test_parse_fixed_width_too_short_returns_empty() -> None:
 
 
 def test_parse_tabular_dispatches_fixed_width(monkeypatch) -> None:
-    # The detector currently emits only csv/markdown, so drive the fixed_width
-    # dispatch branch directly with a stubbed detection result.
+    # Drive the fixed_width dispatch branch directly with a stubbed detection
+    # result, independent of the detector's thresholds.
     import headroom.transforms.tabular_ingest as ti
 
     monkeypatch.setattr(
@@ -264,6 +367,20 @@ def test_parse_tabular_dispatches_fixed_width(monkeypatch) -> None:
     assert fmt == "fixed_width"
     assert headers == ["name", "age"]
     assert rows[0] == ["Alice", "30"]
+
+
+def test_parse_tabular_rejects_single_column_fixed_width(monkeypatch) -> None:
+    import headroom.transforms.tabular_ingest as ti
+
+    monkeypatch.setattr(
+        ti,
+        "detect_content_type",
+        lambda _c: DetectionResult(ContentType.TABULAR, 0.9, {"format": "fixed_width"}),
+    )
+    # Single-space rows split into one cell each; that is not a table.
+    assert (
+        ti.parse_tabular("-rw-r--r-- 1 a b 1 f\n-rw-r--r-- 1 a b 2 g\n-rw-r--r-- 1 a b 3 h") is None
+    )
 
 
 def test_parse_tabular_none_when_no_data_rows_survive() -> None:
@@ -340,6 +457,47 @@ def test_router_respects_disable_flag() -> None:
     result = ContentRouter(cfg).compress(md)
     assert result.compressed == md
     assert result.tokens_saved == 0
+
+
+# Router: tables never fall back to Kompress (#3652) -------------------------
+
+
+def _record_kompress_calls(monkeypatch) -> list[str]:
+    calls: list[str] = []
+
+    def fake(self, content, context, question=None, target_ratio=None):
+        calls.append(content)
+        return "x", 1  # would "win" on savings if the router ever called it
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+    monkeypatch.setattr(ContentRouter, "_try_ml_compressor", fake)
+    return calls
+
+
+def test_router_keeps_ls_output_verbatim(monkeypatch) -> None:
+    calls = _record_kompress_calls(monkeypatch)
+    payload = _ls_issue_payload()
+    result = ContentRouter(ContentRouterConfig()).compress(payload)
+    assert result.compressed == payload
+    assert calls == []
+    assert result.strategy_used is CompressionStrategy.TABULAR
+
+
+def test_router_does_not_kompress_a_ragged_csv(monkeypatch) -> None:
+    calls = _record_kompress_calls(monkeypatch)
+    csv = "id,name,city\n" + "\n".join(f"{i},user_{i},city_{i % 5}" for i in range(30))
+    csv += "\n99,extra,field,here"
+    assert detect_content_type(csv).content_type is ContentType.TABULAR
+    result = ContentRouter(ContentRouterConfig()).compress(csv)
+    assert result.compressed == csv
+    assert calls == []
+
+
+def test_fixed_width_read_stays_protected(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "python")
+    assert _read_output_should_be_protected(_ls_issue_payload()) is True
+    csv = "id,name,city\n" + "\n".join(f"{i},user_{i},city_{i % 5}" for i in range(30))
+    assert _read_output_should_be_protected(csv) is False
 
 
 # Binary spreadsheet ingestion -----------------------------------------------

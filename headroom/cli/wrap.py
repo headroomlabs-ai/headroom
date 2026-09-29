@@ -44,7 +44,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib
 
-from headroom._subprocess import pid_alive, run
+from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
+from headroom._subprocess import pid_alive, proc_identity, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -80,6 +81,9 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
+    CONTEXT_1M_SUFFIX,
+    DEFAULT_1M_MODEL,
+    HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
@@ -93,6 +97,9 @@ from headroom.providers.claude import (
     remote_control_gate_message,
     remote_control_sibling_gate_note,
     remove_vscode_claude_settings,
+    resolve_1m_model,
+    resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
     vscode_claude_proxy_url,
 )
 from headroom.providers.claude import (
@@ -185,6 +192,8 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
+from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
 )
@@ -326,28 +335,15 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
-_CONTEXT_1M_SUFFIX = "[1m]"
-_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
-# Fallback model for `--1m` when nothing else selects one (no ANTHROPIC_MODEL,
-# no explicit --model). Overridable via HEADROOM_1M_MODEL so it can track new
-# Opus releases without a code change and without pinning ANTHROPIC_MODEL
-# globally (which would also change non-`--1m` sessions and override Claude
-# Code's /model picker). #2937.
-_DEFAULT_1M_MODEL = "claude-opus-5"
+# Private aliases preserve the standalone wrapper's existing test and import
+# surface while the provider runtime owns the 1M selection contract.
+_CONTEXT_1M_SUFFIX = CONTEXT_1M_SUFFIX
+_1M_MODEL_ENV = HEADROOM_1M_MODEL_ENV
+_DEFAULT_1M_MODEL = DEFAULT_1M_MODEL
 _OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
-def _resolve_1m_model(current: str | None) -> str:
-    """Return the model id that makes Claude Code request the 1M window (#1158).
-
-    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
-    appending the ``[1m]`` suffix when missing). When none is set it falls back
-    to ``HEADROOM_1M_MODEL`` if defined, else the built-in default Opus (#2937).
-    Idempotent — a value already ending in ``[1m]`` is returned unchanged.
-    """
-    fallback = (os.environ.get(_1M_MODEL_ENV) or "").strip() or _DEFAULT_1M_MODEL
-    base = (current or "").strip() or fallback
-    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+_resolve_1m_model = resolve_1m_model
 
 
 def _apply_1m_to_claude_args(args: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
@@ -672,7 +668,16 @@ def _start_proxy(
     (see ``_find_available_port``).
     """
 
-    cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        str(port),
+        "--workers",
+        "1",
+    ]
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
@@ -721,6 +726,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
+    # A wrap-owned proxy must be a single authoritative process so its orphan
+    # watchdog can observe all activity before deciding to self-terminate.
+    proxy_env.pop("HEADROOM_WORKERS", None)
+    proxy_env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
     # `wrap` from a directory that contains a `headroom/` folder (most commonly a
@@ -739,6 +748,12 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    # Mark the proxy as wrap-spawned so its orphan watchdog (proxy side) stops
+    # it once no live wrap clients remain. Standalone `headroom proxy` and
+    # persistent installs never get this flag and never self-exit. The proxy
+    # is detached (setsid / breakaway flags), so without this a crashed or
+    # killed wrapper leaks the proxy forever and later wraps silently reuse it.
+    proxy_env["HEADROOM_WRAP_OWNED"] = "1"
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
@@ -3437,6 +3452,11 @@ def _run_proxy_only_watcher(
 
     signal.signal(signal.SIGINT, _signal_shutdown)
     signal.signal(signal.SIGTERM, _signal_shutdown)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the watcher dies unhandled and the proxy it spawned is reparented
+    # to PID 1 and leaks. Mirrors the SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_shutdown)
     # Windows exposes Ctrl+Break as SIGBREAK rather than SIGINT. Test runners,
     # IDE terminals, and process supervisors commonly use Ctrl+Break to target
     # a newly created process group, so route it through the same graceful
@@ -3707,12 +3727,12 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
-def _normalize_proxy_api_url(url: object) -> str | None:
+def _normalize_proxy_api_url(url: object, *, strip_provider_v1: bool = True) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
         return None
     normalized = url.strip().rstrip("/")
-    if normalized.endswith("/v1"):
+    if strip_provider_v1 and normalized.endswith("/v1"):
         normalized = normalized[:-3]
     return normalized or None
 
@@ -3736,6 +3756,95 @@ def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
         running_release is not None
         and current_release is not None
         and running_release != current_release
+    )
+
+
+# Upstream-URL config keys that decide where a running proxy forwards
+# traffic. A running proxy is only reusable when every key matches the
+# requested value. This build's /health config payload only serializes the
+# first five keys; the augment/factory entries catch proxies built from
+# feature branches or other versions that DO expose them (exactly the
+# mixed-fleet shape of the 2026-08-22 incident, where a 0.34-era proxy
+# reported augment_api_url). Keys absent from the running config simply
+# compare equal to an unrequested (None) value, so they are inert, never
+# wrong, against proxies that do not expose them.
+_PROXY_ROUTING_URL_KEYS = (
+    "openai_api_url",
+    "anthropic_api_url",
+    "vertex_api_url",
+    "cloudcode_api_url",
+    "gemini_api_url",
+    "augment_api_url",
+    "factory_api_url",
+)
+
+
+def _proxy_routing_mismatches(
+    running_config: Mapping[str, Any],
+    *,
+    backend: str | None,
+    requested_api_urls: Mapping[str, str | None] | None = None,
+) -> list[str]:
+    """Return routing-level keys where a running proxy differs from the request.
+
+    Unlike the feature-flag check in ``_ensure_proxy_unlocked`` (memory,
+    learn, code graph), a mismatch here is never "degraded but usable": the
+    proxy would forward this session's traffic to a backend or upstream the
+    caller did not ask for. URL comparison is symmetric: a running proxy with
+    a non-default upstream the caller did not request is a mismatch too.
+    """
+    mismatches: list[str] = []
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "anthropic"
+    running_backend = running_config.get("backend")
+    if (
+        isinstance(running_backend, str)
+        and running_backend
+        and running_backend != effective_backend
+    ):
+        mismatches.append("backend")
+    requested_api_urls = requested_api_urls or {}
+    for key in _PROXY_ROUTING_URL_KEYS:
+        strip_provider_v1 = key not in {"augment_api_url", "factory_api_url"}
+        if _normalize_proxy_api_url(
+            running_config.get(key),
+            strip_provider_v1=strip_provider_v1,
+        ) != _normalize_proxy_api_url(
+            requested_api_urls.get(key),
+            strip_provider_v1=strip_provider_v1,
+        ):
+            mismatches.append(key)
+    return mismatches
+
+
+def _effective_requested_proxy_routing(
+    *,
+    backend: str | None,
+    openai_api_url: str | None,
+    anthropic_api_url: str | None,
+    vertex_api_url: str | None,
+    clear_vertex_api_url: bool,
+) -> tuple[str, dict[str, str | None]]:
+    """Resolve the routing a newly started proxy would inherit."""
+    from headroom.providers.registry import resolve_api_overrides
+
+    overrides = resolve_api_overrides(
+        anthropic_api_url=anthropic_api_url,
+        openai_api_url=openai_api_url,
+        gemini_api_url=None,
+        cloudcode_api_url=None,
+        vertex_api_url=vertex_api_url,
+    )
+    return (
+        backend or os.environ.get("HEADROOM_BACKEND") or "anthropic",
+        {
+            "anthropic_api_url": overrides.anthropic,
+            "openai_api_url": overrides.openai,
+            "gemini_api_url": overrides.gemini,
+            "cloudcode_api_url": overrides.cloudcode,
+            "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
+            "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
+            "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+        },
     )
 
 
@@ -4200,6 +4309,18 @@ def _ensure_proxy_unlocked(
         or bool(copilot_refresh_oauth_token)
         or copilot_api_token_expires_at is not None
     )
+    requested_backend, requested_api_urls = helpers._effective_requested_proxy_routing(
+        backend=backend,
+        openai_api_url=openai_api_url,
+        anthropic_api_url=anthropic_api_url,
+        vertex_api_url=vertex_api_url,
+        clear_vertex_api_url=clear_vertex_api_url,
+    )
+    # Set True when the proxy on the requested port belongs to a persistent
+    # deployment whose routing config does not match this wrap: the deployment
+    # owns the port and must not be reused, killed, or restarted from the
+    # shared ephemeral path; the wrap starts a dedicated proxy elsewhere.
+    persistent_routing_mismatch = False
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
     if no_proxy and (backend or anyllm_provider or region):
@@ -4222,7 +4343,34 @@ def _ensure_proxy_unlocked(
 
             if probe_ready(manifest.health_url):
                 health_payload = helpers._query_proxy_health(port)
-                if helpers._proxy_needs_version_restart(health_payload):
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                routing_mismatches = (
+                    None
+                    if running_config is None
+                    else helpers._proxy_routing_mismatches(
+                        running_config,
+                        backend=requested_backend,
+                        requested_api_urls=requested_api_urls,
+                    )
+                )
+                if running_config is None:
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        "did not expose routing config; starting a dedicated proxy "
+                        "on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        f"has incompatible routing config ({keys_str}); "
+                        "starting a dedicated proxy on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
                     active_sessions = helpers._proxy_active_session_count(health_payload)
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
@@ -4247,14 +4395,8 @@ def _ensure_proxy_unlocked(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
-                # Check if the running proxy has the features we need.
-                # Without this, a persistent deployment started for one use case
-                # (e.g. --backend anthropic) would be silently reused for another
-                # (e.g. --subscription --provider-type openai) causing auth failures.
-                running_config = helpers._proxy_health_config(health_payload)
-                if running_config is None:
-                    running_config = helpers._query_proxy_config(port)
-                if running_config is not None:
+                else:
+                    # Check if the running proxy has the features we need.
                     missing = []
                     if memory and not running_config.get("memory"):
                         missing.append("memory")
@@ -4262,46 +4404,18 @@ def _ensure_proxy_unlocked(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                         return None, port
-                # Features mismatch or config unavailable — fall through to
-                # the non-persistent path which handles proxy restart.
+                # Features mismatch or config unavailable — fall through to the
+                # non-persistent path which handles proxy restart. A routing
+                # mismatch skips that path entirely (see flag above).
             else:
                 if helpers._recover_persistent_proxy(port):
-                    # If the caller requested feature-sensitive config (e.g.
-                    # openai_api_url for Copilot subscription), continue into
-                    # the shared running-proxy checks below so mismatch-driven
-                    # restart logic can run. For plain recover-only calls,
-                    # preserve the historical fast return.
-                    if not any(
-                        (
-                            memory,
-                            learn,
-                            code_graph,
-                            openai_api_url,
-                            copilot_subscription_seed_requested,
-                        )
-                    ):
-                        return None, port
                     if not helpers._check_proxy(port):
                         return None, port
 
-                    # A freshly recovered persistent proxy may not expose
-                    # a full config payload yet. In feature-sensitive flows
-                    # (e.g. Copilot subscription), treat missing or mismatched
-                    # config as restart-required and refresh the persistent
-                    # deployment directly instead of silently reusing it.
                     health_payload = helpers._query_proxy_health(port)
                     running_config = helpers._proxy_health_config(health_payload)
                     if running_config is None:
@@ -4310,61 +4424,93 @@ def _ensure_proxy_unlocked(
                     if running_config is None:
                         click.echo(
                             f"  Recovered persistent deployment '{manifest.profile}' "
-                            "did not expose config; restarting with requested features..."
+                            "did not expose routing config; starting a dedicated proxy "
+                            "on a different port instead."
                         )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted after recovery."
+                        persistent_routing_mismatch = True
+                    else:
+                        routing_mismatches = helpers._proxy_routing_mismatches(
+                            running_config,
+                            backend=requested_backend,
+                            requested_api_urls=requested_api_urls,
                         )
+                        if routing_mismatches:
+                            keys_str = ", ".join(routing_mismatches)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"has incompatible routing config ({keys_str}); "
+                                "starting a dedicated proxy on a different port instead."
+                            )
+                            persistent_routing_mismatch = True
+                        else:
+                            missing = []
+                            if memory and not running_config.get("memory"):
+                                missing.append("memory")
+                            if learn and not running_config.get("learn"):
+                                missing.append("learn")
+                            if code_graph and not running_config.get("code_graph"):
+                                missing.append("code-graph")
 
-                    missing = []
-                    if memory and not running_config.get("memory"):
-                        missing.append("memory")
-                    if learn and not running_config.get("learn"):
-                        missing.append("learn")
-                    if code_graph and not running_config.get("code_graph"):
-                        missing.append("code-graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
-
-                    if missing:
-                        flags_str = ", ".join(f"--{f}" for f in missing)
-                        click.echo(
-                            f"  Recovered persistent deployment '{manifest.profile}' is missing: "
-                            f"{flags_str}; restarting..."
-                        )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted with requested features."
-                        )
-                    return None, port
+                            if not missing:
+                                return None, port
+                            flags_str = ", ".join(f"--{f}" for f in missing)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"is missing: {flags_str}; restarting..."
+                            )
+                            if helpers._restart_persistent_proxy(manifest, port):
+                                return None, port
+                            raise click.ClickException(
+                                f"Persistent deployment '{manifest.profile}' on port {port} "
+                                "could not be restarted with requested features."
+                            )
                 elif helpers._check_proxy(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
                     )
-            click.echo(
-                f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
-                "is stale; starting a fresh proxy instead."
-            )
+            if not persistent_routing_mismatch:
+                click.echo(
+                    f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
+                    "is stale; starting a fresh proxy instead."
+                )
 
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+        if (
+            not isolated_copilot_subscription_proxy
+            and not persistent_routing_mismatch
+            and helpers._check_proxy(port)
+        ):
             # Proxy is running — check if it has the features we need
             needs_restart = False
+            # Set False when the running proxy must not serve this session at
+            # all (routing-level mismatch with live clients attached): fall
+            # through to a fresh start on a different port.
+            reuse_running = True
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
+            routing_mismatches = (
+                None
+                if running_config is None
+                else helpers._proxy_routing_mismatches(
+                    running_config,
+                    backend=requested_backend,
+                    requested_api_urls=requested_api_urls,
+                )
+            )
+            if running_config is None and not helpers._proxy_needs_version_restart(health_payload):
+                # A proxy that exposes no config block cannot be checked for
+                # feature or routing compatibility, and without a reported PID
+                # it cannot be restarted either. Reusing it blindly is the
+                # silent-misrouting incident class; start a dedicated proxy on
+                # a free port instead (mirrors the persistent branch, which
+                # already treats config-unavailable as not-reusable).
+                click.echo(
+                    f"  Proxy on port {port} did not expose its config; "
+                    "starting a dedicated proxy on a different port instead of "
+                    "reusing it unchecked."
+                )
+                reuse_running = False
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
@@ -4384,28 +4530,37 @@ def _ensure_proxy_unlocked(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"current CLI is {_HEADROOM_VERSION}."
                     )
-                    click.echo(
-                        f"  Leaving it running because {detail} "
-                        "are still attached; it will be restarted when idle."
-                    )
-                    return None, port
+                    if routing_mismatches or running_config is None:
+                        click.echo(
+                            f"  Not reusing it because its routing "
+                            f"{'cannot be verified' if running_config is None else 'is incompatible'}; "
+                            "starting a dedicated proxy on a different port instead."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Leaving it running because {detail} "
+                            "are still attached; it will be restarted when idle."
+                        )
+                        return None, port
 
-                click.echo(
-                    f"  Proxy on port {port} is running Headroom {running_version}; "
-                    f"restarting with {_HEADROOM_VERSION}..."
-                )
-                proxy_pid = running_config.get("pid") if running_config is not None else None
-                if proxy_pid is None:
-                    raise click.ClickException(
-                        f"Proxy on port {port} is stale but did not expose a PID. "
-                        "Stop it manually and retry."
+                else:
+                    click.echo(
+                        f"  Proxy on port {port} is running Headroom {running_version}; "
+                        f"restarting with {_HEADROOM_VERSION}..."
                     )
-                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                    raise click.ClickException(
-                        f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
-                        "Stop it manually and retry."
-                    )
-                needs_restart = True
+                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    if proxy_pid is None:
+                        raise click.ClickException(
+                            f"Proxy on port {port} is stale but did not expose a PID. "
+                            "Stop it manually and retry."
+                        )
+                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        raise click.ClickException(
+                            f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
+                            "Stop it manually and retry."
+                        )
+                    needs_restart = True
 
             if running_config is not None:
                 missing = []
@@ -4415,30 +4570,14 @@ def _ensure_proxy_unlocked(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
-                if copilot_subscription_seed_requested:
-                    missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
                 if (
                     expected_savings_profile is not None
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
-                if vertex_api_url or clear_vertex_api_url:
-                    running_vertex_url = _normalize_proxy_api_url(
-                        running_config.get("vertex_api_url")
-                    )
-                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-                    if running_vertex_url != requested_vertex_url:
-                        missing.append("vertex-api-url")
 
-                if missing:
+                if missing and not routing_mismatches:
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
@@ -4483,7 +4622,47 @@ def _ensure_proxy_unlocked(
                             )
                             return None, port
 
-            if not needs_restart:
+                # Routing-level config (backend, upstream URLs) must match in
+                # both directions. Unlike missing feature flags, reusing a
+                # proxy that forwards to a backend/upstream the caller did not
+                # request is broken, not degraded, so "reuse as-is" is never an
+                # option here (cf. the factory-api-url fail-loud precedent on
+                # the droid branch and the tenant check in wrap auggie).
+                routing_mismatches = [] if needs_restart else (routing_mismatches or [])
+                if routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    if other_wrappers or active_sessions > 0:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}), but live session(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy on a different port instead "
+                            "of reusing or disrupting it."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}); restarting with the requested config..."
+                        )
+                        proxy_pid = running_config.get("pid")
+                        if proxy_pid is None:
+                            raise click.ClickException(
+                                f"Proxy on port {port} has incompatible routing config "
+                                f"({keys_str}) but did not expose a PID. "
+                                "Stop it manually and retry."
+                            )
+                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                            raise click.ClickException(
+                                f"Failed to stop incompatible proxy (PID {proxy_pid}) "
+                                f"on port {port}. Stop it manually and retry."
+                            )
+                        needs_restart = True
+
+            if not needs_restart and reuse_running:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port
@@ -4614,31 +4793,13 @@ def _client_marker_path(port: int) -> Path:
 
 
 def _proc_identity(pid: int) -> tuple[str, float] | None:
-    """Best-effort ``(source, start_time)`` identity for a PID.
+    """Module-level alias of :func:`headroom._subprocess.proc_identity`.
 
-    Used to defeat PID reuse: a marker is only trusted while the live PID is
-    *the same process* that wrote it. Returns ``None`` when start time can't be
-    determined (e.g. macOS without psutil), in which case callers fall back to
-    existence-only liveness — no regression, just no reuse protection there.
-
-    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
-    different units; we only compare like-for-like.
+    Kept as a function (not an assignment) so tests can monkeypatch
+    ``wrap._proc_identity`` and have ``_identity_mismatch`` pick the patch up
+    through the module-global lookup below.
     """
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
-
-        return ("psutil", psutil.Process(pid).create_time())
-    except Exception:
-        pass
-    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
-    # since boot — a stable per-process value. `comm` (field 2) may contain
-    # spaces/parens, so split after the final ')'.
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            fields = fh.read().rpartition(b")")[2].split()
-        return ("proc", float(fields[19]))
-    except (OSError, IndexError, ValueError):
-        return None
+    return proc_identity(pid)
 
 
 def _register_proxy_client(port: int) -> None:
@@ -4675,21 +4836,9 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
-    """True only if ``pid``'s current identity *provably* differs from the
-    recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
-
-    Conservative by design: any uncertainty (unknown/legacy identity, unknown
-    start time, mismatched source) returns ``False`` — never claim a mismatch
-    without proof, since the caller uses this to decide whether to trust or
-    discard state tied to a live PID.
-    """
-    if not isinstance(src, str) or not isinstance(recorded, int | float):
-        return False  # legacy / identity-less record — can't tell
-    ident = _proc_identity(pid)
-    if ident is None or ident[0] != src:
-        return False  # can't compare like-for-like — don't claim mismatch
-    # Start times are stable per process; >1s apart means a different process.
-    return abs(ident[1] - float(recorded)) > 1.0
+    """Delegate to the shared comparison, resolving the identity probe through
+    this module so monkeypatched ``_proc_identity`` keeps working in tests."""
+    return _shared_identity_mismatch(src, recorded, pid, identity_fn=_proc_identity)
 
 
 def _marker_pid_reused(marker: Path, pid: int) -> bool:
@@ -4699,6 +4848,8 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
     try:
         rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
         return False
     return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
 
@@ -4730,61 +4881,21 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
 
 
 def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
-    """Create a cleanup function that terminates the proxy on exit.
-
-    Only kills the proxy when no other live headroom-wrapped clients remain,
-    tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
+    """Create marker cleanup for a successfully launched wrap session.
 
     ``port`` can be an ``int`` or a ``list[int]``.  When a port fallback occurs
     (``_ensure_proxy`` ups the port because the requested one is busy), the
     caller can update ``port[0]`` in-place and the closure picks it up.
-    """
 
-    def _other_clients_exist() -> bool:
-        p = port[0] if isinstance(port, list) else port
-        return len(_live_proxy_clients(p, exclude_self=True)) > 0
+    Normal wrapper exit only unregisters its marker. The wrap-owned proxy's
+    watchdog owns final shutdown so active markerless HTTP or WebSocket traffic
+    receives a full grace period. Startup rollback and explicit stop commands
+    retain direct process termination.
+    """
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
         p = port[0] if isinstance(port, list) else port
         _unregister_proxy_client(p)
-        proc = proxy_proc_holder[0] if proxy_proc_holder else None
-        if proc:
-            if _other_clients_exist():
-                # Other clients still using the proxy — leave it running.
-                return
-            # Snapshot the serving PID before terminating the launcher.  On
-            # Windows the detached serving child can briefly make /health
-            # unavailable while the launcher exits, causing the later safety
-            # probe to classify our own listener as "unidentified" and leave
-            # it orphaned.  We still verify it through Headroom's health
-            # payload before trusting the PID.
-            serving_pid: int | None = None
-            if sys.platform == "win32" and _check_proxy(p):
-                running_config = _query_proxy_config(p)
-                try:
-                    serving_pid = int(running_config["pid"]) if running_config else None
-                except (KeyError, TypeError, ValueError):
-                    serving_pid = None
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            # On Windows the proxy launcher can exit while its detached
-            # serving child remains alive (the native runtime uses a child
-            # process).  The detachment is intentional so an ungraceful
-            # terminal close cannot disrupt other wrappers, but a graceful
-            # Ctrl+C from the last wrapper must still stop the listener.
-            if sys.platform == "win32" and _check_proxy(p):
-                stop_status = _stop_local_proxy_for_unwrap(p)
-                if stop_status == "unidentified" and serving_pid is not None:
-                    stop_status = "stopped" if _kill_proxy_by_pid(serving_pid, p) else "failed"
-                if stop_status not in {"stopped", "not_running"}:
-                    click.echo(
-                        f"  Warning: proxy on port {p} remained running "
-                        f"after shutdown ({stop_status})."
-                    )
 
     return cleanup
 
@@ -4842,6 +4953,12 @@ def _launch_tool(
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, _exit_on_signal)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the wrapper dies unhandled, the `finally` below never runs, and
+    # the proxy it spawned is reparented to PID 1 and leaks. Mirrors the
+    # SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     try:
         click.echo()
@@ -5136,6 +5253,47 @@ def wrap(ctx: click.Context) -> None:
     """
     if _should_purge_context_tools(ctx):
         _report_context_tool_purge()
+    # Every wrap path copies os.environ into the launched agent and the proxy,
+    # and probes the proxy over loopback itself, so one fix here covers all.
+    added = _ensure_loopback_no_proxy(os.environ)
+    if added:
+        # stderr: `wrap <tool> --prepare-only` prints machine-read JSON on stdout.
+        click.echo(
+            f"  Added 127.0.0.1,localhost,::1 to {'/'.join(added)} so the agent reaches "
+            "Headroom directly instead of through your HTTP proxy.",
+            err=True,
+        )
+
+
+_LOOPBACK_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _ensure_loopback_no_proxy(env: MutableMapping[str, str]) -> list[str]:
+    """Exempt loopback from ``HTTP(S)_PROXY`` in ``env``; return the vars written.
+
+    With a corporate proxy exported and no loopback entry in ``NO_PROXY``, an
+    agent sends its ``http://127.0.0.1:<port>`` requests to the corporate proxy,
+    which cannot reach this machine and answers with a block page or 502.
+    ``NO_PROXY`` and ``no_proxy`` are merged before writing both, because tools
+    disagree on which spelling wins and dropping either side's entries would
+    re-route the user's own internal hosts.
+    """
+    from headroom.proxy.tls_diagnostics import loopback_no_proxy_gap
+
+    if loopback_no_proxy_gap(env) is None:
+        return []
+    merged: list[str] = []
+    for var in ("NO_PROXY", "no_proxy"):
+        for entry in env.get(var, "").split(","):
+            entry = entry.strip()
+            if entry and entry not in merged:
+                merged.append(entry)
+    merged.extend(h for h in _LOOPBACK_NO_PROXY_HOSTS if h not in merged)
+    value = ",".join(merged)
+    written = [var for var in ("NO_PROXY", "no_proxy") if env.get(var) != value]
+    for var in written:
+        env[var] = value
+    return written
 
 
 @main.group()
@@ -6186,34 +6344,59 @@ def unwrap_vscode_copilot(settings_file: Path | None) -> None:
     default=True,
     help="Safely add/update Claude Code's proxy environment settings",
 )
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Persist Claude Code's [1m] model selector in settings for the 1M "
+        "context window (issue #3360)."
+    ),
+)
 def vscode_claude(
     port: int,
     memory: bool,
     settings_file: Path | None,
     configure: bool,
+    context_1m: bool,
 ) -> None:
     """Route VS Code's official Claude Code extension through Headroom.
 
     Run this from your project, reload VS Code after first setup, and keep this
     command running while using Claude Code. Authentication and model selection
-    remain unchanged. Run `headroom unwrap vscode-claude` to restore settings.
+    remain unchanged. Use --1m to opt into Claude Code's client-owned 1M model
+    selector. Run `headroom unwrap vscode-claude` to restore settings.
     """
     target_settings = settings_file or claude_user_settings_path()
 
     def _print_setup(actual_port: int) -> None:
         proxy_url = vscode_claude_proxy_url(actual_port, _project_name_from_cwd())
         if configure:
-            action = configure_vscode_claude_settings(target_settings, proxy_url)
+            action = configure_vscode_claude_settings(
+                target_settings, proxy_url, context_1m=context_1m
+            )
             click.echo(f"  VS Code Claude Code proxy settings {action}: {target_settings}")
+            if context_1m:
+                click.echo(
+                    f"  1M context model persisted: {resolve_vscode_claude_model(target_settings)}"
+                )
             click.echo("  Next: Reload VS Code, then use the Claude Code panel.")
             click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
-            click.echo("  Authentication and the selected Claude model are preserved.")
+            if context_1m:
+                click.echo("  Authentication is preserved; the 1M model selector is enabled.")
+            else:
+                click.echo("  Authentication and the selected Claude model are preserved.")
             click.echo("  Undo later with: headroom unwrap vscode-claude")
             click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
         click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
+        if context_1m:
+            click.echo(f"  Add this top-level setting to {target_settings}:")
+            click.echo(
+                f'  "model": "{resolve_vscode_claude_model_for_instructions(target_settings)}"'
+            )
 
     _run_proxy_only_watcher(
         agent_label="VS CODE CLAUDE",
@@ -6650,86 +6833,6 @@ def aider(
         learn=learn,
         memory=memory,
         agent_type="aider",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
-# OpenClaude
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openclaude_args", nargs=-1, type=click.UNPROCESSED)
-def openclaude(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openclaude_args: tuple,
-) -> None:
-    """Launch OpenClaude through Headroom proxy.
-
-    \b
-    OpenClaude is a prose-format coding CLI (like Aider / Cline); it speaks
-    OpenAI- and Anthropic-compatible HTTP, so wrap routes both base URLs
-    through the local proxy — same env shape as `wrap aider`.
-
-    \b
-    Examples:
-        headroom wrap openclaude                         # Start proxy + openclaude
-        headroom wrap openclaude -- --model gpt-4o       # Pass args to openclaude
-    """
-    if prepare_only:
-        return
-
-    openclaude_bin = shutil.which("openclaude")
-    if not openclaude_bin:
-        click.echo("Error: 'openclaude' not found in PATH.")
-        click.echo("Install OpenClaude before running `headroom wrap openclaude`.")
-        raise SystemExit(1)
-
-    env, env_vars_display = _build_aider_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
-
-    _launch_tool(
-        binary=openclaude_bin,
-        args=openclaude_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENCLAUDE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openclaude",
         code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
@@ -7372,190 +7475,6 @@ def continue_dev(
 
 
 # =============================================================================
-# Goose (Block)
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
-def goose(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    goose_args: tuple,
-) -> None:
-    """Launch Goose (Block) CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls
-    through Headroom.
-
-    \b
-    Uninstall: there is no ``headroom unwrap goose`` subcommand — nothing is
-    written to the project.
-
-    \b
-    Examples:
-        headroom wrap goose                          # Start proxy + goose
-        headroom wrap goose -- session               # Start a Goose session
-        headroom wrap goose -- --provider anthropic  # Pass args to goose
-    """
-    if prepare_only:
-        return
-
-    goose_bin = shutil.which("goose")
-    if not goose_bin:
-        click.echo("Error: 'goose' not found in PATH.")
-        click.echo("Install Goose: https://block.github.io/goose/")
-        raise SystemExit(1)
-
-    # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-    ]
-
-    _launch_tool(
-        binary=goose_bin,
-        args=goose_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="GOOSE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="goose",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
-# OpenHands
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_retired_context_tool_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openhands_args", nargs=-1, type=click.UNPROCESSED)
-def openhands(
-    port: int,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openhands_args: tuple,
-) -> None:
-    """Launch OpenHands CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL / ANTHROPIC_BASE_URL to route OpenHands' API calls
-    through Headroom. Nothing is written to disk, so there is nothing to undo.
-
-    \b
-    Examples:
-        headroom wrap openhands                # Start proxy + openhands
-        headroom wrap openhands -- --task ...  # Pass args to openhands
-    """
-    if prepare_only:
-        return
-
-    openhands_bin = shutil.which("openhands")
-    if not openhands_bin:
-        click.echo("Error: 'openhands' not found in PATH.")
-        click.echo("Install OpenHands: https://docs.all-hands.dev/")
-        raise SystemExit(1)
-
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    # Also set LLM_BASE_URL for OpenHands' generic LLM provider config.
-    env["LLM_BASE_URL"] = openai_base
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-        f"LLM_BASE_URL={openai_base}",
-    ]
-    _launch_tool(
-        binary=openhands_bin,
-        args=openhands_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENHANDS",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openhands",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
 # OpenClaw
 # =============================================================================
 
@@ -7990,6 +7909,7 @@ def opencode(
         ),
     )
 
+    launch_started = False
     try:
         # If the proxy fell back to a different port, move our marker so
         # cleanup tracking stays accurate and update MCP config.
@@ -8018,24 +7938,35 @@ def opencode(
 
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
-        _launch_tool(
-            binary=opencode_bin,
-            args=opencode_args,
-            env=env,
-            port=actual_port,
-            no_proxy=True,
-            tool_label="OPENCODE",
-            env_vars_display=env_vars_display,
-            learn=learn,
-            memory=memory,
-            agent_type="opencode",
-            code_graph=code_graph,
-            backend=backend,
-            anyllm_provider=anyllm_provider,
-            region=region,
-        )
+        launch_started = True
+        try:
+            _launch_tool(
+                binary=opencode_bin,
+                args=opencode_args,
+                env=env,
+                port=actual_port,
+                no_proxy=True,
+                tool_label="OPENCODE",
+                env_vars_display=env_vars_display,
+                learn=learn,
+                memory=memory,
+                agent_type="opencode",
+                code_graph=code_graph,
+                backend=backend,
+                anyllm_provider=anyllm_provider,
+                region=region,
+            )
+        except SystemExit as exc:
+            # _launch_tool raises plain SystemExit after a child exits, but
+            # chains pre-launch failures as the cause.
+            if exc.__cause__ is not None:
+                launch_started = False
+            raise
+        except BaseException:
+            launch_started = False
+            raise
     finally:
-        if _opencode_proxy and _opencode_proxy.poll() is None:
+        if not launch_started and _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)
             if not _other:
                 _opencode_proxy.terminate()
@@ -8539,3 +8470,101 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+# =============================================================================
+# Registry-generated wrap commands
+# =============================================================================
+# Env-var tools are described declaratively in headroom.providers.wrap_registry;
+# one click command per WrapTarget is generated here.
+
+
+def _make_registry_command(target: WrapTarget) -> click.Command:
+    def _run(
+        port: int,
+        code_graph: bool,
+        no_proxy: bool,
+        learn: bool,
+        memory: bool,
+        backend: str | None,
+        anyllm_provider: str | None,
+        region: str | None,
+        verbose: bool,
+        prepare_only: bool,
+        tool_args: tuple,
+    ) -> None:
+        if prepare_only:
+            return
+
+        tool_bin = shutil.which(target.binary)
+        if not tool_bin:
+            click.echo(f"Error: '{target.binary}' not found in PATH.")
+            click.echo(target.install_hint)
+            raise SystemExit(1)
+
+        env, env_vars_display = _build_registry_launch_env(
+            target,
+            port,
+            os.environ,
+            project=_project_name_from_cwd() if target.project_prefix else None,
+        )
+
+        _launch_tool(
+            binary=tool_bin,
+            args=tool_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label=target.name.upper(),
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type=target.name,
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
+
+    _run.__doc__ = target.help_text
+    command: Any = _run
+    # Same option surface as the hand-written commands these replaced.
+    for decorator in (
+        click.argument(
+            "tool_args",
+            nargs=-1,
+            type=click.UNPROCESSED,
+            metavar=f"[{target.name.upper()}_ARGS]...",
+        ),
+        click.option("--prepare-only", is_flag=True, hidden=True),
+        click.option("--verbose", "-v", is_flag=True, help="Verbose output"),
+        click.option("--region", default=None, help="Cloud region for Bedrock/Vertex"),
+        click.option("--anyllm-provider", default=None, help="Provider for any-llm backend"),
+        click.option(
+            "--backend",
+            default=None,
+            help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc.",
+        ),
+        click.option("--memory", is_flag=True, help="Enable persistent cross-session memory"),
+        click.option("--learn", is_flag=True, help="Enable live traffic learning"),
+        click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)"),
+        click.option(
+            "--code-graph",
+            is_flag=True,
+            help="Enable code graph indexing via codebase-memory-mcp (optional)",
+        ),
+        click.option(
+            "--port",
+            "-p",
+            default=8787,
+            type=click.IntRange(1, 65535),
+            help="Proxy port (default: 8787)",
+        ),
+        _retired_context_tool_option,
+    ):
+        command = decorator(command)
+    return click.command(target.name, context_settings={"ignore_unknown_options": True})(command)
+
+
+for _target in WRAP_TARGETS.values():
+    wrap.add_command(_make_registry_command(_target))

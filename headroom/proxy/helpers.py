@@ -93,7 +93,11 @@ from headroom.proxy.tool_definition_serialization import (
     serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
+    CcrToolInjectionMode,
     ToolInjectionStickyMode,
+)
+from headroom.proxy.tool_injection_config import (
+    get_ccr_tool_injection_mode as _get_ccr_tool_injection_mode,
 )
 from headroom.proxy.tool_injection_config import (
     get_tool_injection_sticky_mode as _get_tool_injection_sticky_mode,
@@ -2287,6 +2291,15 @@ def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     return _get_tool_injection_sticky_mode()
 
 
+def get_ccr_tool_injection_mode() -> CcrToolInjectionMode:
+    """Return when the CCR retrieval tool enters the tools array.
+
+    Read at request time so operators can flip behaviour without a restart.
+    Unknown values raise loudly per the no-silent-fallback build constraint.
+    """
+    return _get_ccr_tool_injection_mode()
+
+
 def get_tool_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionToolTracker` (sessions cap)."""
     return _get_tool_tracker_max_sessions()
@@ -2686,6 +2699,7 @@ def apply_session_sticky_ccr_tool(
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
     history_has_ccr_reference: bool = False,
+    allow_eager: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2741,7 +2755,9 @@ def apply_session_sticky_ccr_tool(
     # definition and the provider rejects the request because history still
     # references it (#2440).
     if not session_id:
-        if not (has_compressed_content_this_turn or history_has_ccr_reference):
+        # See the fresh-session branch below for what gates eager injection.
+        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+        if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2757,7 +2773,7 @@ def apply_session_sticky_ccr_tool(
             session_id=None,
             decision="inject_first_time"
             if has_compressed_content_this_turn
-            else "inject_history_reference",
+            else ("inject_history_reference" if history_has_ccr_reference else "inject_eager"),
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2807,8 +2823,37 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, True
 
-    # Fresh session — only inject when this turn produced compressed content.
-    if not has_compressed_content_this_turn:
+    # Fresh session. `tools` is the head of Anthropic's cache key, so the
+    # moment this tool enters the array decides what it costs. Waiting for the
+    # first compression means entering against a fully warm prefix and
+    # invalidating all of it — measured on a customer session at 113,888 tokens
+    # of cache write to save 2,205 tokens of content, a ~594-turn payback that
+    # no session reaches. The definition is ~119 tokens; injecting it on the
+    # first request instead folds that cost into the cache write the session
+    # was always going to pay, and the array never changes again.
+    #
+    # The historical gate is still reachable via HEADROOM_CCR_TOOL_INJECTION=lazy
+    # for operators who would rather keep the tool out of conversations that
+    # never compress. A spurious call costs a round trip, not an error: an
+    # unknown hash resolves to a structured {"status": "missing"} tool result
+    # (see CCRResponseHandler._execute_retrieval), not an exception or a 400.
+    #
+    # Eager injection needs three things to be true, because it is the one path
+    # that touches the tools array before anything has been compressed:
+    #
+    #   allow_eager -- the caller confirms it may rewrite this request's tools
+    #     at all. Under `--no-optimize` or a bypass header nothing will ever be
+    #     compressed, so the tool would be permanently unredeemable; the old
+    #     gate got this for free because no compression meant no injection.
+    #   a non-empty client tools array -- adding the first entry would turn a
+    #     no-tools request into a tools request and let the model emit tool_use
+    #     blocks the client never expected (#728). Such a client also has no
+    #     tool results to compress, so there is no warm tools segment to
+    #     protect. The cache problem is a harness problem, and harnesses always
+    #     send tools.
+    #   the eager mode -- operators can restore the historical gate.
+    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+    if not (eager or has_compressed_content_this_turn):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2824,7 +2869,7 @@ def apply_session_sticky_ccr_tool(
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
-        decision="inject_first_time",
+        decision="inject_first_time" if has_compressed_content_this_turn else "inject_eager",
         tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )
@@ -3946,6 +3991,11 @@ def inject_tool_search_deferral(
 # ---------------------------------------------------------------------------
 
 _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
+# A client-side tool-search result (a plain ``tool_result`` carrying
+# ``tool_reference`` blocks) that is left with no resolvable references keeps
+# this text as its content, so its paired ``tool_use`` stays valid -- dropping
+# the block outright would orphan the tool_use (which 400s on its own).
+_CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
 def _tool_search_reference_names(content: Any) -> list[str]:
@@ -3980,10 +4030,12 @@ _TOOL_SEARCH_PLACEHOLDER_BLOCK: dict[str, Any] = {
 def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any, int]:
     """Neutralize tool-search blocks this request's ``tools`` array cannot support.
 
-    A block pair is unsupportable when the request carries no ``tool_search_tool_*``
-    tool, or when a ``tool_reference`` names a tool absent from ``tools`` — the two
-    shapes Anthropic rejects. Both the ``tool_search_tool_result`` and its paired
-    ``server_tool_use`` are handled (an orphan of either 400s on its own).
+    Server-side search block pairs require a matching search mechanism and
+    referenced tools in the outbound tools array. Unsupported pairs are
+    replaced in place. Client-side ``tool_result`` references need only their
+    target definitions: missing references are removed from the nested result,
+    with ``_CLIENT_TOOL_REF_PLACEHOLDER`` retaining an otherwise empty result
+    so its paired ``tool_use`` is not orphaned.
 
     Replace in place rather than remove (#3456). The block indexes of a message
     are load-bearing: ``thinking_block_fingerprint`` keys a signed thinking block
@@ -4033,8 +4085,41 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
 
         neutralize_indexes: set[int] = set()
         orphaned_ids: set[str] = set()
+        rewrites: dict[int, Any] = {}
         for index, block in enumerate(content):
-            if not isinstance(block, dict) or block.get("type") != _TOOL_SEARCH_RESULT_TYPE:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            # Client-side shape: a plain tool_result carrying tool_reference
+            # blocks. Keep resolvable references (deferred-but-present included);
+            # drop the unsupportable ones. If none survive, swap the content for
+            # a placeholder so the paired tool_use is not orphaned.
+            if block_type == "tool_result" and isinstance(block.get("content"), list):
+                inner = block["content"]
+                if any(isinstance(b, dict) and b.get("type") == "tool_reference" for b in inner):
+                    kept_inner: list[Any] = []
+                    dropped = 0
+                    for b in inner:
+                        if isinstance(b, dict) and b.get("type") == "tool_reference":
+                            # Validated against the available definitions ONLY.
+                            # A built-in tool_search_tool_* is deliberately not
+                            # required: Anthropic supports a custom client-side
+                            # search that returns tool_reference blocks from a
+                            # plain tool_use/tool_result pair, referencing the
+                            # top-level tools array. Gating on the server tool
+                            # deleted those valid references.
+                            name = b.get("tool_name") or b.get("name")
+                            if name is not None and str(name) not in available:
+                                dropped += 1
+                                continue
+                        kept_inner.append(b)
+                    if dropped:
+                        new_block = dict(block)
+                        new_block["content"] = kept_inner or _CLIENT_TOOL_REF_PLACEHOLDER
+                        rewrites[index] = new_block
+                        removed += dropped
+                continue
+            if block_type != _TOOL_SEARCH_RESULT_TYPE:
                 continue
             names = _tool_search_reference_names(block.get("content"))
             if has_search_tool and all(name in available for name in names):
@@ -4053,7 +4138,7 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
             if str(block.get("id", "")) in orphaned_ids or (is_search_call and not has_search_tool):
                 neutralize_indexes.add(index)
 
-        if not neutralize_indexes:
+        if not neutralize_indexes and not rewrites:
             out.append(message)
             continue
 
@@ -4061,7 +4146,9 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         removed += len(neutralize_indexes)
         repaired = dict(message)
         repaired["content"] = [
-            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK) if index in neutralize_indexes else block
+            dict(_TOOL_SEARCH_PLACEHOLDER_BLOCK)
+            if index in neutralize_indexes
+            else rewrites.get(index, block)
             for index, block in enumerate(content)
         ]
         out.append(repaired)

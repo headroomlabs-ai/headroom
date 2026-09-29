@@ -186,6 +186,71 @@ class TestStreamingRatelimitHeaderForwarding:
         assert result.headers.get("cf-ray") is None
 
     @pytest.mark.asyncio
+    async def test_compression_metrics_headers_on_streaming(self):
+        """The streaming path stamps the same x-headroom-* metrics as the buffered one."""
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-20250514",
+            request_id="test-metrics",
+            original_tokens=1000,
+            optimized_tokens=400,
+            tokens_saved=600,
+            transforms_applied=["smart_crusher", "read_lifecycle:stale:/a,b.py"],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.headers.get("x-headroom-tokens-before") == "1000"
+        assert result.headers.get("x-headroom-tokens-after") == "400"
+        assert result.headers.get("x-headroom-tokens-saved") == "600"
+        assert result.headers.get("x-headroom-model") == "claude-sonnet-4-20250514"
+        # Comma-bearing detail is collapsed so the header still splits into tags.
+        transforms = result.headers.get("x-headroom-transforms")
+        assert transforms is not None and transforms.split(",")[0] == "smart_crusher"
+        assert "/a,b.py" not in transforms
+        # Upstream headers are still forwarded alongside.
+        assert result.headers.get("x-request-id") == "req-12345"
+
+    @pytest.mark.asyncio
+    async def test_no_transforms_header_when_nothing_was_applied(self):
+        """A request nothing touched still reports its counts, but no empty transforms."""
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-test"},
+            body={"model": "m", "max_tokens": 1, "stream": True, "messages": []},
+            provider="anthropic",
+            model="m",
+            request_id="test-noop",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.headers.get("x-headroom-tokens-saved") == "0"
+        assert result.headers.get("x-headroom-transforms") is None
+
+    @pytest.mark.asyncio
     async def test_request_id_headers_forwarded_in_streaming(self):
         """The request-id family is forwarded on the streaming path (#1100)."""
         proxy = self._create_mock_proxy()

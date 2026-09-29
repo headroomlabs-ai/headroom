@@ -1173,10 +1173,16 @@ def _read_output_should_be_protected(text: Any) -> bool:
     if not isinstance(text, str) or not text:
         return False
     try:
-        return _detect_content(text).content_type not in _RELEASABLE_READ_TYPES
+        detection = _detect_content(text)
     except Exception:
         # Detection failure → protect (preserve the byte-exact default).
         return True
+    if detection.metadata.get("format") == "fixed_width":
+        # Space-aligned columns are also what hand-aligned files look like
+        # (/etc/fstab, a block of C #defines), so a READ of one stays
+        # byte-exact. Only delimited and markdown tables are released.
+        return True
+    return detection.content_type not in _RELEASABLE_READ_TYPES
 
 
 def _create_content_signature(
@@ -2390,6 +2396,36 @@ class ContentRouter(Transform):
             "on",
         }
 
+    def _force_kompress_ready(self) -> bool:
+        """Return whether forced Kompress routing can actually run.
+
+        ``force_kompress`` is an opt-in routing preference, not a reason to
+        disable every other compressor. A cold or unavailable ML model used to
+        turn otherwise compressible logs/JSON into a silent passthrough because
+        the forced KOMPRESS strategy returned its input and the normal
+        structural fallback was never considered. Keep the background warmup,
+        but let the regular detector choose a safe structural compressor until
+        the model is ready.
+        """
+        if not self.config.enable_kompress:
+            return False
+        try:
+            compressor = self._get_kompress()
+        except Exception:
+            return False
+        if compressor is None:
+            return False
+        try:
+            ready = bool(compressor.is_ready())
+        except Exception:
+            return False
+        if not ready:
+            try:
+                compressor.ensure_background_load()
+            except Exception:
+                logger.debug("Kompress background warmup failed", exc_info=True)
+        return ready
+
     def _kompress_model_ready(self) -> bool:
         """Whether the ML compressor is ready (or deliberately disabled).
 
@@ -2580,6 +2616,11 @@ class ContentRouter(Transform):
             # force Kompress, skip the full router detection path so large
             # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            # Forced routing is only meaningful while the ML compressor is
+            # ready. On a cold cache, preserve the normal content detector so
+            # structured compressors can still make progress instead of the
+            # forced passthrough masking them.
+            force_kompress = force_kompress and self._force_kompress_ready()
             if force_kompress:
                 mixed = False
                 detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
@@ -3906,10 +3947,13 @@ class ContentRouter(Transform):
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
+            # TABULAR is deliberately absent: a table the tabular compressor
+            # declined (ragged rows, #1652) or could not shrink stays verbatim.
+            # Kompress drops words inside rows, so it would remove fields from
+            # some rows and not others with nothing marking which (#3652).
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
-                CompressionStrategy.TABULAR,
                 CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
@@ -3989,8 +4033,8 @@ class ContentRouter(Transform):
             # actually shorter — never inflating, never doing worse than the
             # strategy output. DIFF is excluded (Kompress corrupts ``git
             # apply``); TEXT/KOMPRESS already ran Kompress; CODE_AWARE has its
-            # own inline no-shrink fallback; SMART_CRUSHER/TABULAR use the
-            # zero-savings fallback above.
+            # own inline no-shrink fallback; SMART_CRUSHER uses the
+            # zero-savings fallback above; TABULAR never goes to Kompress.
             if (
                 self._lossless_then_lossy
                 and compressed is not None

@@ -568,7 +568,11 @@ def _restart_race_manifest():
         runtime_kind = "python"
         supervisor_kind = "service"
         scope = "user"
+        port = 8787
         health_url = "http://127.0.0.1:8787/readyz"
+        backend = "anthropic"
+        targets: list[str] = []
+        tool_envs: dict[str, dict[str, str]] = {}
         mutations: list = []
 
     return Manifest()

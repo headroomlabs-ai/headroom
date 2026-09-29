@@ -13,6 +13,7 @@ pub mod observability;
 pub mod proxy;
 pub mod responses_items;
 pub mod sse;
+pub mod tls;
 pub mod vertex;
 pub mod websocket;
 

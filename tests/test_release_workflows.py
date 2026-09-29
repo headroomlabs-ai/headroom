@@ -183,6 +183,36 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "steps.image-name.outputs.image_name" in content
 
 
+def test_docker_bake_metadata_never_travels_through_env() -> None:
+    """Bake metadata must reach scripts through a file, never through ``env:``.
+
+    The runner exports every ``env:`` entry when it spawns bash, and bake
+    metadata for the larger targets exceeds the kernel's per-string limit, so
+    the step dies with "Argument list too long" before its script runs.
+    f3d5392c fixed this by piping the JSON through a heredoc file; the arm64
+    rework (ed36676c) reintroduced an unused ``env: BAKE_METADATA`` beside that
+    heredoc, and every build job of a Docker run can fail on it again.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+
+    offenders = [
+        f"{job_name} / {step.get('name', step.get('id'))} / {key}"
+        for job_name, job in workflow["jobs"].items()
+        for step in job.get("steps", [])
+        for key, value in (step.get("env") or {}).items()
+        if "outputs.metadata" in str(value)
+    ]
+    assert not offenders, f"bake metadata passed via env (E2BIG risk): {offenders}"
+
+    export = next(
+        step
+        for step in workflow["jobs"]["docker-build"]["steps"]
+        if step.get("name") == "Export digest"
+    )
+    assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
+    assert "${{ steps.bake.outputs.metadata }}" in export["run"]
+
+
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
     jobs = workflow["jobs"]

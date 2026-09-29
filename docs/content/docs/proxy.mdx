@@ -13,8 +13,10 @@ Running a local OpenAI-compatible model? See [Local LLM prefill benchmarking](/d
 # Basic usage
 headroom proxy
 
-# Custom host and port
-headroom proxy --host 0.0.0.0 --port 8080
+# Deliberate public access, with the existing token protocol
+HEADROOM_PROXY_TOKEN='replace-with-a-secret' headroom proxy --host 0.0.0.0 --port 8080
+# Send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller.
 
 # With logging and budget
 headroom proxy \
@@ -272,7 +274,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 | `--connect-timeout-seconds` | `10` | Upstream connect timeout (seconds). |
 | `--retry-max-attempts` | `3` | Upstream retries on transient failure. |
 | `--limit-concurrency` | `1000` | Concurrent connections before returning 503. |
-| `--rpm` / `--tpm` | `60` / `100000` | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
+| `--rpm` / `--tpm` | `60` / unlimited | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
 | `--budget` / `--budget-period` | none / `daily` | Spend cap in USD per period; over-budget requests get 429. |
 | `--workers` / `HEADROOM_WORKERS` | `1` | Uvicorn worker processes. |
 
@@ -337,6 +339,8 @@ with a privileged job.
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
+| `HEADROOM_CERT_STORE` | `system,bundled` | Trusted roots for upstream TLS: OS certificate store and/or certifi. See [Corporate Networks](/docs/corporate-networks). |
+| `HEADROOM_CA_BUNDLE` | unset | Extra PEM roots (e.g. a Zscaler root) added to the trusted set. |
 
 ### Performance
 
@@ -927,7 +931,9 @@ Rewriting the request body invalidates the caller's **SigV4** signature (it cove
 ## Environment variables
 
 ```bash
+# For deliberate public access, configure the existing token and send it from callers.
 export HEADROOM_HOST=0.0.0.0
+export HEADROOM_PROXY_TOKEN='replace-with-a-secret'
 export HEADROOM_PORT=8787
 export HEADROOM_BUDGET=100.0
 
@@ -954,6 +960,8 @@ gunicorn "headroom.proxy.server:create_app()" \
   --workers 4 \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker
+# Callers must send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret`.
 ```
 
 `headroom.proxy.server` has no module-level `app` object — it exposes a `create_app(config: ProxyConfig | None = None) -> FastAPI` factory, so gunicorn's import string must call it.
@@ -967,8 +975,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y build-essential && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 EXPOSE 8787
-CMD ["headroom", "proxy", "--host", "0.0.0.0"]
+CMD ["headroom", "proxy", "--host", "0.0.0.0", "--port", "8787"]
 ```
+
+Run this image with an explicit token and a deliberate publication choice:
+
+```bash
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e HEADROOM_PROXY_TOKEN='replace-with-a-secret' \
+  headroom-proxy
+```
+
+Callers must send `Authorization: Bearer replace-with-a-secret` or
+`X-Headroom-Proxy-Token: replace-with-a-secret`. For network access, replace
+the host-side `127.0.0.1` with an intentional public address and keep the
+token configured.
 
 <Callout type="info" title="Build dependencies">
 `build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension compiled from source. It is removed after installation to keep the image slim.
