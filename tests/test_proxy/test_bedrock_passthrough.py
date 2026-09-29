@@ -328,6 +328,30 @@ def test_upstream_connect_error_returns_502():
     assert resp.status_code == 502
 
 
+def test_oversized_body_returns_413_and_never_forwards(monkeypatch):
+    """A body over MAX_REQUEST_BODY_SIZE gets a 413 fail-closed response, and
+    _forward_bedrock is never reached: a partially-read oversized body must
+    not go out to the gateway.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        body = {"messages": [{"role": "user", "content": "x" * (small_cap * 4)}], "max_tokens": 8}
+        resp = client.post(INVOKE, json=body)
+
+    assert resp.status_code == 413
+    assert resp.json()["error"]["type"] == "request_too_large"
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
 # ── metrics ───────────────────────────────────────────────────────────
 
 
