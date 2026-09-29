@@ -587,7 +587,22 @@ def test_openai_responses_adapter_accepts_empty_input_list():
     assert strategy_chain == []
 
 
-def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("mcp__headroom__headroom_retrieve", "{}"),
+        # Hermes' single-underscore MCP alias and OpenCode's doubled prefix,
+        # which the old ``== / endswith("__headroom_retrieve")`` check missed.
+        ("mcp_headroom_headroom_retrieve", "{}"),
+        ("headroom_headroom_retrieve", "{}"),
+        # Hermes deferred-tool bridge, batch shape (#3837).
+        (
+            "tool_call",
+            '{"calls": [{"name": "headroom_retrieve", "arguments": {"hash": "abc"}}]}',
+        ),
+    ],
+)
+def test_openai_responses_adapter_preserves_headroom_retrieve_outputs(name, arguments):
     router = ContentRouter()
 
     def compress(self, content: str, **_kwargs):
@@ -606,8 +621,8 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
             {
                 "type": "function_call",
                 "call_id": "call_retrieve",
-                "name": "mcp__headroom__headroom_retrieve",
-                "arguments": "{}",
+                "name": name,
+                "arguments": arguments,
             },
             {
                 "type": "function_call_output",

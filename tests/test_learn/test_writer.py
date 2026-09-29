@@ -9,6 +9,9 @@ from headroom.learn.writer import (
     _MARKER_END,
     _MARKER_START,
     ClaudeCodeWriter,
+    CodexWriter,
+    GeminiWriter,
+    GrokWriter,
     _merge_into_file,
     _parse_prior_recommendations,
     _read_text_tolerant,
@@ -570,3 +573,60 @@ class TestEncodingResilience:
         raw = memory_md.read_bytes()
         assert b"\r\r" not in raw
         assert raw.count(b"\r") == raw.count(b"\r\n")
+
+
+@pytest.mark.windows_newline
+class TestNewlineContract:
+    """Regression guard for #3594 / #3698 — every learn-writer write pins LF.
+
+    This asserts the *call*, not the artifact, on purpose. ``Path.write_text``
+    with ``newline=None`` translates ``\n`` through ``TextIOWrapper``, whose
+    translation target is chosen at C-compile time (``#ifdef MS_WINDOWS``), not
+    read from ``os.linesep`` at runtime. So on POSIX no fixture can make the
+    unpinned call emit CRLF, and every artifact-level assertion here passes
+    with the fix reverted. Spying on the kwarg fails the moment a pin is
+    dropped, on any platform — which is the property #3698 asked for.
+    """
+
+    def test_every_learn_writer_write_pins_lf(self, tmp_path, monkeypatch):
+        proj = _project(tmp_path)
+        context_rec = _rec(RecommendationTarget.CONTEXT_FILE, "Environment", "- Use uv")
+        memory_rec = _rec(RecommendationTarget.MEMORY_FILE, "Errors", "- rule 1")
+
+        # Seed a legacy CLAUDE.md that carries a headroom block *and*
+        # hand-written prose, so ClaudeCodeWriter's migration branch (which
+        # rewrites the cleaned CLAUDE.md) is exercised alongside the rest.
+        (proj.project_path / "CLAUDE.md").write_text(
+            _legacy_block("Build Commands", "- cargo check"), encoding="utf-8"
+        )
+
+        calls: list[tuple[Path, str | None]] = []
+        original = Path.write_text
+
+        def spy(self, data, encoding=None, errors=None, newline=None):
+            calls.append((self, newline))
+            return original(self, data, encoding=encoding, errors=errors, newline=newline)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+
+        ClaudeCodeWriter().write([context_rec, memory_rec], proj, dry_run=False)
+        CodexWriter().write([context_rec, memory_rec], proj, dry_run=False)
+        GeminiWriter().write([context_rec], proj, dry_run=False)
+        GrokWriter().write([context_rec], proj, dry_run=False)
+
+        assert calls, "no writes captured — this test no longer drives the writers"
+        unpinned = sorted(str(path) for path, newline in calls if newline != "\n")
+        assert not unpinned, f"learn writers wrote without newline='\\n': {unpinned}"
+
+        # All seven write sites in headroom/learn/writer.py are reached above;
+        # if a writer grows a new target, this set fails loudly rather than
+        # letting an unguarded write site slip in.
+        assert {path.name for path, _ in calls} == {
+            "CLAUDE.local.md",  # ClaudeCodeWriter context target
+            "CLAUDE.md",  # legacy-migration rewrite
+            "MEMORY.md",  # ClaudeCodeWriter memory target
+            "AGENTS.md",  # CodexWriter context target
+            "instructions.md",  # CodexWriter memory target
+            "GEMINI.md",  # GeminiWriter
+            "GROK.md",  # GrokWriter
+        }

@@ -56,7 +56,7 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
-from headroom.config import unwrap_tool_call_name
+from headroom.config import is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
@@ -2177,9 +2177,10 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            if isinstance(name, str) and (
-                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
-            ):
+            # Same matcher ContentRouter uses for its ccr_retrieve guard, so the
+            # MCP alias forms (mcp__srv__x, Hermes' mcp_srv_x, OpenCode's
+            # headroom_headroom_retrieve) are recognized here too.
+            if isinstance(name, str) and is_tool_excluded(name, ("headroom_retrieve",)):
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
 
@@ -2191,7 +2192,6 @@ class OpenAIHandlerMixin:
             DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
             DEFAULT_EXCLUDE_TOOLS,
             DEFAULT_VERBATIM_EXCLUDE_TOOLS,
-            is_tool_excluded,
         )
 
         router_exclude_tools = getattr(router.config, "exclude_tools", None)
