@@ -1,4 +1,4 @@
-"""SIGHUP must tear the proxy down on every wrap path, not just ``claude``.
+"""SIGHUP must run wrap cleanup on every wrap path, not just ``claude``.
 
 Closing a terminal (or ``tmux kill-session``) delivers SIGHUP, not SIGTERM.
 ``claude()`` learned to catch it in #1768/#3205, but the two shared paths that
@@ -7,10 +7,12 @@ every other wrapped tool goes through did not:
 * ``_launch_tool`` -- Pattern-A (codex, aider, copilot, goose, openhands, ...)
 * ``_run_proxy_only_watcher`` -- Pattern-B (cursor, cline, continue)
 
-Unhandled SIGHUP kills the wrapper outright, so the ``finally: cleanup()`` that
-terminates the proxy never runs. The proxy is in its own session, survives, and
-is reparented to PID 1 -- a leaked listener that no later wrap invocation will
-ever reap.
+Unhandled SIGHUP kills the wrapper outright, so the ``finally: cleanup()`` never
+runs. Since #3202 cleanup no longer terminates the proxy itself: it unregisters
+this wrapper's client marker, and the wrap-owned proxy's orphan watchdog stops
+the proxy once no live markers (and no traffic) remain. A wrapper that dies
+without cleanup leaves a marker behind that only goes stale when its PID does,
+so SIGHUP handling still decides how promptly the proxy is released.
 """
 
 from __future__ import annotations
@@ -134,8 +136,8 @@ def test_proxy_only_watcher_installs_sighup_handler(
 
 # Harness driving the real `_launch_tool` under a real SIGHUP. Only
 # `_ensure_proxy` is stubbed -- to a live child process standing in for the
-# proxy -- so the signal handler, the `finally`, and `_make_cleanup`'s
-# terminate are all the shipping implementations.
+# proxy -- so the signal handler, the `finally`, marker registration and
+# `_make_cleanup` are all the shipping implementations.
 _HARNESS = textwrap.dedent(
     """
     import os, subprocess, sys
@@ -191,8 +193,18 @@ def _pid_alive(pid: int) -> bool:
 
 
 @requires_sighup
-def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
-    """End-to-end: real SIGHUP to a real wrapper must not leak the proxy."""
+def test_sighup_on_launch_tool_releases_the_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end: a real SIGHUP runs cleanup, releasing the wrapper's claim on the proxy.
+
+    Cleanup unregisters the client marker, which is what lets the wrap-owned
+    proxy's orphan watchdog stop the proxy (#3202). The wrapper itself must not
+    kill the proxy: other clients, or in-flight markerless traffic, may still be
+    using it.
+    """
+    from headroom import paths
+
     harness = tmp_path / "harness.py"
     harness.write_text(_HARNESS, encoding="utf-8")
     pid_file = tmp_path / "proxy.pid"
@@ -200,6 +212,8 @@ def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
 
     env = dict(os.environ)
     env["HEADROOM_WORKSPACE_DIR"] = str(tmp_path / "workspace")
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", env["HEADROOM_WORKSPACE_DIR"])
+    marker_dir = paths.proxy_clients_dir(18787)
 
     # Own session/process group: the wrapper's children (stand-in proxy and
     # stand-in CLI) inherit it, so the cleanup below can reap the whole tree
@@ -215,12 +229,19 @@ def test_sighup_on_launch_tool_reaps_the_proxy(tmp_path: Path) -> None:
         assert _wait_for(ready.exists), "harness never reached _ensure_proxy inside _launch_tool"
         proxy_pid = int(pid_file.read_text())
         assert _pid_alive(proxy_pid), "stand-in proxy should be running"
+        marker = marker_dir / f"{wrapper.pid}.json"
+        assert _wait_for(marker.exists), "wrapper never registered as a proxy client"
 
         os.kill(wrapper.pid, signal.SIGHUP)
 
         assert _wait_for(lambda: wrapper.poll() is not None), "wrapper survived SIGHUP"
-        assert _wait_for(lambda: not _pid_alive(proxy_pid)), (
-            f"proxy {proxy_pid} outlived the wrapper -- it would be reparented to PID 1 and leak"
+        assert not marker.exists(), (
+            "SIGHUP skipped cleanup: the stale client marker keeps the wrap-owned "
+            "proxy's orphan watchdog from ever releasing the proxy"
+        )
+        assert _pid_alive(proxy_pid), (
+            "wrapper killed the proxy on exit; since #3202 the proxy's orphan "
+            "watchdog owns shutdown so other clients and in-flight traffic survive"
         )
     finally:
         try:

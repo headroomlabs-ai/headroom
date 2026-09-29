@@ -2532,6 +2532,12 @@ class AnthropicHandlerMixin:
                         existing_tools=tools,
                         has_compressed_content_this_turn=injector.has_compressed_content,
                         history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
+                        # `preserve_tool_order` is this handler's existing name
+                        # for "leave the client's tools alone" (bypass, or
+                        # optimization off). Those requests never compress, so
+                        # injecting ahead of a compression that will not happen
+                        # would leave an unredeemable tool in the array.
+                        allow_eager=not preserve_tool_order,
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -5100,6 +5106,19 @@ class AnthropicHandlerMixin:
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
 
+                # An untrusted TLS-inspection root is the one failure worth
+                # spelling out: it is environmental, never transient, and the
+                # message names only the certificate issuer and the fix.
+                from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+                # Probe the host that actually failed: `url` is the per-request
+                # upstream (Copilot, a custom gateway) once it has been built;
+                # an exception raised before that point never reached a host.
+                _failed_url = locals().get("url")
+                tls_hint = await describe_upstream_failure_async(
+                    e, _failed_url if isinstance(_failed_url, str) else self.ANTHROPIC_API_URL
+                )
+
                 # Return sanitized error message to client (don't expose internal details)
                 return JSONResponse(
                     status_code=502,
@@ -5107,7 +5126,8 @@ class AnthropicHandlerMixin:
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": "An error occurred while processing your request. Please try again.",
+                            "message": tls_hint
+                            or "An error occurred while processing your request. Please try again.",
                         },
                     },
                 )

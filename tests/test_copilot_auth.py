@@ -19,7 +19,7 @@ def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.Monk
 
     captured = {}
 
-    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout, context=None):  # noqa: ANN001, ANN202
         captured["request"] = request
         return io.BytesIO(b'{"device_code":"d","user_code":"u"}')
 
@@ -37,7 +37,7 @@ def test_device_poll_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) 
 
     captured = {}
 
-    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout, context=None):  # noqa: ANN001, ANN202
         captured["request"] = request
         return io.BytesIO(b'{"access_token":"gho-test"}')
 
@@ -1601,7 +1601,7 @@ def test_exchange_token_sync_raises_for_http_error(monkeypatch: pytest.MonkeyPat
         def close(self) -> None:
             return None
 
-    def fake_urlopen(request, timeout: float):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout: float, context=None):  # noqa: ANN001, ANN202
         raise urllib_error.HTTPError(
             url=request.full_url,
             code=404,

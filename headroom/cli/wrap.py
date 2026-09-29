@@ -33,7 +33,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -5194,6 +5194,47 @@ def wrap(ctx: click.Context) -> None:
     """
     if _should_purge_context_tools(ctx):
         _report_context_tool_purge()
+    # Every wrap path copies os.environ into the launched agent and the proxy,
+    # and probes the proxy over loopback itself, so one fix here covers all.
+    added = _ensure_loopback_no_proxy(os.environ)
+    if added:
+        # stderr: `wrap <tool> --prepare-only` prints machine-read JSON on stdout.
+        click.echo(
+            f"  Added 127.0.0.1,localhost,::1 to {'/'.join(added)} so the agent reaches "
+            "Headroom directly instead of through your HTTP proxy.",
+            err=True,
+        )
+
+
+_LOOPBACK_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _ensure_loopback_no_proxy(env: MutableMapping[str, str]) -> list[str]:
+    """Exempt loopback from ``HTTP(S)_PROXY`` in ``env``; return the vars written.
+
+    With a corporate proxy exported and no loopback entry in ``NO_PROXY``, an
+    agent sends its ``http://127.0.0.1:<port>`` requests to the corporate proxy,
+    which cannot reach this machine and answers with a block page or 502.
+    ``NO_PROXY`` and ``no_proxy`` are merged before writing both, because tools
+    disagree on which spelling wins and dropping either side's entries would
+    re-route the user's own internal hosts.
+    """
+    from headroom.proxy.tls_diagnostics import loopback_no_proxy_gap
+
+    if loopback_no_proxy_gap(env) is None:
+        return []
+    merged: list[str] = []
+    for var in ("NO_PROXY", "no_proxy"):
+        for entry in env.get(var, "").split(","):
+            entry = entry.strip()
+            if entry and entry not in merged:
+                merged.append(entry)
+    merged.extend(h for h in _LOOPBACK_NO_PROXY_HOSTS if h not in merged)
+    value = ",".join(merged)
+    written = [var for var in ("NO_PROXY", "no_proxy") if env.get(var) != value]
+    for var in written:
+        env[var] = value
+    return written
 
 
 @main.group()

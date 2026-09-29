@@ -550,11 +550,11 @@ def test_start_proxy_strips_ambient_worker_configuration(
 
     monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(
         wrap_mod,
         "_get_proxy_stdio_log_path",
-        lambda: tmp_path / "proxy-stdio.log",
+        lambda port=None: tmp_path / "proxy-stdio.log",
     )
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
 
@@ -574,11 +574,11 @@ def test_start_proxy_timeout_kills_failed_new_process(
     proc = _FakeProxyProc()
     monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: proc)
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(
         wrap_mod,
         "_get_proxy_stdio_log_path",
-        lambda: tmp_path / "proxy-stdio.log",
+        lambda port=None: tmp_path / "proxy-stdio.log",
     )
     monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 1)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
