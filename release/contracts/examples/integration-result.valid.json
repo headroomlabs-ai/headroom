@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "result_id": "integration-codex-openai-3077ac81",
+  "created_at": "2026-08-13T05:30:00Z",
+  "integration": "Codex",
+  "provider": "OpenAI",
+  "execution_depth": "rc",
+  "candidate_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6",
+  "artifact": {
+    "name": "headroom-ai",
+    "version": "0.36.0rc1",
+    "filename": "headroom_ai-0.36.0rc1-py3-none-any.whl",
+    "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "size_bytes": 1048576
+  },
+  "rollout": {
+    "schema_version": 1,
+    "policy_version": "1",
+    "channel": "stable",
+    "registry_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "snapshot_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "unsafe_override": false,
+    "qualification_eligible": true
+  },
+  "environment": {
+    "runner": "github-hosted",
+    "platform": "linux/amd64",
+    "image": "ubuntu-24.04",
+    "resource_limits": { "cpu": 4, "memory_gib": 16 }
+  },
+  "checks": {
+    "install": "pass",
+    "configuration": "pass",
+    "route_reached": "pass",
+    "realistic_tool_task": "pass",
+    "streaming": "pass",
+    "tool_calls_and_results": "pass",
+    "compression_telemetry": "pass",
+    "passthrough_and_failure": "pass"
+  },
+  "status": "pass",
+  "reasons": [],
+  "producer": {
+    "repository": "headroomlabs-ai/headroom",
+    "workflow": "release-integration.yml",
+    "run_id": 123456790,
+    "run_attempt": 1,
+    "commit_sha": "3077ac81e8ef3ddefebbe308ea37a4e9bb2100e6"
+  }
+}
