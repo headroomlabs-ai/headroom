@@ -165,6 +165,15 @@ def test_passthrough_handler_roots_profile_at_origin_and_strips_region_domain():
                 200,
                 request=httpx.Request(kwargs["method"], kwargs["url"]),
                 json={"id": "p1", "region_domain": "us-east.bob.ibm.com"},
+                # Validators/integrity metadata describe the unfiltered bytes.
+                headers={
+                    "ETag": '"upstream-v1"',
+                    "Last-Modified": "Mon, 28 Sep 2026 00:00:00 GMT",
+                    "Cache-Control": "max-age=60",
+                    "Content-Digest": "sha-256=:dW5maWx0ZXJlZA==:",
+                    "Digest": "SHA-256=dW5maWx0ZXJlZA==",
+                    "X-Request-Id": "req-1",
+                },
             )
 
     class _ProfileRequest:
@@ -183,3 +192,8 @@ def test_passthrough_handler_roots_profile_at_origin_and_strips_region_domain():
     assert handler.http_client.calls == ["https://api.us-east.bob.ibm.com/admin/v1/profile"]
     assert response.status_code == 200
     assert json.loads(response.body) == {"id": "p1"}
+    forwarded = {k.lower() for k in response.headers}
+    stale = {"etag", "last-modified", "cache-control", "content-digest", "digest"}
+    assert not forwarded & stale, "filtered body must not carry the upstream's validators"
+    assert response.headers["x-request-id"] == "req-1"
+    assert response.headers["content-type"] == "application/json"

@@ -11197,6 +11197,18 @@ class OpenAIHandlerMixin:
             filtered = strip_origin_passthrough_response_keys(base_url, path, response_content)
             if filtered is not None:
                 response_content = filtered
+                # The upstream's validators and digests describe the
+                # unfiltered bytes; forwarding them would let a cache or
+                # integrity check pair them with this different body.
+                response_headers = _sanitize_forwarded_response_headers(
+                    response.headers,
+                    "etag",
+                    "last-modified",
+                    "cache-control",
+                    "content-digest",
+                    "digest",
+                    "content-type",
+                )
                 response_headers["content-type"] = "application/json"
 
         if provider == "anthropic" and endpoint_name == "models":
