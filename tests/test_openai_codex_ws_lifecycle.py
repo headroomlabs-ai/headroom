@@ -70,6 +70,47 @@ class _DummyMetrics:
         self.codex_ws_frames.append(dict(kwargs))
 
 
+class _MemoryWsHandler:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(
+            inject_context=False,
+            inject_tools=True,
+            project_root_override="",
+        )
+        self._backend = False
+
+    def compute_memory_tool_definitions(self, provider: str) -> list[dict]:
+        assert provider == "openai"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": "Search memory.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+    async def _ensure_initialized(self) -> None:
+        self._backend = True
+
+    async def _execute_memory_tool(
+        self,
+        name: str,
+        args: dict,
+        user_id: str,
+        provider: str,
+    ) -> str:
+        assert (name, args, user_id, provider) == (
+            "memory_search",
+            {},
+            user_id,
+            "openai",
+        )
+        return '{"memories": []}'
+
+
 class _DummyOpenAIHandler(OpenAIHandlerMixin):
     OPENAI_API_URL = "https://api.openai.com"
 
@@ -154,7 +195,13 @@ class _FakeWebSocket:
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = dict(headers or {"authorization": "Bearer test"})
+        self.headers = dict(
+            headers
+            or {
+                "authorization": "Bearer test",
+                "user-agent": "codex-cli/0.5",
+            }
+        )
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends
@@ -371,7 +418,8 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
     sent = json.loads(upstream.sent[0])
     payload = sent["response"]
     assert "<headroom_output_shaping>" in payload["instructions"]
-    assert payload["text"]["verbosity"] == "low"
+    # text.verbosity is no longer injected: steering is the only lever.
+    assert "text" not in payload
     assert any(t == "output_shaper:verbosity:L2" for t in outcomes[-1].transforms_applied)
 
 
@@ -1739,3 +1787,519 @@ async def test_ws_recognized_client_with_real_path_is_not_restamped():
     # the caller already self-identifies via its User-Agent.
     assert "x-client" not in {k.lower() for k in client_ws.headers}
     assert handler.ws_sessions.active_count() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store", [True, False])
+@pytest.mark.parametrize(
+    "include",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param(["response.output_text.done"], id="missing-marker"),
+        pytest.param(
+            ["response.output_text.done", "reasoning.encrypted_content"],
+            id="existing-marker",
+        ),
+        pytest.param("not-a-list", id="non-list"),
+    ],
+)
+async def test_ws_memory_continuation_replays_history_without_previous_response_id(include, store):
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "remember this",
+                        "store": store,
+                    },
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    if include is not None:
+        client_ws._frames[0] = json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5.4",
+                    "input": "remember this",
+                    "store": store,
+                    "include": include,
+                },
+            }
+        )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) >= 2
+    expected_include = (
+        ["reasoning.encrypted_content"]
+        if include is None
+        else (
+            include
+            if not isinstance(include, list)
+            else (
+                include
+                if "reasoning.encrypted_content" in include
+                else [*include, "reasoning.encrypted_content"]
+            )
+        )
+    )
+    assert json.loads(upstream.sent[0])["response"]["include"] == expected_include
+    continuation = json.loads(upstream.sent[1])
+    assert "previous_response_id" not in continuation["response"]
+    assert continuation["response"]["model"] == "gpt-5.4"
+    assert continuation["response"]["store"] is store
+    assert continuation["response"]["include"] == expected_include
+    assert continuation["response"]["tools"]
+    assert continuation["response"]["instructions"]
+    assert continuation["response"]["input"] == [
+        {"role": "user", "content": "remember this"},
+        function_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"memories": []}',
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_frame",
+    [
+        pytest.param("not-json", id="initial-non-json"),
+        pytest.param(
+            json.dumps({"type": "response.create", "response": []}),
+            id="initial-non-mapping-response",
+        ),
+    ],
+)
+async def test_ws_memory_frame_shape_guards_fail_open(initial_frame):
+    later_frames = [
+        json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-5.4", "input": []},
+            }
+        ),
+        json.dumps({"type": "response.create", "response": "invalid"}),
+    ]
+    frames = [initial_frame, *later_frames]
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=frames, hold_after_initial=True)
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    async def _trigger_disconnect() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger_disconnect())
+        try:
+            await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+        finally:
+            trigger_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await trigger_task
+
+    assert upstream.sent[0] == initial_frame
+    forwarded_valid = json.loads(upstream.sent[1])["response"]
+    assert forwarded_valid["model"] == "gpt-5.4"
+    assert forwarded_valid["input"] == []
+    assert forwarded_valid["tools"]
+    assert forwarded_valid["include"] == ["reasoning.encrypted_content"]
+    assert upstream.sent[2] == later_frames[1]
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_enabled_non_memory_response_streams_completion():
+    message_item = {
+        "type": "message",
+        "id": "message-1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "hello"}],
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    forwarded_initial = json.loads(upstream.sent[0])["response"]
+    assert forwarded_initial["model"] == "gpt-5.4"
+    assert forwarded_initial["input"] == "hi"
+    assert forwarded_initial["tools"]
+    assert forwarded_initial["include"] == ["reasoning.encrypted_content"]
+    assert client_ws.sent_text == upstream_events
+    assert len(upstream.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_ws_late_memory_call_after_streamed_message_passes_through():
+    message_item = {
+        "type": "message",
+        "id": "message-1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "searching"}],
+    }
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert client_ws.sent_text == upstream_events
+    assert len(upstream.sent) == 1
+    assert executed == []
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_handles_invalid_item_arguments_and_unavailable_backend():
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{malformed",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.done", "item": "invalid"}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    async def _leave_backend_unavailable():
+        return None
+
+    handler.memory_handler._ensure_initialized = _leave_backend_unavailable
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 2
+    continuation = json.loads(upstream.sent[1])["response"]
+    assert continuation["input"] == [
+        {"role": "user", "content": "hi"},
+        function_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": '{"error": "backend not ready"}',
+        },
+    ]
+    assert continuation["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"error": "backend not ready"}',
+    }
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_normalizes_malformed_arguments():
+    function_call = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{malformed",
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.done", "item": "invalid"}),
+        json.dumps({"type": "response.output_item.added", "item": function_call}),
+        json.dumps({"type": "response.output_item.done", "item": function_call}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert executed == [("memory_search", {}, "user-1", "openai")]
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_tools_preserve_explicit_store_false_while_injecting():
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "use stateless memory",
+                        "store": False,
+                    },
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 1
+    initial = json.loads(upstream.sent[0])["response"]
+    assert initial["store"] is False
+    assert [tool["name"] for tool in initial["tools"]] == ["memory_search"]
+    assert initial["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.asyncio
+async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call():
+    function_call_one = {
+        "type": "function_call",
+        "id": "fc-1",
+        "call_id": "call-1",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    function_call_two = {
+        "type": "function_call",
+        "id": "fc-2",
+        "call_id": "call-2",
+        "name": "memory_search",
+        "arguments": "{}",
+    }
+    reasoning_without_encryption = {
+        "type": "reasoning",
+        "id": "reasoning-1",
+        "summary": [],
+    }
+    reasoning_with_encryption = {
+        "type": "reasoning",
+        "id": "reasoning-2",
+        "summary": [],
+        "encrypted_content": "encrypted-2",
+    }
+    message_item = {
+        "type": "message",
+        "id": "message-2",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "searching"}],
+    }
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.output_item.added", "item": reasoning_without_encryption}),
+        json.dumps({"type": "response.output_item.done", "item": reasoning_without_encryption}),
+        json.dumps({"type": "response.output_item.added", "item": function_call_one}),
+        json.dumps({"type": "response.output_item.done", "item": function_call_one}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-1"}}),
+        json.dumps({"type": "response.created", "response": {"id": "r-2"}}),
+        json.dumps({"type": "response.output_item.added", "item": reasoning_with_encryption}),
+        json.dumps({"type": "response.output_item.done", "item": reasoning_with_encryption}),
+        json.dumps({"type": "response.output_item.added", "item": message_item}),
+        json.dumps({"type": "response.output_item.done", "item": message_item}),
+        json.dumps({"type": "response.output_item.added", "item": function_call_two}),
+        json.dumps({"type": "response.output_item.done", "item": function_call_two}),
+        json.dumps({"type": "response.completed", "response": {"id": "r-2"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "model": "gpt-5.4",
+                        "input": "remember this",
+                        "client_metadata": {
+                            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+                            "keep": "yes",
+                        },
+                    },
+                }
+            )
+        ],
+        hold_after_initial=True,
+    )
+    client_ws.headers["x-headroom-user-id"] = "user-1"
+    handler = _DummyOpenAIHandler()
+    handler.memory_handler = _MemoryWsHandler()
+    executed: list[tuple[str, dict, str, str]] = []
+
+    async def _execute_memory_tool(name, args, user_id, provider):
+        executed.append((name, args, user_id, provider))
+        return '{"memories": []}'
+
+    handler.memory_handler._execute_memory_tool = _execute_memory_tool
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert len(upstream.sent) == 2
+    first_continuation = json.loads(upstream.sent[1])["response"]["input"]
+    assert reasoning_without_encryption not in first_continuation
+    assert function_call_one in first_continuation
+    assert {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": '{"memories": []}',
+    } in first_continuation
+    assert json.loads(upstream.sent[1])["response"]["client_metadata"] == {"keep": "yes"}
+
+    second_response = [json.loads(frame) for frame in client_ws.sent_text]
+    assert [event["type"] for event in second_response] == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert second_response[0]["response"]["id"] == "r-2"
+    assert second_response[2]["item"] == reasoning_with_encryption
+    assert second_response[3]["item"] == message_item
+    assert second_response[4]["item"] == message_item
+    assert second_response[5]["item"] == function_call_two
+    assert second_response[6]["item"] == function_call_two
+    assert second_response[7]["response"]["id"] == "r-2"
+    assert executed == [("memory_search", {}, "user-1", "openai")]
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_track_model_per_response_create():
+    """A model switch on one WS session must affect the next request outcome."""
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "model": "model-a",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "r_2"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_2",
+                    "model": "model-b",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            }
+        ),
+    ]
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-a", "input": "first turn"},
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "model-b", "input": "second turn"},
+        }
+    )
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert [request["model"] for request in handler.metrics.recorded_requests] == [
+        "model-a",
+        "model-b",
+    ]

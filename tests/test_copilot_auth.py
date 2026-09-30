@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from urllib import error as urllib_error
 import pytest
 
 from headroom import copilot_auth
+from headroom.proxy import ssl_context
 
 
 def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -17,7 +19,7 @@ def test_device_authorization_uses_form_encoded_request(monkeypatch: pytest.Monk
 
     captured = {}
 
-    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout, context=None):  # noqa: ANN001, ANN202
         captured["request"] = request
         return io.BytesIO(b'{"device_code":"d","user_code":"u"}')
 
@@ -35,7 +37,7 @@ def test_device_poll_uses_form_encoded_request(monkeypatch: pytest.MonkeyPatch) 
 
     captured = {}
 
-    def fake_urlopen(request, timeout):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout, context=None):  # noqa: ANN001, ANN202
         captured["request"] = request
         return io.BytesIO(b'{"access_token":"gho-test"}')
 
@@ -90,6 +92,63 @@ def test_read_cached_oauth_token_prefers_headroom_login(
     copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
 
     assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+
+
+def test_saved_oauth_token_file_content_roundtrips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token still writes and reads back after the private-write change."""
+    copilot_auth.save_headroom_copilot_oauth_token("gho-headroom")
+    assert copilot_auth.read_cached_oauth_token() == "gho-headroom"
+    # Re-saving over an existing file rotates the token cleanly.
+    copilot_auth.save_headroom_copilot_oauth_token("gho-rotated")
+    assert copilot_auth.read_cached_oauth_token() == "gho-rotated"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_saved_oauth_token_file_is_private_under_permissive_umask() -> None:
+    """The token file must be 0o600 even under a permissive umask.
+
+    The atomic writer creates the file via ``tempfile.mkstemp`` (always 0o600,
+    umask-independent) and ``os.replace``s it into place, so the destination is
+    private from birth with no world-readable window. Forcing ``umask(0o022)``
+    (which would make a plain ``write_text`` land 0o644) confirms the mode does
+    not depend on umask.
+    """
+    old_umask = os.umask(0o022)
+    try:
+        path = Path(copilot_auth.save_headroom_copilot_oauth_token("gho-headroom"))
+    finally:
+        os.umask(old_umask)
+
+    assert path.exists()
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_token_write_failure_preserves_existing_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed write must fail CLOSED: the old token survives, no secret leaks.
+
+    The write goes to a private temp file and is atomically renamed in, so a
+    failure at the rename never truncates or replaces the existing file (unlike
+    the earlier create-or-narrow-in-place approach, which opened the destination
+    ``O_TRUNC`` before writing). The temp file is cleaned up so no secret is left
+    behind in a stray path.
+    """
+    copilot_auth.save_headroom_copilot_oauth_token("gho-original")
+    path = copilot_auth.headroom_copilot_auth_path()
+    before = set(os.listdir(path.parent))
+
+    monkeypatch.setattr(copilot_auth.os, "replace", _boom)
+    with pytest.raises(OSError):
+        copilot_auth.save_headroom_copilot_oauth_token("gho-should-not-land")
+
+    # Old token intact; no partial/temp file left behind.
+    assert copilot_auth.read_cached_oauth_token() == "gho-original"
+    assert set(os.listdir(path.parent)) == before
+
+
+def _boom(*_args: object, **_kwargs: object) -> None:
+    raise OSError("simulated write failure")
 
 
 def test_default_oauth_domain_uses_enterprise_url_host(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -900,6 +959,14 @@ def test_is_copilot_api_url_matches_ghe_copilot_hosts() -> None:
     assert not copilot_auth.is_copilot_api_url("https://not-copilot-api.acme.ghe.com/v1/responses")
 
 
+def test_is_copilot_upstream_url_matches_public_and_enterprise_hosts() -> None:
+    assert copilot_auth.is_copilot_upstream_url("https://api.githubcopilot.com/v1/messages/batches")
+    assert copilot_auth.is_copilot_upstream_url(
+        "https://copilot-api.acme.ghe.com/v1/messages/batches"
+    )
+    assert not copilot_auth.is_copilot_upstream_url("https://api.anthropic.com/v1/messages/batches")
+
+
 def test_is_copilot_api_url_trusts_configured_enterprise_api_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -986,7 +1053,9 @@ def test_build_copilot_upstream_url_strips_v1_for_configured_enterprise_api_url(
 
 
 def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1018,7 +1087,9 @@ def test_apply_copilot_api_auth_replaces_authorization(monkeypatch: pytest.Monke
 def test_apply_copilot_api_auth_passes_through_existing_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         raise AssertionError("provider should not be called for existing API token")
 
     monkeypatch.setattr(
@@ -1044,7 +1115,9 @@ def test_apply_copilot_api_auth_passes_through_existing_api_token(
 def test_apply_copilot_api_auth_replaces_managed_seeded_api_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-refreshed",
             expires_at=time.time() + 3600,
@@ -1117,7 +1190,9 @@ def test_apply_copilot_api_auth_passes_through_github_oauth_bearer(
 def test_apply_copilot_api_auth_replaces_non_bearer_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1172,7 +1247,9 @@ def test_is_forwardable_copilot_bearer_token_matches_expected_prefixes() -> None
 def test_apply_copilot_api_auth_injects_required_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1203,7 +1280,9 @@ def test_apply_copilot_api_auth_injects_required_headers(
 def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1237,7 +1316,9 @@ def test_apply_copilot_api_auth_preserves_existing_copilot_headers(
 def test_apply_copilot_api_auth_preserves_existing_headers_case_insensitively(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fake_get_api_token() -> copilot_auth.CopilotAPIToken:
+    async def fake_get_api_token(
+        *, integration_id: str | None = None
+    ) -> copilot_auth.CopilotAPIToken:
         return copilot_auth.CopilotAPIToken(
             token="copilot-session",
             expires_at=time.time() + 3600,
@@ -1520,7 +1601,7 @@ def test_exchange_token_sync_raises_for_http_error(monkeypatch: pytest.MonkeyPat
         def close(self) -> None:
             return None
 
-    def fake_urlopen(request, timeout: float):  # noqa: ANN001, ANN202
+    def fake_urlopen(request, timeout: float, context=None):  # noqa: ANN001, ANN202
         raise urllib_error.HTTPError(
             url=request.full_url,
             code=404,
@@ -1601,3 +1682,36 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     )
 
     assert result == payload
+
+
+def test_exchange_token_sync_uses_configured_corporate_tls_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copilot refresh must use the same corporate trust config as upstream I/O."""
+    payload = {"token": "copilot-api", "expires_at": int(time.time()) + 3600}
+    tls_context = object()
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def read(self) -> bytes:
+            return json.dumps(payload).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def fake_urlopen(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr(ssl_context, "build_urlopen_context", lambda: tls_context)
+    monkeypatch.setattr(copilot_auth.urllib_request, "urlopen", fake_urlopen)
+
+    result = copilot_auth.CopilotTokenProvider._exchange_token_sync(
+        {"Authorization": "Bearer gho_test"}  # noqa: S105
+    )
+
+    assert result == payload
+    assert captured["context"] is tls_context

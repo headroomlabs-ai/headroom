@@ -104,18 +104,23 @@ def _invoke_wrap_claude(
     monkeypatch.setattr(wrap_mod, "detect_claude_code_version", lambda *_a, **_k: (2, 1, 196))
     monkeypatch.setattr(wrap_mod.subprocess, "run", fake_run)
 
-    result = runner.invoke(
-        main,
-        [
-            "wrap",
-            "claude",
-            "--no-mcp",
-            "--no-tokensave",
-            "--no-serena",
-            *extra_args,
-        ],
-        env=env,
-    )
+    # Isolate cwd: the wrap flow writes .claude/settings.local.json (selfheal
+    # hook, stale-marker check) relative to cwd, and with shutil.which patched
+    # above a run from the repo root would poison the real repo settings with a
+    # "/usr/bin/claude wrap selfheal" hook.
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "claude",
+                "--no-mcp",
+                "--no-tokensave",
+                "--no-serena",
+                *extra_args,
+            ],
+            env=env,
+        )
 
     assert result.exit_code == 0, result.output
     return captured, result.output
@@ -146,6 +151,57 @@ def test_wrap_claude_plain_mode_api_key_auth_skips_remote_control_warning(
         runner, monkeypatch, env={"ANTHROPIC_API_KEY": "sk-ant-api-xxx"}
     )
     assert "Remote Control" not in output
+
+
+def test_wrap_claude_rejects_conflicting_auth_before_proxy_mutation(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    user_settings = tmp_path / "user-settings.json"
+    user_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
+    proxy_calls: list[int] = []
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda port: proxy_calls.append(port))
+
+    result = runner.invoke(
+        main,
+        ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
+        env={"ANTHROPIC_API_KEY": "api-value"},
+    )
+
+    assert result.exit_code != 0
+    assert "both ANTHROPIC_API_KEY" in result.output
+    assert "shell environment" in result.output
+    assert str(user_settings) in result.output
+    assert "api-value" not in result.output
+    assert "token-value" not in result.output
+    assert proxy_calls == []
+
+
+def test_wrap_claude_includes_shared_project_settings_in_auth_precedence(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    user_settings = tmp_path / "user-settings.json"
+    user_settings.write_text("{}", encoding="utf-8")
+    project_dir = tmp_path / ".claude"
+    project_dir.mkdir()
+    shared_settings = project_dir / "settings.json"
+    shared_settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "claude_user_settings_path", lambda: user_settings)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
+
+    result = runner.invoke(
+        main,
+        ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"],
+        env={"ANTHROPIC_API_KEY": "api-value"},
+    )
+
+    assert result.exit_code != 0
+    assert str(shared_settings) in result.output
+    assert "api-value" not in result.output
+    assert "token-value" not in result.output
 
 
 def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
@@ -383,7 +439,7 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -409,6 +465,29 @@ def test_start_proxy_sets_vertex_target_env_for_proxy_subprocess(
     assert proxy_env["VERTEX_TARGET_API_URL"] == "https://vertex-gateway.internal/custom"
 
 
+def test_start_proxy_marks_subprocess_as_wrap_owned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Wrap-spawned proxies carry HEADROOM_WRAP_OWNED=1 for the orphan watchdog."""
+    fake_proc = _FakeProxyProcess()
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["kwargs"] = kwargs
+        return fake_proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    proc = wrap_mod._start_proxy(8787, agent_type="codex")
+
+    assert proc is fake_proc
+    assert captured["kwargs"]["env"]["HEADROOM_WRAP_OWNED"] == "1"
+
+
 def test_start_proxy_clears_inherited_vertex_target_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -416,7 +495,7 @@ def test_start_proxy_clears_inherited_vertex_target_env(
     captured: dict[str, Any] = {}
 
     monkeypatch.setenv("VERTEX_TARGET_API_URL", "http://127.0.0.1:8787")
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -446,7 +525,7 @@ def test_start_proxy_sets_pythonsafepath_to_avoid_cwd_shadow(
     fake_proc = _FakeProxyProcess()
     captured: dict[str, Any] = {}
 
-    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
     monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 

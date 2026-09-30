@@ -492,3 +492,84 @@ def test_anthropic_backend_nonstreaming_uncached_falls_back_when_input_tokens_ab
     # No input_tokens reported and no cache: the live-zone derivation yields the
     # non-zero token count of the new turn, never the 0 the naive default gave.
     assert outcome.uncached_input_tokens > 0
+
+
+def test_anthropic_backend_nonstreaming_present_null_cache_counters_do_not_crash() -> None:
+    """Present-but-null usage counters must coerce to 0, not crash the turn.
+
+    A backend can send the cache/output counters as JSON ``null`` (key present,
+    value null) rather than omitting them — the direct-Anthropic path already
+    guards this with ``int(usage.get(key, 0) or 0)`` and the surrounding code
+    even acknowledges a backend that "sends null" for ``input_tokens``. The
+    buffered backend branch, however, read ``usage.get(key, 0)`` for
+    ``output_tokens`` / ``cache_read_input_tokens`` / ``cache_creation_input_tokens``,
+    and ``.get`` returns ``None`` for a present-null key (the default applies
+    only to an absent key). That ``None`` then flowed into
+    ``uncached_input_tokens + cr_tokens + cw_tokens`` and the prefix-tracker
+    calls, raising ``TypeError`` that the outer handler turned into a failed
+    request instead of a normal 200 with zeroed counters.
+    """
+    from headroom.proxy.server import HeadroomProxy
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="anyllm",
+        anyllm_provider="anthropic",
+    )
+    body = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-3-5-sonnet-20241022",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 1000,
+            "output_tokens": None,
+            "cache_read_input_tokens": None,
+            "cache_creation_input_tokens": None,
+        },
+    }
+    backend = _make_anthropic_backend(body)
+
+    captured: list[Any] = []
+    orig_record = HeadroomProxy._record_request_outcome
+
+    async def _spy(self, outcome):  # noqa: ANN001, ANN202
+        captured.append(outcome)
+        return await orig_record(self, outcome)
+
+    log_handle = _attach_proxy_log_capture()
+    try:
+        with (
+            patch("headroom.proxy.server.AnyLLMBackend", return_value=backend),
+            patch.object(HeadroomProxy, "_record_request_outcome", _spy),
+        ):
+            app = create_app(config)
+            with TestClient(app) as client:
+                resp = client.post(
+                    "/v1/messages",
+                    json={
+                        "model": "claude-3-5-sonnet-20241022",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 64,
+                    },
+                    headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+                )
+                assert resp.status_code == 200, resp.text[:200]
+    finally:
+        _detach_proxy_log_capture(*log_handle)
+
+    assert captured, "expected a recorded RequestOutcome (turn must not have crashed)"
+    outcome = captured[-1]
+    # Null counters coerce to 0; the present input_tokens still drives uncached.
+    assert outcome.output_tokens == 0
+    assert outcome.cache_read_tokens == 0
+    assert outcome.cache_write_tokens == 0
+    assert outcome.uncached_input_tokens == 1000
+
+    handler = log_handle[0]
+    cr, cw, chp = _find_perf_record(handler.records)
+    assert (cr, cw, chp) == (0, 0, 0)

@@ -263,4 +263,48 @@ describe("HeadroomClient", () => {
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.model).toBe("gpt-4o");
   });
+
+  it("sends a per-call config (snake_cased) in the request body", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { mode: "ccr", targetRatio: 0.3, compressUserMessages: true },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.mode).toBe("ccr");
+    expect(body.config.target_ratio).toBe(0.3);
+    expect(body.config.compress_user_messages).toBe(true);
+  });
+
+  it("per-call config overrides client-level config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({
+      baseUrl: "http://localhost:8787",
+      config: { mode: "lossy_inline" },
+    });
+
+    await client.compress(sampleMessages, {
+      model: "gpt-4o",
+      config: { mode: "ccr" },
+    });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config.mode).toBe("ccr");
+  });
+
+  it("omits the config key when neither client nor call sets config", async () => {
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+    const client = new HeadroomClient({ baseUrl: "http://localhost:8787" });
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+
+    const [, opts] = mockFetch.mock.calls[0];
+    const body = JSON.parse(opts.body);
+    expect(body.config).toBeUndefined();
+  });
 });

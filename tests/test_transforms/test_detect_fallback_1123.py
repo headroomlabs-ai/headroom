@@ -20,8 +20,9 @@ from headroom.transforms import content_router as cr
 
 @pytest.fixture(autouse=True)
 def _compatible_mock_native_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    """These tests replace the native detector, so keep the ORT preflight open."""
+    """Keep mocked native calls reachable regardless of prior test state."""
     monkeypatch.setattr(ort_runtime, "rust_ort_runtime_compatible", lambda: True)
+    monkeypatch.setattr(cr, "_detect_native_unhealthy", False)
 
 
 def test_falls_back_on_rust_exception(monkeypatch):
