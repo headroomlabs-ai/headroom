@@ -395,6 +395,25 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 // Google Gemini → OpenAI
 // ============================================================
 
+// Gemini inlineData / fileData part -> OpenAI image_url url string, or null if unconvertible.
+function geminiMediaUrl(part: any): string | null {
+  const blob = part.inlineData;
+  if (blob && typeof blob === "object" && blob.mimeType && blob.data) {
+    return `data:${blob.mimeType};base64,${blob.data}`;
+  }
+  const file = part.fileData;
+  if (file && typeof file === "object" && typeof file.fileUri === "string") return file.fileUri;
+  return null;
+}
+
+// OpenAI image_url url -> Gemini part. data: URIs become inlineData; other urls fileData
+// (mimeType cannot be carried in an OpenAI part and is optional in the Gemini API).
+function geminiMediaPart(url: string): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (m) return { inlineData: { mimeType: m[1], data: m[2] } };
+  return { fileData: { fileUri: url } };
+}
+
 export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -405,10 +424,26 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
     if (role === "user") {
       // Check for functionResponse parts
       const funcResponses = parts.filter((p: any) => p.functionResponse);
-      const textParts = parts.filter((p: any) => p.text !== undefined);
+      const hasMedia = parts.some((p: any) => p.inlineData || p.fileData);
 
-      if (textParts.length > 0) {
-        result.push({ role: "user", content: textParts.map((p: any) => p.text).join("\n") });
+      if (hasMedia) {
+        const content = parts
+          .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
+          .map((p: any) => {
+            if (p.text !== undefined) return { type: "text" as const, text: p.text };
+            const url = geminiMediaUrl(p);
+            return url ? { type: "image_url" as const, image_url: { url } } : null;
+          })
+          .filter((p: any): p is NonNullable<typeof p> => p !== null);
+
+        if (content.length > 0) {
+          result.push({ role: "user", content });
+        }
+      } else {
+        const textParts = parts.filter((p: any) => p.text !== undefined);
+        if (textParts.length > 0) {
+          result.push({ role: "user", content: textParts.map((p: any) => p.text).join("\n") });
+        }
       }
       for (const fr of funcResponses) {
         result.push({
@@ -456,6 +491,17 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "user") {
+      if (Array.isArray(msg.content) && msg.content.some((p) => p.type === "image_url")) {
+        const geminiParts = msg.content
+          .map((p) => {
+            if (p.type === "text") return { text: p.text };
+            if (p.type === "image_url") return geminiMediaPart(p.image_url.url);
+            return null;
+          })
+          .filter((p) => p !== null);
+        result.push({ role: "user", parts: geminiParts });
+        continue;
+      }
       const text = typeof msg.content === "string"
         ? msg.content
         : (msg.content ?? []).filter((p) => p.type === "text").map((p) => (p as any).text).join("\n");
