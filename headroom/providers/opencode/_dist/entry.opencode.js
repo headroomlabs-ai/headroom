@@ -12484,7 +12484,6 @@ var http = nodeRequire("node:http");
 var https = nodeRequire("node:https");
 var http2 = nodeRequire("node:http2");
 var childProcess = nodeRequire("node:child_process");
-var fs = nodeRequire("node:fs");
 var BASE_URL_HEADER = "x-headroom-base-url";
 var ORIGINAL_PATH_HEADER = "x-headroom-original-path";
 var PROJECT_HEADER = "x-headroom-project";
@@ -12497,20 +12496,6 @@ function getState() {
 function setState(state) {
   globalThis[STATE_KEY] = state;
 }
-function shimImportSpecifier() {
-  const shim = new URL("../hook-shim/handler.js", import.meta.url);
-  return fs.existsSync(shim) ? shim.href : void 0;
-}
-function withNodeImportOption(existing, shim) {
-  const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
-  const alreadyPresent = parts.some((part, index) => {
-    return part === `--import=${shim}` || part === "--import" && parts[index + 1] === shim;
-  });
-  if (!alreadyPresent) {
-    parts.push(`--import=${shim}`);
-  }
-  return parts.join(" ");
-}
 function withExcludeHostsEnv(env, excludeHosts) {
   if (excludeHosts.length > 0) {
     env[EXCLUDE_HOSTS_ENV] = excludeHosts.join(",");
@@ -12522,19 +12507,11 @@ function withShimEnv(env, proxyUrl, excludeHosts) {
   const nextEnv = { ...env ?? process.env };
   nextEnv[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(nextEnv, excludeHosts);
-  const shim = shimImportSpecifier();
-  if (shim) {
-    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
-  }
   return nextEnv;
 }
 function installProcessEnv(proxyUrl, excludeHosts) {
   process.env[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(process.env, excludeHosts);
-  const shim = shimImportSpecifier();
-  if (shim) {
-    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
-  }
 }
 function isOptions(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
@@ -12614,6 +12591,9 @@ function isExcludedHost(hostname3, excludeHosts) {
   const normalized = hostname3.toLowerCase().replace(/^\[|\]$/g, "");
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
+function isLlmEndpointPath(pathname) {
+  return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages");
+}
 function shouldRoute(url2, proxy, excludeHosts) {
   if (url2.protocol !== "http:" && url2.protocol !== "https:") {
     return false;
@@ -12627,7 +12607,7 @@ function shouldRoute(url2, proxy, excludeHosts) {
   if (isExcludedHost(url2.hostname, excludeHosts)) {
     return false;
   }
-  return true;
+  return isLlmEndpointPath(url2.pathname);
 }
 function routedUrl(upstream, proxy) {
   return new URL(`${upstream.pathname}${upstream.search}`, proxy.origin);
@@ -12809,18 +12789,8 @@ function wrapGet(request) {
   };
 }
 function wrapHttp2Connect(originalConnect) {
-  return function headroomHttp2Connect(authority, ...args) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy, state.excludeHosts)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. Use fetch, http, or https so traffic can be routed through Headroom.`
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  return function headroomHttp2Connect(...args) {
+    return Reflect.apply(originalConnect, this, args);
   };
 }
 function installHeadroomTransport(options) {
