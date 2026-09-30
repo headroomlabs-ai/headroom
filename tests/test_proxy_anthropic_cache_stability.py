@@ -515,6 +515,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
 
+            def verify_ownership(self, store=None):  # noqa: ANN001
+                return self.detected_hashes
+
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -582,6 +585,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
 
+            def verify_ownership(self, store=None):  # noqa: ANN001
+                return self.detected_hashes
+
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -630,10 +636,22 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
     value: unit-testing the old policy in isolation is exactly what let a
     wrong-but-self-consistent decision pass.
     """
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
     from headroom.ccr.tool_injection import CCR_TOOL_NAME
     from headroom.proxy.helpers import (
         _reset_session_ccr_tracker_for_test,
         serialize_tool_definition_canonical,
+    )
+
+    # verify_ownership() (issue #2836) requires the marker's hash to be a
+    # real store entry — seed one with the exact hash the marker text below
+    # references, via explicit_hash (the store's own hash generation from
+    # `original` content wouldn't match this hand-typed literal).
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[50 items compressed to 5]",
+        explicit_hash="abc123def456abc123def456",
     )
 
     marker_message = {
@@ -711,6 +729,7 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
             assert _post().status_code == 200
     finally:
         _reset_session_ccr_tracker_for_test()
+        reset_compression_store()
 
     assert len(forwarded) == 2, "expected exactly two forwarded requests"
 

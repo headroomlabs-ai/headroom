@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
+from headroom import paths
 from headroom.cli import wrap as wrap_cli
 from headroom.cli.main import main
 
@@ -68,8 +69,14 @@ def test_unwrap_claude_removes_mcp_purges_retired_hook_and_stops_proxy(
     home = str(tmp_path)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
+    bin_dir = paths.bin_dir()
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
+    hooks_dir = claude_dir / "hooks"
+    hooks_dir.mkdir()
+    hook_script = hooks_dir / "rtk-rewrite.sh"
+    hook_script.write_text(f'#!/bin/sh\nexec {bin_dir / "rtk"} "$@"\n', encoding="utf-8")
     settings = claude_dir / "settings.json"
     settings.write_text(
         json.dumps(
@@ -78,9 +85,7 @@ def test_unwrap_claude_removes_mcp_purges_retired_hook_and_stops_proxy(
                     "PreToolUse": [
                         {
                             "matcher": "Bash",
-                            "hooks": [
-                                {"type": "command", "command": str(claude_dir / "rtk-rewrite.sh")}
-                            ],
+                            "hooks": [{"type": "command", "command": str(hook_script)}],
                         }
                     ]
                 }
@@ -238,18 +243,24 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "foundry_mode": False,
             "vertex_mode": False,
             "settings_path": settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's ownership claim instead of deferring to a
+            # live sibling and silently doing nothing (#3205).
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": True,
             "vertex_mode": False,
             "settings_path": settings_path,
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": True,
             "settings_path": settings_path,
+            "force": True,
         },
     ]
 

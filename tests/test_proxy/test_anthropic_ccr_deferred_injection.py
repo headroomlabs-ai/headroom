@@ -9,10 +9,15 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.helpers import _reset_session_ccr_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
 
 _RAW_TRANSCRIPT = "\n".join(f"row {idx}: payload payload payload" for idx in range(80))
+
+# The hash most fixtures below embed in a "[... Retrieve more: hash=...]"
+# marker to drive CCR tool injection.
+_MARKER_HASH = "abc123def456abc123def456"
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +33,28 @@ def _reset_ccr_tracker():
     _reset_session_ccr_tracker_for_test()
     yield
     _reset_session_ccr_tracker_for_test()
+
+
+@pytest.fixture(autouse=True)
+def _seed_marker_hash_in_store():
+    """Make ``_MARKER_HASH`` a real, verifiable compression-store entry.
+
+    CCRToolInjector.verify_ownership() (issue #2836) only advertises the
+    retrieve tool for hashes the compression store actually recognizes.
+    These fixtures hand-type marker text rather than compressing real
+    content through the store, so without this the hash would (correctly)
+    be treated as foreign and the tool would never get injected — these
+    tests are about the deferred-injection *policy*, not about exercising
+    real storage, so seed the one hash they all key off of.
+    """
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[100 items compressed to 10]",
+        explicit_hash=_MARKER_HASH,
+    )
+    yield
+    reset_compression_store()
 
 
 class _FakePrefixTracker:

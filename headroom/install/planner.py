@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from collections.abc import Iterable
 
 import click
 
 from headroom import paths as _paths
+from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
+from headroom.rollout import RolloutChannel
 
 from .models import (
     ConfigScope,
@@ -141,9 +144,19 @@ def build_manifest(
 
     normalized_profile = validate_profile_name(profile)
 
-    if preset == InstallPreset.PERSISTENT_SERVICE.value:
+    # A Windows service must implement the Service Control Manager protocol.
+    # The Python runner is an ordinary console process, so registering it with
+    # ``sc.exe create`` always fails at start with SCM error 1053.  Task
+    # Scheduler can run the same runner safely and already provides startup
+    # plus periodic health recovery, so make it the effective preset on
+    # Windows instead of creating a service that can never start (#2552).
+    effective_preset = preset
+    if sys.platform.startswith("win") and preset == InstallPreset.PERSISTENT_SERVICE.value:
+        effective_preset = InstallPreset.PERSISTENT_TASK.value
+
+    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
         supervisor_kind = SupervisorKind.SERVICE.value
-    elif preset == InstallPreset.PERSISTENT_TASK.value:
+    elif effective_preset == InstallPreset.PERSISTENT_TASK.value:
         supervisor_kind = SupervisorKind.TASK.value
     else:
         supervisor_kind = SupervisorKind.NONE.value
@@ -165,10 +178,43 @@ def build_manifest(
     base_env["HEADROOM_TELEMETRY"] = "on" if telemetry_enabled else "off"
     if memory_enabled:
         base_env["HEADROOM_MEMORY_ENABLED"] = "1"
+    # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
+    # OpenAI-compatible tools share this proxy (those may need api.openai.com /
+    # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
+    _openai_native = {
+        ToolTarget.CODEX.value,
+        ToolTarget.COPILOT.value,
+        ToolTarget.AIDER.value,
+        ToolTarget.OPENCODE.value,
+    }
+    _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
+    target_set = set(resolved_targets)
+    if target_set & _grok_targets and not (target_set & _openai_native):
+        base_env.setdefault("OPENAI_TARGET_API_URL", _GROK_DEFAULT_API_URL)
     # Applied last so explicit --env overrides win over the auto-derived
     # defaults above (e.g. a custom HEADROOM_WORKSPACE_DIR).
     if extra_env:
         base_env.update(extra_env)
+    if intercept_tool_results:
+        configured_channel = base_env.get("HEADROOM_ROLLOUT_CHANNEL")
+        if configured_channel is None:
+            # The flag is an explicit canary opt-in. Persist the matching
+            # channel so the generated service can actually start.
+            base_env["HEADROOM_ROLLOUT_CHANNEL"] = RolloutChannel.CANARY.value
+        else:
+            channel = RolloutChannel.parse(configured_channel)
+            unsafe = base_env.get("HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "enabled",
+            }
+            if not channel.allows(RolloutChannel.CANARY) and not unsafe:
+                raise click.ClickException(
+                    "--intercept-tool-results requires HEADROOM_ROLLOUT_CHANNEL=canary "
+                    "(or dev), unless the unsafe rollout override is explicitly enabled"
+                )
 
     proxy_args = [
         "--host",
@@ -209,11 +255,14 @@ def build_manifest(
         proxy_args.extend(["--protect-tool-results", protect_tool_results])
     if bedrock_profile:
         proxy_args.extend(["--bedrock-profile", bedrock_profile])
+    openai_target = base_env.get("OPENAI_TARGET_API_URL")
+    if openai_target:
+        proxy_args.extend(["--openai-api-url", openai_target])
 
     container_name = f"headroom-{normalized_profile}"
     return DeploymentManifest(
         profile=normalized_profile,
-        preset=preset,
+        preset=effective_preset,
         runtime_kind=runtime_kind,
         supervisor_kind=supervisor_kind,
         scope=scope,

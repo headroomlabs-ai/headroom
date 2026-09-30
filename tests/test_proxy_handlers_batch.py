@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from headroom.cache.compression_store import CompressionEntry
+from headroom.cache.compression_store import (
+    CompressionEntry,
+    get_compression_store,
+    reset_compression_store,
+)
 from headroom.ccr import response_handler as response_handler_module
 from headroom.proxy.handlers import batch as batch_module
 from headroom.proxy.handlers import gemini as gemini_module
@@ -152,9 +156,16 @@ class FakeRequest:
         self.method = method
         self.url = SimpleNamespace(path=path, query=query)
         self.query_params = {}
+        # Every real Starlette Request has one, and handlers now share a
+        # per-request attribution ledger through it (savings_attribution).
+        self.scope: dict = {"type": "http", "method": method}
 
     async def body(self) -> bytes:
         return self._body
+
+    async def stream(self):
+        # The body reader streams (so it can cap chunked bodies) like Starlette.
+        yield self._body
 
 
 class NativeGeminiHandler(DummyBatchHandler):
@@ -295,6 +306,15 @@ async def test_gemini_native_ccr_continuation(monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.asyncio
 async def test_gemini_native_ccr_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     install_native_gemini_compression(monkeypatch)
+    # verify_ownership() (issue #2836) requires the marker's hash to be a
+    # real store entry; NativeGeminiHandler's mocked pipeline hand-types
+    # "hash=aaaa...aaaa" rather than compressing through the real store.
+    reset_compression_store()
+    get_compression_store().store(
+        original="original content",
+        compressed="compressed [100 items compressed to 1]",
+        explicit_hash="aaaaaaaaaaaaaaaaaaaaaaaa",
+    )
     handler = NativeGeminiHandler(
         [FakeResponse(json_data={"candidates": [{"content": {"parts": [{"text": "answer"}]}}]})]
     )
@@ -319,6 +339,7 @@ async def test_gemini_native_ccr_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     declarations = forwarded_tools[0]["functionDeclarations"]
     assert {item["name"] for item in declarations} == {"client_tool", "headroom_retrieve"}
     assert forwarded_tools[1]["functionDeclarations"] == [{"name": "second_tool"}]
+    reset_compression_store()
 
 
 @pytest.mark.asyncio

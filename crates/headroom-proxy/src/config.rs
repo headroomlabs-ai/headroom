@@ -1,6 +1,9 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
 use clap::{Parser, ValueEnum};
+use headroom_core::rollout::{
+    feature_names, split_feature_names, Feature, RolloutChannel, RolloutSnapshot,
+};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
@@ -230,6 +233,49 @@ impl BetaHeaderSticky {
     about = "Headroom transparent reverse proxy"
 )]
 pub struct CliArgs {
+    /// Runtime rollout channel that bounds which managed features may run.
+    ///
+    /// `stable` admits only features that have completed bake time. `beta` and
+    /// `canary` admit progressively newer features. `dev` is for local work.
+    /// Explicit feature requests still cannot cross this boundary unless the
+    /// unsafe override is set.
+    #[arg(
+        long = "rollout-channel",
+        env = "HEADROOM_ROLLOUT_CHANNEL",
+        default_value = "stable",
+        value_parser = parse_rollout_channel,
+    )]
+    pub rollout_channel: String,
+
+    /// Comma-separated rollout features to request explicitly.
+    #[arg(
+        long = "features",
+        env = "HEADROOM_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub features: String,
+
+    /// Comma-separated rollout features to force off. Disable wins over defaults
+    /// and explicit enable requests.
+    #[arg(
+        long = "disable-features",
+        env = "HEADROOM_DISABLE_FEATURES",
+        default_value = "",
+        value_parser = parse_rollout_features,
+    )]
+    pub disable_features: String,
+
+    /// Break-glass override that allows unstable features below their channel.
+    /// Intended only for emergency mitigation and should be visible in logs.
+    #[arg(
+        long = "unsafe-allow-unstable-features",
+        env = "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub unsafe_allow_unstable_features: bool,
+
     /// Address the proxy listens on (e.g. 0.0.0.0:8787).
     #[arg(long, env = "HEADROOM_PROXY_LISTEN", default_value = "0.0.0.0:8787")]
     pub listen: SocketAddr,
@@ -539,6 +585,32 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| format!("invalid duration `{s}`: {e}"))
 }
 
+fn parse_rollout_channel(value: &str) -> Result<String, String> {
+    value
+        .parse::<RolloutChannel>()
+        .map(|channel| channel.as_str().to_owned())
+        .map_err(|_| {
+            format!("unknown rollout channel `{value}` (valid: stable, beta, canary, dev)")
+        })
+}
+
+fn parse_rollout_features(value: &str) -> Result<String, String> {
+    let valid = feature_names();
+    let unknown: Vec<_> = split_feature_names(value)
+        .into_iter()
+        .filter(|name| !valid.contains(name.as_str()))
+        .collect();
+    if unknown.is_empty() {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "unknown rollout feature(s): {}; valid: {}",
+            unknown.join(", "),
+            valid.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
 fn parse_bytes(s: &str) -> Result<u64, String> {
     s.parse::<bytesize::ByteSize>()
         .map(|b| b.as_u64())
@@ -548,6 +620,8 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 /// Resolved configuration used by the running server.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Runtime rollout state resolved from CLI/env.
+    pub rollout: RolloutSnapshot,
     pub listen: SocketAddr,
     pub upstream: Url,
     pub upstream_timeout: Duration,
@@ -622,6 +696,30 @@ pub struct Config {
 
 impl Config {
     pub fn from_cli(args: CliArgs) -> Self {
+        let mut explicit_features = Vec::new();
+        if args.enable_responses_streaming {
+            explicit_features.push(Feature::OpenAiResponsesStreaming);
+        }
+        if args.enable_bedrock_native {
+            explicit_features.push(Feature::NativeBedrock);
+        }
+        // Preserve the pre-rollout rollback controls as legacy disables. Both
+        // features are stable defaults in the registry, so merely omitting a
+        // false flag from `explicit_features` would turn it straight back on.
+        let mut disabled_features = split_feature_names(&args.disable_features);
+        if !args.enable_responses_streaming {
+            disabled_features.push(Feature::OpenAiResponsesStreaming.spec().name.to_owned());
+        }
+        if !args.enable_bedrock_native {
+            disabled_features.push(Feature::NativeBedrock.spec().name.to_owned());
+        }
+        let rollout = RolloutSnapshot::from_parts_with_explicit(
+            &args.rollout_channel,
+            &args.features,
+            &disabled_features.join(","),
+            args.unsafe_allow_unstable_features,
+            &explicit_features,
+        );
         let rewrite_host = if args.no_rewrite_host {
             false
         } else {
@@ -631,6 +729,7 @@ impl Config {
             .compression_max_body_bytes
             .unwrap_or(args.max_body_bytes);
         Self {
+            rollout: rollout.clone(),
             listen: args.listen,
             upstream: args.upstream,
             upstream_timeout: args.upstream_timeout,
@@ -646,9 +745,13 @@ impl Config {
             auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
             beta_header_sticky: args.beta_header_sticky,
-            enable_responses_streaming: args.enable_responses_streaming,
+            enable_responses_streaming: rollout.is_enabled(
+                Feature::OpenAiResponsesStreaming,
+                args.enable_responses_streaming,
+            ),
             enable_conversations_passthrough: args.enable_conversations_passthrough,
-            enable_bedrock_native: args.enable_bedrock_native,
+            enable_bedrock_native: rollout
+                .is_enabled(Feature::NativeBedrock, args.enable_bedrock_native),
             bedrock_region: args.bedrock_region,
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
@@ -662,6 +765,7 @@ impl Config {
     /// production-default behaviour so existing tests stay unchanged.
     pub fn for_test(upstream: Url) -> Self {
         Self {
+            rollout: RolloutSnapshot::default(),
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_secs(60),
@@ -713,5 +817,50 @@ impl Config {
             vertex_region: "us-central1".to_string(),
             vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod rollout_input_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_rollout_inputs_are_strict_and_diagnosable() {
+        assert_eq!(parse_rollout_channel("CANARY").unwrap(), "canary");
+        assert!(parse_rollout_channel("stabel")
+            .unwrap_err()
+            .contains("unknown rollout channel"));
+        assert!(parse_rollout_features("native-bedrock").is_ok());
+        let error = parse_rollout_features("native_bedrok").unwrap_err();
+        assert!(error.contains("native_bedrok"));
+        assert!(error.contains("native_bedrock"));
+    }
+
+    #[test]
+    fn legacy_false_flags_remain_effective_rollout_disables() {
+        let args = CliArgs::try_parse_from([
+            "headroom-proxy",
+            "--upstream",
+            "http://127.0.0.1:9",
+            "--enable-responses-streaming",
+            "false",
+            "--enable-bedrock-native",
+            "false",
+        ])
+        .unwrap();
+
+        let config = Config::from_cli(args);
+
+        for feature in [Feature::OpenAiResponsesStreaming, Feature::NativeBedrock] {
+            let decision = config.rollout.decision(feature);
+            assert!(!decision.enabled);
+            assert!(decision.disabled);
+            assert_eq!(
+                decision.reason,
+                headroom_core::rollout::FeatureDecisionReason::Disabled
+            );
+        }
+        assert!(!config.enable_responses_streaming);
+        assert!(!config.enable_bedrock_native);
     }
 }

@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
@@ -141,9 +142,8 @@ class ProjectResolver:
     """Resolve a request to a (key, display_name) project identity.
 
     Looks at request signals in priority order and returns ``None`` when
-    no signal yields a project. The router uses that ``None`` to apply
-    the configured fallback (today: ``GLOBAL`` per the user's choice in
-    the bug-fix design discussion).
+    no trusted signal yields a project. The router uses that ``None`` to
+    apply the configured fallback (fail-closed ``empty`` by default).
     """
 
     def resolve(self, ctx: RequestContext) -> tuple[str, str] | None:
@@ -173,7 +173,7 @@ class ProjectResolver:
         # Tier 2: client-provided explicit cwd (any client).
         explicit_cwd = self._first_nonempty_header(ctx.headers, "x-headroom-cwd")
         if explicit_cwd:
-            ident = self._identity_from_cwd(explicit_cwd)
+            ident = self._identity_from_cwd(explicit_cwd, percent_encoded=True)
             if ident is not None:
                 return ident
 
@@ -223,8 +223,18 @@ class ProjectResolver:
         return None
 
     @classmethod
-    def _identity_from_cwd(cls, raw_cwd: str) -> tuple[str, str] | None:
-        cwd = raw_cwd.strip()
+    def _identity_from_cwd(
+        cls, raw_cwd: str, *, percent_encoded: bool = False
+    ) -> tuple[str, str] | None:
+        # ``percent_encoded`` is set only for the ``x-headroom-cwd`` header,
+        # which the wrapper percent-encodes so non-ASCII paths stay valid HTTP
+        # values; there ``unquote`` restores the canonical path before
+        # realpath/hash computation. Every other tier (CLI override, system
+        # prompt) carries a literal filesystem path that was never encoded, so
+        # decoding it would fold genuinely distinct directories together: a
+        # real ``/work/acme%2Fapi`` would collapse onto ``/work/acme/api`` and
+        # share its store. Decode at the boundary that encodes, nowhere else.
+        cwd = unquote(raw_cwd.strip()) if percent_encoded else raw_cwd.strip()
         if not cwd:
             return None
         # Normalise so symlinked / trailing-slash variants collapse to
@@ -333,7 +343,8 @@ class BackendRouter:
                 # command).
                 logger.warning(
                     "event=memory_project_unresolved behavior=empty user_id=%s "
-                    "hint='set x-headroom-project-id or x-headroom-cwd header, "
+                    "hint='set x-headroom-project-id, x-headroom-cwd, or "
+                    "provide a cwd in the system prompt, "
                     "or set memory.unresolved_project_fallback=global to opt-in "
                     "to legacy cross-project GLOBAL pooling (cross-project leak risk).'",
                     ctx.base_user_id,
@@ -421,68 +432,97 @@ class BackendRouter:
             return list(self._backends.keys())
 
 
+def _text_from_blocks(content: Any) -> str:
+    """Join the ``text`` of every dict block in a content list."""
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    return "\n".join(parts)
+
+
+def _system_field_text(system_field: Any) -> str:
+    """Text of the Anthropic top-level ``system`` field (string or blocks)."""
+    if isinstance(system_field, str):
+        return system_field
+    return _text_from_blocks(system_field)
+
+
+def _first_role_system_text(messages: list[Any]) -> str:
+    """Text of the first ``role="system"`` message (OpenAI/Gemini shape)."""
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            if content:
+                return content
+            continue
+        text = _text_from_blocks(content)
+        if text:
+            return text
+    return ""
+
+
+def _first_user_text_with_cwd(messages: list[Any]) -> str:
+    """Text of the first user message carrying a ``cwd:``-family line.
+
+    Claude Code 2.x sends its ``<env>`` block as an ``isMeta`` *user*
+    message rather than inside ``system`` (#3595), and Trae puts it in a
+    user reminder (#1737). Only text that actually contains one of
+    ``_CWD_PREFIXES`` is returned, so ordinary user content never leaks
+    into the system prompt.
+    """
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        user_text = content if isinstance(content, str) else _text_from_blocks(content)
+        if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
+            return user_text
+    return ""
+
+
 def extract_system_prompt(body: Mapping[str, Any]) -> str:
     """Best-effort extraction of the system prompt across providers.
 
     Anthropic puts it on the top-level ``system`` field (string or list
     of content blocks); OpenAI/Gemini-style payloads put it as a message
     with ``role=system``. Returns an empty string when nothing is found
-    rather than raising — the resolver tolerates an empty prompt and
+    rather than raising -- the resolver tolerates an empty prompt and
     will fall through to the configured fallback.
-    """
 
-    system_field = body.get("system")
-    if isinstance(system_field, str):
-        return system_field
-    if isinstance(system_field, list):
-        parts: list[str] = []
-        for block in system_field:
-            if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        if parts:
-            return "\n".join(parts)
+    Every source is *concatenated* rather than first-match-wins. The
+    previous early return on a non-empty ``system`` field made the
+    ``messages[]`` scan unreachable for every client that sends a system
+    prompt at all -- which is every Claude Code request -- so the
+    ``cwd:`` line in a 2.x ``isMeta`` user message was never seen and
+    project resolution fell through to the fail-closed fallback (#3595).
+    """
+    parts: list[str] = []
+
+    system_text = _system_field_text(body.get("system"))
+    if system_text:
+        parts.append(system_text)
 
     messages = body.get("messages")
     if isinstance(messages, list):
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "system":
-                continue
-            content = msg.get("content")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                if parts:
-                    return "\n".join(parts)
+        role_system_text = _first_role_system_text(messages)
+        if role_system_text:
+            parts.append(role_system_text)
 
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            user_text: str | None = None
-            if isinstance(content, str):
-                user_text = content
-            elif isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str):
-                            parts.append(text)
-                if parts:
-                    user_text = "\n".join(parts)
-            if user_text and any(prefix in user_text for prefix in _CWD_PREFIXES):
-                return user_text
+        # User content is client-controlled, so it is only a *fallback*: a
+        # cwd already present in a trusted source (top-level ``system`` or a
+        # ``role="system"`` message) wins, otherwise a user turn could
+        # redirect this request at another project's memory store by pasting
+        # its own ``cwd:`` line.
+        trusted = "\n".join(parts)
+        if not any(prefix in trusted for prefix in _CWD_PREFIXES):
+            cwd_text = _first_user_text_with_cwd(messages)
+            if cwd_text:
+                parts.append(cwd_text)
 
-    return ""
+    return "\n".join(parts)

@@ -4,6 +4,8 @@
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
 //! `--upstream`. See RUST_DEV.md for the operator runbook.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -28,6 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_body_bytes = config.max_body_bytes,
         rewrite_host = config.rewrite_host,
         graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),
+        rollout_channel = config.rollout.config.channel.as_str(),
+        rollout_features_enabled = ?config.rollout.enabled(),
+        rollout_features_disabled = ?config.rollout.config.disabled,
+        unsafe_allow_unstable_features = config.rollout.config.unsafe_allow_unstable,
+        rollout_registry_digest = %config.rollout.registry_digest,
+        rollout_snapshot_digest = %config.rollout.snapshot_digest(),
+        qualification_eligible = config.rollout.qualification_eligible(),
         "headroom-proxy starting"
     );
 

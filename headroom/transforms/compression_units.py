@@ -116,6 +116,7 @@ _LOSSY_UNMARKED_STRATEGIES = {
     CompressionStrategy.KOMPRESS.value,
     CompressionStrategy.TEXT.value,
     CompressionStrategy.CODE_AWARE.value,
+    CompressionStrategy.HTML.value,
 }
 
 
