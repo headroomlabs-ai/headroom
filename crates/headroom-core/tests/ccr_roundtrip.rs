@@ -361,6 +361,46 @@ fn document_walker_with_store_roundtrips_opaque_blob() {
     assert_eq!(store.get(&h).unwrap(), big);
 }
 
+#[test]
+fn nested_structured_prose_leaf_uses_ccr() {
+    use headroom_core::transforms::pipeline::config::PipelineConfig;
+    use headroom_core::transforms::pipeline::offloads::JsonOffload;
+    use headroom_core::transforms::pipeline::orchestrator::CompressionPipeline;
+    use headroom_core::transforms::pipeline::traits::CompressionContext;
+    use headroom_core::transforms::ContentType;
+
+    let prose = (0..12)
+        .map(|i| format!("Segment {i} explains the durable recovery behavior for this field."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let input = serde_json::json!((0..5)
+        .map(|i| serde_json::json!({"id": i, "summary": prose}))
+        .collect::<Vec<_>>())
+    .to_string();
+    let store = InMemoryCcrStore::new();
+    let config = PipelineConfig::default();
+    let pipeline = CompressionPipeline::builder()
+        .with_offload(JsonOffload::from_pipeline(&config))
+        .with_config(config)
+        .build();
+    let result = pipeline.run(
+        &input,
+        ContentType::JsonArray,
+        &CompressionContext::with_query("recovery"),
+        &store,
+    );
+    assert!(result.bytes_saved > 0);
+    assert!(result
+        .steps_applied
+        .iter()
+        .any(|step| step == "json_offload"));
+    assert!(result.output.contains("<<ccr:"));
+    let marker_start = result.output.find("<<ccr:").unwrap() + 6;
+    let leaf_key = result.output[marker_start..].split(">>").next().unwrap();
+    assert_eq!(store.get(leaf_key).as_deref(), Some(prose.as_str()));
+    assert_eq!(store.len(), 2);
+}
+
 // ─── helpers ──────────────────────────────────────────────────────
 
 /// Pull the hash out of a `<<ccr:HASH N_rows_offloaded>>` row marker.

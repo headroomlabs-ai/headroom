@@ -40,9 +40,10 @@ def _read_text_tolerant(file_path: Path) -> str:
     """
     raw = file_path.read_bytes()
     try:
-        return raw.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return raw.decode("utf-8", errors="replace")
+        text = raw.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # =============================================================================
@@ -412,7 +413,7 @@ class ClaudeCodeWriter(ContextWriter):
             result.add(target_path, full_content)
             if not dry_run:
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_text(full_content, encoding="utf-8")
+                target_path.write_text(full_content, encoding="utf-8", newline="\n")
 
         if memory_recs:
             memory_path = self._resolve_memory_path(project)
@@ -420,7 +421,7 @@ class ClaudeCodeWriter(ContextWriter):
             result.add(memory_path, full_content)
             if not dry_run:
                 memory_path.parent.mkdir(parents=True, exist_ok=True)
-                memory_path.write_text(full_content, encoding="utf-8")
+                memory_path.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 
@@ -478,7 +479,7 @@ class ClaudeCodeWriter(ContextWriter):
                 f"{target_path.name}. Review the diff before committing.{gitignore_hint}"
             )
             if not dry_run:
-                legacy_path.write_text(cleaned, encoding="utf-8")
+                legacy_path.write_text(cleaned, encoding="utf-8", newline="\n")
         else:
             # CLAUDE.md held nothing but the Headroom block — remove the husk.
             result.warnings.append(
@@ -521,7 +522,7 @@ class CodexWriter(ContextWriter):
             result.add(agents_md, full_content)
             if not dry_run:
                 agents_md.parent.mkdir(parents=True, exist_ok=True)
-                agents_md.write_text(full_content, encoding="utf-8")
+                agents_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         if memory_recs:
             instructions_md = project.memory_file or (project.data_path.parent / "instructions.md")
@@ -529,7 +530,7 @@ class CodexWriter(ContextWriter):
             result.add(instructions_md, full_content)
             if not dry_run:
                 instructions_md.parent.mkdir(parents=True, exist_ok=True)
-                instructions_md.write_text(full_content, encoding="utf-8")
+                instructions_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 
@@ -559,7 +560,7 @@ class GeminiWriter(ContextWriter):
         result.add(gemini_md, full_content)
         if not dry_run:
             gemini_md.parent.mkdir(parents=True, exist_ok=True)
-            gemini_md.write_text(full_content, encoding="utf-8")
+            gemini_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 
@@ -589,6 +590,6 @@ class GrokWriter(ContextWriter):
         result.add(grok_md, full_content)
         if not dry_run:
             grok_md.parent.mkdir(parents=True, exist_ok=True)
-            grok_md.write_text(full_content, encoding="utf-8")
+            grok_md.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result

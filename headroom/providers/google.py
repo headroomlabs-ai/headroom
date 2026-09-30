@@ -26,6 +26,7 @@ from datetime import date
 from typing import Any
 
 from headroom.models.registry import ModelRegistry
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -264,6 +265,12 @@ class GoogleProvider(Provider):
                     If provided, uses countTokens API for accurate counts.
         """
         self._client = client
+        # Cache counters per model so their internal TokenCountCache (and any
+        # lazily-built genai model) persist across requests, like the Anthropic
+        # and OpenAI providers. Rebuilding a fresh counter every call threw the
+        # cache away every request, so a stable prefix (system prompt + tools)
+        # was re-tokenized on every turn.
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -290,7 +297,9 @@ class GoogleProvider(Provider):
                 f"Model '{model}' is not recognized as a Google model. "
                 f"Supported models: {list(_CONTEXT_LIMITS.keys())}"
             )
-        return GeminiTokenCounter(model, client=self._client)
+        if model not in self._token_counters:
+            self._token_counters[model] = GeminiTokenCounter(model, client=self._client)
+        return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Gemini model.
@@ -346,18 +355,13 @@ class GoogleProvider(Provider):
                 model_lower,  # gemini-1.5-pro
             ]
             for variant in model_variants:
-                try:
-                    cost = litellm.completion_cost(
-                        model=variant,
-                        prompt="",
-                        completion="",
-                        prompt_tokens=input_tokens,
-                        completion_tokens=output_tokens,
-                    )
-                    if cost is not None:
-                        return cost
-                except Exception:
-                    continue
+                cost = estimate_cost_from_tokens(
+                    variant,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                if cost is not None:
+                    return cost
 
         # Fallback to hardcoded pricing
         input_price, output_price = None, None

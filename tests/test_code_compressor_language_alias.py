@@ -32,6 +32,7 @@ from headroom.transforms.code_compressor import CodeLanguage, coerce_language
         ("golang", CodeLanguage.GO),
         ("rs", CodeLanguage.RUST),
         ("c++", CodeLanguage.CPP),
+        ("phtml", CodeLanguage.PHP),
     ],
 )
 def test_coerce_language_maps_common_aliases(alias, expected):
@@ -40,7 +41,7 @@ def test_coerce_language_maps_common_aliases(alias, expected):
 
 @pytest.mark.parametrize(
     "canonical",
-    ["python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "perl"],
+    ["python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "perl", "php"],
 )
 def test_coerce_language_accepts_canonical_values(canonical):
     assert coerce_language(canonical) == CodeLanguage(canonical)

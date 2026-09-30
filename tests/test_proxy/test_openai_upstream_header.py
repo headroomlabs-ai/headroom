@@ -24,6 +24,12 @@ from starlette.datastructures import Headers  # noqa: E402
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the reserved, intentionally unresolvable test origin."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.example")
+
+
 class _FakeRequest:
     """Minimal stand-in exposing ``headers`` like a real Starlette request.
 

@@ -20,6 +20,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import ClaudeCodeWriter, ContextWriter
+from ._paths import path_exists as _path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +83,17 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
             name = _project_display_name(project_path, entry.name)
 
             context_file = None
-            if project_path.exists():
+            if _path_exists(project_path):
                 claude_md = project_path / "CLAUDE.md"
-                if claude_md.exists():
+                if _path_exists(claude_md):
                     context_file = claude_md
 
+            # `entry` itself stats fine (its parent is ours) but a project dir
+            # left behind by a root-run session is not traversable, so stat-ing
+            # anything under it raises PermissionError. Treat that as absent.
             memory_dir = entry / "memory"
-            memory_file = memory_dir / "MEMORY.md" if memory_dir.exists() else None
-            if memory_file and not memory_file.exists():
+            memory_file = memory_dir / "MEMORY.md" if _path_exists(memory_dir) else None
+            if memory_file and not _path_exists(memory_file):
                 memory_file = None
 
             jsonl_files = list(entry.glob("*.jsonl"))
@@ -378,10 +382,10 @@ def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:
     if not tokens:
         return None
     win_path = Path(f"{drive}:\\" + "\\".join(tokens))
-    if win_path.exists():
+    if _path_exists(win_path):
         return win_path
     drive_root = Path(f"{drive}:\\")
-    if drive_root.exists():
+    if _path_exists(drive_root):
         result = _greedy_path_decode(drive_root, tokens)
         if result:
             return result
@@ -411,7 +415,7 @@ def _decode_project_path(escaped_name: str) -> Path | None:
         return None
 
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
-    if simple.exists():
+    if _path_exists(simple):
         return simple
 
     if len(parts) < 3:
@@ -445,9 +449,9 @@ def _project_display_name(project_path: Path, fallback: str) -> str:
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
     """Greedily decode remaining path parts using real child directories."""
     if not parts:
-        return base if base.exists() else None
+        return base if _path_exists(base) else None
 
-    if not base.exists() or not base.is_dir():
+    if not _path_exists(base) or not base.is_dir():
         return None
 
     try:

@@ -18,6 +18,7 @@ For the end-to-end visual flow, see [CI/CD Flow Diagrams](/docs/ci-cd-flows).
 | `headroom-ai` | Python | PyPI | `PYPI_PACKAGE` |
 | `headroom-ai` | TypeScript SDK | npmjs.org | `NPM_SDK_PACKAGE` |
 | `headroom-openclaw` | TypeScript plugin | npmjs.org | `NPM_OPENCLAW_PACKAGE` |
+| `headroom-opencode` | TypeScript plugin | npmjs.org | `NPM_OPENCODE_PACKAGE` |
 | `@{owner}/headroom-ai` | TypeScript SDK | GitHub Package Registry | — |
 | `@{owner}/headroom-openclaw` | TypeScript plugin | GitHub Package Registry | — |
 | `headroom-ai-{version}.tar.gz` / `headroom_ai-{version}-py3-none-any.whl` | Python package distributions | GitHub Release (`{owner}/headroom`) | — |
@@ -41,6 +42,7 @@ Release Please calculates the release version from conventional commits and the 
 - `pyproject.toml` - `[project].version`
 - `headroom/_version.py` - `__version__`, synced at build time
 - `plugins/openclaw/package.json` - `version`, synced at build time
+- `plugins/opencode/package.json` - `version`, synced at build time
 - `sdk/typescript/package.json` - `version`, synced at build time
 
 `release.yml` does not commit back to the repo. Version synchronization happens inside the release build workspace.
@@ -65,13 +67,19 @@ The release PR is the place where version and changelog changes are reviewed bef
 The `release.yml` workflow runs when a GitHub Release is published, which normally happens when the release-please PR is merged. It also supports manual `workflow_dispatch` and PR dry-runs for release-critical workflow/package changes.
 
 ```
-detect-version → build → build-wheels → collect-dist → smoke-import-wheels
-                                      ↘ publish-pypi
-                                      ↘ publish-npm
-                                      ↘ publish-github-packages
-                                      ↘ publish-docker
-                                        → create-release
+detect-version → build → build-wheels ─┬→ collect-dist ─┐
+                       │               └→ smoke-import-wheels ─┬→ publish-pypi ─┐
+                       ├──────────────────────────────────────┼→ publish-docker ┤
+                       ├→ publish-npm ──────────────────────────────────────────┤
+                       └→ publish-github-packages ──────────────────────────────┴→ create-release
 ```
+
+`build-wheels` fans out to `collect-dist` and `smoke-import-wheels` in
+parallel (both only need the wheel artifacts, not each other).
+`publish-npm` and `publish-github-packages` only need `detect-version` +
+`build` -- they do not wait on the wheel matrix at all. `publish-pypi` and
+`publish-docker` both gate on `smoke-import-wheels`. `create-release` is the
+only job that waits on everything (`.github/workflows/release.yml:78-1004`).
 
 The workflow never commits back to the repo.
 
@@ -86,7 +94,7 @@ Resolves the release version from the trigger. On `release: published`, it uses 
 5. Uploads release asset artifacts for downstream publish jobs
 
 ### build-wheels
-Builds the Python wheel matrix for Linux x86_64, Linux arm64, and Apple Silicon macOS, plus one source distribution. Linux wheels are audited for glibc symbol compatibility.
+Builds the Python wheel matrix for Linux x86_64, Linux arm64, Apple Silicon macOS, Intel macOS, and Windows x86_64, plus one source distribution (`.github/workflows/release.yml:214-264`). Linux wheels are audited for glibc symbol compatibility.
 
 ### collect-dist
 Collects the wheel matrix, source distribution, and npm tarballs into the canonical artifacts used by publishing and GitHub Release asset upload.
@@ -95,12 +103,13 @@ Collects the wheel matrix, source distribution, and npm tarballs into the canoni
 Installs the built wheels into representative customer environments and imports `headroom._core`. This blocks publishing if a wheel builds successfully but cannot import on its promised platform floor.
 
 ### publish-pypi
-Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1` (trusted publisher).
+Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@v1.13.0` (trusted publisher).
 
 ### publish-npm
-Publishes both TypeScript packages to npmjs.org:
+Publishes all npm packages to npmjs.org:
 - `sdk/typescript/` as `headroom-ai`
 - `plugins/openclaw/` as `headroom-openclaw`
+- `plugins/opencode/` as `headroom-opencode`
 
 ### publish-github-packages
 Publishes both Node packages to GitHub Package Registry (`npm.pkg.github.com`) using the current repository owner as the npm scope:
@@ -127,6 +136,7 @@ env:
   NPM_REGISTRY_URL: https://registry.npmjs.org
   NPM_SDK_PACKAGE: headroom-ai
   NPM_OPENCLAW_PACKAGE: headroom-openclaw
+  NPM_OPENCODE_PACKAGE: headroom-opencode
   GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
 ```
 
@@ -134,10 +144,10 @@ To rename a package, update the corresponding constant — all references throug
 
 ## Safety Gates
 
-Each publish job requires **both** of the following to be false:
+Each publish job requires all of the following to be true (`.github/workflows/release.yml:768`, PyPI shown; npm/GitHub Packages mirror it with their own skip variable):
 
 ```yaml
-if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
 ```
 
 To skip a publish target, set the corresponding GitHub Actions variable:
@@ -209,10 +219,11 @@ on:
 ### Prerequisites
 
 ```bash
-# Install act
-winget install act
+# macOS
+brew install act actionlint
 
-# Optional: install actionlint for schema validation
+# Windows
+winget install act
 winget install actionlint
 ```
 

@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import os
 import re
 
 __all__ = [
@@ -25,6 +26,8 @@ __all__ = [
     "unfold_repeated_blocks",
     "search_heading",
     "search_unheading",
+    "search_dir_heading",
+    "search_dir_unheading",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -56,6 +59,21 @@ _FOLD_MAX_LINES = 20_000
 _GREP_ROW_RE = re.compile(r"^(?P<path>[^\n:]+):(?P<line>\d+):(?P<content>.*)$")
 # heading-form data row (``line:content``) produced by search_heading.
 _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
+
+# A timestamped log line is NOT a grep row, but it has the same colon-delimited
+# shape: ``2026-09-02 14:30:00 [FATAL] ...`` splits as path=``2026-09-02 14``,
+# line=``30``, content=``00 [FATAL] ...``. Folding it hoists the date+hour into
+# a heading and strips it from every row, so the model sees ``30:00 [FATAL]``
+# and has to reconstruct the clock itself. The fold round-trips exactly, so the
+# inverse-check in compact_lossless cannot catch it -- it must be excluded here.
+_TIMESTAMP_ROW_RE = re.compile(
+    r"^\s*\[?(?:"
+    r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
+    r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
+    r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
+    r")"
+)
 
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
 # without it (git only uses it for rename/blob bookkeeping).
@@ -232,7 +250,7 @@ def search_heading(text: str) -> str:
     out: list[str] = []
     current_path: str | None = None
     for line in lines:
-        m = _GREP_ROW_RE.match(line)
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
         if m:
             path = m.group("path")
             if path != current_path:
@@ -278,6 +296,74 @@ def search_unheading(text: str) -> str:
         # Plain passthrough line (or a stray data row with no header): emit it
         # verbatim and clear any active grouping.
         current_path = None
+        out.append(line)
+        i += 1
+    return _join(out, had_trailing)
+
+
+# A dir-heading data row: ``<base>:<line>:<content>`` where base has no '/'.
+_DIR_DATA_RE = re.compile(r"^(?P<base>[^/\n:]+):(?P<line>\d+):(?P<content>.*)$")
+
+
+def search_dir_heading(text: str) -> str:
+    """Fold grep ``path:line:content`` rows by DIRECTORY.
+
+    Consecutive rows whose path shares a parent directory collapse to that
+    directory once (a header ending in ``/``), then ``base:line:content`` rows
+    beneath it. Complements :func:`search_heading` (which factors a repeated
+    *file*): this factors a repeated *directory* across distinct files — the
+    common ``grep -rn`` case where each file has a single match, so file-heading
+    saves nothing but the shared directory repeats on every row. Rows whose path
+    has no ``/`` pass through untouched. Exactly reversed by
+    :func:`search_dir_unheading`; ``compact_lossless`` verifies the round-trip.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    for line in lines:
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
+        if m and "/" in m.group("path"):
+            path = m.group("path")
+            cut = path.rindex("/") + 1
+            dir_part, base = path[:cut], path[cut:]
+            if dir_part != current_dir:
+                out.append(dir_part)
+                current_dir = dir_part
+            out.append(f"{base}:{m.group('line')}:{m.group('content')}")
+        else:
+            out.append(line)
+            current_dir = None
+    return _join(out, had_trailing)
+
+
+def search_dir_unheading(text: str) -> str:
+    """Exact inverse of :func:`search_dir_heading`.
+
+    A *header* is a line ending in ``/`` immediately followed by a
+    ``base:line:content`` data row; it is consumed and re-prefixed onto each
+    following data row until a non-data line appears.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        data = _DIR_DATA_RE.match(line)
+        if current_dir is not None and data:
+            out.append(f"{current_dir}{line}")
+            i += 1
+            continue
+        if line.endswith("/") and i + 1 < n and _DIR_DATA_RE.match(lines[i + 1]):
+            current_dir = line
+            i += 1
+            continue
+        current_dir = None
         out.append(line)
         i += 1
     return _join(out, had_trailing)
@@ -365,6 +451,19 @@ def _smaller(candidate: str, original: str) -> bool:
     return len(candidate) < len(original)
 
 
+#: Env kill-switch for every fold in this module. Read per call (not cached at
+#: import) so the proxy's live ``POST /admin/runtime-env`` hot-sync applies
+#: without a restart, matching how the output-shaper switches behave.
+_LOSSLESS_COMPACTION_ENV = "HEADROOM_LOSSLESS_COMPACTION"
+
+
+def _lossless_compaction_enabled() -> bool:
+    raw = os.environ.get(_LOSSLESS_COMPACTION_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def compact_lossless(content: str, kind: str) -> str:
     """Dispatch format-native lossless compaction by ``kind``.
 
@@ -373,8 +472,15 @@ def compact_lossless(content: str, kind: str) -> str:
     non-semantic bits, e.g. ANSI color for logs); if verification fails or the
     result is not smaller, the original content is returned unchanged. Never
     raises; unknown kinds pass through.
+
+    Set ``HEADROOM_LOSSLESS_COMPACTION=0`` to disable every fold here while
+    leaving the rest of the pipeline (Kompress, SmartCrusher, CCR) active. The
+    folds are byte-reversible, but the model only ever sees the folded side and
+    must reconstruct the original shape itself, which costs output tokens on
+    reasoning models. Operators need to be able to turn that off without
+    resorting to ``--no-optimize`` (which disables all compression).
     """
-    if not content:
+    if not content or not _lossless_compaction_enabled():
         return content
     try:
         if kind == "log":
@@ -387,10 +493,18 @@ def compact_lossless(content: str, kind: str) -> str:
             return candidate if _smaller(candidate, content) else content
 
         if kind == "search":
-            candidate = search_heading(content)
-            if search_unheading(candidate) != content:
-                return content
-            return candidate if _smaller(candidate, content) else content
+            # Two independent folds; keep the smaller that round-trips exactly.
+            # search_heading factors a repeated FILE (many matches in one file);
+            # search_dir_heading factors a repeated DIRECTORY (one match each
+            # across many files in a dir — the grep -rn case the file fold misses).
+            best = content
+            for candidate, inverse in (
+                (search_heading(content), search_unheading),
+                (search_dir_heading(content), search_dir_unheading),
+            ):
+                if inverse(candidate) == content and _smaller(candidate, best):
+                    best = candidate
+            return best
 
         if kind == "paths":
             # Pure path listings (find/ls -1/rg -l): fold repeated parent dirs.

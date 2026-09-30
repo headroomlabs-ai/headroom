@@ -22,6 +22,8 @@ import headroom._ort as _ort
 def _fresh_resolver(monkeypatch):
     """Reset the module-level cache and scrub the env before every test."""
     monkeypatch.setattr(_ort, "_pinned", _ort._UNSET)
+    monkeypatch.setattr(_ort, "_pinned_from_override", False)
+    monkeypatch.setattr(_ort, "_installed_ort_version", lambda: (1, 24))
     monkeypatch.delenv("ORT_DYLIB_PATH", raising=False)
 
 
@@ -70,6 +72,34 @@ def test_respects_existing_env(monkeypatch):
     monkeypatch.setenv("ORT_DYLIB_PATH", r"C:\custom\onnxruntime.dll")
     assert _ort.ensure_ort_dylib_pinned() == r"C:\custom\onnxruntime.dll"
     assert _ort.os.environ["ORT_DYLIB_PATH"] == r"C:\custom\onnxruntime.dll"
+    assert _ort.rust_ort_runtime_compatible()
+
+
+def test_incompatible_package_is_not_pinned(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(_ort, "_installed_ort_version", lambda: (1, 23))
+    pkg = tmp_path / "onnxruntime"
+    capi = pkg / "capi"
+    capi.mkdir(parents=True)
+    (capi / "libonnxruntime.so.1.23.2").write_bytes(b"old")
+    _fake_spec_for(monkeypatch, pkg)
+
+    assert _ort.ensure_ort_dylib_pinned() is None
+    assert not _ort.rust_ort_runtime_compatible()
+    assert "older C API" in caplog.text
+
+
+def test_content_router_bypasses_native_detector_for_incompatible_ort(monkeypatch, caplog):
+    import headroom.transforms.content_router as router
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(_ort, "rust_ort_runtime_compatible", lambda: False)
+    monkeypatch.setattr(router, "_detect_native_unhealthy", False)
+
+    result = router._detect_content('{"safe": true}')
+
+    assert result.content_type.value.startswith("json")
+    assert router._detect_native_unhealthy is True
+    assert "requires ONNX Runtime 1.24+" in caplog.text
 
 
 def test_pins_to_package_capi_dll(monkeypatch, tmp_path):

@@ -152,6 +152,175 @@ fn backend_swap_byte_equal_keys() {
     }
 }
 
+// ─── Sliding (idle-window) TTL semantics — #2604 ───────────────────────
+//
+// The Python `CompressionStore` treats `HEADROOM_CCR_TTL_SECONDS` as an
+// idle window that restarts on every successful retrieval, bounded by an
+// absolute max lifetime (8x the idle TTL). These tests pin the same
+// semantics onto the Rust backends so an entry a session keeps touching
+// does not expire mid-burst.
+
+#[test]
+fn in_memory_get_refreshes_idle_ttl() {
+    let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(120));
+    let hash = compute_key(b"hot entry");
+    store.put(&hash, "hot entry");
+    // Touch the entry every 60ms for ~4 idle windows' worth of wall
+    // clock. Wall-clock expiry would kill it at 120ms; a sliding idle
+    // window keeps it alive because every hit restarts the clock.
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            store.get(&hash).as_deref(),
+            Some("hot entry"),
+            "an entry accessed within its idle window must stay alive"
+        );
+    }
+    // Now go idle past the window: the entry must expire.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        store.get(&hash),
+        None,
+        "an entry idle past its window must expire"
+    );
+}
+
+#[test]
+fn in_memory_max_lifetime_caps_sliding_window() {
+    // Idle TTL 40ms → max lifetime 320ms (8x). Constant access must not
+    // keep the entry alive forever.
+    let store = InMemoryCcrStore::with_capacity_and_ttl(10, Duration::from_millis(40));
+    let hash = compute_key(b"immortal?");
+    store.put(&hash, "immortal?");
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    let mut expired = false;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        if store.get(&hash).is_none() {
+            expired = true;
+            break;
+        }
+    }
+    assert!(
+        expired,
+        "constant access must not extend an entry past its max lifetime"
+    );
+}
+
+#[test]
+fn sqlite_get_refreshes_idle_ttl() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ccr.sqlite");
+    // 3-second idle window (unix-second resolution needs whole seconds).
+    let store = SqliteCcrStore::open(&path, 3).expect("open sqlite store");
+    let hash = compute_key(b"sliding sqlite");
+    store.put(&hash, "sliding sqlite");
+    // t+2s: hit inside the window — restarts the idle clock.
+    std::thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(
+        store.get(&hash).as_deref(),
+        Some("sliding sqlite"),
+        "first access within the idle window must hit"
+    );
+    // t+4s: wall-clock expiry would have purged at t+3s; the refresh at
+    // t+2s must keep it alive until t+5s.
+    std::thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(
+        store.get(&hash).as_deref(),
+        Some("sliding sqlite"),
+        "an entry accessed within its idle window must stay alive past the wall-clock TTL"
+    );
+    // Go idle past the window.
+    std::thread::sleep(Duration::from_millis(4_100));
+    assert_eq!(
+        store.get(&hash),
+        None,
+        "an entry idle past its window must be purged"
+    );
+}
+
+#[test]
+fn sqlite_max_lifetime_caps_sliding_window() {
+    // Timing note: the backend stores unix-SECONDS (`as_secs()` truncates)
+    // and purges on `last_accessed + ttl <= now`, so apparent elapsed time
+    // is `floor(t0 + s) - floor(t0)` — it rounds UP by nearly a second
+    // depending on where t0 lands within its second. Every margin here is
+    // therefore kept a full second clear of the boundary in both
+    // directions; a sub-second margin makes this test phase-dependent
+    // (the previous 1.5s-against-a-2s-window "still alive" assertion
+    // failed ~70% of runs whenever `frac(t0) >= 0.5`).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ccr.sqlite");
+    // Idle 2s with a 3s ceiling: constant access must not outlive t+3s.
+    let store =
+        SqliteCcrStore::open_with_ttls(&path, 2, 3).expect("open sqlite store with ceiling");
+    let hash = compute_key(b"capped sqlite");
+    store.put(&hash, "capped sqlite");
+    // 0.5s: apparent elapsed is 0s or 1s — always under the 2s window.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        store.get(&hash).as_deref(),
+        Some("capped sqlite"),
+        "entry inside idle window and ceiling must hit"
+    );
+    // Keep touching, but cross the 3s ceiling. The touches must stay INSIDE
+    // the idle window or the entry dies of idleness and the assertion below
+    // passes without ever exercising the ceiling — the thing under test.
+    // 0.7s gaps read as at most 1s apparent, comfortably under the 2s idle
+    // window. Five gaps carry total age to at least 4s, which is strictly
+    // beyond the 3s ceiling even after unix-second truncation. Four gaps
+    // only reach 3.3s and can land exactly on the now-valid 3s boundary.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = store.get(&hash);
+    }
+    assert_eq!(
+        store.get(&hash),
+        None,
+        "constant access must not extend an entry past its max lifetime"
+    );
+}
+
+#[test]
+fn sqlite_migrates_legacy_schema_without_last_accessed() {
+    // A DB created by a pre-sliding-TTL build has no `last_accessed`
+    // column. Opening it must migrate in place and keep the rows
+    // retrievable (backfilling last_accessed from created_at).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ccr.sqlite");
+    let payload = "legacy row";
+    let hash = compute_key(payload.as_bytes());
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw connection");
+        conn.execute(
+            "CREATE TABLE ccr_entries (
+                 hash         TEXT PRIMARY KEY,
+                 original     BLOB NOT NULL,
+                 created_at   INTEGER NOT NULL,
+                 ttl_seconds  INTEGER NOT NULL
+             )",
+            [],
+        )
+        .expect("create legacy schema");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO ccr_entries (hash, original, created_at, ttl_seconds)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![hash, payload.as_bytes(), now, 300_i64],
+        )
+        .expect("insert legacy row");
+    }
+    let store = SqliteCcrStore::open(&path, 300).expect("open must migrate legacy schema");
+    assert_eq!(
+        store.get(&hash).as_deref(),
+        Some(payload),
+        "legacy rows must survive the schema migration"
+    );
+}
+
 // ─── Redis-feature-gated tests ─────────────────────────────────────────
 
 #[cfg(feature = "redis")]
@@ -195,5 +364,32 @@ mod redis_tests {
         let hash = compute_key(payload.as_bytes());
         store.put(&hash, payload);
         assert_eq!(store.get(&hash).as_deref(), Some(payload));
+    }
+
+    #[test]
+    fn redis_get_refreshes_idle_ttl() {
+        let Some(url) = redis_url() else {
+            eprintln!("skipping redis_get_refreshes_idle_ttl: HEADROOM_TEST_REDIS_URL not set");
+            return;
+        };
+        // 2-second idle window (Redis EXPIRE has 1s resolution).
+        let store = RedisCcrStore::open_with_prefix(&url, "ccr_test_sliding".to_string(), 2)
+            .expect("open redis store");
+        let payload = "sliding redis";
+        let hash = compute_key(payload.as_bytes());
+        store.put(&hash, payload);
+        // Touch at t+1.5s (inside window) — restarts the idle clock.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert_eq!(store.get(&hash).as_deref(), Some(payload));
+        // t+3s: wall-clock expiry would have fired at t+2s.
+        std::thread::sleep(Duration::from_millis(1_500));
+        assert_eq!(
+            store.get(&hash).as_deref(),
+            Some(payload),
+            "an entry accessed within its idle window must stay alive past the wall-clock TTL"
+        );
+        // Go idle past the window.
+        std::thread::sleep(Duration::from_millis(3_100));
+        assert_eq!(store.get(&hash), None);
     }
 }
