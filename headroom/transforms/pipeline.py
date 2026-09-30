@@ -86,7 +86,6 @@ def _breaker_env(name: str, default: _N, cast: Callable[[str], _N]) -> _N:
 class TransformPipeline:
     """
     Orchestrates multiple transforms in the correct order.
-
     Transform order:
     1. Cache Aligner - normalize prefix for cache hits
     2. Content Router - intelligent content-aware compression (routes to appropriate
@@ -96,6 +95,13 @@ class TransformPipeline:
     "drop messages from history" stage. Live-zone-only compression is the
     sole strategy going forward — message-list mutation no longer happens
     in the pipeline.
+
+    Production behavior:
+    - Circuit breaker (#847): after N consecutive pipeline failures, messages
+      pass through untouched for a cooldown window instead of re-failing.
+    - Min input tokens guard: inputs below min_input_tokens are returned
+      unchanged (compression overhead would expand rather than save).
+    - All min_input_tokens < 0 values are clamped to 0 with a warning.
     """
 
     def __init__(
@@ -129,6 +135,25 @@ class TransformPipeline:
         self._breaker_lock = threading.Lock()
         self._breaker_failures = 0
         self._breaker_open_until = 0.0
+
+        # Minimum input token threshold — short inputs (< threshold) get bigger
+        # after compression because transform overhead exceeds the savings.
+        # Env var HEADROOM_MIN_INPUT_TOKENS overrides the config value.
+        # Production: warn if env var sets this to 0 (all compression skipped).
+        self._min_input_tokens = _breaker_env(
+            "HEADROOM_MIN_INPUT_TOKENS", self.config.min_input_tokens, int
+        )
+        if self._min_input_tokens < 0:
+            logger.warning(
+                "min_input_tokens=%d is negative from env/config; clamping to 0",
+                self._min_input_tokens,
+            )
+            self._min_input_tokens = 0
+        elif self._min_input_tokens == 0:
+            logger.info(
+                "min_input_tokens=0: compression guard disabled; "
+                "all inputs will be compressed regardless of size"
+            )
 
     def _build_default_transforms(self) -> list[Transform]:
         """Build default transform pipeline from config."""
@@ -283,6 +308,23 @@ class TransformPipeline:
         t_count = time.perf_counter()
         tokens_before = tokenizer.count_messages(messages)
         count_ms = (time.perf_counter() - t_count) * 1000
+
+        # Short-input guard: skip compression when the input is too small to
+        # benefit. The transform overhead (markers, metadata) outweighs any
+        # savings below this threshold.
+        if self._min_input_tokens > 0 and tokens_before < self._min_input_tokens:
+            logger.info(
+                "Pipeline skipped: input has %d tokens (below min_input_tokens=%d); "
+                "compression would expand rather than save",
+                tokens_before,
+                self._min_input_tokens,
+            )
+            return TransformResult(
+                messages=messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                transforms_applied=["pipeline:min_input_tokens_skip"],
+            )
 
         logger.debug(
             "Pipeline starting: %d messages, %d tokens, model=%s",
