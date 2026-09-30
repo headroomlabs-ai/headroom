@@ -233,6 +233,82 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("routes Gemini native :generateContent and :streamGenerateContent through the proxy", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "POST" };
+    await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", init);
+    await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toEqual(
+      new URL("http://127.0.0.1:8787/v1beta/models/gemini-2.0-flash:generateContent"),
+    );
+    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBe(
+      "https://generativelanguage.googleapis.com",
+    );
+    expect(fetchMock.mock.calls[1][0]).toEqual(
+      new URL("http://127.0.0.1:8787/v1beta/models/gemini-2.0-flash:streamGenerateContent"),
+    );
+    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-base-url")).toBe(
+      "https://generativelanguage.googleapis.com",
+    );
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("routes CloudCode :streamGenerateContent variants through the proxy", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "POST" };
+    await fetch("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent", init);
+    await fetch("https://cloudcode-pa.googleapis.com/v1/v1internal:streamGenerateContent", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toEqual(
+      new URL("http://127.0.0.1:8787/v1internal:streamGenerateContent"),
+    );
+    expect(fetchMock.mock.calls[1][0]).toEqual(
+      new URL("http://127.0.0.1:8787/v1/v1internal:streamGenerateContent"),
+    );
+
+    globalThis.fetch = originalFetch;
+  });
+
+  it("does not route lookalike paths containing LLM markers outside valid endpoint shapes", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+
+    const init = { method: "GET" };
+    await fetch("https://example.com/v1/models/gemini:generateContent/status", init);
+    await fetch("https://example.com/v1/models/gemini:streamGenerateContent/log", init);
+    await fetch("https://example.com/api/chat/completions-helper", init);
+    await fetch("https://example.com/v1/messages/inbox", init);
+    await fetch("https://example.com/v1/responses/feedback", init);
+    await fetch("https://example.com/v1/models/generateContent", init);
+
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+    for (const call of fetchMock.mock.calls as FetchCall[]) {
+      expect(typeof call[0]).toBe("string");
+      expect(call[1]).toBe(init);
+      const headers = new Headers(call[1]?.headers);
+      expect(headers.get("x-headroom-base-url")).toBeNull();
+    }
+
+    globalThis.fetch = originalFetch;
+  });
+
   it("routes external https.request calls through the proxy", async () => {
     const proxy = await proxyServer();
     installHeadroomTransport({ proxyUrl: proxy.url });
@@ -368,7 +444,7 @@ describe("Headroom OpenCode transport", () => {
     expect(connectSpy).toHaveBeenCalledWith("https://opencode.ai");
   });
 
-  it("does not mutate process.env.NODE_OPTIONS or inject the hook-shim", () => {
+  it("injects the hook-shim --import into process.env.NODE_OPTIONS when the shim exists", () => {
     const originalNodeOptions = process.env.NODE_OPTIONS;
     const originalProxyUrl = process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
 
@@ -379,12 +455,12 @@ describe("Headroom OpenCode transport", () => {
       installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
 
       expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(process.env.NODE_OPTIONS).toContain("--trace-warnings");
+      expect(process.env.NODE_OPTIONS).toContain("--import=");
 
       installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      expect(process.env.NODE_OPTIONS).toBe("--trace-warnings");
-      expect(process.env.NODE_OPTIONS).not.toContain("--import");
-      expect(process.env.NODE_OPTIONS).not.toContain("hook-shim");
+      const importCount = (process.env.NODE_OPTIONS?.match(/--import=/g) ?? []).length;
+      expect(importCount).toBe(1);
     } finally {
       if (originalNodeOptions === undefined) {
         delete process.env.NODE_OPTIONS;
@@ -417,6 +493,7 @@ describe("Headroom OpenCode transport", () => {
 
       childProcess.spawn("npx", ["-y", "firecrawl-mcp"]);
       const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.NODE_OPTIONS).toBe("--trace-warnings");
       expect(options.env.NODE_OPTIONS).not.toContain("--import");
     } finally {
       if (originalNodeOptions === undefined) {
@@ -448,14 +525,15 @@ describe("Headroom OpenCode transport", () => {
       const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
       expect(options.env.PATH).toBe("/bin");
       expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-      expect(options.env.NODE_OPTIONS).toBe("--trace-warnings");
+      expect(options.env.NODE_OPTIONS).toContain("--trace-warnings");
+      expect(options.env.NODE_OPTIONS).toContain("--import=");
     } finally {
       uninstallHeadroomTransport();
       childProcess.spawn = originalSpawn;
     }
   });
 
-  it("never injects a hook-shim --import into spawn/exec/execFile/fork children", () => {
+  it("injects one idempotent hook-shim --import into spawn/exec/execFile/fork children", () => {
     const originalSpawn = childProcess.spawn;
     const originalExec = childProcess.exec;
     const originalExecFile = childProcess.execFile;
@@ -505,13 +583,16 @@ describe("Headroom OpenCode transport", () => {
       ];
       for (const [call, index, expectedNodeOptions] of pairs) {
         const env = (call[index] as { env: NodeJS.ProcessEnv }).env;
-        expect(env.NODE_OPTIONS).toBe(expectedNodeOptions);
-        expect(env.NODE_OPTIONS).not.toContain("--import");
-        expect(env.NODE_OPTIONS).not.toContain("hook-shim");
+        const nodeOptions = env.NODE_OPTIONS ?? "";
+        expect(nodeOptions).toContain(expectedNodeOptions);
+        expect(nodeOptions).toContain("--import=");
+        expect((nodeOptions.match(/--import=/g) ?? []).length).toBe(1);
         expect(env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
         expect(env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
       }
-      expect(process.env.NODE_OPTIONS).toBe(defaultNodeOptions);
+      const processNodeOptions = process.env.NODE_OPTIONS ?? "";
+      expect(processNodeOptions).toContain(defaultNodeOptions);
+      expect((processNodeOptions.match(/--import=/g) ?? []).length).toBe(1);
     } finally {
       if (originalNodeOptions === undefined) {
         delete process.env.NODE_OPTIONS;

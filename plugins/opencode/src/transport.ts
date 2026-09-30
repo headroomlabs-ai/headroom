@@ -5,6 +5,7 @@ const http = nodeRequire("node:http") as typeof import("node:http");
 const https = nodeRequire("node:https") as typeof import("node:https");
 const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
 const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
@@ -67,6 +68,28 @@ function setState(state: TransportState | undefined): void {
   (globalThis as GlobalWithHeadroomTransport)[STATE_KEY] = state;
 }
 
+// ponytail: the shim only exists next to the checkout build
+// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// `--import=<missing file>` killed every Node child at startup — including
+// OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
+// children go direct instead of dying. Upgrade path is bundling the shim into
+// _dist/ so wheel installs get child-process routing back.
+function shimImportSpecifier(): string | undefined {
+  const shim = new URL("../hook-shim/handler.js", import.meta.url);
+  return fs.existsSync(shim) ? shim.href : undefined;
+}
+
+function withNodeImportOption(existing: string | undefined, shim: string): string {
+  const parts = existing?.trim() ? existing.trim().split(/\s+/) : [];
+  const alreadyPresent = parts.some((part, index) => {
+    return part === `--import=${shim}` || (part === "--import" && parts[index + 1] === shim);
+  });
+  if (!alreadyPresent) {
+    parts.push(`--import=${shim}`);
+  }
+  return parts.join(" ");
+}
+
 // The exported variable mirrors the EFFECTIVE list, not merely a non-empty
 // one: an explicit `excludeHosts: []` overrides a pre-existing variable for
 // this process, so a child that inherited the stale value would bypass hosts
@@ -87,12 +110,20 @@ function withShimEnv(
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(nextEnv, excludeHosts);
+  const shim = shimImportSpecifier();
+  if (shim) {
+    nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
+  }
   return nextEnv;
 }
 
 function installProcessEnv(proxyUrl: string, excludeHosts: string[]): void {
   process.env[PROXY_ENV] = proxyUrl;
   withExcludeHostsEnv(process.env, excludeHosts);
+  const shim = shimImportSpecifier();
+  if (shim) {
+    process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
+  }
 }
 
 function isOptions(value: unknown): value is Record<string, unknown> {
@@ -194,9 +225,18 @@ function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
 // (WebFetch, registries, GitHub, unknown services) must reach its original URL
 // untouched. A bare suffix match keeps provider-prefixed variants working
 // (/api/coding/paas/v4/chat/completions, /base/v1/messages, ...).
+//
+// Native Gemini model-generation endpoints use colon-action suffixes
+// (:generateContent, :streamGenerateContent). These are matched by exact
+// suffix so that lookalike paths containing the marker but not ending with it
+// (e.g. /v1/models/gemini:generateContent/status) remain unrouted.
 function isLlmEndpointPath(pathname: string): boolean {
   return (
-    pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages")
+    pathname.endsWith("/chat/completions") ||
+    pathname.endsWith("/responses") ||
+    pathname.endsWith("/messages") ||
+    pathname.endsWith(":generateContent") ||
+    pathname.endsWith(":streamGenerateContent")
   );
 }
 

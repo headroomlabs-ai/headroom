@@ -2,10 +2,11 @@
 // standalone (see tsup.standalone.config.ts) and shipped inside the Python wheel
 // at headroom/providers/opencode/hook-shim/handler.js.
 //
-// transport.ts wraps `fetch`/`http`/`https` in the plugin's own process only,
-// and nothing auto-injects this loader into spawned children (#3633): child
-// processes stay untouched so npm/npx, WebFetch and Node MCP servers keep
-// working. Load it manually (`node --import <path-to-this-file> ...`) while
+// transport.ts wraps `fetch`/`http`/`https` in the plugin's own process and
+// auto-preloads this loader into spawned Node children when the shim exists on
+// disk. The shim installs the same scoped transport, so non-LLM child traffic
+// (npm/npx, WebFetch, MCP servers) passes through untouched. Manual loading
+// remains available (`node --import <path-to-this-file> ...`) while
 // HEADROOM_OPENCODE_TRANSPORT_PROXY_URL is set when a specific child Node
 // process should route its traffic through Headroom; loading it installs the
 // transport in that process.
