@@ -210,6 +210,19 @@ def _write_fake_docker_shims(tmp_path: Path) -> Path:
     openclaw_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     openclaw_sh.chmod(0o755)
 
+    opencode_sh = shim_dir / "opencode"
+    opencode_sh.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        "  printf 'CONFIG=%s\\n' \"${OPENCODE_CONFIG_CONTENT-}\"\n"
+        "  printf 'ARGS='\n"
+        "  printf '%q ' \"$@\"\n"
+        "  printf '\\n'\n"
+        '} > "${FAKE_OPENCODE_LOG}"\n',
+        encoding="utf-8",
+    )
+    opencode_sh.chmod(0o755)
+
     openclaw_cmd = shim_dir / "openclaw.cmd"
     openclaw_cmd.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
 
@@ -224,6 +237,11 @@ def _build_env(home: Path, tmp_path: Path) -> dict[str, str]:
     env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     env["FAKE_DOCKER_STATE"] = str(tmp_path / "fake-docker-state.json")
     env["FAKE_DOCKER_LOG"] = str(tmp_path / "fake-docker.log")
+    # #2970: the PowerShell installer's Ensure-PathEntry persists to the 'User'
+    # PATH scope (HKCU\Environment), which a HOME/USERPROFILE override does not
+    # redirect. Keep the PATH update ephemeral (Process scope) so running these
+    # tests never leaks the throwaway shim dir into the developer's real PATH.
+    env["HEADROOM_INSTALL_PATH_SCOPE"] = "Process"
     return env
 
 
@@ -366,6 +384,39 @@ def _bash_supports_4_3() -> bool:
     return (major, minor) >= (4, 3)
 
 
+def _assert_loopback_publication(call: list[str]) -> None:
+    publication = call[call.index("-p") + 1].split(":")
+    assert len(publication) == 3
+    assert publication[0] == "127.0.0.1"
+    assert publication[1] == publication[2]
+
+
+def _assert_generated_proxy_argv(
+    call: list[str], expected_port: int, forwarded_tail: list[str] | None = None
+) -> None:
+    _assert_loopback_publication(call)
+    entrypoint = call.index("--entrypoint")
+    image = entrypoint + 2
+    assert call[entrypoint + 1] == "headroom"
+    assert call[image + 1 : image + 6] == [
+        "proxy",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(expected_port),
+    ]
+    if forwarded_tail is not None:
+        assert call[image + 6 :] == forwarded_tail
+
+
+def test_generated_wrappers_explicitly_override_image_host_for_container_access() -> None:
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert 'args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")' in bash_source
+    assert "dockerArgs.Add('0.0.0.0')" in powershell_source
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
     reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
@@ -389,6 +440,7 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         wrap_help = _run([str(wrapper), "wrap", "--help"], env=env)
         assert "Supported commands:" in wrap_help.stdout
         assert "copilot" not in wrap_help.stdout
+        _run([str(wrapper), "proxy", "--help"], env=env)
         unsupported_wrap = _run(
             [str(wrapper), "wrap", "copilot", "--help"],
             env=env,
@@ -499,8 +551,33 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
             if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "--help" in call
         )
         assert "-it" not in help_call
+        proxy_help_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
+        )
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [str(wrapper), "proxy", "--port", str(explicit_port), "--host", "192.0.2.1"],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call
@@ -551,8 +628,271 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         _cleanup_fake_docker(env)
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
+    reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
+)
+def test_bash_native_wrapper_supports_opencode(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    env["FAKE_OPENCODE_LOG"] = str(tmp_path / "opencode.log")
+
+    try:
+        _run(["bash", str(REPO_ROOT / "scripts" / "install.sh")], env=env, cwd=REPO_ROOT)
+        wrapper = home / ".local" / "bin" / "headroom"
+
+        config_file = home / ".config" / "opencode" / "opencode.json"
+        config_file.parent.mkdir(parents=True)
+        config_content = (
+            '{"provider":{"headroom":{"options":{"baseURL":"http://127.0.0.1:8787/v1"}}}}'
+        )
+        config_file.write_text(config_content, encoding="utf-8")
+
+        port = _free_port()
+        result = _run(
+            [str(wrapper), "wrap", "opencode", "--port", str(port), "--", "--help"],
+            env=env,
+        )
+        assert result.stderr == ""
+
+        docker_calls = _read_fake_docker_log(env)
+        prepare_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "--prepare-only" in call and "opencode" in call
+        )
+        assert f"{home}/.config/opencode:/tmp/headroom-home/.config/opencode" in prepare_call
+        assert f"{home}/.config:/tmp/headroom-home/.config" not in prepare_call
+
+        opencode_output = Path(env["FAKE_OPENCODE_LOG"]).read_text(encoding="utf-8")
+        assert f"CONFIG={config_content}" in opencode_output
+        assert "ARGS=--help" in opencode_output
+        docker_state = json.loads(Path(env["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+        assert docker_state["containers"] == {}
+    finally:
+        _cleanup_fake_docker(env)
+
+
 def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+
+
+def _read_user_path_entry() -> tuple[str, int] | None:
+    """Read the raw ``HKCU\\Environment`` PATH value and its registry kind, if it exists.
+
+    Reading the registry directly rather than through
+    ``[Environment]::GetEnvironmentVariable('Path','User')`` keeps two things visible that the
+    .NET getter hides: the unexpanded value (the getter expands ``%USERPROFILE%``-style
+    references) and the value kind, so a ``REG_EXPAND_SZ`` -> ``REG_SZ`` downgrade cannot pass
+    unnoticed.
+    """
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+        try:
+            value, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            return None
+    return str(value), int(kind)
+
+
+def _restore_user_path_entry(previous: tuple[str, int] | None) -> None:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        if previous is None:
+            try:
+                winreg.DeleteValue(key, "Path")
+            except FileNotFoundError:
+                pass
+            return
+        value, kind = previous
+        winreg.SetValueEx(key, "Path", 0, kind, value)
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> None:
+    """The installer must not mutate the real HKCU User PATH (#2970).
+
+    ``Ensure-PathEntry`` persists to the 'User' scope, which a HOME/USERPROFILE
+    override does not redirect, so running the installer against a throwaway home
+    used to leak the temp shim dir into the developer's real PATH. ``_build_env``
+    now sets ``HEADROOM_INSTALL_PATH_SCOPE=Process`` to keep the update
+    ephemeral; the real User PATH must be unchanged across the run.
+
+    The assertion reads ``HKCU\\Environment`` itself instead of counting the entries the .NET
+    getter reports, so it verifies the guard rather than trusting the environment variable to
+    have taken effect: it catches a count-preserving mutation and a change of the value kind,
+    neither of which an entry count can see.
+    """
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    before = _read_user_path_entry()
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+
+        after = _read_user_path_entry()
+        assert str(home) not in (after[0] if after else ""), (
+            f"installer leaked the throwaway install dir into the real User PATH: {home}"
+        )
+        assert after == before, "installer mutated the real User PATH"
+    finally:
+        _cleanup_fake_docker(env)
+        # A passing run never writes to the registry; this only fires if the guard regresses, so
+        # that a failing test cannot leave the developer's PATH polluted.
+        if _read_user_path_entry() != before:
+            _restore_user_path_entry(before)
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_mcp_wrapper_keeps_stdin_attached_for_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    """Piped MCP stdio must still pass -i to Docker even when input is redirected."""
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        wrapper = home / ".local" / "bin" / "headroom.ps1"
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "mcp",
+                "serve",
+            ],
+            env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.returncode == 0
+        mcp_call = next(call for call in _read_fake_docker_log(env) if call[:2] == ["run", "--rm"])
+        assert "-i" in mcp_call
+        assert "-t" not in mcp_call
+    finally:
+        _cleanup_fake_docker(env)
+
+
+# AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
+# a given HEADROOM_INSTALL_PATH_SCOPE, so the scope allow-list is exercised
+# without running the whole installer. Parsing via the PowerShell AST (not a
+# regex) keeps this pinned to the real function body. Only 'Process' (ephemeral)
+# and the throwing paths are driven — never 'User', which would mutate the real
+# HKCU PATH.
+_ENSURE_PATH_SCOPE_HARNESS = r"""
+param([string]$InstallScript, [string]$ScopeValue)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$fn = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Ensure-PathEntry'
+}, $true) | Select-Object -First 1
+if (-not $fn) { Write-Output 'NOFUNC'; exit 3 }
+Invoke-Expression $fn.Extent.Text
+$env:HEADROOM_INSTALL_PATH_SCOPE = $ScopeValue
+try {
+    Ensure-PathEntry -PathEntry 'C:\headroom-scope-test-marker'
+    Write-Output 'OK'
+} catch {
+    Write-Output ('ERR:' + $_.Exception.Message)
+}
+"""
+
+
+def _invoke_scope_harness(scope_value: str, tmp_path: Path) -> str:
+    powershell = _powershell_executable()
+    assert powershell is not None
+    harness = tmp_path / "scope_harness.ps1"
+    harness.write_text(_ENSURE_PATH_SCOPE_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+            "-ScopeValue",
+            scope_value,
+        ],
+        env=os.environ.copy(),
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_accepts_process_case_insensitively(tmp_path: Path) -> None:
+    """'Process' (any case) is a supported ephemeral target: Ensure-PathEntry runs."""
+    assert _invoke_scope_harness("process", tmp_path).endswith("OK")
+    assert _invoke_scope_harness("Process", tmp_path).endswith("OK")
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
+    """'Machine' (system-wide) and typos must fail early, before any PATH write."""
+    for bad in ("Machine", "machine", "system", "bogus"):
+        out = _invoke_scope_harness(bad, tmp_path)
+        assert out.startswith("ERR:"), f"scope {bad!r} was not rejected: {out!r}"
+        assert "User" in out and "Process" in out, out
 
 
 @pytest.mark.skipif(
@@ -759,8 +1099,40 @@ def test_powershell_native_installer_supports_persistent_docker_lifecycle(tmp_pa
             if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
         )
         assert "-it" not in proxy_help_call
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "proxy",
+                "--port",
+                str(explicit_port),
+                "--host",
+                "192.0.2.1",
+            ],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call

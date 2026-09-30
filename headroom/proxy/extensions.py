@@ -18,6 +18,65 @@ Each ``install`` callable is invoked with the FastAPI ``app`` and the
 OSS makes no assumptions about what extensions do. The interface is
 deliberately minimal; extensions own the complexity behind it.
 
+Where extension middleware sits
+-------------------------------
+
+``install_all`` runs **before** the proxy registers its inbound security gate
+and its request-body ceiling, and Starlette builds the stack so that the last
+layer registered is the outermost. Middleware an extension adds therefore
+always runs *inside* both, and an extension author can rely on two things
+without re-implementing them:
+
+  * a request that reaches extension middleware has already passed
+    ``HEADROOM_PROXY_TOKEN`` (when one is configured) — an extension never sees,
+    answers, buffers, or rewrites headers on an unauthenticated request, on
+    either transport (HTTP or WebSocket);
+  * a request body that reaches extension middleware is already bounded by
+    :data:`headroom.proxy.helpers.MAX_REQUEST_BODY_SIZE` — an extension that
+    buffers the body cannot be made to hold more than that.
+
+The flip side is a constraint: extension middleware cannot act as the
+proxy's authentication layer, because the proxy's own gate runs first. An
+extension that needs its own inbound auth applies it in addition to, not
+instead of, the proxy token. ``install_all`` records every middleware entry an
+extension adds on ``app.state.extension_middleware`` so the ordering can be
+asserted by tests rather than assumed.
+
+Reporting what an extension saved, and what it cost
+---------------------------------------------------
+
+An extension that changes the bill should say so, or the operator sees a
+different total with nothing to attribute it to. Two calls, both taking the
+ASGI ``scope`` so they work from middleware — which runs outside the request
+handler and has no other way in::
+
+    from headroom.proxy.savings_attribution import (
+        record_scope_savings, record_scope_timing,
+    )
+
+    record_scope_savings(scope, "my_extension", tokens=1200, usd=0.004)
+    record_scope_timing(scope, "my_extension", elapsed_ms)
+
+``record_scope_savings`` takes ``tokens``, ``usd``, or both, so an extension
+that saves money WITHOUT saving tokens — routing a request to a cheaper model,
+say — can report a real number instead of a token count nobody saved. Pass
+``realized=False`` for a projection rather than a measured amount; the two are
+kept apart everywhere they surface. Savings land on ``/stats`` under
+``savings.by_source``, on the dashboard as their own card, and in Prometheus as
+``headroom_savings_attributed_usd_total{source=...}``. **Attribution only** —
+these rows explain the headline total, they are never added to it.
+
+``record_scope_timing`` is the other half of the trade: an extension's own
+latency, which is otherwise invisible because ``overhead_ms`` is measured
+inside the handler that the extension wraps. It lands in ``/stats`` under
+``pipeline_timing``, in the dashboard's Performance panel, and in
+``headroom_transform_timing_ms_*``, namespaced ``ext:<name>`` so it can never
+collide with a built-in transform.
+
+Both are bounded (32 sources, 16 stages), never raise, and never change a
+response — telemetry from a plugin must not be able to break the request it is
+describing.
+
 **Extensions are opt-in.** Discovery enumerates every registered extension,
 but ``install_all`` only invokes those explicitly enabled by the operator.
 This protects users from silent behavior changes when a package they didn't
@@ -129,9 +188,17 @@ def install_all(
     wildcard = "*" in enabled_set
     installed: list[str] = []
     failed: list[str] = []
+    # Middleware entries added by extensions, in registration order. Starlette
+    # prepends on ``add_middleware``, so the entries an install() adds are
+    # whatever is new at the FRONT of ``app.user_middleware`` afterwards. Kept
+    # on ``app.state`` so the ordering contract in the module docstring is
+    # something the test suite can check against the real app.
+    middleware_list = getattr(app, "user_middleware", None)
+    added_middleware: list[Any] = []
     for name, install in discovered:
         if not wildcard and name not in enabled_set:
             continue
+        before = len(middleware_list) if isinstance(middleware_list, list) else 0
         try:
             install(app, config)
         except Exception as exc:  # noqa: BLE001 — one bad extension must not brick the proxy
@@ -147,7 +214,16 @@ def install_all(
             failed.append(name)
             continue
         installed.append(name)
+        if isinstance(middleware_list, list):
+            added_middleware.extend(middleware_list[: len(middleware_list) - before])
         log.info("proxy extension installed: %s", name)
+
+    state = getattr(app, "state", None)
+    if state is not None:
+        try:
+            state.extension_middleware = added_middleware
+        except Exception:  # noqa: BLE001 — a bare test double may not accept attributes
+            log.debug("could not record extension middleware on app.state", exc_info=True)
 
     if failed:
         skipped = ",".join(sorted(failed))

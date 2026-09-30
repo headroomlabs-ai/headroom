@@ -79,18 +79,43 @@ _SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 CCR_SENTINEL_KEY = "_ccr_dropped"
 
 
+# Prefix/infix identifying the scalar-array drop sentinel emitted by the
+# Rust crusher when string/number/mixed array items are dropped with
+# `enable_ccr_marker` on (headroomlabs-ai/headroom#3650). Unlike the
+# dict sentinel object above, this one is a plain string so string
+# arrays keep a uniform element type.
+SCALAR_SENTINEL_PREFIX = "… "
+SCALAR_SENTINEL_INFIX = " more items "
+
+
 def is_ccr_sentinel(item: Any) -> bool:
-    """True if `item` is a CCR-dropped sentinel object."""
-    return isinstance(item, dict) and CCR_SENTINEL_KEY in item
+    """True if `item` is a CCR-dropped sentinel.
+
+    Covers both sentinel shapes: the dict object (``{"_ccr_dropped": ...}``)
+    emitted for dict arrays, and the plain-string sentinel
+    (``"… N more items <<ccr:HASH N_items_offloaded>>"``) appended to
+    string/number/mixed arrays when items are dropped
+    (headroomlabs-ai/headroom#3650).
+    """
+    if isinstance(item, dict):
+        return CCR_SENTINEL_KEY in item
+    return (
+        isinstance(item, str)
+        and item.startswith(SCALAR_SENTINEL_PREFIX)
+        and SCALAR_SENTINEL_INFIX in item
+        and "<<ccr:" in item
+    )
 
 
 def strip_ccr_sentinels(items: Any) -> Any:
     """Return `items` with any CCR-dropped sentinel objects filtered out.
 
     Pass this through any iteration over a compressed array's contents
-    when your code expects a uniform-schema list of records. The sentinel
-    carries a `<<ccr:HASH ...>>` marker for the LLM and shouldn't be
-    confused for a record — it has only the `_ccr_dropped` key.
+    when your code expects a uniform-schema list of records. The dict
+    sentinel carries a `<<ccr:HASH ...>>` marker for the LLM and shouldn't
+    be confused for a record — it has only the `_ccr_dropped` key. The
+    string sentinel (scalar arrays) likewise marks dropped items without
+    pretending to be data.
 
     Non-list inputs pass through unchanged so callers can wrap whatever
     `json.loads` returned without first checking the shape.
@@ -653,11 +678,12 @@ class SmartCrusher(Transform):
         kept, lost = self._splice_missing_protected(protected, kept)
         if len(kept) != before_count:
             # Only reserialize when something was actually spliced in —
-            # an unmodified `kept` stays byte-identical to Rust's output
-            # (Python's `json.dumps` and serde_json don't necessarily
-            # agree on e.g. non-ASCII escaping).
+            # an unmodified `kept` stays byte-identical to Rust's output.
+            # ensure_ascii=False matches serde_json (which never escapes
+            # non-ASCII), so a splice doesn't turn readable unicode into
+            # model-visible \uXXXX soup.
             result = dict(result)
-            result["items"] = json.dumps(kept)
+            result["items"] = json.dumps(kept, ensure_ascii=False)
         if not lost:
             return result
 
@@ -712,7 +738,9 @@ class SmartCrusher(Transform):
             kept, lost = self._splice_missing_protected(protected, parsed)
             # Only reserialize when something was actually spliced in —
             # see the matching comment in `_apply_audit_safe_protection`.
-            candidate = json.dumps(kept) if len(kept) != len(parsed) else crushed
+            candidate = (
+                json.dumps(kept, ensure_ascii=False) if len(kept) != len(parsed) else crushed
+            )
         else:
             lost = sum(
                 max(0, len(p.findall(original_content)) - len(p.findall(crushed)))

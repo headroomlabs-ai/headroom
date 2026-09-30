@@ -20,6 +20,12 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
+def format_exception_message(exc: BaseException) -> str:
+    """Return exception text with a useful fallback for empty messages."""
+    message = str(exc)
+    return message or f"{type(exc).__name__} (no message)"
+
+
 def compute_hash(data: str | bytes) -> str:
     """Compute SHA256 hash, returning hex string."""
     if isinstance(data, str):
