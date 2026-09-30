@@ -1,7 +1,7 @@
 """Direct unit tests for the shared wrap-subcommand helpers.
 
-These helpers (`_print_wrap_banner`, `_setup_context_tool_for_agent`,
-`_run_proxy_only_watcher`) were extracted to remove ~150 LOC of
+These helpers (`_print_wrap_banner`, `_run_proxy_only_watcher`) were
+extracted to remove ~150 LOC of
 copy-pasted scaffolding across the wrap subcommands (cursor / cline /
 continue / goose / openhands). The wrap-*.py subcommand tests exercise
 them indirectly; these tests pin the contract directly so a future
@@ -15,11 +15,11 @@ from __future__ import annotations
 import errno
 import json
 import os
-import subprocess
-import sys
+import signal
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import click
 import pytest
@@ -28,6 +28,8 @@ from click.testing import CliRunner
 from headroom import paths as paths_mod
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.memory.storage_router import ProjectResolver, RequestContext
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 
 # ---------------------------------------------------------------------------
 # _print_wrap_banner — centering math + box drawing.
@@ -97,29 +99,8 @@ def test_print_wrap_banner_title_is_centered_or_near_centered() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _setup_context_tool_for_agent — all five branches:
-#   1. lean-ctx mode → calls _setup_lean_ctx_agent, returns None
-#   2. rtk install success → calls on_rtk_ready, returns rtk_path
-#   3. rtk install fail + rtk_required=False → returns None silently
-#   4. rtk install fail + rtk_required=True → SystemExit(1)
-#   5. KeyboardInterrupt → _emit_wrap_interrupted, SystemExit(130)
+# wrap claude argument passthrough.
 # ---------------------------------------------------------------------------
-
-
-def test_claude_context_tool_is_opt_in_for_prepare_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Claude skips context-tool setup unless the positive flag is passed."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_prepare_wrap_rtk") as prepare_rtk:
-        default = runner.invoke(main, ["wrap", "claude", "--prepare-only"])
-        opt_in = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
-
-    assert default.exit_code == 0, default.output
-    assert opt_in.exit_code == 0, opt_in.output
-    assert prepare_rtk.call_count == 1
 
 
 def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> None:
@@ -132,195 +113,33 @@ def test_wrap_claude_allows_claude_print_short_flag_in_passthrough_args() -> Non
     assert result.exit_code == 0, result.output
 
 
-def test_claude_context_tool_opt_in_preserves_lean_ctx_selection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The positive flag enables the configured lean-ctx installer."""
-    monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_setup_lean_ctx_agent") as setup_lean_ctx:
-        result = runner.invoke(main, ["wrap", "claude", "--prepare-only", "--context-tool"])
-
-    assert result.exit_code == 0, result.output
-    setup_lean_ctx.assert_called_once_with("claude", verbose=False)
+# ---------------------------------------------------------------------------
+# _apply_1m_to_claude_args — add the [1m] suffix to an explicit pass-through
+# --model so it survives Claude Code's CLI-over-env precedence (#2915).
+# ---------------------------------------------------------------------------
+def test_apply_1m_rewrites_model_flag_value() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
 
 
-def test_claude_no_context_tool_wins_over_context_tool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The legacy opt-out remains authoritative when both flags are supplied."""
-    runner = CliRunner()
-
-    with patch.object(wrap_mod, "_prepare_wrap_rtk") as prepare_rtk:
-        result = runner.invoke(
-            main,
-            ["wrap", "claude", "--prepare-only", "--context-tool", "--no-context-tool"],
-        )
-
-    assert result.exit_code == 0, result.output
-    prepare_rtk.assert_not_called()
+def test_apply_1m_rewrites_equals_model_flag() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model=opusplan",))
+    assert args == ("--model=opusplan[1m]",)
+    assert rewritten == "opusplan[1m]"
 
 
-def test_non_claude_context_tool_setup_remains_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Copilot still sets up RTK without a new positive opt-in flag."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-dummy")
-
-    with (
-        patch.object(wrap_mod.shutil, "which", return_value="copilot"),
-        patch.object(wrap_mod, "_ensure_rtk_binary", return_value=Path("/tmp/rtk")) as ensure_rtk,
-        patch.object(wrap_mod, "_launch_tool"),
-    ):
-        result = CliRunner().invoke(
-            main,
-            ["wrap", "copilot", "--no-proxy", "--", "--model", "claude-sonnet-4-20250514"],
-        )
-
-    assert result.exit_code == 0, result.output
-    ensure_rtk.assert_called_once_with(verbose=False)
+def test_apply_1m_is_idempotent_on_already_suffixed_model() -> None:
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(("--model", "opusplan[1m]"))
+    assert args == ("--model", "opusplan[1m]")
+    assert rewritten == "opusplan[1m]"
 
 
-def test_setup_context_tool_lean_ctx_calls_lean_ctx_setup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When HEADROOM_CONTEXT_TOOL=lean-ctx, helper calls _setup_lean_ctx_agent."""
-    monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "lean-ctx")
-    called_with: dict[str, Any] = {}
-
-    def fake_lean_ctx(agent: str, verbose: bool = False) -> Path | None:
-        called_with["agent"] = agent
-        called_with["verbose"] = verbose
-        return None
-
-    monkeypatch.setattr(wrap_mod, "_setup_lean_ctx_agent", fake_lean_ctx)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=None,
-        )
-        assert result is None
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert called_with == {"agent": "cline", "verbose": False}
-
-
-def test_setup_context_tool_rtk_success_calls_on_rtk_ready(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """rtk install success → on_rtk_ready receives the rtk binary path."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    fake_rtk = Path("/tmp/rtk-fake")
-    received: list[Path] = []
-
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: fake_rtk)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=tmp_path / ".clinerules",
-            on_rtk_ready=lambda rtk: received.append(rtk),
-        )
-        assert result == fake_rtk
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert received == [fake_rtk]
-
-
-def test_setup_context_tool_rtk_failure_with_not_required_returns_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """rtk install failure + rtk_required=False → silent fall-through, None."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
-
-    on_rtk_called = False
-
-    def _should_not_be_called(_rtk: Path) -> None:
-        nonlocal on_rtk_called
-        on_rtk_called = True
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        result = wrap_mod._setup_context_tool_for_agent(
-            agent="cursor",
-            agent_display="Cursor",
-            marker_path=None,
-            on_rtk_ready=_should_not_be_called,
-            rtk_required=False,
-        )
-        assert result is None
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 0, inv.output
-    assert not on_rtk_called, "on_rtk_ready should not be called when rtk install fails"
-
-
-def test_setup_context_tool_rtk_failure_with_required_exits_1(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """rtk install failure + rtk_required=True → SystemExit(1) with refusal message."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", lambda verbose=False: None)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        wrap_mod._setup_context_tool_for_agent(
-            agent="openhands",
-            agent_display="OpenHands",
-            marker_path=None,
-            rtk_required=True,
-        )
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 1, inv.output
-    assert "rtk install failed" in inv.output
-    assert "refusing to inject" in inv.output
-
-
-def test_setup_context_tool_keyboardinterrupt_emits_interrupted_and_exits_130(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """KeyboardInterrupt during setup → _emit_wrap_interrupted, SystemExit(130)."""
-    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
-
-    marker = tmp_path / ".clinerules"
-    marker.write_text("pre-existing")
-
-    def raise_kbd(verbose: bool = False) -> Path | None:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(wrap_mod, "_ensure_rtk_binary", raise_kbd)
-
-    runner = CliRunner()
-
-    @click.command()
-    def _cmd() -> None:
-        wrap_mod._setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=marker,
-        )
-
-    inv = runner.invoke(_cmd)
-    assert inv.exit_code == 130
-    assert "interrupted" in inv.output.lower()
-    assert "idempotent" in inv.output.lower()
-    assert str(marker) in inv.output
+def test_apply_1m_noop_without_model_flag() -> None:
+    original = ("--permission-mode", "auto", "--resume")
+    args, rewritten = wrap_mod._apply_1m_to_claude_args(original)
+    assert args == original
+    assert rewritten is None
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +243,57 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
     assert "Shutting down..." in inv.output
 
 
+def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows console stop handlers must use the clean shutdown path."""
+
+    handlers: dict[int, Any] = {}
+    cleanup_calls = {"n": 0}
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+    def capture_handler(sig: int, handler: Any) -> None:
+        handlers[sig] = handler
+
+    def trigger_sigint(_seconds: float) -> None:
+        handlers[signal.SIGINT](signal.SIGINT, None)
+
+    def cleanup(*_args: Any) -> None:
+        cleanup_calls["n"] += 1
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (_FakeProc(), 8787))
+    monkeypatch.setattr(wrap_mod.time, "sleep", trigger_sigint)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: cleanup)
+    monkeypatch.setattr(wrap_mod.signal, "signal", capture_handler)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    sigbreak = 999
+    monkeypatch.setattr(wrap_mod.signal, "SIGBREAK", sigbreak, raising=False)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._run_proxy_only_watcher(
+            agent_label="vscode copilot",
+            port=8787,
+            no_proxy=False,
+            learn=False,
+            memory=False,
+            agent_type="copilot",
+            print_setup_lines=lambda _port: None,
+        )
+
+    inv = runner.invoke(_cmd)
+    assert inv.exit_code == 0, inv.output
+    assert "Shutting down..." in inv.output
+    assert "Proxy process exited unexpectedly" not in inv.output
+    assert sigbreak in handlers
+    assert cleanup_calls["n"] >= 2  # signal handler plus finally (idempotent)
+
+
 def test_run_proxy_only_watcher_unexpected_exception_returns_exit_1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -510,7 +380,79 @@ class TestApplyProjectHeaderEnv:
         env: dict[str, str] = {}
         wrap_mod._apply_project_header_env(env)
 
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Project: my-project"
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Headroom-Project: my-project",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
+
+    def test_wrap_project_header_resolves_ccr_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+        headers = {
+            name.strip().lower(): value.strip()
+            for name, value in (
+                line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+            )
+        }
+
+        key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers), {}
+        )
+
+        assert key.startswith("my-project-")
+        assert label == "my-project"
+
+    def test_wrap_same_basename_projects_get_distinct_memory_and_ccr_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The wrapped headers keep same-named projects in separate stores."""
+        first = tmp_path / "one" / "api"
+        second = tmp_path / "two" / "api"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+
+        def wrapped_headers(project_dir: Path) -> dict[str, str]:
+            monkeypatch.chdir(project_dir)
+            env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Headroom-Project: shared"}
+            wrap_mod._apply_project_header_env(env)
+            return {
+                name.strip().lower(): value.strip()
+                for name, value in (
+                    line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+                )
+            }
+
+        headers_a = wrapped_headers(first)
+        headers_b = wrapped_headers(second)
+
+        assert headers_a["x-headroom-project"] == headers_b["x-headroom-project"] == "shared"
+        assert headers_a["x-headroom-cwd"] != headers_b["x-headroom-cwd"]
+
+        resolver = ProjectResolver()
+        memory_a = resolver.resolve(
+            RequestContext(headers=headers_a, system_prompt="", base_user_id="")
+        )
+        memory_b = resolver.resolve(
+            RequestContext(headers=headers_b, system_prompt="", base_user_id="")
+        )
+        assert memory_a is not None and memory_b is not None
+        assert memory_a[0] != memory_b[0]
+
+        ccr_a = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_a), {}
+        )
+        ccr_b = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_b), {}
+        )
+        assert ccr_a[0] == memory_a[0]
+        assert ccr_b[0] == memory_b[0]
+        assert ccr_a[0] != ccr_b[0]
 
     def test_appends_to_existing_custom_headers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -523,9 +465,11 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # User header preserved verbatim, ours appended on a new line.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
-            "X-Custom-Trace: abc123\nX-Headroom-Project: proj"
-        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Custom-Trace: abc123",
+            "X-Headroom-Project: proj",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
 
     @pytest.mark.parametrize(
         "user_value",
@@ -549,8 +493,10 @@ class TestApplyProjectHeaderEnv:
         env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
         wrap_mod._apply_project_header_env(env)
 
-        # Untouched: no duplicate header, user override wins.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+        # The user label remains untouched; the missing routing identity is appended.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     @pytest.mark.parametrize(
         "user_value",
@@ -573,7 +519,10 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # Only an exact header-name match counts as a user override.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (f"{user_value}\nX-Headroom-Project: proj")
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Project: proj\n"
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     def test_empty_cwd_name_sets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A degenerate cwd (e.g. filesystem root → empty basename) is a no-op."""
@@ -618,6 +567,34 @@ class TestApplyProjectHeaderEnv:
 
         assert urllib.parse.unquote(result) == "第二大脑共享"
 
+    def test_project_cwd_is_percent_encoded_and_round_trips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "project with space-中文"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        result = wrap_mod._project_cwd_from_cwd()
+        assert result is not None
+        result.encode("ascii")
+
+        import urllib.parse
+
+        assert urllib.parse.unquote(result) == str(project_dir.resolve())
+
+    def test_existing_cwd_header_wins_case_insensitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        user_value = "X-Headroom-Project: their-name\nx-headroom-cwd: /already/trusted"
+        env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
+        wrap_mod._apply_project_header_env(env)
+
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+
     def test_non_ascii_cwd_header_is_ascii_safe(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -631,6 +608,7 @@ class TestApplyProjectHeaderEnv:
 
         header_value = env["ANTHROPIC_CUSTOM_HEADERS"]
         assert header_value.startswith("X-Headroom-Project: ")
+        assert "X-Headroom-Cwd: " in header_value
         header_value.encode("ascii")  # raises UnicodeEncodeError if non-ASCII
 
 
@@ -666,6 +644,62 @@ class _FakeProxyProc:
         self.killed = True
 
 
+def test_start_proxy_strips_ambient_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HEADROOM_WORKERS", "4")
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", '{"port": 9999}')
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    captured: dict[str, object] = {}
+    proc = _FakeProxyProc()
+
+    def fake_popen(command: list[str], **kwargs: object) -> _FakeProxyProc:
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    assert wrap_mod._start_proxy(8787) is proc
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "HEADROOM_WORKERS" not in env
+    assert "HEADROOM_PROXY_CONFIG_JSON" not in env
+    assert env["HEADROOM_HTTP2"] == "false"
+    assert captured["command"][-2:] == ["--workers", "1"]
+
+
+def test_start_proxy_timeout_kills_failed_new_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc = _FakeProxyProc()
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        wrap_mod._start_proxy(8787)
+
+    assert proc.killed is True
+
+
 class TestProxyClientRefCounting:
     """Proxy lifecycle is reference-counted via marker files, not pgrep."""
 
@@ -693,17 +727,83 @@ class TestProxyClientRefCounting:
         marker.write_text(json.dumps(rec))
         return marker
 
-    def test_cleanup_terminates_proxy_when_only_self_registered(self, clients_dir: Path) -> None:
-        """The owner alone → no other clients → proxy is terminated on exit."""
+    def test_cleanup_unregisters_marker_without_terminating_proxy(self, clients_dir: Path) -> None:
+        """Normal exit transfers final shutdown ownership to the watchdog."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
 
         cleanup()
 
-        assert proc.terminated is True
-        # Our own marker is removed before we count.
+        assert proc.terminated is False
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
+
+    def test_cleanup_leaves_detached_windows_serving_child_to_watchdog(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows cleanup follows the same marker-only ownership transfer."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        proc.poll = lambda: 0  # type: ignore[method-assign]
+        stopped: list[int] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 123})
+        monkeypatch.setattr(
+            wrap_mod,
+            "_stop_local_proxy_for_unwrap",
+            lambda port: stopped.append(port) or "stopped",
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert not proc.terminated
+        assert stopped == []
+
+    def test_kill_proxy_uses_taskkill_tree_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows cleanup must terminate the native launcher's whole tree."""
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        checks = iter([True, False])
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: next(checks))
+        monkeypatch.setattr(
+            wrap_mod.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        assert wrap_mod._kill_proxy_by_pid(456, self.PORT)
+        assert calls == [
+            (
+                ["taskkill", "/F", "/T", "/PID", "456"],
+                {"capture_output": True, "timeout": 10, "check": False},
+            )
+        ]
+
+    def test_cleanup_does_not_probe_or_kill_windows_serving_child(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The watchdog, not wrapper cleanup, owns normal listener shutdown."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 456})
+        monkeypatch.setattr(wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "unidentified")
+        monkeypatch.setattr(
+            wrap_mod,
+            "_kill_proxy_by_pid",
+            lambda pid, port: killed.append((pid, port)) or True,
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert not proc.terminated
+        assert killed == []
 
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
@@ -718,18 +818,35 @@ class TestProxyClientRefCounting:
 
         assert proc.terminated is False
 
-    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+    def test_dead_client_marker_is_pruned_and_not_counted(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A marker for a dead PID is pruned from disk and never counted."""
-        # Spawn and reap a child so its PID is reliably dead (not a zombie).
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        dead_pid = child.pid
+        dead_pid = 358784
         marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
         assert dead_pid not in live
         assert not marker.exists()
+
+    def test_dead_client_marker_unlink_failure_is_tolerated(
+        self,
+        clients_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dead_pid = 358784
+        marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
+
+        def fail_unlink(*args: object, **kwargs: object) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
+        assert marker.exists()
 
     def test_reused_pid_with_mismatched_identity_is_pruned(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -785,6 +902,13 @@ class TestProxyClientRefCounting:
 
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
 
+    def test_non_dict_marker_is_tolerated(self, clients_dir: Path) -> None:
+        live_pid = os.getppid()
+        marker = self._write_marker(clients_dir, live_pid)
+        marker.write_text("[]", encoding="utf-8")
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == [live_pid]
+
     def test_cleanup_does_not_shell_out_to_pgrep(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -805,7 +929,7 @@ class TestProxyClientRefCounting:
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
         cleanup()  # must not raise
 
-        assert proc.terminated is True
+        assert proc.terminated is False
 
     def test_register_then_unregister_is_idempotent(self, clients_dir: Path) -> None:
         """Register adds exactly our marker; unregister removes it; re-call is safe."""
@@ -834,12 +958,16 @@ def test_ensure_proxy_already_running_prints_dashboard_url(
     wraps (the common case) never told the user where the dashboard lives.
     """
     port = 1234
+    # A compatible running proxy exposes its config; proxies without a config
+    # block are no longer reused (they cannot be compatibility-checked) and
+    # are covered by test_ensure_proxy_never_reuses_configless_proxy.
+    running_config = {"pid": 4321, "backend": "anthropic"}
     monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
     monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
     monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _h: False)
-    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: None)
-    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: None)
+    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: running_config)
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **kw: [])
 
     output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
 
@@ -864,10 +992,57 @@ def test_resolve_1m_model_is_idempotent() -> None:
     assert wrap_mod._resolve_1m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"
 
 
-def test_resolve_1m_model_falls_back_to_default_when_unset() -> None:
-    """With no model selected, fall back to the default Opus carrying [1m]."""
-    assert wrap_mod._resolve_1m_model(None) == "claude-opus-4-8[1m]"
-    assert wrap_mod._resolve_1m_model("  ") == "claude-opus-4-8[1m]"
+def test_resolve_1m_model_falls_back_to_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no model selected, fall back to the built-in default carrying [1m]."""
+    monkeypatch.delenv("HEADROOM_1M_MODEL", raising=False)
+    expected = f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+    assert wrap_mod._resolve_1m_model(None) == expected
+    assert wrap_mod._resolve_1m_model("  ") == expected
+
+
+def test_resolve_1m_model_env_overrides_builtin_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_1M_MODEL overrides the built-in fallback so --1m can track new
+    Opus releases without a code change or pinning ANTHROPIC_MODEL (#2937)."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_current_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit ANTHROPIC_MODEL still wins; HEADROOM_1M_MODEL is only the
+    fallback default when nothing else is selected."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9")
+    assert wrap_mod._resolve_1m_model("claude-sonnet-5") == "claude-sonnet-5[1m]"
+
+
+def test_resolve_1m_model_env_idempotent_on_suffixed_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A HEADROOM_1M_MODEL that already carries [1m] is not double-suffixed."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "claude-opus-9[1m]")
+    assert wrap_mod._resolve_1m_model(None) == "claude-opus-9[1m]"
+
+
+def test_resolve_1m_model_blank_env_falls_back_to_builtin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blank/whitespace HEADROOM_1M_MODEL falls back to the built-in default."""
+    monkeypatch.setenv("HEADROOM_1M_MODEL", "   ")
+    assert wrap_mod._resolve_1m_model(None) == f"{wrap_mod._DEFAULT_1M_MODEL}[1m]"
+
+
+def test_headroom_1m_model_is_documented_and_default_matches_code() -> None:
+    """The HEADROOM_1M_MODEL knob must stay documented, and the documented
+    default must track the code, so the supported configuration surface cannot
+    silently drift or disappear (#2937).
+    """
+    docs = Path(__file__).resolve().parents[2] / "docs" / "content" / "docs" / "configuration.mdx"
+    text = docs.read_text(encoding="utf-8")
+    assert wrap_mod._1M_MODEL_ENV in text, f"{wrap_mod._1M_MODEL_ENV} is not documented"
+    # The env-var catalog row must advertise the current built-in default.
+    assert f"`{wrap_mod._DEFAULT_1M_MODEL}`" in text, (
+        "documented HEADROOM_1M_MODEL default is out of sync with "
+        f"_DEFAULT_1M_MODEL={wrap_mod._DEFAULT_1M_MODEL!r}"
+    )
 
 
 class TestFindAvailablePort:
@@ -930,3 +1105,43 @@ class TestFindAvailablePort:
         )
         with pytest.raises(RuntimeError, match="No available port found"):
             wrap_mod._find_available_port(8787, max_attempts=3)
+
+
+def test_ensure_proxy_serializes_startup_per_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A normal wrap must enter the per-port startup critical section."""
+    events: list[object] = []
+
+    @contextmanager
+    def fake_lock(port: int):
+        events.append(("lock-enter", port))
+        try:
+            yield
+        finally:
+            events.append(("lock-exit", port))
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fake_lock)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_ensure_proxy_unlocked",
+        lambda port, no_proxy, **kwargs: events.append(("ensure", port, no_proxy)) or (None, port),
+    )
+
+    assert wrap_mod._ensure_proxy(8787, False) == (None, 8787)
+    assert events == [("lock-enter", 8787), ("ensure", 8787, False), ("lock-exit", 8787)]
+
+
+def test_no_proxy_does_not_create_startup_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit --no-proxy reuses an existing service without taking the lock."""
+    entered = False
+
+    @contextmanager
+    def fail_lock(port: int):
+        nonlocal entered
+        entered = True
+        yield
+
+    monkeypatch.setattr(wrap_mod, "_proxy_start_lock", fail_lock)
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy_unlocked", lambda *args, **kwargs: (None, 8787))
+
+    assert wrap_mod._ensure_proxy(8787, True) == (None, 8787)
+    assert entered is False

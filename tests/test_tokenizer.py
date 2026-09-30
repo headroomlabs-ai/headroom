@@ -22,6 +22,41 @@ class FakeTokenCounter:
         return sum(len(str(msg.get("content", "")).split()) for msg in messages)
 
 
+def test_claude_priced_with_real_bpe_not_char_estimate() -> None:
+    """Claude has no public tokenizer, so we price it against a real BPE
+    (tiktoken o200k_base) instead of a content-adaptive character estimate —
+    otherwise before/after counts drift between components and compressing text
+    can appear to *increase* tokens. A tool_result fold must always register as
+    a reduction; and when the vocab is available the count is the exact o200k
+    count (proving it is a real BPE, not a chars/token ratio)."""
+    from headroom.tokenizers import get_tokenizer
+
+    tok = get_tokenizer("claude-opus-4-8")
+
+    long_msg = [
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "alpha " * 300}],
+        }
+    ]
+    short_msg = [
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t", "content": "alpha " * 3}],
+        }
+    ]
+    assert tok.count_messages(long_msg) > tok.count_messages(short_msg)  # fold visible
+
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("o200k_base")
+    except Exception:  # vocab unavailable → estimator fallback; monotonicity above still holds
+        return
+    sample = "The quick brown fox jumps over the lazy dog. " * 10
+    assert tok.count_text(sample) == len(enc.encode(sample))
+
+
 def test_tokenizer_delegates_to_counter() -> None:
     counter = FakeTokenCounter()
     tokenizer = Tokenizer(counter, model="gpt-4o")

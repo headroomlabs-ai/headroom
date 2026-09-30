@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from headroom.ccr.tool_injection import CCRToolInjector
-from headroom.proxy.ccr_marker_policy import has_new_ccr_markers, should_inject_ccr_tool
+from headroom.proxy.ccr_marker_policy import has_new_ccr_markers
 
 
 def _hashes(*contents: str) -> list[str]:
@@ -25,6 +25,13 @@ def test_has_new_ccr_markers_filters_replayed_forwarded_markers() -> None:
         )
         is False
     )
+
+
+def test_source_line_span_marker_is_still_detected() -> None:
+    # The compressor annotates the count with a source-line span (#2586); the
+    # retrieval hash must still be extracted from the enriched marker.
+    marker = "[122 items compressed to 27 (from 5 source lines). Retrieve more: hash=c00eb437e5e5c00eb437e5e5]"
+    assert _hashes(marker) == ["c00eb437e5e5c00eb437e5e5"]
 
 
 def test_has_new_ccr_markers_detects_hash_not_seen_in_previous_forward() -> None:
@@ -63,27 +70,3 @@ def test_has_new_ccr_markers_returns_false_without_current_hashes() -> None:
         )
         is False
     )
-
-
-def test_should_inject_ccr_tool_overrides_frozen_prefix_deferral_for_markers() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=3,
-        has_compressed_content=True,
-    ) == (True, True)
-
-
-def test_should_inject_ccr_tool_defers_frozen_prefix_without_markers() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=3,
-        has_compressed_content=False,
-    ) == (False, False)
-
-
-def test_should_inject_ccr_tool_injects_configured_tool_without_frozen_prefix() -> None:
-    assert should_inject_ccr_tool(
-        configured_inject_tool=True,
-        frozen_message_count=0,
-        has_compressed_content=False,
-    ) == (True, False)

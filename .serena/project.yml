@@ -1,38 +1,5 @@
-# the name by which the project can be referenced within Serena
-project_name: "feature-opencode-wrap"
-
-
-# list of languages for which language servers are started; choose from:
-#   al                  angular             ansible             bash                clojure
-#   cpp                 cpp_ccls            crystal             csharp              csharp_omnisharp
-#   dart                elixir              elm                 erlang              fortran
-#   fsharp              go                  groovy              haskell             haxe
-#   hlsl                html                java                json                julia
-#   kotlin              lean4               lua                 luau                markdown
-#   matlab              msl                 nix                 ocaml               pascal
-#   perl                php                 php_phpactor        powershell          python
-#   python_jedi         python_ty           r                   rego                ruby
-#   ruby_solargraph     rust                scala               scss                solidity
-#   svelte              swift               systemverilog       terraform           toml
-#   typescript          typescript_vts      vue                 yaml                zig
-#   (This list may be outdated. For the current list, see values of Language enum here:
-#   https://github.com/oraios/serena/blob/main/src/solidlsp/ls_config.py
-#   For some languages, there are alternative language servers, e.g. csharp_omnisharp, ruby_solargraph.)
-# Note:
-#   - For C, use cpp
-#   - For JavaScript, use typescript
-#   - For Angular projects, use angular (subsumes typescript+html; requires `npm install` in the project root)
-#   - For Svelte projects, use svelte (subsumes typescript/javascript for .svelte projects; requires npm)
-#   - For SCSS / Sass / plain CSS, use scss (some-sass-language-server handles all three)
-#   - For Free Pascal/Lazarus, use pascal
-# Special requirements:
-#   Some languages require additional setup/installations.
-#   See here for details: https://oraios.github.io/serena/01-about/020_programming-languages.html#language-servers
-# When using multiple languages, the first language server that supports a given file will be used for that file.
-# The first language is the default language and the respective language server will be used as a fallback.
-# Note that when using the JetBrains backend, language servers are not used and this list is correspondingly ignored.
-languages:
-- typescript
+# the name by which the project can be referenced within Serena/when chatting with the LLM.
+project_name: "headroom"
 
 # the encoding used by text files in the project
 # For a list of possible encodings, see https://docs.python.org/3.11/library/codecs.html#standard-encodings
@@ -55,23 +22,19 @@ ignore_all_files_in_gitignore: true
 
 # advanced configuration option allowing to configure language server-specific options.
 # Maps the language key to the options.
-# Have a look at the docstring of the constructors of the LS implementations within solidlsp (e.g., for C# or PHP) to see which options are available.
-# No documentation on options means no options are available.
+# The settings are considered only if the project is trusted (see global configuration to define trusted projects).
+# See https://oraios.github.io/serena/02-usage/050_configuration.html#language-server-specific-settings
 ls_specific_settings: {}
-
-# list of additional workspace folder paths for cross-package reference support (e.g. in monorepos).
-# Paths can be absolute or relative to the project root.
-# Each folder is registered as an LSP workspace folder, enabling language servers to discover
-# symbols and references across package boundaries.
-# Currently supported for: TypeScript.
-# Example:
-#   additional_workspace_folders:
-#     - ../sibling-package
-#     - ../shared-lib
-additional_workspace_folders: []
 
 # list of additional paths to ignore in this project.
 # Same syntax as gitignore, so you can use * and **.
+# Important: quote patterns that start with `*`, otherwise YAML treats them as aliases.
+# Example:
+#   ignored_paths:
+#     - "examples/**"
+#     - ".worktrees/**"
+#     - "**/bin/**"
+#     - "**/obj/**"
 # Note: global ignored_paths from serena_config.yml are also applied additively.
 ignored_paths: []
 
@@ -131,3 +94,76 @@ read_only_memory_patterns: []
 # Extends the list from the global configuration, merging the two lists.
 # Example: ["_archive/.*", "_episodes/.*"]
 ignored_memory_patterns: []
+
+# list of additional workspace folder paths for cross-package reference support.
+# Paths can be absolute or relative to the project root.
+# Each folder is registered as an LSP workspace folder, enabling language servers to discover
+# symbols and references across package boundaries, but these folders are not indexed by Serena,
+# i.e. the respective symbols will not be found using Serena's symbol search tools.
+# Example:
+#   additional_workspace_folders:
+#     - ../sibling-package
+#     - ../shared-lib
+ls_additional_workspace_folders: []
+
+# list of language servers to start when using the LSP backend; choose from:
+#   ada                    al                     angular                ansible                bash
+#   bsl                    clojure                cpp                    cpp_ccls               crystal
+#   csharp                 csharp_omnisharp       cue                    dart                   elixir
+#   elm                    erlang                 fortran                fsharp                 gdscript
+#   go                     groovy                 haskell                haxe                   hlsl
+#   html                   java                   json                   julia                  kotlin
+#   latex                  lean4                  lua                    luau                   markdown
+#   matlab                 msl                    nix                    ocaml                  pascal
+#   perl                   php                    php_phpactor           php_phpantom           powershell
+#   python                 python_basedpyright    python_jedi            python_pyrefly         python_ty
+#   qml                    r                      rego                   ruby                   ruby_solargraph
+#   rust                   scala                  scss                   solidity               svelte
+#   swift                  systemverilog          terraform              toml                   typescript
+#   typescript_vts         vue                    yaml                   zig
+#   (This list may be outdated; generated with scripts/print_language_list.py;
+#   For the current list, see values of the LanguageServerId enum here:
+#   https://github.com/oraios/serena/blob/main/src/solidlsp/ls_config.py)
+# For some languages, there are several alternative language servers, e.g. csharp_omnisharp, ruby_solargraph.)
+# Note:
+#   - For C, use cpp
+#   - For JavaScript, use typescript
+#   - For Angular projects, use angular (subsumes typescript+html; requires `npm install` in the project root)
+#   - For Svelte projects, use svelte (subsumes typescript/javascript for .svelte projects; requires npm)
+#   - For SCSS / Sass / plain CSS, use scss (some-sass-language-server handles all three)
+#   - For Free Pascal/Lazarus, use pascal
+# Special requirements:
+#   Some language servers require additional setup/installations.
+#   See here for details: https://oraios.github.io/serena/01-about/020_programming-languages.html#language-servers
+# When using multiple language servers, the first language server that supports a given file will be used for that file.
+# The first language server is the default language and the respective language server will be used as a fallback.
+# Note that when using the JetBrains backend, language servers are not used and this list is correspondingly ignored.
+language_servers:
+- python
+- rust
+- typescript
+
+# list of workspace folder paths (LSP backend only).
+# These folders will be used to build up Serena's symbol index.
+# Paths must be within the project root and should thus be relative to the project root.
+# Furthermore, the paths should not be filtered by ignore settings.
+# Default setting: The entire project root folder (".") is considered.
+# In (large) monorepos, this can be used to index only subfolders of the project root, e.g.
+#   ls_workspace_folders:
+#     - "./subproject1"
+#     - "./subproject2"
+ls_workspace_folders:
+- .
+
+# optional shell command to run before the language backend (LSP or JetBrains) is initialised.
+# the command runs in the project root directory and is only executed if the project is trusted
+# (see trusted_project_path_patterns in the global configuration).
+# serena waits for the command to exit: a non-zero exit code is logged as an error but does not
+# abort activation. a per-project timeout (activation_command_timeout, default 180s) is the safety
+# backstop for non-terminating commands; on expiry the process is killed and activation continues.
+# example: activation_command: "npx nx run-many -t build"
+activation_command:
+
+# maximum time in seconds to wait for activation_command to complete before killing it (default 180s).
+# must be a positive number.
+activation_command_timeout: 180.0

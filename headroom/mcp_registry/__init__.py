@@ -14,15 +14,15 @@ without changing the calling code.
 from __future__ import annotations
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
-from .claude import ClaudeRegistrar
+from .claude import ClaudeConfigMutationError, ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
 from .grok import GrokRegistrar
 from .install import (
+    CLAUDE_SERENA_CONTEXT,
     DEFAULT_PROXY_URL,
     build_headroom_spec,
     build_serena_spec,
-    build_tokensave_spec,
     get_all_registrars,
     install_everywhere,
 )
@@ -31,6 +31,8 @@ from .server_json import build_server_json, render_server_json
 
 __all__ = [
     "DEFAULT_PROXY_URL",
+    "CLAUDE_SERENA_CONTEXT",
+    "ClaudeConfigMutationError",
     "ClaudeRegistrar",
     "CodexRegistrar",
     "GrokRegistrar",
@@ -43,7 +45,6 @@ __all__ = [
     "build_headroom_spec",
     "build_serena_spec",
     "build_server_json",
-    "build_tokensave_spec",
     "format_result",
     "format_results",
     "get_all_registrars",

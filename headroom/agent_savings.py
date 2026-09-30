@@ -55,7 +55,6 @@ class AgentSavingsProfile:
     lossless_then_lossy: bool = False
     protect_reads: bool = False
     code_aware: bool = True
-    effort_router: bool = True
     lossless: bool = False
     min_chars_for_block: int | None = None
 
@@ -87,7 +86,6 @@ class AgentSavingsProfile:
             "HEADROOM_LOSSLESS_THEN_LOSSY": "1" if self.lossless_then_lossy else "0",
             "HEADROOM_PROTECT_READS": "1" if self.protect_reads else "0",
             "HEADROOM_CODE_AWARE_ENABLED": "1" if self.code_aware else "0",
-            "HEADROOM_EFFORT_ROUTER": "1" if self.effort_router else "0",
             "HEADROOM_LOSSLESS": "1" if self.lossless else "0",
         }
         # Only pin a keep-ratio when the profile sets one; workload personas
@@ -182,7 +180,6 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         lossless_then_lossy=True,
         protect_reads=True,
         code_aware=True,
-        effort_router=False,
         lossless=False,
         min_chars_for_block=25,
     ),
@@ -207,27 +204,43 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
 def get_agent_savings_profile(name: str | None = None) -> AgentSavingsProfile:
     """Return a named agent savings profile.
 
-    An unrecognized name falls back to the ``balanced`` profile with a warning
-    instead of raising. The savings profile is a soft config knob, but it is
-    resolved during proxy startup (``proxy_pipeline_kwargs`` -> ``create_app``),
-    so raising here takes the whole proxy down before it can open its port. That
-    happens on desktop/runtime version skew: a newer client requests a profile
-    (e.g. ``coding``) that an older pinned or fallback runtime predates. Degrade
-    to ``balanced`` rather than leaving the user with no proxy at all.
+    An unrecognized name degrades with a warning instead of raising. The savings
+    profile is a soft config knob, but it is resolved during proxy startup
+    (``proxy_pipeline_kwargs`` -> ``create_app``), so raising here takes the
+    whole proxy down before it can open its port. That happens on desktop/runtime
+    version skew: a newer client requests a profile (e.g. ``coding``) that an
+    older pinned or fallback runtime predates. Degrade rather than leaving the
+    user with no proxy at all.
+
+    **Where it degrades to matters.** This used to land on ``balanced``
+    unconditionally, which is a drastically different posture from the
+    out-of-box default: cache->token mode, cross-turn dedup off, tool-search
+    off, user messages uncompressed, the message floor 25x higher (250 vs 10)
+    and the block floor 20x higher (500 vs 25). A single typo in
+    ``HEADROOM_SAVINGS_PROFILE`` therefore silently reconfigured the whole
+    proxy, and the only trace was one WARNING at startup that operators read
+    past. Prefer :data:`DEFAULT_PROFILE` — the documented out-of-box posture and
+    the same thing an unset variable resolves to, so a typo now costs nothing.
+    ``balanced`` remains the last resort for the genuine version-skew case,
+    where an older runtime has no ``DEFAULT_PROFILE`` entry to fall back to.
     """
 
     key = (name or DEFAULT_PROFILE).strip().lower()
     profile = _PROFILES.get(key)
     if profile is not None:
         return profile
+    fallback_name = DEFAULT_PROFILE if DEFAULT_PROFILE in _PROFILES else FALLBACK_PROFILE
     valid = ", ".join(sorted(_PROFILES))
     logger.warning(
-        "unknown savings profile %r; falling back to %r (known: %s)",
+        "unknown savings profile %r; falling back to %r (known: %s). "
+        "Set HEADROOM_SAVINGS_PROFILE to one of the known names, or unset it to "
+        "get %r explicitly.",
         name,
-        FALLBACK_PROFILE,
+        fallback_name,
         valid,
+        DEFAULT_PROFILE,
     )
-    return _PROFILES[FALLBACK_PROFILE]
+    return _PROFILES[fallback_name]
 
 
 def apply_agent_savings_env_defaults(
@@ -300,6 +313,28 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         # unset → Kompress decides / ambient default applies).
         if profile.target_ratio is not None:
             kwargs["target_ratio"] = profile.target_ratio
+        # Block-compression char floor. Every OTHER router pipeline kwarg in this
+        # function travels on the config object; this one alone was populated
+        # only from ``HEADROOM_MIN_CHARS_FOR_BLOCK`` (read below), so a proxy
+        # whose config carries ``savings_profile="coding"`` but whose process env
+        # was never seeded applied every sibling coding knob while this floor
+        # silently stayed at ``ContentRouterConfig.min_chars_for_block_compression``
+        # (500) instead of the profile's 25 — a 20x gap on the gate that governs
+        # tool_result blocks, the dominant content type in agent traffic.
+        #
+        # NOTE: this does not make the profile fully config-deliverable. The
+        # profile's ``cross_turn_dedup`` / ``tool_search`` / ``lossless_then_lossy``
+        # / ``protect_reads`` / ``code_aware`` / ``lossless``
+        # fields are still env-only, but by a different mechanism: their consumers
+        # read ``os.environ`` directly (ContentRouter.__init__ for HEADROOM_DEDUPE,
+        # the Anthropic handler for HEADROOM_TOOL_SEARCH) and never pass through
+        # this function at all. Those remain seed-dependent and are the reason a
+        # profile can still be half-applied; fixing them means threading each
+        # consumer, which is a larger change than this one.
+        #
+        # The env read below still wins, since it is an explicit operator override.
+        if profile.min_chars_for_block is not None:
+            kwargs["min_chars_for_block_compression"] = profile.min_chars_for_block
 
     if getattr(config, "compress_user_messages", False):
         kwargs["compress_user_messages"] = True

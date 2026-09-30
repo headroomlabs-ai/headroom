@@ -7,13 +7,12 @@ being a one-time cost. Two loop shapes matter:
 1. **Error loops** — the same call fails, the agent retries, it fails again
    (e.g. a wrong path read N times). Every repetition is pure waste.
 
-2. **RTK re-fetch loops** — RTK (Realtime Token Kompress) rewrites a shell
-   command to truncate its output (``grep foo`` → ``grep foo | head -50``).
-   When the truncation drops what the agent needed, the agent re-runs a
-   *variant* of the same command to fetch more (``head -100``, a new offset,
-   a narrower pattern). Each call succeeds (``is_error=False``) but returns
-   insufficient output, so the loop is invisible to failure-only analysis.
-   See ``docs/rtk-architecture.md`` for why RTK truncates commands.
+2. **Re-fetch loops** — a shell command's output is limited or truncated
+   (``grep foo | head -50``). When the limit drops what the agent needed, the
+   agent re-runs a *variant* of the same command to fetch more (``head -100``,
+   a new offset, a narrower pattern). Each call succeeds (``is_error=False``)
+   but returns insufficient output, so the loop is invisible to failure-only
+   analysis.
 
 This module collapses such variants to a canonical signature, counts the
 repetitions, and measures the wasted tokens so the analyzer can (a) surface
@@ -25,10 +24,18 @@ weight at all.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
 from .models import Recommendation, SessionData, ToolCall
+
+# Upper bound on the signature body kept for fuzzy rule matching. Matches the
+# width that ``input_summary`` previously imposed, so the majority-overlap rule
+# in ``apply_loop_weighting`` keeps behaving exactly as it did before identity
+# stopped going through that truncation.
+_SIGNATURE_MATCH_LIMIT = 100
 
 # Minimum repetitions of one signature before it counts as a loop. Three is the
 # smallest count that distinguishes a loop ("again, and again") from a one-off
@@ -41,7 +48,7 @@ DEFAULT_MIN_OCCURRENCES = 3
 # estimate. The analyzer's digest builder uses the same 4:1 approximation.
 _BYTES_PER_TOKEN = 4
 
-# Pagination / output-limiting fragments that vary between RTK re-fetch
+# Pagination / output-limiting fragments that vary between re-fetch
 # attempts but do NOT change which command is being run. Stripping these is
 # what collapses ``grep foo | head -50`` and ``grep foo | head -100`` to one
 # signature. Order-independent: applied as a global substitution.
@@ -61,7 +68,6 @@ _PAGINATION_RE = re.compile("|".join(_PAGINATION_PATTERNS), re.IGNORECASE)
 # Collapse any remaining bare integers so e.g. line numbers / byte offsets in
 # otherwise identical commands do not split a loop into singletons.
 _INT_RE = re.compile(r"\b\d+\b")
-_WS_RE = re.compile(r"\s+")
 
 
 @dataclass
@@ -83,28 +89,133 @@ class LoopPattern:
 
     @property
     def kind(self) -> str:
-        return "error-loop" if self.is_error_loop else "rtk-refetch-loop"
+        return "error-loop" if self.is_error_loop else "refetch-loop"
+
+
+# Input fields that identify a call, per tool. ``ToolCall.input_summary`` reads
+# the same fields but is a *display* helper — it cuts Bash commands at 100 chars
+# and renders any tool missing from this table as ``str(input_data)[:80]``. Two
+# distinct calls sharing a long prefix survive that truncation as equal strings,
+# so identity is taken from the untruncated input here instead.
+#
+# Because identity no longer reads ``input_summary``, a field that distinguishes
+# two calls has to be named here to count — adding one to the summary alone
+# changes the display and leaves the grouping merged.
+#
+# Adding a *second* field to a tool listed here also moves it to the structured
+# identity form in ``_identity_input``, which ``_PAGINATION_RE`` below is not
+# written against — so a second field on ``bash``/``shell`` would stop
+# re-fetch variants of one command collapsing.
+_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "bash": ("command",),
+    "shell": ("command",),
+    "read": ("file_path",),
+    # A search is identified by pattern *and* path: the same pattern swept
+    # across three service directories is three searches, not a loop. #3455
+    # pins this on the display side; identity has to agree or one undoes the
+    # other depending on merge order.
+    "grep": ("pattern", "path"),
+    "glob": ("pattern", "path"),
+    "edit": ("file_path",),
+    "write": ("file_path",),
+}
+
+
+def _identity_input(tc: ToolCall) -> str:
+    """Render a tool call's input in full, for identity comparison.
+
+    Falls back to the whole input mapping — key-sorted so ordering cannot split
+    a group — rather than to a truncated ``repr``. The fallback also covers a
+    tool that *is* in :data:`_IDENTITY_FIELDS` but carries none of its fields:
+    ``normalize_tool_name`` maps provider tools onto the builtin names without
+    normalizing their input schema, and an empty identity would collapse every
+    such call into one loop — the merge this function exists to prevent.
+    """
+    data = tc.input_data if isinstance(tc.input_data, dict) else {}
+    fields = _IDENTITY_FIELDS.get(tc.name.lower())
+    if fields is not None:
+        parts = [str(data.get(field, "")) for field in fields]
+        if any(parts):
+            # A lone field is already unambiguous, and leaving it bare is what
+            # the shell pagination normalization below matches against. Two or
+            # more have to carry their own boundaries: joined on a space,
+            # ("error in src", "logs") and ("error", "in src logs") are two
+            # different searches rendering one string — and so one phantom loop.
+            # Escaping stays off: ``\u00e9`` would reach _signature_tokens as a
+            # token no recommendation can contain, diluting the majority overlap
+            # apply_loop_weighting needs to credit the loop.
+            return parts[0] if len(parts) == 1 else json.dumps(parts, ensure_ascii=False)
+    try:
+        return json.dumps(tc.input_data, sort_keys=True, default=repr, ensure_ascii=False)
+    except TypeError:
+        # Unorderable keys — not reachable from parsed JSON, but identity is
+        # derived from files the user did not write, so it must not raise.
+        return str(tc.input_data)
 
 
 def _canonical_signature(tc: ToolCall) -> str:
     """Collapse a tool call to a signature stable across re-fetch variants.
 
     For shell commands this strips pagination/limit fragments and bare
-    integers so RTK truncation variants of the same command map together.
-    For other tools the input summary is normalized on whitespace only.
+    integers so output-limit variants of the same command map together.
+    For other tools the identity input is normalized on whitespace only.
     """
-    raw = tc.input_summary.strip()
+    raw = _identity_input(tc).strip()
     if tc.name.lower() in ("bash", "shell"):
         raw = _PAGINATION_RE.sub(" ", raw)
         raw = _INT_RE.sub("N", raw)
-    raw = _WS_RE.sub(" ", raw).strip().lower()
+    # ``" ".join(split())`` collapses whitespace runs and strips, identically to
+    # ``re.sub(r"\s+", " ", raw).strip()`` but without the regex engine walking the
+    # whole input — the dominant cost now that the signature is the untruncated one.
+    raw = " ".join(raw.split()).lower()
     return f"{tc.name.lower()}::{raw}"
+
+
+def _group_key(signature: str) -> str:
+    """Fixed-size grouping key for a canonical signature.
+
+    The signature is lossless, so it can be as large as the tool input itself.
+    Hashing keeps the grouping tables bounded regardless of input size; the
+    digest is never surfaced, only used to bucket identical signatures.
+    """
+    return hashlib.blake2b(signature.encode("utf-8", "replace"), digest_size=16).hexdigest()
+
+
+def _fuzzy_signature(signature: str) -> str:
+    """Bounded form of a canonical signature, for fuzzy rule matching.
+
+    ``LoopPattern.signature`` is consumed only by :func:`_signature_tokens`,
+    which requires a *majority* of its tokens to appear in a recommendation. An
+    unbounded signature would put that threshold out of reach for large inputs
+    and silently strip real loops of their measured-waste boost, so the stored
+    value is capped. Identity still comes from the full signature above.
+    """
+    name, sep, body = signature.partition("::")
+    return f"{name}{sep}{body[:_SIGNATURE_MATCH_LIMIT]}"
 
 
 def _tokens(tc: ToolCall) -> int:
     """Token estimate for a single call's output."""
     nbytes = tc.output_bytes or len(tc.output)
     return nbytes // _BYTES_PER_TOKEN
+
+
+def _without_replays(calls: list[ToolCall], seen: set[str]) -> list[ToolCall]:
+    """Drop calls whose ``tool_call_id`` is already in ``seen``, recording the rest.
+
+    ``seen`` is mutated, so the caller chooses the scope a replay is judged
+    against: a fresh set collapses a transcript's own repeated turns, while a
+    set carried across sessions suppresses a resume's replay of earlier ones.
+    An id-less call is always kept — nothing identifies it as a replay.
+    """
+    kept: list[ToolCall] = []
+    for call in calls:
+        if call.tool_call_id:
+            if call.tool_call_id in seen:
+                continue
+            seen.add(call.tool_call_id)
+        kept.append(call)
+    return kept
 
 
 def detect_loops(
@@ -118,20 +229,52 @@ def detect_loops(
     a within-conversation phenomenon; the same command in two unrelated
     sessions is not a loop). Groups meeting ``min_occurrences`` become
     ``LoopPattern`` results, sorted by measured wasted tokens descending.
+
+    A call is counted once per ``tool_call_id``. A resumed conversation can be
+    written as a fresh transcript that replays earlier turns, which presents the
+    same provider-assigned call to the scanner more than once; without this the
+    replayed turns would inflate the loop. Calls carrying no id are always
+    counted, since nothing identifies them as replays.
+
+    This makes ``tool_call_id`` uniqueness a scanner contract: an id must be
+    unique across sessions, not just within one, or two unrelated sessions look
+    like one replayed twice. Scanners that synthesize ids scope them by session
+    (see ``GeminiPlugin`` and ``OpenCodePlugin``).
+
+    Dedup runs *before* the threshold, twice over. A session is screened on its
+    distinct calls, because the question the threshold asks — did this
+    conversation repeat itself? — is not answered by one call written into the
+    transcript three times. Only then are its calls merged, deduped again
+    against the calls already collected for that signature so a resume that
+    replays an earlier session adds only what is new. Screening the raw group
+    instead would let three sessions that each merely replayed one call
+    contribute one real call apiece and clear the bar together, reporting a loop
+    no conversation ran.
     """
     groups: dict[str, list[ToolCall]] = {}
+    signatures: dict[str, str] = {}
+    seen_ids: dict[str, set[str]] = {}
     for session in sessions:
         per_session: dict[str, list[ToolCall]] = {}
         for tc in session.tool_calls:
-            per_session.setdefault(_canonical_signature(tc), []).append(tc)
+            sig = _canonical_signature(tc)
+            key = _group_key(sig)
+            signatures.setdefault(key, sig)
+            per_session.setdefault(key, []).append(tc)
         # Merge each session's qualifying groups into the global view keyed by
         # signature so cross-session recurrence of the SAME loop accumulates.
-        for sig, calls in per_session.items():
-            if len(calls) >= min_occurrences:
-                groups.setdefault(sig, []).extend(calls)
+        for key, calls in per_session.items():
+            distinct = _without_replays(calls, set())
+            if len(distinct) < min_occurrences:
+                continue
+            bucket = groups.setdefault(key, [])
+            bucket.extend(_without_replays(distinct, seen_ids.setdefault(key, set())))
 
     loops: list[LoopPattern] = []
-    for sig, calls in groups.items():
+    for key, calls in groups.items():
+        # No post-merge threshold re-check: every group here was seeded by a
+        # session that cleared the bar on its own distinct calls, and merging
+        # only ever adds.
         count = len(calls)
         is_error_loop = sum(1 for c in calls if c.is_error) >= (count / 2)
         if is_error_loop:
@@ -140,13 +283,13 @@ def detect_loops(
             wasted = sum(_tokens(c) for c in calls)
         else:
             # Re-fetch loop: the first call is legitimate; the N-1 follow-ups
-            # are the redundant re-fetches RTK truncation provoked.
+            # are the redundant re-fetches the output truncation provoked.
             per_call = sorted((_tokens(c) for c in calls), reverse=True)
             wasted = sum(per_call[1:])
         loops.append(
             LoopPattern(
                 tool=calls[0].name,
-                signature=sig,
+                signature=_fuzzy_signature(signatures[key]),
                 sample_input=calls[0].input_summary[:120],
                 count=count,
                 is_error_loop=is_error_loop,

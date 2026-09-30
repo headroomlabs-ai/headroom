@@ -337,11 +337,14 @@ fn humanize_bytes(n: usize) -> String {
 
 fn json_scalar_to_csv(v: &Value) -> String {
     match v {
-        Value::Null => String::new(),
+        // Keep null distinct from CellValue::Missing (empty field) and
+        // Value::String("") (quoted empty field). Literal string "null"
+        // is quoted below so these cases remain byte-distinguishable.
+        Value::Null => "null".to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            if needs_csv_quote(s) {
+            if s.is_empty() || s == "null" || needs_csv_quote(s) {
                 csv_quote(s)
             } else {
                 s.clone()
@@ -724,6 +727,43 @@ mod tests {
         assert!(with_summary.contains("__dropped:3"));
         let without = CsvSchemaFormatter::new().format(&c);
         assert!(!without.contains("__dropped"));
+    }
+
+    #[test]
+    fn csv_formatter_distinguishes_missing_null_empty_and_literal_null() {
+        let c = Compaction::Table {
+            schema: Schema {
+                fields: vec![super::super::ir::FieldSpec {
+                    name: "label".into(),
+                    type_tag: "string".into(),
+                    nullable: true,
+                }],
+            },
+            rows: vec![
+                Row::new(vec![CellValue::Missing]),
+                Row::new(vec![CellValue::Scalar(Value::Null)]),
+                Row::new(vec![CellValue::Scalar(Value::String(String::new()))]),
+                Row::new(vec![CellValue::Scalar(Value::String("null".into()))]),
+            ],
+            original_count: 4,
+        };
+        let out = CsvSchemaFormatter::new().format(&c);
+        assert_eq!(out, "[4]{label:string?}\n\nnull\n\"\"\n\"null\"\n");
+    }
+
+    #[test]
+    fn csv_formatter_nullable_swap_is_not_identical() {
+        let a = vec![
+            json!({"id": 1, "label": ""}),
+            json!({"id": 2, "label": null}),
+        ];
+        let b = vec![
+            json!({"id": 1, "label": null}),
+            json!({"id": 2, "label": ""}),
+        ];
+        let fa = CsvSchemaFormatter::new().format(&compact(&a, &cfg()));
+        let fb = CsvSchemaFormatter::new().format(&compact(&b, &cfg()));
+        assert_ne!(fa, fb);
     }
 
     #[test]
