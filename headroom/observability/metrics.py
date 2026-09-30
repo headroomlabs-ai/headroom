@@ -207,12 +207,15 @@ class HeadroomOtelMetrics:
         )
         self._proxy_failed_requests = self._meter.create_counter(
             "headroom.proxy.requests.failed",
-            description="Proxy requests that failed.",
+            description="Proxy requests that failed upstream (4xx and 5xx, excluding 429).",
             unit="1",
         )
         self._proxy_rate_limited_requests = self._meter.create_counter(
             "headroom.proxy.requests.rate_limited",
-            description="Proxy requests rejected by rate limiting.",
+            description=(
+                "Proxy requests rejected with 429, by source "
+                "(headroom=our own limiter, upstream=the provider)."
+            ),
             unit="1",
         )
         self._proxy_input_tokens = self._meter.create_counter(
@@ -458,7 +461,9 @@ class HeadroomOtelMetrics:
         uncached_input_tokens: int = 0,
         attempted_input_tokens: int = 0,
         output_tokens_saved: int = 0,
-        savings_usd: Mapping[str, float] | None = None,
+        # Mixed value types: per-layer dollars plus a string `basis` label.
+        # The loop below skips anything non-numeric rather than coercing it.
+        savings_usd: Mapping[str, Any] | None = None,
         project: str | None = None,
         client: str | None = None,
     ) -> None:
@@ -482,12 +487,37 @@ class HeadroomOtelMetrics:
             self._proxy_attempted_input_tokens.add(attempted_input_tokens, attrs)
         if output_tokens_saved > 0:
             self._proxy_output_saved_tokens.add(output_tokens_saved, attrs)
+        # ``savings_usd`` is the breakdown from
+        # ``savings_tracker.estimate_request_savings_usd``: per-layer dollars,
+        # plus two companions that must NOT become their own counter series.
+        #
+        #   * ``basis`` — a string saying how soundly the layers were priced.
+        #     It is a DIMENSION, not a measure, so it rides on the attributes
+        #     where a consumer can group by it.
+        #   * ``*_list`` — the same layers at flat list price (the upper bound).
+        #     Exporting them as sources would make a dashboard summing `source`
+        #     report roughly double the real saving, since each layer would
+        #     appear twice.
+        #
+        # Anything non-numeric is skipped rather than coerced: this loop used to
+        # call `float()` on every value and would raise on a string, taking the
+        # whole request-metrics path down with it.
+        savings_basis = str((savings_usd or {}).get("basis") or "")[:32]
         for source, value in (savings_usd or {}).items():
-            amount = max(float(value or 0.0), 0.0)
+            if source == "basis" or str(source).endswith("_list"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            amount = max(float(value), 0.0)
             if amount:
                 self._proxy_savings_usd.add(
                     amount,
-                    {**attrs, "source": str(source)[:64], "estimated": True},
+                    {
+                        **attrs,
+                        "source": str(source)[:64],
+                        "estimated": True,
+                        "basis": savings_basis,
+                    },
                 )
         compression_saved = max(tokens_saved, 0)
         tool_schema_saved = max(tool_search_saved, 0)
@@ -540,8 +570,15 @@ class HeadroomOtelMetrics:
         *,
         provider: str | None = None,
         model: str | None = None,
+        source: str = "headroom",
     ) -> None:
-        self._proxy_rate_limited_requests.add(1, self._attrs(provider=provider, model=model))
+        # ``source`` mirrors the headroom_requests_rate_limited_total{source}
+        # Prometheus label: "headroom" = our own limiter refused the request,
+        # "upstream" = the provider did. Same split in both backends so an
+        # operator's query means the same thing whichever one they scrape.
+        self._proxy_rate_limited_requests.add(
+            1, self._attrs(provider=provider, model=model, source=source)
+        )
 
     def record_proxy_cache_bust(self, *, tokens_lost: int) -> None:
         self._proxy_cache_busts.add(1)

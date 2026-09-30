@@ -141,7 +141,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ">=24.16.0 <25"
 
       - name: Sync version to package files
         run: |
@@ -779,7 +779,7 @@ jobs:
 
       - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         id: pypi-publish
-        uses: pypa/gh-action-pypi-publish@v1.13.0
+        uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           # Idempotent re-runs: when a wheel filename for the computed
           # version is already on PyPI (e.g. a previous push to main
@@ -807,7 +807,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ">=24.16.0 <25"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
 
       # No artifact download required: the publish steps below pack and
@@ -899,7 +899,7 @@ jobs:
       - name: Set up Node.js for GitHub Package Registry
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ">=24.16.0 <25"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
 
       # No artifact download required: the publish-github-packages flow
@@ -1075,3 +1075,29 @@ jobs:
         run: |
           TAG="v${{ needs.detect-version.outputs.version }}"
           gh release upload "$TAG" release-assets/*.tgz --clobber
+
+  notify-release:
+    # This boundary intentionally means "the GitHub Release and its assets are
+    # ready", not "every registry publish succeeded". create-release owns that
+    # narrower contract and only runs after the release build/smoke gates.
+    needs: create-release
+    if: >-
+      ${{
+        github.event_name == 'release' &&
+        github.event.action == 'published' &&
+        needs.create-release.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Announce completed GitHub Release assets
+        uses: ./.github/actions/release-slack-notification
+        with:
+          release-name: ${{ github.event.release.name }}
+          tag: ${{ github.event.release.tag_name }}
+          url: ${{ github.event.release.html_url }}
+          repository: ${{ github.repository }}
+          actor: ${{ github.actor }}
+          webhook-url: ${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}

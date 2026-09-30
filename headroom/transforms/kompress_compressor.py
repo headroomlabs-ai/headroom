@@ -55,6 +55,29 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|\.[a-z]{2,4}\b"  # extensions: .py .so .json
     r"|--?[a-z][\w-]*"  # flags: --verbose, -n
     r"|\b[A-Z][a-z]+[A-Z]\w*"  # CamelCase: EXC_BAD_INSTRUCTION, IndexError
+    # Directive words. Every other class above protects a token the model could
+    # not RECONSTRUCT; these protect tokens whose loss INVERTS the surrounding
+    # sentence. Compressed prompts carry instructions as often as they carry
+    # tool output, and "do not guess at model names" without its "not" is not a
+    # degraded instruction, it is the opposite instruction. Measured over 40
+    # real skill bodies with THIS pattern: negation retention rose
+    # 73.5% -> 91.9% and modal retention 65.5% -> 96.8%, for 0.2 percentage
+    # points of compression (ratio 0.716 -> 0.718) -- these are short, common
+    # words, so the model was already keeping most of them and pinning the rest
+    # costs almost nothing.
+    r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
+    r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
+    r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
+    # Boolean connectives, for the same reason as the directive words above:
+    # they decide WHICH predicates have to hold, so dropping one does not
+    # weaken the statement, it changes the condition. Negation was pinned but
+    # conjunction was not, so one line could lose its `or` and keep its `not`
+    # (issue #3545: 12 of 40 `or` lost from a repeated Python return line,
+    # while the same word survived 48/48 in prose). The surviving text is the
+    # dangerous part -- `a == b not c.startswith(d)` still reads as code, and
+    # nothing marks it as altered. Uppercase `AND`/`OR` were already held by
+    # the ALLCAPS class; only the lowercase forms leaked.
+    r"|(?i:\b(?:and|or|nor|xor)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
@@ -920,8 +943,6 @@ def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
         padding=True,
         return_tensors="pt",
     )
-    input_ids = encoding["input_ids"].to(device)
-    attention_mask = encoding["attention_mask"].to(device)
     semaphore, _wait_ms = _acquire_execution_slot(
         "pytorch",
         device,
@@ -930,6 +951,8 @@ def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
     assert semaphore is not None
     with contextlib.ExitStack() as stack:
         stack.callback(semaphore.release)
+        input_ids = encoding["input_ids"].to(device)
+        attention_mask = encoding["attention_mask"].to(device)
         scores = model.get_scores(input_ids, attention_mask)
         _ = scores[0].detach().cpu()
 
@@ -1084,10 +1107,13 @@ def _download_retry_blocked(model_id: str) -> bool:
     if entry is None:
         return False
     failures, last_attempt = entry
-    window = min(
-        _DOWNLOAD_RETRY_MAX_SECONDS,
-        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
-    )
+    # Stop doubling at the cap: computing 2 ** (failures - 1) first can
+    # overflow when converted to float after a long run of failed downloads.
+    window = min(_DOWNLOAD_RETRY_BASE_SECONDS, _DOWNLOAD_RETRY_MAX_SECONDS)
+    for _ in range(failures - 1):
+        if window >= _DOWNLOAD_RETRY_MAX_SECONDS:
+            break
+        window = min(window * 2, _DOWNLOAD_RETRY_MAX_SECONDS)
     return bool((time.monotonic() - last_attempt) < window)
 
 
@@ -1281,6 +1307,41 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+_payload_encoder: Any = None
+
+
+def payload_tokens(text: str) -> int:
+    """Token count of a complete payload, in one consistent unit.
+
+    The unit is cl100k_base (tiktoken, a hard dependency), used as a fixed
+    estimate. Actual model tokenizers, including those of other OpenAI
+    models, can differ. Without an encoder, the fallback compares character
+    counts; that heuristic is not a bound on provider token counts.
+
+    The CCR gate measures the whole original and the whole candidate-plus-
+    marker with this, never a marker-only cost against a word count: the
+    marker is 36-45 tokens for 12 words, the words Kompress drops can be one
+    token each, and the word left at the head of the candidate can tokenize
+    differently from its space-prefixed form in the source. Only a comparison
+    of the two complete texts in one unit establishes that the shipped
+    payload is smaller.
+    """
+    global _payload_encoder
+    if _payload_encoder is None:
+        try:
+            import tiktoken
+
+            _payload_encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _payload_encoder = False
+    if _payload_encoder:
+        try:
+            return len(_payload_encoder.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return len(text)
+
+
 def ccr_retrieval_marker(
     n_words: int, compressed_count: int, ccr_source: str, cache_key: str
 ) -> str:
@@ -1354,6 +1415,14 @@ class KompressCompressor(Transform):
     """
 
     name: str = "kompress_compressor"
+
+    # ``compress()`` accepts ``_deadline_started_at``, so a caller that
+    # compresses many blocks for ONE request can hand every call the same
+    # origin and have the deadline bound the request. Duck-typed rather than
+    # isinstance-checked at the call site because ``RemoteKompressCompressor``
+    # is the other compressor the router may get back and its ``compress()``
+    # does not take the argument.
+    shares_request_deadline: bool = True
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
@@ -1447,12 +1516,21 @@ class KompressCompressor(Transform):
         )
         input_ids = encoding["input_ids"]
         attention_mask = encoding["attention_mask"]
-        if not is_onnx:
-            device = next(model.parameters()).device
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+        device_type = _model_device_type(model, backend)
+        semaphore, _wait_ms = _acquire_execution_slot(
+            backend,
+            device_type,
+            timeout_seconds=None,
+        )
+        assert semaphore is not None
         started = time.perf_counter()
-        model.get_keep_mask(input_ids, attention_mask)
+        with contextlib.ExitStack() as stack:
+            stack.callback(semaphore.release)
+            if not is_onnx:
+                device = next(model.parameters()).device
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+            model.get_keep_mask(input_ids, attention_mask)
         return time.perf_counter() - started
 
     def is_ready(self) -> bool:
@@ -1606,8 +1684,6 @@ class KompressCompressor(Transform):
 
                 if not is_onnx:
                     device = next(model.parameters()).device
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
 
                 request_remaining: float | None = None
                 if deadline_s:
@@ -1654,6 +1730,9 @@ class KompressCompressor(Transform):
 
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
+                    if not is_onnx:
+                        input_ids = input_ids.to(device)
+                        attention_mask = attention_mask.to(device)
                     inference_started = time.perf_counter()
                     if target_ratio is not None:
                         scores = model.get_scores(input_ids, attention_mask)
@@ -1712,30 +1791,43 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=ratio,
-                model_used=self.config.model_id,
-            )
-
-            # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            # CCR marker: anything the lossy pass shrank must stay retrievable,
+            # and the complete marked payload must be smaller than the
+            # original. Both are measured whole, in one unit (payload_tokens);
+            # a candidate that is not is passed through. The accounting then
+            # reports that same measurement, so ``tokens_saved`` describes
+            # the shipped payload rather than a word count.
+            if self.config.enable_ccr:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    result.compressed += ccr_retrieval_marker(
+                    marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        return self._passthrough(content, n_words)
+                    compressed = marked
+
+            ratio = compressed_tokens / original_tokens if original_tokens else 1.0
+            result = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=ratio,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
             if inference_ms >= 1000.0:
                 logger.info(
@@ -2004,8 +2096,6 @@ class KompressCompressor(Transform):
 
                 if not is_onnx:
                     device = next(model.parameters()).device
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
 
                 request_remaining: float | None = None
                 if deadline_s:
@@ -2042,6 +2132,9 @@ class KompressCompressor(Transform):
 
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
+                    if not is_onnx:
+                        input_ids = input_ids.to(device)
+                        attention_mask = attention_mask.to(device)
                     inference_started = time.perf_counter()
                     scores = model.get_scores(input_ids, attention_mask)
                     inference_ms += (time.perf_counter() - inference_started) * 1000
@@ -2106,33 +2199,40 @@ class KompressCompressor(Transform):
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
             compressed = " ".join(compressed_words)
             compressed_count = len(compressed_words)
-            comp_ratio = compressed_count / n_words if n_words else 1.0
+            cache_key: str | None = None
+            original_tokens = n_words
+            compressed_tokens = compressed_count
 
-            result = KompressResult(
-                compressed=compressed,
-                original=content,
-                original_tokens=n_words,
-                compressed_tokens=compressed_count,
-                compression_ratio=comp_ratio,
-                model_used=self.config.model_id,
-            )
-
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            # Same gate and accounting as the single path.
+            if self.config.enable_ccr:
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
                 if cache_key:
-                    result.cache_key = cache_key
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    result.compressed += ccr_retrieval_marker(
+                    marked = compressed + ccr_retrieval_marker(
                         n_words, compressed_count, ccr_source, cache_key
                     )
+                    original_tokens = payload_tokens(content)
+                    compressed_tokens = payload_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        results[text_idx] = self._passthrough(content, n_words)
+                        continue
+                    compressed = marked
 
-            results[text_idx] = result
+            results[text_idx] = KompressResult(
+                compressed=compressed,
+                original=content,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                compression_ratio=compressed_tokens / original_tokens if original_tokens else 1.0,
+                cache_key=cache_key,
+                model_used=self.config.model_id,
+            )
 
         # Safety: every slot must be populated.
         final: list[KompressResult] = []
