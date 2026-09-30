@@ -48,6 +48,21 @@ Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
 # the OpenAI-style payload, which is what the handlers' own 413s use.
 _ANTHROPIC_PATH_MARKERS = ("/v1/messages",)
 
+# The AWS Bedrock InvokeModel passthrough speaks a third dialect: its handler
+# (``handle_bedrock_invoke``) answers a too-large body with
+# ``{"error": {"type": "request_too_large", "message": ...}}``. Its routes are
+# ``/model/{model_id:path}/invoke`` and
+# ``/model/{model_id:path}/invoke-with-response-stream``
+# (``headroom/providers/proxy_routes.py``), and model ids may contain slashes
+# (ARN-style inference profiles), so the match is a suffix check under the
+# ``/model/`` prefix rather than a fixed-path table.
+_BEDROCK_INVOKE_PREFIX = "/model/"
+_BEDROCK_INVOKE_SUFFIXES = ("/invoke", "/invoke-with-response-stream")
+
+
+def _is_bedrock_invoke_path(path: str) -> bool:
+    return path.startswith(_BEDROCK_INVOKE_PREFIX) and path.endswith(_BEDROCK_INVOKE_SUFFIXES)
+
 
 def _too_large_payload(path: str, limit: int) -> bytes:
     """Mirror the handlers' own 413 payloads so clients see one shape per dialect."""
@@ -56,6 +71,13 @@ def _too_large_payload(path: str, limit: int) -> bytes:
         payload: dict[str, Any] = {
             "type": "error",
             "error": {"type": "request_too_large", "message": message},
+        }
+    elif _is_bedrock_invoke_path(path):
+        payload = {
+            "error": {
+                "type": "request_too_large",
+                "message": message,
+            }
         }
     else:
         payload = {

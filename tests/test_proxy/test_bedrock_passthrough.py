@@ -352,6 +352,81 @@ def test_oversized_body_returns_413_and_never_forwards(monkeypatch):
     http.send.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "route", [INVOKE, INVOKE_STREAM], ids=["invoke", "invoke-with-response-stream"]
+)
+def test_body_ceiling_413_uses_bedrock_handler_dialect(monkeypatch, route):
+    """The body ceiling is enforced outside the handler, but its 413 must keep
+    the route's own wire dialect: exactly the payload ``handle_bedrock_invoke``
+    returns for ``RequestBodyTooLarge`` —
+    ``{"error": {"type": "request_too_large", "message": ...}}`` — with the
+    request refused before any upstream call.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        body = {"messages": [{"role": "user", "content": "x" * (small_cap * 4)}], "max_tokens": 8}
+        resp = client.post(route, json=body)
+
+    assert resp.status_code == 413
+    assert resp.json() == {
+        "error": {
+            "type": "request_too_large",
+            "message": f"Request body too large. Maximum size is {small_cap // (1024 * 1024)}MB",
+        }
+    }
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
+def test_body_ceiling_413_leaves_other_dialects_unchanged(monkeypatch):
+    """The dialect fix is scoped to the Bedrock InvokeModel routes: ``/v1/messages``
+    keeps the Anthropic envelope and OpenAI chat keeps
+    ``{"error": {"type": "invalid_request_error", "code": "request_too_large"}}``.
+    """
+    import headroom.proxy.helpers as helpers_mod
+
+    small_cap = 1024
+    monkeypatch.setattr(helpers_mod, "MAX_REQUEST_BODY_SIZE", small_cap)
+
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+        proxy.anthropic_pipeline.apply = MagicMock(side_effect=AssertionError("should not run"))
+        oversized = b"x" * (small_cap * 4)
+        messages = client.post(
+            "/v1/messages",
+            content=oversized,
+            headers={"content-type": "application/json"},
+        )
+        chat = client.post(
+            "/v1/chat/completions",
+            content=oversized,
+            headers={"content-type": "application/json"},
+        )
+
+    message = f"Request body too large. Maximum size is {small_cap // (1024 * 1024)}MB"
+    assert messages.status_code == 413
+    assert messages.json() == {
+        "type": "error",
+        "error": {"type": "request_too_large", "message": message},
+    }
+    assert chat.status_code == 413
+    assert chat.json() == {
+        "error": {"message": message, "type": "invalid_request_error", "code": "request_too_large"}
+    }
+    http.build_request.assert_not_called()
+    http.send.assert_not_called()
+
+
 # ── metrics ───────────────────────────────────────────────────────────
 
 

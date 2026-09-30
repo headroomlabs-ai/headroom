@@ -17,6 +17,7 @@ monkeypatching discovery, so the tests exercise the app exactly as
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -247,6 +248,42 @@ class TestBodyCeilingAppliesBeforeExtensionMiddleware:
             },
         }
 
+    @pytest.mark.parametrize(
+        "route",
+        [
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke",
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke-with-response-stream",
+        ],
+        ids=["invoke", "invoke-with-response-stream"],
+    )
+    def test_bedrock_invoke_dialect_payload_on_model_paths(self, monkeypatch, route):
+        """The two Bedrock InvokeModel routes keep handle_bedrock_invoke's wire
+        dialect on the body ceiling: exactly
+        ``{"error": {"type": "request_too_large", "message": ...}}`` — not the
+        OpenAI-style payload — and the extension never buffers the body.
+        """
+        monkeypatch.setattr(proxy_helpers, "MAX_REQUEST_BODY_SIZE", 1024)
+        app = _make_app(
+            monkeypatch,
+            _install_buffering,
+            proxy_token=TOKEN,
+            bedrock_api_url="http://127.0.0.1:4000",
+        )
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.post(
+                route,
+                content=b"x" * 4096,
+                headers={"Authorization": f"Bearer {TOKEN}", "content-type": "application/json"},
+            )
+        assert resp.status_code == 413
+        assert resp.json() == {
+            "error": {
+                "type": "request_too_large",
+                "message": "Request body too large. Maximum size is 0MB",
+            }
+        }
+        assert _BufferingExtension.max_seen == 0
+
     def test_body_within_ceiling_reaches_extension_intact(self, monkeypatch):
         monkeypatch.setattr(proxy_helpers, "MAX_REQUEST_BODY_SIZE", 1024)
         app = _make_app(monkeypatch, _install_buffering, proxy_token=TOKEN)
@@ -367,6 +404,68 @@ class TestRequestBodyLimitMiddlewareDirectly:
         assert 0 < len(held) <= 1000
         statuses = [m["status"] for m in sent if m["type"] == "http.response.start"]
         assert statuses == [413]  # exactly one refusal; the downstream 400 was dropped
+        assert downstream_sent == [{"attempted": True}]
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke",
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke-with-response-stream",
+        ],
+        ids=["invoke", "invoke-with-response-stream"],
+    )
+    async def test_stream_trip_answers_once_in_bedrock_dialect(self, path):
+        """On a metered-stream trip over a Bedrock InvokeModel route the single
+        refusal carries handle_bedrock_invoke's dialect, and the handler's own
+        413 answer (its RequestBodyTooLarge response) is discarded by the
+        response-once state: exactly one response reaches the wire.
+        """
+        downstream_sent: list[dict] = []
+
+        async def downstream(scope, receive, send):
+            try:
+                while True:
+                    m = await receive()
+                    if m["type"] != "http.request":
+                        break
+                    if not m.get("more_body"):
+                        break
+            except proxy_helpers.RequestBodyTooLarge:
+                # handle_bedrock_invoke answers RequestBodyTooLarge with its own
+                # 413; response-once must drop it because the ceiling already answered.
+                body = b'{"error": {"type": "request_too_large", "message": "from handler"}}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 413,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                downstream_sent.append({"attempted": True})
+                return
+            raise AssertionError("reader should have been stopped")
+
+        sent: list[dict] = []
+
+        async def send(m):
+            sent.append(m)
+
+        mw = RequestBodyLimitMiddleware(downstream, max_bytes=1000)
+        await mw(self._http_scope(path=path), self._chunked_receive([b"a" * 400] * 5), send)
+
+        statuses = [m["status"] for m in sent if m["type"] == "http.response.start"]
+        assert statuses == [413]  # exactly one response; the handler's 413 was dropped
+        body = b"".join(m.get("body") or b"" for m in sent if m["type"] == "http.response.body")
+        assert json.loads(body) == {
+            "error": {
+                "type": "request_too_large",
+                "message": "Request body too large. Maximum size is 0MB",
+            }
+        }
         assert downstream_sent == [{"attempted": True}]
 
     async def test_body_under_ceiling_is_delivered_untouched(self):
