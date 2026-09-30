@@ -695,7 +695,10 @@ describe("geminiToOpenAI", () => {
         role: "user",
         content: [
           { type: "text", text: "summarise" },
-          { type: "image_url", image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc" } },
+          {
+            type: "image_url",
+            image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc", mime_type: "application/pdf" },
+          },
         ],
       },
     ]);
@@ -725,15 +728,41 @@ describe("openAIToGemini", () => {
     ]);
   });
 
-  it("restores a non-data image_url as a fileData part", () => {
-    const msgs: OpenAIMessage[] = [
+  it("restores a non-data image_url with a carried MIME type as a complete fileData part", () => {
+    const msgs = [
       {
         role: "user",
-        content: [{ type: "image_url", image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc" } }],
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: "https://generativelanguage.googleapis.com/v1beta/files/abc", mime_type: "application/pdf" },
+          },
+        ],
       },
+    ] as OpenAIMessage[];
+    expect(openAIToGemini(msgs)).toEqual([
+      {
+        role: "user",
+        parts: [{ fileData: { mimeType: "application/pdf", fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } }],
+      },
+    ]);
+  });
+
+  it("infers the MIME type from a common file extension when the image_url carries none", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/cat.png?size=large" } }] },
     ];
     expect(openAIToGemini(msgs)).toEqual([
-      { role: "user", parts: [{ fileData: { fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } }] },
+      { role: "user", parts: [{ fileData: { mimeType: "image/png", fileUri: "https://example.com/cat.png?size=large" } }] },
+    ]);
+  });
+
+  it("keeps only fileUri when no MIME type is known (documented fallback)", () => {
+    const msgs: OpenAIMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/blob" } }] },
+    ];
+    expect(openAIToGemini(msgs)).toEqual([
+      { role: "user", parts: [{ fileData: { fileUri: "https://example.com/blob" } }] },
     ]);
   });
 
@@ -751,6 +780,19 @@ describe("round-trip: geminiToOpenAI then openAIToGemini", () => {
       {
         role: "user",
         parts: [{ text: "what is this?" }, { inlineData: { mimeType: "image/png", data: "AAAA" } }],
+      },
+    ];
+    expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);
+  });
+
+  it("reproduces a text+fileData (application/pdf) turn exactly", () => {
+    const original = [
+      {
+        role: "user",
+        parts: [
+          { text: "summarise" },
+          { fileData: { mimeType: "application/pdf", fileUri: "https://generativelanguage.googleapis.com/v1beta/files/abc" } },
+        ],
       },
     ];
     expect(openAIToGemini(geminiToOpenAI(original))).toEqual(original);

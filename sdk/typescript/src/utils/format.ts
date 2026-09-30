@@ -398,23 +398,42 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 // Google Gemini → OpenAI
 // ============================================================
 
-// Gemini inlineData / fileData part -> OpenAI image_url url string, or null if unconvertible.
-function geminiMediaUrl(part: any): string | null {
+// Gemini inlineData / fileData part -> OpenAI image_url object, or null if unconvertible.
+// inlineData travels as a data: URI (MIME type included). fileData keeps its MIME type on a
+// private `mime_type` key so the reverse conversion can rebuild the complete
+// { mimeType, fileUri } that @google/generative-ai requires; the proxy passes non-text
+// parts through unchanged, so the key survives /v1/compress.
+function geminiMediaImageUrl(part: any): { url: string; mime_type?: string } | null {
   const blob = part.inlineData;
   if (blob && typeof blob === "object" && blob.mimeType && blob.data) {
-    return `data:${blob.mimeType};base64,${blob.data}`;
+    return { url: `data:${blob.mimeType};base64,${blob.data}` };
   }
   const file = part.fileData;
-  if (file && typeof file === "object" && typeof file.fileUri === "string") return file.fileUri;
+  if (file && typeof file === "object" && typeof file.fileUri === "string") {
+    return typeof file.mimeType === "string"
+      ? { url: file.fileUri, mime_type: file.mimeType }
+      : { url: file.fileUri };
+  }
   return null;
 }
 
-// OpenAI image_url url -> Gemini part. data: URIs become inlineData; other urls fileData
-// (mimeType cannot be carried in an OpenAI part and is optional in the Gemini API).
-function geminiMediaPart(url: string): any {
-  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+const MIME_BY_EXTENSION: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+};
+
+// OpenAI image_url -> Gemini part. data: URIs become inlineData. Other urls become fileData
+// with the carried MIME type, else one inferred from a common extension, else fileUri only.
+function geminiMediaPart(imageUrl: { url: string; mime_type?: string }): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(imageUrl.url);
   if (m) return { inlineData: { mimeType: m[1], data: m[2] } };
-  return { fileData: { fileUri: url } };
+  const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(imageUrl.url)?.[1]?.toLowerCase();
+  const mimeType = imageUrl.mime_type ?? (ext ? MIME_BY_EXTENSION[ext] : undefined);
+  return { fileData: mimeType ? { mimeType, fileUri: imageUrl.url } : { fileUri: imageUrl.url } };
 }
 
 export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
@@ -434,8 +453,8 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
           .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
           .map((p: any) => {
             if (p.text !== undefined) return { type: "text" as const, text: p.text };
-            const url = geminiMediaUrl(p);
-            return url ? { type: "image_url" as const, image_url: { url } } : null;
+            const imageUrl = geminiMediaImageUrl(p);
+            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
           })
           .filter((p: any): p is NonNullable<typeof p> => p !== null);
 
@@ -498,7 +517,7 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
         const geminiParts = msg.content
           .map((p) => {
             if (p.type === "text") return { text: p.text };
-            if (p.type === "image_url") return geminiMediaPart(p.image_url.url);
+            if (p.type === "image_url") return geminiMediaPart(p.image_url);
             return null;
           })
           .filter((p) => p !== null);
