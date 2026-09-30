@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
+from headroom import paths
 from headroom.cli import wrap as wrap_cli
 from headroom.cli.main import main
 
@@ -16,7 +17,12 @@ def runner() -> CliRunner:
     return CliRunner()
 
 
-def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> None:
+@pytest.fixture(autouse=True)
+def _no_persistent_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda _port: None)
+
+
+def test_remove_claude_managed_hooks_preserves_unrelated_hooks(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps(
@@ -29,7 +35,9 @@ def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> No
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "/Users/test/.claude/hooks/rtk-rewrite.sh",
+                                    "command": (
+                                        "headroom init hook ensure --marker headroom-init-claude"
+                                    ),
                                 },
                                 {"type": "command", "command": "echo keep"},
                             ],
@@ -45,7 +53,7 @@ def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+    assert wrap_cli._remove_claude_managed_hooks(settings) is True
 
     payload = json.loads(settings.read_text(encoding="utf-8"))
     pre_tool_hooks = payload["hooks"]["PreToolUse"][0]["hooks"]
@@ -53,7 +61,7 @@ def test_remove_claude_rtk_hooks_preserves_unrelated_hooks(tmp_path: Path) -> No
     assert payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] == "keep"
 
 
-def test_unwrap_claude_removes_mcp_rtk_and_stops_proxy(
+def test_unwrap_claude_removes_mcp_purges_retired_hook_and_stops_proxy(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -61,8 +69,14 @@ def test_unwrap_claude_removes_mcp_rtk_and_stops_proxy(
     home = str(tmp_path)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.delenv("HEADROOM_WORKSPACE_DIR", raising=False)
+    bin_dir = paths.bin_dir()
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
+    hooks_dir = claude_dir / "hooks"
+    hooks_dir.mkdir()
+    hook_script = hooks_dir / "rtk-rewrite.sh"
+    hook_script.write_text(f'#!/bin/sh\nexec {bin_dir / "rtk"} "$@"\n', encoding="utf-8")
     settings = claude_dir / "settings.json"
     settings.write_text(
         json.dumps(
@@ -71,9 +85,7 @@ def test_unwrap_claude_removes_mcp_rtk_and_stops_proxy(
                     "PreToolUse": [
                         {
                             "matcher": "Bash",
-                            "hooks": [
-                                {"type": "command", "command": str(claude_dir / "rtk-rewrite.sh")}
-                            ],
+                            "hooks": [{"type": "command", "command": str(hook_script)}],
                         }
                     ]
                 }
@@ -111,6 +123,8 @@ def test_unwrap_claude_removes_mcp_rtk_and_stops_proxy(
     assert unregistered == ["headroom", "codebase-memory-mcp"]
     assert stopped == [9999]
     assert "Stopped local Headroom proxy on port 9999" in result.output
+    # The leftover retired context-tool hook is purged end-to-end by unwrap
+    # (via purge_context_tool_artifacts), leaving no hooks behind.
     assert "hooks" not in json.loads(settings.read_text(encoding="utf-8"))
 
 
@@ -141,7 +155,7 @@ def test_unwrap_claude_preserves_user_managed_serena(
 
     with (
         patch("headroom.mcp_registry.ClaudeRegistrar", return_value=Registrar()),
-        patch("headroom.cli.wrap._remove_claude_rtk_hooks", return_value=False),
+        patch("headroom.cli.wrap._remove_claude_managed_hooks", return_value=False),
         patch("headroom.cli.wrap._stop_local_proxy_for_unwrap"),
     ):
         result = runner.invoke(main, ["unwrap", "claude"])
@@ -181,7 +195,7 @@ def test_unwrap_claude_removes_headroom_installed_serena(
 
     with (
         patch("headroom.mcp_registry.ClaudeRegistrar", return_value=Registrar()),
-        patch("headroom.cli.wrap._remove_claude_rtk_hooks", return_value=False),
+        patch("headroom.cli.wrap._remove_claude_managed_hooks", return_value=False),
         patch("headroom.cli.wrap._stop_local_proxy_for_unwrap"),
     ):
         result = runner.invoke(main, ["unwrap", "claude"])
@@ -196,17 +210,16 @@ def test_unwrap_claude_keep_flags_skip_cleanup(
 ) -> None:
     with (
         patch("headroom.mcp_registry.ClaudeRegistrar") as registrar,
-        patch("headroom.cli.wrap._remove_claude_rtk_hooks") as remove_rtk,
+        patch("headroom.cli.wrap._remove_claude_managed_hooks", return_value=False),
         patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_proxy,
     ):
         result = runner.invoke(
             main,
-            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--no-stop-proxy"],
+            ["unwrap", "claude", "--keep-mcp", "--no-stop-proxy"],
         )
 
     assert result.exit_code == 0, result.output
     registrar.assert_not_called()
-    remove_rtk.assert_not_called()
     stop_proxy.assert_not_called()
 
 
@@ -219,7 +232,7 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
     with patch("headroom.cli.wrap._restore_claude_wrap_base_url", side_effect=restore_base_url):
         result = runner.invoke(
             main,
-            ["unwrap", "claude", "--keep-mcp", "--keep-rtk", "--no-stop-proxy"],
+            ["unwrap", "claude", "--keep-mcp", "--no-stop-proxy"],
         )
 
     assert result.exit_code == 0, result.output
@@ -230,23 +243,129 @@ def test_unwrap_claude_restores_all_base_url_modes(runner: CliRunner) -> None:
             "foundry_mode": False,
             "vertex_mode": False,
             "settings_path": settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's ownership claim instead of deferring to a
+            # live sibling and silently doing nothing (#3205).
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": True,
             "vertex_mode": False,
             "settings_path": settings_path,
+            "force": True,
         },
         {
             "previous": None,
             "foundry_mode": False,
             "vertex_mode": True,
             "settings_path": settings_path,
+            "force": True,
         },
     ]
 
 
-def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
+def test_unwrap_claude_stops_claude_owned_persistent_deployment(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manifest:
+        profile = "unwrap-2340"
+        targets = ["claude"]
+        tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
+        mutations: list[object] = []
+        supervisor_kind = "service"
+
+    stopped: list[str] = []
+    deactivated: list[str] = []
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: Manifest())
+    monkeypatch.setattr(
+        "headroom.cli.install._deactivate_deployment_mutations",
+        lambda manifest: deactivated.append(manifest.profile),
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install._stop_deployment",
+        lambda manifest: stopped.append(manifest.profile),
+    )
+
+    with (
+        patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_local,
+    ):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    stop_local.assert_not_called()
+    assert deactivated == ["unwrap-2340"]
+    assert stopped == ["unwrap-2340"]
+    assert "Stopped Claude-owned persistent deployment 'unwrap-2340' on port 8787." in result.output
+    assert "Claude is no longer durably wrapped by Headroom." in result.output
+
+
+def test_unwrap_claude_reports_ambiguous_same_port_persistent_deployment(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Manifest:
+        profile = "shared-proxy"
+        targets = ["codex"]
+        tool_envs = {"codex": {"OPENAI_BASE_URL": "http://127.0.0.1:8787"}}
+        mutations: list[object] = []
+        supervisor_kind = "service"
+
+    monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: Manifest())
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap") as stop_local:
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    stop_local.assert_not_called()
+    assert "same-port persistent deployment 'shared-proxy' still owns port 8787" in result.output
+    assert "headroom install stop --profile shared-proxy" in result.output
+    assert "Claude is no longer durably wrapped by Headroom." not in result.output
+
+
+def test_unwrap_claude_warns_about_same_port_inherited_env(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8787")
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "current shell still exports ANTHROPIC_BASE_URL for port 8787" in result.output
+    assert "Claude is no longer durably wrapped by Headroom." not in result.output
+
+
+def test_unwrap_claude_ignores_malformed_inherited_env_port(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:notaport")
+
+    with patch("headroom.cli.wrap._stop_local_proxy_for_unwrap", return_value="stopped"):
+        result = runner.invoke(
+            main,
+            ["unwrap", "claude", "--keep-mcp", "--port", "8787"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "current shell still exports ANTHROPIC_BASE_URL" not in result.output
+    assert "Claude is no longer durably wrapped by Headroom." in result.output
+
+
+def test_remove_claude_managed_hooks_removes_init_hooks_and_env(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps(
@@ -288,7 +407,7 @@ def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+    assert wrap_cli._remove_claude_managed_hooks(settings) is True
 
     payload = json.loads(settings.read_text(encoding="utf-8"))
     # ANTHROPIC_BASE_URL stripped; unrelated env var preserved
@@ -302,7 +421,7 @@ def test_remove_claude_rtk_hooks_removes_init_hooks_and_env(tmp_path: Path) -> N
     assert payload["model"] == "opus"
 
 
-def test_remove_claude_rtk_hooks_strips_env_without_hooks(tmp_path: Path) -> None:
+def test_remove_claude_managed_hooks_strips_env_without_hooks(tmp_path: Path) -> None:
     # Regression: unwrap previously returned early when no hooks existed,
     # leaving init's ANTHROPIC_BASE_URL behind in settings.json.
     settings = tmp_path / "settings.json"
@@ -311,13 +430,13 @@ def test_remove_claude_rtk_hooks_strips_env_without_hooks(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+    assert wrap_cli._remove_claude_managed_hooks(settings) is True
 
     payload = json.loads(settings.read_text(encoding="utf-8"))
     assert "env" not in payload  # emptied env dict is dropped
 
 
-def test_remove_claude_rtk_hooks_noop_when_nothing_managed(tmp_path: Path) -> None:
+def test_remove_claude_managed_hooks_noop_when_nothing_managed(tmp_path: Path) -> None:
     settings = tmp_path / "settings.json"
     original = {
         "model": "opus",
@@ -330,12 +449,12 @@ def test_remove_claude_rtk_hooks_noop_when_nothing_managed(tmp_path: Path) -> No
     }
     settings.write_text(json.dumps(original) + "\n", encoding="utf-8")
 
-    assert wrap_cli._remove_claude_rtk_hooks(settings) is False
+    assert wrap_cli._remove_claude_managed_hooks(settings) is False
     # nothing managed -> file untouched
     assert json.loads(settings.read_text(encoding="utf-8")) == original
 
 
-def test_remove_claude_rtk_hooks_strips_enable_tool_search(tmp_path: Path) -> None:
+def test_remove_claude_managed_hooks_strips_enable_tool_search(tmp_path: Path) -> None:
     # unwrap must remove BOTH env vars init writes (ANTHROPIC_BASE_URL +
     # ENABLE_TOOL_SEARCH, GH #746), leaving user-set vars intact.
     settings = tmp_path / "settings.json"
@@ -353,7 +472,7 @@ def test_remove_claude_rtk_hooks_strips_enable_tool_search(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    assert wrap_cli._remove_claude_rtk_hooks(settings) is True
+    assert wrap_cli._remove_claude_managed_hooks(settings) is True
 
     payload = json.loads(settings.read_text(encoding="utf-8"))
     assert payload["env"] == {"KEEP": "1"}

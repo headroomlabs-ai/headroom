@@ -22,6 +22,8 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     plugins = root / "plugins"
     openclaw = plugins / "openclaw"
     openclaw.mkdir(parents=True)
+    opencode = plugins / "opencode"
+    opencode.mkdir(parents=True)
     agent_hooks_claude = plugins / "headroom-agent-hooks" / ".claude-plugin"
     agent_hooks_claude.mkdir(parents=True)
     agent_hooks_github = plugins / "headroom-agent-hooks" / ".github" / "plugin"
@@ -44,6 +46,17 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
         json.dumps(
             {
                 "name": "test",
+                "version": "0.5.25",
+                "dependencies": {"headroom-ai": "^0.22.3"},
+            }
+        )
+    )
+
+    opencode_pkg = opencode / "package.json"
+    opencode_pkg.write_text(
+        json.dumps(
+            {
+                "name": "test-opencode",
                 "version": "0.5.25",
                 "dependencies": {"headroom-ai": "^0.22.3"},
             }
@@ -80,16 +93,32 @@ def temp_project(tmp_path: Path) -> dict[str, Path]:
     typescript_pkg = typescript / "package.json"
     typescript_pkg.write_text(json.dumps({"name": "test", "version": "0.5.25"}))
 
+    # server.json — the MCP registry descriptor. Asserted byte-for-byte against
+    # render_server_json(), which reads the version from pyproject.toml, so it has
+    # to move with every bump or the release PR's test job fails.
+    server_json = root / "server.json"
+    server_json.write_text(
+        json.dumps(
+            {
+                "name": "io.github.headroomlabs-ai/headroom",
+                "version": "0.5.25",
+                "packages": [{"registryType": "pypi", "version": "0.5.25"}],
+            }
+        )
+    )
+
     return {
         "root": root,
         "pyproject": pyproject,
         "version_py": version_py,
         "openclaw_pkg": openclaw_pkg,
+        "opencode_pkg": opencode_pkg,
         "repo_claude_marketplace": repo_claude_marketplace,
         "repo_github_marketplace": repo_github_marketplace,
         "claude_plugin": claude_plugin,
         "github_plugin": github_plugin,
         "typescript_pkg": typescript_pkg,
+        "server_json": server_json,
     }
 
 
@@ -119,6 +148,10 @@ def test_version_sync_explicit_version(temp_project: dict[str, Path]) -> None:
     assert openclaw_pkg["version"] == "0.7.0"
     assert openclaw_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
 
+    opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
+    assert opencode_pkg["version"] == "0.7.0"
+    assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
     # Verify sdk/typescript/package.json
     typescript_pkg = json.loads(temp_project["typescript_pkg"].read_text())
     assert typescript_pkg["version"] == "0.7.0"
@@ -145,6 +178,7 @@ def test_version_sync_explicit_version(temp_project: dict[str, Path]) -> None:
     assert metadata["packages"]["pypi"] == "0.7.0"
     assert metadata["packages"]["npm-sdk"] == "0.7.0"
     assert metadata["packages"]["npm-openclaw"] == "0.7.0"
+    assert metadata["packages"]["npm-opencode"] == "0.7.0"
     assert metadata["packages"]["agent-hooks-plugin"] == "0.7.0"
 
 
@@ -171,6 +205,10 @@ def test_bump_patch(temp_project: dict[str, Path]) -> None:
     openclaw_pkg = json.loads(temp_project["openclaw_pkg"].read_text())
     assert openclaw_pkg["version"] == "0.5.26"
     assert openclaw_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
+    opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
+    assert opencode_pkg["version"] == "0.5.26"
+    assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
 
     typescript_pkg = json.loads(temp_project["typescript_pkg"].read_text())
     assert typescript_pkg["version"] == "0.5.26"
@@ -203,6 +241,10 @@ def test_bump_minor(temp_project: dict[str, Path]) -> None:
     assert openclaw_pkg["version"] == "0.6.0"
     assert openclaw_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
 
+    opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
+    assert opencode_pkg["version"] == "0.6.0"
+    assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
     typescript_pkg = json.loads(temp_project["typescript_pkg"].read_text())
     assert typescript_pkg["version"] == "0.6.0"
 
@@ -234,6 +276,10 @@ def test_bump_major(temp_project: dict[str, Path]) -> None:
     assert openclaw_pkg["version"] == "1.0.0"
     assert openclaw_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
 
+    opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
+    assert opencode_pkg["version"] == "1.0.0"
+    assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
     typescript_pkg = json.loads(temp_project["typescript_pkg"].read_text())
     assert typescript_pkg["version"] == "1.0.0"
 
@@ -264,6 +310,7 @@ def test_release_metadata_written(temp_project: dict[str, Path]) -> None:
             "pypi": "0.6.0",
             "npm-sdk": "0.6.0",
             "npm-openclaw": "0.6.0",
+            "npm-opencode": "0.6.0",
             "agent-hooks-plugin": "0.6.0",
         },
     }
@@ -294,6 +341,7 @@ def test_plugin_manifests_only_leaves_package_versions_unchanged(
     assert 'version = "0.5.25"' in temp_project["pyproject"].read_text()
     assert '__version__ = "0.5.25"' in temp_project["version_py"].read_text()
     assert json.loads(temp_project["openclaw_pkg"].read_text())["version"] == "0.5.25"
+    assert json.loads(temp_project["opencode_pkg"].read_text())["version"] == "0.5.25"
     assert json.loads(temp_project["typescript_pkg"].read_text())["version"] == "0.5.25"
     assert json.loads(temp_project["claude_plugin"].read_text())["version"] == "0.8.0"
     assert (
@@ -320,3 +368,49 @@ def test_openclaw_headroom_dependency_is_preserved_for_registry_installability(
     openclaw_pkg = json.loads(temp_project["openclaw_pkg"].read_text())
     assert openclaw_pkg["version"] == "0.28.0"
     assert openclaw_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
+
+def test_server_json_version_is_synchronized(temp_project: dict[str, Path]) -> None:
+    """server.json must track the bump or the release PR's test job fails.
+
+    ``tests/test_mcp_registry/test_server_json.py::test_root_server_json_matches_builder``
+    asserts the tracked file equals ``render_server_json()``, which reads the version
+    from ``pyproject.toml``. Nothing regenerated server.json, so it fell behind every
+    release and blocked v0.33.0 (PR #2339).
+    """
+    root = temp_project["root"]
+    script = Path(__file__).parent.parent / "version-sync.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--root", str(root), "--version", "0.33.0"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"Script failed: {result.stderr}"
+    server_json = json.loads(temp_project["server_json"].read_text())
+    assert server_json["version"] == "0.33.0"
+    # The packages[] entry carries its own version and is checked by the builder too.
+    assert [p["version"] for p in server_json["packages"]] == ["0.33.0"]
+    # Untouched keys must survive so the file still matches the builder's output.
+    assert server_json["name"] == "io.github.headroomlabs-ai/headroom"
+    assert server_json["packages"][0]["registryType"] == "pypi"
+
+
+def test_opencode_headroom_dependency_is_preserved_for_registry_installability(
+    temp_project: dict[str, Path],
+) -> None:
+    """Source package stays installable even when the next SDK is not on npm yet."""
+    root = temp_project["root"]
+    script = Path(__file__).parent.parent / "version-sync.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--root", str(root), "--version", "0.28.0"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"Script failed: {result.stderr}"
+    opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
+    assert opencode_pkg["version"] == "0.28.0"
+    assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"

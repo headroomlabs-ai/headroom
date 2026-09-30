@@ -58,6 +58,36 @@ def test_has_ccr_tool_calls_uses_provider_native_names() -> None:
     )
 
 
+def test_ccr_detection_survives_null_function_tool_call() -> None:
+    # A partial/streamed OpenAI tool call with an explicit {"function": null}
+    # must not crash detection: dict.get("function", {}) returns None for a
+    # present-but-null key, and .get on None raises AttributeError.
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": None},
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {
+                                "name": CCR_TOOL_NAME,
+                                "arguments": '{"hash": "' + HASH + '"}',
+                            },
+                        },
+                    ]
+                }
+            }
+        ]
+    }
+
+    assert has_ccr_tool_calls(response, "openai")
+    ccr_calls, other_calls = parse_ccr_tool_calls(response, "openai")
+    assert ccr_calls == [CCRToolCall(tool_call_id="call_2", hash_key=HASH)]
+    assert other_calls == [{"id": "call_1", "type": "function", "function": None}]
+
+
 def test_parse_ccr_tool_calls_splits_retrievals_from_other_tools() -> None:
     response = {
         "content": [

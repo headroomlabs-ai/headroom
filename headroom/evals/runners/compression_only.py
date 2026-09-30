@@ -14,7 +14,10 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from headroom.evals.core import EvalSuite
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +232,91 @@ class CompressionOnlyRunner:
 
         return CompressionOnlyResult(
             benchmark="information_retention",
+            total_cases=total_cases,
+            passed_cases=passed,
+            failed_cases=failed,
+            accuracy_rate=passed / total_cases if total_cases > 0 else 0.0,
+            avg_compression_ratio=sum(ratios) / len(ratios) if ratios else 0.0,
+            total_original_tokens=total_original,
+            total_compressed_tokens=total_compressed,
+            total_tokens_saved=total_original - total_compressed,
+            duration_seconds=time.time() - start_time,
+            details=details,
+            errors=errors,
+        )
+
+    def evaluate_dataset_recall(
+        self,
+        suite: EvalSuite,
+        recall_threshold: float = 0.9,
+        min_answer_chars: int = 4,
+    ) -> CompressionOnlyResult:
+        """Compress each QA case's context and check its answer survives.
+
+        The probe is the case's ``ground_truth`` answer. A case only counts when
+        the answer literally appears in the original context (otherwise survival
+        is not measurable); trivial answers (too short, or yes/no) are skipped.
+        Compression uses the production routing path, so prose flows through
+        Kompress (ModernBERT) — intended for the model-allowed weekly job, not
+        the hermetic per-PR gate.
+
+        Args:
+            suite: An EvalSuite of QA cases (e.g. from ``load_hotpotqa``).
+            recall_threshold: Minimum answer recall for a case to pass.
+            min_answer_chars: Answers shorter than this are skipped as un-probeable.
+        """
+        from headroom.evals.metrics import compute_information_recall
+        from headroom.transforms.content_router import ContentRouter
+
+        trivial = {"yes", "no", "true", "false"}
+        start_time = time.time()
+        router = ContentRouter()
+        passed = 0
+        failed = 0
+        total_original = 0
+        total_compressed = 0
+        details: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        for case in suite.cases:
+            answer = (case.ground_truth or "").strip()
+            if len(answer) < min_answer_chars or answer.lower() in trivial:
+                continue  # un-probeable: survival of this answer carries no signal
+            if answer.lower() not in case.context.lower():
+                continue  # answer not literally in context; nothing to measure
+
+            original_tokens = self._estimate_tokens(case.context)
+            try:
+                compressed = router.compress(case.context).compressed
+                compressed_tokens = self._estimate_tokens(compressed)
+                recall = compute_information_recall(case.context, compressed, [answer])["recall"]
+                is_pass = recall >= recall_threshold
+
+                total_original += original_tokens
+                total_compressed += compressed_tokens
+                passed += is_pass
+                failed += not is_pass
+                details.append(
+                    {
+                        "id": case.id,
+                        "passed": is_pass,
+                        "recall": recall,
+                        "answer": answer,
+                        "compression_ratio": 1 - (compressed_tokens / original_tokens)
+                        if original_tokens > 0
+                        else 0,
+                    }
+                )
+            except Exception as e:
+                failed += 1
+                errors.append(f"Dataset recall error for {case.id}: {e}")
+                details.append({"id": case.id, "passed": False, "error": str(e)})
+
+        total_cases = passed + failed
+        ratios = [d["compression_ratio"] for d in details if "compression_ratio" in d]
+
+        return CompressionOnlyResult(
+            benchmark=f"dataset_recall:{suite.name}",
             total_cases=total_cases,
             passed_cases=passed,
             failed_cases=failed,

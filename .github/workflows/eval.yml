@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -32,7 +32,9 @@ jobs:
       # `pip install -e .` invokes maturin (declared in pyproject.toml's
       # build-system) which calls cargo to compile the Rust extension.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -88,7 +90,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -100,7 +102,9 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-eval-
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -143,6 +147,32 @@ jobs:
           if not result.passed:
               print(f'::warning title=Fidelity recall::{result.failed_cases} case(s) fell below 0.9 recall: {result.errors[:3]}')
           "
+
+      # Real-dataset recall on the prose path (HotpotQA): does the ground-truth
+      # answer survive compressing the supporting context? Uses the production
+      # routing path, so prose flows through Kompress (ModernBERT) — allowed here
+      # because the weekly job installs [all]. Non-blocking and defensive: a
+      # dataset download or model failure warns rather than fails the job.
+      - name: Dataset recall report — HotpotQA (model-allowed, non-blocking)
+        run: |
+          python -c "
+          try:
+              from headroom.transforms.kompress_compressor import warm_kompress_model
+              from headroom.evals.datasets import load_hotpotqa
+              from headroom.evals.runners.compression_only import CompressionOnlyRunner
+              # Block until the Kompress model is loaded; otherwise prose passes
+              # through uncompressed and the recall number is meaningless.
+              warmed = warm_kompress_model()
+              suite = load_hotpotqa(n=50)
+              result = CompressionOnlyRunner().evaluate_dataset_recall(suite)
+              print(f'HotpotQA answer recall: {result.passed_cases}/{result.total_cases} probeable cases >=0.9, avg compression {result.avg_compression_ratio:.1%} (model_warmed={warmed})')
+              if result.avg_compression_ratio < 0.01:
+                  print('::warning title=Dataset recall::compression did not engage (~0%); recall is not a meaningful fidelity signal — check Kompress model availability')
+              elif result.failed_cases:
+                  print(f'::warning title=Dataset recall::{result.failed_cases} HotpotQA case(s) lost the answer under compression')
+          except Exception as e:
+              print(f'::warning title=Dataset recall::skipped (dataset/model unavailable): {e}')
+          " || true
 
       - name: Upload results
         if: always()

@@ -23,21 +23,34 @@ def headroom_opencode_plugin_path() -> str | None:
     OpenCode loads a plugin from an absolute file path (verified against
     opencode 1.17). The plugin's loader entry exports ONLY the plugin function
     (``plugins/opencode/dist/entry.opencode.js``) — the library barrel cannot
-    be loaded directly ("Plugin export is not a function"). Returns ``None``
-    when the plugin has not been built (e.g. a pip-only install that does not
-    ship ``plugins/``), in which case wrap falls back to the native-provider
-    baseURL override, which already covers Anthropic/OpenAI.
+    be loaded directly ("Plugin export is not a function").
 
-    ``HEADROOM_OPENCODE_PLUGIN_PATH`` overrides the resolved path.
+    Resolution order:
+
+    1. ``HEADROOM_OPENCODE_PLUGIN_PATH`` env override.
+    2. A repo-checkout build (``plugins/opencode/dist/entry.opencode.js``) —
+       external-deps build, resolvable because the checkout has node_modules.
+    3. The self-contained bundle shipped inside the wheel
+       (``headroom/providers/opencode/_dist/entry.opencode.js``, built by
+       ``npm run build:standalone``) — every dependency inlined, so it loads
+       from site-packages where no node_modules exists (verified against
+       opencode 1.18.5).
+
+    Returns ``None`` only when none of the three exist, in which case wrap
+    falls back to the native-provider baseURL override, which already covers
+    Anthropic/OpenAI.
     """
     override = os.environ.get("HEADROOM_OPENCODE_PLUGIN_PATH", "").strip()
     if override:
         return override if Path(override).is_file() else None
     # runtime.py → opencode → providers → headroom → <repo root>
-    candidate = (
+    repo_candidate = (
         Path(__file__).resolve().parents[3] / "plugins" / "opencode" / "dist" / "entry.opencode.js"
     )
-    return str(candidate) if candidate.is_file() else None
+    if repo_candidate.is_file():
+        return str(repo_candidate)
+    packaged = Path(__file__).resolve().parent / "_dist" / "entry.opencode.js"
+    return str(packaged) if packaged.is_file() else None
 
 
 def build_opencode_config_content(

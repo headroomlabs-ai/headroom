@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from .models import ArtifactRecord, DeploymentManifest, ManagedMutation, iso_utc_now
 from .paths import deploy_root, manifest_path, profile_root
@@ -60,6 +61,23 @@ def save_manifest(manifest: DeploymentManifest) -> None:
         logger.warning("Cannot save deployment manifest: %s — continuing without persistence", e)
 
 
+# The Docker image org moved from a personal repo to the project org. The old
+# ``ghcr.io/chopratejas/headroom`` repo is frozen at 0.27.0, so a manifest that
+# still pins it silently runs ~5 minor versions behind the CLI with no drift
+# signal (#2426). Rewrite it to the org repo on load, preserving the tag.
+_DEPRECATED_IMAGE_REPO = "ghcr.io/chopratejas/headroom"
+_CURRENT_IMAGE_REPO = "ghcr.io/headroomlabs-ai/headroom"
+
+
+def _migrate_deprecated_image(image: Any) -> Any:
+    """Rewrite the retired ``chopratejas`` Docker repo to the org repo (#2426)."""
+    if isinstance(image, str) and image.startswith(_DEPRECATED_IMAGE_REPO):
+        migrated = _CURRENT_IMAGE_REPO + image[len(_DEPRECATED_IMAGE_REPO) :]
+        logger.info("Migrating deployment image from retired repo %s to %s", image, migrated)
+        return migrated
+    return image
+
+
 def load_manifest(profile: str = "default") -> DeploymentManifest | None:
     """Load a deployment manifest when present."""
 
@@ -74,6 +92,8 @@ def load_manifest(profile: str = "default") -> DeploymentManifest | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["mutations"] = [ManagedMutation(**item) for item in payload.get("mutations", [])]
         payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
+        if "image" in payload:
+            payload["image"] = _migrate_deprecated_image(payload["image"])
         return DeploymentManifest(**payload)
     except (json.JSONDecodeError, ValueError, TypeError, OSError) as e:
         raise ManifestError(f"deployment profile '{profile}' is corrupt ({path}): {e}") from e
@@ -94,6 +114,8 @@ def list_manifests() -> list[DeploymentManifest]:
                 ManagedMutation(**item) for item in payload.get("mutations", [])
             ]
             payload["artifacts"] = [ArtifactRecord(**item) for item in payload.get("artifacts", [])]
+            if "image" in payload:
+                payload["image"] = _migrate_deprecated_image(payload["image"])
             manifests.append(DeploymentManifest(**payload))
         except (OSError, ValueError, TypeError):
             continue

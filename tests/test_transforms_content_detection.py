@@ -4,6 +4,8 @@ import json
 
 from headroom.transforms.content_detector import (
     ContentType,
+    _is_grep_context_line,
+    _is_search_result_line,
     _try_detect_code,
     _try_detect_diff,
     _try_detect_html,
@@ -168,6 +170,133 @@ def test_search_detection_uses_match_ratio() -> None:
 
     assert _try_detect_search("one:1:match\nplain\nplain\nplain") is None
     assert _try_detect_search("\n\n") is None
+
+
+def test_search_detection_rejects_datetime_prefixed_user_message() -> None:
+    """Regression: wrap-copilot ate one-line interactive prompts (2026-08-23).
+
+    Copilot CLI prepends ``<current_datetime>…</current_datetime>`` to every
+    interactive user turn. The ISO-8601 ``T09:57:59`` matched the grep
+    ``file:line:`` pattern, so a datetime + one-line prompt classified as
+    SEARCH_RESULTS (1 match / 2 lines = 50% ≥ 30%) and the SearchCompressor
+    deleted the prompt line — the model received only the timestamp.
+    """
+    incident = (
+        "<current_datetime>2026-08-23T09:57:59.792+02:00</current_datetime>\n"
+        "\n"
+        "Please update the PR desc and check .overlay/ for hints."
+    )
+    assert _try_detect_search(incident) is None
+    assert detect_content_type(incident).content_type is not ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_requires_two_matching_lines() -> None:
+    """A single coincidental ``word:digits:`` line must not classify prose."""
+    assert _try_detect_search("src/foo.py:12:def foo():") is None
+    assert (
+        _try_detect_search(
+            "Meeting at 09:30:00 tomorrow.\nBring the reports.\nDo not forget coffee."
+        )
+        is None
+    )
+    # Two genuine grep lines still classify.
+    two = "src/foo.py:12:def foo():\nsrc/bar.py:34:    foo()"
+    result = _try_detect_search(two)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_rejects_tag_like_and_key_value_prefixes() -> None:
+    """Markup / key=value lines are not file paths even with ``:\\d+:`` inside."""
+    assert (
+        _try_detect_search('<log time="10:00:00">started</log>\n<log time="10:00:01">stopped</log>')
+        is None
+    )
+    assert _try_detect_search("timeout=30:12:retried\ntimeout=31:12:retried") is None
+
+
+def test_search_detection_classifies_grep_context_lines() -> None:
+    """Regression (#3580): ``grep -A/-B/-C`` context lines are search output.
+
+    GNU grep separates context lines with ``-`` (``path-NN-content``) instead
+    of the ``:`` match lines use. The dash alone flipped detection to
+    PLAIN_TEXT, routing source code into the word-dropping Kompress prose
+    compressor. Context lines must classify as SEARCH_RESULTS, exactly like
+    the colon-separated match lines already do.
+    """
+    code = [
+        'env = payload.get("env")',
+        "env_map = dict(env) if isinstance(env, dict) else {}",
+        "previous = {name: env_map.get(name) for name in values}",
+        'payload["env"] = env_map',
+        'path.write_text(json.dumps(payload, indent=2), encoding="utf-8")',
+    ]
+    path = "./headroom/providers/claude/install.py"
+
+    def build(sep: str) -> str:
+        return "\n".join(
+            f"{path}:{40 + i}{sep}{line}" for _ in range(14) for i, line in enumerate(code)
+        )
+
+    for sep in (":", "-"):
+        result = _try_detect_search(build(sep))
+        assert result is not None, f"separator {sep!r} not detected as search"
+        assert result.content_type is ContentType.SEARCH_RESULTS
+        assert result.metadata == {"matching_lines": 70, "total_lines": 70}
+        assert detect_content_type(build(sep)).content_type is ContentType.SEARCH_RESULTS
+
+
+def test_grep_context_line_predicate_guards() -> None:
+    """The ``path-NN-content`` shape must not claim dates, prose, or markup."""
+    # Genuine context lines, including dashed file names and ripgrep output.
+    assert _is_grep_context_line("src/main.py-40-some context before")
+    assert _is_grep_context_line("src/my-file.py-12-x = 1")
+    assert _is_grep_context_line("./headroom/providers/claude/install.py-40-    x = 1")
+    # Group separators and single dashes are never matches.
+    assert not _is_grep_context_line("--")
+    assert not _is_grep_context_line("-")
+    # Dates and dashed prose have no path-shaped prefix (no ``/`` or ``.``).
+    assert not _is_grep_context_line("2026-09-14")
+    assert not _is_grep_context_line("2026-09-14-release-notes-here")
+    assert not _is_grep_context_line("version-2-release")
+    # Markup / key=value prefixes are excluded, mirroring the colon branch.
+    assert not _is_grep_context_line('<log time="10-00-00">started</log>')
+    assert not _is_grep_context_line("timeout=30-12-retried")
+
+
+def test_grep_colon_dash_shape_routes_like_context() -> None:
+    """``path:NN-content`` (the reported repro shape) is search output too."""
+    assert _is_search_result_line("src/main.py:40-    context before")
+    assert _is_search_result_line("./headroom/x.py:40-env = payload.get(1)")
+    # Same prefix exclusions as the colon branch.
+    assert not _is_search_result_line('<log time="10:00-00">started</log>')
+    assert not _is_search_result_line("timeout=30:12-retried")
+
+
+def test_search_detection_mixed_match_and_context_block() -> None:
+    """A ``grep -C`` block mixing ``:`` matches, ``-`` context, and ``--``."""
+    block = "\n".join(
+        [
+            "src/main.py-40-    context before",
+            "src/main.py:42:def process_data(items):",
+            "src/main.py-43-    context after",
+            "--",
+            "src/other.py-10-    more context",
+            "src/other.py:12:    return True",
+            "src/other.py-13-    trailing context",
+        ]
+    )
+    result = _try_detect_search(block)
+    assert result is not None
+    assert result.content_type is ContentType.SEARCH_RESULTS
+    # Six grep-shaped lines out of seven (``--`` is a separator, not a match).
+    assert result.metadata == {"matching_lines": 6, "total_lines": 7}
+    assert detect_content_type(block).content_type is ContentType.SEARCH_RESULTS
+
+
+def test_search_detection_single_context_line_stays_unclaimed() -> None:
+    """One coincidental ``path-NN`` line must not classify prose (floor of 2)."""
+    assert _try_detect_search("src/foo.py-12-    foo()") is None
 
 
 def test_log_detection_prefers_build_output_patterns() -> None:

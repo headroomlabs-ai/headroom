@@ -48,7 +48,17 @@ MAX_ANCHOR_CANDIDATES = 16
 # NOT match a padded/right-aligned prefix (``   123<TAB>`` from ``cat -n``): the
 # line must start with the digit, so ``number + delta`` re-numbers byte-exactly
 # without touching alignment padding, keeping renumbered folds strictly lossless.
-_LINENO_RE = re.compile(r"^(\d+)(:|\t)(.*)$", re.DOTALL)
+#
+# ``[1-9]\d*`` (not ``\d+``) is load-bearing: a LEADING-ZERO run (``08:00:01`` in
+# a timestamped log, ``007:...``) is not an unpadded grep/sed line number, and
+# recovery is ``str(int(number) + delta)``, which drops the zero pad — ``int("08")
+# + 1`` renders ``"9"``, not ``"09"``. Matching those would fold them under a
+# uniform delta and the round-trip would NOT be byte-exact, breaking the strictly
+# lossless promise above. Excluding them keeps such lines non-numbered, so they
+# fold only on an EXACT match (delta 0) — the "prefer false negatives" posture.
+# Real grep -n / sed -n / rg -n numbers never carry a leading zero, so the
+# intended renumber-fold feature is unaffected.
+_LINENO_RE = re.compile(r"^([1-9]\d*)(:|\t)(.*)$", re.DOTALL)
 
 
 def _num_and_key(line: str) -> tuple[int | None, str, str]:

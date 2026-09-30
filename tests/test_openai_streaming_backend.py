@@ -11,6 +11,7 @@ Run with:
 """
 
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -260,3 +261,49 @@ class TestOpenAIStreamingMock:
                 assert "application/json" in content_type
                 data = response.json()
                 assert data["choices"][0]["message"]["content"] == "Hello!"
+
+    def test_litellm_vertex_streaming_preserves_max_tokens_and_vendor_fields(self):
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            backend="litellm-vertex",
+        )
+
+        async def fake_stream():
+            yield SimpleNamespace(
+                model_dump=lambda **kwargs: {
+                    "id": "chunk1",
+                    "choices": [{"delta": {"content": "a"}}],
+                }
+            )
+
+        with (
+            patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+            patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+        ):
+            mock_acomp.return_value = fake_stream()
+            app = create_app(config)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "claude-sonnet-4-6",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 32,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "stream": True,
+                    },
+                    headers={"Authorization": "Bearer test-key"},
+                )
+
+        assert response.status_code == 200, response.text
+        assert "text/event-stream" in response.headers.get("content-type", "")
+        assert "data: [DONE]" in response.text
+
+        kwargs = mock_acomp.await_args.kwargs
+        assert kwargs["stream"] is True
+        assert kwargs["max_tokens"] == 32
+        assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert "max_completion_tokens" not in kwargs["extra_body"]

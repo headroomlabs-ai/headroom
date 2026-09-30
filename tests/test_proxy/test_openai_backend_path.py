@@ -16,6 +16,7 @@ don't need a real provider:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -89,6 +90,21 @@ def _make_mock_backend(response_body: dict, status_code: int = 200) -> MagicMock
         )
     )
     return backend
+
+
+def _make_litellm_response() -> SimpleNamespace:
+    return SimpleNamespace(
+        id="resp_2392",
+        created=123456,
+        choices=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                message=SimpleNamespace(role="assistant", content="ok", tool_calls=None),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+    )
 
 
 def _install_tracker_stub(client: TestClient) -> _RecordingTracker:
@@ -194,6 +210,40 @@ def test_backend_response_falls_back_to_openai_cached_tokens_when_bedrock_keys_a
     assert call["cache_read_tokens"] == 200
     # No cache_creation_input_tokens → inferred = prompt_tokens - cache_read = 500 - 200 = 300
     assert call["cache_write_tokens"] == 300
+
+
+def test_litellm_vertex_backend_path_preserves_max_tokens_and_vendor_fields():
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="litellm-vertex",
+    )
+
+    with (
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+    ):
+        mock_acomp.return_value = _make_litellm_response()
+        app = create_app(config)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 32,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert response.status_code == 200, response.text
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["max_tokens"] == 32
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert "max_completion_tokens" not in kwargs["extra_body"]
 
 
 def test_backend_response_with_ccr_tool_call_is_intercepted_and_resolved():

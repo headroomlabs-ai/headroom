@@ -72,17 +72,18 @@ Different data patterns need different position importance:
 
 ```python
 class AnchorStrategy(Enum):
-    FRONT_HEAVY = "front_heavy"     # Search results: top items matter most
-    BACK_HEAVY = "back_heavy"       # Logs: recent items matter most
-    BALANCED = "balanced"           # Time series: both ends matter
-    MIDDLE_AWARE = "middle_aware"   # Database: order might be arbitrary
+    FRONT_HEAVY = "front_heavy"  # Search results: top items matter most
+    BACK_HEAVY = "back_heavy"  # Logs: recent items matter most
+    BALANCED = "balanced"  # Time series: both ends matter
+    MIDDLE_AWARE = "middle_aware"  # Database: order might be arbitrary
+
 
 def get_anchor_strategy(pattern: DataPattern) -> AnchorStrategy:
     return {
         DataPattern.SEARCH_RESULTS: AnchorStrategy.FRONT_HEAVY,  # Top N by score
-        DataPattern.LOGS: AnchorStrategy.BACK_HEAVY,             # Recency matters
-        DataPattern.TIME_SERIES: AnchorStrategy.BALANCED,        # Both ends for trend
-        DataPattern.GENERIC: AnchorStrategy.MIDDLE_AWARE,        # Don't assume order
+        DataPattern.LOGS: AnchorStrategy.BACK_HEAVY,  # Recency matters
+        DataPattern.TIME_SERIES: AnchorStrategy.BALANCED,  # Both ends for trend
+        DataPattern.GENERIC: AnchorStrategy.MIDDLE_AWARE,  # Don't assume order
     }.get(pattern, AnchorStrategy.BALANCED)
 ```
 
@@ -150,7 +151,7 @@ def select_informative_anchors(
     items: list[dict],
     region: str,  # "front", "back", "middle"
     slots: int,
-    all_items_hash: set[str]
+    all_items_hash: set[str],
 ) -> list[int]:
     """Select most informative items from a region."""
 
@@ -195,7 +196,7 @@ def calculate_information_score(item: dict, all_items: list[dict]) -> float:
     for field, value in item.items():
         field_values = [i.get(field) for i in all_items if field in i]
         value_frequency = field_values.count(value) / len(field_values)
-        score += (1 - value_frequency)  # Rare values score higher
+        score += 1 - value_frequency  # Rare values score higher
 
     # 2. Structural uniqueness - different fields than typical
     typical_fields = get_typical_fields(all_items)
@@ -221,6 +222,7 @@ Track which positions users actually retrieve and learn from it:
 @dataclass
 class PositionRetrievalPattern:
     """Learned position importance from retrieval data."""
+
     tool_name: str
     total_compressions: int
     position_retrievals: dict[str, int]  # "front_10%", "middle", "back_10%"
@@ -231,21 +233,13 @@ class PositionRetrievalPattern:
         if total == 0:
             return {"front": 0.5, "middle": 0.0, "back": 0.5}
 
-        return {
-            position: count / total
-            for position, count in self.position_retrievals.items()
-        }
+        return {position: count / total for position, count in self.position_retrievals.items()}
 
 
 class TOINPositionLearning:
     """Learn position importance from retrieval patterns."""
 
-    def record_retrieval(
-        self,
-        tool_name: str,
-        original_size: int,
-        retrieved_indices: list[int]
-    ):
+    def record_retrieval(self, tool_name: str, original_size: int, retrieved_indices: list[int]):
         """Record which positions were retrieved."""
         for idx in retrieved_indices:
             position = self._classify_position(idx, original_size)
@@ -287,9 +281,7 @@ For large arrays, sample strategically from middle:
 
 ```python
 def stratified_middle_sample(
-    items: list[dict],
-    num_samples: int,
-    analysis: ArrayAnalysis
+    items: list[dict], num_samples: int, analysis: ArrayAnalysis
 ) -> list[int]:
     """Sample middle positions using stratified approach."""
 
@@ -310,9 +302,7 @@ def stratified_middle_sample(
     if analysis.numeric_fields:
         variance_scores = calculate_position_variance(items, analysis.numeric_fields)
         sorted_by_variance = sorted(
-            middle_items,
-            key=lambda i: variance_scores.get(i, 0),
-            reverse=True
+            middle_items, key=lambda i: variance_scores.get(i, 0), reverse=True
         )
         return sorted(sorted_by_variance[:num_samples])
 
@@ -383,11 +373,7 @@ class TestAdversarialPositions:
         items[42]["name"] = "target_item"
         items[42]["description"] = "This is what user asked about"
 
-        result = smart_crusher.crush(
-            items,
-            max_items=10,
-            query="find target_item"
-        )
+        result = smart_crusher.crush(items, max_items=10, query="find target_item")
 
         # Query-matched item MUST be preserved
         assert any("target_item" in item.get("name", "") for item in result)
@@ -399,12 +385,15 @@ class TestAdversarialPositions:
 class TestSizeAdaptation:
     """Test that anchor allocation scales with array size."""
 
-    @pytest.mark.parametrize("size,expected_min_anchors", [
-        (20, 3),    # Small array: at least 3 anchors
-        (100, 4),   # Medium array: at least 4 anchors
-        (500, 5),   # Large array: at least 5 anchors
-        (2000, 6),  # Very large: at least 6 anchors
-    ])
+    @pytest.mark.parametrize(
+        "size,expected_min_anchors",
+        [
+            (20, 3),  # Small array: at least 3 anchors
+            (100, 4),  # Medium array: at least 4 anchors
+            (500, 5),  # Large array: at least 5 anchors
+            (2000, 6),  # Very large: at least 6 anchors
+        ],
+    )
     def test_anchor_count_scales(self, size, expected_min_anchors):
         """Anchor count should increase with array size."""
         items = [{"id": i, "value": i * 10} for i in range(size)]
@@ -413,8 +402,7 @@ class TestSizeAdaptation:
 
         # Count items from first 10% and last 10%
         anchor_count = sum(
-            1 for item in result
-            if item["id"] < size * 0.1 or item["id"] > size * 0.9
+            1 for item in result if item["id"] < size * 0.1 or item["id"] > size * 0.9
         )
 
         assert anchor_count >= expected_min_anchors
@@ -454,10 +442,7 @@ class TestPatternAwareAnchoring:
 
     def test_search_results_front_heavy(self):
         """Search results should preserve more from front."""
-        items = [
-            {"title": f"Result {i}", "score": 1.0 - (i * 0.01)}
-            for i in range(100)
-        ]
+        items = [{"title": f"Result {i}", "score": 1.0 - (i * 0.01)} for i in range(100)]
 
         result = smart_crusher.crush(items, max_items=10)
 
@@ -485,10 +470,7 @@ class TestPatternAwareAnchoring:
 
     def test_time_series_balanced(self):
         """Time series should have balanced front/back."""
-        items = [
-            {"timestamp": f"2024-01-01T{i:02d}:00:00", "value": 100 + i}
-            for i in range(24)
-        ]
+        items = [{"timestamp": f"2024-01-01T{i:02d}:00:00", "value": 100 + i} for i in range(24)]
 
         result = smart_crusher.crush(items, max_items=8)
 
@@ -510,11 +492,7 @@ class TestQueryAwareAnchoring:
         """'Latest' in query should preserve more recent items."""
         items = [{"id": i, "created": f"2024-01-{i:02d}"} for i in range(1, 31)]
 
-        result = smart_crusher.crush(
-            items,
-            max_items=8,
-            query="Show me the latest entries"
-        )
+        result = smart_crusher.crush(items, max_items=8, query="Show me the latest entries")
 
         ids = [item["id"] for item in result]
         recent_count = sum(1 for id in ids if id > 20)
@@ -525,11 +503,7 @@ class TestQueryAwareAnchoring:
         """'First' in query should preserve earlier items."""
         items = [{"id": i, "created": f"2024-01-{i:02d}"} for i in range(1, 31)]
 
-        result = smart_crusher.crush(
-            items,
-            max_items=8,
-            query="Show me the first entries"
-        )
+        result = smart_crusher.crush(items, max_items=8, query="Show me the first entries")
 
         ids = [item["id"] for item in result]
         early_count = sum(1 for id in ids if id < 10)
@@ -540,11 +514,7 @@ class TestQueryAwareAnchoring:
         """Query for specific ID should find it regardless of position."""
         items = [{"id": f"item_{i:04d}", "value": i} for i in range(1000)]
 
-        result = smart_crusher.crush(
-            items,
-            max_items=10,
-            query="Find item_0567"
-        )
+        result = smart_crusher.crush(items, max_items=10, query="Find item_0567")
 
         assert any(item["id"] == "item_0567" for item in result)
 ```
@@ -574,8 +544,7 @@ class TestCoverageMetrics:
     def test_category_coverage(self):
         """Preserved items should represent all categories."""
         items = [
-            {"category": cat, "id": i}
-            for i, cat in enumerate(["A"] * 30 + ["B"] * 30 + ["C"] * 40)
+            {"category": cat, "id": i} for i, cat in enumerate(["A"] * 30 + ["B"] * 30 + ["C"] * 40)
         ]
 
         result = smart_crusher.crush(items, max_items=10)
@@ -608,10 +577,7 @@ class TestRetrievalSimulation:
 
     def test_retrieval_hit_rate_random_queries(self):
         """Measure how often preserved items satisfy random queries."""
-        items = [
-            {"id": i, "name": f"Item {i}", "category": f"cat_{i % 5}"}
-            for i in range(100)
-        ]
+        items = [{"id": i, "name": f"Item {i}", "category": f"cat_{i % 5}"} for i in range(100)]
 
         compressed = smart_crusher.crush(items, max_items=15)
         compressed_ids = {item["id"] for item in compressed}
@@ -636,9 +602,9 @@ class TestRetrievalSimulation:
         # Weight queries toward front (30%), back (30%), anomalies (40%)
         hits = 0
         queries = (
-            list(range(10)) * 3 +  # Front queries
-            list(range(90, 100)) * 3 +  # Back queries
-            [50] * 4  # Middle anomaly queries
+            list(range(10)) * 3  # Front queries
+            + list(range(90, 100)) * 3  # Back queries
+            + [50] * 4  # Middle anomaly queries
         )
 
         for target_id in queries:
@@ -718,12 +684,12 @@ class AnchorConfig:
     time_series_balance: float = 0.5
 
     # Query keyword detection
-    recency_keywords: list[str] = field(default_factory=lambda: [
-        "latest", "recent", "last", "newest", "current"
-    ])
-    historical_keywords: list[str] = field(default_factory=lambda: [
-        "first", "oldest", "earliest", "original", "initial"
-    ])
+    recency_keywords: list[str] = field(
+        default_factory=lambda: ["latest", "recent", "last", "newest", "current"]
+    )
+    historical_keywords: list[str] = field(
+        default_factory=lambda: ["first", "oldest", "earliest", "original", "initial"]
+    )
 
     # Information density selection
     use_information_density: bool = True

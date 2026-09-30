@@ -77,7 +77,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 3. One logical change per PR.
 4. Add tests.
 5. `uv run pytest` · `uv run ruff check .` · `uv run ruff format .`
-6. Update `CHANGELOG.md` for user-facing changes.
+6. Do **not** edit `CHANGELOG.md` — release-please generates it from your Conventional Commit PR title, so a clear `fix(...)`/`feat(...)` title *is* your changelog entry. A CI guard rejects manual edits.
 7. Open the PR with a clear description + `Real behavior proof` + any spec/justification required, and keep the PR in draft until the `Review Readiness` boxes are complete.
 
 **Title format** (conventional commits): `feat:`, `fix:`, `docs:`, `test:`, `refactor:`.
@@ -89,7 +89,7 @@ A human maintainer reviews every dep change. PRs that add or bump a package must
 ## Development setup
 
 ```bash
-git clone https://github.com/chopratejas/headroom.git
+git clone https://github.com/headroomlabs-ai/headroom.git
 cd headroom
 python -m venv .venv && source .venv/bin/activate
 node --version  # Node 18+ required for commitlint hooks
@@ -123,6 +123,16 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - Type hints on public functions; Google-style docstrings.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
 - Python 3.10+. Optional features go behind extras.
+- **Headroom writes LF and normalizes on read, on every platform.** Pass
+  `newline="\n"` to every `write_text`/`open` that writes a context, memory,
+  or state file, and normalize `\r\n`/`\r` when you read one back. Without
+  the pin, `TextIOWrapper` translates `\n` to `\r\n` on Windows, and a reader
+  that decodes bytes directly then re-writes accumulates carriage returns
+  (#3594); even with a normalizing reader, two subsystems writing the same
+  file (`CLAUDE.md`, `AGENTS.md`) flip it between LF and CRLF (#3698). Cover
+  new write sites with `@pytest.mark.windows_newline` — those tests assert the
+  `newline=` kwarg (an artifact assertion cannot fail on POSIX) and also run
+  on `windows-latest` in CI.
 
 ## Architecture principles
 

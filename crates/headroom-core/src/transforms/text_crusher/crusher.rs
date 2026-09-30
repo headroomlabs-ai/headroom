@@ -362,7 +362,19 @@ fn tokens_ascii(text: &str) -> Vec<String> {
     out
 }
 
-/// CJK path: ICU WordSegmenter (dictionary) word units; alnum-bearing, lowercased.
+/// Fold full-width ASCII variants (Ａ-Ｚ, ０-９, full-width punctuation) to their
+/// half-width form, and the ideographic space to a normal space. Real CJK text
+/// mixes these with normal ASCII; folding makes a token match regardless of
+/// width. Only the internal token KEY is folded -- the kept output stays verbatim.
+fn width_fold(c: char) -> char {
+    match c as u32 {
+        0xFF01..=0xFF5E => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        0x3000 => ' ',
+        _ => c,
+    }
+}
+
+/// CJK path: ICU WordSegmenter (dictionary) word units; width-folded, lowercased.
 fn tokens_icu(text: &str) -> Vec<String> {
     let seg = *WORD_SEGMENTER;
     let mut out = Vec::new();
@@ -371,7 +383,7 @@ fn tokens_icu(text: &str) -> Vec<String> {
         if b > prev {
             let w = text[prev..b].trim();
             if !w.is_empty() && w.chars().any(|c| c.is_alphanumeric()) {
-                out.push(w.to_lowercase());
+                out.push(w.chars().map(width_fold).collect::<String>().to_lowercase());
             }
             prev = b;
         }
@@ -559,6 +571,22 @@ mod tests {
         assert!(
             tokens("数据库连接失败重试三次").len() >= 3,
             "CJK run must yield multiple word-ish tokens"
+        );
+    }
+
+    #[test]
+    fn fullwidth_ascii_folds_to_halfwidth() {
+        // full-width "ＡＰＩ" inside CJK must fold to the same token as "api",
+        // so dedup/relevance match across width variants.
+        let toks = tokens("认证ＡＰＩ密钥");
+        assert!(
+            toks.iter().any(|t| t == "api"),
+            "full-width ASCII should fold to 'api': {toks:?}"
+        );
+        // full-width digits too
+        assert!(
+            tokens("端口８０８０").iter().any(|t| t == "8080"),
+            "full-width digits should fold"
         );
     }
 

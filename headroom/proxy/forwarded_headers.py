@@ -127,9 +127,7 @@ def load_trusted_dashboard_client_cidrs(
     try:
         return _parse_cidr_list(raw)
     except ValueError as exc:
-        raise ValueError(
-            f"Invalid {TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV} entry: {exc}"
-        ) from exc
+        raise ValueError(f"Invalid {TRUSTED_DASHBOARD_CLIENT_CIDRS_ENV} entry: {exc}") from exc
 
 
 def _normalize_ip(

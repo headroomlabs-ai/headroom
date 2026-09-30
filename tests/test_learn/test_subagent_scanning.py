@@ -42,6 +42,46 @@ def _write_session(path: Path, out: str = "x" * 400) -> None:
     path.write_text("\n".join(json.dumps(line) for line in lines))
 
 
+def test_scan_survives_null_message_line(tmp_path: Path) -> None:
+    # A single line with an explicit {"message": null} must not crash the scan
+    # (the per-file guard only catches OSError/UnicodeDecodeError, so an
+    # AttributeError here would abort the whole `learn` run). The valid tool_use
+    # pair around it must still be parsed.
+    path = tmp_path / "main-uuid.jsonl"
+    lines = [
+        {"type": "assistant", "message": None},
+        {
+            "type": "assistant",
+            "message": {
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "u1",
+                        "name": "Read",
+                        "input": {"file_path": "/a.py"},
+                    }
+                ],
+            },
+        },
+        {"type": "user", "message": None},
+        {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "u1", "content": "x" * 400}]
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines))
+
+    plugin = ClaudeCodePlugin()
+    session = plugin._scan_session(path)
+
+    assert session is not None
+    assert len(session.tool_calls) == 1
+    assert session.total_input_tokens == 100
+
+
 def test_scan_project_discovers_subagent_and_workflow_transcripts(tmp_path: Path) -> None:
     _write_session(tmp_path / "main-uuid.jsonl")
     _write_session(tmp_path / "main-uuid" / "subagents" / "agent-1.jsonl")

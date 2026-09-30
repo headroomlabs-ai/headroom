@@ -6,7 +6,9 @@ from headroom.transforms.kompress_remote import RemoteKompressCompressor
 
 
 def _long_text() -> str:
-    return " ".join(f"word{i}" for i in range(20))
+    # Above the production word floor (min_input_words=64) so the remote
+    # call under test actually fires.
+    return " ".join(f"word{i}" for i in range(80))
 
 
 def _compressor(transport: httpx.BaseTransport) -> RemoteKompressCompressor:
@@ -87,6 +89,49 @@ def test_remote_kompress_http_error_fails_open() -> None:
 def test_remote_kompress_malformed_success_fails_open() -> None:
     content = _long_text()
     compressor = _compressor(httpx.MockTransport(lambda request: httpx.Response(200, json={})))
+    try:
+        result = compressor.compress(content)
+    finally:
+        compressor.close()
+
+    assert result.compressed == content
+    assert result.compression_ratio == 1.0
+
+
+def test_remote_kompress_null_numeric_field_fails_open() -> None:
+    # A 200 response with a valid 'compressed' but a malformed numeric field
+    # (here an explicit JSON null) must still fail open, not raise. data.get
+    # returns None for a present key, so float(None) would blow up if the
+    # coercions were outside the fail-open guard.
+    content = _long_text()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"compressed": "short result", "compression_ratio": None},
+        )
+
+    compressor = _compressor(httpx.MockTransport(handler))
+    try:
+        result = compressor.compress(content)
+    finally:
+        compressor.close()
+
+    assert result.compressed == content
+    assert result.compression_ratio == 1.0
+
+
+def test_remote_kompress_non_numeric_field_fails_open() -> None:
+    # A non-numeric string in a numeric field is also a malformed response.
+    content = _long_text()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"compressed": "short result", "original_tokens": "lots"},
+        )
+
+    compressor = _compressor(httpx.MockTransport(handler))
     try:
         result = compressor.compress(content)
     finally:

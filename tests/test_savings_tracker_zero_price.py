@@ -15,8 +15,10 @@ import types
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import (
     DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
+    DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN,
     _estimate_compression_savings_usd,
     _estimate_input_cost_usd,
+    _estimate_output_savings_usd,
 )
 
 
@@ -61,3 +63,30 @@ def test_input_cost_zero_for_free_model(monkeypatch):
         lambda: _fake_litellm({"free-model": {"input_cost_per_token": 0.0}}),
     )
     assert _estimate_input_cost_usd("free-model", 500_000) == 0.0
+
+
+def test_output_savings_zero_for_free_model(monkeypatch):
+    # output_cost_per_token == 0.0 (free model) must yield $0, not the fallback.
+    monkeypatch.setattr(
+        st,
+        "_get_litellm_module",
+        lambda: _fake_litellm({"free-model": {"output_cost_per_token": 0.0}}),
+    )
+    assert _estimate_output_savings_usd("free-model", 1_000_000) == 0.0
+
+
+def test_output_savings_falls_back_for_unknown_model(monkeypatch):
+    # Model absent from litellm → output_cost_per_token is None → fall back.
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: _fake_litellm({}))
+    got = _estimate_output_savings_usd("unknown-model", 1_000_000)
+    assert got == 1_000_000 * DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN
+
+
+def test_output_savings_uses_real_price_for_paid_model(monkeypatch):
+    price = 15.0 / 1_000_000
+    monkeypatch.setattr(
+        st,
+        "_get_litellm_module",
+        lambda: _fake_litellm({"paid-model": {"output_cost_per_token": price}}),
+    )
+    assert _estimate_output_savings_usd("paid-model", 1_000_000) == 1_000_000 * price

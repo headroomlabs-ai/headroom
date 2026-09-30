@@ -79,6 +79,36 @@ def test_thinking_delta_accumulated() -> None:
     assert block["thinking"] == "Let me consider the question carefully."
 
 
+def test_non_standard_block_fields_preserved() -> None:
+    # A block whose type isn't text/tool_use/thinking/redacted_thinking (e.g.
+    # server_tool_use, web_search_tool_result) must keep its fields on
+    # reconstruction, not collapse to a bare {type, index}. The sibling
+    # _reconstruct_anthropic_response already does this via dict(block).
+    parser = _Parser()
+    events = [
+        {"type": "message_start", "message": {"id": "msg_1", "model": "claude-opus-4"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "headroom proxy"},
+            },
+        },
+        {"type": "content_block_stop", "index": 0},
+    ]
+    sse = _build_sse(events)
+    response = parser._parse_sse_to_response(sse, "anthropic")
+    assert response is not None
+    block = response["content"][0]
+    assert block["type"] == "server_tool_use"
+    assert block["id"] == "srvtoolu_1"
+    assert block["name"] == "web_search"
+    assert block["input"] == {"query": "headroom proxy"}
+
+
 def test_signature_delta_preserved() -> None:
     parser = _Parser()
     events = [
@@ -294,6 +324,40 @@ def test_response_to_sse_emits_unknown_content_block_verbatim() -> None:
     assert not any(ev["type"] == "content_block_delta" for ev in events)
 
 
+def test_response_to_sse_tolerates_malformed_content_and_usage() -> None:
+    # `_response_to_sse` runs on provider/reconstruction-controlled JSON and is
+    # reached from a call site (anthropic.py buffered CCR path) that only catches
+    # ValueError, so a present-but-null `content`/`usage` or a non-dict block must
+    # not raise a TypeError/AttributeError that would 500 the streamed request.
+    # The sibling `_record_ccr_feedback_from_response` guards `content` the same
+    # way. Each of these once crashed the unguarded loop.
+    parser = _Parser()
+
+    for response in (
+        {"content": None, "usage": {"output_tokens": 5}},
+        {"content": "not-a-list"},
+        {"content": [None, {"type": "text", "text": "hi"}]},
+        {"content": [], "usage": None},
+    ):
+        sse_text = b"".join(parser._response_to_sse(response, "anthropic")).decode("utf-8")
+        # Always a well-formed envelope, regardless of the malformed body.
+        assert "event: message_start" in sse_text
+        assert "event: message_stop" in sse_text
+
+    # The one valid block alongside a null element is still rendered.
+    sse_text = b"".join(
+        parser._response_to_sse({"content": [None, {"type": "text", "text": "hi"}]}, "anthropic")
+    ).decode("utf-8")
+    events = _sse_events(sse_text)
+    text_deltas = [
+        ev
+        for ev in events
+        if ev["type"] == "content_block_delta" and ev["delta"].get("type") == "text_delta"
+    ]
+    assert len(text_deltas) == 1
+    assert text_deltas[0]["delta"]["text"] == "hi"
+
+
 def test_response_to_sse_emits_server_tool_use_without_delta() -> None:
     parser = _Parser()
     server_tool_use = {
@@ -469,3 +533,45 @@ def test_buffered_ccr_extended_thinking_round_trip_preserves_all_blocks() -> Non
     )
     assert round_tripped["content"][2]["type"] == "tool_use"
     assert round_tripped["content"][2]["input"] == {"y": 2}
+
+
+def test_server_tool_use_input_reassembled_from_partial_json() -> None:
+    # server_tool_use streams its input via input_json_delta exactly like
+    # tool_use: the content_block_start carries an empty input, the real args
+    # arrive as partial_json, and content_block_stop must parse them into an
+    # object. Gating the parse on type == "tool_use" left server_tool_use.input
+    # empty and leaked the `_partial_json` scratch key into replayed assistant
+    # history, which Anthropic rejects on the next turn (#2438).
+    parser = _Parser()
+    events = [
+        {"type": "message_start", "message": {"id": "msg_1", "model": "claude-opus-4"}},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"query": "hea'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": 'droom proxy"}'},
+        },
+        {"type": "content_block_stop", "index": 0},
+    ]
+    sse = _build_sse(events)
+    response = parser._parse_sse_to_response(sse, "anthropic")
+    assert response is not None
+    block = response["content"][0]
+    assert block["type"] == "server_tool_use"
+    assert block["input"] == {"query": "headroom proxy"}
+    # Scratch key must never leak into a block that gets replayed as history.
+    assert "_partial_json" not in block
