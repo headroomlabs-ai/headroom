@@ -6,12 +6,12 @@ Headroom provides explicit exceptions for debugging, with a safety guarantee tha
 
 ```python
 from headroom import (
-    HeadroomError,        # Base class - catch all Headroom errors
-    ConfigurationError,   # Invalid configuration
-    ProviderError,        # Provider issues (unknown model, etc.)
-    StorageError,         # Database/storage failures
-    CompressionError,     # Compression failures (rare)
-    ValidationError,      # Setup validation failures
+    HeadroomError,  # Base class - catch all Headroom errors
+    ConfigurationError,  # Invalid configuration
+    ProviderError,  # Provider issues (unknown model, etc.)
+    StorageError,  # Database/storage failures
+    CompressionError,  # Compression failures (rare)
+    ValidationError,  # Setup validation failures
 )
 ```
 
@@ -75,10 +75,7 @@ Raised for provider-specific issues.
 # - Token counting failure
 
 try:
-    response = client.chat.completions.create(
-        model="unknown-model-xyz",
-        messages=[...]
-    )
+    response = client.chat.completions.create(model="unknown-model-xyz", messages=[...])
 except ProviderError as e:
     print(f"Provider error: {e}")
     print(f"Provider: {e.details.get('provider')}")
@@ -122,10 +119,7 @@ Raised when setup validation fails.
 ```python
 result = client.validate_setup()
 if not result["valid"]:
-    raise ValidationError(
-        "Setup validation failed",
-        details={"issues": result["issues"]}
-    )
+    raise ValidationError("Setup validation failed", details={"issues": result["issues"]})
 ```
 
 ## Safety Guarantee
@@ -136,16 +130,11 @@ This is a core design principle. Your LLM calls never fail due to Headroom:
 
 ```python
 # Even if SmartCrusher encounters unexpected data:
-messages = [
-    {"role": "tool", "content": "malformed json {{{"}
-]
+messages = [{"role": "tool", "content": "malformed json {{{"}]
 
 # This will NOT raise an exception
 # Instead, the malformed content passes through unchanged
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=messages
-)
+response = client.chat.completions.create(model="gpt-4o", messages=messages)
 ```
 
 ## Logging Errors
@@ -154,6 +143,7 @@ Enable logging to see error details:
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.WARNING)
 
 # Now you'll see warnings when compression is skipped:
@@ -232,6 +222,7 @@ response = client.chat.completions.create(...)
 
 ```python
 import logging
+
 logging.basicConfig(level=logging.DEBUG)
 
 # Shows detailed transform decisions

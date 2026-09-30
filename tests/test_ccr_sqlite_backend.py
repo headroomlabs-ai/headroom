@@ -58,6 +58,79 @@ class TestSQLiteBackend:
         assert not b.exists("h1")
         assert not b.delete("h1")
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+    def test_db_file_is_private_under_permissive_umask(self, db_path):
+        """The CCR db (sensitive tool output) must be 0o600 under any umask.
+
+        ``_ensure_private`` creates the db with an explicit ``0o600`` mode
+        (``O_CREAT | O_EXCL``) before ``sqlite3.connect`` opens it, so it is
+        private from birth. Forcing ``umask(0o022)`` — which would make sqlite
+        create it 0o644 — confirms the mode is umask-independent.
+        """
+        old_umask = os.umask(0o022)
+        try:
+            SQLiteBackend(db_path)  # fresh open, private from birth
+        finally:
+            os.umask(old_umask)
+
+        assert db_path.exists()
+        assert (db_path.stat().st_mode & 0o777) == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX chmod semantics")
+    def test_open_fails_closed_when_db_cannot_be_made_private(self, db_path, monkeypatch):
+        """If an existing db cannot be narrowed, opening must abort (fail closed).
+
+        A store of raw tool output must not be opened world-readable, so
+        ``_ensure_private`` raises rather than silently proceeding to
+        ``sqlite3.connect`` on a db it could not make private.
+        """
+        import headroom.cache.backends.sqlite as sqlite_mod
+
+        db_path.write_text("")  # pre-existing regular db file
+
+        def boom(fd, mode):
+            raise PermissionError("cannot fchmod")
+
+        # The existing-file path narrows through the descriptor (fchmod), so a
+        # narrowing failure there must still abort the open.
+        monkeypatch.setattr(sqlite_mod.os, "fchmod", boom)
+        with pytest.raises(PermissionError):
+            SQLiteBackend(db_path)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+    def test_open_fails_closed_on_symlinked_db_path(self, tmp_path):
+        """A symlinked db path must be refused without following it.
+
+        If the db path is a symlink an attacker planted, ``_ensure_private``
+        must fail closed (O_NOFOLLOW) rather than chmod-ing and handing the
+        attacker-chosen target to ``sqlite3.connect``. The target must be left
+        untouched: neither narrowed nor opened/rewritten.
+        """
+        target = tmp_path / "attacker_target"
+        # Create the target with a deliberately wider mode via umask (not an
+        # explicit permissive chmod) so a chmod-follow regression would show up
+        # as a mode change, without the test itself performing a world-readable
+        # chmod that the security scanner flags as overly permissive.
+        old_umask = os.umask(0o022)
+        try:
+            target.write_text("SECRET-ORIGINAL")  # lands 0o644 under this umask
+        finally:
+            os.umask(old_umask)
+        before_mode = target.stat().st_mode & 0o777
+        assert before_mode != 0o600  # precondition: a narrow would be visible
+
+        link = tmp_path / "ccr_store.db"
+        link.symlink_to(target)
+
+        with pytest.raises(PermissionError):
+            SQLiteBackend(link)
+
+        # Target was neither narrowed (mode unchanged) nor opened/rewritten by
+        # sqlite (contents intact, no WAL/journal siblings created).
+        assert (target.stat().st_mode & 0o777) == before_mode
+        assert target.read_text() == "SECRET-ORIGINAL"
+        assert link.is_symlink()
+
     def test_survives_reopen(self, db_path):
         """The restart-survival property the default flip exists for."""
         SQLiteBackend(db_path).set("h1", make_entry())
@@ -85,6 +158,78 @@ class TestSQLiteBackend:
         assert stats["backend_type"] == "sqlite"
         assert stats["entry_count"] == 2
         assert stats["bytes_used"] > 0
+
+    def test_opening_a_db_with_the_old_index_drops_it_and_keeps_the_rows(self, db_path):
+        # Databases written before idx_ccr_expiry_deadline still carry the
+        # superseded idx_ccr_expiry; opening them must migrate, not fail.
+        seeded = SQLiteBackend(db_path)
+        seeded.set("h1", make_entry("h1"))
+        seeded._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ccr_expiry ON ccr_entries (created_at)"
+        )
+        seeded._conn.commit()
+        seeded._conn.close()
+
+        b = SQLiteBackend(db_path)
+        indexes = {
+            row[0]
+            for row in b._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
+            )
+        }
+        assert indexes == {"idx_ccr_expiry_deadline"}
+        entry = b.get("h1")
+        assert entry is not None
+        assert entry.original_content == make_entry("h1").original_content
+
+    def test_purge_expired_deletes_by_deadline_and_keeps_the_boundary_row(self, db_path):
+        b = SQLiteBackend(db_path)
+        now = time.time()
+        expired = make_entry("expired", ttl=10)
+        expired.created_at = now - 11
+        boundary = make_entry("boundary", ttl=10)
+        boundary.created_at = now - 10
+        live = make_entry("live", ttl=60)
+        live.created_at = now - 11
+
+        # Keep backend.set() from performing its opportunistic purge first.
+        b._last_purge = now
+        for entry in (expired, boundary, live):
+            b.set(entry.hash, entry)
+
+        assert b.purge_expired(now) == 1
+        assert set(b.keys()) == {"boundary", "live"}
+
+    def test_new_insert_purges_expired_sqlite_entry_without_decoding_live_payloads(
+        self, db_path, monkeypatch
+    ):
+        backend = SQLiteBackend(db_path)
+        store = CompressionStore(max_entries=4, backend=backend, enable_feedback=False)
+        expired_hash = store.store("expired original", "expired compact", ttl=10)
+        live_hash = store.store("live original", "live compact", ttl=60)
+        other_live_hash = store.store("other live original", "other live compact", ttl=60)
+
+        expired = backend.get(expired_hash)
+        assert expired is not None
+        expired.created_at = time.time() - 11
+        backend.set(expired_hash, expired)
+        # The setup stores above intentionally exercised the periodic purge and
+        # advanced its 60-second throttle. Make the insertion under test eligible
+        # to purge the row we only just backdated.
+        backend._last_purge = 0.0
+
+        monkeypatch.setattr(
+            backend,
+            "_entry_from_json",
+            lambda _raw: pytest.fail("new insertion decoded existing CCR payloads"),
+        )
+
+        new_hash = store.store("new original", "new compact", ttl=60)
+
+        assert not backend.exists(expired_hash)
+        assert backend.exists(live_hash)
+        assert backend.exists(other_live_hash)
+        assert backend.exists(new_hash)
 
     def test_clear(self, db_path):
         b = SQLiteBackend(db_path)

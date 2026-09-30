@@ -36,12 +36,79 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
         return True
     if isinstance(system, list):
         for block in system:
-            if isinstance(block, dict) and block.get("text", "").startswith(_STEERING_SENTINEL):
-                if block["text"] == text:
+            # Guard the text is a string before ``startswith``: a malformed
+            # client block (``{"type": "text", "text": null}``) would otherwise
+            # raise ``AttributeError`` here and 500 the request. The OpenAI chat
+            # sibling below already guards this exact case.
+            block_text = block.get("text") if isinstance(block, dict) else None
+            if isinstance(block_text, str) and block_text.startswith(_STEERING_SENTINEL):
+                if block_text == text:
                     return False
                 block["text"] = text
                 return True
         system.append({"type": "text", "text": text})
+        return True
+    return False
+
+
+def apply_openai_chat_verbosity_steering(
+    body: dict[str, Any],
+    level: int,
+) -> bool:
+    """Append or replace the steering block in an OpenAI chat/completions body.
+
+    OpenAI ``/v1/chat/completions`` carries the system prompt as a
+    ``role: "system"`` (or ``"developer"``) message inside ``messages`` rather
+    than a top-level field, so it needs its own injector (the Anthropic
+    ``system`` and Responses ``instructions`` variants do not reach it — the
+    root cause of GitHub Copilot CLI seeing zero output savings, #2302).
+
+    The block is appended to the tail of the last system/developer message so a
+    treatment conversation's steering stays byte-stable across turns (and
+    re-applies idempotently via the sentinel). When the request carries no
+    system message at all, one is inserted at the front. Returns True only when
+    the body actually changed.
+    """
+    text = steering_text(level)
+    if text is None:
+        return False
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    target: dict[str, Any] | None = None
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") in ("system", "developer"):
+            target = message
+    if target is None:
+        # No system prompt to append to — insert one carrying just the block.
+        messages.insert(0, {"role": "system", "content": text})
+        return True
+
+    content = target.get("content")
+    if content is None:
+        target["content"] = text
+        return True
+    if isinstance(content, str):
+        updated, changed = replace_or_append_steering_block(content, text)
+        if changed:
+            target["content"] = updated
+        return changed
+    if isinstance(content, list):
+        # OpenAI also accepts a content-part list ([{"type": "text", ...}]).
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and part["text"].startswith(_STEERING_SENTINEL)
+            ):
+                if part["text"] == text:
+                    return False
+                part["text"] = text
+                return True
+        content.append({"type": "text", "text": text})
         return True
     return False
 

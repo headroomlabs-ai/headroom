@@ -127,6 +127,9 @@ def test_eager_load_defers_kompress_regardless_of_cache_state(monkeypatch, cache
     router = _router_kompress_only()
     stub = _StubCompressor(cached=cache_state == "cached")
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+    # Artifact prefetch is files-only, but it still reaches the network — keep it
+    # out of this assertion so the test stays about the native-preload boundary.
+    monkeypatch.setattr(router, "_prefetch_kompress_artifacts_async", lambda _cfg: False)
 
     status = router.eager_load_compressors()
 
@@ -164,6 +167,7 @@ def test_non_kompress_warmups_continue_when_kompress_is_deferred(monkeypatch):
     router = _router_kompress_only()
     stub = _StubCompressor(cached=True)
     monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+    monkeypatch.setattr(router, "_prefetch_kompress_artifacts_async", lambda _cfg: False)
     monkeypatch.setattr("headroom.compression.detector._magika_available", lambda: True)
     monkeypatch.setattr("headroom.compression.detector._get_magika", lambda: object())
 
@@ -172,6 +176,74 @@ def test_non_kompress_warmups_continue_when_kompress_is_deferred(monkeypatch):
     assert status["kompress"] == "deferred"
     assert status["magika"] == "enabled"
     assert stub.preload_calls == []
+
+
+# ── Startup artifact prefetch (files only, never native init) ──────────────────
+# The cold-start cost #2001 left behind: the ~4-minute model download began on the
+# FIRST REQUEST, so every request in that window went silently uncompressed.
+# Prefetching FILES at startup is safe because it is plain huggingface_hub HTTP —
+# it never constructs an InferenceSession, which is the boundary that segfaults in
+# libarrow/jemalloc on RHEL/CentOS 7-family hosts (#1908).
+
+
+def test_eager_load_starts_artifact_prefetch_without_native_preload(monkeypatch):
+    router = _router_kompress_only()
+    stub = _StubCompressor(cached=False)
+    monkeypatch.setattr(router, "_get_kompress", lambda: stub)
+    prefetch_calls: list[object] = []
+    monkeypatch.setattr(
+        router,
+        "_prefetch_kompress_artifacts_async",
+        lambda cfg: (prefetch_calls.append(cfg), True)[1],
+    )
+
+    status = router.eager_load_compressors()
+
+    assert status["kompress_artifacts"] == "prefetching"
+    # The #2001 invariant still holds: no native preload on the startup path.
+    assert status["kompress"] == "deferred"
+    assert stub.preload_calls == []
+    assert len(prefetch_calls) == 1
+
+
+def test_prefetch_never_constructs_a_session_or_imports_transformers(monkeypatch):
+    """The safety property that makes startup prefetch legal at all."""
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+    requested: list[str] = []
+
+    def fake_local_first(repo_id, filename, *, allow_network=True):
+        requested.append(filename)
+        return f"/cache/{filename}"
+
+    monkeypatch.setattr(kc, "hf_hub_download_local_first", fake_local_first)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("prefetch must not build the model")
+
+    monkeypatch.setattr(kc, "_load_kompress", explode)
+    monkeypatch.setattr(kc, "_load_kompress_onnx", explode)
+
+    assert kc.prefetch_kompress_artifacts("org/model") is True
+    # Stops at the first candidate that resolves — the loader tries the same order.
+    assert requested == [kc._onnx_filename_candidates()[0]]
+
+
+def test_prefetch_reports_false_when_no_artifact_resolves(monkeypatch):
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+
+    def always_missing(repo_id, filename, *, allow_network=True):
+        raise OSError("not found")
+
+    monkeypatch.setattr(kc, "hf_hub_download_local_first", always_missing)
+
+    assert kc.prefetch_kompress_artifacts("org/model") is False
+
+
+def test_background_prefetch_is_noop_when_model_already_cached(monkeypatch):
+    monkeypatch.setattr(kc, "_kompress_cache", {"org/model": object()})
+    monkeypatch.setattr(kc, "is_kompress_available", lambda: True)
+
+    assert kc.ensure_background_prefetch("org/model") is False
 
 
 @pytest.mark.asyncio

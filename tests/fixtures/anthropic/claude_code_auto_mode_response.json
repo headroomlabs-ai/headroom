@@ -1,0 +1,20 @@
+{
+  "id": "msg_auto_001",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-test-20260924",
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_auto_001",
+      "name": "run_action",
+      "input": {"target": "sanitized-target"}
+    }
+  ],
+  "stop_reason": "tool_use",
+  "usage": {"input_tokens": 12, "output_tokens": 8},
+  "safeguard_results": {
+    "decision": "allow",
+    "tool_use_id": "toolu_auto_001"
+  }
+}

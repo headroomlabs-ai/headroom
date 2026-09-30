@@ -221,3 +221,45 @@ def test_experimental_read_keep_ratio_flag_and_gating(monkeypatch):
     assert r_on._experimental_compress_read("z" * 500) is None
     # sub-floor content never attempted
     assert r_on._experimental_compress_read("short") is None
+
+
+# --- directory-prefix fold: grep -rn across many distinct files ---
+from headroom.transforms.lossless_compaction import (  # noqa: E402
+    compact_lossless,
+    search_dir_heading,
+    search_dir_unheading,
+)
+
+
+def test_search_dir_fold_factors_directory_across_distinct_files() -> None:
+    # Sorted grep -rn output: same-dir files are consecutive, one match each, so
+    # the file-heading fold saves nothing but the shared directory repeats on
+    # every row. The dir fold factors it out — byte-losslessly.
+    grep = (
+        "\n".join(f"headroom/proxy/mod_{i:02d}.py:{i + 1}:    x = compress(p)" for i in range(12))
+        + "\n"
+    )
+    folded = compact_lossless(grep, "search")
+    assert len(folded) < len(grep)  # actually shrank (0% before this fold)
+    assert "headroom/proxy/" in folded  # directory factored to a header line
+    assert search_dir_unheading(folded) == grep  # exact byte round-trip
+    assert search_dir_unheading(search_dir_heading(grep)) == grep
+
+
+def test_search_dir_fold_roundtrips_mixed_and_passthrough() -> None:
+    mixed = (
+        "src/a/x.py:1:hit one\nsrc/a/y.py:2:hit two\n"
+        "== a plain banner ==\n"
+        "src/b/z.py:3:content with a colon: value\nnoslash.py:4:pathless row\n"
+    )
+    out = compact_lossless(mixed, "search")
+    assert search_dir_unheading(out) == mixed or search_unheading(out) == mixed or out == mixed
+
+
+def test_search_file_fold_still_wins_for_many_matches_one_file() -> None:
+    # Many matches in ONE file: the file fold is smaller, and compact_lossless
+    # keeps whichever candidate round-trips and is smallest.
+    grep = "\n".join(f"headroom/proxy/server.py:{i}:    line {i}" for i in range(1, 40)) + "\n"
+    out = compact_lossless(grep, "search")
+    assert len(out) < len(grep)
+    assert search_unheading(out) == grep

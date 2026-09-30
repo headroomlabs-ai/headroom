@@ -32,7 +32,7 @@ from .main import main
     "--codex",
     "codex_mode",
     is_flag=True,
-    help="Audit Codex transcripts instead (shell-based reads: cat/sed/rtk read). "
+    help="Audit Codex transcripts instead (shell-based reads: cat/sed/head). "
     "Default path becomes ~/.codex/sessions.",
 )
 def audit_reads_cmd(

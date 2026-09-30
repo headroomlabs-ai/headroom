@@ -149,3 +149,13 @@ lockfile_suffixes = [
 # show up in formatter / linter commits and carry no signal the LLM
 # needs to reason about.
 drop_whitespace_only_hunks = true
+
+# ─── Structured prose-field offload config ─────────────────────────
+#
+# Only detector-confirmed PlainText leaves above both floors are candidates.
+# The final marker-inclusive output must still be shorter than the leaf.
+
+[offload.prose_field]
+min_bytes = 256
+min_segments = 6
+target_ratio = 0.5
