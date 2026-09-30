@@ -17,7 +17,6 @@ import yaml
 from click.testing import CliRunner
 
 from headroom.cli.main import main
-from headroom.cli.wrap import _inject_rtk_instructions
 from headroom.providers.omp import (
     MANAGED_MARKER,
     backup_path,
@@ -186,7 +185,7 @@ def test_build_launch_env_passes_env_through_and_emits_display(omp_home: Path) -
 
 def test_wrap_omp_missing_binary_exits_with_install_hint(runner: CliRunner, omp_home: Path) -> None:
     with patch("headroom.cli.wrap.shutil.which", return_value=None):
-        result = runner.invoke(main, ["wrap", "omp", "--no-rtk"])
+        result = runner.invoke(main, ["wrap", "omp"])
 
     assert result.exit_code == 1
     assert "npm install -g @oh-my-pi/pi-coding-agent" in result.output
@@ -208,7 +207,7 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
         patch("headroom.cli.wrap.shutil.which", return_value="omp"),
         patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
     ):
-        result = runner.invoke(main, ["wrap", "omp", "--no-rtk", "--", "-p", "fix the bug"])
+        result = runner.invoke(main, ["wrap", "omp", "--", "-p", "fix the bug"])
 
     assert result.exit_code == 0, result.output
     assert captured["tool_label"] == "OMP"
@@ -226,33 +225,18 @@ def test_wrap_omp_happy_path_injects_before_launch(runner: CliRunner, omp_home: 
     assert f"models.yml: providers.anthropic.baseUrl={base_url}" in display
 
 
-def test_wrap_omp_no_rtk_skips_agents_md(runner: CliRunner, omp_home: Path, tmp_path: Path) -> None:
-    with (
-        patch("headroom.cli.wrap.shutil.which", return_value="omp"),
-        patch("headroom.cli.wrap._launch_tool"),
-    ):
-        result = runner.invoke(main, ["wrap", "omp", "--no-rtk"])
-
-    assert result.exit_code == 0, result.output
-    assert not (tmp_path / "AGENTS.md").exists()
-
-
-def test_wrap_omp_rtk_injects_into_cwd_agents_md(
-    runner: CliRunner, omp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_wrap_omp_does_not_write_agents_md(
+    runner: CliRunner, omp_home: Path, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("HEADROOM_CONTEXT_TOOL", "rtk")
-    monkeypatch.setenv("HEADROOM_RTK", "1")
+    """`wrap omp` redirects via models.yml only; it never authors AGENTS.md."""
     with (
         patch("headroom.cli.wrap.shutil.which", return_value="omp"),
         patch("headroom.cli.wrap._launch_tool"),
-        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=tmp_path / "rtk"),
     ):
         result = runner.invoke(main, ["wrap", "omp"])
 
     assert result.exit_code == 0, result.output
-    agents_md = tmp_path / "AGENTS.md"
-    assert agents_md.exists()
-    assert "headroom:rtk-instructions" in agents_md.read_text(encoding="utf-8")
+    assert not (tmp_path / "AGENTS.md").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -260,17 +244,10 @@ def test_wrap_omp_rtk_injects_into_cwd_agents_md(
 # ---------------------------------------------------------------------------
 
 
-def test_unwrap_omp_restored_and_cleans_agents_md(
-    runner: CliRunner, omp_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HEADROOM_RTK", "1")
+def test_unwrap_omp_restores_pristine_and_stops_proxy(runner: CliRunner, omp_home: Path) -> None:
     original = "providers:\n  anthropic:\n    apiKey: sk-user-secret\n"
     omp_home.write_bytes(original.encode("utf-8"))
     inject_models_override(8787, "proj")
-
-    agents_md = tmp_path / "AGENTS.md"
-    agents_md.write_text("# My project rules\n\nBe nice.\n", encoding="utf-8")
-    _inject_rtk_instructions(agents_md)
 
     stopped: list[int] = []
     with patch(
@@ -283,11 +260,6 @@ def test_unwrap_omp_restored_and_cleans_agents_md(
     assert "Restored pre-wrap models.yml" in result.output
     assert omp_home.read_bytes() == original.encode("utf-8")
     assert not backup_path(omp_home).exists()
-
-    # Only the marker-fenced rtk block is scrubbed; user content survives.
-    remaining = agents_md.read_text(encoding="utf-8")
-    assert "headroom:rtk-instructions" not in remaining
-    assert "Be nice." in remaining
 
     # A real restore (not a noop) attempts to stop the proxy on the given port.
     assert stopped == [8787]

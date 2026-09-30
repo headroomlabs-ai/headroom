@@ -1,8 +1,10 @@
 """Wrap CLI commands to run through Headroom proxy.
 
 Usage:
-    headroom wrap claude                    # Start proxy + context tool + claude
+    headroom wrap claude                    # Start proxy + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
+    headroom wrap vscode                    # Transparently proxy VS Code Copilot
+    headroom wrap vscode-claude             # Transparently proxy VS Code Claude Code
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
     headroom wrap openclaude                # Start proxy + OpenClaude
@@ -11,13 +13,13 @@ Usage:
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
-    headroom wrap claude --no-context-tool  # Without CLI context-tool setup
     headroom wrap claude --port 9999        # Custom proxy port
     headroom wrap claude -- --model opus    # Pass args to claude
 """
 
 from __future__ import annotations
 
+import atexit
 import errno
 import importlib.util
 import io
@@ -29,14 +31,21 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, MutableMapping
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
-from headroom._subprocess import pid_alive, run
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
+from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
+from headroom._subprocess import pid_alive, proc_identity, run
 
 # Fix Windows cp1252 encoding — box-drawing characters require UTF-8
 if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
@@ -57,6 +66,8 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
+from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
+from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
     _API_TOKEN_EXPIRES_AT_ENV_VAR,
@@ -71,23 +82,42 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
+    CONTEXT_1M_SUFFIX,
+    DEFAULT_1M_MODEL,
+    HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
     TOOL_SEARCH_DEFAULT,
     TOOL_SEARCH_ENV,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
+    claude_user_settings_path,
+    configure_vscode_claude_settings,
     detect_claude_code_version,
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
     remote_control_sibling_gate_note,
+    remove_vscode_claude_settings,
+    resolve_1m_model,
+    resolve_vscode_claude_model,
+    resolve_vscode_claude_model_for_instructions,
+    vscode_claude_proxy_url,
 )
 from headroom.providers.claude import (
     proxy_base_url as _claude_proxy_base_url,
 )
+from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
 from headroom.providers.codex.install import codex_uses_chatgpt_auth
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
+)
+from headroom.providers.copilot import (
+    configure_vscode_proxy_settings,
+    remove_vscode_proxy_settings,
+    vscode_proxy_url,
+    vscode_settings_path,
 )
 from headroom.providers.copilot import (
     copilot_model_from_args as _copilot_model_from_args_impl,
@@ -120,7 +150,12 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
-from headroom.providers.grok import build_launch_env as _build_grok_launch_env
+from headroom.providers.grok import (
+    DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
+)
+from headroom.providers.grok import (
+    build_launch_env as _build_grok_launch_env,
+)
 from headroom.providers.grok_build import render_setup_lines as _render_grok_build_setup_lines
 from headroom.providers.grok_build.config import (
     inject_grok_provider_config,
@@ -158,6 +193,8 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
+from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
 from headroom.providers.zcode import (
     detect_upstream as _detect_zcode_upstream,
 )
@@ -205,15 +242,76 @@ def _write_text(path: Path, content: str) -> None:
     fsutil.write_text(path, content)
 
 
+def _read_settings_for_write(path: Path) -> dict[str, Any]:
+    """Read a Claude settings file that is about to be mutated, or refuse to write.
+
+    Callers previously fell back to ``{}`` when the file existed but would not
+    parse, then wrote that back — turning a hand-edited typo or a transient read
+    error into total loss of the user's ``permissions``/``env``/``hooks``. Abort
+    instead, mirroring ``mcp_registry.claude._read_json_for_write``: a malformed
+    config is the user's to fix, and no Headroom feature is worth erasing it.
+
+    An **empty** file is the one safe exception and is treated as ``{}``: there
+    are no settings in it to lose, and refusing would strand the user behind a
+    file they cannot see anything wrong with. A zero-byte settings.json is also
+    the classic residue of an interrupted non-atomic write (the failure mode
+    :func:`headroom.fsutil.write_text` now prevents), so recovering from it is
+    exactly right. Anything non-empty that will not parse is treated as data.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = _read_text(path)
+    except OSError as exc:
+        raise click.ClickException(
+            f"could not read {path} ({exc}). Fix or move it, then re-run — "
+            "refusing to overwrite it and lose your settings."
+        ) from exc
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(
+            f"{path} is not valid JSON ({exc}). Fix or move it, then re-run — "
+            "refusing to overwrite it and lose your settings."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise click.ClickException(
+            f"{path} does not contain a JSON object. Fix or move it, then re-run."
+        )
+    return cast("dict[str, Any]", payload)
+
+
+def _claude_settings_env(path: Path) -> dict[str, object]:
+    """Read a Claude settings env block for preflight validation."""
+    env = _read_settings_for_write(path).get("env")
+    return dict(env) if isinstance(env, dict) else {}
+
+
+def _raise_on_claude_auth_conflict(
+    *,
+    user_settings_path: Path,
+    project_settings_path: Path,
+    project_local_settings_path: Path,
+    environ: dict[str, str],
+) -> None:
+    """Refuse an auth state Claude Code rejects before mutating wrap state."""
+    conflict = claude_auth_conflict_sources(
+        (str(user_settings_path), _claude_settings_env(user_settings_path)),
+        (str(project_settings_path), _claude_settings_env(project_settings_path)),
+        (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
+        ("shell environment", environ),
+    )
+    if conflict is not None:
+        raise click.ClickException(claude_auth_conflict_message(conflict))
+
+
 def _append_text(path: Path, content: str) -> None:
     """Append to a text file as UTF-8 without translating line endings."""
     fsutil.append_text(path, content)
 
 
-_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
-_CONTEXT_TOOL_RTK = "rtk"
-_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
-_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
 _AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "opencode"}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
@@ -222,13 +320,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 # Issue #746: Claude Code disables on-demand tool loading (deferral) when
 # ANTHROPIC_BASE_URL is a custom host and ENABLE_TOOL_SEARCH is unset, which
 # inflates the local context window by tens of K tokens. Setting the env var
-# when we launch Claude Code keeps deferral on. Default to "true" — defer the
-# MCP/system tools for maximum context savings, matching native first-party
-# behaviour (core built-ins like Read/Edit/Bash are never deferred by Claude
-# Code, so the agent loop is unaffected). The key/default are shared with
-# `init` and `install` via the Claude provider package to prevent drift.
+# when we launch Claude Code keeps deferral on. The generic default stays
+# "true" for non-Foundry sessions, while Foundry uses a dedicated compatibility
+# default of "false" because its upstream does not support the deferred-tool
+# shape. The key/defaults are shared with `init` and `install` via the Claude
+# provider package to prevent drift.
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
+_TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
 _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
@@ -237,23 +336,42 @@ _AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
 # ANTHROPIC_BASE_URL (the proxy) its `/model` picker selection does not survive,
 # so `--1m` forces the suffix via ANTHROPIC_MODEL on the launched process.
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
-_CONTEXT_1M_SUFFIX = "[1m]"
-# Only used when no model is otherwise selected (no ANTHROPIC_MODEL set). The
-# current default Opus; the suffix logic preserves any model the user did set.
-_DEFAULT_1M_MODEL = "claude-opus-4-8"
+# Private aliases preserve the standalone wrapper's existing test and import
+# surface while the provider runtime owns the 1M selection contract.
+_CONTEXT_1M_SUFFIX = CONTEXT_1M_SUFFIX
+_1M_MODEL_ENV = HEADROOM_1M_MODEL_ENV
+_DEFAULT_1M_MODEL = DEFAULT_1M_MODEL
 _OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
-def _resolve_1m_model(current: str | None) -> str:
-    """Return the model id that makes Claude Code request the 1M window (#1158).
+_resolve_1m_model = resolve_1m_model
 
-    Preserves a model the user already selected via ``ANTHROPIC_MODEL`` (only
-    appending the ``[1m]`` suffix when missing); falls back to the default Opus
-    when none is set. Idempotent — a value already ending in ``[1m]`` is
-    returned unchanged.
+
+def _apply_1m_to_claude_args(args: tuple[str, ...]) -> tuple[tuple[str, ...], str | None]:
+    """Add the ``[1m]`` suffix to an explicit ``--model`` in pass-through args.
+
+    Claude Code gives the ``--model`` CLI flag precedence over the
+    ``ANTHROPIC_MODEL`` env var, so when a user passes both ``--1m`` and
+    ``--model X`` the env-var suffix is silently shadowed and the session caps at
+    200k (#2915). Rewriting the flag's value the same way ``_resolve_1m_model``
+    rewrites the env var keeps ``--1m`` effective on the higher-precedence flag.
+
+    Handles ``--model VALUE`` and ``--model=VALUE`` (the first occurrence only, as
+    Claude Code honours the first). Idempotent via ``_resolve_1m_model``. Returns
+    ``(new_args, rewritten_value)``; ``rewritten_value`` is ``None`` when no
+    ``--model`` was present (the env-var path already covers that case).
     """
-    base = (current or "").strip() or _DEFAULT_1M_MODEL
-    return base if base.endswith(_CONTEXT_1M_SUFFIX) else f"{base}{_CONTEXT_1M_SUFFIX}"
+    out = list(args)
+    for i, arg in enumerate(out):
+        if arg == "--model" and i + 1 < len(out):
+            rewritten = _resolve_1m_model(out[i + 1])
+            out[i + 1] = rewritten
+            return tuple(out), rewritten
+        if arg.startswith("--model="):
+            rewritten = _resolve_1m_model(arg.split("=", 1)[1])
+            out[i] = f"--model={rewritten}"
+            return tuple(out), rewritten
+    return tuple(out), None
 
 
 def _normalize_tool_search_mode(value: str) -> str:
@@ -284,7 +402,8 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     1. explicit ``--tool-search`` flag — wins (the user asked for it on the CLI),
     2. a pre-existing ``ENABLE_TOOL_SEARCH`` in the environment — respected and
        left untouched (the user's own Claude Code knob),
-    3. the built-in default (``true``).
+    3. the built-in mode-specific default (``true`` normally, ``false`` on
+       Foundry).
 
     Returns the value written, or ``None`` when an existing environment value
     was deliberately left in place.
@@ -299,13 +418,64 @@ def _configure_tool_search_env(env: dict[str, str], flag_value: str | None) -> s
     existing = env.get(_TOOL_SEARCH_ENV)
     if existing is not None and existing.strip():
         return None
-    env[_TOOL_SEARCH_ENV] = _TOOL_SEARCH_DEFAULT
-    return _TOOL_SEARCH_DEFAULT
+    default = (
+        _TOOL_SEARCH_FOUNDRY_DEFAULT if env.get("CLAUDE_CODE_USE_FOUNDRY") else _TOOL_SEARCH_DEFAULT
+    )
+    env[_TOOL_SEARCH_ENV] = default
+    return default
 
 
 # ENABLE_TOOL_SEARCH modes that turn deferral OFF. Everything else Claude Code
 # accepts (true/1/yes/on/auto/auto:N) keeps on-demand tool loading active.
 _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
+
+
+# Reduce-at-source: CLI tools pad tool_result output with progress bars, pager
+# framing, funding/telemetry banners, and version nags — all zero-signal tokens
+# the agent never acts on. Setting conservative, SAFE env defaults in the
+# launched agent's environment makes those tools emit less AT THE SOURCE, so the
+# proxy never has to strip them. Only knobs that can't hide diffs, errors,
+# summaries, or search results are set here (no blanket --silent/--quiet).
+# Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
+_QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
+_QUIET_CLI_FALSY = {"0", "false", "no", "off"}
+# name -> value, injected only when the user has not already set it.
+_QUIET_CLI_DEFAULTS: dict[str, str] = {
+    "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
+    "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",  # drop the "new pip available" nag
+    "npm_config_fund": "false",  # drop the funding banner
+    "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
+    "npm_config_progress": "false",  # drop the install progress bar
+}
+
+
+def _quiet_cli_enabled() -> bool:
+    """Quiet-CLI source defaults are on unless HEADROOM_WRAP_QUIET is falsy."""
+    return os.environ.get(_QUIET_CLI_ENV, "").strip().lower() not in _QUIET_CLI_FALSY
+
+
+def _configure_quiet_cli_env(env: dict[str, str]) -> list[str]:
+    """Inject SAFE quiet-CLI defaults into ``env`` in place; return names set.
+
+    No-op when ``HEADROOM_WRAP_QUIET`` is falsy. A value the user already set
+    always wins (defaults are only filled when absent). ``PYTEST_ADDOPTS`` is
+    *augmented* with ``-q`` rather than clobbered, so an existing value survives.
+    Nothing RISKY (anything that could suppress diffs/errors/summaries/search
+    output) is ever set here.
+    """
+    if not _quiet_cli_enabled():
+        return []
+    written: list[str] = []
+    for name, value in _QUIET_CLI_DEFAULTS.items():
+        if name not in env:
+            env[name] = value
+            written.append(name)
+    existing = env.get("PYTEST_ADDOPTS", "")
+    if "-q" not in existing.split():
+        env["PYTEST_ADDOPTS"] = f"{existing} -q".strip()
+        written.append("PYTEST_ADDOPTS")
+    return written
 
 
 def _resolved_tool_search_mode(flag_value: str | None) -> str:
@@ -320,6 +490,8 @@ def _resolved_tool_search_mode(flag_value: str | None) -> str:
     existing = os.environ.get(_TOOL_SEARCH_ENV)
     if existing is not None:
         probe[_TOOL_SEARCH_ENV] = existing
+    if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
+        probe["CLAUDE_CODE_USE_FOUNDRY"] = os.environ["CLAUDE_CODE_USE_FOUNDRY"]
     written = _configure_tool_search_env(probe, flag_value)
     return written if written is not None else probe.get(_TOOL_SEARCH_ENV, "")
 
@@ -332,26 +504,6 @@ def _tool_search_mode_is_active(value: str) -> bool:
 def _live_wrap_module() -> Any:
     """Return the current live wrap module instance."""
     return cast(Any, sys.modules[__name__])
-
-
-def _selected_context_tool() -> str:
-    """Return the configured CLI context tool.
-
-    RTK remains the default for backward compatibility. Set
-    ``HEADROOM_CONTEXT_TOOL=lean-ctx`` to let lean-ctx configure the supported
-    coding agent instead.
-    """
-
-    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
-    if not raw:
-        return _CONTEXT_TOOL_RTK
-    if raw == "leanctx":
-        raw = _CONTEXT_TOOL_LEAN_CTX
-    if raw not in _VALID_CONTEXT_TOOLS:
-        raise click.ClickException(
-            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
-        )
-    return raw
 
 
 def _module_available(module_name: str) -> bool:
@@ -432,6 +584,22 @@ def _check_proxy(port: int) -> bool:
         return False
 
 
+def _foreign_listener(port: int) -> bool:
+    """True when something accepts TCP on ``port`` but is not a Headroom proxy.
+
+    ``_check_proxy`` is a bare TCP connect, so any service squatting the port
+    (observed: a caveman gateway on 8787) satisfies it. Only a ``/health``
+    payload that ``_is_headroom_health`` recognizes proves Headroom identity —
+    generic JSON such as ``{"status": "ok"}`` does not. A listener without it
+    must never be reused, restarted, or trusted as a live wrapped session.
+    """
+    if not _check_proxy(port):
+        return False
+    if _is_headroom_health(_query_proxy_health(port)):
+        return False
+    return _query_proxy_config(port) is None
+
+
 def _port_bind_error(port: int) -> OSError | None:
     """Return the bind error for a local proxy port, or None when it is usable."""
     try:
@@ -462,18 +630,31 @@ def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
     raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
-def _get_log_path() -> Path:
-    """Get path for proxy log file."""
+def _get_log_path(port: int | None = None) -> Path:
+    """Get path for the proxy runtime log file.
+
+    Per-port (``proxy-<port>.log``) so concurrent wrap sessions on different
+    ports do not rotate a single shared log away; the legacy ``proxy.log``
+    name is used when *port* is omitted.
+    """
     from headroom import paths as _paths
 
     log_dir = _paths.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "proxy.log"
+    return _paths.proxy_log_path(port)
 
 
-def _get_proxy_stdio_log_path() -> Path:
-    """Get path for dedicated proxy stdio capture."""
-    return _get_log_path().with_name("proxy-stdio.log")
+def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Get path for dedicated proxy stdio capture (per-port when *port* given).
+
+    The filename comes from :func:`headroom.paths.proxy_stdio_log_path` (the
+    single source of truth) while the directory comes from :func:`_get_log_path`,
+    so a caller (or test) that redirects the log directory via that helper
+    redirects the stdio capture with it.
+    """
+    from headroom import paths as _paths
+
+    return _get_log_path(port).with_name(_paths.proxy_stdio_log_path(port).name)
 
 
 def _start_proxy(
@@ -496,15 +677,24 @@ def _start_proxy(
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
-    Stdout and stderr are written to a dedicated sibling file, usually
-    `~/.headroom/logs/proxy-stdio.log`, to avoid pipe deadlock risk without
-    competing with the rotating `proxy.log` runtime log.
+    Stdout and stderr are written to a dedicated per-port sibling file,
+    `~/.headroom/logs/proxy-stdio-<port>.log`, to avoid pipe deadlock risk
+    without competing with the rotating `proxy-<port>.log` runtime log.
 
     The caller is responsible for ensuring *port* is available
     (see ``_find_available_port``).
     """
 
-    cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        str(port),
+        "--workers",
+        "1",
+    ]
 
     # Forward HEADROOM_MODE env var so the proxy respects the user's mode choice
     headroom_mode = os.environ.get("HEADROOM_MODE")
@@ -546,14 +736,27 @@ def _start_proxy(
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
-    log_path = _get_log_path()
-    stdio_log_path = _get_proxy_stdio_log_path()
+    log_path = _get_log_path(port)
+    stdio_log_path = _get_proxy_stdio_log_path(port)
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(proxy_env)
+    # A wrap-owned proxy must be a single authoritative process so its orphan
+    # watchdog can observe all activity before deciding to self-terminate.
+    proxy_env.pop("HEADROOM_WORKERS", None)
+    proxy_env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+    # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
+    # `wrap` from a directory that contains a `headroom/` folder (most commonly a
+    # clone of this repo, whose package lives at <root>/headroom/) shadows the
+    # installed wheel with the raw source tree, which has no compiled
+    # `headroom._core`. The proxy then dies with "No module named 'headroom._core'"
+    # and wrap silently falls back to launching the client unwrapped (#2793).
+    # PYTHONSAFEPATH disables that cwd prepend (Python 3.11+; a harmless no-op on
+    # 3.10) so the subprocess always resolves the installed package.
+    proxy_env["PYTHONSAFEPATH"] = "1"
     # Vertex AI RST_STREAMs HTTP/2 connections (error_code:2). Force HTTP/1.1
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
@@ -562,6 +765,12 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    # Mark the proxy as wrap-spawned so its orphan watchdog (proxy side) stops
+    # it once no live wrap clients remain. Standalone `headroom proxy` and
+    # persistent installs never get this flag and never self-exit. The proxy
+    # is detached (setsid / breakaway flags), so without this a crashed or
+    # killed wrapper leaks the proxy forever and later wraps silently reuse it.
+    proxy_env["HEADROOM_WRAP_OWNED"] = "1"
     savings_profile = _wrap_agent_savings_profile(agent_type)
     if savings_profile is not None:
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
@@ -665,36 +874,95 @@ def _start_proxy(
         stdio_log_file.close()
 
 
-def _rtk_opt_in() -> bool:
-    """Whether RTK CLI-command filtering was explicitly enabled.
+# CLI context tools (rtk, lean-ctx) were removed from Headroom. The selector is
+# kept only long enough to fail loudly: it lives in shell profiles, scripts and
+# CI jobs, and silently ignoring it would look like Headroom had stopped working.
+# See :mod:`headroom.context_tool_cleanup`, which uninstalls what they left behind.
+_RETIRED_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_RETIRED_CONTEXT_TOOL_MESSAGE = (
+    "CLI context tools (rtk, lean-ctx) have been removed from Headroom: they "
+    "rewrote shell commands through a third-party binary Headroom no longer "
+    "manages. Drop --context-tool / --no-context-tool and unset "
+    f"{_RETIRED_CONTEXT_TOOL_ENV}; `headroom wrap` uninstalls what they left "
+    "behind automatically."
+)
 
-    RTK is opt-in (off by default): turn it on with ``--rtk`` (which sets
-    ``HEADROOM_RTK=1``) or by exporting ``HEADROOM_RTK=1``. ``--no-rtk`` remains
-    accepted as a deprecated no-op.
+
+def _retired_context_tool_callback(ctx: Any, param: Any, value: str | None) -> str | None:
+    """Click eager callback: reject any surviving context-tool selection.
+
+    Also checks the env var (the callback runs on every wrap subcommand, flag
+    passed or not), so an exported ``HEADROOM_CONTEXT_TOOL`` fails with the same
+    message instead of silently doing nothing.
     """
-    return os.environ.get("HEADROOM_RTK", "").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _rtk_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
-    """Click eager callback: ``--rtk`` sets HEADROOM_RTK so the central RTK gate
-    (:func:`_rtk_opt_in`) sees the opt-in without threading a param through every
-    wrap subcommand."""
-    if value:
-        os.environ["HEADROOM_RTK"] = "1"
+    if value is not None or os.environ.get(_RETIRED_CONTEXT_TOOL_ENV, "").strip():
+        raise click.ClickException(_RETIRED_CONTEXT_TOOL_MESSAGE)
     return value
 
 
-# Shared opt-in flag applied to every ``wrap`` subcommand. ``expose_value=False``
-# so no subcommand signature changes; it works purely through HEADROOM_RTK.
-_rtk_option = click.option(
-    "--rtk",
-    is_flag=True,
-    default=False,
+# Applied to every ``wrap`` subcommand. ``expose_value=False`` so no subcommand
+# signature carries it; both spellings the flag ever had are accepted and
+# rejected with one message.
+_retired_context_tool_option = click.option(
+    "--context-tool",
+    "--no-context-tool",
+    default=None,
+    is_flag=False,
+    flag_value="",
+    metavar="TOOL",
     expose_value=False,
     is_eager=True,
-    callback=_rtk_flag_callback,
-    help="Enable RTK CLI-command filtering (opt-in; off by default). Also enabled by HEADROOM_RTK=1.",
+    hidden=True,
+    callback=_retired_context_tool_callback,
+    help="Removed: CLI context tools (rtk, lean-ctx) are no longer supported.",
 )
+
+
+def _should_purge_context_tools(ctx: click.Context) -> bool:
+    """Whether this invocation should run the retired-context-tool cleanup.
+
+    Two exemptions, both about not doing filesystem surgery from a command the
+    caller expects to be inert:
+
+    * ``wrap selfheal`` — runs from a SessionStart hook on every new
+      conversation, where rewriting ``~/.claude.json`` would race Claude Code's
+      own writer for no benefit.
+    * any ``--help`` invocation — help must stay read-only. Click resolves a
+      subcommand's help *after* this group callback, so it cannot be detected
+      from ``ctx``; scanning argv is blunt but correct, and a false positive only
+      defers the cleanup to the next real run.
+    """
+    if ctx.invoked_subcommand == "selfheal":
+        return False
+    return not any(arg in ("--help", "-h") for arg in sys.argv[1:])
+
+
+def _report_context_tool_purge() -> None:
+    """Uninstall leftover rtk / lean-ctx state, reporting anything removed.
+
+    Removing the integration code cannot help a machine that already ran the old
+    default: the Claude ``PreToolUse`` hook, the vendored binaries and the
+    injected hint-file guidance are all durable on disk. Running this once per
+    ``wrap`` / ``unwrap`` invocation is what actually makes the tools go away.
+    Silent when there is nothing to do — the common case once the machine-global
+    half is stamped done, though the project- and config-directory-scoped half
+    still runs every launch — and never fatal: a cleanup failure must not block
+    launching the tool.
+
+    Reports on **stderr**: some subcommands (``wrap/unwrap openclaw
+    --prepare-only``) emit machine-readable JSON on stdout as their entire
+    contract, and a human cleanup line prepended to it breaks every
+    ``json.loads(stdout)`` consumer on the one run that has something to remove.
+    """
+    from headroom.context_tool_cleanup import purge_context_tool_artifacts
+
+    try:
+        removed = purge_context_tool_artifacts()
+    except Exception as exc:  # pragma: no cover - defensive, cleanup is best-effort
+        click.echo(f"Warning: could not finish removing retired CLI context tools: {exc}", err=True)
+        return
+    for line in removed:
+        click.echo(f"Retired CLI context tool cleanup: {line}", err=True)
 
 
 def _serena_instructions_opt_in() -> bool:
@@ -727,7 +995,7 @@ def _serena_instructions_flag_callback(ctx: Any, param: Any, value: bool) -> boo
 # Shared opt-in flag for Serena instruction injection, applied to the wrap
 # subcommands that set up Serena. ``expose_value=False`` so no subcommand
 # signature changes; it works purely through HEADROOM_SERENA_INSTRUCTIONS. Same
-# approach as _rtk_option above — set via the callback with NO ``envvar=`` so the
+# approach as _code_memory_option below — set via the callback with NO ``envvar=`` so the
 # settings_store drift guard doesn't flag it.
 _serena_instructions_option = click.option(
     "--serena-instructions",
@@ -744,7 +1012,7 @@ _serena_instructions_option = click.option(
 # The code-memory MCP is Serena by default; turn it off with --code-memory none.
 # Selection flows through HEADROOM_CODE_MEMORY (set by the eager --code-memory
 # callback) so it works the same on every agent without threading a param
-# through each subcommand — the same approach as _rtk_option above.
+# through each subcommand — the same approach as _serena_instructions_option above.
 _CODE_MEMORY_ENV = "HEADROOM_CODE_MEMORY"
 _CODE_MEMORY_SERENA = "serena"
 _CODE_MEMORY_NONE = "none"
@@ -802,165 +1070,11 @@ _code_memory_option = click.option(
 )
 
 
-def _setup_rtk(verbose: bool = False) -> Path | None:
-    """Ensure rtk is installed and hooks are registered."""
-    if not _rtk_opt_in():
-        return None
-    from headroom.rtk import get_rtk_path
-    from headroom.rtk.installer import ensure_rtk, register_claude_hooks
-
-    rtk_path = get_rtk_path()
-
-    if rtk_path:
-        if verbose:
-            click.echo(f"  rtk found at {rtk_path}")
-    else:
-        click.echo("  Downloading rtk (Rust Token Killer)...")
-        rtk_path = ensure_rtk()
-        if rtk_path:
-            click.echo(f"  rtk installed at {rtk_path}")
-        else:
-            click.echo("  rtk download failed — continuing without it")
-            return None
-
-    # Register hooks (idempotent)
-    if register_claude_hooks(rtk_path):
-        if verbose:
-            click.echo("  rtk hooks registered in Claude Code")
-        try:
-            linked = _ensure_rtk_on_path(rtk_path)
-            if linked and verbose:
-                click.echo(f"  rtk linked onto PATH at {linked}")
-        except Exception as e:
-            if verbose:
-                click.echo(f"  rtk PATH link skipped: {e}")
-    else:
-        click.echo("  rtk hook registration failed — continuing without it")
-
-    return rtk_path
-
-
-def _ensure_rtk_on_path(rtk_path: Path, path_dirs: list[str] | None = None) -> Path | None:
-    """Make the Headroom-managed rtk resolvable as a bare ``rtk`` on PATH.
-
-    ``rtk init --global --auto-patch`` writes ``~/.claude/hooks/rtk-rewrite.sh``,
-    and ``rtk rewrite`` emits a bare ``rtk`` token at runtime that the hook feeds
-    back to the shell — so bare ``rtk`` has to resolve on PATH regardless of the
-    hook's contents. Since ``~/.headroom/bin`` (where Headroom installs rtk) is
-    not on PATH by default, that lookup fails and compression silently never
-    runs (issue #487).
-
-    An earlier fix rewrote the generated hook to hard-code rtk's absolute path.
-    That mutates the hook *after* ``rtk init`` bakes in its expected SHA-256, so
-    rtk's integrity guard rejects it (``hook integrity check FAILED … RTK will
-    not execute``) and only absolutizes the hook's own ``rtk`` call — not the
-    bare ``rtk`` that ``rtk rewrite`` emits at runtime (issue #1631). Instead,
-    leave the canonical hook untouched and link the managed binary into a PATH
-    directory so bare ``rtk`` resolves.
-
-    Idempotent and conservative:
-      * no-op if a ``rtk`` already resolves on PATH (managed or system);
-      * no-op on Windows (symlinks need privilege; hooks resolve differently);
-      * only creates/refreshes a symlink Headroom owns — never clobbers an
-        existing real file or foreign binary.
-
-    Returns the link path that was created or already correct, else ``None``.
-    """
-    if sys.platform == "win32":
-        return None
-
-    # A bare `rtk` already resolves — the hook will find it, nothing to do.
-    if shutil.which("rtk"):
-        return None
-
-    if path_dirs is None:
-        path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-
-    preferred = Path.home() / ".local" / "bin"
-
-    # Prefer ~/.local/bin (conventionally on PATH), then any other PATH dir.
-    ordered: list[Path] = []
-    if str(preferred) in path_dirs:
-        ordered.append(preferred)
-    for entry in path_dirs:
-        if not entry:
-            continue
-        candidate = Path(entry)
-        if candidate not in ordered:
-            ordered.append(candidate)
-
-    target = rtk_path.resolve()
-
-    for target_dir in ordered:
-        link = target_dir / "rtk"
-        try:
-            # Existing correct link — done.
-            if link.is_symlink() and link.resolve() == target:
-                return link
-            # Never clobber a real file or a link pointing elsewhere.
-            if link.exists() or link.is_symlink():
-                continue
-            # Create ~/.local/bin on demand; other PATH dirs must already exist.
-            if target_dir == preferred:
-                target_dir.mkdir(parents=True, exist_ok=True)
-            if not target_dir.is_dir() or not os.access(target_dir, os.W_OK):
-                continue
-            link.symlink_to(target)
-            return link
-        except OSError:
-            continue
-
-    return None
-
-
-def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
-    """Run lean-ctx agent setup for the requested coding tool."""
-
-    from headroom.lean_ctx import get_lean_ctx_path
-    from headroom.lean_ctx.installer import ensure_lean_ctx
-
-    lean_ctx = get_lean_ctx_path()
-    if not lean_ctx:
-        click.echo("  Downloading lean-ctx...")
-        lean_ctx = ensure_lean_ctx()
-    if not lean_ctx:
-        click.echo("  lean-ctx download failed — continuing without it")
-        return None
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="headroom-lean-ctx-") as setup_cwd:
-            # lean-ctx writes project-local files when initialized from a git
-            # checkout. Run from a non-project directory so setup is limited to
-            # home-scoped agent config such as ~/.codex or ~/.claude.
-            result = run(
-                [str(lean_ctx), "init", "--agent", agent],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=setup_cwd,
-            )
-    except Exception as e:
-        click.echo(f"  lean-ctx setup failed — continuing without it: {e}")
-        return None
-
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        suffix = f": {detail}" if detail else ""
-        click.echo(f"  lean-ctx setup failed — continuing without it{suffix}")
-        return None
-
-    if verbose:
-        detail = result.stdout.strip()
-        if detail:
-            click.echo(f"  lean-ctx configured for {agent}: {detail}")
-        else:
-            click.echo(f"  lean-ctx configured for {agent}")
-    return lean_ctx
-
-
 # Hook-command markers Headroom manages in Claude settings.json. unwrap drops
-# any hook entry whose command contains one of these.
-_HEADROOM_HOOK_MARKERS = ("rtk-rewrite", "headroom-init-claude")
+# any hook entry whose command contains one of these. (Retired rtk / lean-ctx
+# hooks are removed separately, by
+# headroom.context_tool_cleanup.purge_context_tool_artifacts.)
+_HEADROOM_HOOK_MARKERS = ("headroom-init-claude",)
 
 # Env vars Headroom's init/wrap inject into Claude settings.json; unwrap removes
 # them. ENABLE_TOOL_SEARCH keeps Claude Code's tool deferral on behind the proxy
@@ -973,16 +1087,14 @@ _HEADROOM_ENV_KEYS = ("ANTHROPIC_BASE_URL", "ENABLE_TOOL_SEARCH")
 _WRAP_SELFHEAL_HOOK_MARKER = "headroom-wrap-selfheal"
 
 
-def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
+def _remove_claude_managed_hooks(settings_path: Path | None = None) -> bool:
     """Remove Headroom-managed entries from Claude settings.json.
 
-    Reverses what ``headroom init claude`` and ``rtk init --auto-patch`` add:
+    Reverses what ``headroom init claude`` adds:
       * PreToolUse / SessionStart hooks whose command contains a Headroom marker
-        (``rtk-rewrite`` or ``headroom-init-claude``), and
+        (``headroom-init-claude``), and
       * the ``ANTHROPIC_BASE_URL`` proxy-routing env var.
-    Unrelated settings and user-authored hooks are left untouched. (Previously
-    this only matched ``rtk-rewrite`` and returned early when no hooks existed,
-    so init's env + hooks survived unwrap.)
+    Unrelated settings and user-authored hooks are left untouched.
     """
 
     path = settings_path or (Path.home() / ".claude" / "settings.json")
@@ -1131,6 +1243,235 @@ def _wrap_marker_path(settings_path: Path) -> Path:
     return settings_path.parent / ".headroom_wrap_marker.json"
 
 
+def _wrap_owners_path(settings_path: Path) -> Path:
+    """Sidecar recording which live wrap sessions own each settings env key.
+
+    Separate from ``.headroom_wrap_marker.json`` on purpose: that marker
+    describes a single writer and is consumed by doctor, unwrap and the
+    staleness checks. Concurrency ownership is additive state, so it lives in
+    its own file rather than changing a shape those readers depend on.
+    """
+    return settings_path.parent / ".headroom_wrap_owners.json"
+
+
+def _wrap_settings_lock(settings_path: Path) -> Any:
+    """Serialize settings read-modify-write across concurrent wrap sessions.
+
+    Writing the proxy URL into ``settings.local.json`` is a read-modify-write,
+    and several ``headroom wrap`` sessions in one project run it concurrently.
+    The write itself is atomic, so the file never tears -- but without this the
+    updates are still lost against each other (#3205).
+    """
+    from contextlib import nullcontext
+
+    lock_path = settings_path.parent / ".headroom_wrap_settings.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Matches _proxy_start_lock: a workspace that cannot hold lock state is
+        # degraded, not unusable.
+        return nullcontext()
+    return _locked_file(lock_file)
+
+
+@contextmanager
+def _locked_file(lock_file: Any) -> Any:
+    """Hold an exclusive OS lock on an already-open file for the block.
+
+    Shared by ``_proxy_start_lock`` and ``_wrap_settings_lock`` -- the two
+    differ only in which file they lock, and an OS-lock dance duplicated per
+    call site is one place for the platform branches to drift apart.
+    """
+    with lock_file:
+        if sys.platform == "win32":
+            import msvcrt
+
+            # msvcrt.locking operates on bytes from the current file position.
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.seek(0)
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            # LK_LOCK has implementation-dependent retry limits, and a holder
+            # may legitimately take longer than that (a proxy loading ML
+            # components), so use the non-blocking primitive in a loop.
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_wrap_owners(settings_path: Path) -> dict[str, Any]:
+    try:
+        rec = json.loads(_read_text(_wrap_owners_path(settings_path)))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def _write_wrap_owners(settings_path: Path, owners: dict[str, Any]) -> None:
+    target = _wrap_owners_path(settings_path)
+    try:
+        if not owners:
+            target.unlink(missing_ok=True)
+            return
+        _write_text(target, json.dumps(owners, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _live_holders(entry: Any, *, dead_ports: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+    """Holders in *entry* whose process is still provably alive.
+
+    Reuses the same conservative liveness the proxy-client markers use: a PID
+    that is gone, or that is now provably a different process, is dropped. Any
+    uncertainty keeps the holder, because dropping a live owner is what causes
+    a running session to be unrouted.
+
+    ``dead_ports`` additionally drops holders whose proxy port the caller has
+    *proven* dead. A wrapper process outlives its proxy after a hard reboot or
+    SIGKILL of the proxy alone, and such a holder routes nothing; left in place
+    it would block the #2221 self-heal from clearing a base_url that now points
+    at nothing.
+    """
+    if not isinstance(entry, dict):
+        return []
+    holders = entry.get("holders")
+    if not isinstance(holders, list):
+        return []
+    live: list[dict[str, Any]] = []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        pid = holder.get("pid")
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        if _identity_mismatch(holder.get("start_src"), holder.get("start_time"), pid):
+            continue
+        port = holder.get("port")
+        if isinstance(port, int) and port in dead_ports:
+            continue
+        live.append(holder)
+    return live
+
+
+def _self_holder(port: int | None) -> dict[str, Any]:
+    ident = _proc_identity(os.getpid())
+    return {
+        "pid": os.getpid(),
+        "start_src": ident[0] if ident else None,
+        "start_time": ident[1] if ident else None,
+        "port": port,
+    }
+
+
+def _claim_wrap_key(
+    settings_path: Path,
+    key: str,
+    current_value: str | None,
+    *,
+    port: int | None = None,
+) -> None:
+    """Register this process as an owner of *key*, recording the true original.
+
+    The first live owner records ``original``; later owners inherit it and are
+    flagged ``inherited`` so their exit knows the value they happened to
+    observe was not the pre-wrap one. Without that, a second wrap session
+    captures the *first session's* proxy URL as the value to restore, and puts
+    a dead proxy back into the file on exit (#3205).
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    live = _live_holders(entry)
+    inherited = bool(live) and isinstance(entry, dict) and "original" in entry
+    original = entry.get("original") if inherited and isinstance(entry, dict) else current_value
+    me = _self_holder(port)
+    me["inherited"] = inherited
+    live = [h for h in live if h.get("pid") != me["pid"]]
+    live.append(me)
+    owners[key] = {"original": original, "holders": live}
+    _write_wrap_owners(settings_path, owners)
+
+
+class _KeyRelease(NamedTuple):
+    """Outcome of dropping this process's claim on a settings env key."""
+
+    should_restore: bool
+    original: str | None
+    trust_caller: bool
+    survivor: dict[str, Any] | None
+
+
+def _release_wrap_key(
+    settings_path: Path,
+    key: str,
+    *,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
+) -> _KeyRelease:
+    """Drop this process's claim on *key*.
+
+    ``should_restore`` is False while another live wrap session still owns the
+    key -- restoring then silently unroutes a running session. ``force`` is for
+    ``unwrap``, where the user is explicitly asking for their settings back:
+    every claim is dropped and the restore happens regardless.
+
+    ``trust_caller`` says whether the caller's remembered ``previous`` is its
+    own first-hand observation of the pre-wrap value. True when there is no
+    owner record at all (unwrap of a pre-upgrade session, and the legacy
+    callers that pass the value directly), and when this process founded the
+    record. False for an inheriting holder -- it remembers the *first
+    session's* proxy URL, so honouring it writes a dead proxy back, the exact
+    bug #3205 is about -- and false for a caller with no claim of its own,
+    whose marker-derived value is second-hand where the record is not.
+
+    ``survivor`` is a still-live holder the caller can re-point the
+    single-slot wrap marker at, so an exiting session does not take the
+    surviving one's #2221 self-heal record with it.
+    """
+    owners = _read_wrap_owners(settings_path)
+    entry = owners.get(key)
+    if not isinstance(entry, dict):
+        return _KeyRelease(True, None, True, None)
+    me = os.getpid()
+    remaining = [h for h in _live_holders(entry, dead_ports=dead_ports) if h.get("pid") != me]
+    original = entry.get("original")
+    # Look this process's own claim up in the raw holder list, never the
+    # liveness-filtered one: the caller is by definition running, and its claim
+    # is what says whether the value it remembers is first-hand.
+    raw = entry.get("holders")
+    mine = (
+        next((h for h in raw if isinstance(h, dict) and h.get("pid") == me), None)
+        if isinstance(raw, list)
+        else None
+    )
+    trust_caller = mine is not None and not mine.get("inherited")
+    if remaining and not force:
+        owners[key] = {"original": original, "holders": remaining}
+        _write_wrap_owners(settings_path, owners)
+        return _KeyRelease(False, original, trust_caller, remaining[0])
+    owners.pop(key, None)
+    _write_wrap_owners(settings_path, owners)
+    return _KeyRelease(True, original, trust_caller, None)
+
+
 def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: str | None) -> None:
     """Best-effort record of which (pid, port, key) wrote the base_url entry.
 
@@ -1149,6 +1490,53 @@ def _write_wrap_marker(settings_path: Path, *, port: int, key: str, previous: st
             "previous": previous,
         }
         _write_text(_wrap_marker_path(settings_path), json.dumps(payload))
+    except OSError:
+        pass
+
+
+def _rehome_wrap_marker(
+    settings_path: Path,
+    *,
+    key: str,
+    survivor: dict[str, Any] | None,
+    original: str | None,
+) -> None:
+    """Hand this session's wrap marker to a session that is still running.
+
+    The marker has one slot and the last writer wins it. When that writer exits
+    while a sibling still owns the key, leaving the marker describes a dead
+    process, and deleting it strips the survivor of the #2221 dead-proxy
+    self-heal record. Rewrite it to describe the survivor instead, carrying the
+    owner record's ``original`` as the value to restore -- the marker's own
+    ``previous`` may be an earlier session's proxy URL (#3205).
+
+    Only ever touches a marker this process wrote; a sibling's marker is
+    already accurate.
+    """
+    marker_path = _wrap_marker_path(settings_path)
+    marker = _read_wrap_marker(settings_path)
+    if marker is None or marker.get("key") != key or marker.get("pid") != os.getpid():
+        return
+    port = survivor.get("port") if survivor is not None else None
+    try:
+        if survivor is None or not isinstance(port, int):
+            # No survivor to hand it to, or one whose port we never recorded:
+            # a marker without a usable port is worse than none.
+            marker_path.unlink(missing_ok=True)
+            return
+        _write_text(
+            marker_path,
+            json.dumps(
+                {
+                    "pid": survivor.get("pid"),
+                    "start_src": survivor.get("start_src"),
+                    "start_time": survivor.get("start_time"),
+                    "port": port,
+                    "key": key,
+                    "previous": original,
+                }
+            ),
+        )
     except OSError:
         pass
 
@@ -1266,7 +1654,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         # is a live session (never cleared); only a port that fails the whole
         # retry window is dead. One probe here — no correlated double check.
         if _wrap_proxy_alive(port):
-            return None
+            if not _foreign_listener(port):
+                return None
+            if not _wrap_marker_is_stale(marker):
+                # The port answers but not as Headroom, yet the wrapper that
+                # wrote the marker is still alive — leave its claim alone.
+                return None
+            # A foreign service took the dead proxy's port: TCP-alive
+            # is a false liveness signal, and the writer PID is gone. Treat
+            # the marker as dead and restore below.
     elif not _wrap_marker_is_stale(marker):
         # No recorded port → fall back to PID-based staleness.
         return None
@@ -1276,7 +1672,15 @@ def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str |
         f"running (issue #2221); restoring prior value",
         err=True,
     )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=key,
+        # The wrapper process can outlive its proxy (the proxy alone was
+        # SIGKILLed). Its ownership claim would otherwise veto this restore and
+        # leave the base_url pointing at a port proven dead just above (#3205).
+        dead_ports=frozenset({port}) if isinstance(port, int) else frozenset(),
+    )
     return previous
 
 
@@ -1296,14 +1700,40 @@ def _selfheal_dead_wrap_base_url() -> None:
     """
     try:
         settings_path = Path.cwd() / ".claude" / "settings.local.json"
+        marker_before = _read_wrap_marker(settings_path)
         for key in (
             _claude_wrap_base_url_env_key(),
             _claude_wrap_base_url_env_key(foundry_mode=True),
             _claude_wrap_base_url_env_key(vertex_mode=True),
         ):
             _check_and_clear_dead_wrap_marker(settings_path, key=key)
+        # The prior value a clear restores may itself be None, so detect the
+        # clear by the marker changing rather than by the return value.
+        if marker_before is not None and _read_wrap_marker(settings_path) != marker_before:
+            _warn_live_proxy_after_selfheal(marker_before)
     except Exception:  # noqa: BLE001 - hook must never break session startup
         pass
+
+
+def _warn_live_proxy_after_selfheal(dead_marker: dict[str, Any] | None) -> None:
+    """After clearing a dead wrap route, point at a live proxy if one exists.
+
+    Deliberately warn-only: repointing settings at another session's proxy
+    would silently adopt a proxy this project never chose (different backend,
+    mode, or owner). The message names the exact command instead.
+    """
+    from headroom.cli.port_discovery import find_live_proxy_elsewhere
+
+    dead_port = dead_marker.get("port") if isinstance(dead_marker, dict) else None
+    requested = dead_port if isinstance(dead_port, int) else 8787
+    live = find_live_proxy_elsewhere(requested)
+    if live is None:
+        return
+    click.echo(
+        f"headroom: a Headroom proxy is running on port {live}; route this project "
+        f"through it with: headroom wrap claude --port {live}",
+        err=True,
+    )
 
 
 def _wrap_selfheal_hook_command() -> str:
@@ -1325,43 +1755,34 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
     with a SessionStart hook that runs the hidden ``wrap selfheal`` command.
     SessionStart ONLY (never PreToolUse): the self-heal must not run per Bash
     call mid-session, where a transient probe blip could clear a live session.
-    Idempotent — an existing entry carrying the marker is not duplicated.
+    Idempotent — an existing entry carrying the marker is not duplicated; if its
+    command drifted (hand edit, moved headroom binary) it is rewritten in place.
     """
-    payload: dict[str, Any] = {}
-    if settings_path.exists():
-        try:
-            payload = json.loads(_read_text(settings_path))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+    payload = _read_settings_for_write(settings_path)
     hooks = dict(payload.get("hooks") or {}) if isinstance(payload.get("hooks"), dict) else {}
     entries = (
         list(hooks.get("SessionStart") or []) if isinstance(hooks.get("SessionStart"), list) else []
     )
-    already = any(
-        isinstance(entry, dict)
-        and isinstance(entry.get("hooks"), list)
-        and any(
-            isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
-            for item in entry["hooks"]
-        )
+    command = _wrap_selfheal_hook_command()
+    marked = [
+        item
         for entry in entries
-    )
-    if already:
-        return
-    entries.append(
-        {
-            "matcher": "startup|resume",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": _wrap_selfheal_hook_command(),
-                    "timeout": 10,
-                }
-            ],
-        }
-    )
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+        for item in entry["hooks"]
+        if isinstance(item, dict) and _WRAP_SELFHEAL_HOOK_MARKER in str(item.get("command", ""))
+    ]
+    if marked:
+        if all(item.get("command") == command for item in marked):
+            return
+        for item in marked:
+            item["command"] = command
+    else:
+        entries.append(
+            {
+                "matcher": "startup|resume",
+                "hooks": [{"type": "command", "command": command, "timeout": 10}],
+            }
+        )
     hooks["SessionStart"] = entries
     payload["hooks"] = hooks
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1371,7 +1792,7 @@ def _ensure_claude_wrap_selfheal_hook(settings_path: Path) -> None:
 def _remove_claude_wrap_selfheal_hook(settings_path: Path) -> bool:
     """Remove the SessionStart self-heal hook that ``wrap claude`` installed (#2221).
 
-    Mirrors ``_remove_claude_rtk_hooks`` but matches only the wrap self-heal
+    Mirrors ``_remove_claude_managed_hooks`` but matches only the wrap self-heal
     marker in the project-local settings.local.json. Returns True if anything
     was removed. Unrelated hooks and user-authored entries are left untouched.
     """
@@ -1449,24 +1870,54 @@ def _write_claude_wrap_base_url(
     detected and self-healed (issue #1768).
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
-    payload: dict[str, Any] = {}
-    if path.exists():
-        try:
-            payload = json.loads(_read_text(path))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
     key = _claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
-    previous = env_map.get(key)
-    env_map[key] = proxy_url
-    payload["env"] = env_map
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_text(path, json.dumps(payload, indent=2) + "\n")
-    if port is not None:
-        _write_wrap_marker(path, port=port, key=key, previous=previous)
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(key)
+        # Claim before writing, so the recorded original is the value that was
+        # there before *any* wrap session touched it -- not the previous
+        # session's proxy URL (#3205).
+        _claim_wrap_key(path, key, previous, port=port)
+        env_map[key] = proxy_url
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+        if port is not None:
+            _write_wrap_marker(path, port=port, key=key, previous=previous)
     return previous
+
+
+def _write_claude_wrap_tool_search(value: str, *, settings_path: Path | None = None) -> str | None:
+    """Persist the resolved tool-search mode for daemon-spawned workers.
+
+    Claude Code workers read project settings afresh rather than inheriting
+    the parent process environment (#2492). Keep this separate from the proxy
+    URL crash marker: a stale tool-search mode cannot route traffic to a dead
+    process, and is restored transactionally when the wrap session exits.
+    """
+    path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _wrap_settings_lock(path):
+        payload = _read_settings_for_write(path)
+        env_map = dict(payload.get("env") or {}) if isinstance(payload.get("env"), dict) else {}
+        previous = env_map.get(_TOOL_SEARCH_ENV)
+        _claim_wrap_key(path, _TOOL_SEARCH_ENV, previous)
+        env_map[_TOOL_SEARCH_ENV] = value
+        payload["env"] = env_map
+        _write_text(path, json.dumps(payload, indent=2) + "\n")
+    return previous
+
+
+def _restore_claude_wrap_tool_search(
+    previous: str | None, *, settings_path: Path | None = None
+) -> None:
+    """Restore the project-local tool-search value written for this session."""
+    _restore_claude_wrap_base_url(
+        previous,
+        settings_path=settings_path,
+        _key_override=_TOOL_SEARCH_ENV,
+    )
 
 
 def _restore_claude_wrap_base_url(
@@ -1476,6 +1927,8 @@ def _restore_claude_wrap_base_url(
     vertex_mode: bool = False,
     settings_path: Path | None = None,
     _key_override: str | None = None,
+    force: bool = False,
+    dead_ports: frozenset[int] = frozenset(),
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -1484,40 +1937,63 @@ def _restore_claude_wrap_base_url(
     ``previous`` is None the key is removed; when it has a value it is
     restored — preserving any URL the project already had set. Also clears
     this key's sidecar wrap marker, if any (issue #1768).
+
+    Concurrency (#3205): while another live wrap session still owns the key,
+    this is a no-op — restoring underneath a running session unroutes it. Set
+    ``force`` when the user has explicitly asked for their settings back
+    (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
+    holders that outlived their proxy stop counting as live.
     """
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    if not path.exists():
-        _clear_wrap_marker(path, key=key)
-        return
-    try:
-        payload = json.loads(_read_text(path))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict):
-        return
-    env_map = payload.get("env")
-    if not isinstance(env_map, dict):
-        return
-    if previous is None:
-        if key not in env_map:
+    with _wrap_settings_lock(path):
+        # Another live wrap session in this project may still be using the key.
+        # Restoring underneath it silently unroutes a running session -- traffic
+        # bypasses the proxy with no error anywhere (#3205).
+        release = _release_wrap_key(path, key, force=force, dead_ports=dead_ports)
+        if not release.should_restore:
+            # The value stays, but this session's marker must not linger
+            # describing a process that is gone: hand the slot to a survivor.
+            _rehome_wrap_marker(path, key=key, survivor=release.survivor, original=release.original)
+            return
+        # The owner record holds the value from before *any* wrap session wrote.
+        # Prefer the caller's own value only when the caller observed it
+        # first-hand; a session that started second remembers the first
+        # session's (now dead) proxy URL, and so does the marker an unwrap or a
+        # self-heal reads it from.
+        restore_to = previous if release.trust_caller else release.original
+
+        if not path.exists():
             _clear_wrap_marker(path, key=key)
             return
-        del env_map[key]
-        if env_map:
-            payload["env"] = env_map
+        try:
+            payload = json.loads(_read_text(path))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        env_map = payload.get("env")
+        if not isinstance(env_map, dict):
+            return
+        if restore_to is None:
+            if key not in env_map:
+                _clear_wrap_marker(path, key=key)
+                return
+            del env_map[key]
+            if env_map:
+                payload["env"] = env_map
+            else:
+                payload.pop("env", None)
         else:
-            payload.pop("env", None)
-    else:
-        env_map[key] = previous
-        payload["env"] = env_map
-    if payload:
-        _write_text(path, json.dumps(payload, indent=2) + "\n")
-    else:
-        path.unlink(missing_ok=True)
-    _clear_wrap_marker(path, key=key)
+            env_map[key] = restore_to
+            payload["env"] = env_map
+        if payload:
+            _write_text(path, json.dumps(payload, indent=2) + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        _clear_wrap_marker(path, key=key)
 
 
 def _setup_headroom_mcp(
@@ -1559,43 +2035,84 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
     """Disable Serena's browser dashboard auto-open in ``~/.serena/serena_config.yml``.
 
     Serena opens its web dashboard in a browser tab on launch by default
-    (``web_dashboard_open_on_launch: true``). Since Headroom now registers Serena
-    as the default code-memory MCP, flip that setting off so wrapped sessions
-    don't spawn a browser tab. The dashboard backend still runs and stays
-    reachable at http://localhost:24282/dashboard/. The setting lives in Serena's
-    own config (authoritative, unlike a startup flag); other keys and comments are
-    preserved via a targeted line edit rather than a YAML rewrite.
+    (``web_dashboard_open_on_launch: true``), so flip that off for users who run
+    Serena outside Headroom. The dashboard backend still runs and stays reachable
+    at http://localhost:24282/dashboard/. Other keys and comments are preserved
+    via a targeted line edit rather than a YAML rewrite.
+
+    **Never creates the file.** Verified against Serena 1.6.2.dev0
+    (``serena/config/serena_config.py``): Serena autogenerates its own complete
+    config only when the path does *not* exist (``if not
+    os.path.exists(config_file_path): cls._generate_config_file(...)``, ~line
+    1033). Once any file exists it validates instead of filling gaps, and while
+    every other field falls back to a dataclass default via
+    ``get_value_or_default``, a missing ``projects`` key is fatal (~line 1064):
+
+        SerenaConfigError: `projects` key not found in Serena configuration.
+
+    So Headroom writing its own bootstrap file bricked Serena on every machine
+    without a pre-existing config — the MCP server died mid-handshake ("connection
+    closed: initialize response" on Codex, bare ``MCP error -32000`` on OpenCode)
+    and ``serena project index`` failed identically (#2674). Letting Serena
+    generate the file is immune to Serena adding required keys later; guessing the
+    schema is what caused the outage.
+
+    Suppressing the popup does not need this file anyway: ``build_serena_spec``
+    passes ``--open-web-dashboard False``, which Serena applies *after* loading
+    the config (``serena/mcp.py:361`` — ``config.web_dashboard_open_on_launch =
+    open_web_dashboard``), so the flag wins regardless of what is on disk.
+
+    ``projects: []`` is still backfilled into an *existing* file, to repair
+    configs an affected Headroom version already wrote.
     """
     import re
 
     cfg = Path.home() / ".serena" / "serena_config.yml"
     key = "web_dashboard_open_on_launch"
+    if not cfg.exists():
+        # Let Serena bootstrap its own valid config; the MCP flag handles the popup.
+        if verbose:
+            click.echo("  Serena: no serena_config.yml yet — letting Serena generate it")
+        return
     try:
-        if cfg.exists():
-            text = cfg.read_text(encoding="utf-8")
-            pattern = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
-            if pattern.search(text):
-                new = pattern.sub(rf"\g<1>{key}: false", text)
-            else:
-                new = text.rstrip("\n") + f"\n{key}: false\n"
-            if new != text:
-                cfg.write_text(new, encoding="utf-8")
-                if verbose:
-                    click.echo("  Serena: disabled dashboard browser auto-open (serena_config.yml)")
-        else:
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            # Serena fills defaults for any keys we omit, so a single-key file is valid.
-            cfg.write_text(f"{key}: false\n", encoding="utf-8")
-            if verbose:
-                click.echo("  Serena: created serena_config.yml with dashboard auto-open off")
+        text = cfg.read_text(encoding="utf-8")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not read serena_config.yml ({e})")
+        return
+
+    new = text
+    appended: list[str] = []
+
+    dashboard = re.compile(rf"^(\s*){re.escape(key)}:\s*\S+\s*$", re.MULTILINE)
+    if dashboard.search(new):
+        new = dashboard.sub(rf"\g<1>{key}: false", new)
+    else:
+        appended.append(f"{key}: false")
+
+    # Repair a config left by an affected Headroom version (see #2674 above).
+    if not re.search(r"^\s*projects\s*:", new, re.MULTILINE):
+        appended.append("projects: []")
+
+    if appended:
+        body = new.rstrip("\n")
+        new = (f"{body}\n" if body.strip() else "") + "\n".join(appended) + "\n"
+
+    if new == text:
+        return
+    try:
+        cfg.write_text(new, encoding="utf-8")
     except OSError as e:
         if verbose:
             click.echo(f"  Serena: could not update serena_config.yml ({e})")
+        return
+    if verbose:
+        click.echo("  Serena: updated serena_config.yml (dashboard auto-open off)")
 
 
 # Marker-fenced guidance steering the agent toward Serena's symbol tools.
-# Injected only when Serena is the active code-memory engine. Mirrors the RTK
-# instruction block (idempotent, marker-guarded).
+# Injected only when Serena is the active code-memory engine (idempotent,
+# marker-guarded).
 _SERENA_MARKER = "<!-- headroom:serena-instructions -->"
 
 SERENA_INSTRUCTIONS_BLOCK = """\
@@ -1619,73 +2136,6 @@ Reach for a symbol tool first; fall back to reading a whole file only when the
 symbol view does not answer the question.
 <!-- /headroom:serena-instructions -->
 """
-
-# Ext → Serena language key. Values match the ``Language`` enum in Serena's
-# solidlsp ``ls_config`` (the same keys accepted by ``.serena/project.yml``'s
-# ``languages`` list). Only real programming languages are mapped — data/markup
-# formats (json/yaml/toml/md/html/css) are intentionally skipped so Serena does
-# not spin up language servers that add no symbol-navigation value.
-_EXT_TO_SERENA_LANGUAGE: dict[str, str] = {
-    ".py": "python",
-    ".pyi": "python",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".mts": "typescript",
-    ".cts": "typescript",
-    ".js": "typescript",
-    ".jsx": "typescript",
-    ".mjs": "typescript",
-    ".cjs": "typescript",
-    ".go": "go",
-    ".rs": "rust",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".kts": "kotlin",
-    ".rb": "ruby",
-    ".erb": "ruby",
-    ".cs": "csharp",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".c++": "cpp",
-    ".hpp": "cpp",
-    ".hh": "cpp",
-    ".hxx": "cpp",
-    ".c": "cpp",
-    ".h": "cpp",
-    ".php": "php",
-    ".swift": "swift",
-    ".dart": "dart",
-    ".scala": "scala",
-    ".sbt": "scala",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".lua": "lua",
-    ".r": "r",
-    ".pl": "perl",
-    ".pm": "perl",
-    ".ex": "elixir",
-    ".exs": "elixir",
-    ".clj": "clojure",
-    ".cljs": "clojure",
-    ".cljc": "clojure",
-    ".elm": "elm",
-    ".tf": "terraform",
-    ".tfvars": "terraform",
-    ".zig": "zig",
-    ".nix": "nix",
-    ".hs": "haskell",
-    ".jl": "julia",
-    ".sol": "solidity",
-    ".vue": "vue",
-    ".svelte": "svelte",
-}
-
-# Directories never worth scanning for language detection (VCS, dependencies,
-# build output, virtualenvs, caches). Pruned in-place during the walk.
-_LANG_SCAN_IGNORE_DIRS = frozenset(
-    {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
-)
 
 
 def _serena_instruction_file(registrar: Any) -> Path:
@@ -1727,108 +2177,268 @@ def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
     return True
 
 
-def _detect_repo_languages(root: Path) -> list[str]:
-    """Detect the Serena languages present under *root* by file extension.
+def _serena_project_skip_reason(root: Path) -> str | None:
+    """Why Serena's per-project setup must not run for *root* (None = proceed).
 
-    Returns the mapped Serena language keys ordered by file count (most common
-    first — Serena treats the first entry as the default/fallback language
-    server), with ties broken alphabetically for determinism. Dependency,
-    build, VCS, and cache directories are pruned from the walk.
+    ``$HOME`` is never a project: scanning it walks every unrelated tree
+    (Downloads, VM images, network mounts) and would write ``project.yml`` into
+    Serena's own ``~/.serena`` config directory. A linked git worktree (its
+    top-level ``.git`` is a file, not a directory) is an ephemeral checkout that
+    would pay for its own index at a path that soon disappears.
+
+    A project with no ``.serena/project.yml`` is skipped because the pre-index
+    cannot succeed there (#2938). ``serena project index`` auto-creates the file
+    when it is missing, and that auto-creation calls
+    ``ProjectConfig.autogenerate(interactive=True)``, which asks one ``[y/N]``
+    question per additionally-detected language server. The CLI has no
+    non-interactive switch; the only way to reach the silent branch is to pass
+    ``--ls/--language`` explicitly, which means Headroom guessing the project's
+    languages again — exactly the hand-maintained map removed below. Serena's
+    MCP server generates that file itself (non-interactively) on first start and
+    indexes lazily on demand, so the pre-index simply resumes from the next
+    wrap onwards.
     """
-    counts: dict[str, int] = {}
-    for _dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _LANG_SCAN_IGNORE_DIRS]
-        for filename in filenames:
-            lang = _EXT_TO_SERENA_LANGUAGE.get(Path(filename).suffix.lower())
-            if lang is not None:
-                counts[lang] = counts.get(lang, 0) + 1
-    return [lang for lang, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
-
-
-def _scope_serena_languages(*, verbose: bool = False) -> None:
-    """Pin the repo's languages into ``.serena/project.yml`` (best-effort).
-
-    Scoping the LSP to the languages actually present keeps Serena from
-    starting unnecessary language servers. Runs before indexing so
-    ``serena project index`` respects the scope. Writes the ``languages`` key as
-    a YAML flow list (the format Serena's own project template uses) via a
-    targeted line edit — mirroring :func:`_ensure_serena_dashboard_disabled` —
-    and creates a minimal ``project.yml`` (``project_name`` + ``languages``, the
-    only fields Serena requires) when absent. An existing block-style or
-    otherwise unexpected ``languages`` entry is left untouched rather than risk
-    corrupting the file. Non-fatal on any I/O error.
-    """
-    languages = _detect_repo_languages(Path.cwd())
-    if not languages:
-        if verbose:
-            click.echo("  Serena: no recognized source languages detected — leaving scope unset")
-        return
-
-    cfg = Path.cwd() / ".serena" / "project.yml"
-    value = "[" + ", ".join(f'"{lang}"' for lang in languages) + "]"
     try:
-        if cfg.exists():
-            text = _read_text(cfg)
-            # Match only a single-line flow list (the format we and Serena write).
-            pattern = re.compile(r"^(\s*)languages:\s*\[[^\]\n]*\]\s*$", re.MULTILINE)
-            if pattern.search(text):
-                new = pattern.sub(rf"\g<1>languages: {value}", text, count=1)
-                if new != text:
-                    _write_text(cfg, new)
-                    if verbose:
-                        click.echo(f"  Serena: scoped languages to {value} (project.yml)")
-            elif verbose:
-                click.echo(
-                    "  Serena: project.yml has a custom languages entry — leaving it untouched"
-                )
-        else:
-            cfg.parent.mkdir(parents=True, exist_ok=True)
-            project_name = Path.cwd().name or "project"
-            _write_text(cfg, f'project_name: "{project_name}"\nlanguages: {value}\n')
-            if verbose:
-                click.echo(f"  Serena: created project.yml scoped to {value}")
-    except OSError as e:
-        if verbose:
-            click.echo(f"  Serena: could not scope languages ({e})")
+        resolved = root.resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    if resolved == home:
+        return "$HOME is not a project"
+    if (resolved / ".git").is_file():
+        return "linked git worktree"
+    if not (resolved / ".serena" / "project.yml").is_file():
+        return "no .serena/project.yml yet — Serena will create it and index on demand"
+    return None
+
+
+#: Env knob for the launch-blocking pre-index. Unset (the default) means the
+#: wrap does not wait at all: ``serena project index`` runs in the background
+#: while the agent starts (#3436). A positive integer restores the pre-#3436
+#: behaviour of blocking the launch for at most that many seconds.
+_SERENA_INDEX_TIMEOUT_ENV = "HEADROOM_SERENA_INDEX_TIMEOUT"
+
+
+def _resolve_serena_index_wait_seconds() -> int:
+    """Seconds the launch may block on the pre-index (0 = do not wait).
+
+    The pre-index used to be synchronous, so this knob sized a stall budget
+    (#3093). On a directory holding several repositories no budget is big
+    enough — the index cannot finish, so every launch waited the whole budget
+    out and then threw the partial work away (#3436). The default is therefore
+    now 0: the index runs in the background and the agent starts immediately.
+
+    Setting the variable to a positive integer opts back into a blocking
+    pre-index with that budget, which is the escape hatch for anyone who wants
+    a warm cache before the first prompt (and the way to get the old behaviour
+    back).
+
+    A bad value is not fatal: the pre-index is best-effort, so an unusable
+    setting falls back to the background default rather than aborting a launch
+    that would otherwise succeed. It is reported unconditionally, because a
+    knob that looks applied but is not is the failure #3093 was about.
+    """
+    raw = os.environ.get(_SERENA_INDEX_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return 0
+
+    wait_seconds: int | None
+    try:
+        wait_seconds = int(raw)
+    except ValueError:
+        wait_seconds = None
+    if wait_seconds is None or wait_seconds <= 0:
+        click.echo(
+            f"  Serena: ignoring {_SERENA_INDEX_TIMEOUT_ENV}={raw!r} "
+            f"(want a positive integer number of seconds) "
+            "— indexing in the background instead"
+        )
+        return 0
+    return wait_seconds
+
+
+def _kill_serena_index_tree(proc: subprocess.Popen) -> None:
+    """Kill *proc* and everything it spawned (best-effort, never raises).
+
+    ``uvx`` is a launcher: it resolves the environment and then runs the real
+    ``serena`` executable as a grandchild. Killing only the direct child leaves
+    that grandchild alive and reparented to PID 1, so every timed-out pre-index
+    leaked one process that never exits (#2938 — the same failure mode as #615
+    and #880). The child is started in its own process group precisely so the
+    whole tree can be signalled here.
+    """
+    if sys.platform == "win32":
+        # Windows has no process groups to signal for an already-wedged child;
+        # ``taskkill /T`` walks the tree by parent PID instead. ``/F`` because a
+        # process blocked in a read will not act on a graceful close request.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+    # Backstop: if the tree kill above did not land, at least the direct child
+    # goes. Then reap so the parent does not leave a zombie behind, and close
+    # the capture pipes we opened so the wrap does not carry stray fds into the
+    # agent it is about to exec.
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+#: Handle on the background ``serena project index`` child, so the wrap can
+#: stop it when the session ends instead of leaving it to grind on unowned.
+_SERENA_INDEX_PROC: subprocess.Popen | None = None
+
+
+def _stop_background_serena_index() -> None:
+    """Stop the background pre-index when the wrap exits (best-effort).
+
+    Registered with :mod:`atexit` rather than plumbed into ``_launch_tool``'s
+    cleanup: the wrap stays alive as the agent's parent for the whole session,
+    Ctrl-C is swallowed by ``_ignore_child_sigint``, and SIGTERM/SIGHUP raise
+    ``SystemExit`` through ``_exit_on_signal`` (#3205), so every ordinary exit
+    path unwinds normally and runs this.
+
+    Killing a half-finished index is cheap: ``serena project index`` flushes
+    its caches every 30s while it runs, and ``request_document_symbols`` skips
+    files whose content hash it has already cached, so the next wrap resumes
+    roughly where this one stopped instead of starting over.
+    """
+    global _SERENA_INDEX_PROC
+
+    proc, _SERENA_INDEX_PROC = _SERENA_INDEX_PROC, None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is not None:  # already finished — nothing to kill
+            return
+    except Exception:
+        return
+    _kill_serena_index_tree(proc)
 
 
 def _index_serena_project(*, verbose: bool = False) -> None:
     """Warm Serena's symbol cache for the current project (non-fatal).
 
-    Runs ``serena project index`` (the same ``uvx --from git+…`` launch used to
-    start the MCP server) in the project directory so the first symbol query is
-    not paying for a cold index. Timeout-guarded and best-effort: Serena also
-    indexes lazily on demand, so a failure or timeout here never blocks the
-    wrap.
+    Runs ``serena project index`` (the same ``uvx --from serena-agent`` launch
+    used to start the MCP server) in the project directory so the first symbol
+    query is not paying for a cold index. Serena also indexes lazily on demand,
+    so any failure here is survivable.
+
+    This does **not** block the launch (#3436). The index used to run
+    synchronously, which meant a directory holding several repositories waited
+    out the whole stall budget on every single launch and then threw the
+    partial work away — no budget is large enough there, because the per-file
+    cost is a language server rebuilding its workspace view for a root it
+    cannot resolve. The child is started and left to run alongside the agent;
+    Serena's MCP server serves symbol queries from whatever is cached, and
+    indexes the rest on demand, while it warms.
+    ``HEADROOM_SERENA_INDEX_TIMEOUT`` opts back into a bounded blocking wait.
+
+    Three guards keep the child harmless:
+
+    * ``stdin`` is ``DEVNULL``. Serena prompts when it has to auto-create
+      ``project.yml``, and because its output is redirected the question never
+      reaches the terminal — an inherited stdin turned that into a silent hang
+      (#2938). EOF makes it fail in about a second instead.
+      ``_serena_project_skip_reason`` already keeps us out of that state; this
+      is the belt-and-braces half, and it covers any future Serena prompt too.
+    * ``stdout``/``stderr`` are ``DEVNULL`` rather than pipes. Nothing drains
+      them once the wrap stops waiting, and the indexer writes a progress line
+      per file, so a pipe would fill its buffer and wedge the child for good.
+      Serena records its own failures in ``.serena/logs/indexing.txt``.
+    * The child gets its own process group, both so a terminal Ctrl-C aimed at
+      the agent does not reach it and so ``_kill_serena_index_tree`` can take
+      out the ``uvx`` grandchild rather than orphaning it (#2938).
     """
+    global _SERENA_INDEX_PROC
+
     if shutil.which("uvx") is None:
         if verbose:
             click.echo("  Serena: uvx not found — skipping pre-index")
         return
+
+    wait_seconds = _resolve_serena_index_wait_seconds()
+
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "cwd": str(Path.cwd()),
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+
     try:
-        result = run(
+        proc = subprocess.Popen(
             [
                 "uvx",
+                # PyPI (prebuilt wheels), not the git source that fails to build
+                # under proot-based filesystems (#2871).
                 "--from",
-                "git+https://github.com/oraios/serena",
+                "serena-agent",
                 "serena",
                 "project",
                 "index",
             ],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=str(Path.cwd()),
+            **popen_kwargs,
         )
-        if result.returncode == 0:
-            click.echo("  Serena: project pre-indexed (symbol cache warmed)")
-        elif verbose:
-            click.echo(f"  Serena: pre-index failed ({(result.stderr or '')[:100]})")
-    except subprocess.TimeoutExpired:
-        click.echo("  Serena: pre-index timed out (will index on demand)")
     except Exception as e:
         if verbose:
             click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    if wait_seconds <= 0:
+        _SERENA_INDEX_PROC = proc
+        atexit.register(_stop_background_serena_index)
+        click.echo("  Serena: indexing project in the background (symbol tools work meanwhile)")
+        return
+
+    # Opted back into a blocking pre-index. Announce the wait: indexing a large
+    # repo legitimately takes minutes and the output is redirected, so without
+    # this line the wrap looks hung.
+    click.echo(f"  Serena: pre-indexing project (waiting up to {wait_seconds}s)…")
+    try:
+        proc.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        _kill_serena_index_tree(proc)
+        click.echo("  Serena: pre-index timed out (will index on demand)")
+        return
+    except Exception as e:
+        _kill_serena_index_tree(proc)
+        if verbose:
+            click.echo(f"  Serena: pre-index skipped ({e})")
+        return
+
+    if proc.returncode == 0:
+        click.echo("  Serena: project pre-indexed (symbol cache warmed)")
+    elif verbose:
+        click.echo(
+            f"  Serena: pre-index failed (exit {proc.returncode}; "
+            f"see .serena/logs/ for Serena's own log)"
+        )
 
 
 def _setup_serena_mcp(
@@ -1864,17 +2474,18 @@ def _setup_serena_mcp(
 
     spec = build_serena_spec(context)
     result = registrar.register_server(spec, force=force)
+    owned_drift = (
+        result.status == RegisterStatus.MISMATCH
+        and not force
+        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
+    )
 
     # Migrate a stale Headroom-installed entry. register_server won't overwrite
     # a differing spec without force, so an older Headroom Serena entry would
     # otherwise persist across re-wraps. Force-update it only when the ledger
     # proves Headroom installed the entry that's currently on disk — never a
     # user-managed Serena.
-    if (
-        result.status == RegisterStatus.MISMATCH
-        and not force
-        and headroom_installed_matching(registrar.name, registrar.get_server("serena"))
-    ):
+    if result.status == RegisterStatus.MISMATCH and not force and owned_drift:
         result = registrar.register_server(spec, force=True)
         if result.status == RegisterStatus.REGISTERED:
             click.echo("  Serena MCP: migrated previously-installed entry to current spec")
@@ -1887,19 +2498,40 @@ def _setup_serena_mcp(
         result,
         label="Serena MCP",
         verbose=verbose,
-        overwrite_hint="update or remove the existing serena MCP entry, then rerun headroom wrap",
+        overwrite_hint=(
+            "run headroom wrap again"
+            if owned_drift
+            else "run headroom mcp reconcile --adopt"
+            if registrar.name == "claude"
+            else "update or remove the existing serena MCP entry, then rerun headroom wrap"
+        ),
         restart_hint=f"restart {registrar.display_name} if it was already running",
     )
     if line is not None:
         click.echo(line)
 
     # Serena is the active engine here (we passed the detect/uvx guards): steer
-    # the agent toward symbol-level tools, scope the LSP to the repo's
-    # languages, then warm the symbol cache. Scoping runs before indexing so
-    # ``serena project index`` respects the scope. Each step is best-effort and
-    # non-fatal — none of them block the wrap.
+    # the agent toward symbol-level tools, then warm the symbol cache. Both are
+    # best-effort and non-fatal, and neither blocks the launch: the pre-index
+    # runs alongside the agent and is stopped when the wrap exits (#3436). See
+    # ``_index_serena_project`` for the guards on that child process.
+    #
+    # Headroom no longer writes ``.serena/project.yml`` language scoping. Serena
+    # determines the project's languages itself during
+    # ``ProjectConfig.autogenerate`` (``_determine_project_language_servers``),
+    # and it records them under ``language_servers`` — ``languages`` is a legacy
+    # name it migrates via ``RENAMED_FIELDS``. Our scoping therefore no-op'd on
+    # any Serena-generated project.yml (wrong key, block-style list) and only did
+    # anything when it created the file itself, which is the same partial-config
+    # trap as #2674 — and skipped the ``project.local.yml`` sidecar Serena writes
+    # alongside. Letting Serena own that file removes a hand-maintained ext→
+    # language map that duplicated its detection.
     _inject_serena_instructions(_serena_instruction_file(registrar), verbose=verbose)
-    _scope_serena_languages(verbose=verbose)
+    skip_reason = _serena_project_skip_reason(Path.cwd())
+    if skip_reason is not None:
+        if verbose:
+            click.echo(f"  Serena: skipping pre-index ({skip_reason})")
+        return
     _index_serena_project(verbose=verbose)
 
 
@@ -2039,57 +2671,6 @@ def _setup_coding_compressor(registrar: Any, *, serena_context: str, **kwargs: A
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
-# rtk instructions for tools without hook support (Codex, Cursor, Aider).
-# These get injected into AGENTS.md / .cursorrules so the LLM voluntarily
-# uses rtk-prefixed commands. Kept concise to minimize instruction overhead.
-RTK_INSTRUCTIONS_BLOCK = """\
-<!-- headroom:rtk-instructions -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
-
-When running shell commands, **always prefix with `rtk`**. This reduces context
-usage by 60-90% with zero behavior change. If rtk has no filter for a command,
-it passes through unchanged — so it is always safe to use.
-
-## Key Commands
-```bash
-# Git (59-80% savings)
-rtk git status          rtk git diff            rtk git log
-
-# Files & Search (60-75% savings)
-rtk ls <path>           rtk read <file>         rtk grep <pattern>
-rtk find <pattern>      rtk diff <file>
-
-# Test (90-99% savings) — shows failures only
-rtk pytest tests/       rtk cargo test          rtk test <cmd>
-
-# Build & Lint (80-90% savings) — shows errors only
-rtk tsc                 rtk lint                rtk cargo build
-rtk prettier --check    rtk mypy                rtk ruff check
-
-# Analysis (70-90% savings)
-rtk err <cmd>           rtk log <file>          rtk json <file>
-rtk summary <cmd>       rtk deps                rtk env
-
-# GitHub (26-87% savings)
-rtk gh pr view <n>      rtk gh run list         rtk gh issue list
-
-# Infrastructure (85% savings)
-rtk docker ps           rtk kubectl get         rtk docker logs <c>
-
-# Package managers (70-90% savings)
-rtk pip list            rtk pnpm install        rtk npm run <script>
-```
-
-## Rules
-- In command chains, prefix each segment: `rtk git add . && rtk git commit -m "msg"`
-- For debugging, use raw command without rtk prefix
-- `rtk proxy <cmd>` runs command without filtering but tracks usage
-<!-- /headroom:rtk-instructions -->
-"""
-
-# Marker used to detect if instructions are already injected
-_RTK_MARKER = "<!-- headroom:rtk-instructions -->"
-
 # Memory MCP markers
 _MEMORY_MCP_MARKER = "# --- Headroom memory MCP (auto-injected) ---"
 _MEMORY_MCP_END = "# --- end Headroom memory ---"
@@ -2109,10 +2690,9 @@ _CODEX_CONFIG_BACKUP_SUFFIX = ".headroom-backup"
 
 def _codex_home_dir() -> Path:
     """Return Codex's config directory, respecting ``CODEX_HOME`` when set."""
-    codex_home = os.environ.get("CODEX_HOME")
-    if codex_home:
-        return Path(codex_home).expanduser()
-    return Path.home() / ".codex"
+    from headroom.install.paths import codex_home_dir
+
+    return codex_home_dir()
 
 
 def _codex_profile_from_args(codex_args: tuple[str, ...]) -> str | None:
@@ -2317,16 +2897,23 @@ def _strip_codex_headroom_blocks(
         content,
     )
 
-    # Strip any orphaned `[model_providers.headroom]` table with the fields we
-    # write.  We only remove it if the table is recognisably ours (base_url
-    # mentions localhost and a Headroom proxy port).  This protects users who
-    # happen to have a differently configured `headroom` provider.
-    orphan_headroom_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
-        r"(?=^\[|\Z)"
-    )
-    content = orphan_headroom_table.sub("", content)
+    # Remove an orphaned local-proxy provider structurally. Text-level table
+    # matching cannot safely distinguish comments, multiline strings, and
+    # arrays of tables from a provider's body.
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        pass
+    else:
+        providers = document.get("model_providers")
+        if isinstance(providers, MutableMapping):
+            provider = providers.get("headroom")
+            base_url = provider.get("base_url") if isinstance(provider, Mapping) else None
+            if isinstance(base_url, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+/v1", base_url):
+                del providers["headroom"]
+                content = tomlkit.dumps(document)
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -2340,17 +2927,51 @@ _REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
 
 
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
-    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap."""
-    if "[model_providers.headroom]" not in content:
+    """Remove a legacy Headroom provider table without touching other TOML.
+
+    ``tomlkit`` identifies tables structurally, preserving comments, string
+    values, and arrays of tables that text-level table-boundary matching can
+    mistake for provider content. The injector owns this provider name, so an
+    existing table is replaced by the current Headroom configuration.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
         return content
 
-    import re  # local import to match surrounding helper convention
+    providers = document.get("model_providers")
+    if not isinstance(providers, MutableMapping):
+        return content
+    provider = providers.get("headroom")
+    if not isinstance(provider, Mapping):
+        return content
+    del providers["headroom"]
+    return str(tomlkit.dumps(document))
 
-    provider_table = re.compile(
-        r"(?ms)^[ \t]*\[model_providers\.headroom\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
-    )
-    content = provider_table.sub("", content)
-    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+def _strip_existing_codex_memory_mcp_table(content: str) -> str:
+    """Remove an unmarked memory MCP table without text-level TOML parsing.
+
+    TOMLKit resolves quoted keys and finds table boundaries structurally, so
+    comments, multiline strings, and arrays of tables remain untouched.
+    Invalid source TOML is deliberately left unchanged; the caller validates
+    its complete generated candidate before it can overwrite the file.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        return content
+
+    mcp_servers = document.get("mcp_servers")
+    if not isinstance(mcp_servers, MutableMapping) or "headroom_memory" not in mcp_servers:
+        return content
+
+    del mcp_servers["headroom_memory"]
+    return str(tomlkit.dumps(document))
 
 
 def _redirect_existing_top_level_keys(content: str, port: int) -> str:
@@ -2449,40 +3070,10 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
     shutil.copy2(config_file, backup_file)
 
 
-def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
-    """Ensure rtk binary is installed (download if needed). No hook registration."""
-    if not _rtk_opt_in():
-        return None
-    from headroom.rtk import get_rtk_path
-    from headroom.rtk.installer import ensure_rtk
-
-    rtk_path = get_rtk_path()
-
-    if rtk_path:
-        if verbose:
-            click.echo(f"  rtk found at {rtk_path}")
-        return rtk_path
-
-    click.echo("  Downloading rtk (Rust Token Killer)...")
-    rtk_path = ensure_rtk()
-    if rtk_path:
-        click.echo(f"  rtk installed at {rtk_path}")
-        return rtk_path
-
-    click.echo("  rtk download failed — continuing without it")
-    return None
-
-
-def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Path | None:
-    """Ensure rtk is present for host-bridged wrap flows without host-specific setup."""
-    if label:
-        click.echo(f"  Preparing rtk for {label}...")
-    return _ensure_rtk_binary(verbose=verbose)
-
-
 # Canonical casing for the proxy's per-project savings header (matched
 # case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
 _PROJECT_HEADER_NAME = "X-Headroom-Project"
+_PROJECT_CWD_HEADER_NAME = "X-Headroom-Cwd"
 
 
 def _project_name_from_cwd() -> str | None:
@@ -2498,29 +3089,52 @@ def _project_name_from_cwd() -> str | None:
     return urllib.parse.quote(name, safe="-_.() ")
 
 
+def _project_cwd_from_cwd() -> str | None:
+    """Return the canonical launch directory for X-Headroom-Cwd.
+
+    The full path is the collision-resistant project identity used by memory
+    and CCR routing. Percent-encoding keeps the value valid in an HTTP header;
+    the resolver decodes it before normalising and hashing the path.
+    """
+    cwd = str(Path.cwd().resolve()).strip()
+    if not cwd:
+        return None
+    return urllib.parse.quote(cwd, safe="/:._-~()")
+
+
 def _apply_project_header_env(env: dict[str, str]) -> None:
-    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+    """Inject project label and routing identity into custom headers.
 
     Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
     ``Name: value`` lines and attaches them to every API request; the
-    Headroom proxy uses the X-Headroom-Project header for per-project
-    savings attribution.  An existing user-supplied x-headroom-project
-    header (any casing) always wins — we never duplicate or overwrite it,
-    and any other user headers are preserved by appending.
+    Headroom proxy uses X-Headroom-Project for per-project savings
+    attribution and X-Headroom-Cwd for collision-resistant memory/CCR
+    routing. Existing user-supplied headers (any casing) always win — we
+    never duplicate or overwrite them, and all other user headers are
+    preserved by appending.
     """
     project = _project_name_from_cwd()
     if not project:
         return
-    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    cwd = _project_cwd_from_cwd()
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    existing_names: set[str] = set()
     if existing:
         for line in existing.splitlines():
             name = line.split(":", 1)[0].strip()
-            if name.lower() == _PROJECT_HEADER_NAME.lower():
-                return  # user override wins
-        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
-    else:
-        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+            existing_names.add(name.lower())
+
+    generated: list[str] = []
+    if _PROJECT_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_HEADER_NAME}: {project}")
+    if cwd and _PROJECT_CWD_HEADER_NAME.lower() not in existing_names:
+        generated.append(f"{_PROJECT_CWD_HEADER_NAME}: {cwd}")
+    if not generated:
+        return
+
+    env["ANTHROPIC_CUSTOM_HEADERS"] = (
+        "\n".join([existing, *generated]) if existing else "\n".join(generated)
+    )
 
 
 # Codex's own built-in providers plus Headroom's injected one — never treated
@@ -2651,6 +3265,9 @@ def _inject_codex_provider_config(port: int) -> str | None:
     """
     config_file, backup_file = _codex_config_paths()
     config_dir = config_file.parent
+    # Never repoint an existing headroom provider to another port silently: a
+    # different live proxy (or a persistent install) may own the old route.
+    warn_codex_provider_port_change(config_file, port)
 
     # Detect an existing custom OpenAI-compatible provider BEFORE building the
     # injected block below, so it can be preserved as the upstream the proxy
@@ -2776,6 +3393,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
                 f"\n{provider_section}"
             )
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         if custom_upstream_base_url:
@@ -2847,26 +3466,6 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     return "noop", config_file
 
 
-def _emit_wrap_interrupted(agent: str, marker_path: Path | None) -> None:
-    """Log a clear interruption message after a partial wrap setup.
-
-    Called when a wrap subcommand catches ``KeyboardInterrupt`` between marker
-    injection and proxy startup. The marker file (if any) is left on disk —
-    re-running the same ``headroom wrap <agent>`` command is idempotent and
-    safe.
-    """
-    if marker_path is not None:
-        click.echo(
-            f"\n  Wrap was interrupted; marker file at {marker_path} is on "
-            f"disk. Rerun `headroom wrap {agent}` to retry — it's idempotent."
-        )
-    else:
-        click.echo(
-            f"\n  Wrap was interrupted before any on-disk changes. Rerun "
-            f"`headroom wrap {agent}` to retry — it's idempotent."
-        )
-
-
 _WRAP_BANNER_INNER_WIDTH = 47
 
 
@@ -2889,64 +3488,6 @@ def _print_wrap_banner(agent: str) -> None:
     click.echo()
 
 
-def _setup_context_tool_for_agent(
-    *,
-    agent: str,
-    agent_display: str,
-    marker_path: Path | None,
-    on_rtk_ready: Callable[[Path], object] | None = None,
-    rtk_required: bool = False,
-    verbose: bool = False,
-) -> Path | None:
-    """Run the rtk-or-lean-ctx context-tool setup with KeyboardInterrupt handling.
-
-    Replaces the ``try / except KeyboardInterrupt / rtk-vs-lean-ctx fork``
-    each wrap subcommand was inlining. Returns the rtk binary path if rtk
-    mode was selected and the install succeeded; otherwise ``None``.
-
-    Args:
-        agent: Internal agent name (used by ``_setup_lean_ctx_agent`` and
-            the interrupt message).
-        agent_display: User-facing capitalized name for the echo lines
-            (e.g. ``"Cline"``, ``"OpenHands"``).
-        marker_path: Optional path to report on Ctrl+C interruption. Pass
-            ``None`` for env-only agents that never touch disk (openhands).
-        on_rtk_ready: Optional callback invoked with the rtk binary path
-            when rtk install succeeds. Use to inject into a marker file
-            (e.g. ``.clinerules``, ``.goosehints``, ``config.json``).
-        rtk_required: If ``True`` and rtk install fails, raise
-            ``SystemExit(1)`` instead of silently falling through. Use this
-            for env-var-only agents (openhands) where there is no
-            fallback marker file to write to.
-        verbose: Forwarded to the rtk/lean-ctx installers.
-    """
-    try:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo(f"  Setting up lean-ctx for {agent_display}...")
-            _setup_lean_ctx_agent(agent, verbose=verbose)
-            return None
-        click.echo(f"  Setting up rtk for {agent_display}...")
-        rtk_path = _ensure_rtk_binary(verbose=verbose)
-        if not rtk_path:
-            if rtk_required:
-                click.echo(
-                    "  Error: rtk install failed; refusing to inject "
-                    f"context-tool guidance for {agent_display} without rtk. "
-                    "Install rtk manually and re-run, or pass --no-context-tool "
-                    "to skip rtk."
-                )
-                raise SystemExit(1)
-            return None
-        if on_rtk_ready is not None:
-            on_rtk_ready(rtk_path)
-        return rtk_path
-    except KeyboardInterrupt:
-        _emit_wrap_interrupted(
-            agent, marker_path if (marker_path and marker_path.exists()) else None
-        )
-        raise SystemExit(130) from None
-
-
 def _run_proxy_only_watcher(
     *,
     agent_label: str,
@@ -2958,6 +3499,9 @@ def _run_proxy_only_watcher(
     print_setup_lines: Callable[[int], None],
     anthropic_api_url: str | None = None,
     openai_api_url: str | None = None,
+    copilot_api_token: str | None = None,
+    copilot_refresh_oauth_token: str | None = None,
+    copilot_api_token_expires_at: float | None = None,
 ) -> None:
     """Shared scaffolding for proxy-only wrap subcommands (no child binary launch).
 
@@ -2973,8 +3517,27 @@ def _run_proxy_only_watcher(
     proxy_holder: list[subprocess.Popen | None] = [None]
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
+
+    def _signal_shutdown(signum: int, frame: Any) -> None:
+        cleanup(signum, frame)
+        # cleanup alone leaves the watcher loop alive long enough to observe
+        # the intentionally terminated proxy and report a false crash. Raise
+        # into its normal Ctrl-C path so shutdown exits successfully.
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _signal_shutdown)
+    signal.signal(signal.SIGTERM, _signal_shutdown)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the watcher dies unhandled and the proxy it spawned is reparented
+    # to PID 1 and leaks. Mirrors the SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_shutdown)
+    # Windows exposes Ctrl+Break as SIGBREAK rather than SIGINT. Test runners,
+    # IDE terminals, and process supervisors commonly use Ctrl+Break to target
+    # a newly created process group, so route it through the same graceful
+    # cleanup path as an interactive Ctrl+C.
+    if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _signal_shutdown)
 
     try:
         _print_wrap_banner(agent_label)
@@ -2987,6 +3550,9 @@ def _run_proxy_only_watcher(
             agent_type=agent_type,
             anthropic_api_url=anthropic_api_url,
             openai_api_url=openai_api_url,
+            copilot_api_token=copilot_api_token,
+            copilot_refresh_oauth_token=copilot_refresh_oauth_token,
+            copilot_api_token_expires_at=copilot_api_token_expires_at,
         )
         if actual_port != port:
             _unregister_proxy_client(port)
@@ -3015,58 +3581,6 @@ def _run_proxy_only_watcher(
         raise SystemExit(1) from e
     finally:
         cleanup()
-
-
-def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
-    """Inject rtk instructions into a file (AGENTS.md, .cursorrules, etc.).
-
-    Idempotent — skips if marker already present. Appends to existing content.
-    Returns True if instructions were written.
-    """
-    if not _rtk_opt_in():
-        return False
-    if file_path.exists():
-        existing = _read_text(file_path)
-        if _RTK_MARKER in existing:
-            if verbose:
-                click.echo(f"  rtk instructions already in {file_path.name}")
-            return True
-        # Append to existing file
-        _append_text(file_path, "\n\n" + RTK_INSTRUCTIONS_BLOCK)
-    else:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(file_path, RTK_INSTRUCTIONS_BLOCK)
-
-    click.echo(f"  rtk instructions injected into {file_path}")
-    return True
-
-
-def _remove_rtk_instructions(file_path: Path) -> bool:
-    """Remove Headroom's marker-fenced rtk guidance from an instruction file."""
-    if not file_path.exists():
-        return False
-
-    content = _read_text(file_path)
-    end_marker = "<!-- /headroom:rtk-instructions -->"
-    start = content.find(_RTK_MARKER)
-    if start < 0:
-        return False
-
-    end = content.find(end_marker, start)
-    if end < 0:
-        return False
-    end += len(end_marker)
-    prefix = content[:start].rstrip()
-    suffix = content[end:].lstrip("\r\n")
-    cleaned = "\n\n".join(part for part in (prefix, suffix) if part)
-    if cleaned:
-        cleaned = cleaned.rstrip() + "\n"
-
-    if cleaned:
-        _write_text(file_path, cleaned)
-    else:
-        file_path.unlink()
-    return True
 
 
 def _inject_memory_mcp_config(user_id: str) -> None:
@@ -3108,10 +3622,21 @@ def _inject_memory_mcp_config(user_id: str) -> None:
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
                 content = content[:start].rstrip("\n") + mcp_section + content[end:].lstrip("\n")
             else:
+                # No marker yet. A `[mcp_servers.headroom_memory]` table can
+                # still exist unmarked — e.g. a user copied the snippet from
+                # this module's docstring by hand, or the table survived
+                # from before markers guarded this injection. Strip it first
+                # so we don't end up with two `[mcp_servers.headroom_memory]`
+                # tables, which is invalid TOML and silently breaks Codex's
+                # MCP config parsing (last-table-wins or hard failure
+                # depending on the TOML parser).
+                content = _strip_existing_codex_memory_mcp_table(content)
                 content = content.rstrip() + "\n" + mcp_section
         else:
             content = mcp_section
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
@@ -3148,147 +3673,21 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     return True
 
 
-def _apply_rtk_to_systemmessage_field(
-    container: dict[str, Any],
-    location_label: str,
-    verbose: bool = False,
-) -> tuple[bool, bool]:
-    """Apply the RTK block to ``container["systemMessage"]`` in place.
-
-    Returns ``(changed, ok)``:
-
-    * ``changed`` is ``True`` if the field was written (or rewritten) on this
-      call. ``False`` for idempotent skips and for refusals.
-    * ``ok`` is ``True`` for "RTK guidance is now present (or refused-safely)",
-      ``False`` only for refusals where the user must intervene. Callers
-      surface ``not ok`` as a warning to the user.
-
-    Refusal cases (loud, no silent overwrite):
-
-    * ``systemMessage`` exists and is **not a string** (dict / list / number).
-      We never clobber user data of an unknown shape. The user must remove or
-      clear the field before re-running.
-    """
-    existing_msg = container.get("systemMessage")
-
-    if isinstance(existing_msg, str) and _RTK_MARKER in existing_msg:
-        if verbose:
-            click.echo(f"  rtk instructions already in {location_label}")
-        return False, True
-
-    if existing_msg is None or (isinstance(existing_msg, str) and not existing_msg.strip()):
-        container["systemMessage"] = RTK_INSTRUCTIONS_BLOCK
-        return True, True
-
-    if isinstance(existing_msg, str):
-        container["systemMessage"] = existing_msg.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
-        return True, True
-
-    # Non-string, non-null value present — refuse loudly. We will not clobber
-    # user data of unknown shape.
-    click.echo(
-        f"  Warning: {location_label} systemMessage is not a string "
-        f"(type={type(existing_msg).__name__}); refusing to overwrite. "
-        "To opt in, remove or clear the existing systemMessage value and re-run."
-    )
-    return False, False
-
-
-def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False) -> bool:
-    """Inject the rtk instructions block into Continue's ``.continue/config.json``.
-
-    Continue's schema supports both a top-level ``systemMessage`` string and a
-    per-model ``systemMessage`` on each entry in the ``models`` array. The
-    per-model value, when set, overrides the top-level one — so users with
-    per-model configs would otherwise silently get no RTK guidance. This
-    helper writes the RTK block into **every** ``systemMessage`` site:
-
-    * top-level ``systemMessage``
-    * each ``models[i].systemMessage`` where ``models[i]`` is a dict
-
-    The RTK marker (``<!-- headroom:rtk-instructions -->``) is the idempotency
-    token: if a prior ``systemMessage`` already contains the marker we leave
-    that site alone. If the existing value is a non-empty string we append
-    with a separator. If the existing value is **non-string** (dict / list /
-    number) we refuse loudly and leave it untouched — we do not clobber user
-    data of unknown shape. To opt in to overwrite, the user must clear the
-    existing value first.
-
-    The config file is read/written as JSON. Malformed JSON is left untouched
-    and the helper returns ``False``. Note: Continue's modern config is
-    YAML-first; users on the YAML schema should configure systemMessage
-    through that file instead — this helper only handles the JSON variant.
-
-    Returns ``True`` if injection succeeded (or was already idempotent at
-    every site); ``False`` if any site refused or the file was malformed.
-    """
-    if config_file.exists():
-        try:
-            content = _read_text(config_file)
-        except OSError as exc:
-            click.echo(f"  Warning: could not read {config_file}: {exc}")
-            return False
-        if not content.strip():
-            data: dict[str, Any] = {}
-        else:
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError as exc:
-                click.echo(
-                    f"  Warning: {config_file} is not valid JSON ({exc.msg}); "
-                    "not modifying — fix the file manually before re-running."
-                )
-                return False
-            if not isinstance(parsed, dict):
-                click.echo(
-                    f"  Warning: {config_file} top-level value is not an object; "
-                    "Continue expects a JSON object — leaving file untouched."
-                )
-                return False
-            data = parsed
-    else:
-        data = {}
-
-    any_changed = False
-    all_ok = True
-
-    # 1. Top-level systemMessage.
-    changed, ok = _apply_rtk_to_systemmessage_field(
-        data, location_label=f"{config_file.name} (top-level)", verbose=verbose
-    )
-    any_changed = any_changed or changed
-    all_ok = all_ok and ok
-
-    # 2. Per-model systemMessage. Continue's models[] entry overrides the
-    # top-level value when set, so we must visit each one.
-    models = data.get("models")
-    if isinstance(models, list):
-        for idx, model in enumerate(models):
-            if not isinstance(model, dict):
-                continue
-            label = f"{config_file.name} models[{idx}]"
-            if isinstance(model.get("title"), str):
-                label = f"{config_file.name} models[{idx}] ({model['title']})"
-            changed_i, ok_i = _apply_rtk_to_systemmessage_field(
-                model, location_label=label, verbose=verbose
-            )
-            any_changed = any_changed or changed_i
-            all_ok = all_ok and ok_i
-
-    if any_changed:
-        config_file.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(config_file, json.dumps(data, indent=2) + "\n")
-        click.echo(f"  rtk instructions injected into {config_file}")
-    elif all_ok and verbose:
-        # Idempotent re-run with no refusals — nothing to do.
-        click.echo(f"  rtk instructions already present in {config_file.name}")
-
-    return all_ok
-
-
 def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
     return _copilot_resolve_provider_type(backend, provider_type)
+
+
+def _is_headroom_health(payload: dict[str, Any] | None) -> bool:
+    """True when a /health payload identifies a Headroom proxy.
+
+    The Python proxy reports ``service: "headroom-proxy"`` plus a ``config``
+    block; the Rust proxy reports only ``{"ok": true, "service": "headroom-proxy"}``.
+    Any other JSON (a generic ``{"status": "ok"}``) is a foreign service.
+    """
+    if payload is None:
+        return False
+    return payload.get("service") == "headroom-proxy" or _proxy_health_config(payload) is not None
 
 
 def _query_proxy_config(port: int) -> dict[str, Any] | None:
@@ -3415,12 +3814,12 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
-def _normalize_proxy_api_url(url: object) -> str | None:
+def _normalize_proxy_api_url(url: object, *, strip_provider_v1: bool = True) -> str | None:
     """Normalize configured upstream URLs for running-proxy comparisons."""
     if not isinstance(url, str):
         return None
     normalized = url.strip().rstrip("/")
-    if normalized.endswith("/v1"):
+    if strip_provider_v1 and normalized.endswith("/v1"):
         normalized = normalized[:-3]
     return normalized or None
 
@@ -3436,14 +3835,110 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
-    running_release = _normalize_release_version(running_version)
     # -dev is a display marker for source builds; compare the base release so a
-    # dev CLI still restarts a stale proxy on a real version difference.
+    # dev CLI still restarts a stale proxy on a real version difference. The
+    # suffix must be stripped from the running version too: with it intact,
+    # "0.34.0-dev" fails the release regex, normalizes to None, and the check
+    # below silently never fires for source-built proxies. The scheme is always
+    # "<base>-dev" (get_version in headroom/_version.py); any future "-rcN" or
+    # "-dev.N" style would need stripping here as well.
+    running_release = _normalize_release_version(
+        running_version.removesuffix("-dev") if running_version is not None else None
+    )
     current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None
         and current_release is not None
         and running_release != current_release
+    )
+
+
+# Upstream-URL config keys that decide where a running proxy forwards
+# traffic. A running proxy is only reusable when every key matches the
+# requested value. This build's /health config payload only serializes the
+# first five keys; the augment/factory entries catch proxies built from
+# feature branches or other versions that DO expose them (exactly the
+# mixed-fleet shape of the 2026-08-22 incident, where a 0.34-era proxy
+# reported augment_api_url). Keys absent from the running config simply
+# compare equal to an unrequested (None) value, so they are inert, never
+# wrong, against proxies that do not expose them.
+_PROXY_ROUTING_URL_KEYS = (
+    "openai_api_url",
+    "anthropic_api_url",
+    "vertex_api_url",
+    "cloudcode_api_url",
+    "gemini_api_url",
+    "augment_api_url",
+    "factory_api_url",
+)
+
+
+def _proxy_routing_mismatches(
+    running_config: Mapping[str, Any],
+    *,
+    backend: str | None,
+    requested_api_urls: Mapping[str, str | None] | None = None,
+) -> list[str]:
+    """Return routing-level keys where a running proxy differs from the request.
+
+    Unlike the feature-flag check in ``_ensure_proxy_unlocked`` (memory,
+    learn, code graph), a mismatch here is never "degraded but usable": the
+    proxy would forward this session's traffic to a backend or upstream the
+    caller did not ask for. URL comparison is symmetric: a running proxy with
+    a non-default upstream the caller did not request is a mismatch too.
+    """
+    mismatches: list[str] = []
+    effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "anthropic"
+    running_backend = running_config.get("backend")
+    if (
+        isinstance(running_backend, str)
+        and running_backend
+        and running_backend != effective_backend
+    ):
+        mismatches.append("backend")
+    requested_api_urls = requested_api_urls or {}
+    for key in _PROXY_ROUTING_URL_KEYS:
+        strip_provider_v1 = key not in {"augment_api_url", "factory_api_url"}
+        if _normalize_proxy_api_url(
+            running_config.get(key),
+            strip_provider_v1=strip_provider_v1,
+        ) != _normalize_proxy_api_url(
+            requested_api_urls.get(key),
+            strip_provider_v1=strip_provider_v1,
+        ):
+            mismatches.append(key)
+    return mismatches
+
+
+def _effective_requested_proxy_routing(
+    *,
+    backend: str | None,
+    openai_api_url: str | None,
+    anthropic_api_url: str | None,
+    vertex_api_url: str | None,
+    clear_vertex_api_url: bool,
+) -> tuple[str, dict[str, str | None]]:
+    """Resolve the routing a newly started proxy would inherit."""
+    from headroom.providers.registry import resolve_api_overrides
+
+    overrides = resolve_api_overrides(
+        anthropic_api_url=anthropic_api_url,
+        openai_api_url=openai_api_url,
+        gemini_api_url=None,
+        cloudcode_api_url=None,
+        vertex_api_url=vertex_api_url,
+    )
+    return (
+        backend or os.environ.get("HEADROOM_BACKEND") or "anthropic",
+        {
+            "anthropic_api_url": overrides.anthropic,
+            "openai_api_url": overrides.openai,
+            "gemini_api_url": overrides.gemini,
+            "cloudcode_api_url": overrides.cloudcode,
+            "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
+            "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
+            "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+        },
     )
 
 
@@ -3458,6 +3953,27 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
     Returns True if the port is free afterwards, False otherwise.
     """
+    if sys.platform == "win32":
+        # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
+        # native proxy launcher can own a serving child, so terminating the
+        # reported PID alone may leave that child bound to the port.  Walk the
+        # verified Headroom process tree, matching the existing Serena cleanup
+        # strategy used elsewhere in this module.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+        for _ in range(50):
+            time.sleep(0.1)
+            if not _check_proxy(port):
+                return True
+        return False
+
     try:
         os.kill(pid, signal.SIGTERM)
     except PermissionError:
@@ -3781,6 +4297,20 @@ def _copilot_default_wire_api_for_model(model: str | None) -> str:
     return _copilot_default_wire_api_for_model_impl(model)
 
 
+def _build_copilot_native_launch_env(
+    *, port: int, environ: dict[str, str], project: str | None
+) -> tuple[dict[str, str], list[str]]:
+    from headroom.providers.copilot.wrap import build_native_launch_env
+
+    return build_native_launch_env(port=port, environ=environ, project=project)
+
+
+def _native_api_url_supported(*, environ: Mapping[str, str] | None = None) -> bool | None:
+    from headroom.providers.copilot.wrap import native_api_url_supported
+
+    return native_api_url_supported(environ=environ)
+
+
 def _should_use_copilot_oauth(
     *,
     backend: str | None,
@@ -3841,7 +4371,7 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
-def _ensure_proxy(
+def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
     *,
@@ -3860,13 +4390,31 @@ def _ensure_proxy(
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> tuple[subprocess.Popen | None, int]:
-    """Start or verify proxy. Returns (process_handle, actual_port)."""
+    """Start or verify proxy. Returns (process_handle, actual_port).
+
+    The public ``_ensure_proxy`` wrapper serializes callers per port before
+    entering this function. Keeping the implementation separate makes the
+    lock boundary explicit and ensures every health/configuration check runs
+    under the same startup critical section.
+    """
     helpers = _live_wrap_module()
     copilot_subscription_seed_requested = (
         bool(copilot_api_token)
         or bool(copilot_refresh_oauth_token)
         or copilot_api_token_expires_at is not None
     )
+    requested_backend, requested_api_urls = helpers._effective_requested_proxy_routing(
+        backend=backend,
+        openai_api_url=openai_api_url,
+        anthropic_api_url=anthropic_api_url,
+        vertex_api_url=vertex_api_url,
+        clear_vertex_api_url=clear_vertex_api_url,
+    )
+    # Set True when the proxy on the requested port belongs to a persistent
+    # deployment whose routing config does not match this wrap: the deployment
+    # owns the port and must not be reused, killed, or restarted from the
+    # shared ephemeral path; the wrap starts a dedicated proxy elsewhere.
+    persistent_routing_mismatch = False
     # --no-proxy reuses an already-running proxy, so backend/region/provider
     # flags (which only apply when we start one) would be silently dropped.
     if no_proxy and (backend or anyllm_provider or region):
@@ -3884,12 +4432,52 @@ def _ensure_proxy(
                 "  Copilot subscription seeds are session-specific; "
                 "starting a dedicated local proxy instance for this wrap session."
             )
+        if (
+            not isolated_copilot_subscription_proxy
+            and manifest is not None
+            and helpers._foreign_listener(port)
+        ):
+            # The manifest's port is held by a non-Headroom service; recovery
+            # can never rebind it. Skip the respawn/wait entirely and start a
+            # fresh proxy on another port.
+            click.echo(
+                f"  Persistent deployment '{manifest.profile}' port {port} is held by a "
+                "non-Headroom service; starting a fresh proxy on another port."
+            )
+            manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
             from headroom.install.health import probe_ready
 
             if probe_ready(manifest.health_url):
                 health_payload = helpers._query_proxy_health(port)
-                if helpers._proxy_needs_version_restart(health_payload):
+                running_config = helpers._proxy_health_config(health_payload)
+                if running_config is None:
+                    running_config = helpers._query_proxy_config(port)
+                routing_mismatches = (
+                    None
+                    if running_config is None
+                    else helpers._proxy_routing_mismatches(
+                        running_config,
+                        backend=requested_backend,
+                        requested_api_urls=requested_api_urls,
+                    )
+                )
+                if running_config is None:
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        "did not expose routing config; starting a dedicated proxy "
+                        "on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    click.echo(
+                        f"  Persistent deployment '{manifest.profile}' on port {port} "
+                        f"has incompatible routing config ({keys_str}); "
+                        "starting a dedicated proxy on a different port instead."
+                    )
+                    persistent_routing_mismatch = True
+                elif helpers._proxy_needs_version_restart(health_payload):
                     running_version = helpers._proxy_version(health_payload) or "unknown"
                     active_sessions = helpers._proxy_active_session_count(health_payload)
                     other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
@@ -3914,14 +4502,8 @@ def _ensure_proxy(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
-                # Check if the running proxy has the features we need.
-                # Without this, a persistent deployment started for one use case
-                # (e.g. --backend anthropic) would be silently reused for another
-                # (e.g. --subscription --provider-type openai) causing auth failures.
-                running_config = helpers._proxy_health_config(health_payload)
-                if running_config is None:
-                    running_config = helpers._query_proxy_config(port)
-                if running_config is not None:
+                else:
+                    # Check if the running proxy has the features we need.
                     missing = []
                     if memory and not running_config.get("memory"):
                         missing.append("memory")
@@ -3929,46 +4511,18 @@ def _ensure_proxy(
                         missing.append("learn")
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                         return None, port
-                # Features mismatch or config unavailable — fall through to
-                # the non-persistent path which handles proxy restart.
+                # Features mismatch or config unavailable — fall through to the
+                # non-persistent path which handles proxy restart. A routing
+                # mismatch skips that path entirely (see flag above).
             else:
                 if helpers._recover_persistent_proxy(port):
-                    # If the caller requested feature-sensitive config (e.g.
-                    # openai_api_url for Copilot subscription), continue into
-                    # the shared running-proxy checks below so mismatch-driven
-                    # restart logic can run. For plain recover-only calls,
-                    # preserve the historical fast return.
-                    if not any(
-                        (
-                            memory,
-                            learn,
-                            code_graph,
-                            openai_api_url,
-                            copilot_subscription_seed_requested,
-                        )
-                    ):
-                        return None, port
                     if not helpers._check_proxy(port):
                         return None, port
 
-                    # A freshly recovered persistent proxy may not expose
-                    # a full config payload yet. In feature-sensitive flows
-                    # (e.g. Copilot subscription), treat missing or mismatched
-                    # config as restart-required and refresh the persistent
-                    # deployment directly instead of silently reusing it.
                     health_payload = helpers._query_proxy_health(port)
                     running_config = helpers._proxy_health_config(health_payload)
                     if running_config is None:
@@ -3977,61 +4531,109 @@ def _ensure_proxy(
                     if running_config is None:
                         click.echo(
                             f"  Recovered persistent deployment '{manifest.profile}' "
-                            "did not expose config; restarting with requested features..."
+                            "did not expose routing config; starting a dedicated proxy "
+                            "on a different port instead."
                         )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted after recovery."
+                        persistent_routing_mismatch = True
+                    else:
+                        routing_mismatches = helpers._proxy_routing_mismatches(
+                            running_config,
+                            backend=requested_backend,
+                            requested_api_urls=requested_api_urls,
                         )
+                        if routing_mismatches:
+                            keys_str = ", ".join(routing_mismatches)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"has incompatible routing config ({keys_str}); "
+                                "starting a dedicated proxy on a different port instead."
+                            )
+                            persistent_routing_mismatch = True
+                        else:
+                            missing = []
+                            if memory and not running_config.get("memory"):
+                                missing.append("memory")
+                            if learn and not running_config.get("learn"):
+                                missing.append("learn")
+                            if code_graph and not running_config.get("code_graph"):
+                                missing.append("code-graph")
 
-                    missing = []
-                    if memory and not running_config.get("memory"):
-                        missing.append("memory")
-                    if learn and not running_config.get("learn"):
-                        missing.append("learn")
-                    if code_graph and not running_config.get("code_graph"):
-                        missing.append("code-graph")
-                    if copilot_subscription_seed_requested:
-                        missing.append("copilot-subscription-auth")
-                    if openai_api_url:
-                        running_openai_url = _normalize_proxy_api_url(
-                            running_config.get("openai_api_url")
-                        )
-                        requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                        if running_openai_url != requested_openai_url:
-                            missing.append("openai-api-url")
-
-                    if missing:
-                        flags_str = ", ".join(f"--{f}" for f in missing)
-                        click.echo(
-                            f"  Recovered persistent deployment '{manifest.profile}' is missing: "
-                            f"{flags_str}; restarting..."
-                        )
-                        if helpers._restart_persistent_proxy(manifest, port):
-                            return None, port
-                        raise click.ClickException(
-                            f"Persistent deployment '{manifest.profile}' on port {port} "
-                            "could not be restarted with requested features."
-                        )
-                    return None, port
-                elif helpers._check_proxy(port):
+                            if not missing:
+                                return None, port
+                            flags_str = ", ".join(f"--{f}" for f in missing)
+                            click.echo(
+                                f"  Recovered persistent deployment '{manifest.profile}' "
+                                f"is missing: {flags_str}; restarting..."
+                            )
+                            if helpers._restart_persistent_proxy(manifest, port):
+                                return None, port
+                            raise click.ClickException(
+                                f"Persistent deployment '{manifest.profile}' on port {port} "
+                                "could not be restarted with requested features."
+                            )
+                elif helpers._check_proxy(port) and not helpers._foreign_listener(port):
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
                     )
-            click.echo(
-                f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
-                "is stale; starting a fresh proxy instead."
-            )
+                # A foreign (non-Headroom) listener squatting the manifest's
+                # port is treated like a stale deployment: fall through and
+                # start a fresh proxy on another port.
+            if not persistent_routing_mismatch:
+                click.echo(
+                    f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
+                    "is stale; starting a fresh proxy instead."
+                )
 
-        if not isolated_copilot_subscription_proxy and helpers._check_proxy(port):
+        proxy_listener = (
+            not isolated_copilot_subscription_proxy
+            and not persistent_routing_mismatch
+            and helpers._check_proxy(port)
+        )
+        health_payload = helpers._query_proxy_health(port) if proxy_listener else None
+        running_config = helpers._proxy_health_config(health_payload)
+        if proxy_listener and running_config is None:
+            running_config = helpers._query_proxy_config(port)
+        if (
+            proxy_listener
+            and running_config is None
+            and not helpers._is_headroom_health(health_payload)
+        ):
+            # TCP accepted, but /health did not identify a Headroom proxy — a
+            # foreign service is squatting the port. Fall through to the port
+            # search below instead of reusing (or "version-restarting") it.
+            click.echo(
+                f"  Port {port} is in use by a non-Headroom service; selecting another port..."
+            )
+            proxy_listener = False
+        if proxy_listener:
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            health_payload = helpers._query_proxy_health(port)
-            running_config = helpers._proxy_health_config(health_payload)
-            if running_config is None:
-                running_config = helpers._query_proxy_config(port)
+            # Set False when the running proxy must not serve this session at
+            # all (routing-level mismatch with live clients attached): fall
+            # through to a fresh start on a different port.
+            reuse_running = True
+            routing_mismatches = (
+                None
+                if running_config is None
+                else helpers._proxy_routing_mismatches(
+                    running_config,
+                    backend=requested_backend,
+                    requested_api_urls=requested_api_urls,
+                )
+            )
+            if running_config is None and not helpers._proxy_needs_version_restart(health_payload):
+                # A proxy that exposes no config block cannot be checked for
+                # feature or routing compatibility, and without a reported PID
+                # it cannot be restarted either. Reusing it blindly is the
+                # silent-misrouting incident class; start a dedicated proxy on
+                # a free port instead (mirrors the persistent branch, which
+                # already treats config-unavailable as not-reusable).
+                click.echo(
+                    f"  Proxy on port {port} did not expose its config; "
+                    "starting a dedicated proxy on a different port instead of "
+                    "reusing it unchecked."
+                )
+                reuse_running = False
 
             if helpers._proxy_needs_version_restart(health_payload):
                 running_version = helpers._proxy_version(health_payload) or "unknown"
@@ -4051,28 +4653,37 @@ def _ensure_proxy(
                         f"  Proxy on port {port} is running Headroom {running_version}; "
                         f"current CLI is {_HEADROOM_VERSION}."
                     )
-                    click.echo(
-                        f"  Leaving it running because {detail} "
-                        "are still attached; it will be restarted when idle."
-                    )
-                    return None, port
+                    if routing_mismatches or running_config is None:
+                        click.echo(
+                            f"  Not reusing it because its routing "
+                            f"{'cannot be verified' if running_config is None else 'is incompatible'}; "
+                            "starting a dedicated proxy on a different port instead."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Leaving it running because {detail} "
+                            "are still attached; it will be restarted when idle."
+                        )
+                        return None, port
 
-                click.echo(
-                    f"  Proxy on port {port} is running Headroom {running_version}; "
-                    f"restarting with {_HEADROOM_VERSION}..."
-                )
-                proxy_pid = running_config.get("pid") if running_config is not None else None
-                if proxy_pid is None:
-                    raise click.ClickException(
-                        f"Proxy on port {port} is stale but did not expose a PID. "
-                        "Stop it manually and retry."
+                else:
+                    click.echo(
+                        f"  Proxy on port {port} is running Headroom {running_version}; "
+                        f"restarting with {_HEADROOM_VERSION}..."
                     )
-                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
-                    raise click.ClickException(
-                        f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
-                        "Stop it manually and retry."
-                    )
-                needs_restart = True
+                    proxy_pid = running_config.get("pid") if running_config is not None else None
+                    if proxy_pid is None:
+                        raise click.ClickException(
+                            f"Proxy on port {port} is stale but did not expose a PID. "
+                            "Stop it manually and retry."
+                        )
+                    if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                        raise click.ClickException(
+                            f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
+                            "Stop it manually and retry."
+                        )
+                    needs_restart = True
 
             if running_config is not None:
                 missing = []
@@ -4082,30 +4693,14 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
-                if copilot_subscription_seed_requested:
-                    missing.append("copilot-subscription-auth")
                 expected_savings_profile = helpers._wrap_agent_savings_profile(agent_type)
                 if (
                     expected_savings_profile is not None
                     and running_config.get("savings_profile") != expected_savings_profile
                 ):
                     missing.append("savings-profile")
-                if openai_api_url:
-                    running_openai_url = _normalize_proxy_api_url(
-                        running_config.get("openai_api_url")
-                    )
-                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
-                    if running_openai_url != requested_openai_url:
-                        missing.append("openai-api-url")
-                if vertex_api_url or clear_vertex_api_url:
-                    running_vertex_url = _normalize_proxy_api_url(
-                        running_config.get("vertex_api_url")
-                    )
-                    requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-                    if running_vertex_url != requested_vertex_url:
-                        missing.append("vertex-api-url")
 
-                if missing:
+                if missing and not routing_mismatches:
                     flags_str = ", ".join(
                         f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
@@ -4150,7 +4745,47 @@ def _ensure_proxy(
                             )
                             return None, port
 
-            if not needs_restart:
+                # Routing-level config (backend, upstream URLs) must match in
+                # both directions. Unlike missing feature flags, reusing a
+                # proxy that forwards to a backend/upstream the caller did not
+                # request is broken, not degraded, so "reuse as-is" is never an
+                # option here (cf. the factory-api-url fail-loud precedent on
+                # the droid branch and the tenant check in wrap auggie).
+                routing_mismatches = [] if needs_restart else (routing_mismatches or [])
+                if routing_mismatches:
+                    keys_str = ", ".join(routing_mismatches)
+                    other_wrappers = helpers._live_proxy_clients(port, exclude_self=True)
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    if other_wrappers or active_sessions > 0:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}), but live session(s) are attached."
+                        )
+                        click.echo(
+                            "  Starting a dedicated proxy on a different port instead "
+                            "of reusing or disrupting it."
+                        )
+                        reuse_running = False
+                    else:
+                        click.echo(
+                            f"  Proxy on port {port} has incompatible routing config "
+                            f"({keys_str}); restarting with the requested config..."
+                        )
+                        proxy_pid = running_config.get("pid")
+                        if proxy_pid is None:
+                            raise click.ClickException(
+                                f"Proxy on port {port} has incompatible routing config "
+                                f"({keys_str}) but did not expose a PID. "
+                                "Stop it manually and retry."
+                            )
+                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                            raise click.ClickException(
+                                f"Failed to stop incompatible proxy (PID {proxy_pid}) "
+                                f"on port {port}. Stop it manually and retry."
+                            )
+                        needs_restart = True
+
+            if not needs_restart and reuse_running:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None, port
@@ -4227,6 +4862,50 @@ def _ensure_proxy(
         return None, port
 
 
+@contextmanager
+def _proxy_start_lock(port: int) -> Any:
+    """Serialize wrap proxy startup across processes sharing a port.
+
+    A proxy can spend tens of seconds loading optional ML components before it
+    binds its socket. Without this lock, two concurrent ``headroom wrap``
+    commands both see an unavailable health endpoint, choose the same port,
+    and race to spawn a listener. The lock is deliberately held through the
+    health/configuration checks and startup, then released once the proxy is
+    ready (or startup fails). Lock files are retained so an interrupted
+    process cannot create an inode-replacement race for another waiter.
+    """
+    from headroom import paths as _paths
+
+    lock_path = _paths.proxy_start_lock_path(port)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "a+b")  # noqa: SIM115
+    except OSError:
+        # Locking is a race-prevention enhancement, not a reason to make wrap
+        # unusable when a read-only/custom workspace cannot hold state. The
+        # existing port bind remains the final safety check in that degraded
+        # environment.
+        yield
+        return
+    with _locked_file(lock_file):
+        yield
+
+
+@wraps(_ensure_proxy_unlocked)
+def _ensure_proxy(
+    port: int,
+    no_proxy: bool,
+    **kwargs: Any,
+) -> tuple[subprocess.Popen | None, int]:
+    """Start or reuse a proxy without racing another wrap on the same port."""
+    if no_proxy:
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+    with _proxy_start_lock(port):
+        # Re-checking is part of the lock boundary: a concurrent wrapper may
+        # have finished startup while this caller was waiting for the lock.
+        return _ensure_proxy_unlocked(port, no_proxy, **kwargs)
+
+
 def _client_marker_path(port: int) -> Path:
     """Path to this process's wrap-client marker for ``port``."""
     from headroom import paths as _paths
@@ -4237,31 +4916,13 @@ def _client_marker_path(port: int) -> Path:
 
 
 def _proc_identity(pid: int) -> tuple[str, float] | None:
-    """Best-effort ``(source, start_time)`` identity for a PID.
+    """Module-level alias of :func:`headroom._subprocess.proc_identity`.
 
-    Used to defeat PID reuse: a marker is only trusted while the live PID is
-    *the same process* that wrote it. Returns ``None`` when start time can't be
-    determined (e.g. macOS without psutil), in which case callers fall back to
-    existence-only liveness — no regression, just no reuse protection there.
-
-    The ``source`` tag ("psutil" vs "proc") guards against comparing values in
-    different units; we only compare like-for-like.
+    Kept as a function (not an assignment) so tests can monkeypatch
+    ``wrap._proc_identity`` and have ``_identity_mismatch`` pick the patch up
+    through the module-global lookup below.
     """
-    try:
-        import psutil  # type: ignore[import-untyped]  # optional dependency; portable when present
-
-        return ("psutil", psutil.Process(pid).create_time())
-    except Exception:
-        pass
-    # Linux fallback: field 22 of /proc/<pid>/stat is starttime in clock ticks
-    # since boot — a stable per-process value. `comm` (field 2) may contain
-    # spaces/parens, so split after the final ')'.
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            fields = fh.read().rpartition(b")")[2].split()
-        return ("proc", float(fields[19]))
-    except (OSError, IndexError, ValueError):
-        return None
+    return proc_identity(pid)
 
 
 def _register_proxy_client(port: int) -> None:
@@ -4298,21 +4959,9 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _identity_mismatch(src: Any, recorded: Any, pid: int) -> bool:
-    """True only if ``pid``'s current identity *provably* differs from the
-    recorded ``(src, recorded)`` identity (i.e. the PID was recycled).
-
-    Conservative by design: any uncertainty (unknown/legacy identity, unknown
-    start time, mismatched source) returns ``False`` — never claim a mismatch
-    without proof, since the caller uses this to decide whether to trust or
-    discard state tied to a live PID.
-    """
-    if not isinstance(src, str) or not isinstance(recorded, int | float):
-        return False  # legacy / identity-less record — can't tell
-    ident = _proc_identity(pid)
-    if ident is None or ident[0] != src:
-        return False  # can't compare like-for-like — don't claim mismatch
-    # Start times are stable per process; >1s apart means a different process.
-    return abs(ident[1] - float(recorded)) > 1.0
+    """Delegate to the shared comparison, resolving the identity probe through
+    this module so monkeypatched ``_proc_identity`` keeps working in tests."""
+    return _shared_identity_mismatch(src, recorded, pid, identity_fn=_proc_identity)
 
 
 def _marker_pid_reused(marker: Path, pid: int) -> bool:
@@ -4322,6 +4971,8 @@ def _marker_pid_reused(marker: Path, pid: int) -> bool:
     try:
         rec = json.loads(_read_text(marker))
     except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
         return False
     return _identity_mismatch(rec.get("start_src"), rec.get("start_time"), pid)
 
@@ -4353,33 +5004,21 @@ def _live_proxy_clients(port: int, *, exclude_self: bool = True) -> list[int]:
 
 
 def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
-    """Create a cleanup function that terminates the proxy on exit.
-
-    Only kills the proxy when no other live headroom-wrapped clients remain,
-    tracked via per-PID marker files in ``paths.proxy_clients_dir(port)``.
+    """Create marker cleanup for a successfully launched wrap session.
 
     ``port`` can be an ``int`` or a ``list[int]``.  When a port fallback occurs
     (``_ensure_proxy`` ups the port because the requested one is busy), the
     caller can update ``port[0]`` in-place and the closure picks it up.
-    """
 
-    def _other_clients_exist() -> bool:
-        p = port[0] if isinstance(port, list) else port
-        return len(_live_proxy_clients(p, exclude_self=True)) > 0
+    Normal wrapper exit only unregisters its marker. The wrap-owned proxy's
+    watchdog owns final shutdown so active markerless HTTP or WebSocket traffic
+    receives a full grace period. Startup rollback and explicit stop commands
+    retain direct process termination.
+    """
 
     def cleanup(signum: int | None = None, frame: Any = None) -> None:
         p = port[0] if isinstance(port, list) else port
         _unregister_proxy_client(p)
-        proc = proxy_proc_holder[0] if proxy_proc_holder else None
-        if proc and proc.poll() is None:
-            if _other_clients_exist():
-                # Other clients still using the proxy — leave it running.
-                return
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
 
     return cleanup
 
@@ -4388,6 +5027,20 @@ def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
     """Keep the wrapper alive when Ctrl-C is intended for the child CLI."""
 
     return None
+
+
+def _exit_on_signal(signum: int | None = None, frame: Any = None) -> None:
+    """Unwind on SIGTERM/SIGHUP so the ``finally`` block actually runs.
+
+    Registering ``cleanup`` itself as the handler did not achieve what its call
+    site documented. A Python signal handler that returns normally does not
+    unwind the stack -- under PEP 475 the interrupted ``waitpid`` is simply
+    retried -- so the ``finally`` that restores ``settings.local.json`` never
+    ran, while the handler had already terminated the proxy underneath a child
+    that was still alive. Raising SystemExit reverses that: the settings are
+    restored and cleanup runs exactly once, from ``finally`` (#3205).
+    """
+    raise SystemExit(128 + int(signum or 0))
 
 
 def _launch_tool(
@@ -4407,6 +5060,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4421,7 +5075,13 @@ def _launch_tool(
     port_holder: list[int] = [port]
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
+    # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM. Without
+    # this the wrapper dies unhandled, the `finally` below never runs, and
+    # the proxy it spawned is reparented to PID 1 and leaks. Mirrors the
+    # SIGHUP handling on the `claude` path.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     try:
         click.echo()
@@ -4443,6 +5103,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4453,18 +5114,31 @@ def _launch_tool(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        # If port fell back, update env URLs to point at the actual port
+        # If port fell back, update environment URLs to point at the actual port.
         if actual_port != port:
             for k, v in dict(env).items():
                 env[k] = v.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+            env_vars_display = [
+                line.replace(f"127.0.0.1:{port}", f"127.0.0.1:{actual_port}")
+                for line in env_vars_display
+            ]
 
         if configure_launch is not None:
             args, env, env_vars_display = configure_launch(actual_port, args, env, env_vars_display)
+
+        # Reduce-at-source: fill in SAFE quiet-CLI env defaults for the launched
+        # agent (git/npm/pip/pytest emit less noise), unless the user opted out.
+        # Applies to every wrapped tool since they all launch through here.
+        _quiet_written = _configure_quiet_cli_env(env)
 
         click.echo()
         click.echo(f"  Launching {tool_label} (API routed through Headroom)...")
         for var in env_vars_display:
             click.echo(f"  {var}")
+        if _quiet_written:
+            click.echo(
+                f"  Quiet CLI defaults: {', '.join(_quiet_written)} (opt out: {_QUIET_CLI_ENV}=0)"
+            )
         if args:
             click.echo(f"  Extra args: {' '.join(args)}")
         _print_telemetry_notice()
@@ -4663,7 +5337,8 @@ def _copy_openclaw_plugin_into_extensions(
 
 
 @main.group()
-def wrap() -> None:
+@click.pass_context
+def wrap(ctx: click.Context) -> None:
     """Wrap CLI tools to run through Headroom.
 
     \b
@@ -4675,6 +5350,8 @@ def wrap() -> None:
         headroom wrap claude              # Claude Code (Anthropic)
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
+        headroom wrap vscode             # VS Code Copilot (preserves model picker)
+        headroom wrap vscode-claude      # VS Code Claude Code extension
         headroom wrap aider               # Aider
         headroom wrap openclaude          # OpenClaude
         headroom wrap vibe                # Mistral Vibe
@@ -4701,11 +5378,57 @@ def wrap() -> None:
     \b
     `openclaw` is a separate tool — different from opencode.
     """
+    if _should_purge_context_tools(ctx):
+        _report_context_tool_purge()
+    # Every wrap path copies os.environ into the launched agent and the proxy,
+    # and probes the proxy over loopback itself, so one fix here covers all.
+    added = _ensure_loopback_no_proxy(os.environ)
+    if added:
+        # stderr: `wrap <tool> --prepare-only` prints machine-read JSON on stdout.
+        click.echo(
+            f"  Added 127.0.0.1,localhost,::1 to {'/'.join(added)} so the agent reaches "
+            "Headroom directly instead of through your HTTP proxy.",
+            err=True,
+        )
+
+
+_LOOPBACK_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _ensure_loopback_no_proxy(env: MutableMapping[str, str]) -> list[str]:
+    """Exempt loopback from ``HTTP(S)_PROXY`` in ``env``; return the vars written.
+
+    With a corporate proxy exported and no loopback entry in ``NO_PROXY``, an
+    agent sends its ``http://127.0.0.1:<port>`` requests to the corporate proxy,
+    which cannot reach this machine and answers with a block page or 502.
+    ``NO_PROXY`` and ``no_proxy`` are merged before writing both, because tools
+    disagree on which spelling wins and dropping either side's entries would
+    re-route the user's own internal hosts.
+    """
+    from headroom.proxy.tls_diagnostics import loopback_no_proxy_gap
+
+    if loopback_no_proxy_gap(env) is None:
+        return []
+    merged: list[str] = []
+    for var in ("NO_PROXY", "no_proxy"):
+        for entry in env.get(var, "").split(","):
+            entry = entry.strip()
+            if entry and entry not in merged:
+                merged.append(entry)
+    merged.extend(h for h in _LOOPBACK_NO_PROXY_HOSTS if h not in merged)
+    value = ",".join(merged)
+    written = [var for var in ("NO_PROXY", "no_proxy") if env.get(var) != value]
+    for var in written:
+        env[var] = value
+    return written
 
 
 @main.group()
-def unwrap() -> None:
+@click.pass_context
+def unwrap(ctx: click.Context) -> None:
     """Undo durable Headroom wrapping for supported tools."""
+    if _should_purge_context_tools(ctx):
+        _report_context_tool_purge()
 
 
 @wrap.command("selfheal", hidden=True)
@@ -4763,28 +5486,10 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
+@_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
-    "--port",
-    default=8787,
-    type=click.IntRange(1, 65535),
-    help="Proxy port (default: 8787)",
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--context-tool",
-    "context_tool",
-    is_flag=True,
-    help="Enable CLI context-tool setup",
-)
+# no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
+@proxy_port_option("--port")
 @click.option(
     "--no-mcp",
     is_flag=True,
@@ -4860,8 +5565,6 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
     port: int,
-    no_rtk: bool,
-    context_tool: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -4890,24 +5593,11 @@ def claude(
         headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
-        headroom wrap claude --context-tool     # Enable CLI context-tool setup
-        headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --1m               # Preserve the 1M context window
     """
-    # RTK/context-tool is opt-in (off by default): --context-tool (legacy) and
-    # --rtk both enable it. Mirror --context-tool into HEADROOM_RTK so the central
-    # RTK gate (_rtk_opt_in) fires for the legacy flag too.
-    if context_tool:
-        os.environ["HEADROOM_RTK"] = "1"
-    setup_context_tool = (context_tool or _rtk_opt_in()) and not no_rtk
     if prepare_only:
-        if setup_context_tool:
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                _setup_lean_ctx_agent("claude", verbose=verbose)
-            else:
-                _prepare_wrap_rtk(verbose=verbose, label="Claude")
         return
 
     claude_bin = shutil.which("claude")
@@ -4920,9 +5610,10 @@ def claude(
     if tool_search is not None:
         tool_search = _normalize_tool_search_mode(tool_search)
 
-    # Setup rtk before launching (Claude-specific)
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
+    _tool_search_not_written = object()
+    _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
@@ -4931,13 +5622,19 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
+    _raise_on_claude_auth_conflict(
+        user_settings_path=claude_user_settings_path(),
+        project_settings_path=Path.cwd() / ".claude" / "settings.json",
+        project_local_settings_path=_wrap_settings_path,
+        environ=dict(os.environ),
+    )
     cleanup = _make_cleanup(proxy_holder, port_holder)
     signal.signal(signal.SIGINT, _ignore_child_sigint)
-    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGTERM, _exit_on_signal)
     if hasattr(signal, "SIGHUP"):
         # Terminal close / tmux kill-session sends SIGHUP, not SIGTERM — without
         # this, the finally block's base_url restore never runs (issue #1768).
-        signal.signal(signal.SIGHUP, cleanup)
+        signal.signal(signal.SIGHUP, _exit_on_signal)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
     if memory:
@@ -5045,16 +5742,6 @@ def claude(
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
-        if setup_context_tool:
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  Setting up lean-ctx...")
-                _setup_lean_ctx_agent("claude", verbose=verbose)
-            else:
-                click.echo("  Setting up rtk...")
-                _setup_rtk(verbose=verbose)
-        elif verbose:
-            click.echo("  Skipping CLI context tool (--no-context-tool)")
-
         if not no_mcp:
             from headroom.mcp_registry import ClaudeRegistrar
 
@@ -5063,11 +5750,11 @@ def claude(
             click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         # Coding-task compressor: Serena (retires any legacy tokensave entry).
-        from headroom.mcp_registry import ClaudeRegistrar
+        from headroom.mcp_registry import CLAUDE_SERENA_CONTEXT, ClaudeRegistrar
 
         _setup_coding_compressor(
             ClaudeRegistrar(),
-            serena_context="claude-code",
+            serena_context=CLAUDE_SERENA_CONTEXT,
             serena=serena,
             no_serena=no_serena,
             no_tokensave=no_tokensave,
@@ -5166,7 +5853,10 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            # The URL above is built from actual_port; stamping the requested
+            # port here made the marker/owner claim point at the wrong port
+            # whenever _ensure_proxy fell back to another one.
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -5180,6 +5870,11 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
+        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+        _saved_tool_search[0] = _write_claude_wrap_tool_search(
+            _resolved_tool_search_value,
+            settings_path=_wrap_settings_path,
+        )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -5203,10 +5898,18 @@ def claude(
         # force it via ANTHROPIC_MODEL on the launched process.
         if context_1m:
             env[_ANTHROPIC_MODEL_ENV] = _resolve_1m_model(env.get(_ANTHROPIC_MODEL_ENV))
-            click.echo(
-                f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
-                "(1M context window; issue #1158)"
-            )
+            # An explicit pass-through --model outranks ANTHROPIC_MODEL in Claude
+            # Code, so add the suffix there too or the env var is silently
+            # shadowed and the window stays 200k (#2915). Report what will
+            # actually take effect rather than the shadowed env value.
+            claude_args, _model_flag_1m = _apply_1m_to_claude_args(claude_args)
+            if _model_flag_1m is not None:
+                click.echo(f"  --model {_model_flag_1m} (1M context window; issue #1158)")
+            else:
+                click.echo(
+                    f"  {_ANTHROPIC_MODEL_ENV}={env[_ANTHROPIC_MODEL_ENV]} "
+                    "(1M context window; issue #1158)"
+                )
 
         result = subprocess.run([claude_bin, *claude_args], env=env)
         raise SystemExit(result.returncode)
@@ -5217,6 +5920,11 @@ def claude(
         click.echo(f"  Error: {e}")
         raise SystemExit(1) from e
     finally:
+        if _saved_tool_search[0] is not _tool_search_not_written:
+            _restore_claude_wrap_tool_search(
+                cast(str | None, _saved_tool_search[0]),
+                settings_path=_wrap_settings_path,
+            )
         _restore_claude_wrap_base_url(
             _saved_base_url[0],
             foundry_mode=_settings_foundry[0],
@@ -5231,18 +5939,48 @@ def claude(
 # =============================================================================
 
 
+def _warn_if_proxy_env_leaked(port: int) -> None:
+    """Issue #2238: surface a proxy URL that survived unwrap in the live shell.
+
+    ``unwrap_claude`` restores settings.local.json, but if ``ANTHROPIC_BASE_URL``
+    (or the Foundry/Vertex equivalents) was exported into the current shell or a
+    persistent profile, it outlives the JSON edit and Claude keeps trying to reach
+    the (now unwrapped) proxy, failing with a connection error. The user previously
+    had to discover ``Remove-Item Env:ANTHROPIC_BASE_URL`` by hand — emit it here.
+    """
+    proxy_host = f"127.0.0.1:{port}"
+    leaked = []
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"):
+        value = os.environ.get(name, "").strip()
+        if proxy_host in value:
+            leaked.append((name, value))
+    if not leaked:
+        return
+    click.echo("  ⚠ Headroom's proxy URL is still exported in this shell's environment:")
+    for name, value in leaked:
+        click.echo(f"      {name}={value}")
+    click.echo(
+        "    Claude will keep routing through the (now unwrapped) proxy and fail to connect."
+    )
+    click.echo("    Clear it for the current shell, then restart Claude Code:")
+    click.echo("      PowerShell:  Remove-Item Env:ANTHROPIC_BASE_URL")
+    click.echo("      bash/zsh:    unset ANTHROPIC_BASE_URL")
+    click.echo(
+        "    If it reappears after restart, remove it from your shell profile "
+        "(e.g. $PROFILE / ~/.bashrc / ~/.zshrc)."
+    )
+
+
 @unwrap.command("claude")
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
-@click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
 def unwrap_claude(
     port: int,
     no_stop_proxy: bool,
     keep_mcp: bool,
-    keep_rtk: bool,
 ) -> None:
     """Undo durable setup from ``headroom wrap claude``."""
     click.echo()
@@ -5281,13 +6019,10 @@ def unwrap_claude(
     else:
         click.echo("  Kept Claude MCP registrations (--keep-mcp).")
 
-    if not keep_rtk:
-        if _remove_claude_rtk_hooks():
-            click.echo("  Removed rtk Claude hook from settings.json.")
-        else:
-            click.echo("  No rtk Claude hook found in settings.json.")
+    if _remove_claude_managed_hooks():
+        click.echo("  Removed Headroom-managed hooks and proxy env from settings.json.")
     else:
-        click.echo("  Kept rtk Claude hooks (--keep-rtk).")
+        click.echo("  No Headroom-managed hooks found in settings.json.")
 
     _unwrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
     if _remove_claude_wrap_selfheal_hook(_unwrap_settings_path):
@@ -5303,7 +6038,18 @@ def unwrap_claude(
             foundry_mode=_foundry,
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
+            # unwrap is the user asking for their settings back, so it drops
+            # every wrap session's claim rather than deferring to a live
+            # sibling and silently doing nothing (#3205).
+            force=True,
         )
+
+    # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
+    # exported into the live shell (or a persistent profile) survives unwrap and
+    # leaves Claude unable to reach the real API ("connection error" until the
+    # user manually runs `Remove-Item Env:ANTHROPIC_BASE_URL`). Warn loudly and
+    # give the exact per-shell fix instead of leaving the user to discover it.
+    _warn_if_proxy_env_leaked(port)
 
     click.echo()
     clean_unwrap = True
@@ -5338,17 +6084,8 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
     "--backend",
@@ -5385,11 +6122,18 @@ def _require_copilot_subscription_resolution() -> CopilotSubscriptionTokenResolu
     ),
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--native",
+    is_flag=True,
+    help=(
+        "Route Copilot's own GitHub-authenticated API through Headroom instead of "
+        "the single-model BYOK override. Keeps native model aliases and /model switching."
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     backend: str | None,
     anyllm_provider: str | None,
@@ -5398,6 +6142,7 @@ def copilot(
     wire_api: str | None,
     subscription: bool,
     memory: bool,
+    native: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -5415,7 +6160,6 @@ def copilot(
         headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
         headroom wrap copilot --subscription -- --model gpt-4.1
-        headroom wrap copilot --no-context-tool -- --prompt "explain this file"
 
     \b
     Copilot hosted API (--subscription and the implicit OAuth path) routes to the
@@ -5433,6 +6177,7 @@ def copilot(
         )
         raise SystemExit(1)
 
+    explicit_subscription = subscription
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
     if _check_proxy(port):
         running_backend = _detect_running_proxy_backend(port)
@@ -5442,6 +6187,17 @@ def copilot(
                 f"Stop it or rerun with --backend {running_backend}."
             )
         effective_backend = running_backend or effective_backend
+
+    if native:
+        subscription = True
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--native does not use the BYOK provider override; drop --provider-type anthropic."
+            )
+        if wire_api is not None:
+            raise click.ClickException(
+                "--native selects the wire per request; drop the BYOK-only --wire-api option."
+            )
 
     effective_provider_type = _resolve_copilot_provider_type(effective_backend, provider_type)
     if subscription:
@@ -5462,17 +6218,6 @@ def copilot(
         backend=effective_backend,
     )
 
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Copilot...")
-            _setup_lean_ctx_agent("copilot", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Copilot...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                copilot_instructions = Path.cwd() / ".github" / "copilot-instructions.md"
-                _inject_rtk_instructions(copilot_instructions, verbose=verbose)
-
     env = os.environ.copy()
     _scrub_copilot_proxy_seed_env(env)
     openai_api_url: str | None = None
@@ -5481,12 +6226,22 @@ def copilot(
     copilot_api_token_expires_at: float | None = None
     client_bearer: str | None = None
     subscription_resolution: CopilotSubscriptionTokenResolution | None = None
-    if _should_use_copilot_oauth(
+    anthropic_api_url: str | None = None
+    use_copilot_oauth = _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
         env=env,
         force_subscription=subscription,
-    ):
+    )
+    # Without a provider key, the old implicit OAuth lane still configured
+    # Copilot as a one-model BYOK client. Native aliases (and runtime /model
+    # switches) were then forwarded literally and rejected by GitHub (#1910).
+    # Explicit --subscription remains on its existing fixed-wire behavior;
+    # implicit GitHub OAuth uses Copilot's own routing automatically.
+    if use_copilot_oauth and not explicit_subscription:
+        native = True
+
+    if use_copilot_oauth:
         if subscription:
             subscription_resolution = _require_copilot_subscription_resolution()
             client_bearer = subscription_resolution.token
@@ -5499,7 +6254,35 @@ def copilot(
                 "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
-        selected_model = _copilot_model_from_args(copilot_args, env)
+        if native:
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env, env_vars_display = _build_copilot_native_launch_env(
+                port=port,
+                environ=env,
+                project=_project_name_from_cwd(),
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env["ANTHROPIC_TARGET_API_URL"] = openai_api_url
+            anthropic_api_url = openai_api_url
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            support = _native_api_url_supported(environ=os.environ)
+            if support is False:
+                raise click.ClickException(
+                    "This Copilot CLI build does not reference COPILOT_API_URL; refusing "
+                    "a native launch that could silently bypass Headroom."
+                )
+            if support is None and verbose:
+                click.echo("  Note: could not verify this Copilot CLI's COPILOT_API_URL support.")
+        else:
+            selected_model = _copilot_model_from_args(copilot_args, env)
 
         # ``--model auto`` is a Copilot-internal routing token that the BYOK
         # API rejects with ``400 The requested model is not supported``.  In
@@ -5507,7 +6290,7 @@ def copilot(
         # Copilot's own native auto-selection works fine — we just need to
         # strip the ``--model auto`` flag before launch so Copilot doesn't
         # forward it to the provider endpoint.
-        if _is_auto_model(selected_model):
+        if not native and _is_auto_model(selected_model):
             copilot_args = _strip_auto_model_args(copilot_args)
             selected_model = None
             click.echo(
@@ -5516,54 +6299,58 @@ def copilot(
                 "automatic model selection."
             )
 
-        effective_wire_api = wire_api or (
-            _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
-        )
-        env["COPILOT_PROVIDER_TYPE"] = "openai"
-        # Per-project savings: the Copilot CLI cannot send custom headers, so
-        # the project rides as a /p/<name> base-URL prefix the proxy strips.
-        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
-            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
-        )
-        env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
-        env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
-        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        env.pop("COPILOT_PROVIDER_API_KEY", None)
-        # Hand the exact token we resolved (and, for --subscription, validated
-        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
-        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
-        # deterministic instead of the proxy re-running unvalidated discovery
-        # (read_cached_oauth_token returns the *first* candidate, which may not
-        # be the one the wrapper approved → environment-dependent 401s). Passing
-        # it as a launch argument — rather than mutating this process's global
-        # os.environ — keeps the token off shared state and out of unrelated
-        # code paths.
-        copilot_proxy_token = client_bearer
-        if subscription_resolution is not None:
-            copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
-            copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
-        env_vars_display = [
-            "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
-            f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            (
-                "COPILOT_AUTH_MODE=github-subscription-experimental"
-                if subscription
-                else "COPILOT_AUTH_MODE=github-oauth"
-            ),
-        ]
-        # Non-subscription OAuth keeps upstream's generic-host policy from
-        # #610. Subscription mode can use the endpoint returned by the Copilot
-        # token exchange, which is how Business accounts advertise their API
-        # host without requiring users to configure it manually.
-        openai_api_url = (
-            subscription_resolution.api_url
-            if subscription_resolution is not None
-            else resolve_copilot_api_url(client_bearer)
-        )
-        env["GITHUB_COPILOT_API_URL"] = openai_api_url
-        env["OPENAI_TARGET_API_URL"] = openai_api_url
-        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+        if not native:
+            env_wire_api = env.get("COPILOT_PROVIDER_WIRE_API")
+            effective_wire_api = wire_api or (
+                env_wire_api
+                if env_wire_api in {"completions", "responses"}
+                else _copilot_default_wire_api_for_model(selected_model)
+            )
+            env["COPILOT_PROVIDER_TYPE"] = "openai"
+            # Per-project savings: the Copilot CLI cannot send custom headers, so
+            # the project rides as a /p/<name> base-URL prefix the proxy strips.
+            env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+                f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+            )
+            env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
+            env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+            env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+            env.pop("COPILOT_PROVIDER_API_KEY", None)
+            # Hand the exact token we resolved (and, for --subscription, validated
+            # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+            # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+            # deterministic instead of the proxy re-running unvalidated discovery
+            # (read_cached_oauth_token returns the *first* candidate, which may not
+            # be the one the wrapper approved → environment-dependent 401s). Passing
+            # it as a launch argument — rather than mutating this process's global
+            # os.environ — keeps the token off shared state and out of unrelated
+            # code paths.
+            copilot_proxy_token = client_bearer
+            if subscription_resolution is not None:
+                copilot_refresh_oauth_token = subscription_resolution.refresh_oauth_token
+                copilot_api_token_expires_at = subscription_resolution.api_token_expires_at
+            env_vars_display = [
+                "COPILOT_PROVIDER_TYPE=openai",
+                f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
+                f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
+                (
+                    "COPILOT_AUTH_MODE=github-subscription-experimental"
+                    if subscription
+                    else "COPILOT_AUTH_MODE=github-oauth"
+                ),
+            ]
+            # Non-subscription OAuth keeps upstream's generic-host policy from
+            # #610. Subscription mode can use the endpoint returned by the Copilot
+            # token exchange, which is how Business accounts advertise their API
+            # host without requiring users to configure it manually.
+            openai_api_url = (
+                subscription_resolution.api_url
+                if subscription_resolution is not None
+                else resolve_copilot_api_url(client_bearer)
+            )
+            env["GITHUB_COPILOT_API_URL"] = openai_api_url
+            env["OPENAI_TARGET_API_URL"] = openai_api_url
+            env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -5586,7 +6373,7 @@ def copilot(
             )
             raise SystemExit(1)
 
-    if not subscription and not _copilot_model_configured(copilot_args, env):
+    if not subscription and not native and not _copilot_model_configured(copilot_args, env):
         # Distinguish between "--model auto" (wrong model for BYOK) and
         # genuinely missing model (no --model flag at all).
         raw_model = _copilot_model_from_args(copilot_args, env)
@@ -5623,10 +6410,199 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        anthropic_api_url=anthropic_api_url,
         copilot_api_token=copilot_proxy_token,
         copilot_refresh_oauth_token=copilot_refresh_oauth_token,
         copilot_api_token_expires_at=copilot_api_token_expires_at,
     )
+
+
+# =============================================================================
+# GitHub Copilot CLI (unwrap)
+# =============================================================================
+
+
+@wrap.command("vscode")
+@proxy_port_option()
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path (Insiders, VSCodium, portable profiles)",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Safely add/update Headroom's transparent Copilot proxy settings",
+)
+def vscode_copilot(
+    port: int,
+    memory: bool,
+    settings_file: Path | None,
+    configure: bool,
+) -> None:
+    """Run Headroom for GitHub Copilot inside Visual Studio Code.
+
+    Transparently overrides Copilot's proxy and CAPI endpoints, preserving the
+    model selected in VS Code. It does not edit Codex settings.
+    """
+    resolution = _require_copilot_subscription_resolution()
+    target_settings = settings_file or vscode_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        if configure:
+            action = configure_vscode_proxy_settings(
+                target_settings,
+                vscode_proxy_url(actual_port, _project_name_from_cwd()),
+            )
+            click.echo(f"  VS Code Copilot proxy settings {action}: {target_settings}")
+            click.echo(
+                "  Keep using Copilot's normal model picker; the selected model is preserved."
+            )
+            return
+        click.echo("  Add these user settings to VS Code:")
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideProxyUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}",'
+        )
+        click.echo(
+            f'  "github.copilot.advanced.debug.overrideCapiUrl": "{vscode_proxy_url(actual_port, _project_name_from_cwd())}"'
+        )
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE COPILOT",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="copilot",
+        print_setup_lines=_print_setup,
+        openai_api_url=resolution.api_url,
+        copilot_api_token=resolution.token,
+        copilot_refresh_oauth_token=resolution.refresh_oauth_token,
+        copilot_api_token_expires_at=resolution.api_token_expires_at,
+    )
+
+
+@unwrap.command("vscode")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override settings.json path",
+)
+def unwrap_vscode_copilot(settings_file: Path | None) -> None:
+    """Remove only Headroom's transparent VS Code Copilot proxy settings."""
+    target_settings = settings_file or vscode_settings_path()
+    if remove_vscode_proxy_settings(target_settings):
+        click.echo(f"Removed Headroom Copilot proxy settings from {target_settings}")
+    else:
+        click.echo(f"No Headroom Copilot proxy settings found in {target_settings}")
+
+
+# =============================================================================
+# Claude Code for VS Code
+# =============================================================================
+
+
+@wrap.command("vscode-claude")
+@proxy_port_option()
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override Claude Code user settings.json path",
+)
+@click.option(
+    "--configure/--no-configure",
+    default=True,
+    help="Safely add/update Claude Code's proxy environment settings",
+)
+@click.option(
+    "--1m",
+    "context_1m",
+    is_flag=True,
+    help=(
+        "Persist Claude Code's [1m] model selector in settings for the 1M "
+        "context window (issue #3360)."
+    ),
+)
+def vscode_claude(
+    port: int,
+    memory: bool,
+    settings_file: Path | None,
+    configure: bool,
+    context_1m: bool,
+) -> None:
+    """Route VS Code's official Claude Code extension through Headroom.
+
+    Run this from your project, reload VS Code after first setup, and keep this
+    command running while using Claude Code. Authentication and model selection
+    remain unchanged. Use --1m to opt into Claude Code's client-owned 1M model
+    selector. Run `headroom unwrap vscode-claude` to restore settings.
+    """
+    target_settings = settings_file or claude_user_settings_path()
+
+    def _print_setup(actual_port: int) -> None:
+        proxy_url = vscode_claude_proxy_url(actual_port, _project_name_from_cwd())
+        if configure:
+            action = configure_vscode_claude_settings(
+                target_settings, proxy_url, context_1m=context_1m
+            )
+            click.echo(f"  VS Code Claude Code proxy settings {action}: {target_settings}")
+            if context_1m:
+                click.echo(
+                    f"  1M context model persisted: {resolve_vscode_claude_model(target_settings)}"
+                )
+            click.echo("  Next: Reload VS Code, then use the Claude Code panel.")
+            click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
+            if context_1m:
+                click.echo("  Authentication is preserved; the 1M model selector is enabled.")
+            else:
+                click.echo("  Authentication and the selected Claude model are preserved.")
+            click.echo("  Undo later with: headroom unwrap vscode-claude")
+            click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
+            return
+        click.echo(f"  Add these values under 'env' in {target_settings}:")
+        click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')
+        click.echo(f'  "{_TOOL_SEARCH_ENV}": "{_TOOL_SEARCH_DEFAULT}"')
+        if context_1m:
+            click.echo(f"  Add this top-level setting to {target_settings}:")
+            click.echo(
+                f'  "model": "{resolve_vscode_claude_model_for_instructions(target_settings)}"'
+            )
+
+    _run_proxy_only_watcher(
+        agent_label="VS CODE CLAUDE",
+        port=port,
+        no_proxy=False,
+        learn=False,
+        memory=memory,
+        agent_type="claude",
+        print_setup_lines=_print_setup,
+    )
+
+
+@unwrap.command("vscode-claude")
+@click.option(
+    "--settings-file",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Override Claude Code user settings.json path",
+)
+def unwrap_vscode_claude(settings_file: Path | None) -> None:
+    """Restore settings saved by `headroom wrap vscode-claude`.
+
+    Reload the VS Code window afterward. If setup used --settings-file, pass the
+    same path here.
+    """
+    target_settings = settings_file or claude_user_settings_path()
+    if remove_vscode_claude_settings(target_settings):
+        click.echo(f"Restored Claude Code settings in {target_settings}")
+        click.echo("Reload the VS Code window to apply the restored settings.")
+    else:
+        click.echo(f"No Headroom VS Code Claude settings found for {target_settings}")
 
 
 # =============================================================================
@@ -5641,12 +6617,6 @@ def copilot(
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
     """Undo durable setup from ``headroom wrap copilot``."""
-    instructions = Path.cwd() / ".github" / "copilot-instructions.md"
-    if _remove_rtk_instructions(instructions):
-        click.echo("  Removed Headroom rtk instructions from Copilot.")
-    else:
-        click.echo("  No Headroom rtk instructions found for Copilot.")
-
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
@@ -5659,17 +6629,26 @@ def unwrap_copilot(port: int, no_stop_proxy: bool) -> None:
 def _prepare_codex_wrap_state(
     *,
     port: int,
-    no_rtk: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
     no_serena: bool,
     memory: bool,
     verbose: bool,
-    rtk_home: Path | None = None,
     persistent_routing: bool = True,
 ) -> None:
     """Prepare the active Codex home for a wrap or prepare-only invocation."""
+    # Ensure the Codex home exists before anything tries to detect or write it.
+    # ``CodexRegistrar.detect()`` is just ``self._codex_dir.is_dir()``, and until
+    # now the directory was created as a *side effect* of injecting the rtk
+    # guidance into ``$CODEX_HOME/AGENTS.md``. With the CLI context tools removed
+    # nothing creates it, so on a machine where Codex is installed but has never
+    # been launched, detect() returned False and Headroom silently skipped the
+    # MCP registration — no ``headroom_retrieve``, so every compression marker
+    # the proxy emits would be unresolvable. (Latent since #2344 made rtk
+    # opt-in; the wrap e2e only masked it by exporting HEADROOM_RTK=1.)
+    _codex_home_dir().mkdir(parents=True, exist_ok=True)
+
     # Snapshot Codex config.toml BEFORE any wrap-time mutation so
     # `headroom unwrap codex` can restore the user's pre-wrap state
     # byte-for-byte. The snapshot is a no-op if the backup already exists
@@ -5679,19 +6658,6 @@ def _prepare_codex_wrap_state(
     if persistent_routing:
         _codex_config_file, _codex_backup_file = _codex_config_paths()
         _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
-
-    # Setup CLI context tool for Codex.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Codex...")
-            _setup_lean_ctx_agent("codex", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Codex...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                # Keep RTK guidance local to the user's Codex configuration.
-                global_agents = (rtk_home or _codex_home_dir()) / "AGENTS.md"
-                _inject_rtk_instructions(global_agents, verbose=verbose)
 
     # Register headroom MCP server in Codex config.toml so Codex can
     # call headroom_retrieve on compression markers from the proxy.
@@ -5774,7 +6740,6 @@ def _prepare_codex_wrap_state(
 def _run_codex_wrap(
     *,
     port: int,
-    no_rtk: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -5791,10 +6756,12 @@ def _run_codex_wrap(
     codex_args: tuple,
 ) -> None:
     """Execute the Codex wrap flow against the durable Codex home."""
+    if not no_proxy:
+        ensure_proxy_dependencies()
+
     if prepare_only:
         _prepare_codex_wrap_state(
             port=port,
-            no_rtk=no_rtk,
             no_mcp=no_mcp,
             no_tokensave=no_tokensave,
             serena=serena,
@@ -5814,14 +6781,12 @@ def _run_codex_wrap(
     _offer_dangling_codex_recovery(active_codex_home)
     _prepare_codex_wrap_state(
         port=port,
-        no_rtk=no_rtk,
         no_mcp=no_mcp,
         no_tokensave=no_tokensave,
         serena=serena,
         no_serena=no_serena,
         memory=memory,
         verbose=verbose,
-        rtk_home=active_codex_home,
         persistent_routing=False,
     )
 
@@ -5861,18 +6826,9 @@ def _run_codex_wrap(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
+@_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@proxy_port_option()
 @click.option(
     "--no-mcp",
     is_flag=True,
@@ -5925,7 +6881,6 @@ def _run_codex_wrap(
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
 def codex(
     port: int,
-    no_rtk: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -5945,16 +6900,13 @@ def codex(
 
     \b
     Sets OPENAI_BASE_URL to route all OpenAI API calls through Headroom.
-    Sets up the selected CLI context tool so Codex uses token-optimized
-    commands (60-90% savings on shell output). Also
-    registers the headroom MCP server in the active Codex config file
+    Also registers the headroom MCP server in the active Codex config file
     so Codex can call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
-        headroom wrap codex                         # Start proxy + context tool + mcp + codex
+        headroom wrap codex                         # Start proxy + mcp + codex
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
-        headroom wrap codex --no-context-tool       # Skip CLI context-tool setup
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap codex --code-memory none      # No code-memory MCP
         headroom wrap codex --port 9999             # Custom proxy port
@@ -5962,7 +6914,6 @@ def codex(
     """
     return _run_codex_wrap(
         port=port,
-        no_rtk=no_rtk,
         no_mcp=no_mcp,
         no_tokensave=no_tokensave,
         serena=serena,
@@ -5986,17 +6937,8 @@ def codex(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6015,7 +6957,6 @@ def codex(
 @click.argument("aider_args", nargs=-1, type=click.UNPROCESSED)
 def aider(
     port: int,
-    no_rtk: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -6031,29 +6972,14 @@ def aider(
 
     \b
     Sets OPENAI_API_BASE to route all API calls through Headroom.
-    Sets up the selected CLI context tool so aider uses token-optimized commands.
 
     \b
     Examples:
-        headroom wrap aider                              # Start proxy + context tool + aider
+        headroom wrap aider                              # Start proxy + aider
         headroom wrap aider -- --model gpt-4o            # Use GPT-4o
         headroom wrap aider -- --model claude-sonnet-4   # Use Claude
-        headroom wrap aider --no-context-tool            # Skip CLI context-tool setup
         headroom wrap aider --backend litellm-vertex --region us-central1
     """
-    # Setup CLI context tool for aider.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for aider...")
-            _setup_lean_ctx_agent("aider", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for aider...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                # aider reads CONVENTIONS.md from project root
-                conventions = Path.cwd() / "CONVENTIONS.md"
-                _inject_rtk_instructions(conventions, verbose=verbose)
-
     if prepare_only:
         return
 
@@ -6086,125 +7012,13 @@ def aider(
 
 
 # =============================================================================
-# OpenClaude
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openclaude_args", nargs=-1, type=click.UNPROCESSED)
-def openclaude(
-    port: int,
-    no_rtk: bool,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openclaude_args: tuple,
-) -> None:
-    """Launch OpenClaude through Headroom proxy.
-
-    \b
-    OpenClaude is a prose-format coding CLI (like Aider / Cline); it speaks
-    OpenAI- and Anthropic-compatible HTTP, so wrap routes both base URLs
-    through the local proxy — same env shape as `wrap aider`.
-
-    \b
-    Examples:
-        headroom wrap openclaude                         # Start proxy + openclaude
-        headroom wrap openclaude -- --model gpt-4o       # Pass args to openclaude
-        headroom wrap openclaude --no-context-tool       # Skip CLI context-tool setup
-    """
-    openclaude_instructions: Path | None = (
-        Path.cwd() / _OPENCLAUDE_INSTRUCTIONS_FILE if not no_rtk else None
-    )
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="openclaude",
-            agent_display="OpenClaude",
-            marker_path=openclaude_instructions,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, openclaude_instructions), verbose=verbose
-            ),
-            verbose=verbose,
-        )
-
-    if prepare_only:
-        return
-
-    openclaude_bin = shutil.which("openclaude")
-    if not openclaude_bin:
-        click.echo("Error: 'openclaude' not found in PATH.")
-        click.echo("Install OpenClaude before running `headroom wrap openclaude`.")
-        raise SystemExit(1)
-
-    env, env_vars_display = _build_aider_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
-
-    _launch_tool(
-        binary=openclaude_bin,
-        args=openclaude_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENCLAUDE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openclaude",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
 # Mistral Vibe
 # =============================================================================
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup (no effect for vibe)",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6218,7 +7032,6 @@ def openclaude(
 @click.argument("vibe_args", nargs=-1, type=click.UNPROCESSED)
 def vibe(
     port: int,
-    no_rtk: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -6237,7 +7050,6 @@ def vibe(
         headroom wrap vibe                         # Start proxy + vibe
         headroom wrap vibe -- "fix the bug"        # Pass prompt to vibe
         headroom wrap vibe --port 9999             # Custom proxy port
-        headroom wrap vibe --no-context-tool       # Skip CLI context-tool setup
     """
     if prepare_only:
         return
@@ -6274,17 +7086,8 @@ def vibe(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup (no effect for kimi)",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -6303,7 +7106,6 @@ def vibe(
 @click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
 def kimi(
     port: int,
-    no_rtk: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -6316,9 +7118,10 @@ def kimi(
     """Launch Kimi CLI through Headroom proxy.
 
     \b
-    Sets KIMI_BASE_URL to route Kimi's OpenAI-compatible /chat/completions
-    traffic through Headroom. Kimi's own OAuth bearer is forwarded upstream,
-    so no extra login is required — run `kimi` once to authenticate first.
+    Sets KIMI_CODE_BASE_URL for managed Kimi Code and KIMI_BASE_URL for legacy
+    kimi-cli to route OpenAI-compatible /chat/completions traffic through
+    Headroom. Managed Kimi Code needs one `/login` after the proxy URL changes
+    so its OAuth slot matches that URL; legacy kimi-cli keeps its existing login.
 
     \b
     Examples:
@@ -6336,9 +7139,20 @@ def kimi(
         click.echo("Install Kimi CLI: https://github.com/MoonshotAI/kimi-cli")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_kimi_launch_env(
-        port, os.environ, project=_project_name_from_cwd()
-    )
+    project = _project_name_from_cwd()
+    env, env_vars_display = _build_kimi_launch_env(port, os.environ, project=project)
+
+    def configure_kimi_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        del current_display
+        updated_env, updated_display = _build_kimi_launch_env(
+            actual_port, current_env, project=project
+        )
+        return current_args, updated_env, updated_display
 
     _launch_tool(
         binary=kimi_bin,
@@ -6353,6 +7167,7 @@ def kimi(
         agent_type="kimi",
         code_graph=code_graph,
         openai_api_url=kimi_api_url,
+        configure_launch=configure_kimi_launch,
     )
 
 
@@ -6362,18 +7177,9 @@ def kimi(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
+@_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @_code_memory_option
 @click.option(
@@ -6414,7 +7220,6 @@ def kimi(
 @click.argument("grok_args", nargs=-1, type=click.UNPROCESSED)
 def grok(
     port: int,
-    no_rtk: bool,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -6433,30 +7238,18 @@ def grok(
     """Launch Grok CLI through Headroom proxy.
 
     \b
-    Sets ``GROK_CLI_CHAT_PROXY_BASE_URL`` so Grok routes inference traffic
-    through Headroom. Registers the headroom MCP server in ``~/.grok/config.toml``
-    so Grok can call ``headroom_retrieve`` on compression markers.
+    Sets ``GROK_MODELS_BASE_URL`` so Grok routes inference traffic through
+    Headroom while preserving native settings and authentication routing.
+    Registers the headroom MCP server in ``~/.grok/config.toml`` so Grok can
+    call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
-        headroom wrap grok                         # Start proxy + context tool + grok
+        headroom wrap grok                         # Start proxy + grok
         headroom wrap grok -- -p "fix the bug"     # Pass prompt to grok
-        headroom wrap grok --no-context-tool       # Skip CLI context-tool setup
         headroom wrap grok --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap grok --port 9999             # Custom proxy port
     """
-    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="grok",
-            agent_display="Grok",
-            marker_path=agents_md,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, agents_md), verbose=verbose
-            ),
-            verbose=verbose,
-        )
-
     if not no_mcp:
         from headroom.mcp_registry import GrokRegistrar
 
@@ -6504,7 +7297,7 @@ def grok(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        openai_api_url="https://api.x.ai",
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 
@@ -6514,17 +7307,8 @@ def grok(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to .cursor/rules/)"
@@ -6534,7 +7318,6 @@ def grok(
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def cursor(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6545,8 +7328,8 @@ def cursor(
 
     \b
     Cursor reads its API configuration from its settings UI, not from
-    environment variables. This command starts the proxy, sets up the selected
-    CLI context tool, and prints the Cursor settings.
+    environment variables. This command starts the proxy and prints the Cursor
+    settings.
 
     \b
     After running this command, open Cursor and configure:
@@ -6554,55 +7337,15 @@ def cursor(
 
     \b
     Example:
-        headroom wrap cursor                # Start proxy + context-tool instructions
-        headroom wrap cursor --no-context-tool  # Proxy only, no CLI context tool
+        headroom wrap cursor                # Start proxy + Cursor settings
         headroom wrap cursor --port 9999    # Custom proxy port
     """
-    cursorrules: Path | None = Path.cwd() / ".cursorrules" if not no_rtk else None
-    cursor_hook_registered = False
-    if not no_rtk:
-
-        def _register_cursor_hook(rtk_path: Path) -> None:
-            # rtk registers a native hook for Cursor (`rtk init --agent cursor`),
-            # same mechanism as Claude Code. Prefer that over injecting the
-            # RTK_INSTRUCTIONS_BLOCK text into .cursorrules — a silent hook makes
-            # the custom-rules text redundant guidance (GH #756).
-            nonlocal cursor_hook_registered
-            from headroom.rtk.installer import register_agent_hooks
-
-            # rtk may exit 0 without writing hooks.json (e.g. an rtk build that
-            # doesn't support --agent cursor), so trust the file, not the exit
-            # code: only skip the .cursorrules fallback if the native hook is
-            # actually on disk (GH #756).
-            cursor_hooks_json = Path.home() / ".cursor" / "hooks.json"
-            if register_agent_hooks(rtk_path, agent="cursor") and cursor_hooks_json.is_file():
-                cursor_hook_registered = True
-            else:
-                _inject_rtk_instructions(cast(Path, cursorrules), verbose=verbose)
-
-        _setup_context_tool_for_agent(
-            agent="cursor",
-            agent_display="Cursor",
-            marker_path=cursorrules,
-            on_rtk_ready=_register_cursor_hook,
-            verbose=verbose,
-        )
-
     if prepare_only:
         return
 
     def _print_cursor_setup(actual_port: int) -> None:
         for line in _render_cursor_setup_lines(actual_port, project=_project_name_from_cwd()):
             click.echo(line)
-        if not no_rtk:
-            click.echo()
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  lean-ctx configured for Cursor")
-            elif cursor_hook_registered:
-                click.echo("  rtk hook registered for Cursor")
-            else:
-                click.echo("  rtk instructions injected into .cursorrules")
-            click.echo("  Cursor will use token-optimized commands automatically.")
 
     _run_proxy_only_watcher(
         agent_label="cursor",
@@ -6621,17 +7364,8 @@ def cursor(
 
 
 @wrap.command("grok-build", context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6639,7 +7373,6 @@ def cursor(
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def grok_build(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6650,31 +7383,16 @@ def grok_build(
 
     \b
     Grok Build reads model endpoints from ``~/.grok/config.toml``. This
-    command starts the proxy, optionally sets up the selected CLI context
-    tool, injects a Headroom-managed ``[model.grok-build]`` override, and
-    prints next steps.
+    command starts the proxy (upstream ``https://api.x.ai``, same as
+    ``wrap grok``), injects a Headroom-managed ``[model.grok-build]``
+    override, and prints next steps.
 
     \b
     Example:
         headroom wrap grok-build
-        headroom wrap grok-build --no-context-tool
         headroom wrap grok-build --port 9999
     """
     project = _project_name_from_cwd()
-    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="grok_build",
-            agent_display="Grok Build",
-            marker_path=agents_md,
-            on_rtk_ready=lambda _rtk: (
-                _inject_rtk_instructions(cast(Path, agents_md), verbose=verbose)
-                if agents_md is not None
-                else None
-            ),
-            verbose=verbose,
-        )
-
     if prepare_only:
         try:
             config_file = inject_grok_provider_config(port, project=project)
@@ -6693,14 +7411,9 @@ def grok_build(
             click.echo()
         for line in _render_grok_build_setup_lines(actual_port, project=project):
             click.echo(line)
-        if not no_rtk:
-            click.echo()
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  lean-ctx configured for Grok Build")
-            else:
-                click.echo("  rtk instructions injected into AGENTS.md")
-            click.echo("  Grok Build will use token-optimized commands automatically.")
 
+    # Client hop is local proxy via config.toml; upstream must be xAI (not
+    # the OpenAI default). Omitting this caused 401s with Grok auth headers.
     _run_proxy_only_watcher(
         agent_label="grok-build",
         port=port,
@@ -6709,6 +7422,7 @@ def grok_build(
         memory=memory,
         agent_type="grok_build",
         print_setup_lines=_print_grok_build_setup,
+        openai_api_url=_GROK_DEFAULT_API_URL,
     )
 
 
@@ -6718,17 +7432,8 @@ def grok_build(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6736,7 +7441,6 @@ def grok_build(
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def cline(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6748,44 +7452,21 @@ def cline(
     \b
     Cline is a VS Code extension that reads its API configuration from the
     VS Code settings UI, not from environment variables. This command starts
-    the proxy, sets up the selected CLI context tool (injecting RTK guidance
-    into .clinerules at the project root), and prints the Cline settings the
-    user should configure.
+    the proxy and prints the Cline settings the user should configure.
 
     \b
     After running this command, open Cline's settings in VS Code and configure
     the API Base URL to point at the local Headroom proxy.
 
     \b
-    Uninstall: there is no ``headroom unwrap cline`` subcommand. To remove the
-    injected guidance, hand-edit ``.clinerules`` at the project root and
-    delete everything between ``<!-- headroom:rtk-instructions -->`` and
-    ``<!-- /headroom:rtk-instructions -->`` (inclusive). If ``lean-ctx`` mode
-    is selected, the lean-ctx agent name ``cline`` may not be recognized by
-    the local lean-ctx binary; a warning is printed in that case and setup
-    is skipped silently.
+    Uninstall: there is no ``headroom unwrap cline`` subcommand — nothing is
+    written to the project.
 
     \b
     Examples:
-        headroom wrap cline                  # Start proxy + .clinerules instructions
-        headroom wrap cline --no-context-tool # Proxy only, no CLI context tool
+        headroom wrap cline                  # Start proxy + Cline settings
         headroom wrap cline --port 9999      # Custom proxy port
     """
-    # Pre-compute the marker path so the KeyboardInterrupt handler can report
-    # its location even if the interrupt fires before _inject_rtk_instructions
-    # returns (e.g., during the inner _ensure_rtk_binary download).
-    clinerules: Path | None = Path.cwd() / ".clinerules" if not no_rtk else None
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="cline",
-            agent_display="Cline",
-            marker_path=clinerules,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, clinerules), verbose=verbose
-            ),
-            verbose=verbose,
-        )
-
     if prepare_only:
         return
 
@@ -6796,13 +7477,6 @@ def cline(
         click.echo("    Settings > Cline > API Provider")
         click.echo(f"    Anthropic Base URL: {anthropic_base}")
         click.echo(f"    OpenAI Compatible Base URL: {openai_base}")
-        if not no_rtk:
-            click.echo()
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  lean-ctx configured for Cline")
-            else:
-                click.echo("  rtk instructions injected into .clinerules")
-            click.echo("  Cline will use token-optimized commands automatically.")
 
     _run_proxy_only_watcher(
         agent_label="cline",
@@ -6821,17 +7495,8 @@ def cline(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6839,7 +7504,6 @@ def cline(
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def zcode(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6851,9 +7515,7 @@ def zcode(
     \b
     ZCode is a desktop Electron app that reads its API configuration from
     the settings UI, not from environment variables. This command starts the
-    proxy, sets up the selected CLI context tool (injecting RTK guidance into
-    AGENTS.md at the project root), and prints the ZCode settings the user
-    should configure.
+    proxy and prints the ZCode settings the user should configure.
 
     \b
     After running this command, open ZCode and configure:
@@ -6862,22 +7524,9 @@ def zcode(
 
     \b
     Example:
-        headroom wrap zcode                # Start proxy + context-tool instructions
-        headroom wrap zcode --no-context-tool  # Proxy only, no CLI context tool
+        headroom wrap zcode                # Start proxy + ZCode settings
         headroom wrap zcode --port 9999    # Custom proxy port
     """
-    agents_md: Path | None = Path.cwd() / "AGENTS.md" if not no_rtk else None
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="zcode",
-            agent_display="ZCode",
-            marker_path=agents_md,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, agents_md), verbose=verbose
-            ),
-            verbose=verbose,
-        )
-
     if prepare_only:
         return
 
@@ -6890,13 +7539,6 @@ def zcode(
         click.echo()
         for line in _render_zcode_setup_lines(actual_port):
             click.echo(line)
-        if not no_rtk:
-            click.echo()
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  lean-ctx configured for ZCode")
-            else:
-                click.echo("  rtk instructions injected into AGENTS.md")
-            click.echo("  ZCode will use token-optimized commands automatically.")
 
     _run_proxy_only_watcher(
         agent_label="zcode",
@@ -6917,17 +7559,8 @@ def zcode(
 
 
 @wrap.command("continue", context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6942,7 +7575,6 @@ def zcode(
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def continue_dev(
     port: int,
-    no_rtk: bool,
     no_proxy: bool,
     learn: bool,
     memory: bool,
@@ -6955,9 +7587,8 @@ def continue_dev(
     \b
     Continue reads its model configuration from .continue/config.json (a JSON
     document with a top-level ``systemMessage`` and a ``models`` array). This
-    command starts the proxy, sets up the selected CLI context tool by
-    extending ``systemMessage`` with RTK guidance, and prints the per-model
-    ``apiBase`` the user should configure manually.
+    command starts the proxy and prints the per-model ``apiBase`` the user
+    should configure manually.
 
     \b
     Continue is an IDE extension — its API base URL is configured per-model
@@ -6965,47 +7596,16 @@ def continue_dev(
     config file is overridable via --config.
 
     \b
-    Note: Continue's modern config is YAML-first (``.continue/config.yaml``).
-    This helper only writes the JSON variant. Users on the YAML schema should
-    configure ``systemMessage`` through that file by hand.
-
-    \b
-    Per-model handling: Continue overrides top-level ``systemMessage`` with
-    per-model ``systemMessage`` when set, so this command also injects into
-    each ``models[i].systemMessage`` if the ``models`` array is present.
-    Existing non-string ``systemMessage`` values are NEVER overwritten — the
-    command warns loudly and leaves them in place. To opt in, clear the
-    existing value first.
-
-    \b
-    Uninstall: there is no ``headroom unwrap continue`` subcommand. To remove
-    the injected guidance, hand-edit ``.continue/config.json`` and delete
-    everything between ``<!-- headroom:rtk-instructions -->`` and
-    ``<!-- /headroom:rtk-instructions -->`` (inclusive) from every
-    ``systemMessage`` field — both top-level and inside ``models[*]``. If
-    ``lean-ctx`` mode is selected, the lean-ctx agent name ``continue`` may
-    not be recognized by the local lean-ctx binary; a warning is printed in
-    that case and setup is skipped silently.
+    Uninstall: there is no ``headroom unwrap continue`` subcommand — the config
+    file is left untouched.
 
     \b
     Examples:
-        headroom wrap continue                # Start proxy + inject systemMessage
-        headroom wrap continue --no-context-tool   # Proxy only
+        headroom wrap continue                # Start proxy + print apiBase
         headroom wrap continue --port 9999    # Custom proxy port
         headroom wrap continue --config path/to/config.json
     """
     config_file = config_path or (Path.cwd() / ".continue" / "config.json")
-
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="continue",
-            agent_display="Continue",
-            marker_path=config_file,
-            on_rtk_ready=lambda _rtk: _inject_continue_rtk_systemmessage(
-                config_file, verbose=verbose
-            ),
-            verbose=verbose,
-        )
 
     if prepare_only:
         return
@@ -7017,13 +7617,6 @@ def continue_dev(
         click.echo(f"    Edit {config_file} and set, per model:")
         click.echo(f'      "apiBase": "{openai_base}"          # OpenAI-compatible models')
         click.echo(f'      "apiBase": "{anthropic_base}"       # Anthropic models')
-        if not no_rtk:
-            click.echo()
-            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-                click.echo("  lean-ctx configured for Continue")
-            else:
-                click.echo(f"  rtk instructions injected into {config_file.name} systemMessage")
-            click.echo("  Continue will use token-optimized commands automatically.")
 
     _run_proxy_only_watcher(
         agent_label="continue",
@@ -7037,282 +7630,12 @@ def continue_dev(
 
 
 # =============================================================================
-# Goose (Block)
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
-def goose(
-    port: int,
-    no_rtk: bool,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    goose_args: tuple,
-) -> None:
-    """Launch Goose (Block) CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls
-    through Headroom. Sets up the selected CLI context tool by injecting RTK
-    guidance into .goosehints at the project root (Goose reads this file as
-    extra system context).
-
-    \b
-    Uninstall: there is no ``headroom unwrap goose`` subcommand. To remove the
-    injected guidance, hand-edit ``.goosehints`` at the project root and
-    delete everything between ``<!-- headroom:rtk-instructions -->`` and
-    ``<!-- /headroom:rtk-instructions -->`` (inclusive). If ``lean-ctx`` mode
-    is selected, the lean-ctx agent name ``goose`` may not be recognized by
-    the local lean-ctx binary; a warning is printed in that case and setup
-    is skipped silently.
-
-    \b
-    Examples:
-        headroom wrap goose                          # Start proxy + context tool + goose
-        headroom wrap goose -- session               # Start a Goose session
-        headroom wrap goose -- --provider anthropic  # Pass args to goose
-        headroom wrap goose --no-context-tool        # Skip CLI context-tool setup
-    """
-    # Goose reads .goosehints from the project root as extra context.
-    # Pre-compute the marker path so the KeyboardInterrupt handler can report
-    # its location even if the interrupt fires before _inject_rtk_instructions
-    # returns (e.g., during the inner _ensure_rtk_binary download).
-    goosehints: Path | None = Path.cwd() / ".goosehints" if not no_rtk else None
-    if not no_rtk:
-        _setup_context_tool_for_agent(
-            agent="goose",
-            agent_display="Goose",
-            marker_path=goosehints,
-            on_rtk_ready=lambda _rtk: _inject_rtk_instructions(
-                cast(Path, goosehints), verbose=verbose
-            ),
-            verbose=verbose,
-        )
-
-    if prepare_only:
-        return
-
-    goose_bin = shutil.which("goose")
-    if not goose_bin:
-        click.echo("Error: 'goose' not found in PATH.")
-        click.echo("Install Goose: https://block.github.io/goose/")
-        raise SystemExit(1)
-
-    # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-    ]
-
-    _launch_tool(
-        binary=goose_bin,
-        args=goose_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="GOOSE",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="goose",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
-# OpenHands
-# =============================================================================
-
-
-@wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--code-graph",
-    is_flag=True,
-    help="Enable code graph indexing via codebase-memory-mcp (optional)",
-)
-@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
-@click.option("--learn", is_flag=True, help="Enable live traffic learning")
-@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
-@click.option(
-    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
-)
-@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
-@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
-@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-@click.option("--prepare-only", is_flag=True, hidden=True)
-@click.argument("openhands_args", nargs=-1, type=click.UNPROCESSED)
-def openhands(
-    port: int,
-    no_rtk: bool,
-    code_graph: bool,
-    no_proxy: bool,
-    learn: bool,
-    memory: bool,
-    backend: str | None,
-    anyllm_provider: str | None,
-    region: str | None,
-    verbose: bool,
-    prepare_only: bool,
-    openhands_args: tuple,
-) -> None:
-    """Launch OpenHands CLI through Headroom proxy.
-
-    \b
-    Sets OPENAI_BASE_URL / ANTHROPIC_BASE_URL to route OpenHands' API calls
-    through Headroom. Instructions are injected via the
-    ``OPENHANDS_INSTRUCTIONS`` environment variable at launch time so the
-    on-disk OpenHands config is left untouched.
-
-    \b
-    The ``OPENHANDS_INSTRUCTIONS`` value injected by this command contains the
-    ``<!-- headroom:rtk-instructions -->`` marker. To uninstall, simply do not
-    set ``OPENHANDS_INSTRUCTIONS`` in the parent shell — this command never
-    writes to disk, so nothing to clean up. If ``lean-ctx`` mode is selected,
-    the lean-ctx agent name ``openhands`` may not be recognized by the local
-    lean-ctx binary; a warning is printed in that case and rtk-style guidance
-    falls through.
-
-    \b
-    Examples:
-        headroom wrap openhands                # Start proxy + context tool + openhands
-        headroom wrap openhands -- --task ...  # Pass args to openhands
-        headroom wrap openhands --no-context-tool
-    """
-    # openhands never writes to disk — its rtk guidance ships via the
-    # OPENHANDS_INSTRUCTIONS env var below — so marker_path is None and
-    # rtk_required gates the env-only path: without an rtk binary there
-    # is no fallback marker file to fall through to.
-    rtk_path: Path | None = None
-    if not no_rtk:
-        rtk_path = _setup_context_tool_for_agent(
-            agent="openhands",
-            agent_display="OpenHands",
-            marker_path=None,
-            rtk_required=True,
-            verbose=verbose,
-        )
-
-    if prepare_only:
-        return
-
-    openhands_bin = shutil.which("openhands")
-    if not openhands_bin:
-        click.echo("Error: 'openhands' not found in PATH.")
-        click.echo("Install OpenHands: https://docs.all-hands.dev/")
-        raise SystemExit(1)
-
-    env = os.environ.copy()
-    openai_base = f"http://127.0.0.1:{port}/v1"
-    anthropic_base = _claude_proxy_base_url(port)
-    env["OPENAI_BASE_URL"] = openai_base
-    env["OPENAI_API_BASE"] = openai_base
-    env["ANTHROPIC_BASE_URL"] = anthropic_base
-    # Also set LLM_BASE_URL for OpenHands' generic LLM provider config.
-    env["LLM_BASE_URL"] = openai_base
-    if not no_rtk and rtk_path:
-        # Inject rtk guidance via env var so OpenHands picks it up as the
-        # session's instruction prefix. Appending instead of overwriting
-        # any pre-existing OPENHANDS_INSTRUCTIONS so user-supplied content
-        # is preserved. The marker check guards against double-injection
-        # when the user inherits an env var that already has the rtk block.
-        existing_instructions = env.get("OPENHANDS_INSTRUCTIONS", "")
-        if _RTK_MARKER in existing_instructions:
-            # Already injected — pre-existing env var contains marker.
-            pass
-        elif existing_instructions.strip():
-            env["OPENHANDS_INSTRUCTIONS"] = (
-                existing_instructions.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
-            )
-        else:
-            env["OPENHANDS_INSTRUCTIONS"] = RTK_INSTRUCTIONS_BLOCK
-
-    env_vars_display = [
-        f"OPENAI_BASE_URL={openai_base}",
-        f"ANTHROPIC_BASE_URL={anthropic_base}",
-        f"LLM_BASE_URL={openai_base}",
-    ]
-    if not no_rtk and "OPENHANDS_INSTRUCTIONS" in env:
-        env_vars_display.append("OPENHANDS_INSTRUCTIONS=<rtk instructions injected>")
-
-    _launch_tool(
-        binary=openhands_bin,
-        args=openhands_args,
-        env=env,
-        port=port,
-        no_proxy=no_proxy,
-        tool_label="OPENHANDS",
-        env_vars_display=env_vars_display,
-        learn=learn,
-        memory=memory,
-        agent_type="openhands",
-        code_graph=code_graph,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-    )
-
-
-# =============================================================================
 # OpenClaw
 # =============================================================================
 
 
 @wrap.command("openclaw")
-@_rtk_option
+@_retired_context_tool_option
 @click.option(
     "--plugin-path",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
@@ -7335,8 +7658,8 @@ def openhands(
     is_flag=True,
     help="Install by copying plugin path instead of using --link",
 )
-@click.option(
-    "--proxy-port", default=8787, type=click.IntRange(1, 65535), help="Headroom proxy port"
+@proxy_port_option(
+    "--proxy-port", help_text="Headroom proxy port (default: $HEADROOM_PORT, else 8787)"
 )
 @click.option("--startup-timeout-ms", default=20000, type=int, help="Proxy startup timeout")
 @click.option(
@@ -7477,13 +7800,34 @@ def openclaw(
         install_cmd.append(plugin_spec)
         install_cwd = None
 
-    click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
+    click.echo("  Installing OpenClaw plugin...")
     install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
     )
+    if install_result.returncode != 0:
+        combined_error = "\n".join(
+            x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x
+        )
+        # New OpenClaw releases retired the legacy scan override and require
+        # source/capability confirmation instead. Retry only this explicit CLI
+        # migration request for the selected plugin, preserving older releases
+        # and terminal install-policy blocks.
+        if (
+            "--dangerously-force-unsafe-install is deprecated" in combined_error
+            and "Install cancelled; rerun with --force" in combined_error
+        ):
+            install_cmd[3:4] = ["--force", "--accept-capabilities"]
+            click.echo("  Confirming the selected plugin source and its declared capabilities...")
+            install_result = run(
+                install_cmd,
+                cwd=str(install_cwd) if install_cwd else None,
+                capture_output=True,
+                text=True,
+            )
+
     if install_result.returncode != 0:
         combined_error = "\n".join(
             x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x
@@ -7554,23 +7898,9 @@ def openclaw(
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
+@_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
-@click.option(
-    "--no-project-rtk",
-    is_flag=True,
-    help="Skip rtk instruction injection into the project AGENTS.md",
-)
+@proxy_port_option()
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.option(
@@ -7596,8 +7926,6 @@ def openclaw(
 @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
 def opencode(
     port: int,
-    no_rtk: bool,
-    no_project_rtk: bool,
     no_mcp: bool,
     no_serena: bool,
     code_graph: bool,
@@ -7621,10 +7949,8 @@ def opencode(
 
     \b
     Examples:
-        headroom wrap opencode                         # Start proxy + context tool + opencode
+        headroom wrap opencode                         # Start proxy + opencode
         headroom wrap opencode -- "fix the bug"        # Pass prompt to opencode
-        headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
-        headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap opencode --no-serena             # Skip Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
@@ -7651,26 +7977,24 @@ def opencode(
             )
         subscription_resolution = _require_copilot_subscription_resolution()
 
+    # Verify the opencode binary exists BEFORE mutating any config. Otherwise a
+    # missing binary leaves headroom MCP/Serena/memory entries in the user's
+    # opencode config and an injected AGENTS.md, then errors with no cleanup --
+    # the config-before-verify anti-pattern (#1614). Siblings (claude, codex,
+    # goose, omp) already check first. `--prepare-only` intentionally writes
+    # config without launching, so it is exempt.
+    opencode_bin: str | None = None
+    if not prepare_only:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            click.echo("Error: 'opencode' not found in PATH.")
+            click.echo("Install OpenCode: https://opencode.ai")
+            raise SystemExit(1)
+
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
     _opencode_config_file, _opencode_backup_file = opencode_config_paths()
     snapshot_opencode_config_if_unwrapped(_opencode_config_file, _opencode_backup_file)
-
-    # Setup CLI context tool for OpenCode.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for OpenCode...")
-            _setup_lean_ctx_agent("opencode", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for OpenCode...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                if not no_project_rtk:
-                    project_agents = Path.cwd() / "AGENTS.md"
-                    _inject_rtk_instructions(project_agents, verbose=verbose)
-                # Inject into global OpenCode AGENTS.md
-                global_agents = _opencode_home_dir() / "AGENTS.md"
-                _inject_rtk_instructions(global_agents, verbose=verbose)
 
     # Register headroom MCP server in OpenCode config so OpenCode can
     # call headroom_retrieve on compression markers from the proxy.
@@ -7707,11 +8031,9 @@ def opencode(
         inject_opencode_provider_config(port)
         return
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        click.echo("Error: 'opencode' not found in PATH.")
-        click.echo("Install OpenCode: https://opencode.ai")
-        raise SystemExit(1)
+    # Past the prepare-only return the launch path always ran the binary check
+    # above, so opencode_bin is resolved.
+    assert opencode_bin is not None
 
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
@@ -7740,6 +8062,7 @@ def opencode(
         ),
     )
 
+    launch_started = False
     try:
         # If the proxy fell back to a different port, move our marker so
         # cleanup tracking stays accurate and update MCP config.
@@ -7768,24 +8091,35 @@ def opencode(
 
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
-        _launch_tool(
-            binary=opencode_bin,
-            args=opencode_args,
-            env=env,
-            port=actual_port,
-            no_proxy=True,
-            tool_label="OPENCODE",
-            env_vars_display=env_vars_display,
-            learn=learn,
-            memory=memory,
-            agent_type="opencode",
-            code_graph=code_graph,
-            backend=backend,
-            anyllm_provider=anyllm_provider,
-            region=region,
-        )
+        launch_started = True
+        try:
+            _launch_tool(
+                binary=opencode_bin,
+                args=opencode_args,
+                env=env,
+                port=actual_port,
+                no_proxy=True,
+                tool_label="OPENCODE",
+                env_vars_display=env_vars_display,
+                learn=learn,
+                memory=memory,
+                agent_type="opencode",
+                code_graph=code_graph,
+                backend=backend,
+                anyllm_provider=anyllm_provider,
+                region=region,
+            )
+        except SystemExit as exc:
+            # _launch_tool raises plain SystemExit after a child exits, but
+            # chains pre-launch failures as the cause.
+            if exc.__cause__ is not None:
+                launch_started = False
+            raise
+        except BaseException:
+            launch_started = False
+            raise
     finally:
-        if _opencode_proxy and _opencode_proxy.poll() is None:
+        if not launch_started and _opencode_proxy and _opencode_proxy.poll() is None:
             _other = _live_proxy_clients(actual_port, exclude_self=True)
             if not _other:
                 _opencode_proxy.terminate()
@@ -7878,17 +8212,6 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
             click.echo("  Removed Headroom-installed Serena MCP server from OpenCode.")
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
-
-    # `wrap opencode` injects the marker-fenced rtk guidance into both the project
-    # `AGENTS.md` and the global `_opencode_home_dir() / "AGENTS.md"`; that block is
-    # durable state the config restore above does not touch. Without removing it, a
-    # plain `opencode` launch keeps following Headroom's "prefix shell commands with
-    # rtk" instruction and fails when the managed rtk binary is off PATH. Mirror what
-    # unwrap_codex / unwrap_copilot already do. Best-effort and unconditional, like
-    # the MCP cleanup above.
-    for _agents_md in (Path.cwd() / "AGENTS.md", _opencode_home_dir() / "AGENTS.md"):
-        if _remove_rtk_instructions(_agents_md):
-            click.echo(f"  Removed Headroom rtk instructions from {_agents_md}.")
 
     click.echo()
     click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")
@@ -8090,16 +8413,6 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
-    # `wrap codex` injects the marker-fenced rtk guidance into the Codex global
-    # AGENTS.md (`_codex_home_dir() / "AGENTS.md"`); that block is durable state
-    # the config restore above does not touch. Without removing it, a plain
-    # `codex` launch keeps following Headroom's "prefix shell commands with rtk"
-    # instruction and fails when the managed rtk binary is off PATH. Mirror what
-    # unwrap_copilot already does. Best-effort and unconditional, like the MCP
-    # cleanup above.
-    if _remove_rtk_instructions(_codex_home_dir() / "AGENTS.md"):
-        click.echo("  Removed Headroom rtk instructions from Codex AGENTS.md.")
-
     if status in {"restored", "cleaned", "removed"}:
         # Hand the threads back to the native-provider menu so the full history
         # stays visible once Codex no longer routes through Headroom. Best-effort.
@@ -8118,17 +8431,8 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
-@_rtk_option
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option(
-    "--no-context-tool",
-    "--no-rtk",
-    "no_rtk",
-    is_flag=True,
-    help="Skip CLI context-tool setup",
-)
+@_retired_context_tool_option
+@proxy_port_option()
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -8142,7 +8446,6 @@ def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
 @click.argument("omp_args", nargs=-1, type=click.UNPROCESSED)
 def omp(
     port: int,
-    no_rtk: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -8165,24 +8468,11 @@ def omp(
 
     \b
     Examples:
-        headroom wrap omp                       # Start proxy + context tool + omp
+        headroom wrap omp                       # Start proxy + omp
         headroom wrap omp -- -p "fix the bug"   # omp in non-interactive print mode
         headroom wrap omp -- --model opus       # Pick a model (fuzzy match)
-        headroom wrap omp --no-context-tool     # Skip CLI context-tool setup
         headroom unwrap omp                     # Restore pre-wrap models.yml
     """
-    # Setup CLI context tool for omp — it reads AGENTS.md from the project root.
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for omp...")
-            _setup_lean_ctx_agent("omp", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for omp...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                agents_md = Path.cwd() / "AGENTS.md"
-                _inject_rtk_instructions(agents_md, verbose=verbose)
-
     if prepare_only:
         _inject_omp_models_override(port, _project_name_from_cwd())
         return
@@ -8228,8 +8518,7 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 
     Restores the byte-for-byte pre-wrap backup when one exists, or removes the
     wrap-created file when there was no models.yml before wrapping. A
-    models.yml the wrap does not manage is never touched. Also removes the
-    marker-fenced rtk guidance from the current project's AGENTS.md.
+    models.yml the wrap does not manage is never touched.
     """
     status = _restore_omp_models_override()
     if status == "restored":
@@ -8238,9 +8527,6 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
         click.echo(f"  Removed wrap-created models.yml: {_omp_models_yml_path()}")
     else:
         click.echo("  No Headroom-managed models.yml found — nothing to restore.")
-
-    if _remove_rtk_instructions(Path.cwd() / "AGENTS.md"):
-        click.echo("  Removed Headroom rtk instructions from AGENTS.md.")
 
     click.echo()
     click.echo("✓ omp is no longer routed through the Headroom proxy.")
@@ -8262,10 +8548,10 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     """Undo durable ``headroom wrap grok`` MCP and guidance edits.
 
-    Grok API routing is session-scoped via ``GROK_CLI_CHAT_PROXY_BASE_URL`` and
-    does not require config restoration. This command removes Headroom MCP
-    servers from ``~/.grok/config.toml`` and strips injected RTK guidance from
-    the project ``AGENTS.md``.
+    Grok inference routing is session-scoped via ``GROK_MODELS_BASE_URL`` and
+    does not require config restoration. Native settings and authentication
+    routing stay unchanged. This command removes Headroom MCP servers from
+    ``~/.grok/config.toml``.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
@@ -8296,12 +8582,8 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
             click.echo("  Removed Headroom MCP server from Grok config.")
             removed_any = True
 
-    if _remove_rtk_instructions(Path.cwd() / "AGENTS.md"):
-        click.echo("  Removed Headroom rtk instructions from project AGENTS.md.")
-        removed_any = True
-
     if not removed_any:
-        click.echo("  Nothing to undo: no Headroom MCP markers or rtk guidance found.")
+        click.echo("  Nothing to undo: no Headroom MCP markers found.")
 
     click.echo()
     click.echo("✓ Grok is no longer configured for Headroom MCP retrieval.")
@@ -8322,10 +8604,10 @@ def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
-    """Undo ``headroom wrap zcode`` edits to AGENTS.md.
+    """Stop routing ZCode through Headroom.
 
-    Removes RTK instructions injected into AGENTS.md at the project root.
-    If the file only contained RTK instructions, it is deleted entirely.
+    ``wrap zcode`` only prints settings for ZCode's UI (it writes no ZCode
+    config), so there is nothing to restore — this stops the local proxy.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")
@@ -8333,17 +8615,101 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
 
-    agents_md = Path.cwd() / "AGENTS.md"
-    if _remove_rtk_instructions(agents_md):
-        click.echo(f"  Removed Headroom rtk instructions from {agents_md}")
-        if agents_md.exists() and not agents_md.read_text().strip():
-            agents_md.unlink()
-            click.echo(f"  Removed empty {agents_md}")
-    else:
-        click.echo(f"  Nothing to undo: {agents_md} has no Headroom RTK markers.")
-
+    click.echo("  Remove the Headroom base URLs from ZCode's provider settings.")
     click.echo()
     click.echo("✓ ZCode is no longer routed through the Headroom proxy.")
     if not no_stop_proxy:
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+# =============================================================================
+# Registry-generated wrap commands
+# =============================================================================
+# Env-var tools are described declaratively in headroom.providers.wrap_registry;
+# one click command per WrapTarget is generated here.
+
+
+def _make_registry_command(target: WrapTarget) -> click.Command:
+    def _run(
+        port: int,
+        code_graph: bool,
+        no_proxy: bool,
+        learn: bool,
+        memory: bool,
+        backend: str | None,
+        anyllm_provider: str | None,
+        region: str | None,
+        verbose: bool,
+        prepare_only: bool,
+        tool_args: tuple,
+    ) -> None:
+        if prepare_only:
+            return
+
+        tool_bin = shutil.which(target.binary)
+        if not tool_bin:
+            click.echo(f"Error: '{target.binary}' not found in PATH.")
+            click.echo(target.install_hint)
+            raise SystemExit(1)
+
+        env, env_vars_display = _build_registry_launch_env(
+            target,
+            port,
+            os.environ,
+            project=_project_name_from_cwd() if target.project_prefix else None,
+        )
+
+        _launch_tool(
+            binary=tool_bin,
+            args=tool_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label=target.name.upper(),
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type=target.name,
+            code_graph=code_graph,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+        )
+
+    _run.__doc__ = target.help_text
+    command: Any = _run
+    # Same option surface as the hand-written commands these replaced.
+    for decorator in (
+        click.argument(
+            "tool_args",
+            nargs=-1,
+            type=click.UNPROCESSED,
+            metavar=f"[{target.name.upper()}_ARGS]...",
+        ),
+        click.option("--prepare-only", is_flag=True, hidden=True),
+        click.option("--verbose", "-v", is_flag=True, help="Verbose output"),
+        click.option("--region", default=None, help="Cloud region for Bedrock/Vertex"),
+        click.option("--anyllm-provider", default=None, help="Provider for any-llm backend"),
+        click.option(
+            "--backend",
+            default=None,
+            help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc.",
+        ),
+        click.option("--memory", is_flag=True, help="Enable persistent cross-session memory"),
+        click.option("--learn", is_flag=True, help="Enable live traffic learning"),
+        click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)"),
+        click.option(
+            "--code-graph",
+            is_flag=True,
+            help="Enable code graph indexing via codebase-memory-mcp (optional)",
+        ),
+        proxy_port_option(),
+        _retired_context_tool_option,
+    ):
+        command = decorator(command)
+    return click.command(target.name, context_settings={"ignore_unknown_options": True})(command)
+
+
+for _target in WRAP_TARGETS.values():
+    wrap.add_command(_make_registry_command(_target))

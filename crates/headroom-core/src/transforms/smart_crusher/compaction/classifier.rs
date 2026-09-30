@@ -21,6 +21,12 @@ use serde_json::Value;
 
 use super::ir::OpaqueKind;
 
+/// Prefix of every CCR marker this crate emits (`<<ccr:HASH,KIND,SIZE>>`,
+/// `<<ccr:HASH N_rows_offloaded>>`, `<<ccr:HASH>>`). Content carrying one is
+/// already-compressed output and must never be offloaded again — see
+/// [`classify_string`].
+const CCR_MARKER_PREFIX: &str = "<<ccr:";
+
 /// Per-cell classification result.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CellClass {
@@ -86,6 +92,24 @@ pub fn classify_cell(value: &Value, cfg: &ClassifyConfig) -> CellClass {
 }
 
 fn classify_string(s: &str, cfg: &ClassifyConfig) -> CellClass {
+    // Never re-offload our own output (#2694). A string carrying a
+    // `<<ccr:…>>` marker is *compressed output*, not source content: the
+    // real bytes already live in the store under the marker's hash. Hashing
+    // it again would stash the MARKER as the new entry's "original", so
+    // `headroom_retrieve` hands the caller a placeholder instead of the
+    // data — silent, permanent loss of whatever the inner marker pointed at
+    // (its hash is no longer visible anywhere the model can reach). Same
+    // defect class as #1209 (tag placeholders persisted as originals).
+    //
+    // This is the shared choke point for both offload sites — the document
+    // walker (`walker::walk_string`) and the table compactor
+    // (`compactor::cell_from_value`) — so one guard covers both. A cell that
+    // is already a marker also renders no smaller, so keeping it Scalar
+    // costs nothing.
+    if s.contains(CCR_MARKER_PREFIX) {
+        return CellClass::Scalar;
+    }
+
     // Stringified-JSON check first. Cheap fast-path: must start with
     // `{` or `[` (after optional whitespace) — skip strings that
     // can't possibly be JSON containers. Parsing `"123"` would

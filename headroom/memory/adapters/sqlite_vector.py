@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
-from ..models import Memory, ScopeLevel
+from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
 if TYPE_CHECKING:
@@ -135,7 +135,9 @@ class VectorMetadata:
             valid_until=(
                 datetime.fromisoformat(d["valid_until"]) if d.get("valid_until") else None
             ),
-            entity_refs=d.get("entity_refs", []),
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(d.get("entity_refs")),
             content=d["content"],
             created_at=datetime.fromisoformat(d["created_at"]),
             importance=d.get("importance", 0.5),

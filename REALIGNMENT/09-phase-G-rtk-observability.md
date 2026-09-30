@@ -1,5 +1,14 @@
 # Phase G — RTK Breadth + Observability
 
+> **SUPERSEDED.** RTK and lean-ctx were removed from Headroom entirely: the
+> `headroom/rtk/` and `headroom/lean_ctx/` packages, all `--rtk` / `--context-tool`
+> flags, the wrap-side hooks and hint-file injection, and the proxy-side `rtk gain`
+> polling are all gone, and `headroom/context_tool_cleanup.py` uninstalls what
+> earlier versions left on disk. The RTK-specific plan below is historical; the
+> non-RTK observability items (cache-hit rate, compression ratio, token
+> validation) were kept. `docs/rtk-architecture.md`, referenced throughout this
+> document, was deleted with the feature.
+
 **Goal:** Extend RTK coverage to more wrap-CLI agents; close the dead `tokens_saved_rtk` data plane; add per-invocation RTK metrics; add the cache-hit-rate, compression-ratio, token-validation observability surface that's missing today.
 
 **Calendar:** 1 week.

@@ -22,7 +22,7 @@ from headroom.proxy.helpers import (
     claude_code_tool_search_inactive,
     format_tool_search_disabled_hint,
     reset_tool_search_hint_state,
-    take_tool_search_hint_slot,
+    take_tool_search_scan_slot,
     tool_search_hint_pending,
 )
 
@@ -159,11 +159,11 @@ def test_hint_slot_fires_once() -> None:
     reset_tool_search_hint_state()
     try:
         assert tool_search_hint_pending() is True
-        assert take_tool_search_hint_slot() is True
+        assert take_tool_search_scan_slot() is True
         # Once consumed, the cheap gate flips so the hot path stops scanning.
         assert tool_search_hint_pending() is False
-        assert take_tool_search_hint_slot() is False
-        assert take_tool_search_hint_slot() is False
+        assert take_tool_search_scan_slot() is False
+        assert take_tool_search_scan_slot() is False
     finally:
         reset_tool_search_hint_state()
 
@@ -176,7 +176,9 @@ from headroom.proxy.helpers import (  # noqa: E402
     _TOOL_SEARCH_DEFAULT_NAME,
     _TOOL_SEARCH_DEFAULT_TYPE,
     _TOOL_SEARCH_MIN_TOOLS,
+    anthropic_first_party_tool_search_supported,
     inject_tool_search_deferral,
+    strip_first_party_tool_search_tools_for_third_party_upstream,
 )
 
 
@@ -257,3 +259,669 @@ def test_non_dict_and_typed_tools_stay_resident() -> None:
     out = inject_tool_search_deferral(tools)
     typed = [t for t in out if t.get("type") == "web_search_20250305"]
     assert len(typed) == 1 and typed[0].get("defer_loading") is None
+
+
+def test_third_party_upstream_strips_first_party_tool_search_from_headroom_issue_2526() -> None:
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {"name": "Bash", "description": "run a command", "input_schema": {}},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+    out = strip_first_party_tool_search_tools_for_third_party_upstream(
+        tools,
+        "https://api.deepseek.com/anthropic",
+    )
+    assert out is not tools
+    assert [tool.get("name") for tool in out if isinstance(tool, dict)] == ["Bash", "web_search"]
+    assert all(
+        not str(tool.get("type", "")).startswith("tool_search_tool_")
+        for tool in out
+        if isinstance(tool, dict)
+    )
+
+
+def test_first_party_anthropic_preserves_client_tool_search_entry() -> None:
+    tools = [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {"name": "Bash", "description": "run a command", "input_schema": {}},
+    ]
+    assert anthropic_first_party_tool_search_supported("https://api.anthropic.com")
+    assert (
+        strip_first_party_tool_search_tools_for_third_party_upstream(
+            tools,
+            "https://api.anthropic.com",
+        )
+        is tools
+    )
+
+
+@pytest.mark.parametrize(
+    ("api_base_url", "expected_supported"),
+    [
+        ("https://api.anthropic.com", True),
+        ("https://api.anthropic.com/v1", True),
+        ("https://api.deepseek.com/anthropic", False),
+        ("http://127.0.0.1:8787", False),
+    ],
+)
+def test_third_party_or_first_party_matrix(api_base_url: str, expected_supported: bool) -> None:
+    assert anthropic_first_party_tool_search_supported(api_base_url) is expected_supported
+
+
+# ---------------------------------------------------------------------------
+# PascalCase clients (Claude Code). The core-tool exemption is spelled in
+# lowercase, so an exact-match comparison never fired for Claude Code: every
+# tool was deferred, including Claude Code's own ``ToolSearch``.
+# ---------------------------------------------------------------------------
+
+
+def _claude_code_tools() -> list[dict]:
+    """Claude Code's surface: PascalCase built-ins, its ToolSearch, MCP tools."""
+    names = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "ToolSearch"] + [
+        f"mcp__srv__t{i}" for i in range(12)
+    ]
+    return [{"name": n, "description": n, "input_schema": {}} for n in names]
+
+
+def test_core_tools_match_case_insensitively() -> None:
+    # Without a case-insensitive match, routine edit/read/run loops each pay a
+    # search round-trip — the exact thing _TOOL_SEARCH_CORE_TOOLS exists to avoid.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    for name in ("Bash", "Read", "Write", "Edit", "Glob", "Grep"):
+        assert by_name[name].get("defer_loading") is None, name
+    # MCP tools are still deferred — the token saving is preserved.
+    assert by_name["mcp__srv__t0"].get("defer_loading") is True
+
+
+def test_client_tool_search_tool_is_never_deferred() -> None:
+    # ToolSearch is the client's own schema fetcher for tools that never appear
+    # in the request body (TaskCreate, WebFetch, …). Deferring it hides the only
+    # tool that can load them, so they become permanently unreachable.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    by_name = {t.get("name"): t for t in out if "name" in t}
+    assert by_name["ToolSearch"].get("defer_loading") is None
+
+
+def test_resident_real_tool_survives_pascal_case_surface() -> None:
+    # The injected search tool is typed and does not satisfy the invariant on its
+    # own; Anthropic 400s when every real tool is deferred.
+    out = inject_tool_search_deferral(_claude_code_tools())
+    assert any(not t.get("type") and not t.get("defer_loading") for t in out)
+
+
+def _omp_tools() -> list[dict]:
+    """Oh My Pi's 12-tool surface: underscore-prefixed built-ins plus typed tools."""
+    named = [
+        "_hub",
+        "_edit",
+        "_task",
+        "_todo",
+        "_eval",
+        "_read",
+        "_bash",
+        "_glob",
+        "_grep",
+        "_write",
+    ]
+    return [
+        *[{"name": name, "description": name, "input_schema": {}} for name in named],
+        {"type": "computer_20250124", "name": "computer"},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]
+
+
+def test_core_tools_match_leading_underscore_namespace() -> None:
+    tools = _omp_tools()
+    assert len(tools) == _TOOL_SEARCH_MIN_TOOLS
+
+    out = inject_tool_search_deferral(tools)
+
+    by_name = {tool.get("name"): tool for tool in out if isinstance(tool, dict)}
+    for name in ("_edit", "_task", "_read", "_bash", "_glob", "_grep", "_write"):
+        assert by_name[name].get("defer_loading") is None, name
+    for name in ("_hub", "_todo", "_eval"):
+        assert by_name[name].get("defer_loading") is True, name
+    for name in ("computer", "web_search"):
+        assert by_name[name].get("defer_loading") is None, name
+
+
+# ---------------------------------------------------------------------------
+# Tool-search history repair (#2805)
+#
+# Anthropic validates every tool_reference in the transcript against the
+# request's tools array. Claude Code replays one transcript across requests
+# with DIFFERENT tools arrays (main loop vs prompt-type Stop hook evaluator),
+# so the side-request 400s with "Tool reference 'X' not found in available
+# tools". The repair drops blocks a request cannot support.
+# ---------------------------------------------------------------------------
+
+from headroom.proxy.helpers import (  # noqa: E402
+    _CLIENT_TOOL_REF_PLACEHOLDER,
+    _tool_search_reference_names,
+    strip_unsupported_tool_search_blocks,
+    strip_unsupported_tool_search_references,
+)
+
+_SEARCH_TOOL = {"type": _TOOL_SEARCH_DEFAULT_TYPE, "name": _TOOL_SEARCH_DEFAULT_NAME}
+
+
+def _poisoned_transcript() -> list[dict]:
+    """A transcript as Claude Code stores it after one server-side tool search."""
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "ask the user"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Searching for a tool."},
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_01ABC",
+                    "name": _TOOL_SEARCH_DEFAULT_NAME,
+                    "input": {"pattern": "question|ask"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_01ABC",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {"type": "tool_reference", "tool_name": "AskUserQuestion"}
+                        ],
+                    },
+                },
+                {"type": "text", "text": "Found it."},
+            ],
+        },
+    ]
+
+
+def test_repair_neutralizes_blocks_the_hook_evaluator_cannot_resolve() -> None:
+    # The Stop hook evaluator replays the transcript with a small tools array
+    # that has neither the search tool nor AskUserQuestion -> upstream 400.
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _poisoned_transcript(), [{"name": "Read", "input_schema": {}}]
+    )
+    assert removed == 2  # server_tool_use + tool_search_tool_result
+    kinds = [b["type"] for b in messages[1]["content"]]
+    assert kinds == ["text", "text", "text", "text"]  # both swapped for text in place
+    assert messages[1]["content"][0]["text"] == "Searching for a tool."
+    assert messages[1]["content"][3]["text"] == "Found it."  # index preserved
+    assert "tool search omitted" in messages[1]["content"][1]["text"]
+    assert "tool search omitted" in messages[1]["content"][2]["text"]
+    assert messages[0]["content"][0]["text"] == "ask the user"
+
+
+def test_repair_is_noop_on_the_main_loop() -> None:
+    # Same transcript, but the request carries the injected search tool AND the
+    # referenced tool: nothing to repair, and the object is returned by identity
+    # so the outbound prefix (and its cache) is untouched.
+    transcript = _poisoned_transcript()
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [_SEARCH_TOOL, {"name": "AskUserQuestion", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_keeps_a_turn_that_was_only_bookkeeping() -> None:
+    # An assistant turn that was ONLY the search round-trip keeps its message
+    # slot (an all-text turn is valid, an empty content array is not). Dropping
+    # the message would shift every later message index and so move any signed
+    # thinking block, which makes select_outbound_body discard the repair (#3456).
+    transcript = _poisoned_transcript()
+    transcript[1]["content"] = transcript[1]["content"][1:3]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, [])
+    assert removed == 2
+    assert len(messages) == 2
+    assert messages[1]["role"] == "assistant"
+    assert [b["type"] for b in messages[1]["content"]] == ["text", "text"]
+
+
+def test_repair_leaves_other_server_tools_alone() -> None:
+    # web_search / code execution use the same block type and stay untouched.
+    transcript = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_web",
+                    "name": "web_search",
+                    "input": {"query": "x"},
+                },
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_web", "content": []},
+            ],
+        }
+    ]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, [])
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_is_idempotent() -> None:
+    # Deterministic: repairing an already-repaired transcript is a no-op, so a
+    # session's forwarded prefix stays byte-stable turn over turn.
+    once, _ = strip_unsupported_tool_search_blocks(_poisoned_transcript(), [])
+    twice, removed = strip_unsupported_tool_search_blocks(once, [])
+    assert removed == 0
+    assert twice is once
+
+
+def test_repair_strips_search_history_when_only_the_tool_is_missing() -> None:
+    # References all resolve, but the request has no tool_search tool at all
+    # (e.g. deferral skipped below _TOOL_SEARCH_MIN_TOOLS) -- history still
+    # cannot be supported, so it goes.
+    _, removed = strip_unsupported_tool_search_blocks(
+        _poisoned_transcript(), [{"name": "AskUserQuestion", "input_schema": {}}]
+    )
+    assert removed == 2
+
+
+# ---------------------------------------------------------------------------
+# Client-side tool search: Claude Code (and any custom implementation) stores
+# discovered tools as tool_reference blocks inside a PLAIN tool_result, not a
+# tool_search_tool_result. Anthropic validates those references too, so a stale
+# one (e.g. an MCP server that disconnected mid-session) 400s the same way.
+# ---------------------------------------------------------------------------
+
+
+def _client_side_transcript(*referenced: str) -> list[dict]:
+    return [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Searching."},
+                {"type": "tool_use", "id": "toolu_cs", "name": "ToolSearch", "input": {"q": "x"}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_cs",
+                    "content": [
+                        {"type": "tool_reference", "tool_name": name} for name in referenced
+                    ],
+                }
+            ],
+        },
+    ]
+
+
+def test_repair_neutralizes_client_side_reference_to_absent_tool() -> None:
+    # Absent tool: drop the reference, and because it was the whole result,
+    # replace the content with a placeholder so the paired tool_use is kept
+    # (an orphaned tool_use 400s on its own).
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "Read", "input_schema": {}}],
+    )
+    assert removed == 1
+    assert messages[0]["content"][1]["type"] == "tool_use"  # search call preserved
+    result = messages[1]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["content"] == _CLIENT_TOOL_REF_PLACEHOLDER
+
+
+def test_repair_keeps_client_side_reference_to_present_deferred_tool() -> None:
+    # A deferred-but-present tool is valid; keep it and return by identity.
+    transcript = _client_side_transcript("CronCreate")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_keeps_present_client_side_reference_and_drops_absent() -> None:
+    # Mixed result: keep the present reference, drop only the absent one.
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("CronCreate", "mcp__x__ghost"),
+        [_SEARCH_TOOL, {"name": "CronCreate", "input_schema": {}, "defer_loading": True}],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["CronCreate"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the direct-Anthropic regression reported in PR #2539
+# comment #5280259642: "Tool reference 'tool_search_tool_regex' not found in
+# available tools".
+#
+# Root cause: when a client sends ``tool_search_tool_regex`` as a *typeless*
+# tool, ``inject_tool_search_deferral`` would (a) not early-exit because the
+# guard only checked ``type``, and (b) defer the tool.  Anthropic then found
+# the deferred copy via the server-side search and stored the tool's name in a
+# ``tool_reference`` entry.  On subsequent requests where the typed injected
+# search tool was present, ``strip_unsupported_tool_search_blocks`` incorrectly
+# treated the injected search tool's *name* as proof the reference was
+# resolvable — but the typed server tool is not a valid deferred-tool target, so
+# Anthropic rejected the request with 400.
+#
+# The two-part fix:
+#   1. ``inject_tool_search_deferral`` early-exit also fires on a name-prefix
+#      match, preventing double-injection when the client carries a typeless
+#      ``tool_search_tool_*`` entry.
+#   2. ``strip_unsupported_tool_search_blocks`` excludes typed search tools
+#      from the ``available`` set — they are the search mechanism, not targets.
+# ---------------------------------------------------------------------------
+
+
+def _transcript_with_search_tool_regex_reference() -> list[dict]:
+    """Transcript where the search found 'tool_search_tool_regex' itself.
+
+    This happens when inject_tool_search_deferral defers a typeless client tool
+    named 'tool_search_tool_regex': Anthropic finds it and stores it as a
+    tool_reference.  On subsequent requests the repair must drop the block
+    rather than falsely keep it because the typed injected search-tool shares
+    the same name.
+    """
+    return [
+        {"role": "user", "content": [{"type": "text", "text": "search for a tool"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_REGEX",
+                    "name": _TOOL_SEARCH_DEFAULT_NAME,
+                    "input": {"pattern": "regex"},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_REGEX",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {
+                                "type": "tool_reference",
+                                # The search found the deferred 'tool_search_tool_regex'
+                                # typeless tool — this is the broken reference.
+                                "tool_name": _TOOL_SEARCH_DEFAULT_NAME,
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [_TOOL_SEARCH_DEFAULT_NAME, "TOOL_SEARCH_TOOL_BM25"],
+)
+def test_inject_deferral_exits_early_on_typeless_tool_search_name(name: str) -> None:
+    # A client that sends tool_search_tool_regex without a ``type`` field should
+    # be treated as already using tool search (name-prefix guard), so Headroom
+    # must not inject a second search tool on top of it.
+    typeless_search = {"name": name, "input_schema": {}}
+    tools = _tools(20) + [typeless_search]
+    result = inject_tool_search_deferral(tools)
+    assert result is tools  # no injection
+
+
+def test_inject_deferral_does_not_false_match_similar_typeless_tool_name() -> None:
+    # Keep ordinary tools whose names merely resemble the reserved prefix on the
+    # normal deferral path; the trailing underscore is part of the match.
+    tools = _tools(20) + [{"name": "tool_search_toolbox", "input_schema": {}}]
+    result = inject_tool_search_deferral(tools)
+    assert result is not tools
+    by_name = {tool.get("name"): tool for tool in result}
+    assert by_name["tool_search_toolbox"]["defer_loading"] is True
+
+
+def test_repair_drops_search_tool_self_reference_when_inject_ran() -> None:
+    # Regression for PR #2539 comment #5280259642.
+    #
+    # Scenario: inject ran on a previous turn (has_search_tool=True because the
+    # typed search tool is present), but the transcript's tool_reference names
+    # 'tool_search_tool_regex' — the search tool itself.  The typed injected
+    # search tool must NOT count as a valid reference target; the block must be
+    # dropped so Anthropic never sees an unresolvable tool_reference.
+    transcript = _transcript_with_search_tool_regex_reference()
+    # tools array after inject: typed search tool + regular deferred tools
+    tools = [
+        _SEARCH_TOOL,  # typed search tool — must NOT be in 'available'
+        {"name": "Bash", "input_schema": {}},
+        {"name": "mcp_tool_x", "input_schema": {}, "defer_loading": True},
+    ]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
+    assert removed == 2  # server_tool_use + tool_search_tool_result both repaired
+    # The assistant turn keeps its slot; both search blocks became text.
+    assert len(messages) == 2
+    assert [b["type"] for b in messages[1]["content"]] == ["text", "text"]
+
+
+def test_repair_noop_when_referenced_tool_is_regular_deferred_tool() -> None:
+    # Baseline: when the transcript references a normal deferred tool (not the
+    # search tool itself) and that tool is in the current tools array, the block
+    # must be kept — no false-positive stripping from the typed-search exclusion.
+    transcript = _poisoned_transcript()  # references "AskUserQuestion"
+    tools = [
+        _SEARCH_TOOL,
+        {"name": "AskUserQuestion", "input_schema": {}, "defer_loading": True},
+    ]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_drops_when_referenced_tool_absent_despite_search_tool_present() -> None:
+    # The referenced tool is NOT in the current tools array even though the
+    # typed search tool is present (e.g. a compact request with a different tool
+    # subset).  The block must be dropped.
+    transcript = _poisoned_transcript()  # references "AskUserQuestion"
+    tools = [
+        _SEARCH_TOOL,
+        {"name": "Bash", "input_schema": {}},
+        # AskUserQuestion intentionally absent
+    ]
+    messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
+    assert removed == 2
+
+
+def test_repair_keeps_custom_client_side_references_without_a_builtin_search_tool() -> None:
+    """Anthropic supports a custom client-side search: a normal tool_use /
+    tool_result pair returning tool_reference blocks that point at the
+    top-level tools array. No ``tool_search_tool_*`` server tool is involved,
+    so gating the client-side branch on one deleted every valid reference."""
+    transcript = _client_side_transcript("Calendar")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_still_drops_an_absent_reference_without_a_builtin_search_tool() -> None:
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("Calendar", "mcp__x__ghost"),
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["Calendar"]
+
+
+def test_repair_does_not_move_signed_thinking_blocks() -> None:
+    # Production failure (#3456): the unsupportable block sat in the SAME
+    # assistant message as signed thinking blocks. Removing it moved the
+    # thinking block that followed it, thinking_blocks_survived_mutation went
+    # False, and select_outbound_body forwarded the client's ORIGINAL bytes --
+    # discarding the repair, so upstream 400'd on the very reference we found.
+    # Repairing in place must leave the thinking fingerprint byte-identical.
+    from headroom.proxy.body_forwarding import thinking_block_fingerprint
+
+    transcript = [
+        {"role": "user", "content": [{"type": "text", "text": "go"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "first", "signature": "sig-1"},
+                {"type": "text", "text": "Checking."},
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_01ABC",
+                    "name": _TOOL_SEARCH_DEFAULT_NAME,
+                    "input": {},
+                },
+                {
+                    "type": "tool_search_tool_result",
+                    "tool_use_id": "srvtoolu_01ABC",
+                    "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [
+                            {"type": "tool_reference", "tool_name": "mcp__gone__tool"}
+                        ],
+                    },
+                },
+                {"type": "thinking", "thinking": "second", "signature": "sig-2"},
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "next"}]},
+    ]
+    before = thinking_block_fingerprint({"messages": transcript})
+
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript, [_SEARCH_TOOL, {"name": "Bash", "input_schema": {}}]
+    )
+
+    assert removed == 2
+    assert thinking_block_fingerprint({"messages": messages}) == before
+    assert not [
+        block
+        for message in messages
+        for block in message["content"]
+        if block["type"] in ("tool_search_tool_result", "server_tool_use")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# tools-array repair: a tool_reference naming the search tool itself
+# ---------------------------------------------------------------------------
+
+
+def test_reference_repair_drops_typed_search_tool_reference() -> None:
+    # Anthropic answered a match-all search (empty input) with a hit on its own
+    # server tool.  Claude Code stored it in the session's loaded-tool set and
+    # replays it as a tool_reference, so every later turn 400s with "Tool
+    # reference 'tool_search_tool_regex' not found in available tools".  The
+    # block repair cannot see this: the poison is in tools, not the history.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+        {"name": "Read", "input_schema": {}},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired
+    assert _SEARCH_TOOL in repaired  # the search mechanism itself must survive
+    assert all(
+        t.get("name") != _TOOL_SEARCH_DEFAULT_NAME
+        for t in repaired
+        if t.get("type") == "tool_reference"
+    )
+
+
+def test_reference_repair_is_a_noop_on_a_clean_tools_array() -> None:
+    # Identity return, so the caller skips the write-back and the prefix cache
+    # is not disturbed on the overwhelming majority of requests.
+    tools = [_SEARCH_TOOL, {"type": "tool_reference", "name": "Bash"}]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_keeps_a_deferred_tool_named_like_a_search_tool() -> None:
+    # A typeless client tool may legitimately be called "tool_search_tool_*".
+    # It is a normal reference target, not a search mechanism, so a reference to
+    # it must survive: the request carries no typed mechanism under that name.
+    # Matching on the name prefix alone would wrongly strip it.
+    deferred = {"name": "tool_search_tool_custom", "input_schema": {}}
+    tools = [
+        _SEARCH_TOOL,
+        deferred,
+        {"type": "tool_reference", "name": "tool_search_tool_custom"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_keeps_prefixed_reference_with_no_matching_mechanism() -> None:
+    # Prefix-shaped reference, but this request carries no typed search tool at
+    # all — there is nothing for it to be a self-reference to, so it is not ours
+    # to remove.  Dropping it here would delete a reference the request needs.
+    tools = [
+        {"name": "Bash", "input_schema": {}},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 0
+    assert repaired is tools
+
+
+def test_reference_repair_matches_mechanism_name_exactly() -> None:
+    # Scoped to the mechanism names actually present: the exact name goes, a
+    # merely prefix-sharing sibling stays.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME + "_other"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    kept_names = [t.get("name") for t in repaired if t.get("type") == "tool_reference"]
+    assert kept_names == [_TOOL_SEARCH_DEFAULT_NAME + "_other"]
+
+
+def test_reference_repair_uses_the_file_wide_name_precedence() -> None:
+    # One precedence rule for the file: ``tool_name`` wins over ``name``, as in
+    # _tool_search_reference_names. An entry carrying both keys is judged by
+    # ``tool_name``, so these two readers can never disagree about it.
+    tools = [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": _TOOL_SEARCH_DEFAULT_NAME, "name": "Bash"},
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert repaired == [
+        _SEARCH_TOOL,
+        {"type": "tool_reference", "tool_name": "Bash", "name": _TOOL_SEARCH_DEFAULT_NAME},
+    ]
+    # Same answer from the history-side reader for the same entries.
+    assert _tool_search_reference_names(tools[1:]) == [_TOOL_SEARCH_DEFAULT_NAME, "Bash"]
+
+
+def test_reference_repair_registers_a_mechanism_named_by_tool_name() -> None:
+    # A mechanism shaped like a server-side block (``tool_name``, no ``name``)
+    # must still register, symmetric with the liberal reference matching.
+    tools = [
+        {"type": _TOOL_SEARCH_DEFAULT_TYPE, "tool_name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": _TOOL_SEARCH_DEFAULT_NAME},
+        {"type": "tool_reference", "name": "Bash"},
+    ]
+    repaired, removed = strip_unsupported_tool_search_references(tools)
+    assert removed == 1
+    assert {"type": "tool_reference", "name": "Bash"} in repaired

@@ -6,25 +6,20 @@ import json
 
 import pytest
 
-from headroom.audit.codex import audit_codex, classify_command, render_codex_text, strip_wrappers
+from headroom.audit.codex import audit_codex, classify_command, render_codex_text
 
 
 class TestClassifier:
-    def test_strip_wrappers(self):
-        assert strip_wrappers("rtk cat foo.py") == "cat foo.py"
-        assert strip_wrappers("rtk proxy sed -n '1,20p' foo.py") == "sed -n '1,20p' foo.py"
-        assert strip_wrappers("git status") == "git status"
-
     @pytest.mark.parametrize(
         ("cmd", "category", "partial"),
         [
             ("cat src/foo.py", "read", False),
             ("sed -n '1,200p' src/foo.py", "read", True),
-            ("rtk read src/foo.py --lines 10-50", "read", True),
+            ("bat src/foo.py --lines 10-50", "read", True),
             ("head -50 src/foo.py", "read", True),
             ("nl headroom/config.py", "read", False),
             ("rg -n 'def apply' headroom/", "search", False),
-            ("rtk grep -n pattern .", "search", False),
+            ("grep -rn pattern .", "search", False),
             ("git diff HEAD~1", "git", False),
             ("apply_patch <<'EOF'\n*** Begin Patch\nEOF", "edit", False),
             ("pytest tests/ -x -q", "build/test", False),
@@ -100,7 +95,7 @@ def codex_dir(tmp_path):
         _output("c2", content[:500]),
         _call("c3", "rg -n 'def ' src/"),
         _output("c3", "src/foo.py:1:def x():"),
-        _call("c4", "rtk read src/bar.py --lines 1-50"),
+        _call("c4", "bat src/bar.py --lines 1-50"),
         _output("c4", "bar content " * 10),
     ]
     sessions = tmp_path / "sessions" / "2026" / "06"

@@ -12,6 +12,7 @@ import os
 from unittest.mock import patch
 
 import click
+import pytest
 from click.testing import CliRunner
 
 from headroom.cli import wrap
@@ -64,12 +65,105 @@ def test_serena_dashboard_disabled_flips_existing_config(tmp_path, monkeypatch) 
     assert "web_dashboard: true" in text  # other keys preserved
 
 
-def test_serena_dashboard_disabled_creates_config(tmp_path, monkeypatch) -> None:
+def test_serena_config_is_never_created_by_headroom(tmp_path, monkeypatch) -> None:
+    """Headroom must NOT pre-empt Serena's own config bootstrap (#2674).
+
+    This is the exact invariant, and it is the reason the outage happened.
+    Verified against Serena 1.6.2.dev0 ``serena/config/serena_config.py``: Serena
+    autogenerates a complete config only when the path does not exist; once any
+    file is there it validates instead, and a missing ``projects`` key is fatal
+    (``SerenaConfigError``). Headroom used to write a one-key bootstrap file,
+    which killed Serena's MCP handshake on every fresh install.
+
+    Asserting "we write nothing" is stronger than asserting which keys we write:
+    it stays correct even if Serena adds a new required key, whereas a test that
+    pins our own key list would go on passing while users broke again.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
+
     wrap._ensure_serena_dashboard_disabled()
+
     cfg = tmp_path / ".serena" / "serena_config.yml"
-    assert cfg.exists()
-    assert "web_dashboard_open_on_launch: false" in cfg.read_text()
+    assert not cfg.exists(), "Headroom created a config Serena would have generated itself"
+
+
+def test_serena_dashboard_disabled_repairs_config_missing_projects(tmp_path, monkeypatch) -> None:
+    """Backfill ``projects`` into a config an older Headroom already wrote (#2674).
+
+    Users who ran an affected version have the single-key file on disk, so simply
+    not creating new bad files would leave them broken forever.
+    """
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("web_dashboard_open_on_launch: false\n")
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    parsed = yaml.safe_load(cfg.read_text())
+    assert parsed["projects"] == []
+    assert parsed["web_dashboard_open_on_launch"] is False
+
+
+def test_serena_dashboard_disabled_preserves_registered_projects(tmp_path, monkeypatch) -> None:
+    """Never clobber Serena's real project registry — it is user data."""
+    import yaml
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "# my serena config\nprojects:\n  - /home/me/work/api\n  - /home/me/work/web\n"
+        "web_dashboard_open_on_launch: true\n"
+    )
+
+    wrap._ensure_serena_dashboard_disabled()
+
+    text = cfg.read_text()
+    parsed = yaml.safe_load(text)
+    assert parsed["projects"] == ["/home/me/work/api", "/home/me/work/web"]
+    assert parsed["web_dashboard_open_on_launch"] is False
+    assert "# my serena config" in text  # comments preserved
+    assert text.count("projects:") == 1  # no duplicate key
+
+
+def test_serena_dashboard_disabled_is_idempotent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".serena" / "serena_config.yml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("projects: []\nweb_dashboard_open_on_launch: true\n")
+    wrap._ensure_serena_dashboard_disabled()
+    first = cfg.read_text()
+    wrap._ensure_serena_dashboard_disabled()
+    assert cfg.read_text() == first
+
+
+def test_serena_config_required_keys_match_serena_source() -> None:
+    """Pin the assumption this fix rests on, against Serena's real source (#2674).
+
+    Skipped unless a Serena checkout is present. When it is, this proves the claim
+    the fix depends on — that ``projects`` is the *only* hard-required key and that
+    Serena bootstraps only a missing file — rather than trusting a bug report.
+    Set ``SERENA_SRC`` to a Serena source tree to enable it.
+    """
+    import os
+    import re
+    from pathlib import Path
+
+    src = os.environ.get("SERENA_SRC", "")
+    if not src or not (Path(src) / "config" / "serena_config.py").is_file():
+        pytest.skip("set SERENA_SRC to a Serena source tree to run this check")
+
+    text = (Path(src) / "config" / "serena_config.py").read_text(encoding="utf-8")
+    # Serena bootstraps only when the file is absent — so we must not create one.
+    assert re.search(r"if not os\.path\.exists\(config_file_path\)", text)
+    # `projects` is the sole fatal omission; everything else has a default.
+    fatal = re.findall(r"raise SerenaConfigError\((.*?)\)", text, re.DOTALL)
+    projects_fatal = [f for f in fatal if "projects" in f]
+    assert projects_fatal, "Serena no longer rejects a missing `projects` key"
+    assert "get_value_or_default" in text, "Serena's default-filling path changed"
 
 
 def test_invalid_env_raises() -> None:

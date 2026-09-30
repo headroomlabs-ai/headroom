@@ -17,8 +17,8 @@ Strands-native primitives:
   ``uvx`` on first launch. On by default; disable with
   ``enable_serena_mcp=False``.
 
-* **HeadroomHookProvider** — the RTK-equivalent for Strands.
-  Compresses tool outputs in-place via ``AfterToolCallEvent`` so
+* **HeadroomHookProvider** — the in-process tool-output compressor
+  for Strands. Compresses tool outputs in-place via ``AfterToolCallEvent`` so
   verbose JSON / log / search outputs are shrunk before they
   pollute the agent's context.
 
@@ -123,8 +123,7 @@ class HeadroomBundle:
         enable_serena_mcp: Include the Serena MCP server — the coding-task
             compressor. Default True. Adds a ``uvx`` first-launch download.
         enable_hooks: Include :class:`HeadroomHookProvider` for in-place
-            tool-output compression (the RTK-equivalent for Strands).
-            Default True.
+            tool-output compression. Default True.
         config: Optional :class:`HeadroomConfig` passed to
             :class:`HeadroomHookProvider`. Default uses framework
             defaults.

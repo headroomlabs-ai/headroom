@@ -29,7 +29,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from headroom import paths as _paths
 from headroom.subscription.base import QuotaTracker
@@ -52,63 +52,6 @@ _DEFAULT_ACTIVE_WINDOW_S = 60
 _PERSIST_FILE_ENV = _paths.HEADROOM_SUBSCRIPTION_STATE_PATH_ENV
 _DEFAULT_PERSIST_DIR = ".headroom"
 _DEFAULT_PERSIST_FILE = "subscription_state.json"
-
-# PR-G2 (Realignment) — RTK savings wiring.
-#
-# Operators can disable the RTK polling from inside ``update_contribution``
-# without uninstalling the binary or unsetting ``HEADROOM_CONTEXT_TOOL``.
-# Used for diagnostics and for environments where RTK is intentionally
-# excluded from headroom accounting (e.g. shadow tests).
-#
-# Loud / configurable / no silent fallback: unknown values raise loudly via
-# the parser below — they do not silently default to ``enabled``.
-_RTK_WIRING_ENV = "HEADROOM_RTK_WIRING"
-_RTK_WIRING_DEFAULT = "enabled"
-_RTK_WIRING_ALLOWED = ("enabled", "disabled")
-
-# PR-G2 remediation (C3) — multi-worker poll ownership.
-#
-# Each uvicorn worker independently runs ``configure_subscription_tracker``,
-# so each worker would poll RTK and add the same delta to its own
-# ``c.tokens_saved_rtk``. The persisted state is shared by atomic
-# os.replace, but the in-memory counters diverge per worker — and any
-# dashboard hitting a non-owner worker would see drifted values.
-#
-# The owner-election strategy mirrors the beacon's file-lock pattern in
-# ``headroom/proxy/server.py``: a non-blocking ``fcntl.flock`` on
-# ``HEADROOM_RTK_POLL_LOCK`` (default under the workspace dir). Only the
-# lock holder polls; non-owners return 0 from ``_poll_rtk_delta`` and
-# delegate to whatever the owner writes to the shared state file.
-#
-# Loud / no silent fallback: when ``fcntl`` is unavailable (Windows), every
-# worker polls — but the explicit ``WindowsNoLockMode`` log line surfaces
-# the choice so operators see it in startup logs.
-_RTK_POLL_LOCK_ENV = "HEADROOM_RTK_POLL_LOCK"
-
-
-def _rtk_wiring_mode() -> str:
-    """Return ``enabled`` or ``disabled``. Raises on unknown values.
-
-    Read at call-time so operators can flip the env var without a restart.
-    """
-    raw = os.environ.get(_RTK_WIRING_ENV, "").strip().lower()
-    if not raw:
-        return _RTK_WIRING_DEFAULT
-    if raw in _RTK_WIRING_ALLOWED:
-        return raw
-    raise ValueError(f"Invalid {_RTK_WIRING_ENV}={raw!r}; expected one of {_RTK_WIRING_ALLOWED}")
-
-
-def _validate_rtk_env_at_startup() -> None:
-    """Validate RTK env vars eagerly at proxy startup.
-
-    Raises ``ValueError`` loudly if ``HEADROOM_RTK_WIRING`` is set to an
-    invalid value. PR-G2 remediation (H1): previously a typo at startup
-    would silently default to enabled but get swallowed at every
-    ``update_contribution`` call — fail loudly here instead.
-    """
-    _rtk_wiring_mode()
-
 
 # Singleton on-demand poll floor (seconds): the dashboard may request a fresh
 # poll if the cached snapshot is stale, but we cap how often we will actually
@@ -186,34 +129,6 @@ class SubscriptionTracker(QuotaTracker):
         self._current_token: str | None = None
         self._full_tokens: dict[str, int] = {}  # token_prefix -> count of requests
 
-        # PR-G2 (Realignment) — most recent session-incremental ``tokens_saved``
-        # observed in ``_get_rtk_stats()['session']['tokens_saved']``. This
-        # field is de-baselined by the helper (see
-        # :func:`~headroom.proxy.helpers._get_context_tool_stats`) so it
-        # already represents savings accumulated since the proxy session
-        # baseline was pinned at startup.
-        #
-        # PR-G2 remediation (C1): previously we read
-        # ``lifetime_tokens_saved`` (the raw monotonic counter from
-        # ``rtk gain --project``), which on the very first poll emitted the
-        # entire pre-Headroom RTK history as one fake delta. Switching to
-        # the session-incremental field dissolves both the first-poll
-        # phantom and the post-restart phantom (the helper rebaselines
-        # session counters at every proxy startup, so a fresh process sees
-        # ``session.tokens_saved == 0`` until new RTK invocations land).
-        #
-        # Monotonic non-decreasing within a proxy session: only advances on
-        # positive delta and on explicit counter-reset detection (session
-        # value drops below the last seen value).
-        self._last_rtk_tokens_saved: int = 0
-
-        # PR-G2 remediation (C3) — owner-election state for multi-worker
-        # poll deduplication. None means we haven't tried to elect yet; True
-        # means this worker holds the lock and polls; False means another
-        # worker owns the lock and we skip polling.
-        self._rtk_poll_owner: bool | None = None
-        self._rtk_poll_lock_fd: Any = None
-
         self._stop_event: asyncio.Event | None = None
         self._poll_task: asyncio.Task[None] | None = None
 
@@ -258,9 +173,6 @@ class SubscriptionTracker(QuotaTracker):
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 self._poll_task.cancel()
         self._persist_state()
-        # PR-G2 remediation (C3): release the poll lock so a subsequent
-        # process / worker restart can re-elect the owner.
-        self._release_rtk_poll_lock()
         logger.info("Subscription tracker stopped")
 
     # ------------------------------------------------------------------
@@ -290,8 +202,6 @@ class SubscriptionTracker(QuotaTracker):
         *,
         tokens_submitted: int = 0,
         tokens_saved_compression: int = 0,
-        tokens_saved_cli_filtering: int | None = None,
-        tokens_saved_rtk: int | None = None,
         tokens_saved_cache_reads: int = 0,
         compression_savings_usd: float = 0.0,
         cache_savings_usd: float = 0.0,
@@ -299,256 +209,14 @@ class SubscriptionTracker(QuotaTracker):
         """Update headroom contribution counters for the current session window.
 
         Called after each proxy request completes with the actual token deltas.
-
-        PR-G2 (Realignment) — ``tokens_saved_rtk`` is now sourced from RTK's
-        own stats endpoint (``rtk gain --format json`` via
-        :func:`headroom.proxy.helpers._get_rtk_stats`) when the caller does
-        not pass an explicit value. The tracker computes the delta against
-        the last per-session ``tokens_saved`` it observed and feeds only the
-        delta into the contribution counter.
-
-        PR-G2 remediation (C1): the RTK source is the SESSION-incremental
-        ``session.tokens_saved`` field of the helper payload, NOT the raw
-        ``lifetime_tokens_saved`` counter. The helper de-baselines per
-        proxy session, so the first poll after process startup correctly
-        reads 0 instead of the entire pre-Headroom RTK history.
-
-        Args:
-            tokens_saved_cli_filtering: Explicit per-call CLI-filtering
-                contribution. PR-G2 remediation (M5): ``None`` means "caller
-                omitted, default 0" (mirrors the ``tokens_saved_rtk is
-                None`` semantic). An explicit ``0`` is honored verbatim.
-            tokens_saved_rtk: Explicit override for tokens saved by RTK on
-                this call. If ``None`` (the default), the tracker polls RTK
-                stats itself and writes the per-call delta. If passed
-                (including ``0``), the override is used verbatim.
         """
-        # Polled outside the lock so the subprocess call can't deadlock the
-        # event loop or contend with concurrent ``notify_active`` callers.
-        if tokens_saved_rtk is None:
-            tokens_saved_rtk = self._poll_rtk_delta()
-
         with self._lock:
             c = self._state.contribution
-            # PR-G2 remediation (M5): explicit None-guard so callers can
-            # pass ``0`` and have it honored without colliding with the
-            # default "caller omitted" semantic.
-            if tokens_saved_cli_filtering is None:
-                cli_filtering = 0
-            else:
-                cli_filtering = tokens_saved_cli_filtering
             c.tokens_submitted += max(tokens_submitted, 0)
             c.tokens_saved_compression += max(tokens_saved_compression, 0)
-            c.tokens_saved_cli_filtering += max(cli_filtering, 0)
-            c.tokens_saved_rtk += max(tokens_saved_rtk, 0)
             c.tokens_saved_cache_reads += max(tokens_saved_cache_reads, 0)
             c.compression_savings_usd += max(compression_savings_usd, 0.0)
             c.cache_savings_usd += max(cache_savings_usd, 0.0)
-
-    def _poll_rtk_delta(self) -> int:
-        """Return the delta of the session-scoped RTK ``tokens_saved`` since last poll.
-
-        Implementation of PR-G2 data-plane wiring. Calls
-        :func:`headroom.proxy.helpers._get_rtk_stats` and reads the
-        session-incremental ``session.tokens_saved`` field (de-baselined per
-        proxy session by the helper), then diffs against
-        ``self._last_rtk_tokens_saved``.
-
-        Returns ``0`` (never negative) when:
-        - ``HEADROOM_RTK_WIRING=disabled`` — operator opt-out.
-        - ``_get_rtk_stats()`` returns ``None`` — RTK not selected, or the
-          stat read failed this poll ("no data"); explicit zero contribution
-          is the right answer and the high-water mark is preserved.
-        - ``_get_rtk_stats()`` raises — transient error, logged loudly.
-        - The session counter regressed (RTK reset / new project) — that
-          path also re-baselines ``_last_rtk_tokens_saved`` to the new
-          (smaller) value so subsequent polls return correct deltas.
-        - PR-G2 remediation (C3): another worker holds the RTK poll lock —
-          this worker skips polling so we don't double-count.
-
-        Otherwise advances ``self._last_rtk_tokens_saved`` to the new
-        session total and returns the positive delta.
-
-        PR-G2 remediation (H1): ``HEADROOM_RTK_WIRING`` is now validated at
-        startup via :func:`_validate_rtk_env_at_startup`; an invalid value
-        raises at proxy boot rather than being silently swallowed here.
-        We still catch + structured-log per-call as a defence-in-depth so
-        that an env var flipped to garbage after startup is at least loud
-        in the logs.
-        """
-        try:
-            wiring_mode = _rtk_wiring_mode()
-        except ValueError as exc:
-            # PR-G2 remediation (H1): elevate to ERROR — this is config
-            # corruption, not a transient runtime hiccup. The bad value
-            # should have been caught at startup but a rotation could flip
-            # it mid-run; either way the operator must see this.
-            logger.error(
-                "event=subscription_rtk_invalid_env error=%s",
-                exc,
-            )
-            return 0
-        if wiring_mode == "disabled":
-            return 0
-
-        # PR-G2 remediation (C3): only the lock-holder worker polls. We try
-        # once per tracker instance and cache the verdict; the lock is
-        # released on tracker stop.
-        if not self._try_acquire_rtk_poll_lock():
-            return 0
-
-        try:
-            # Local import keeps the tracker module decoupled from the proxy
-            # helper at import time (helpers.py imports many heavy deps).
-            from headroom.proxy.helpers import _get_rtk_stats
-        except Exception as exc:  # pragma: no cover — defensive
-            logger.warning(
-                "event=subscription_rtk_helper_import_failed error=%s",
-                exc,
-            )
-            return 0
-
-        try:
-            stats = _get_rtk_stats()
-        except Exception as exc:
-            logger.warning(
-                "event=subscription_rtk_stats_fetch_failed error=%s",
-                exc,
-            )
-            return 0
-
-        if stats is None:
-            logger.info(
-                "event=subscription_rtk_stats_unavailable wiring=%s",
-                wiring_mode,
-            )
-            return 0
-
-        # PR-G2 remediation (C1): read the SESSION-incremental field, not
-        # the raw lifetime counter. The helper de-baselines per proxy
-        # session at startup, so ``session.tokens_saved`` already excludes
-        # the pre-Headroom RTK history. Falls back to the top-level
-        # ``tokens_saved`` (which is also session-scoped in the canonical
-        # payload; see ``_get_context_tool_stats``) and finally to 0 for
-        # not-installed zero payloads (failed reads arrive as ``None`` and
-        # returned above).
-        session_payload = stats.get("session")
-        if isinstance(session_payload, dict) and "tokens_saved" in session_payload:
-            current_total_raw = session_payload.get("tokens_saved", 0)
-        else:
-            current_total_raw = stats.get("tokens_saved", 0)
-        try:
-            current_total = int(current_total_raw or 0)
-        except (TypeError, ValueError) as exc:
-            logger.warning(
-                "event=subscription_rtk_stats_coerce_failed value=%r error=%s",
-                current_total_raw,
-                exc,
-            )
-            return 0
-
-        with self._lock:
-            last = self._last_rtk_tokens_saved
-            if current_total < last:
-                # Counter regressed: helper rebaselined (session reset) or
-                # RTK rebuilt its DB. Re-baseline silently — losing one
-                # delta is preferable to reporting a giant negative number.
-                logger.info(
-                    "event=subscription_rtk_counter_regressed previous=%d current=%d",
-                    last,
-                    current_total,
-                )
-                self._last_rtk_tokens_saved = current_total
-                return 0
-            delta = current_total - last
-            if delta > 0:
-                self._last_rtk_tokens_saved = current_total
-            return delta
-
-    # ------------------------------------------------------------------
-    # Multi-worker poll ownership (PR-G2 remediation C3)
-    # ------------------------------------------------------------------
-
-    def _try_acquire_rtk_poll_lock(self) -> bool:
-        """Try to acquire the RTK poll file lock (non-blocking).
-
-        Returns ``True`` if this worker owns the lock and should poll RTK.
-        Caches the verdict so we don't pay the syscall on every call. The
-        lock is released in :meth:`_release_rtk_poll_lock`, called from
-        :meth:`stop`.
-
-        Mirrors the beacon's ``_try_acquire_beacon_lock`` pattern in
-        ``headroom/proxy/server.py`` (fcntl.flock, LOCK_EX | LOCK_NB).
-        """
-        if self._rtk_poll_owner is not None:
-            return self._rtk_poll_owner
-
-        try:
-            import fcntl
-        except ImportError:
-            # Platform without fcntl (Windows). Every worker polls; log
-            # loudly so the operator knows the multi-worker invariant is
-            # weaker on this platform.
-            logger.warning("event=subscription_rtk_poll_lock_unavailable platform=no-fcntl")
-            self._rtk_poll_owner = True
-            return True
-
-        lock_path = self._rtk_poll_lock_path()
-        fd = None
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = open(lock_path, "w")  # noqa: SIM115
-            fcntl_any = cast(Any, fcntl)
-            fcntl_any.flock(fd, fcntl_any.LOCK_EX | fcntl_any.LOCK_NB)
-            fd.write(str(os.getpid()))
-            fd.flush()
-            self._rtk_poll_lock_fd = fd
-            self._rtk_poll_owner = True
-            logger.info(
-                "event=subscription_rtk_poll_lock_acquired pid=%d path=%s",
-                os.getpid(),
-                lock_path,
-            )
-            return True
-        except OSError:
-            if fd is not None:
-                fd.close()
-            self._rtk_poll_owner = False
-            logger.info(
-                "event=subscription_rtk_poll_lock_skipped pid=%d path=%s",
-                os.getpid(),
-                lock_path,
-            )
-            return False
-
-    def _release_rtk_poll_lock(self) -> None:
-        """Release the RTK poll file lock; safe to call repeatedly."""
-        fd = self._rtk_poll_lock_fd
-        if fd is None:
-            return
-        try:
-            import fcntl
-
-            fcntl_any = cast(Any, fcntl)
-            fcntl_any.flock(fd, fcntl_any.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            fd.close()
-        except Exception:
-            pass
-        self._rtk_poll_lock_fd = None
-        try:
-            self._rtk_poll_lock_path().unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def _rtk_poll_lock_path(self) -> Path:
-        """Return the path to the RTK poll lock file."""
-        override = os.environ.get(_RTK_POLL_LOCK_ENV, "").strip()
-        if override:
-            return Path(override)
-        return self._persist_path.parent / ".rtk_poll_lock"
 
     # ------------------------------------------------------------------
     # State access
@@ -824,37 +492,10 @@ class SubscriptionTracker(QuotaTracker):
             c.tokens_saved_compression = int(
                 saved.get("proxy_compression", saved.get("compression", 0))
             )
-            # PR-G2 (Realignment) — prefer the raw counters when present
-            # (new format). For backward compatibility with state written
-            # before PR-G2 we fall back to the dashboard-aliased keys.
-            cli_filtering = int(
-                saved.get(
-                    "cli_filtering_raw",
-                    saved.get("cli_filtering", saved.get("rtk", 0)),
-                )
-            )
-            c.tokens_saved_cli_filtering = cli_filtering
-            # PR-G2 remediation (M2): legacy state files written before this
-            # PR have no ``rtk_raw`` key — but pre-G2 the ``rtk`` field
-            # silently mirrored ``cli_filtering``. Treat the legacy ``rtk``
-            # field as authoritative for the rtk_raw counter to avoid
-            # zeroing historical accumulation. New format writes ``rtk_raw``
-            # explicitly; legacy writes had only ``rtk`` (aliased) and we
-            # honor it on read.
-            is_legacy_state = "rtk_raw" not in saved
-            if is_legacy_state:
-                # Pre-G2 semantic: ``rtk`` == ``cli_filtering``. Carry the
-                # accumulated value forward instead of silently zeroing it.
-                legacy_rtk_value = int(saved.get("rtk", cli_filtering))
-                c.tokens_saved_rtk = legacy_rtk_value
-                logger.info(
-                    "event=subscription_state_legacy_load "
-                    "migrated_rtk_raw_from_cli_filtering=%d path=%s",
-                    legacy_rtk_value,
-                    self._persist_path,
-                )
-            else:
-                c.tokens_saved_rtk = int(saved.get("rtk_raw", 0))
+            # State written before the CLI context tools were removed also carries
+            # ``cli_filtering`` / ``cli_filtering_raw`` / ``rtk`` / ``rtk_raw``
+            # counters. Those tools are gone, so the keys are simply ignored —
+            # read must stay tolerant of them rather than raising on an old file.
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})
             c.compression_savings_usd = float(savings_usd.get("compression", 0.0))
@@ -964,14 +605,7 @@ def configure_subscription_tracker(
     persist_path: Path | None = None,
     client: SubscriptionClient | None = None,
 ) -> SubscriptionTracker:
-    """Create (or return existing) global tracker singleton.
-
-    PR-G2 remediation (H1): validates RTK-related env vars eagerly here so
-    a typo (``HEADROOM_RTK_WIRING=enabld``) crashes the proxy at startup
-    instead of being silently swallowed at every ``update_contribution``
-    call.
-    """
-    _validate_rtk_env_at_startup()
+    """Create (or return existing) global tracker singleton."""
     global _tracker_instance
     with _tracker_lock:
         if _tracker_instance is None:

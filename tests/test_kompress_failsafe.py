@@ -94,6 +94,9 @@ def _reset_module_state(monkeypatch):
 
 def _make_compressor(monkeypatch, model: FakeModel, **config_kwargs) -> KompressCompressor:
     config_kwargs.setdefault("enable_ccr", False)
+    # These fixtures are deliberately tiny; drop the production word floor
+    # (min_input_words=64) to its clamp so the failsafe paths under test run.
+    config_kwargs.setdefault("min_input_words", 10)
     compressor = KompressCompressor(config=KompressConfig(**config_kwargs))
     monkeypatch.setattr(
         kc,
@@ -534,4 +537,147 @@ def test_canary_probe_error_never_breaks_preload(monkeypatch):
 
     assert compressor.preload() == "onnx"
     _join_canary(compressor)
+    assert compressor._degraded_reason is None
+
+
+# ── Artifact selection: reject at LOAD what would fail at RUN ──────────────────
+# Reported case: the int8 weight-only artifact carries MatMulNBits with bits=8.
+# ORT's CPU kernel only handles 8-bit via the prepacked MLAS path, so a build
+# without an 8-bit SQNBitGemm kernel falls into ComputeBUnpacked, which asserts
+# nbits_ == 4. That raises on session.run() AFTER construction succeeded, so the
+# load-only candidate loop never saw it and the fp32 fallback was unreachable:
+# 207 consecutive per-request failures over three days, ML compression silently
+# dead the whole time.
+
+
+class _FakeOrtSession:
+    """Constructs fine; optionally rejects execution the way ORT's CPU kernel does."""
+
+    def __init__(self, path: str, *, fails_at_run: bool):
+        self.path = path
+        self._fails_at_run = fails_at_run
+        self.runs = 0
+
+    def run(self, outputs, feeds):
+        self.runs += 1
+        if self._fails_at_run:
+            raise RuntimeError(
+                "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code "
+                "returned while running MatMulNBits node ... nbits_ == 4 was false. "
+                "Only 4b quantization is supported for unpacked compute."
+            )
+        import numpy as np
+
+        return [np.zeros((1, 2), dtype=np.float32)]
+
+
+def _install_fake_ort(monkeypatch, *, run_fails_for: set[str]):
+    """Patch onnxruntime so InferenceSession succeeds but run() may not."""
+    created: list[_FakeOrtSession] = []
+
+    class _FakeOrt:
+        @staticmethod
+        def SessionOptions():  # noqa: N802 - mirrors the ORT API
+            return object()
+
+        @staticmethod
+        def InferenceSession(path, options=None, providers=None):  # noqa: N802
+            session = _FakeOrtSession(path, fails_at_run=any(bad in path for bad in run_fails_for))
+            created.append(session)
+            return session
+
+    monkeypatch.setitem(__import__("sys").modules, "onnxruntime", _FakeOrt)
+    monkeypatch.setattr(kc, "_onnx_session_options", lambda _ort: object())
+    monkeypatch.setattr(kc, "hf_hub_download_local_first", lambda repo, fn, **kw: f"/cache/{fn}")
+    return created
+
+
+def test_run_time_artifact_rejection_falls_through_to_next_candidate(monkeypatch, caplog):
+    """A session that loads then fails at run must be skipped, not returned."""
+    created = _install_fake_ort(monkeypatch, run_fails_for={"int8-wo"})
+
+    with caplog.at_level("WARNING"):
+        session = kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
+
+    # int8-wo was constructed, smoke-run, rejected; fp32 was selected instead.
+    assert "int8-wo" in created[0].path
+    assert created[0].runs == 1
+    assert "kompress-fp32.onnx" in session.path
+    assert "unusable" in caplog.text
+
+
+def test_healthy_artifact_is_selected_after_one_smoke_run(monkeypatch):
+    created = _install_fake_ort(monkeypatch, run_fails_for=set())
+
+    session = kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
+
+    # First candidate works, so no fallback and exactly one probe.
+    assert session is created[0]
+    assert len(created) == 1
+    assert session.runs == 1
+
+
+def test_all_artifacts_failing_at_run_raises_rather_than_returning_a_dead_session(monkeypatch):
+    _install_fake_ort(monkeypatch, run_fails_for={"onnx/"})
+
+    with pytest.raises(FileNotFoundError, match="No loadable ONNX artifact"):
+        kc._create_onnx_session("org/model", ["CPUExecutionProvider"])
+
+
+# ── Failure latch: a broken model stops costing us every request ───────────────
+
+
+def test_repeated_inference_failures_latch_to_passthrough(monkeypatch, caplog):
+    class AlwaysFailingModel(FakeModel):
+        def get_keep_mask(self, input_ids, attention_mask):
+            self._tick()
+            raise RuntimeError("MatMulNBits nbits_ == 4 was false")
+
+    model = AlwaysFailingModel()
+    compressor = _make_compressor(monkeypatch, model)
+    monkeypatch.setenv(KOMPRESS_CANARY_THRESHOLD_ENV, "0")  # no canary interference
+
+    with caplog.at_level("WARNING"):
+        for _ in range(kc._INFERENCE_FAILURE_LATCH):
+            assert compressor.compress(CONTENT_40_WORDS).compressed == CONTENT_40_WORDS
+
+    assert compressor._degraded_reason is not None
+    assert "DISABLED" in caplog.text
+    calls_at_latch = model.calls
+
+    # Latched: further calls short-circuit without touching the model again, so a
+    # broken artifact can't burn inference on every request for three days.
+    assert compressor.compress(CONTENT_40_WORDS).compressed == CONTENT_40_WORDS
+    assert model.calls == calls_at_latch
+
+
+def test_a_success_resets_the_failure_count(monkeypatch):
+    class FlakyModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.fail_next = True
+
+        def get_keep_mask(self, input_ids, attention_mask):
+            if self.fail_next:
+                self._tick()
+                raise RuntimeError("transient")
+            return super().get_keep_mask(input_ids, attention_mask)
+
+    model = FlakyModel()
+    compressor = _make_compressor(monkeypatch, model)
+    monkeypatch.setenv(KOMPRESS_CANARY_THRESHOLD_ENV, "0")
+
+    # Two failures, then a success, then two more failures: never 3 in a row.
+    for _ in range(kc._INFERENCE_FAILURE_LATCH - 1):
+        compressor.compress(CONTENT_40_WORDS)
+    assert compressor._inference_failures == kc._INFERENCE_FAILURE_LATCH - 1
+
+    model.fail_next = False
+    compressor.compress(CONTENT_40_WORDS)
+    assert compressor._inference_failures == 0
+    assert compressor._degraded_reason is None
+
+    model.fail_next = True
+    for _ in range(kc._INFERENCE_FAILURE_LATCH - 1):
+        compressor.compress(CONTENT_40_WORDS)
     assert compressor._degraded_reason is None

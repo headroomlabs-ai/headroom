@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "import { foo } from './foo';\nconst bar = require('bar');\n\nconst CONST = 99;\n\nexport function processData(items) {\n    const results = [];\n    for (const item of items) {\n        if (!item) {\n            continue;\n        }\n        const clean = item.trim().toLowerCase();\n        results.push(clean);\n    }\n    return results;\n}\n\nclass Widget {\n    constructor(name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    render(ctx) {\n        ctx.clear();\n        ctx.draw(this.name);\n        this.count += 1;\n        return ctx;\n    }\n}\n\nmodule.exports = { processData, Widget };\n",
+  "input_sha256": "b16202e9b81a5bba3ca5c9ff0ecf632870f77938a98bb41c1f0026e57b403753",
+  "output": {
+    "cache_key": null,
+    "compressed": "import { foo } from './foo';\nconst bar = require('bar');\n\nconst CONST = 99;\n\nexport function processData(items) {\n    const results = [];\n    for (const item of items) {\n        if (!item) {\n            continue;\n        }\n        const clean = item.trim().toLowerCase();\n        results.push(clean);\n    }\n    return results;\n}\n\nclass Widget {\n    constructor(name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    render(ctx) {\n        ctx.clear();\n        ctx.draw(this.name);\n        this.count += 1;\n        return ctx;\n    }\n}\n\nmodule.exports = { processData, Widget };\n",
+    "compressed_bodies": 0,
+    "compressed_tokens": 147,
+    "compression_ratio": 1.0,
+    "language": "javascript",
+    "language_confidence": 1.0,
+    "original": "import { foo } from './foo';\nconst bar = require('bar');\n\nconst CONST = 99;\n\nexport function processData(items) {\n    const results = [];\n    for (const item of items) {\n        if (!item) {\n            continue;\n        }\n        const clean = item.trim().toLowerCase();\n        results.push(clean);\n    }\n    return results;\n}\n\nclass Widget {\n    constructor(name) {\n        this.name = name;\n        this.count = 0;\n    }\n\n    render(ctx) {\n        ctx.clear();\n        ctx.draw(this.name);\n        this.count += 1;\n        return ctx;\n    }\n}\n\nmodule.exports = { processData, Widget };\n",
+    "original_tokens": 147,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.323440+00:00",
+  "transform": "code_aware_compressor"
+}

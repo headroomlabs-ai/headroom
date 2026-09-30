@@ -127,6 +127,6 @@ class CursorMemoryWriter(AgentWriter):
 
         if not dry_run:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(full_content, encoding="utf-8")
+            target.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result

@@ -77,3 +77,33 @@ async def count_texts_offloaded(owner: Any, model: Any, texts: Any) -> tuple[Any
     return await _count_offloaded(
         owner, model, lambda counter: sum(counter.count_text(text) for text in text_list)
     )
+
+
+def gemini_output_tokens(usage_meta: dict[str, Any]) -> int:
+    """Output-token count for a Gemini ``usageMetadata``, including thinking tokens.
+
+    Gemini reports ``candidatesTokenCount`` sometimes inclusive of the
+    ``thoughtsTokenCount`` (2.5-family reasoning) and sometimes exclusive of it.
+    When ``promptTokenCount + candidatesTokenCount != totalTokenCount`` the
+    thinking tokens are a separate bucket and must be added, or the output cost
+    (billed at the output rate) is undercounted. Mirrors litellm's
+    ``is_candidate_token_count_inclusive`` rule. Robust to missing/null fields.
+    """
+
+    def _int(value: Any) -> int:
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    candidates = _int(usage_meta.get("candidatesTokenCount"))
+    thoughts = _int(usage_meta.get("thoughtsTokenCount"))
+    if thoughts <= 0:
+        return candidates
+    prompt = _int(usage_meta.get("promptTokenCount"))
+    total = _int(usage_meta.get("totalTokenCount"))
+    # Inclusive iff prompt + candidates already equals total; otherwise the
+    # thinking tokens are a separate bucket that belongs in the output count.
+    if prompt + candidates == total:
+        return candidates
+    return candidates + thoughts
