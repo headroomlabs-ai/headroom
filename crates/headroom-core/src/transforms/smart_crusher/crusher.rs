@@ -45,7 +45,7 @@ use super::compaction::{
     CompactConfig, Compaction, CompactionStage,
 };
 use super::config::SmartCrusherConfig;
-use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
+use super::crushers::{compute_k_split, crush_number_array, crush_string_array};
 use super::planning::SmartCrusherPlanner;
 use super::traits::{Constraint, CrushEvent, Observer};
 use super::types::{CompressionPlan, CompressionStrategy, CrushResult};
@@ -595,20 +595,31 @@ impl SmartCrusher {
                             let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
                             let (crushed, strategy) = crush_string_array(&strs, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            let crushed_values: Vec<Value> =
+                            let mut crushed_values: Vec<Value> =
                                 crushed.into_iter().map(Value::String).collect();
+                            // #3650: dropped strings get a retrievable
+                            // sentinel — silent truncation is a data-loss
+                            // bug even when the marker gate is on.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
                             return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::NumberArray => {
                             let (crushed, strategy) = crush_number_array(arr, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            // #3650: same sentinel contract as StringArray.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::MixedArray => {
                             let (crushed, strategy) =
                                 self.crush_mixed_array(arr, query_context, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
-                            return (Value::Array(crushed), info_parts.join(","));
+                            let mut crushed_values = crushed;
+                            // #3650: same sentinel contract as the
+                            // StringArray/NumberArray arms.
+                            self.append_scalar_drop_sentinel(&mut crushed_values, arr);
+                            return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         // NestedArray, BoolArray, Empty → fall through
                         // to recursive descent.
@@ -634,7 +645,18 @@ impl SmartCrusher {
                 (Value::Array(processed), info_parts.join(","))
             }
             Value::Object(map) => {
-                // First pass: recurse into values to compress nested arrays.
+                // Object keys are never dropped. Object fields are
+                // independent named properties, not interchangeable
+                // sampled records, and the previous key-dropping
+                // implementation violated the CCR reversibility
+                // contract: it deleted keys (e.g. `tags`, `subtasks`
+                // on MCP task payloads) with no retrieval marker, so
+                // the data was unrecoverable (see #3650 / PR #3648).
+                //
+                // Recursing into the values is the whole job here:
+                // nested arrays still get large-array compaction and
+                // CCR-backed row offload, which stay reversible,
+                // without deleting their enclosing keys.
                 let mut processed = serde_json::Map::new();
                 for (k, v) in map {
                     let (p_val, p_info) =
@@ -642,19 +664,6 @@ impl SmartCrusher {
                     processed.insert(k.clone(), p_val);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
-                    }
-                }
-
-                // Second pass: crush_object preserves every property
-                // (object fields are not interchangeable sampled
-                // records). Nested arrays were already compacted above,
-                // so large-array compaction and CCR row offload still
-                // run without deleting their enclosing keys.
-                if processed.len() >= self.config.min_items_to_analyze {
-                    let (crushed_dict, strategy) = crush_object(&processed, &self.config, bias);
-                    if strategy != "object:passthrough" {
-                        info_parts.push(strategy);
-                        return (Value::Object(crushed_dict), info_parts.join(","));
                     }
                 }
 
@@ -1109,6 +1118,30 @@ impl SmartCrusher {
         );
         (result, strategy)
     }
+
+    /// Appends a visible, retrievable CCR sentinel to `kept` when items were
+    /// dropped from `original` and the marker gate is on.
+    ///
+    /// Mirrors the dict-array path: the full original array is serialized
+    /// once (`canonical_array_json`), hashed with the shared
+    /// `hash_canonical` (SHA256, first 12 hex chars — the same scheme the
+    /// Python bridge and retrieval use), and stored in the CCR store so
+    /// the marker round-trips through retrieval. No-op when nothing was
+    /// dropped or `enable_ccr_marker` is false.
+    fn append_scalar_drop_sentinel(&self, kept: &mut Vec<Value>, original: &[Value]) {
+        let dropped = original.len().saturating_sub(kept.len());
+        if dropped == 0 || !self.config.enable_ccr_marker {
+            return;
+        }
+        let canonical = canonical_array_json(original);
+        let hash = hash_canonical(&canonical);
+        if let Some(store) = &self.ccr_store {
+            store.put(&hash, &canonical);
+        }
+        kept.push(Value::String(format!(
+            "… {dropped} more items <<ccr:{hash} {dropped}_items_offloaded>>"
+        )));
+    }
 }
 
 // ---------- helpers ----------
@@ -1276,6 +1309,166 @@ fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Extracts the CCR hash from a scalar drop sentinel produced by
+    /// `append_scalar_drop_sentinel`.
+    fn scalar_sentinel_hash(s: &str) -> &str {
+        let start = s.find("<<ccr:").expect("sentinel must carry a CCR marker") + 6;
+        let end = s[start..].find(' ').expect("marker must have a tag") + start;
+        &s[start..end]
+    }
+
+    /// Crushes a JSON array string and returns the parsed compressed array.
+    fn crush_array_values(crusher: &SmartCrusher, items: &[Value]) -> Vec<Value> {
+        let out = crusher.crush(&serde_json::to_string(items).unwrap(), "", 1.0);
+        serde_json::from_str::<Value>(&out.compressed)
+            .expect("compressed output is JSON")
+            .as_array()
+            .expect("output stays an array")
+            .clone()
+    }
+
+    /// Looks up the stored original array for a sentinel's CCR hash.
+    fn stored_original(crusher: &SmartCrusher, sentinel: &str) -> Vec<Value> {
+        let hash = scalar_sentinel_hash(sentinel);
+        let raw = crusher
+            .ccr_store()
+            .and_then(|store| store.get(hash))
+            .expect("sentinel hash must be in the CCR store");
+        serde_json::from_str(&raw).expect("stored payload is a JSON array")
+    }
+
+    // Regression tests for headroomlabs-ai/headroom#3650: scalar
+    // (string/number/mixed) array crushers dropped items silently. They
+    // must now emit a visible, retrievable CCR sentinel.
+
+    #[test]
+    fn string_array_drops_emit_retrievable_sentinel() {
+        // The issue's repro shape: 120 short slugs.
+        let items: Vec<Value> = (0..120).map(|i| json!(format!("r{i}"))).collect();
+        let config = SmartCrusherConfig {
+            enable_ccr_marker: true,
+            ..Default::default()
+        };
+        let crusher = SmartCrusher::new(config);
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item string array"
+        );
+        let sentinel = kept
+            .last()
+            .and_then(|v| v.as_str())
+            .expect("last element is the string sentinel");
+        assert!(
+            sentinel.starts_with(&format!("… {dropped} more items ")),
+            "sentinel shows the visible drop count, got: {sentinel}"
+        );
+        assert!(
+            sentinel.contains("<<ccr:")
+                && sentinel.ends_with(&format!("{dropped}_items_offloaded>>")),
+            "sentinel carries a CCR marker, got: {sentinel}"
+        );
+        // The marker hash must retrieve the FULL original array.
+        let stored = stored_original(&crusher, sentinel);
+        assert_eq!(stored.len(), 120);
+        assert_eq!(stored[119], json!("r119"));
+    }
+
+    #[test]
+    fn string_array_sentinel_suppressed_when_marker_gate_off() {
+        let items: Vec<Value> = (0..120).map(|i| json!(format!("r{i}"))).collect();
+        let config = SmartCrusherConfig {
+            enable_ccr_marker: false,
+            ..Default::default()
+        };
+        let crusher = SmartCrusher::new(config);
+
+        let kept = crush_array_values(&crusher, &items);
+        assert!(
+            !kept
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("<<ccr:"))),
+            "no sentinel when the marker gate is off"
+        );
+    }
+
+    #[test]
+    fn string_array_no_sentinel_when_nothing_dropped() {
+        let items: Vec<Value> = (0..5).map(|i| json!(format!("r{i}"))).collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        assert_eq!(kept.len(), items.len());
+        assert!(
+            !kept
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("<<ccr:"))),
+            "no sentinel when nothing was dropped"
+        );
+    }
+
+    #[test]
+    fn number_array_drops_emit_retrievable_sentinel() {
+        let items: Vec<Value> = (0..120).map(|i| json!(i)).collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item number array"
+        );
+        let sentinel = kept
+            .last()
+            .and_then(|v| v.as_str())
+            .expect("last element is the string sentinel");
+        assert!(sentinel.starts_with(&format!("… {dropped} more items ")));
+        let stored = stored_original(&crusher, sentinel);
+        assert_eq!(stored.len(), 120);
+    }
+
+    #[test]
+    fn mixed_array_drops_emit_single_sentinel() {
+        let items: Vec<Value> = (0..120)
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!(format!("entry-{i}"))
+                } else {
+                    json!(i)
+                }
+            })
+            .collect();
+        let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+
+        let kept = crush_array_values(&crusher, &items);
+        // `kept` includes the trailing sentinel, so the crusher's drop
+        // count is original minus the data items (all but the last).
+        let dropped = items.len() - (kept.len() - 1);
+        assert!(
+            kept.len() < items.len(),
+            "expected drops for a 120-item mixed array"
+        );
+        let sentinels: Vec<&str> = kept
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| s.contains("_items_offloaded>>"))
+            .collect();
+        assert_eq!(
+            sentinels.len(),
+            1,
+            "exactly one sentinel, got {sentinels:?}"
+        );
+        assert!(sentinels[0].starts_with(&format!("… {dropped} more items ")));
+        let stored = stored_original(&crusher, sentinels[0]);
+        assert_eq!(stored.len(), 120);
+    }
 
     #[test]
     fn default_crush_ignores_opt_in_prose_hook() {
@@ -1520,6 +1713,171 @@ mod tests {
     fn crusher_construction_default() {
         let c = SmartCrusher::new(SmartCrusherConfig::default());
         assert_eq!(c.config.max_items_after_crush, 15);
+    }
+
+    // ---------- object key preservation (#3650 / #3697) ----------
+    //
+    // Object fields are independent named properties, not interchangeable
+    // sampled records, so no object key may be dropped: the object path
+    // emits no CCR retrieval marker, and dropping a key there would make
+    // the value unrecoverable. These guard the invariant explicitly, so
+    // it does not rest on the mere absence of key-dropping code.
+
+    /// Wide object above every historical key-selection gate: >= 5 keys,
+    /// long string values, a nested dict, nulls, booleans, empty arrays.
+    /// `expensive_index` places the nested dict at begin / middle / end,
+    /// since boundary/stride selection used to drop the middle one.
+    fn wide_object(expensive_index: usize) -> Value {
+        let n = 15;
+        let expensive_index = expensive_index.min(n - 1);
+        let mut obj = serde_json::Map::new();
+        for i in 0..n {
+            if i == expensive_index {
+                obj.insert(
+                    format!("expensive_{i}"),
+                    json!({
+                        "nested": {"label": format!("nested-{i}"), "note": "x".repeat(120)},
+                        "items": [],
+                        "ok": true,
+                        "missing": null
+                    }),
+                );
+            } else {
+                obj.insert(
+                    format!("field_{i:02}"),
+                    json!(format!(
+                        "this is a relatively long value string for entry number {i} with content"
+                    )),
+                );
+            }
+        }
+        obj.insert("flag".to_string(), json!(false));
+        obj.insert("empty".to_string(), json!([]));
+        obj.insert("nada".to_string(), json!(null));
+        obj.insert(
+            "msg1".to_string(),
+            json!(format!("FATAL: {}", "x".repeat(200))),
+        );
+        obj.insert("tiny".to_string(), json!(1));
+        Value::Object(obj)
+    }
+
+    fn assert_every_key_round_trips(value: &Value, config: SmartCrusherConfig) {
+        let input = serde_json::to_string(value).expect("serialize");
+        let result = SmartCrusher::new(config).crush(&input, "", 1.0);
+        let out: Value = serde_json::from_str(&result.compressed)
+            .unwrap_or_else(|e| panic!("output is not JSON ({e}): {}", result.compressed));
+        assert_eq!(
+            &out, value,
+            "object keys must survive the crush path untouched"
+        );
+        let (expected, got) = (
+            value.as_object().expect("object"),
+            out.as_object().expect("object"),
+        );
+        assert_eq!(got.len(), expected.len(), "key count changed");
+        for (k, v) in expected {
+            assert_eq!(got.get(k), Some(v), "key {k} was dropped or altered");
+        }
+        assert!(
+            !result.strategy.contains("object:"),
+            "no object-level crush strategy may be reported: {}",
+            result.strategy
+        );
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_for_five_key_object() {
+        // Exactly at the old `min_items_to_analyze` gate: the smallest
+        // object the removed second pass used to touch.
+        let mut obj = serde_json::Map::new();
+        for i in 0..5 {
+            obj.insert(
+                format!("k{i}"),
+                json!(format!("value number {i} for the five key object")),
+            );
+        }
+        assert_every_key_round_trips(&Value::Object(obj), SmartCrusherConfig::default());
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_for_wide_mixed_object() {
+        for expensive_index in [0, 7, 14] {
+            assert_every_key_round_trips(
+                &wide_object(expensive_index),
+                SmartCrusherConfig::default(),
+            );
+            assert_every_key_round_trips(
+                &wide_object(expensive_index),
+                SmartCrusherConfig {
+                    lossless_only: true,
+                    ..SmartCrusherConfig::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn crush_object_keeps_every_key_when_nested_arrays_compact() {
+        // The behaviour this refactor relies on: recursing into object VALUES
+        // still compacts a nested array, and the enclosing key survives that
+        // compaction. The array has to actually shrink for the test to mean
+        // anything -- an all-scalar object would pass even if recursion were
+        // removed from the object branch, which is the whole thing being
+        // guarded here.
+        let mut obj = serde_json::Map::new();
+        for i in 0..40 {
+            obj.insert(
+                format!("k{i:02}"),
+                json!(format!(
+                    "long description for entry {i}, above the small-value floor"
+                )),
+            );
+        }
+        let rows: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({
+                    "id": i,
+                    "name": format!("row-{i}"),
+                    "status": if i % 3 == 0 { "error" } else { "ok" },
+                    "detail": format!("detail text for row {i} padded out a bit"),
+                })
+            })
+            .collect();
+        let row_count = rows.len();
+        obj.insert("records".to_string(), Value::Array(rows));
+
+        let value = Value::Object(obj);
+        let input = serde_json::to_string(&value).expect("serialize");
+        let result = crusher().crush(&input, "", 1.0);
+        let out: Value = serde_json::from_str(&result.compressed).expect("valid JSON out");
+        let got = out.as_object().expect("object out");
+
+        assert_eq!(got.len(), 41, "all 40 scalar keys + `records` must survive");
+        for k in value.as_object().unwrap().keys() {
+            assert!(got.contains_key(k), "dropped key {k}");
+        }
+
+        // The nested array took a compaction path...
+        assert!(
+            result.was_modified,
+            "nested array should have been compacted; strategy={} out={}",
+            result.strategy, result.compressed
+        );
+        let compacted = got.get("records").expect("`records` key survived");
+        assert_ne!(
+            compacted,
+            value.as_object().unwrap().get("records").unwrap(),
+            "`records` should have been transformed, not passed through verbatim"
+        );
+        // ...and shrank, while its enclosing key stayed put.
+        if let Some(arr) = compacted.as_array() {
+            assert!(
+                arr.len() < row_count,
+                "compacted array should hold fewer than {row_count} items, got {}",
+                arr.len()
+            );
+        }
     }
 
     // ---------- top-level crush ----------

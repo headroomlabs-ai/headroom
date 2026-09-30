@@ -146,6 +146,42 @@ async def test_standard_params_still_forwarded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_max_completion_tokens_forwarded_as_standard_param() -> None:
+    backend = make_backend()
+    body = request_body(max_completion_tokens=64)
+    body.pop("max_tokens")
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = make_response()
+
+        await backend.send_openai_message(body, {})
+
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["max_completion_tokens"] == 64
+    assert "extra_body" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_max_completion_tokens_forwarded_as_standard_param_streaming() -> None:
+    backend = make_backend()
+    body = request_body(max_completion_tokens=64)
+    body.pop("max_tokens")
+    stream = FakeAsyncStream(
+        [SimpleNamespace(model_dump=lambda **kwargs: {"id": "chunk1", "choices": []})]
+    )
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = stream
+
+        chunks = [chunk async for chunk in backend.stream_openai_message(body, {})]
+
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["max_completion_tokens"] == 64
+    assert "extra_body" not in kwargs
+    assert chunks[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
 async def test_reasoning_params_forwarded_top_level_not_extra_body() -> None:
     # reasoning_effort / max_completion_tokens are litellm-mapped params: they
     # must go as top-level kwargs (litellm maps reasoning_effort -> Anthropic

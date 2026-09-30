@@ -71,6 +71,23 @@ export function detectFormat(messages: any[]): MessageFormat {
 // Anthropic → OpenAI
 // ============================================================
 
+// Anthropic image block `source` -> OpenAI image_url url string, or null if unconvertible.
+function anthropicImageUrl(source: any): string | null {
+  if (!source || typeof source !== "object") return null;
+  if (source.type === "base64" && source.media_type && source.data) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  if (source.type === "url" && typeof source.url === "string") return source.url;
+  return null;
+}
+
+// OpenAI image_url url -> Anthropic image block. data: URIs become a base64 source; other urls a url source.
+function openAIImageBlock(url: string): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+  return { type: "image", source: { type: "url", url } };
+}
+
 export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -81,14 +98,30 @@ export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
         continue;
       }
       if (Array.isArray(msg.content)) {
-        const textBlocks = msg.content.filter((b: any) => b.type === "text");
         const toolResults = msg.content.filter((b: any) => b.type === "tool_result");
+        const hasImages = msg.content.some((b: any) => b.type === "image");
 
-        if (textBlocks.length > 0) {
-          result.push({
-            role: "user",
-            content: textBlocks.map((b: any) => b.text).join("\n"),
-          });
+        if (hasImages) {
+          const parts = msg.content
+            .filter((b: any) => b.type === "text" || b.type === "image")
+            .map((b: any) => {
+              if (b.type === "text") return { type: "text" as const, text: b.text };
+              const url = anthropicImageUrl(b.source);
+              return url ? { type: "image_url" as const, image_url: { url } } : null;
+            })
+            .filter((p: any): p is NonNullable<typeof p> => p !== null);
+
+          if (parts.length > 0) {
+            result.push({ role: "user", content: parts });
+          }
+        } else {
+          const textBlocks = msg.content.filter((b: any) => b.type === "text");
+          if (textBlocks.length > 0) {
+            result.push({
+              role: "user",
+              content: textBlocks.map((b: any) => b.text).join("\n"),
+            });
+          }
         }
         for (const tr of toolResults) {
           const content = typeof tr.content === "string"
@@ -155,9 +188,11 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
       } else if (Array.isArray(msg.content)) {
         result.push({
           role: "user",
-          content: msg.content.map((p) =>
-            p.type === "text" ? { type: "text", text: p.text } : { type: "text", text: "" },
-          ),
+          content: msg.content.map((p) => {
+            if (p.type === "text") return { type: "text", text: p.text };
+            if (p.type === "image_url") return openAIImageBlock(p.image_url.url);
+            return { type: "text", text: "" };
+          }),
         });
       }
       continue;

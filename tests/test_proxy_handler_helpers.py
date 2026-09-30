@@ -141,6 +141,9 @@ class _VertexGeminiImageRequest:
         query="",
     )
 
+    async def stream(self):
+        yield await self.body()
+
     async def body(self) -> bytes:
         return json.dumps(
             {

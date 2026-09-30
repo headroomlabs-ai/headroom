@@ -18,6 +18,7 @@ import gzip
 import itertools
 import json
 import threading
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -199,15 +200,26 @@ def test_the_wire_contract_worker_js_must_satisfy():
     assert len(compressed) < 64 * 1024
 
 
-def test_a_413_must_not_trigger_the_uncompressed_retry(collector):
+def test_a_413_must_not_trigger_the_uncompressed_retry(monkeypatch):
     """413 means the body was too big. Answering that by re-sending the SAME
     payload uncompressed — six times larger — is guaranteed to 413 again, and
     would permanently switch off the compression that was the only thing
     keeping the request under the cap. Only "I cannot read this encoding"
     (400/415) may fall back."""
-    collector["too_large"] = True
+    monkeypatch.setenv("HEADROOM_BEACON_GZIP", "1")
+    monkeypatch.setattr(S, "_gzip_supported", True)
+    attempted: list[bool] = []
+
+    def _always_413(
+        endpoint: str, body: bytes, agent: str, timeout: float, *, compress: bool
+    ) -> None:
+        del body, agent, timeout
+        attempted.append(compress)
+        raise urllib.error.HTTPError(endpoint, 413, "Request Entity Too Large", hdrs=None, fp=None)
+
+    monkeypatch.setattr(S, "_send", _always_413)
     S._post_blocking(sample_payload())
-    assert collector["over"] == 1, "it should not have retried at all"
+    assert attempted == [True], "it should not have retried at all"
     assert S._gzip_enabled() is True, "a 413 disabled compression"
 
 

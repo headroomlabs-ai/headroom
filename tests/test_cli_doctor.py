@@ -20,6 +20,7 @@ from headroom.cli.doctor import (
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_kompress_health,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
@@ -43,6 +44,38 @@ STATS_OK = {
     },
     "cost": {"budget_limit_usd": 10.0, "budget_period": "daily"},
 }
+
+
+class TestKompressHealth:
+    def test_missing_health_endpoint_skips(self):
+        result = check_kompress_health(None)
+        assert result.status == SKIP
+        assert "health endpoint" in result.summary
+
+    def test_older_proxy_without_component_warns(self):
+        result = check_kompress_health({"checks": {}})
+        assert result.status == WARN
+        assert "readiness" in result.summary
+
+    def test_disabled_passes(self):
+        result = check_kompress_health({"checks": {"kompress": {"enabled": False}}})
+        assert result.status == PASS
+        assert result.summary == "disabled"
+
+    def test_ready_reports_backend(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": True, "backend": "onnx"}}}
+        )
+        assert result.status == PASS
+        assert result.summary == "ready (onnx)"
+
+    def test_cold_model_warns_with_action(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": False, "status": "degraded"}}}
+        )
+        assert result.status == WARN
+        assert "passing through" in result.summary
+        assert "/debug/warmup" in (result.hint or "")
 
 
 class TestProxyLiveness:

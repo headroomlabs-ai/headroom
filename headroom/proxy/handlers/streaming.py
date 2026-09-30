@@ -30,6 +30,7 @@ import httpx
 from headroom.copilot_auth import apply_copilot_api_auth
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
+from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -408,393 +409,31 @@ class StreamingMixin:
         cannot replay; anything else returns None so the caller can fail
         loudly instead.
         """
-        if provider != "anthropic":
-            return None  # Only implemented for Anthropic
+        if provider == "anthropic":
+            # Keep the complete wire envelope alongside the mutable message
+            # view. Callers that need to render a changed response own this
+            # envelope in their request-local flow; never attach it to this
+            # shared handler instance.
+            from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
 
-        # Event framing is CRLF in some intermediaries (and mixed after a
-        # retry through one). Normalize before the line split so a
-        # correctly framed stream is never read as zero events.
-        sse_data = sse_data.replace("\r\n", "\n").replace("\r", "\n")
-
-        response: dict[str, Any] = {"content": [], "usage": {}}
-        saw_message_start = False
-        saw_message_stop = False
-        saw_error = False
-        saw_unreplayable_delta = False
-        open_block_indices: set[int] = set()
-        # Track blocks by their `index` field so out-of-order events
-        # don't corrupt the reconstruction. The current block pointer
-        # remains for backward-compat with code that walks this dict
-        # sequentially, but the index map is the source of truth.
-        blocks_by_index: dict[int, dict[str, Any]] = {}
-        current_block: dict[str, Any] | None = None
-        # Track which block indices have already been appended to
-        # `response["content"]`. Dedup used to be `target not in
-        # response["content"]` — plain dict-equality. Two distinct blocks
-        # that happen to accumulate identical values (most commonly two
-        # separate empty `thinking` blocks, e.g. from a retried HTTP/2
-        # stream reset redelivering a truncated segment) either got
-        # wrongly collapsed into one, or — when their partial content
-        # happened to differ (same index, unequal dict) — both slipped
-        # through as duplicates. Indexing by `index` (falling back to
-        # object identity for the legacy no-index path) makes dedup exact
-        # regardless of what the accumulated content looks like: one
-        # entry per block index, first `content_block_stop` wins.
-        appended_block_keys: set[int] = set()
-
-        for line in sse_data.split("\n"):
-            if not line.startswith("data:"):
-                continue
-            data_str = line[5:].strip()
-            if not data_str or data_str == "[DONE]":
-                continue
-
-            try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            event_type = data.get("type", "")
-
-            if event_type == "message_start":
-                saw_message_start = True
-                msg = data.get("message", {})
-                response["id"] = msg.get("id")
-                response["type"] = msg.get("type", "message")
-                if "stop_sequence" in msg:
-                    response["stop_sequence"] = msg["stop_sequence"]
-                response["model"] = msg.get("model")
-                response["role"] = msg.get("role", "assistant")
-                response["stop_reason"] = msg.get("stop_reason")
-                if "stop_details" in msg:
-                    response["stop_details"] = msg["stop_details"]
-                if msg.get("usage"):
-                    response["usage"].update(msg["usage"])
-
-            elif event_type == "content_block_start":
-                block = data.get("content_block", {})
-                block_index = data.get("index", len(response["content"]))
-                btype = block.get("type")
-                current_block = {
-                    "type": btype,
-                    "index": block_index,
-                }
-                if btype == "text":
-                    current_block["text"] = block.get("text", "")
-                elif btype == "tool_use":
-                    current_block["id"] = block.get("id")
-                    current_block["name"] = block.get("name")
-                    current_block["input"] = {}
-                elif btype == "thinking":
-                    # Thinking block — accumulate text via
-                    # `thinking_delta`; signature arrives via
-                    # `signature_delta` (single value, not accumulated).
-                    current_block["thinking_buffer"] = block.get("thinking", "")
-                    if "signature" in block:
-                        current_block["signature"] = block["signature"]
-                elif btype == "redacted_thinking":
-                    # Per Anthropic spec §2.7: opaque encrypted reasoning
-                    # block. The `data` field is preserved as-is and
-                    # MUST be replayed unchanged on the next turn for
-                    # signature validation to pass.
-                    if "data" in block:
-                        current_block["data"] = block["data"]
-                elif btype:
-                    # Non-standard block (server_tool_use, web_search_tool_result,
-                    # ...): copy through all of the block's fields so the
-                    # reconstruction doesn't silently drop them to a bare
-                    # {type, index}. Mirrors the sibling reconstructor
-                    # `_reconstruct_anthropic_response`, which does `dict(block)`.
-                    for _k, _v in block.items():
-                        if _k != "type":
-                            current_block[_k] = _v
-                blocks_by_index[block_index] = current_block
-                open_block_indices.add(block_index)
-
-            elif event_type == "content_block_delta":
-                # Resolve the target block by index (preferred) or fall
-                # back to current_block for legacy linear streams.
-                idx = data.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is not None:
-                    delta = data.get("delta", {})
-                    dtype = delta.get("type")
-                    if dtype == "text_delta":
-                        target["text"] = target.get("text", "") + delta.get("text", "")
-                    elif dtype == "input_json_delta":
-                        # Accumulate partial JSON for tool input.
-                        partial = delta.get("partial_json", "")
-                        target["_partial_json"] = target.get("_partial_json", "") + partial
-                    elif dtype == "thinking_delta":
-                        # Accumulate thinking text into the dedicated
-                        # buffer so it never collides with `text` on
-                        # text blocks (separate field per guide §2.7).
-                        target["thinking_buffer"] = target.get("thinking_buffer", "") + delta.get(
-                            "thinking", ""
-                        )
-                    elif dtype == "signature_delta":
-                        # Single value, not accumulated. Last-write
-                        # wins per Anthropic spec.
-                        if "signature" in delta:
-                            target["signature"] = delta["signature"]
-                    elif dtype == "citations_delta":
-                        # Append the citation object to the citations
-                        # list so multi-citation blocks reconstruct
-                        # correctly. Per guide §2.5: each delta carries
-                        # one full citation object under `citation`.
-                        citations = target.setdefault("citations", [])
-                        citation = delta.get("citation")
-                        if citation is not None:
-                            citations.append(citation)
-                    else:
-                        # A delta this reconstructor has no rule for: the
-                        # accumulated block is missing whatever it carried.
-                        saw_unreplayable_delta = True
-
-            elif event_type == "content_block_stop":
-                idx = data.get("index")
-                target = (blocks_by_index.get(idx) if idx is not None else None) or current_block
-                if target is not None:
-                    # Parse accumulated JSON into `input` for any block that
-                    # streamed `input_json_delta` — tool_use AND server_tool_use
-                    # (and future tool-ish blocks). Gating on the block type
-                    # missed server_tool_use, leaving its `input` at the empty
-                    # start-event value and leaking the `_partial_json` scratch
-                    # key into replayed assistant history, which Anthropic then
-                    # rejects with `server_tool_use.input: Input should be an
-                    # object` (#2438). Always strip the scratch key.
-                    if "_partial_json" in target:
-                        raw = target.pop("_partial_json")
-                        try:
-                            target["input"] = json.loads(raw) if raw else {}
-                        except json.JSONDecodeError:
-                            target["input"] = {}
-                    # Materialize the thinking buffer into the
-                    # canonical `thinking` field expected by the
-                    # Anthropic API.
-                    if target.get("type") == "thinking" and "thinking_buffer" in target:
-                        target["thinking"] = target.pop("thinking_buffer")
-                    # Append the block exactly once, keyed by its block
-                    # index (or object identity when no index was ever
-                    # assigned). `current_block` may not match the
-                    # indexed target if the stream interleaved multiple
-                    # blocks; index-keyed map is authoritative.
-                    block_key = idx if idx is not None else id(target)
-                    if block_key not in appended_block_keys:
-                        response["content"].append(target)
-                        appended_block_keys.add(block_key)
-                    if idx is not None:
-                        open_block_indices.discard(idx)
-                    current_block = None
-
-            elif event_type == "message_delta":
-                delta = data.get("delta", {})
-                if "stop_reason" in delta:
-                    response["stop_reason"] = delta["stop_reason"]
-                if "stop_details" in delta:
-                    response["stop_details"] = delta["stop_details"]
-                if "stop_sequence" in delta:
-                    response["stop_sequence"] = delta["stop_sequence"]
-                if data.get("usage"):
-                    response["usage"].update(data["usage"])
-
-            elif event_type == "message_stop":
-                saw_message_stop = True
-
-            elif event_type == "error":
-                # An in-band failure. Permissive callers keep salvaging
-                # what arrived before it; a strict caller must not dress
-                # the remains up as a successful turn.
-                saw_error = True
-
-        if require_complete:
-            if (
-                not saw_message_start
-                or not saw_message_stop
-                or saw_error
-                or saw_unreplayable_delta
-                or open_block_indices
-            ):
+            envelope = AnthropicSSEEnvelope.parse(sse_data.encode("utf-8"))
+            if require_complete and not envelope.is_message_reconstructable():
                 return None
-            # ``index`` is a response-delta field. Anthropic rejects it on
-            # the next request ("content.0.text.index: Extra inputs are not
-            # permitted"), so it must not survive into a body the client
-            # will persist and echo back.
-            for block in response["content"]:
-                if isinstance(block, dict):
-                    block.pop("index", None)
-            return response
-
-        return response if response.get("content") else None
+            return (
+                envelope.message
+                if envelope.message.get("content") or envelope.saw_message_start
+                else None
+            )
 
     def _response_to_sse(self, response: dict[str, Any], provider: str) -> list[bytes]:
-        """Convert a response dict back to SSE format.
+        """Convert a response dictionary back to provider SSE frames."""
 
-        Args:
-            response: API response dict.
-            provider: Provider type for formatting.
-
-        Returns:
-            List of SSE event bytes.
-        """
         if provider != "anthropic":
             return []
 
-        events: list[bytes] = []
+        from headroom.proxy.anthropic_wire import render_anthropic_sse_response
 
-        # message_start
-        msg_start = {
-            "type": "message_start",
-            "message": {
-                "id": response.get("id", "msg_generated"),
-                "type": "message",
-                "role": response.get("role", "assistant"),
-                "model": response.get("model", "unknown"),
-                "content": [],
-                "stop_reason": None,
-                "usage": response.get("usage", {}),
-            },
-        }
-        events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
-
-        # Content blocks. `content` is provider/reconstruction-controlled, so a
-        # present-but-null value or a non-list would crash `enumerate`, and a
-        # non-dict element would crash `block.get(...)`. Guard both, matching the
-        # sibling `_record_ccr_feedback_from_response` below. This is reached from
-        # a call site (anthropic.py buffered CCR path) that only catches
-        # ValueError, so an unguarded TypeError/AttributeError would 500 the
-        # streamed request.
-        content = response.get("content")
-        for idx, block in enumerate(content if isinstance(content, list) else []):
-            if not isinstance(block, dict):
-                continue
-            # content_block_start
-            if block.get("type") == "text":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {"type": "text", "text": ""},
-                }
-            elif block.get("type") == "tool_use":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": block.get("id", f"toolu_{idx}"),
-                        "name": block.get("name", ""),
-                        "input": {},
-                    },
-                }
-            elif block.get("type") == "thinking":
-                content_block = {
-                    "type": "thinking",
-                    "thinking": "",
-                }
-                if "signature" in block:
-                    content_block["signature"] = block["signature"]
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": content_block,
-                }
-            elif block.get("type") == "redacted_thinking":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "redacted_thinking",
-                        "data": block.get("data", ""),
-                    },
-                }
-            elif block.get("type") == "server_tool_use":
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": block,
-                }
-            else:
-                block_start = {
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": block,
-                }
-
-            events.append(
-                f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
-            )
-
-            # content_block_delta(s)
-            if block.get("type") == "text" and block.get("text"):
-                delta = {
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "text_delta", "text": block["text"]},
-                }
-                events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
-                for citation in block.get("citations", []) or []:
-                    citation_delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "citations_delta", "citation": citation},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(citation_delta)}\n\n".encode()
-                    )
-            elif block.get("type") == "tool_use" and block.get("input"):
-                delta = {
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(block["input"]),
-                    },
-                }
-                events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
-            elif block.get("type") == "thinking":
-                if block.get("thinking"):
-                    delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "thinking_delta", "thinking": block["thinking"]},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
-                    )
-                if block.get("signature"):
-                    delta = {
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {"type": "signature_delta", "signature": block["signature"]},
-                    }
-                    events.append(
-                        f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode()
-                    )
-
-            # content_block_stop
-            block_stop = {"type": "content_block_stop", "index": idx}
-            events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
-
-        # message_delta
-        msg_delta_payload: dict[str, Any] = {}
-        if "stop_reason" in response:
-            msg_delta_payload["stop_reason"] = response["stop_reason"]
-        if "stop_details" in response:
-            msg_delta_payload["stop_details"] = response["stop_details"]
-        usage = response.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
-        msg_delta = {
-            "type": "message_delta",
-            "delta": msg_delta_payload,
-            "usage": {"output_tokens": usage.get("output_tokens", 0)},
-        }
-        events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
-
-        # message_stop
-        events.append(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
-
-        return events
+        return render_anthropic_sse_response(response)
 
     def _record_ccr_feedback_from_response(
         self, response: dict, provider: str, request_id: str
@@ -947,34 +586,15 @@ class StreamingMixin:
 
         # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
         # When upstream truncates mid-event (client disconnect, network
-        # drop, connection reset), the message_start (cache_read /
-        # cache_creation) or message_delta (output_tokens) usage events
-        # can sit in the residual buffer and never be parsed — surfacing
-        # as cache_read=cache_write=0 in PERF logs and poisoning the
-        # downstream freeze heuristic for the next request. Append the
-        # terminator so the buffer parser drains whatever's there. The
-        # per-event try/except in the parser swallows incomplete JSON,
-        # so this is safe even when the truncation cut mid-payload.
+        # drop, connection reset), the residual bytes are not a complete
+        # SSE event. Do not append a synthetic terminator here: doing so
+        # turns a partial UTF-8 sequence or partial event into input for
+        # the strict decoder and can raise while finalizing the stream.
+        # Complete usage events have already been parsed in the read loop;
+        # discard the incomplete tail instead of treating it as authoritative.
         sse_buffer = stream_state.get("sse_buffer")
         if isinstance(sse_buffer, bytearray) and len(sse_buffer) > 0:
-            sse_buffer.extend(b"\n\n")
-            late_usage = self._parse_sse_usage_from_buffer(stream_state, provider) or {}
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "cache_read_input_tokens",
-                "cache_creation_input_tokens",
-                "cache_creation_ephemeral_5m_input_tokens",
-                "cache_creation_ephemeral_1h_input_tokens",
-            ):
-                if key not in late_usage:
-                    continue
-                current = stream_state.get(key)
-                # Only fill in unset (None) or default-zero slots so a
-                # real cache_read=0 from earlier in the stream isn't
-                # clobbered by a later partial event.
-                if current is None or current == 0:
-                    stream_state[key] = late_usage[key]
+            sse_buffer.clear()
 
         output_tokens = stream_state["output_tokens"]
         output_tokens_source = "provider"
@@ -988,13 +608,20 @@ class StreamingMixin:
             output_tokens, output_tokens_source = estimate_output_tokens(
                 sse_text=full_sse_data,
                 total_bytes=stream_state["total_bytes"],
+                # The provider body as sent, so a turn stopped by its output
+                # ceiling can be counted exactly instead of estimated. Matters
+                # most for a tool call truncated mid-arguments, whose dropped
+                # JSON leaves almost no text to count.
+                body=body,
             )
             # Name the actual basis. The old message always said "from N bytes"
             # even though that is now only true for the fallback rung, and an
             # operator reading it needs to know which estimate they are looking
             # at before trusting the number.
             basis = (
-                "counted from stream text"
+                "exact: turn hit its output-token ceiling"
+                if output_tokens_source == "exact_ceiling"
+                else "counted from stream text"
                 if output_tokens_source == "estimated_text"
                 else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
             )
@@ -1259,6 +886,7 @@ class StreamingMixin:
         # bytes once before entering the connection-retry loop. When a
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
+        from headroom.proxy.anthropic_wire import is_safeguard_capable_request
         from headroom.proxy.body_forwarding import select_outbound_body
         from headroom.proxy.helpers import (
             capture_codex_wire_debug,
@@ -1285,8 +913,14 @@ class StreamingMixin:
             source=outbound_source,
             dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
+        safeguard_capable = provider == "anthropic" and is_safeguard_capable_request(
+            body, headers.get("anthropic-beta")
+        )
         _codex_wire_debug = (
-            codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
+            codex_wire_debug_enabled()
+            and not safeguard_capable
+            and provider == "openai"
+            and "/responses" in url
         )
         if _codex_wire_debug:
             capture_codex_wire_debug(
@@ -1583,6 +1217,21 @@ class StreamingMixin:
             or k.lower().startswith("x-codex")
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
+        # Headroom's own compression metrics, as the buffered path stamps them.
+        # Every counted value is known before the first byte, and streaming is
+        # how real coding agents talk to the proxy, so without these a client
+        # (or a metering layer in front of it) never learns what its request
+        # saved.
+        forwarded_headers["x-headroom-tokens-before"] = str(original_tokens)
+        forwarded_headers["x-headroom-tokens-after"] = str(optimized_tokens)
+        forwarded_headers["x-headroom-tokens-saved"] = str(tokens_saved)
+        forwarded_headers["x-headroom-model"] = model
+        if transforms_applied:
+            from headroom.proxy.cost import header_safe_transforms
+
+            forwarded_headers["x-headroom-transforms"] = ",".join(
+                header_safe_transforms(transforms_applied)
+            )
 
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
@@ -2015,10 +1664,11 @@ class StreamingMixin:
                         logger.error(f"[{request_id}] Bedrock stream error: {event.data}")
 
             except Exception as e:
-                logger.error(f"[{request_id}] Bedrock streaming error: {e}")
+                error_message = format_exception_message(e)
+                logger.error(f"[{request_id}] Bedrock streaming error: {error_message}")
                 error_event = {
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": error_message},
                 }
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
@@ -2123,6 +1773,7 @@ class StreamingMixin:
         waste_signals: dict[str, int] | None = None,
         prefix_tracker: Any | None = None,
         optimized_messages: list[dict] | None = None,
+        original_messages: list[dict] | None = None,
         backend: Any | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
@@ -2145,6 +1796,11 @@ class StreamingMixin:
         the FINAL usage frame can update the tracker for the next turn
         — mirroring the direct streaming path
         (``_stream_response``/``_finalize_stream_response``).
+        ``original_messages`` is the immutable pre-transform client
+        snapshot for the same update: the tracker must record what the
+        client SENT as its ``last_original_messages``, not what we
+        forwarded, or next turn's overlay never matches the client
+        prefix and cannot replay the cached bytes.
 
         NOTE: CCR request-level intercept on the streaming path is
         intentionally OUT OF SCOPE. Mirrors the Anthropic streaming
@@ -2215,14 +1871,13 @@ class StreamingMixin:
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
-                # Late-flush: if upstream truncated the stream mid-event,
-                # the buffer parser hasn't seen the closing ``\n\n`` yet.
-                # Mirror _finalize_stream_response: append the terminator
-                # and drain anything still parseable.
+                # A residual buffer without an SSE terminator is an
+                # incomplete event. Complete usage frames were parsed in
+                # the read loop; never synthesize ``\n\n`` here, because
+                # that can make partial UTF-8 look like a complete event.
                 buf = stream_state["sse_buffer"]
                 if len(buf) > 0:
-                    buf.extend(b"\n\n")
-                    _absorb(self._parse_sse_usage_from_buffer(stream_state, "openai"))
+                    buf.clear()
 
                 # Mirror the non-streaming sibling (``_extract_responses_usage``
                 # in handlers/openai.py): only infer cache metrics when
@@ -2269,6 +1924,7 @@ class StreamingMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=tracker_messages,
+                        original_messages=original_messages,
                     )
 
                 # CCR Feedback: record headroom_retrieve tool calls so

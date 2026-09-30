@@ -21,6 +21,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ try:
     _env_snapshot = set(_os.environ)
     import litellm
     from litellm import acompletion
+    from litellm.utils import supports_prompt_caching
 
     for _leaked_key in set(_os.environ) - _env_snapshot:
         del _os.environ[_leaked_key]
@@ -76,6 +79,7 @@ except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore
     acompletion = None  # type: ignore
+    supports_prompt_caching = None  # type: ignore
 
 
 # =============================================================================
@@ -178,6 +182,49 @@ def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         and not key.startswith("x-headroom-")
         and not key.startswith("x_headroom_")
     }
+
+
+def _place_system_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``messages`` with an ephemeral cache breakpoint on the first system message.
+
+    litellm turns the marker into a Bedrock Converse ``cachePoint``, which caches
+    every tool and system block before it. The first system message is marked
+    (not the last) so a client that appends volatile system messages later does
+    not turn every turn into a cache write. Returned unchanged when the client
+    already placed markers anywhere (it owns breakpoint placement then) or when
+    there is no system message with content to mark. Never mutates the input:
+    the proxy still reads ``body["messages"]`` after the request is built.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if "cache_control" in message or (
+            isinstance(content, list)
+            and any(isinstance(block, dict) and "cache_control" in block for block in content)
+        ):
+            return messages
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            marked = {**message, "cache_control": {"type": "ephemeral"}}
+        elif isinstance(content, list):
+            # litellm only reads block-level markers off list content.
+            blocks = list(content)
+            for block_index in range(len(blocks) - 1, -1, -1):
+                block = blocks[block_index]
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    blocks[block_index] = {**block, "cache_control": {"type": "ephemeral"}}
+                    break
+            else:
+                continue
+            marked = {**message, "content": blocks}
+        else:
+            continue
+        return [*messages[:index], marked, *messages[index + 1 :]]
+    return messages
 
 
 def _fetch_bedrock_inference_profiles(
@@ -588,6 +635,23 @@ def _parse_tool_arguments(arguments: Any) -> Any:
     return arguments
 
 
+def _anthropic_image_to_openai(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert an Anthropic ``image`` block to an OpenAI ``image_url`` part.
+
+    Same mapping as ``AnyLLMBackend._convert_content_blocks``. Returns None for a
+    source type it does not know, so that block is skipped as before.
+    """
+    source = block.get("source") or {}
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/png")
+        url = f"data:{media_type};base64,{source.get('data', '')}"
+    elif source.get("type") == "url":
+        url = source.get("url", "")
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 def _is_anthropic_family_model(litellm_model: str) -> bool:
     """True when the resolved litellm target speaks the Anthropic Messages
     dialect: the Anthropic API, Bedrock-Claude, Vertex-Claude, Azure-Claude.
@@ -755,6 +819,15 @@ class LiteLLMBackend(Backend):
                 f"from HEADROOM_BEDROCK_MODEL_MAP: {sorted(self._model_overrides)}"
             )
 
+        # Opt-in (rollout feature): mark the system prompt for Bedrock prompt
+        # caching on the OpenAI-format path, where clients such as OpenAI-compat
+        # gateways never send `cache_control` themselves.
+        from headroom.rollout import resolve_rollout
+
+        self._openai_prompt_caching = provider == "bedrock" and resolve_rollout().is_enabled(
+            "bedrock_openai_prompt_caching"
+        )
+
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
 
     @property
@@ -884,6 +957,9 @@ class LiteLLMBackend(Backend):
                 tool_use_blocks = []
                 tool_result_blocks = []
                 thinking_blocks: list[dict[str, Any]] = []
+                # Ordered text + image parts; only used when the turn has an image.
+                parts: list[dict[str, Any]] = []
+                has_image = False
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -891,6 +967,12 @@ class LiteLLMBackend(Backend):
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
+                        parts.append({"type": "text", "text": block.get("text", "")})
+                    elif block_type == "image":
+                        image_part = _anthropic_image_to_openai(block)
+                        if image_part:
+                            parts.append(image_part)
+                            has_image = True
                     elif block_type == "tool_use":
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
@@ -966,6 +1048,10 @@ class LiteLLMBackend(Backend):
                     "role": role,
                     "content": "\n".join(text_parts) if text_parts else "",
                 }
+                # User turns only: litellm's Bedrock transform raises on an
+                # assistant-turn image, which this code has always dropped.
+                if has_image and role == "user":
+                    simple_msg["content"] = parts
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
                 converted.append(simple_msg)
@@ -1177,7 +1263,8 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM error: {error_message}")
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1197,10 +1284,10 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "type": "error",
-                    "error": {"type": error_type, "message": str(e)},
+                    "error": {"type": error_type, "message": error_message},
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_message(
@@ -1587,12 +1674,13 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": error_message},
                 },
             )
 
@@ -1635,6 +1723,9 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
@@ -1784,7 +1875,8 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI error: {error_message}")
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1804,13 +1896,13 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "error": {
-                        "message": str(e),
+                        "message": error_message,
                         "type": error_type,
                         "code": error_type,
                     }
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_openai_message(
@@ -1842,6 +1934,9 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
@@ -1880,10 +1975,11 @@ class LiteLLMBackend(Backend):
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": error_message,
                     "type": "api_error",
                     "code": "backend_error",
                 }
