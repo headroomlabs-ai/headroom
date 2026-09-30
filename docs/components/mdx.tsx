@@ -9,10 +9,6 @@ import {
   KeyFeatures,
   FrameworkIntegrations,
 } from './marketing';
-import { LiveStats } from './live-stats';
-import { CommunityStatsHeader } from './community-stats-header';
-import { StatsSection } from './stats';
-import { CommunityCharts } from './community-charts';
 
 const generator = createGenerator();
 
@@ -26,10 +22,6 @@ export function getMDXComponents(components?: MDXComponents) {
     TypeTable,
     Tab,
     Tabs,
-    StatsSection,
-    CommunityCharts,
-    CommunityStatsHeader,
-    LiveStats,
     KeyFeatures,
     FrameworkIntegrations,
     ...components,

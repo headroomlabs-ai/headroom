@@ -1,4 +1,8 @@
-"""CCR marker freshness and retrieval-tool injection policy."""
+"""CCR marker freshness policy.
+
+Retrieval-tool injection is decided by ``apply_session_sticky_ccr_tool`` in
+``headroom.proxy.helpers``, from what the session has actually forwarded.
+"""
 
 from __future__ import annotations
 
@@ -28,18 +32,3 @@ def has_new_ccr_markers(
     )
     previous.scan_for_markers(previous_forwarded_messages)
     return bool(current - set(previous.detected_hashes))
-
-
-def should_inject_ccr_tool(
-    *,
-    configured_inject_tool: bool,
-    frozen_message_count: int,
-    has_compressed_content: bool,
-) -> tuple[bool, bool]:
-    """Decide whether the CCR retrieval tool must be injected this turn."""
-
-    inject_tool = configured_inject_tool
-    if inject_tool and frozen_message_count > 0:
-        inject_tool = False
-    is_marker_override = not inject_tool and has_compressed_content
-    return (inject_tool or is_marker_override), is_marker_override

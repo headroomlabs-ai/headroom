@@ -13,12 +13,31 @@ from .anthropic_prices import (
 from .anthropic_prices import (
     LAST_UPDATED as ANTHROPIC_LAST_UPDATED,
 )
+from .cache_ttl import (
+    CACHE_READ_MULTIPLIER,
+    CACHE_WRITE_MULTIPLIERS,
+    DEFAULT_CACHE_TTL,
+    CacheTTL,
+    cache_rates_per_1m,
+    cache_write_multiplier,
+    ttl_breakeven_share,
+)
 from .deepseek_prices import (
     DEEPSEEK_PRICES,
     get_deepseek_registry,
 )
 from .deepseek_prices import (
     LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
+)
+from .deepseek_tiers import (
+    OFF_PEAK_RATES_PER_1M,
+    PEAK_MULTIPLIER,
+    WEEKEND_OFF_PEAK_FROM,
+    DeepSeekRates,
+    bare_model,
+    is_peak,
+    off_peak_rates,
+    rates_for,
 )
 from .litellm_pricing import (
     LiteLLMModelPricing,
@@ -37,6 +56,14 @@ from .openai_prices import (
 from .registry import CostEstimate, ModelPricing, PricingRegistry
 
 __all__ = [
+    # Prompt-cache TTL structure (read / 5m write / 1h write)
+    "CACHE_READ_MULTIPLIER",
+    "CACHE_WRITE_MULTIPLIERS",
+    "DEFAULT_CACHE_TTL",
+    "CacheTTL",
+    "cache_rates_per_1m",
+    "cache_write_multiplier",
+    "ttl_breakeven_share",
     # LiteLLM-based pricing (preferred)
     "LiteLLMModelPricing",
     "estimate_cost",
@@ -59,4 +86,13 @@ __all__ = [
     "DEEPSEEK_LAST_UPDATED",
     "DEEPSEEK_PRICES",
     "get_deepseek_registry",
+    # DeepSeek peak/off-peak structure (Beijing windows; peak = 2x off-peak)
+    "OFF_PEAK_RATES_PER_1M",
+    "PEAK_MULTIPLIER",
+    "WEEKEND_OFF_PEAK_FROM",
+    "DeepSeekRates",
+    "bare_model",
+    "is_peak",
+    "off_peak_rates",
+    "rates_for",
 ]

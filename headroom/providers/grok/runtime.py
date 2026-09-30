@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from headroom.proxy.project_context import with_project_prefix
 
 DEFAULT_API_URL = "https://api.x.ai"
-PROXY_ENV_KEY = "GROK_CLI_CHAT_PROXY_BASE_URL"
+PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 
 
 def proxy_base_url(port: int) -> str:
@@ -23,9 +23,9 @@ def build_launch_env(
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for Grok CLI through the local proxy.
 
-    Grok routes inference traffic through ``GROK_CLI_CHAT_PROXY_BASE_URL``
-    when set (see Grok CLI auth/custom-models docs). The proxy forwards
-    OpenAI-compatible chat requests upstream to xAI.
+    Grok routes inference traffic through ``GROK_MODELS_BASE_URL`` when set.
+    The proxy forwards OpenAI-compatible chat requests upstream to xAI while
+    Grok keeps its native settings and authentication routing.
 
     ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
     base-URL prefix because Grok cannot send custom attribution headers;

@@ -13,8 +13,6 @@ services:
       # the Docker bind-mount source and is intentionally different.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
       HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
-      # CLI-filtering dashboard figures require the `rtk` binary inside this
-      # container; it is not installed by this image. See docs/content/docs/docker-install.mdx.
     volumes:
       - ${HEADROOM_WORKSPACE:-.}:/workspace
       - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.headroom:/tmp/headroom-home/.headroom
@@ -31,14 +29,13 @@ services:
     environment:
       HOME: /tmp/headroom-home
       HEADROOM_HOST: 0.0.0.0
+      HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:-}
       # Canonical Headroom filesystem contract (issue #175). See `cli` service
       # above for rationale.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom
       HEADROOM_CONFIG_DIR: /tmp/headroom-home/.headroom/config
-      # CLI-filtering dashboard figures require the `rtk` binary inside this
-      # container; it is not installed by this image. See docs/content/docs/docker-install.mdx.
     ports:
-      - "${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"
+      - "127.0.0.1:${HEADROOM_PORT:-8787}:${HEADROOM_PORT:-8787}"
     volumes:
       - ${HEADROOM_WORKSPACE:-.}:/workspace
       - ${HEADROOM_HOST_HOME:?set HEADROOM_HOST_HOME}/.headroom:/tmp/headroom-home/.headroom

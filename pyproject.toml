@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.32.0"
+version = "0.39.1"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -33,7 +33,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -49,11 +48,11 @@ dependencies = [
     # Core: lightweight compression (SmartCrusher, ContentRouter, CCR, TOIN)
     "tiktoken>=0.5.0",            # Tokenizer for all compressors
     "pydantic>=2.0.0",            # Config and data models
-    # litellm's own metadata pins requires-python <3.14, and headroom only uses it for
-    # model registry / pricing / non-core providers — all lazily imported and
-    # ImportError-guarded. Marking it 3.14-optional lets headroom install on Python 3.14
-    # (core compression + the Anthropic proxy path never import litellm). See GH #956.
-    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # model registry, pricing, providers (lazy)
+    # Model registry, pricing and non-core providers; all lazily imported and
+    # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
+    # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
+    # Python 3.14 (GH #956) or fall back to a Rust source build.
+    "litellm>=1.96.2,<2.0",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -66,6 +65,10 @@ dependencies = [
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
     "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
+    # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
+    # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
+    # Netskope). Pure Python, no deps; the same library pip uses by default.
+    "truststore>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -78,13 +81,22 @@ proxy = [
     "orjson>=3.9.14; platform_python_implementation != 'PyPy'",
     "httpx[http2]>=0.24.0",
     "openai>=2.14.0",             # OpenAI API format support
-    "mcp>=1.28.1",                 # MCP server (headroom_compress, retrieve, stats)
+    # The server still uses the v1 low-level Server decorator API. Keep this
+    # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
+    "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
     "magika>=0.6.0",              # ML content detection for ContentRouter
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
-    "onnxruntime>=1.16.0",        # Kompress ONNX INT8 text compression (no torch needed)
+    # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
+    # returning an initialization error; 1.24+ no longer ships Python 3.10
+    # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
+    "onnxruntime>=1.24.0; python_version>='3.11'",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
-    "watchdog>=4.0.0",            # File watcher for live code graph reindexing (--code-graph)
+    # File watcher for live code graph reindexing (--code-graph). watchdog 6.0.0
+    # publishes no macOS wheel for Python 3.14, so installing it there needs a C
+    # compiler. The watcher is optional and skips itself when watchdog is absent.
+    "watchdog>=4.0.0; sys_platform != 'darwin' or python_version < '3.14'",
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
@@ -126,7 +138,7 @@ ml = [
 # [memory]) fail on any machine without a compiler — see #1368.
 memory = [
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Optional HNSW vector backend. Needs a C++ toolchain to build hnswlib, so it is
 # kept out of [memory] and [all]; opt in with `pip install headroom-ai[vector]`
@@ -207,6 +219,14 @@ langchain = [
     "langchain-core>=1.3.3,<4.0",
     "langchain-openai>=1.1.14,<2.0",
 ]
+# LangGraph integration (headroom.integrations.langchain.langgraph)
+# LangGraph ships its own langchain-core pin, so this only adds langgraph itself
+# on top of the langchain extra.
+langgraph = [
+    "langchain-core>=1.3.3,<4.0",
+    "langchain-openai>=1.1.14,<2.0",
+    "langgraph>=1.0,<2.0",
+]
 # Agno agent framework integration
 agno = [
     "agno>=1.0.0",
@@ -217,7 +237,7 @@ strands = [
 ]
 # CrewAI agent framework integration
 crewai = [
-    "crewai>=1.0",
+    "crewai>=1.15.21",
 ]
 # AutoGen agent framework integration
 autogen = [
@@ -225,27 +245,28 @@ autogen = [
 ]
 # MCP server for Claude Code integration
 mcp = [
-    "mcp>=1.28.1",
+    "mcp>=1.28.1,<2.0.0",
     "httpx>=0.24.0",
     "starlette>=0.27.0",
     "uvicorn>=0.23.0,<1.0",
 ]
 # Voice filler detection
 voice = [
-    "onnxruntime>=1.16.0",
+    "onnxruntime>=1.24.0; python_version>='3.11'",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
     "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]
 # Voice training (includes voice deps + training extras)
 voice-train = [
     "headroom-ai[voice]",
-    "datasets>=2.14.0",
+    "datasets>=5.0.1",
     "accelerate>=0.20.0",
 ]
 # Evaluation framework
 evals = [
-    "datasets>=2.14.0",
-    "sentence-transformers>=2.2.0,<6.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "datasets>=5.0.1",
+    "sentence-transformers>=2.2.0,<7.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
     "scikit-learn>=1.3.0",
     "anthropic>=0.18.0",
@@ -270,15 +291,19 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
-    "ruff>=0.1.0",
+    "ruff==0.16.8",
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.86.2,<2.0; python_version < '3.14'",  # see core deps note (GH #956)
+    "litellm>=1.96.2,<2.0",       # see core deps note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
-    "httpx[http2]>=0.24.0",
+    # socks: test_upstream_guard proves a guarded upstream is refused on EVERY
+    # supported proxy transport. Without the extra, httpcore substitutes a stub
+    # AsyncSOCKSProxy that cannot be constructed, and the SOCKS case degrades to
+    # asserting on a type rather than a real pool.
+    "httpx[http2,socks]>=0.24.0",
     "websockets>=13.0",
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp-proto-http>=1.24.0",
@@ -286,9 +311,16 @@ dev = [
     "langchain-ollama>=0.2.0",
     "hnswlib>=0.8.0",
     "sqlite-vec>=0.1.6",
-    "sentence-transformers>=2.2.0,<6.0",
+    "sentence-transformers>=2.2.0,<7.0",
     "numpy>=1.24.0",
     "openpyxl>=3.1.0",  # exercises spreadsheet_ingest (.xlsx) in the test suite
+    "xlrd>=2.0.1",      # exercises spreadsheet_ingest (.xls) in the test suite
+    "xlwt>=1.3.0",      # writes the legacy .xls fixtures for spreadsheet_ingest tests
+    # test_upstream_guard builds a self-signed cert to prove the pinned connection
+    # still presents the original hostname for SNI and still verifies the cert.
+    # The floor in the security-pins block below is a *version* constraint on a
+    # transitive dep, not a guarantee it is installed -- CI had neither.
+    "cryptography>=50.0.0",
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
 # All optional dependencies (everything you need).
@@ -325,17 +357,18 @@ sandbox = [
 
 [project.scripts]
 headroom = "headroom.cli:main"
+headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
 [project.urls]
-Homepage = "https://headroom-docs.vercel.app"
-Documentation = "https://headroom-docs.vercel.app/docs"
-Repository = "https://github.com/chopratejas/headroom"
-Issues = "https://github.com/chopratejas/headroom/issues"
-Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+Homepage = "https://docs.headroomlabs.ai"
+Documentation = "https://docs.headroomlabs.ai/docs"
+Repository = "https://github.com/headroomlabs-ai/headroom"
+Issues = "https://github.com/headroomlabs-ai/headroom/issues"
+Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
 # at the auto-generated docs index so they can resolve install paths
 # and entry points without a follow-up fetch.
-"AI / LLM Index" = "https://headroom-docs.vercel.app/llms.txt"
+"AI / LLM Index" = "https://docs.headroomlabs.ai/llms.txt"
 
 # Maturin builds a single wheel containing both the Python source under
 # `headroom/` AND the compiled Rust extension `headroom/_core.so` (cdylib
@@ -353,8 +386,11 @@ constraint-dependencies = [
     "pygments>=2.20.0",
     # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2
     "pydantic-settings>=2.14.2",
-    # GHSA-mv93-w799-cj2w + 4 others (High) — transitive via agno; fix at 3.1.50
-    "gitpython>=3.1.50",
+    # GHSA-hmq2-w58f-27jc, GHSA-jm78-9fvv-mhgr, GHSA-wvpp-8hx9-p66j (High),
+    # GHSA-hh9p-6wh2-4mfc (Medium) + earlier ones — transitive via agno.
+    # 3.1.58 clears every GitPython advisory published to date; the previous
+    # 3.1.50 floor resolved to 3.1.54, which nine open advisories still cover.
+    "gitpython>=3.1.58",
     # GHSA-f4xh-w4cj-qxq8 (High) — transitive via langchain-core; fix at 0.8.18
     "langsmith>=0.9.0",
     # CVE-2026-49825 (High, XSS) — transitive via lxml[html-clean]; fix at 0.4.5
@@ -363,6 +399,10 @@ constraint-dependencies = [
     "transformers>=5.5.0",
     # PYSEC-2026-3447 — transitive dependency; fix at 83.0.0
     "setuptools>=83.0.0",
+    # PYSEC-2026-3545/3546/3547 — transitive HTTP/WebSocket parser fixes
+    "aiohttp>=3.14.3",
+    # PYSEC-2026-3552/3553/3554 — PKCS#7 and certificate verification fixes
+    "cryptography>=50.0.0",
 ]
 
 # Pin the project's package index to public PyPI. Without this, `uv lock`
@@ -491,6 +531,8 @@ markers = [
     "slow: slow tests (model loads, large fixtures)",
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
     "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
+    "proxy_dependency_gate: exercises ensure_proxy_dependencies() without mocking",
+    "windows_newline: newline-contract tests (#3698); also run on windows-latest in CI",
 ]
 
 [tool.coverage.run]

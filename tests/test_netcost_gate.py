@@ -73,6 +73,60 @@ class TestNetCostGate:
         assert _tool_slot_compressed(result, messages)
         assert not any(t.startswith("netcost:skip:") for t in result.transforms_applied)
 
+    def test_one_hour_ttl_prices_write_tier(self, router, tokenizer, monkeypatch):
+        # 5-minute pricing still admits this shave, while the larger 1h
+        # cache-write multiplier must turn the same candidate into a skip.
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        messages = _messages(_tool_json(300), suffix_filler_words=1000)
+
+        monkeypatch.delenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", raising=False)
+        five_minute = router.apply([dict(m) for m in messages], tokenizer)
+        assert _tool_slot_compressed(five_minute, messages)
+
+        monkeypatch.setenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", "3600")
+        one_hour = router.apply([dict(m) for m in messages], tokenizer)
+        assert not _tool_slot_compressed(one_hour, messages)
+        assert any(t.startswith("netcost:skip:") for t in one_hour.transforms_applied)
+
+    def test_request_one_hour_marker_overrides_env_fallback(self, router, tokenizer, monkeypatch):
+        monkeypatch.setenv("HEADROOM_NET_COST_POLICY", "1")
+        monkeypatch.delenv("HEADROOM_NET_COST_CACHE_TTL_SECONDS", raising=False)
+        for name in (
+            "DISABLE_PROMPT_CACHING",
+            "DISABLE_PROMPT_CACHING_SONNET",
+            "ENABLE_PROMPT_CACHING_1H",
+            "FORCE_PROMPT_CACHING_5M",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        messages = _messages(_tool_json(300), suffix_filler_words=1000)
+        messages[0] = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "fetch the records",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                }
+            ],
+        }
+
+        from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
+        request_ttl = anthropic_cache_ttl_seconds("claude-sonnet-4-6", messages)
+        assert request_ttl == 3600
+
+        five_minute = router.apply([dict(m) for m in messages], tokenizer)
+        assert _tool_slot_compressed(five_minute, messages)
+
+        one_hour = router.apply(
+            [dict(m) for m in messages],
+            tokenizer,
+            cache_ttl_seconds=request_ttl,
+        )
+        assert not _tool_slot_compressed(one_hour, messages)
+        assert any(t.startswith("netcost:skip:") for t in one_hour.transforms_applied)
+
     def test_flag_on_gates_cached_results_too(self, router, tokenizer, monkeypatch):
         # First apply warms the result cache with the flag off; second apply
         # with the flag on must still gate the cache-hit path.
@@ -148,8 +202,13 @@ class TestNetCostHelpers:
         assert _gain_bucket(float("inf")) == "nan"
 
     def test_message_tokens_block_list_beats_repr(self, tokenizer):
-        # str(content) over a block list counts repr punctuation/type names;
-        # the block-aware helper counts only the text-bearing payload.
+        # str(content) over a block list embeds the whole base64 payload; the
+        # block-aware helper prices the image at its pixel cost instead.
+        #
+        # This used to use a 500-char stub image, which is *smaller* than a
+        # single image's real token cost -- so repr looked cheap and the
+        # payload-scaling bug stayed invisible. Use a realistically sized
+        # payload, which is what actually occurs (screenshots).
         from headroom.transforms.content_router import _netcost_message_tokens
 
         text = "word " * 200
@@ -157,15 +216,17 @@ class TestNetCostHelpers:
             "role": "user",
             "content": [
                 {"type": "text", "text": text},
-                {"type": "image", "source": {"data": "x" * 500}},
+                {"type": "image", "source": {"data": "x" * 200_000}},
             ],
         }
         helper = _netcost_message_tokens(block_msg, tokenizer)
         text_only = tokenizer.count_text(text)
-        # Helper tracks the text payload closely; the image block adds only a
-        # small repr proxy, far less than stringifying the whole list.
-        assert abs(helper - text_only) < text_only * 0.5
-        assert helper < tokenizer.count_text(str(block_msg["content"]))
+        # The text payload is still counted in full, and the image adds a
+        # bounded pixel-based cost rather than a payload-scaled one.
+        assert helper >= text_only
+        assert helper - text_only <= 2000
+        # ...which is dramatically less than stringifying the whole list.
+        assert helper < tokenizer.count_text(str(block_msg["content"])) / 10
 
     def test_message_tokens_tool_result_blocks(self, tokenizer):
         from headroom.transforms.content_router import _netcost_message_tokens

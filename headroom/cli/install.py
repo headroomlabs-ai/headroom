@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 
 import click
+from click.core import ParameterSource
 
 from headroom._subprocess import run
 from headroom.install.health import probe_json, probe_ready
@@ -20,7 +23,7 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
-from headroom.install.planner import build_manifest
+from headroom.install.planner import build_manifest, build_tool_envs
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
@@ -30,10 +33,12 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    list_manifests,
     load_manifest,
     save_manifest,
 )
@@ -63,14 +68,82 @@ def install() -> None:
     """Install and manage persistent Headroom deployments."""
 
 
+def _profile_selection_was_explicit() -> bool:
+    """True when the current command received an explicit ``--profile``.
+
+    An explicit selection must be honored verbatim or rejected, never redirected
+    to ``HEADROOM_DEPLOYMENT_PROFILE`` or a lone installed deployment: silently
+    operating ``stop``/``restart``/``remove`` on a different profile than the one
+    the user typed is dangerous. Only a defaulted (omitted) ``--profile`` is
+    eligible for the recovery fallback. Outside a Click command context (direct
+    calls / unit tests) there is no explicit selection to protect.
+    """
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return False
+    return bool(ctx.get_parameter_source("profile") == ParameterSource.COMMANDLINE)
+
+
+def _missing_profile_error(
+    name: str,
+    installed: list[DeploymentManifest],
+    *,
+    source: str | None = None,
+) -> click.ClickException:
+    if installed:
+        names = ", ".join(sorted(m.profile for m in installed))
+        hint = f" Installed: {names}. Select one with --profile <name>."
+    else:
+        hint = " No deployments are installed; run `headroom init` or `headroom install apply`."
+    origin = f" (from {source})" if source else ""
+    return click.ClickException(f"No deployment profile named '{name}'{origin} is installed.{hint}")
+
+
 def _require_manifest(profile: str) -> DeploymentManifest:
     try:
         manifest = load_manifest(profile)
     except ManifestError as e:
         raise click.ClickException(str(e)) from None
-    if manifest is None:
-        raise click.ClickException(f"No deployment profile named '{profile}' is installed.")
-    return manifest
+    if manifest is not None:
+        return manifest
+
+    # The requested profile isn't installed. `headroom init` installs under a
+    # non-"default" profile name (e.g. init-user), while every lifecycle command
+    # defaults --profile to "default" -- so on an init'd machine the documented
+    # bare commands (`headroom install status`, etc.) would all dead-end (#2811).
+    installed = list_manifests()
+
+    # An EXPLICIT --profile is honored or rejected verbatim, never redirected: a
+    # typo must not silently act on the env/lone profile (#2832 review).
+    if _profile_selection_was_explicit():
+        raise _missing_profile_error(profile, installed)
+
+    # --profile was defaulted. A non-empty HEADROOM_DEPLOYMENT_PROFILE (which the
+    # runtime exports) is itself an explicit selection: honor it when installed,
+    # otherwise fail naming it. It must never fall through to the lone-manifest
+    # fallback and silently operate on a different deployment (#2832 review).
+    env_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE", "").strip()
+    if env_profile:
+        if env_profile != profile:
+            try:
+                resolved = load_manifest(env_profile)
+            except ManifestError:
+                resolved = None
+            if resolved is not None:
+                return resolved
+        raise _missing_profile_error(env_profile, installed, source="HEADROOM_DEPLOYMENT_PROFILE")
+
+    # Neither CLI nor environment named a profile. A single installed deployment
+    # is unambiguous, so use it; otherwise report what is available.
+    if len(installed) == 1:
+        return installed[0]
+    raise _missing_profile_error(profile, installed)
+
+
+def _is_windows() -> bool:
+    """Return whether this command is running on Windows."""
+
+    return sys.platform.startswith("win")
 
 
 def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool = False) -> None:
@@ -119,6 +192,15 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         stop_supervisor(manifest)
     stop_runtime(manifest)
+    # Stopping returns before the old process has finished shutting down, so it
+    # can keep answering /readyz. `_start_deployment` treats a ready endpoint as
+    # "already running" and would skip the start, leaving the deployment stopped
+    # once the old process exits. Block until it is really gone.
+    if not wait_stopped(manifest):
+        raise click.ClickException(
+            f"Deployment '{manifest.profile}' is still answering on "
+            f"{manifest.health_url} after stop."
+        )
 
 
 def _deactivate_deployment_mutations(
@@ -132,7 +214,77 @@ def _deactivate_deployment_mutations(
         save_manifest(manifest)
 
 
+def _reconcile_tool_envs(manifest: DeploymentManifest) -> dict[str, list[str]]:
+    """Add managed env vars introduced since this manifest was written.
+
+    ``tool_envs`` is built once, by ``build_manifest`` during ``headroom
+    install``, and then stored. Every later lifecycle command re-applies the
+    STORED map, so a variable added to a provider's install env afterwards never
+    reaches a deployment that already exists -- not on ``start``, not on
+    ``restart``, and not on a Headroom upgrade. The only cure was reinstalling,
+    which nobody does for a proxy that is working.
+
+    That is not hypothetical. ``ENABLE_TOOL_SEARCH`` was added to Claude's
+    install env on 2026-06-19 to stop Claude Code inlining every MCP schema when
+    it sees a custom ``ANTHROPIC_BASE_URL`` (GH #746). A deployment installed
+    before that date keeps getting the base URL written without it, so the
+    client is pointed at the proxy AND has its own tool-schema deferral switched
+    off -- the expensive half of the change with none of the mitigation.
+
+    Missing keys are ADDED; existing values are never overwritten. The stored
+    value may legitimately differ from a fresh build (a hand-edited port, a
+    deployment pinned to something specific), and healing an omission is a much
+    smaller claim than re-deciding a setting the manifest already records.
+    Returns the names added per target, for reporting.
+    """
+
+    added: dict[str, list[str]] = {}
+    for target, values in pending_tool_envs(manifest).items():
+        stored = manifest.tool_envs.get(target)
+        if not isinstance(stored, dict):
+            # Absent, or hand-edited into something that is not a mapping. Either
+            # way the managed values are what this deployment should have, and
+            # ``stored.update`` on a string would crash a lifecycle command.
+            manifest.tool_envs[target] = dict(values)
+        else:
+            stored.update(values)
+        added[target] = sorted(values)
+    return added
+
+
+def pending_tool_envs(manifest: DeploymentManifest) -> dict[str, dict[str, str]]:
+    """Managed env vars this manifest is missing, WITHOUT mutating it.
+
+    Split out so a lifecycle command can ask "is there anything to apply?"
+    before deciding to re-apply mutations. ``install start`` skips activation
+    entirely for a deployment that is already healthy and already has mutations
+    recorded -- which is every normally-installed working deployment, i.e.
+    exactly the population that needs reconciling. Asking first is what lets it
+    re-apply only when something is genuinely missing.
+
+    Targets whose managed env is empty are omitted, so a no-op reconcile does
+    not rewrite the manifest and bump ``updated_at`` for no visible reason.
+    """
+
+    current = build_tool_envs(manifest.port, manifest.backend, list(manifest.targets))
+    pending: dict[str, dict[str, str]] = {}
+    for target, values in current.items():
+        if not values:
+            continue
+        stored = manifest.tool_envs.get(target)
+        missing = (
+            dict(values)
+            if not isinstance(stored, dict)
+            else {name: value for name, value in values.items() if name not in stored}
+        )
+        if missing:
+            pending[target] = missing
+    return pending
+
+
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
+    for target, names in sorted(_reconcile_tool_envs(manifest).items()):
+        click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
     manifest.mutations = apply_mutations(manifest)
     save_manifest(manifest)
 
@@ -317,6 +469,40 @@ def _build_deployment_manifest(
     return manifest
 
 
+# Upstream-routing overrides the interactive `headroom proxy` reads from the
+# environment (via resolve_api_overrides), but a supervised runner starts from a
+# bare environment, so these never reach the persistent proxy unless captured
+# into the manifest. Without this, `install apply` with e.g.
+# ANTHROPIC_TARGET_API_URL exported silently routes to the default provider
+# endpoint instead of the user's gateway (#2240). Only URL overrides are
+# captured; the *_TARGET_API_HEADERS vars can carry bearer tokens and are left
+# to explicit `--env` so a secret is never persisted to the manifest implicitly.
+_PASSTHROUGH_URL_ENV_VARS = (
+    "ANTHROPIC_TARGET_API_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "OPENAI_TARGET_API_URL",
+    "GEMINI_TARGET_API_URL",
+    "CLOUDCODE_TARGET_API_URL",
+    "VERTEX_TARGET_API_URL",
+    "BEDROCK_TARGET_API_URL",
+)
+
+
+def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """Return the upstream-routing overrides present in ``environ``.
+
+    An empty or unset value is skipped so it cannot shadow an auto-derived
+    default. Explicit ``--env`` values are meant to win over these, so callers
+    should merge the returned dict *under* the parsed ``--env`` map.
+    """
+    captured: dict[str, str] = {}
+    for name in _PASSTHROUGH_URL_ENV_VARS:
+        value = environ.get(name)
+        if value:
+            captured[name] = value
+    return captured
+
+
 def _apply_manifest(manifest: DeploymentManifest) -> None:
     try:
         existing = load_manifest(manifest.profile)
@@ -401,9 +587,10 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     "--port",
     "-p",
     default=8787,
+    envvar="HEADROOM_PORT",
     type=click.IntRange(1, 65535),
     show_default=True,
-    help="Persistent proxy port.",
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",
@@ -418,7 +605,11 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
 )
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
 @click.option(
-    "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
+    "--mode",
+    "proxy_mode",
+    default="cache",
+    show_default=True,
+    help="Proxy optimization mode. cache = delta-only compression at ~0 prefix-cache busts.",
 )
 @click.option("--memory", is_flag=True, help="Enable persistent memory in the proxy runtime.")
 @click.option(
@@ -469,7 +660,8 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     is_flag=True,
     help=(
         "Opt in to tool_result interceptors (ast-grep Read outliner, etc.) in the "
-        "persistent runtime. Off by default while this feature ships."
+        "persistent runtime. This also selects the required canary rollout channel "
+        "unless --env HEADROOM_ROLLOUT_CHANNEL=... is supplied."
     ),
 )
 @click.option(
@@ -540,6 +732,11 @@ def install_apply(
         key, _, value = item.partition("=")
         parsed_env[key] = value
 
+    # Auto-carry upstream-routing overrides from the current environment so a
+    # supervised runner forwards to the same gateway the interactive proxy would
+    # (#2240). Explicit --env wins, so merge the captured vars underneath.
+    combined_env = {**_capture_passthrough_env(os.environ), **parsed_env}
+
     manifest = _build_deployment_manifest(
         profile=profile,
         preset=preset,
@@ -562,8 +759,18 @@ def install_apply(
         intercept_tool_results=intercept_tool_results,
         protect_tool_results=protect_tool_results,
         bedrock_profile=bedrock_profile,
-        extra_env=parsed_env,
+        extra_env=combined_env,
     )
+    if (
+        preset == InstallPreset.PERSISTENT_SERVICE.value
+        and manifest.preset == InstallPreset.PERSISTENT_TASK.value
+        and _is_windows()
+    ):
+        click.echo(
+            "Warning: persistent-service is not supported on Windows because the "
+            "Python runner cannot act as a Windows service. Falling back to "
+            "persistent-task with Task Scheduler."
+        )
 
     _apply_manifest(manifest)
     _echo_installed(manifest)
@@ -572,7 +779,13 @@ def install_apply(
 @main.command("deploy")
 @click.option("--profile", default="default", show_default=True, help="Deployment profile name.")
 @click.option(
-    "--port", "-p", default=8787, type=int, show_default=True, help="Persistent proxy port."
+    "--port",
+    "-p",
+    default=8787,
+    envvar="HEADROOM_PORT",
+    type=int,
+    show_default=True,
+    help="Persistent proxy port (env: HEADROOM_PORT).",
 )
 @click.option(
     "--backend",
@@ -587,7 +800,11 @@ def install_apply(
 )
 @click.option("--region", default=None, help="Cloud region for Bedrock / Vertex style backends.")
 @click.option(
-    "--mode", "proxy_mode", default="token", show_default=True, help="Proxy optimization mode."
+    "--mode",
+    "proxy_mode",
+    default="cache",
+    show_default=True,
+    help="Proxy optimization mode. cache = delta-only compression at ~0 prefix-cache busts.",
 )
 @click.option(
     "--scope",
@@ -624,7 +841,7 @@ def install_apply(
 )
 @click.option(
     "--image",
-    default="ghcr.io/chopratejas/headroom:latest",
+    default="ghcr.io/headroomlabs-ai/headroom:latest",
     show_default=True,
     help="Docker image to use when Docker is selected.",
 )
@@ -721,7 +938,10 @@ def install_start(profile: str) -> None:
     if not probe_ready(manifest.health_url):
         _deactivate_deployment_mutations(manifest)
     _start_deployment(manifest)
-    if probe_ready(manifest.health_url) and not manifest.mutations:
+    # ``not manifest.mutations`` alone skipped activation for every healthy,
+    # normally-installed deployment -- which is precisely the population whose
+    # stored env is stale. Re-apply when reconciliation has something to add.
+    if probe_ready(manifest.health_url) and (not manifest.mutations or pending_tool_envs(manifest)):
         _activate_deployment_mutations(manifest)
     click.echo(f"Started deployment '{profile}'.")
 

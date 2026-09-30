@@ -1,0 +1,37 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "first_line",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\ntype Processor struct {\n\tName  string\n\tCount int\n}\n\nfunc (p *Processor) Process(items []string) []string {\n\tresults := make([]string, 0, len(items))\n\tfor _, item := range items {\n\t\tif item == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\tclean := strings.ToLower(strings.TrimSpace(item))\n\t\tresults = append(results, clean)\n\t\tp.Count++\n\t}\n\treturn results\n}\n\nfunc main() {\n\tp := &Processor{Name: \"main\"}\n\tfmt.Println(p.Process([]string{\"a\", \"b\"}))\n}\n\n// variant 1",
+  "input_sha256": "716a5a2380907e7165334f0d0ce4c4502d6756647f8cb24dacf9b4882c1f8ede",
+  "output": {
+    "cache_key": null,
+    "compressed": "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\ntype Processor struct {\n\tName  string\n\tCount int\n}\n\nfunc (p *Processor) Process(items []string) []string {\n\tresults := make([]string, 0, len(items))\n\tfor _, item := range items {\n\t\tif item == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\tclean := strings.ToLower(strings.TrimSpace(item))\n\t\tresults = append(results, clean)\n\t\tp.Count++\n\t}\n\treturn results\n}\n\nfunc main() {\n\tp := &Processor{Name: \"main\"}\n\tfmt.Println(p.Process([]string{\"a\", \"b\"}))\n}\n\n// variant 1",
+    "compressed_bodies": 0,
+    "compressed_tokens": 120,
+    "compression_ratio": 1.0,
+    "language": "go",
+    "language_confidence": 1.0,
+    "original": "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\ntype Processor struct {\n\tName  string\n\tCount int\n}\n\nfunc (p *Processor) Process(items []string) []string {\n\tresults := make([]string, 0, len(items))\n\tfor _, item := range items {\n\t\tif item == \"\" {\n\t\t\tcontinue\n\t\t}\n\t\tclean := strings.ToLower(strings.TrimSpace(item))\n\t\tresults = append(results, clean)\n\t\tp.Count++\n\t}\n\treturn results\n}\n\nfunc main() {\n\tp := &Processor{Name: \"main\"}\n\tfmt.Println(p.Process([]string{\"a\", \"b\"}))\n}\n\n// variant 1",
+    "original_tokens": 120,
+    "preserved_imports": 0,
+    "preserved_signatures": 0,
+    "symbol_scores": {},
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.342039+00:00",
+  "transform": "code_aware_compressor"
+}

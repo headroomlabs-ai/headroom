@@ -10,16 +10,19 @@ tests/test_proxy/test_openai_backend_path.py for that precedent.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
 
-from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.requests import Request  # noqa: E402
 
 from headroom.cache.compression_store import reset_compression_store  # noqa: E402
 from headroom.ccr.tool_injection import CCR_TOOL_NAME  # noqa: E402
@@ -260,3 +263,286 @@ def test_streaming_request_without_retrieve_tool_uses_normal_stream_path():
 
     assert resp.status_code == 200, resp.text
     assert stream_called["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_withholds_output_until_upstream_resolves():
+    """Nothing is sent — no status, no body — until the buffered result exists."""
+    app = _make_app()
+    body = {
+        "model": "gpt-5-codex",
+        "input": "please wait",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+    started = asyncio.Event()
+    release = asyncio.Event()
+    request_delivered = False
+
+    async def receive():
+        # Mirror a real ASGI server: the body arrives once, then the channel
+        # stays open because the client is still connected. Returning instantly
+        # on every call spins `StreamingResponse.listen_for_disconnect`, which
+        # never yields, so the response body would never be scheduled.
+        nonlocal request_delivered
+        if request_delivered:
+            await asyncio.Event().wait()
+        request_delivered = True
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+
+        async def delayed_retry(*args, **kwargs):  # noqa: ANN002, ANN003
+            started.set()
+            await release.wait()
+            return _final_response("https://api.openai.com/v1/responses")
+
+        server._retry_request = delayed_retry
+        task = asyncio.create_task(server.handle_openai_responses(Request(scope, receive)))
+        await started.wait()
+        response = await asyncio.wait_for(asyncio.shield(task), 1)
+        events: list[dict] = []
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+
+        response_task = asyncio.create_task(response(scope, receive, send))
+        # Longer than the deleted 1.0s keepalive deadline: an unresolved upstream
+        # must still have produced no ASGI message at all.
+        await asyncio.sleep(1.1)
+        assert events == []
+        release.set()
+        await response_task
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 200
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"event: ping" not in bodies
+    assert b"Resolved!" in bodies
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_preserves_early_failure_status_and_headers():
+    app = _make_app()
+    body = {
+        "model": "gpt-5-codex",
+        "input": "fail early",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+
+        async def early_failure(*args, **kwargs):  # noqa: ANN002, ANN003
+            await asyncio.sleep(0.05)
+            return httpx.Response(
+                429,
+                headers={"retry-after": "7"},
+                json={"error": {"message": "slow down"}},
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            )
+
+        server._retry_request = early_failure
+        response = await server.handle_openai_responses(Request(scope, receive))
+        events: list[dict] = []
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+
+        await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert start["status"] == 429
+    assert headers[b"retry-after"] == b"7"
+    assert b": headroom-keepalive\n\n" not in b"".join(
+        event["body"] for event in events if event["type"] == "http.response.body"
+    )
+
+
+def test_buffered_responses_ccr_rejects_malformed_success_as_502():
+    """A malformed upstream 200 must not become a successful streamed turn."""
+    app = _make_app()
+    with TestClient(app) as client:
+        server = app.state.proxy
+        server._retry_request = AsyncMock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html>gateway timeout</html>",
+                headers={"content-type": "text/html"},
+                request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            )
+        )
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer sk-test"},
+            json={
+                "model": "gpt-5-codex",
+                "input": "fail safely",
+                "stream": True,
+                "tools": [_RETRIEVE_TOOL],
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_protocol_error", response.text
+    assert b"gateway timeout" not in response.content
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_late_failure_emits_sanitized_error_event():
+    app = _make_app()
+    body = {
+        "model": "gpt-5-codex",
+        "input": "please wait",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+        proxy_logger = logging.getLogger("headroom.proxy")
+        error_records: list[logging.LogRecord] = []
+        log_handler = logging.Handler()
+        log_handler.setLevel(logging.ERROR)
+        log_handler.emit = error_records.append
+        proxy_logger.addHandler(log_handler)
+
+        async def delayed_failure(*args, **kwargs):  # noqa: ANN002, ANN003
+            started.set()
+            await release.wait()
+            raise RuntimeError("boom")
+
+        with patch.object(server.metrics, "record_failed", new_callable=AsyncMock) as record_failed:
+            server._retry_request = delayed_failure
+            task = asyncio.create_task(server.handle_openai_responses(Request(scope, receive)))
+            await started.wait()
+            response = await asyncio.wait_for(asyncio.shield(task), 1)
+            events: list[dict] = []
+
+            async def send(message):  # noqa: ANN001
+                events.append(message)
+
+            response_task = asyncio.create_task(response(scope, receive, send))
+            await asyncio.sleep(0)
+            assert events == []
+            release.set()
+            await response_task
+            record_failed.assert_awaited_once_with(provider="openai")
+        proxy_logger.removeHandler(log_handler)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    assert start["status"] == 502
+    bodies = b"".join(event["body"] for event in events if event["type"] == "http.response.body")
+    assert b"An error occurred while processing your request." in bodies
+    assert b"boom" not in bodies
+    assert events[-1]["more_body"] is False
+    assert any(
+        record.levelno == logging.ERROR and "RuntimeError: boom" in record.getMessage()
+        for record in error_records
+    )
+
+
+@pytest.mark.asyncio
+async def test_buffered_responses_ccr_pre_keepalive_exception_returns_json_error():
+    app = _make_app()
+    body = {
+        "model": "gpt-5-codex",
+        "input": "fail before keepalive",
+        "tools": [_RETRIEVE_TOOL],
+        "stream": True,
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "headers": [(b"authorization", b"Bearer sk-test")],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+
+    with TestClient(app):
+        server = app.state.proxy
+
+        async def early_exception(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise RuntimeError("boom")
+
+        server._retry_request = early_exception
+        response = await server.handle_openai_responses(Request(scope, receive))
+        events: list[dict] = []
+
+        async def send(message):  # noqa: ANN001
+            events.append(message)
+
+        await response(scope, receive, send)
+
+    start = next(event for event in events if event["type"] == "http.response.start")
+    bodies = [event["body"] for event in events if event["type"] == "http.response.body"]
+    assert start["status"] == 502
+    assert dict(start["headers"])[b"content-type"] == b"application/json"
+    payload = json.loads(bodies[-1].decode())
+    assert (
+        payload["error"]["message"]
+        == "An error occurred while processing your request. Please try again."
+    )

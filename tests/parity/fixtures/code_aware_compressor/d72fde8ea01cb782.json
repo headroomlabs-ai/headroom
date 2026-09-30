@@ -1,0 +1,40 @@
+{
+  "config": {
+    "ccr_ttl": 300,
+    "compress_comments": true,
+    "docstring_mode": "full",
+    "enable_ccr": false,
+    "fallback_to_kompress": false,
+    "language_hint": null,
+    "max_body_lines": 5,
+    "min_tokens_for_compression": 100,
+    "preserve_decorators": true,
+    "preserve_imports": true,
+    "preserve_signatures": true,
+    "preserve_type_annotations": true,
+    "semantic_analysis": true,
+    "target_compression_rate": 0.2
+  },
+  "input": "import logging\n\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\n\n    Sets up the root logger with the given level and handler list,\n    applies the format string to every handler, and toggles warning\n    capture so library warnings are routed through the logger too.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    formatter = logging.Formatter(fmt)\n    for handler in handlers:\n        handler.setFormatter(formatter)\n        logger.addHandler(handler)\n    logger.propagate = propagate\n    logging.captureWarnings(capture_warnings)\n    logger.info(\"logging configured at level %s\", level)\n    return logger\n\n\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    return logger\n",
+  "input_sha256": "d72fde8ea01cb782c6e3de2e9d8322b40cc5e27593eefbd1049b64ad4467c154",
+  "output": {
+    "cache_key": null,
+    "compressed": "import logging\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\n\n    Sets up the root logger with the given level and handler list,\n    applies the format string to every handler, and toggles warning\n    capture so library warnings are routed through the logger too.\n    \"\"\"\n    logger = logging.getLogger()\n    # [9 lines omitted]\n    pass\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    # [1 lines omitted]\n    pass",
+    "compressed_bodies": 0,
+    "compressed_tokens": 148,
+    "compression_ratio": 0.6788990825688074,
+    "language": "python",
+    "language_confidence": 1.0,
+    "original": "import logging\n\n\ndef configure(level, handlers, fmt, propagate, capture_warnings):\n    \"\"\"Configure logging for the whole application.\n\n    Sets up the root logger with the given level and handler list,\n    applies the format string to every handler, and toggles warning\n    capture so library warnings are routed through the logger too.\n    \"\"\"\n    logger = logging.getLogger()\n    logger.setLevel(level)\n    formatter = logging.Formatter(fmt)\n    for handler in handlers:\n        handler.setFormatter(formatter)\n        logger.addHandler(handler)\n    logger.propagate = propagate\n    logging.captureWarnings(capture_warnings)\n    logger.info(\"logging configured at level %s\", level)\n    return logger\n\n\ndef teardown(logger):\n    for handler in list(logger.handlers):\n        handler.flush()\n        handler.close()\n        logger.removeHandler(handler)\n    return logger\n",
+    "original_tokens": 218,
+    "preserved_imports": 1,
+    "preserved_signatures": 2,
+    "symbol_scores": {
+      "configure": 0.5,
+      "teardown": 0.5
+    },
+    "syntax_valid": true
+  },
+  "recorded_at": "2026-06-19T00:15:16.356466+00:00",
+  "transform": "code_aware_compressor"
+}

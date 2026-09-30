@@ -15,6 +15,7 @@ class _FakeRequest:
         self.headers: dict[str, str] = {}
         self.query_params: dict[str, str] = {}
         self.url = SimpleNamespace(path="/v1beta/models/gemini-pro:generateContent", query="")
+        self.scope: dict = {"type": "http", "method": "POST"}
 
 
 class _NonJsonResponse:
@@ -56,6 +57,14 @@ class _Handler(GeminiHandlerMixin):
 
     async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
         self.outcomes.append(outcome)
+
+    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+        # Test stub for HeadroomProxy._count_tokens_offloaded: resolve the
+        # tokenizer and count inline (the real method offloads to the executor).
+        from headroom.tokenizers import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+        return tokenizer, tokenizer.count_messages(messages)
 
 
 @pytest.mark.asyncio
