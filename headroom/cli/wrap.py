@@ -39,6 +39,11 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
 from headroom._subprocess import identity_mismatch as _shared_identity_mismatch
 from headroom._subprocess import pid_alive, proc_identity, run
 
@@ -2892,16 +2897,23 @@ def _strip_codex_headroom_blocks(
         content,
     )
 
-    # Strip any orphaned `[model_providers.headroom]` table with the fields we
-    # write.  We only remove it if the table is recognisably ours (base_url
-    # mentions localhost and a Headroom proxy port).  This protects users who
-    # happen to have a differently configured `headroom` provider.
-    orphan_headroom_table = re.compile(
-        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
-        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
-        r"(?=^\[|\Z)"
-    )
-    content = orphan_headroom_table.sub("", content)
+    # Remove an orphaned local-proxy provider structurally. Text-level table
+    # matching cannot safely distinguish comments, multiline strings, and
+    # arrays of tables from a provider's body.
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        pass
+    else:
+        providers = document.get("model_providers")
+        if isinstance(providers, MutableMapping):
+            provider = providers.get("headroom")
+            base_url = provider.get("base_url") if isinstance(provider, Mapping) else None
+            if isinstance(base_url, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+/v1", base_url):
+                del providers["headroom"]
+                content = tomlkit.dumps(document)
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -2915,17 +2927,51 @@ _REDIRECTABLE_KEYS: tuple[str, ...] = ("model_provider", "openai_base_url")
 
 
 def _strip_existing_codex_headroom_provider_table(content: str) -> str:
-    """Remove a pre-existing ``[model_providers.headroom]`` table before wrap."""
-    if "[model_providers.headroom]" not in content:
+    """Remove a legacy Headroom provider table without touching other TOML.
+
+    ``tomlkit`` identifies tables structurally, preserving comments, string
+    values, and arrays of tables that text-level table-boundary matching can
+    mistake for provider content. The injector owns this provider name, so an
+    existing table is replaced by the current Headroom configuration.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
         return content
 
-    import re  # local import to match surrounding helper convention
+    providers = document.get("model_providers")
+    if not isinstance(providers, MutableMapping):
+        return content
+    provider = providers.get("headroom")
+    if not isinstance(provider, Mapping):
+        return content
+    del providers["headroom"]
+    return str(tomlkit.dumps(document))
 
-    provider_table = re.compile(
-        r"(?ms)^[ \t]*\[model_providers\.headroom\][^\n]*\n.*?(?=^[ \t]*\[|\Z)"
-    )
-    content = provider_table.sub("", content)
-    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+def _strip_existing_codex_memory_mcp_table(content: str) -> str:
+    """Remove an unmarked memory MCP table without text-level TOML parsing.
+
+    TOMLKit resolves quoted keys and finds table boundaries structurally, so
+    comments, multiline strings, and arrays of tables remain untouched.
+    Invalid source TOML is deliberately left unchanged; the caller validates
+    its complete generated candidate before it can overwrite the file.
+    """
+    import tomlkit
+
+    try:
+        document = tomlkit.parse(content)
+    except tomlkit.exceptions.ParseError:
+        return content
+
+    mcp_servers = document.get("mcp_servers")
+    if not isinstance(mcp_servers, MutableMapping) or "headroom_memory" not in mcp_servers:
+        return content
+
+    del mcp_servers["headroom_memory"]
+    return str(tomlkit.dumps(document))
 
 
 def _redirect_existing_top_level_keys(content: str, port: int) -> str:
@@ -3347,6 +3393,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
                 f"\n{provider_section}"
             )
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
         if custom_upstream_base_url:
@@ -3574,10 +3622,21 @@ def _inject_memory_mcp_config(user_id: str) -> None:
                 end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
                 content = content[:start].rstrip("\n") + mcp_section + content[end:].lstrip("\n")
             else:
+                # No marker yet. A `[mcp_servers.headroom_memory]` table can
+                # still exist unmarked — e.g. a user copied the snippet from
+                # this module's docstring by hand, or the table survived
+                # from before markers guarded this injection. Strip it first
+                # so we don't end up with two `[mcp_servers.headroom_memory]`
+                # tables, which is invalid TOML and silently breaks Codex's
+                # MCP config parsing (last-table-wins or hard failure
+                # depending on the TOML parser).
+                content = _strip_existing_codex_memory_mcp_table(content)
                 content = content.rstrip() + "\n" + mcp_section
         else:
             content = mcp_section
 
+        # Never replace a usable config with a malformed generated candidate.
+        tomllib.loads(content)
         _write_text(config_file, content)
         click.echo(f"  Memory MCP: registered in {config_file}")
     except Exception as e:
@@ -3776,9 +3835,16 @@ def _proxy_version(payload: dict[str, Any] | None) -> str | None:
 def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
-    running_release = _normalize_release_version(running_version)
     # -dev is a display marker for source builds; compare the base release so a
-    # dev CLI still restarts a stale proxy on a real version difference.
+    # dev CLI still restarts a stale proxy on a real version difference. The
+    # suffix must be stripped from the running version too: with it intact,
+    # "0.34.0-dev" fails the release regex, normalizes to None, and the check
+    # below silently never fires for source-built proxies. The scheme is always
+    # "<base>-dev" (get_version in headroom/_version.py); any future "-rcN" or
+    # "-dev.N" style would need stripping here as well.
+    running_release = _normalize_release_version(
+        running_version.removesuffix("-dev") if running_version is not None else None
+    )
     current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None

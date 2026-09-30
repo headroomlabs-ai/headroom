@@ -328,6 +328,8 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
 
 export function openAIToVercel(messages: OpenAIMessage[]): any[] {
   const result: any[] = [];
+  // tool_call id -> function name, so tool-result parts carry the name the AI SDK expects.
+  const toolNames = new Map<string, string>();
 
   for (const msg of messages) {
     if (msg.role === "system") {
@@ -354,6 +356,7 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
       if (msg.content) parts.push({ type: "text", text: msg.content });
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
+          toolNames.set(tc.id, tc.function.name);
           let input: any;
           try { input = JSON.parse(tc.function.arguments); } catch { input = tc.function.arguments ?? {}; }
           parts.push({
@@ -380,7 +383,7 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
         content: [{
           type: "tool-result",
           toolCallId: msg.tool_call_id,
-          toolName: "unknown",
+          toolName: toolNames.get(msg.tool_call_id) ?? "unknown",
           output,
         }],
       });

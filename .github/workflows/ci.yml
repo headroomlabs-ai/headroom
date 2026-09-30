@@ -422,6 +422,9 @@ jobs:
             --tb=short -q
 
       - name: Upload coverage shard ${{ matrix.shard }} to Codecov
+        # A shard with a failing test still writes its report; skipping the
+        # upload drops every line only that shard covers from codecov/patch.
+        if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v5
         with:
           files: coverage-${{ matrix.shard }}.xml
