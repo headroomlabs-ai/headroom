@@ -12,16 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from headroom.cli.wrap import (
-    _MEMORY_AGENTS_MARKER,
-    _RTK_MARKER,
-    _inject_memory_agents_md,
-    _inject_rtk_instructions,
-)
+from headroom.cli.wrap import _MEMORY_AGENTS_MARKER, _inject_memory_agents_md
 
-# (inject_fn, marker) for the two prose injectors that share the bug.
+# (inject_fn, marker) for the prose injectors that shared the bug.
 INJECTORS = [
-    pytest.param(_inject_rtk_instructions, _RTK_MARKER, id="rtk"),
     pytest.param(_inject_memory_agents_md, _MEMORY_AGENTS_MARKER, id="memory_agents"),
 ]
 

@@ -45,6 +45,16 @@ def main(ctx: click.Context) -> None:
     except Exception:  # noqa: BLE001 — settings load must never break the CLI
         pass
 
+    # Verify TLS through the OS trust store for every client in this process
+    # (after settings.json, which may set HEADROOM_CERT_STORE). Corporate
+    # TLS-inspection roots live there; certifi does not have them.
+    try:
+        from headroom.proxy.ssl_context import ensure_process_trust
+
+        ensure_process_trust()
+    except Exception:  # noqa: BLE001 — trust wiring must never break the CLI
+        pass
+
     # Fire a rate-limited, opt-out background check for newer releases so other
     # surfaces (e.g. the proxy banner) can show an "update available" notice.
     # Never blocks, never raises; skipped for `update` (it checks explicitly).
@@ -76,7 +86,9 @@ def _register_commands() -> None:
         perf,  # noqa: F401
         proxy,  # noqa: F401
         recover,  # noqa: F401
+        rollout,  # noqa: F401
         savings,  # noqa: F401
+        telemetry,  # noqa: F401
         tools,  # noqa: F401
         update,  # noqa: F401
         wrap,  # noqa: F401
@@ -86,6 +98,15 @@ def _register_commands() -> None:
     try:
         from . import memory  # noqa: F401
     except ImportError:
+        pass
+
+    # Third-party subcommands (headroom.cli_extension entry points). Runs last so
+    # built-ins are already attached and a plugin cannot shadow one.
+    try:
+        from .extensions import register_all
+
+        register_all(main)
+    except Exception:  # noqa: BLE001 — extension discovery must never break the CLI
         pass
 
 

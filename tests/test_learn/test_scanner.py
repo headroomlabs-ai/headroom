@@ -573,3 +573,42 @@ class TestDecodeProjectPath:
         assert result == project
         # The home component is reconstructed whole, never split on a separator.
         assert home.name in result.parts
+
+
+# ---------------------------------------------------------------------------
+# PermissionError on speculative candidate paths (issue #2443)
+# ---------------------------------------------------------------------------
+
+
+class TestDecodePermissionError:
+    """A candidate path that raises PermissionError must not crash decode.
+
+    When the username contains a dash (``marco-rocha``), decoding
+    ``-home-marco-rocha-butterfly-sylphina`` probes candidates like
+    ``/home/marco/rocha``. If ``/home/marco`` is another user's unreadable
+    directory, ``Path.exists()`` raises ``PermissionError`` from ``os.stat``
+    rather than returning ``False`` — this used to crash ``headroom learn``.
+    """
+
+    def test_permission_error_treated_as_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_exists = Path.exists
+
+        def fake_exists(self: Path, *args: object, **kwargs: object) -> bool:
+            if str(self) == "/home/marco/rocha":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        # Must not raise; the unreadable candidate is treated as non-existent.
+        result = _decode_project_path("-home-marco-rocha-butterfly-sylphina")
+        assert result is None or isinstance(result, Path)
+
+    def test_path_exists_swallows_oserror(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from headroom.learn.plugins.claude import _path_exists
+
+        def boom(self: Path, *args: object, **kwargs: object) -> bool:
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "exists", boom)
+        assert _path_exists(Path("/home/marco")) is False

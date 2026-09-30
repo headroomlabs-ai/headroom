@@ -82,6 +82,12 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "which",
         lambda name, *a, **k: "/usr/bin/uvx" if name == "uvx" else real_which(name, *a, **k),
     )
+    # ``_setup_serena_mcp`` now also injects guidance, scopes languages, and
+    # pre-indexes once registration succeeds. Those touch the real cwd / run
+    # real ``uvx`` — neutralise them so these registration-focused tests stay
+    # hermetic (covered directly in test_wrap_serena_boost.py).
+    monkeypatch.setattr(wrap_cli, "_inject_serena_instructions", lambda *a, **k: True)
+    monkeypatch.setattr(wrap_cli, "_index_serena_project", lambda *a, **k: None)
 
 
 def test_rewrap_migrates_stale_headroom_serena(

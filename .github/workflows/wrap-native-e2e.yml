@@ -16,7 +16,6 @@ on:
     paths:
       - "headroom/cli/**"
       - "headroom/providers/**"
-      - "headroom/rtk/**"
       - "tests/test_cli/test_wrap_bridge.py"
       - ".github/actions/headroom-e2e-setup/**"
       - ".github/workflows/wrap-native-e2e.yml"

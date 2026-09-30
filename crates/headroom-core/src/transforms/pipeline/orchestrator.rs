@@ -776,7 +776,7 @@ mod tests {
         let cfg = PipelineConfig::default();
         let p = CompressionPipeline::builder()
             .with_reformat(JsonMinifier)
-            .with_offload(JsonOffload::new(cfg.offload.json))
+            .with_offload(JsonOffload::from_pipeline(&cfg))
             .with_config(cfg)
             .build();
         let s = store();
@@ -809,7 +809,7 @@ mod tests {
     fn end_to_end_json_offload_skipped_for_small_array() {
         let cfg = PipelineConfig::default();
         let p = CompressionPipeline::builder()
-            .with_offload(JsonOffload::new(cfg.offload.json))
+            .with_offload(JsonOffload::from_pipeline(&cfg))
             .with_config(cfg)
             .build();
         let s = store();

@@ -219,6 +219,77 @@ def test_concurrent_tool_calls_share_backend_initialization(monkeypatch) -> None
     asyncio.run(scenario())
 
 
+def test_server_cleanup_closes_initialized_backend_once(monkeypatch) -> None:
+    async def scenario() -> None:
+        backend = SimpleNamespace(close=AsyncMock())
+        monkeypatch.setattr(mcp_server_mod, "Server", _CapturingServer)
+        monkeypatch.setattr(mcp_server_mod, "LocalBackend", lambda config: backend)
+        monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", AsyncMock())
+
+        server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+        await server.list_tools_handler()
+        await asyncio.sleep(0)
+
+        close_backend = server._headroom_close
+        await close_backend()
+        await close_backend()
+
+        backend.close.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_server_cleanup_cancels_pending_backend_initialization(monkeypatch) -> None:
+    async def scenario() -> None:
+        init_started = asyncio.Event()
+        backend = SimpleNamespace(close=AsyncMock())
+
+        async def warm_up(_backend, _user_id: str) -> None:
+            init_started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(mcp_server_mod, "Server", _CapturingServer)
+        monkeypatch.setattr(mcp_server_mod, "LocalBackend", lambda config: backend)
+        monkeypatch.setattr(mcp_server_mod, "_warm_up_backend", warm_up)
+
+        server = mcp_server_mod.create_memory_server("memory.db", user_id="alice")
+        await server.list_tools_handler()
+        await init_started.wait()
+
+        await server._headroom_close()
+
+        backend.close.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_run_closes_backend_when_stdio_exits(monkeypatch) -> None:
+    async def scenario() -> None:
+        close_backend = AsyncMock()
+        server = SimpleNamespace(
+            create_initialization_options=lambda: {},
+            run=AsyncMock(),
+            _headroom_close=close_backend,
+        )
+
+        class _StdioContext:
+            async def __aenter__(self):
+                return object(), object()
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                return False
+
+        monkeypatch.setattr(mcp_server_mod, "create_memory_server", lambda *args: server)
+        monkeypatch.setattr(mcp_server_mod, "stdio_server", lambda: _StdioContext())
+
+        await mcp_server_mod._run("memory.db", "alice")
+
+        server.run.assert_awaited_once()
+        close_backend.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
 def test_memory_mcp_startup_context_reports_dynamic_project_db(tmp_path) -> None:
     project_dir = tmp_path / "project-a"
     project_dir.mkdir()

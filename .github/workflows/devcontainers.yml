@@ -43,7 +43,7 @@ jobs:
       # Reclaim ~14 GB by stripping preinstalled tools none of the devcontainer
       # paths use (Android SDK, .NET, Haskell).
       - name: Free runner disk
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@v2.0.0
         with:
           tool-cache: true
           android: true
@@ -54,7 +54,7 @@ jobs:
           swap-storage: false
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -88,7 +88,7 @@ jobs:
       # device", see PR #495). Reclaim ~14 GB by stripping preinstalled tools the
       # build never touches — mirrors the memory-stack job's existing remedy.
       - name: Free runner disk
-        uses: jlumbroso/free-disk-space@v1.3.1
+        uses: jlumbroso/free-disk-space@v2.0.0
         with:
           tool-cache: true
           android: true
@@ -102,7 +102,7 @@ jobs:
         run: git worktree add "$RUNNER_TEMP/headroom-worktree" HEAD
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 

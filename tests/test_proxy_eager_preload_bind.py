@@ -11,6 +11,7 @@ bind still happens and transforms fall back to lazy loading.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -35,7 +36,14 @@ def _make_proxy(*, optimize: bool):
         image_optimize=False,
         subscription_tracking_enabled=False,
     )
-    return create_app(config).state.proxy
+    proxy = create_app(config).state.proxy
+    # Every test here substitutes fake pipelines to control exactly what the
+    # preload walks. The proxy also eagerly builds the default /v1/compress
+    # pipeline (a derived ContentRouter, warmed alongside the request
+    # pipelines), which would inject real transform statuses into those
+    # assertions — drop it so the fakes remain the only input.
+    proxy._compress_pipeline_cache = {}
+    return proxy
 
 
 class _FastTransform:
@@ -83,8 +91,15 @@ def test_eager_preload_dedupes_and_swallows_failures():
 
     eager_status, statuses = proxy._eager_preload_transforms()
 
-    assert eager_status == {"shared": "enabled", "kompress": "enabled"}
+    # Keys the preload contributes itself rather than collecting from a
+    # transform, so this assertion stays about dedupe/swallowing.
+    non_transform_keys = {"litellm"}
+    assert {k: v for k, v in eager_status.items() if k not in non_transform_keys} == {
+        "shared": "enabled",
+        "kompress": "enabled",
+    }
     assert statuses == [{"shared": "enabled"}, {"kompress": "enabled"}]
+    assert eager_status["litellm"] in {"ready", "not installed", "skipped"}
 
 
 async def test_startup_binds_despite_hung_preload(monkeypatch):
@@ -116,5 +131,27 @@ async def test_startup_merges_warmup_for_normal_transforms(monkeypatch):
         await proxy.startup()
         assert {"kompress": "enabled"} in captured
         assert proxy._kompress_status == "enabled"
+    finally:
+        await proxy.shutdown()
+
+
+async def test_startup_reports_deferred_kompress(caplog):
+    proxy = _make_proxy(optimize=True)
+    proxy.anthropic_pipeline = _FakePipeline([_FastTransform({"kompress": "deferred"})])
+    proxy.openai_pipeline = _FakePipeline([])
+
+    try:
+        # Proxy setup disables propagation on the ``headroom`` logger, so
+        # attach caplog's handler directly to the logger that emits this line.
+        server_mod.logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=server_mod.logger.name):
+                await proxy.startup()
+        finally:
+            server_mod.logger.removeHandler(caplog.handler)
+
+        assert proxy._kompress_status == "deferred"
+        assert "Kompress: DEFERRED (model loads on first request)" in caplog.messages
+        assert not any("Kompress: not installed" in message for message in caplog.messages)
     finally:
         await proxy.shutdown()

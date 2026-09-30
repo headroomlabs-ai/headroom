@@ -12,7 +12,6 @@ anything else the user has configured.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -53,10 +52,10 @@ class CodexRegistrar(MCPRegistrar):
     def __init__(self, *, home_dir: Path | None = None) -> None:
         if home_dir is not None:
             self._codex_dir = home_dir / ".codex"
-        elif os.environ.get("CODEX_HOME"):
-            self._codex_dir = Path(os.environ["CODEX_HOME"]).expanduser()
         else:
-            self._codex_dir = Path.home() / ".codex"
+            from headroom.install.paths import codex_home_dir
+
+            self._codex_dir = codex_home_dir()
         self._config_file = self._codex_dir / "config.toml"
 
     # ------------------------------------------------------------------
