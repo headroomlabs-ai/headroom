@@ -5096,6 +5096,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         if not include_sensitive:
             payload.pop("projects", None)
+            payload.pop("sessions", None)
             persistence = payload.get("persistence")
             if isinstance(persistence, dict):
                 payload["persistence"] = {**persistence, "error": None}
@@ -5131,6 +5132,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
         return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
+
+    @app.get("/stats/sessions/{session_id}", dependencies=[Depends(_require_loopback)])
+    async def stats_session(session_id: str):
+        """Per-session savings row for one harness session id.
+
+        The id is the one the client sent (``x-claude-code-session-id``, else ``x-headroom-session-id``). The row has the same shape as a per-project row from ``/stats-lifetime``. Loopback-only via ``require_loopback``, matching ``/admin`` and ``/debug``: the map keys are client-supplied strings and enumerate an operator's agent runs, which is not a network caller's business, and unlike ``/stats`` there is no aggregate-only subset worth serving to one.
+        """
+        entry = proxy.metrics.savings_tracker.session_response(session_id)
+        if entry is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "session_not_found", "session_id": session_id},
+            )
+        return entry
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
     async def transformations_feed(limit: int = 20, include_messages: bool = True):

@@ -395,6 +395,14 @@ curl http://localhost:8787/stats-history
 curl "http://localhost:8787/stats-history?format=csv&series=weekly"
 ```
 
+### `GET /stats/sessions/{session_id}`
+
+Per-session savings for one harness session id, taken from the `x-claude-code-session-id` request header (or `x-headroom-session-id`). Same row shape as a per-project row from `/stats-lifetime`; loopback-only, like `/admin` and `/debug`. Requests without either header are counted globally but never attributed to a session.
+
+```bash
+curl http://localhost:8787/stats/sessions/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
+```
+
 ### `GET /metrics`
 
 Prometheus-format metrics for monitoring.

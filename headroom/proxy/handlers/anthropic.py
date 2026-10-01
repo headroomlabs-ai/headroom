@@ -1201,8 +1201,11 @@ class AnthropicHandlerMixin:
             headers.pop("accept-encoding", None)
             tags = extract_tags(headers)
             from headroom.proxy.savings_attribution import bind_scope
+            from headroom.proxy.session_policy import bind_session_tag
 
             bind_scope(tags, request.scope)
+            # Savings-session attribution rides the same tags dict the scope ledgers do, so every outcome-emitting path below (stream, non-stream, buffered CCR) carries it without further threading.
+            bind_session_tag(tags, headers)
             # Identify the harness (codex / claude-code / aider / etc.)
             # from User-Agent or X-Client. Surfaced via the funnel into
             # PERF logs and RequestLog.tags — see RequestOutcome.client.

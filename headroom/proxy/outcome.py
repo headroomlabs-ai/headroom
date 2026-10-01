@@ -483,6 +483,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         public_tags,
         timings_from_tags,
     )
+    from headroom.proxy.session_policy import session_from_tags
     from headroom.telemetry.session import record_outcome
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
@@ -611,6 +612,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Session attribution: the harness session id the handler stashed on the request's tags (x-claude-code-session-id, else x-headroom-session-id). No fallback and no fabricated key; unattributed stays unattributed.
+    session_id = session_from_tags(outcome.tags)
+
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
     # while everything that accumulates across turns uses this, so a removed
@@ -674,6 +678,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         attempted_input_tokens=outcome.attempted_input_tokens,
         output_tokens_saved=output_tokens_saved_est,
         project=project,
+        session_id=session_id,
         client=outcome.client,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,

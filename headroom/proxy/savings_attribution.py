@@ -211,9 +211,15 @@ def public_tags(tags: MutableMapping[str, Any] | None) -> dict[str, Any]:
 
     They are carried on ``tags`` because that is the one dict that reaches the
     outcome funnel from every handler; letting them through to ``RequestLog``
-    would put a list and a dict into a string-keyed label store.
+    would put a list and a dict into a string-keyed label store. The bound
+    session id (``session_policy.SESSION_TAG``) is a scalar but is stripped
+    for the same reason from the other side: it is per-run plumbing, and a
+    label store that treated it as a filter facet would cardinality-explode.
     """
-    return {key: value for key, value in (tags or {}).items() if key not in _INTERNAL_TAGS}
+    from headroom.proxy.session_policy import SESSION_TAG
+
+    internal = _INTERNAL_TAGS | {SESSION_TAG}
+    return {key: value for key, value in (tags or {}).items() if key not in internal}
 
 
 def encode(items: list[dict[str, Any]]) -> str:

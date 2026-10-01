@@ -816,6 +816,8 @@ class PrometheusMetrics:
         attempted_input_tokens: int = 0,
         output_tokens_saved: int = 0,
         project: str | None = None,
+        # Harness session id for per-session savings attribution; rides the same record path as ``project`` (see session_policy).
+        session_id: str | None = None,
         client: str | None = None,
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
@@ -1039,6 +1041,7 @@ class PrometheusMetrics:
                 tool_search_saved=tool_search_saved,
                 provider=provider,
                 project=project,
+                session_id=session_id,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
@@ -1105,6 +1108,7 @@ class PrometheusMetrics:
                 model=model,
                 client=client or "proxy",
                 source="proxy",
+                session=session_id,
                 # The two layers, kept APART on disk. They price against
                 # different regions of the request (live zone vs cached prefix)
                 # and therefore at different rates, so a ledger that stores only

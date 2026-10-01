@@ -53,6 +53,9 @@ SCHEMA_VERSION = 6
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
+# Per-session savings attribution bounds. Sessions (one per harness run, from x-claude-code-session-id / x-headroom-session-id) are an order more numerous than projects, so the map is bounded two ways: a session idle longer than DEFAULT_SESSION_INACTIVITY_HOURS is evicted on the next recorded request (an agent session parked overnight resumes with the same id, so the window must outlive the 60-minute display-session rollover; one idle for a full day is finished), and the map is capped at DEFAULT_MAX_SESSIONS entries by evicting the least recently active, so a client cycling fresh ids cannot grow the persisted state without bound.
+DEFAULT_MAX_SESSIONS = 256
+DEFAULT_SESSION_INACTIVITY_HOURS = 24
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
 # Throttle for the negative-savings warning. The first one is immediate; after
@@ -751,6 +754,54 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
     return projects
 
 
+def _empty_session_entry() -> dict[str, Any]:
+    # Deliberately the project entry's shape (see _empty_project_entry) so a /stats/sessions/<id> row and a per-project row are interchangeable for dashboard consumers; delegating keeps the two from drifting apart.
+    return _empty_project_entry()
+
+
+def _normalize_sessions(raw: Any) -> dict[str, dict[str, Any]]:
+    """Sanitize a persisted per-session map, enforcing both bounds at load.
+
+    Idle-expired sessions are dropped here as well as on record: a proxy that restarts after a day of downtime would otherwise re-carry every stale session until some OTHER session happened to record again.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    sessions: dict[str, dict[str, Any]] = {}
+    idle_cutoff_iso = _to_utc_iso(_utc_now() - timedelta(hours=DEFAULT_SESSION_INACTIVITY_HOURS))
+    for session_id, entry in raw.items():
+        key = sanitize_project_name(session_id)
+        if key is None or not isinstance(entry, dict):
+            continue
+        normalized = _empty_session_entry()
+        normalized["requests"] = _coerce_int(entry.get("requests"))
+        normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
+        normalized["compression_savings_usd"] = round(
+            _coerce_signed_float(entry.get("compression_savings_usd")), 6
+        )
+        normalized["total_input_tokens"] = _coerce_int(entry.get("total_input_tokens"))
+        normalized["total_input_cost_usd"] = round(
+            _coerce_float(entry.get("total_input_cost_usd")), 6
+        )
+        last_activity = _parse_timestamp(entry.get("last_activity_at"))
+        normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
+        # last_activity_at is written (and re-written here) via _to_utc_iso, a fixed-width UTC format, so a lexical compare is a chronological one. An entry with no stamp (hand-edited or foreign-written state) cannot be proven idle, so it is kept rather than dropped; the cap below still bounds it.
+        if (
+            normalized["last_activity_at"] is not None
+            and normalized["last_activity_at"] < idle_cutoff_iso
+        ):
+            continue
+        sessions[key] = normalized
+    if len(sessions) > DEFAULT_MAX_SESSIONS:
+        # Same rationale as the projects cap: shrink an oversized persisted map in one step, keeping the most recently active sessions.
+        kept = sorted(
+            sessions.items(),
+            key=lambda item: item[1]["last_activity_at"] or "",
+            reverse=True,
+        )[:DEFAULT_MAX_SESSIONS]
+        sessions = dict(kept)
+    return sessions
+
+
 def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
@@ -1021,6 +1072,8 @@ class SavingsTracker:
         output_tokens: int = 0,
         provider: str | None = None,
         project: str | None = None,
+        # Harness session id (x-claude-code-session-id / x-headroom-session-id) for per-session attribution. Named ``session_id`` because ``session`` is the display-session local below. Unattributed traffic (``None``) skips the per-session map exactly like it skips the per-project one.
+        session_id: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
@@ -1277,6 +1330,16 @@ class SavingsTracker:
                 input_cost_usd_delta=delta_input_cost_usd,
             )
 
+            self._record_session_locked(
+                session_id,
+                timestamp_dt=timestamp_dt,
+                requests_delta=1,
+                tokens_saved_delta=delta_tokens_saved,
+                savings_usd_delta=delta_savings_usd,
+                input_tokens_delta=delta_input_tokens,
+                input_cost_usd_delta=delta_input_cost_usd,
+            )
+
             # In --mode cache, headroom's own compression (tokens_saved) is
             # near-always 0 by design — the frozen prefix is byte-replayed,
             # not lossy-compressed, to keep Bedrock's prompt cache warm. Gating
@@ -1453,6 +1516,54 @@ class SavingsTracker:
             )
             del projects[evict]
 
+    def _record_session_locked(
+        self,
+        session_id: str | None,
+        *,
+        timestamp_dt: datetime,
+        requests_delta: int = 0,
+        tokens_saved_delta: int = 0,
+        savings_usd_delta: float = 0.0,
+        input_tokens_delta: int = 0,
+        input_cost_usd_delta: float = 0.0,
+    ) -> None:
+        """Accumulate per-session savings. Caller must hold ``self._lock``.
+
+        Mirrors ``_record_project_locked`` on the same record path so global, per-project and per-session numbers cannot drift apart. Unattributed traffic (``session`` missing or unusable) is skipped. The map is bounded two ways; see the DEFAULT_MAX_SESSIONS / DEFAULT_SESSION_INACTIVITY_HOURS comment block at module scope.
+        """
+        key = sanitize_project_name(session_id)
+        if key is None:
+            return
+        sessions: dict[str, dict[str, Any]] = self._state.setdefault("sessions", {})
+        # Idle sweep against the incoming record's timestamp (the same reference _trim_history_locked uses), never the current wall clock: a test or backfill driving scripted timestamps must evict deterministically. The recording session is exempt from its own sweep, mirroring the projects cap's ``key != name``; a session already evicted by an earlier record simply starts a fresh entry, which is what eviction means. Lexical compare is chronological because every last_activity_at is _to_utc_iso output (fixed-width UTC), including entries re-normalized at load.
+        idle_cutoff_iso = _to_utc_iso(
+            timestamp_dt - timedelta(hours=DEFAULT_SESSION_INACTIVITY_HOURS)
+        )
+        for idle_key in [
+            other
+            for other, entry in sessions.items()
+            if other != key and (entry["last_activity_at"] or "") < idle_cutoff_iso
+        ]:
+            del sessions[idle_key]
+        entry = sessions.setdefault(key, _empty_session_entry())
+        entry["requests"] += max(requests_delta, 0)
+        entry["tokens_saved"] += max(tokens_saved_delta, 0)
+        entry["compression_savings_usd"] = round(
+            entry["compression_savings_usd"] + savings_usd_delta, 6
+        )
+        entry["total_input_tokens"] += max(input_tokens_delta, 0)
+        entry["total_input_cost_usd"] = round(
+            entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
+        )
+        entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
+        if len(sessions) > DEFAULT_MAX_SESSIONS:
+            # Evict the least recently active session, not the smallest saver: sessions are a recency-scoped index (an operator asks "what did this run save"), so recency is the only honest eviction order. String compare on the ISO activity stamp is a time compare.
+            evict = min(
+                (other for other in sessions if other != key),
+                key=lambda other: sessions[other]["last_activity_at"] or "",
+            )
+            del sessions[evict]
+
     def _record_by_model_locked(
         self,
         model: str,
@@ -1502,6 +1613,45 @@ class SavingsTracker:
             result[name] = view
         return result
 
+    def _sessions_snapshot_locked(self) -> dict[str, dict[str, Any]]:
+        """Per-session stats, same row shape and derivation as the projects snapshot."""
+        sessions = self._state.get("sessions", {})
+        ranked = sorted(
+            sessions.items(),
+            key=lambda item: item[1]["tokens_saved"],
+            reverse=True,
+        )
+        result: dict[str, dict[str, Any]] = {}
+        for session_id, entry in ranked:
+            view = dict(entry)
+            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            view["savings_percent"] = round(
+                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                2,
+            )
+            result[session_id] = view
+        return result
+
+    def session_response(self, session_id: str) -> dict[str, Any] | None:
+        """One session's stats row for ``GET /stats/sessions/<id>``.
+
+        Returns the same view as a ``_sessions_snapshot_locked`` row (and therefore the same shape as a per-project row), or ``None`` when the session id is unknown or unusable. The caller decides the not-found representation; the tracker only reports presence.
+        """
+        key = sanitize_project_name(session_id)
+        if key is None:
+            return None
+        with self._lock:
+            entry = self._state.get("sessions", {}).get(key)
+            if not isinstance(entry, dict):
+                return None
+            view = dict(entry)
+            total_before = entry["tokens_saved"] + entry["total_input_tokens"]
+            view["savings_percent"] = round(
+                (entry["tokens_saved"] / total_before * 100) if total_before > 0 else 0.0,
+                2,
+            )
+            return view
+
     def _by_model_snapshot_locked(self) -> dict[str, dict[str, Any]]:
         """Per-model stats ranked by savings."""
         by_model = self._state.get("by_model", {})
@@ -1549,6 +1699,7 @@ class SavingsTracker:
                 }
             )
             response["projects"] = self._projects_snapshot_locked()
+            response["sessions"] = self._sessions_snapshot_locked()
             return response
 
     def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
@@ -1690,6 +1841,7 @@ class SavingsTracker:
             "display_session": _empty_display_session(),
             "history": [],
             "projects": {},
+            "sessions": {},
             "by_model": {},
         }
 
@@ -1863,6 +2015,7 @@ class SavingsTracker:
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
             "projects": _normalize_projects(raw.get("projects")),
+            "sessions": _normalize_sessions(raw.get("sessions")),
             "by_model": _normalize_by_model(raw.get("by_model")),
         }
         raw_lifetime_metrics = raw.get("lifetime_metrics")
@@ -2031,6 +2184,7 @@ class SavingsTracker:
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],
                 "projects": self._state.get("projects", {}),
+                "sessions": self._state.get("sessions", {}),
                 "by_model": self._state.get("by_model", {}),
                 "lifetime_metrics": lifetime_metrics,
             }

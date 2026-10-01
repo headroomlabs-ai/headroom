@@ -36,6 +36,13 @@ disk, so a future basis change can re-derive the whole ledger.
 v1 events still read: they report their stored list dollar as both figures and
 carry ``basis="list"``, so a mixed ledger stays legible rather than silently
 blending two meanings.
+
+Schema v3 adds the harness session id (``session``, from
+``x-claude-code-session-id`` / ``x-headroom-session-id``) so the ledger can
+answer "what did this agent run save" without joining on timestamps. The
+field is omitted when no session id was available, which is what every v1/v2
+event is; readers treat absence as "unattributed", never as a distinct key to
+aggregate under.
 """
 
 from __future__ import annotations
@@ -68,7 +75,7 @@ try:
 except ImportError:
     _HAS_FCNTL = False
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UNKNOWN = "unknown"
 
 #: Basis recorded on a v1 event read back today: list-priced, mix unknown and
@@ -279,6 +286,10 @@ def record_savings_event(
     provider: Any = None,
     new_input_tokens: int | None = None,
     deferred_tokens: int = 0,
+    # v3: harness session id. Optional. Omitted (not blank, not "unknown")
+    # when unavailable, so the line is byte-identical to what a v2 writer
+    # produced on the same request.
+    session: Any = None,
 ) -> bool:
     """Append one savings event to the durable ledger. Never raises.
 
@@ -337,6 +348,10 @@ def record_savings_event(
         "source": str(source or UNKNOWN),
         "pid": os.getpid(),
     }
+    # v3 session attribution. Sanitized to None when unusable and then simply omitted: absence IS the "unattributed" marker (see the module docstring), and a sentinel id would invent a bucket every older event also lands in.
+    session_label = sanitize_project_name(session)
+    if session_label is not None:
+        event["session"] = session_label
     if new_input_tokens is not None:
         try:
             event["new_input"] = max(int(new_input_tokens), 0)
