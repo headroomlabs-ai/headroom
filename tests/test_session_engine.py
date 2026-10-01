@@ -182,6 +182,36 @@ def test_finalize_count_hook_failure_falls_back() -> None:
     assert turn.tokens is None
 
 
+def test_finalize_declines_inflating_replay_by_default() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+    # The pipeline recompressed message 0 SMALLER than the returned form.
+    recompressed = [
+        {"role": "user", "content": "[t]"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+    turn = finalize_turn(recompressed, current, prev_original, prev_returned)
+    assert not turn.replayed
+    assert turn.messages == recompressed
+
+
+def test_finalize_confirmed_floor_replays_confirmed_bytes() -> None:
+    prev_original, prev_returned = _prev_pair()
+    current = prev_original + [{"role": "user", "content": "next"}]
+    recompressed = [
+        {"role": "user", "content": "[t]"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "next"},
+    ]
+    turn = finalize_turn(
+        recompressed, current, prev_original, prev_returned, confirmed_frozen_count=2
+    )
+    assert turn.replayed
+    assert turn.messages[0]["content"] == "[returned-form]"
+    assert turn.messages[-1]["content"] == "next"
+
+
 # --------------------------------------------------------------------------- #
 # OpenAI proxy token-path migration: formula identity + marking benefit.       #
 # --------------------------------------------------------------------------- #

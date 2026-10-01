@@ -24,6 +24,7 @@
     "failure-learning",
     "---Proxy Server---",
     "proxy",
+    "corporate-networks",
     "local-llm-prefill",
     "---Integrations---",
     "vercel-ai-sdk",

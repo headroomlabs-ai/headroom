@@ -109,10 +109,41 @@ def claude_settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
-def codex_config_path() -> Path:
-    """Return the Codex config path."""
+def codex_home_dir() -> Path:
+    """Return Codex's user config directory, honoring ``CODEX_HOME``.
 
-    return Path.home() / ".codex" / "config.toml"
+    Codex itself resolves its home from ``CODEX_HOME`` (falling back to
+    ``~/.codex``); every Headroom reader and writer of Codex state must agree
+    with it, or ``doctor`` inspects one file while ``wrap``/``init`` write
+    another.
+    """
+
+    configured = os.environ.get("CODEX_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".codex"
+
+
+def codex_config_path() -> Path:
+    """Return the user-level Codex config path (``$CODEX_HOME/config.toml``)."""
+
+    return codex_home_dir() / "config.toml"
+
+
+def codex_hooks_path() -> Path:
+    """Return the user-level Codex hooks file (``$CODEX_HOME/hooks.json``)."""
+
+    return codex_home_dir() / "hooks.json"
+
+
+def codex_project_config_path(cwd: Path | None = None) -> Path:
+    """Return the project-scoped Codex config (``<cwd>/.codex/config.toml``).
+
+    Codex layers a trusted project's ``.codex/config.toml`` over the user
+    config, and ``headroom init codex`` (without ``-g``) writes there.
+    """
+
+    return (cwd or Path.cwd()) / ".codex" / "config.toml"
 
 
 def openclaw_config_path() -> Path:
