@@ -125,7 +125,7 @@ class TestLiteLLMToolsForwarding:
     """Test that tools are forwarded through LiteLLM send_message."""
 
     @pytest.mark.asyncio
-    async def test_tools_forwarded_in_send_message(self):
+    async def test_handoff_compatibility_tools_forwarded_in_send_message(self):
         """Tools should be converted and passed to litellm.acompletion."""
         mock_response = MagicMock()
         mock_response.choices = [

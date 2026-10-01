@@ -158,8 +158,6 @@ class _DummyHandler:
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -355,7 +353,7 @@ def test_contract_isolation_standalone_evaluate_matches_handler(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_mode_no_declared_limit():
+def test_budget_contract_mode_no_declared_limit():
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -369,7 +367,7 @@ def test_mode_no_declared_limit():
     assert d.should_reject is False
 
 
-def test_mode_observe_under_threshold():
+def test_budget_contract_mode_observe_under_threshold():
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -383,7 +381,7 @@ def test_mode_observe_under_threshold():
     assert d.should_reject is False
 
 
-def test_mode_observe_over_threshold():
+def test_budget_contract_mode_observe_over_threshold():
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -429,7 +427,7 @@ def test_variant_observe_over_threshold_logs_decision_fields(monkeypatch, caplog
     assert "mode=observe" in warning
 
 
-def test_mode_reject_over_threshold():
+def test_budget_contract_mode_reject_over_threshold():
     from headroom.proxy.context_budget_policy import evaluate
 
     d = evaluate(
@@ -443,7 +441,7 @@ def test_mode_reject_over_threshold():
     assert d.should_reject is True
 
 
-def test_mode_resolvers_default_and_invalid(monkeypatch):
+def test_budget_contract_mode_resolvers_default_and_invalid(monkeypatch):
     from headroom.proxy.context_budget_policy import resolve_mode, resolve_safety_margin
 
     monkeypatch.delenv("HEADROOM_CONTEXT_LIMIT_MODE", raising=False)
@@ -677,7 +675,9 @@ def test_variant_bypass_not_evaluated(monkeypatch):
     assert len(handler.upstream_calls) == 1
 
 
-def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypatch, caplog):
+def test_capability_identity_context1m_without_raw_declaration_degrades_to_observe(
+    monkeypatch, caplog
+):
     """context-1m beta without raw-id declaration degrades to observe even in reject mode."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
@@ -706,8 +706,8 @@ def test_variant_context1m_without_raw_declaration_degrades_to_observe(monkeypat
     assert any("no raw model declaration" in record.getMessage() for record in caplog.records)
 
 
-def test_variant_guard_internal_error_forwards(monkeypatch):
-    """Any exception inside the guard block forwards the request unchanged."""
+def test_reject_evaluation_failure_policy_error(monkeypatch):
+    """Configured rejection refuses an unavailable policy evaluation locally."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
     import headroom.proxy.context_budget_policy as _pol
     import headroom.tokenizers as _tk
@@ -727,12 +727,221 @@ def test_variant_guard_internal_error_forwards(monkeypatch):
             "max_tokens": 8_192,
         },
     )
-    anyio.run(handler.handle_anthropic_messages, req)
-    # Forwarded despite policy error
-    assert len(handler.upstream_calls) == 1
+    resp = anyio.run(handler.handle_anthropic_messages, req)
+    assert resp.status_code == 500
+    assert json.loads(resp.body)["error"]["type"] == "api_error"
+    assert len(handler.upstream_calls) == 0
 
 
-def test_variant_invalid_guard_configuration_forwards_with_warning(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("source_limit", "target_limit", "expected_status"),
+    [(1_000, 100_000, 200), (100_000, 1_000, 400)],
+)
+def test_destination_identity_uses_cost_router_destination_limit(
+    monkeypatch,
+    source_limit: int,
+    target_limit: int,
+    expected_status: int,
+):
+    """The declared window follows the model selected for the outgoing body."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    source_model = "step-source-v1"
+    target_model = "step-target-v1"
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=None)
+    handler.anthropic_provider._operator_context_limits.update(
+        {source_model: source_limit, target_model: target_limit}
+    )
+    handler.model_router = SimpleNamespace(
+        enabled=True,
+        select=lambda **_kwargs: SimpleNamespace(
+            changed=True,
+            reason="test route",
+            routed_model=target_model,
+        ),
+    )
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda _model: _DummyTokenizer(2_008))
+
+    req = _build_request(
+        {
+            "model": source_model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+
+    resp = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert resp.status_code == expected_status
+    if expected_status == 400:
+        assert target_model in json.loads(resp.body)["error"]["message"]
+        assert handler.upstream_calls == []
+    else:
+        assert handler.upstream_bodies[-1]["model"] == target_model
+
+
+def test_destination_identity_uses_backend_resolver_model_and_tokenizer(monkeypatch):
+    """A backend route is checked against its rewritten model and tokenizer."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+    from headroom.proxy.route_advice import BackendResolver, RouteAdvice
+
+    source_model = "step-source-v1"
+    target_model = "step-target-v1"
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=None)
+    handler.anthropic_provider._operator_context_limits.update(
+        {source_model: 100_000, target_model: 1_000}
+    )
+    tokenized_models: list[str] = []
+
+    def _get_tokenizer(model: str):
+        tokenized_models.append(model)
+        return _DummyTokenizer(2_008 if model == target_model else 1)
+
+    monkeypatch.setattr(_tk, "get_tokenizer", _get_tokenizer)
+
+    class _UnusedBackend:
+        name = "openai"
+
+        def map_model_id(self, model):
+            return model
+
+        def prepare_message(self, body, headers, *, stream=False):
+            return body
+
+        async def send_message(self, *_args, **_kwargs):
+            raise AssertionError("an over-budget request must stop before backend send")
+
+    resolver = BackendResolver(default=None)
+    backend = _UnusedBackend()
+    resolver._build = lambda _provider: backend
+    handler._route_resolver_cache = resolver
+
+    req = _build_request(
+        {
+            "model": source_model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+    req.state.headroom_route = RouteAdvice(model=target_model, provider="openai")
+
+    resp = anyio.run(handler.handle_anthropic_messages, req)
+
+    assert resp.status_code == 400
+    assert target_model in json.loads(resp.body)["error"]["message"]
+    assert target_model in tokenized_models
+
+
+def test_destination_identity_uses_url_model_override_limit_and_tokenizer(monkeypatch):
+    """A path-selected model owns the limit even when the body keeps its model."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as _tk
+
+    source_model = "step-source-v1"
+    target_model = "step-target-v1"
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=None)
+    handler.anthropic_provider._operator_context_limits.update(
+        {source_model: 1_000, target_model: 100_000}
+    )
+    tokenized_models: list[str] = []
+
+    def _get_tokenizer(model: str):
+        tokenized_models.append(model)
+        return _DummyTokenizer(2_008 if model == target_model else 1)
+
+    monkeypatch.setattr(_tk, "get_tokenizer", _get_tokenizer)
+    req = _build_request(
+        {
+            "model": source_model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+
+    async def _run_request():
+        return await handler.handle_anthropic_messages(req, model_override=target_model)
+
+    resp = anyio.run(_run_request)
+
+    assert resp.status_code == 200
+    assert target_model in tokenized_models
+
+
+def test_selected_bytes_counts_signed_thinking_wire_body_after_restoration(monkeypatch):
+    """The guard counts client bytes restored for signed-thinking passthrough."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "0")
+    import headroom.tokenizers as _tk
+    from headroom.pipeline import PipelineExtensionManager, PipelineStage
+
+    class _BodySizeTokenizer:
+        def count_messages(self, messages) -> int:
+            return 2_008 if "x" * 100 in json.dumps(messages) else 28
+
+        def count_text(self, _text: str) -> int:
+            return 0
+
+    class _ShrinkToolResult:
+        def on_pipeline_event(self, event):
+            if event.stage is PipelineStage.PRE_SEND and event.messages:
+                event.messages[1]["content"][0]["content"] = "short"
+            return None
+
+    monkeypatch.setattr(_tk, "get_tokenizer", lambda _model: _BodySizeTokenizer())
+    BudgetHandler = _make_handler_subclass()
+    handler = BudgetHandler(operator_limit=1_000)
+    handler.pipeline_extensions = PipelineExtensionManager(
+        extensions=[_ShrinkToolResult()], discover=False
+    )
+    original_body = {
+        "model": "step-router-v1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "reasoning",
+                        "signature": "signed-block",
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "x" * 2_000,
+                    }
+                ],
+            },
+        ],
+        "max_tokens": 100,
+    }
+
+    resp = anyio.run(
+        handler.handle_anthropic_messages,
+        _build_request(original_body),
+    )
+
+    assert resp.status_code == 400
+    assert "2008 tokens counted" in json.loads(resp.body)["error"]["message"]
+    assert handler.upstream_calls == []
+
+
+def test_observe_preservation_invalid_guard_configuration_forwards_with_warning(
+    monkeypatch, caplog
+):
     """Invalid operator values fail open and identify the configuration fix."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "invalid")
     import headroom.tokenizers as _tk
@@ -752,8 +961,8 @@ def test_variant_invalid_guard_configuration_forwards_with_warning(monkeypatch, 
 
     assert len(handler.upstream_calls) == 1
     assert any(
-        "invalid configuration" in record.getMessage()
-        and "forwarding unchanged" in record.getMessage()
+        "not accepted" in record.getMessage()
+        and "forwarding in observe mode" in record.getMessage()
         for record in caplog.records
     )
 
@@ -763,7 +972,7 @@ def test_variant_invalid_guard_configuration_forwards_with_warning(monkeypatch, 
 # --------------------------------------------------------------------------- #
 
 
-def test_preservation_unconfigured_install_forwards(monkeypatch):
+def test_observe_preservation_unconfigured_install_forwards(monkeypatch):
     """Without any operator limit, requests forward byte-identically."""
     import headroom.tokenizers as _tk
 
@@ -783,7 +992,7 @@ def test_preservation_unconfigured_install_forwards(monkeypatch):
     assert handler.upstream_original_body_bytes[-1] == json.dumps(original_body).encode()
 
 
-def test_preservation_get_context_limit_unchanged():
+def test_operator_provenance_get_context_limit_unchanged():
     """get_context_limit behavior is identical before and after the change."""
     from headroom.providers.anthropic import AnthropicProvider
 
@@ -794,7 +1003,7 @@ def test_preservation_get_context_limit_unchanged():
     assert provider.get_context_limit("test-model") == 200_000
 
 
-def test_preservation_get_operator_context_limit_no_declaration():
+def test_operator_provenance_get_operator_context_limit_no_declaration():
     """get_operator_context_limit returns None for undeclared models."""
     from headroom.providers.anthropic import AnthropicProvider
 
@@ -804,7 +1013,7 @@ def test_preservation_get_operator_context_limit_no_declaration():
     assert result is None
 
 
-def test_preservation_get_operator_context_limit_declared():
+def test_operator_provenance_get_operator_context_limit_declared():
     """get_operator_context_limit returns the declared value for a declared model."""
     import json
 
@@ -819,7 +1028,7 @@ def test_preservation_get_operator_context_limit_declared():
     assert provider.get_context_limit("step-router-v1") == 262_144
 
 
-def test_preservation_get_operator_context_limit_sanitized_variant():
+def test_operator_provenance_get_operator_context_limit_sanitized_variant():
     """A sanitized lookup finds the declaration for a styled model id."""
     from headroom.providers.anthropic import AnthropicProvider
 
@@ -832,7 +1041,7 @@ def test_preservation_get_operator_context_limit_sanitized_variant():
     assert provider.has_raw_operator_context_limit("claude-opus-4[1m]") is False
 
 
-def test_preservation_has_raw_operator_context_limit():
+def test_operator_provenance_has_raw_operator_context_limit():
     """A declaration keyed by the styled id is recognized as raw."""
     from headroom.providers.anthropic import AnthropicProvider
 
@@ -845,7 +1054,7 @@ def test_preservation_has_raw_operator_context_limit():
     assert provider.has_raw_operator_context_limit("claude-opus-4[1m]") is True
 
 
-def test_preservation_no_message_mutation(monkeypatch):
+def test_preservation_boundaries_no_message_mutation(monkeypatch):
     """The guard never mutates body['messages'], body['system'], or body['tools']."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
     import headroom.tokenizers as _tk
@@ -867,7 +1076,7 @@ def test_preservation_no_message_mutation(monkeypatch):
     assert "tools" not in handler.upstream_bodies[-1]
 
 
-def test_preservation_system_and_tools_forward_unchanged(monkeypatch):
+def test_preservation_boundaries_system_and_tools_forward_unchanged(monkeypatch):
     """Observe mode forwards top-level system and tools without mutation."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "observe")
     import headroom.tokenizers as _tk
@@ -936,7 +1145,7 @@ def test_negative_space_observe_over_threshold_still_forwards(monkeypatch):
     assert len(handler.upstream_calls) == 1
 
 
-def test_negative_space_bypassed_over_threshold_in_reject_mode_forwards(monkeypatch):
+def test_observe_preservation_bypassed_over_threshold_in_reject_mode_forwards(monkeypatch):
     """A bypassed over-threshold request in reject mode still reaches upstream."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
     import headroom.tokenizers as _tk
@@ -956,7 +1165,7 @@ def test_negative_space_bypassed_over_threshold_in_reject_mode_forwards(monkeypa
     assert len(handler.upstream_calls) == 1
 
 
-def test_variant_context1m_with_raw_declaration_still_enforces(monkeypatch):
+def test_capability_identity_context1m_with_raw_declaration_still_enforces(monkeypatch):
     """A sticky context-1m beta must not disarm a model the operator declared by raw id.
 
     `anthropic-beta` is session-sticky (`get_session_beta_tracker`), so a later
@@ -985,7 +1194,7 @@ def test_variant_context1m_with_raw_declaration_still_enforces(monkeypatch):
     assert len(handler.upstream_calls) == 0
 
 
-def test_variant_context1m_suffixed_declaration_still_enforces(monkeypatch):
+def test_capability_identity_context1m_suffixed_declaration_still_enforces(monkeypatch):
     """A declaration keyed by the [1m] model id survives handler sanitization."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
@@ -1196,3 +1405,434 @@ def test_production_route_guard_fires_on_create_app(monkeypatch):
 
     # Restore for cleanup
     proxy.anthropic_provider.get_operator_context_limit = original_get_op
+
+
+def test_step_fun_reproduction_real_loopback():
+    from tests.context_budget_behavior_probe import run_initial
+
+    row = run_initial()
+    assert row["status"] == 400 and row["upstream_calls"] == 0
+    assert (
+        row["declared_limit"] == 262144 and row["reserve"] == 12000 and row["threshold"] == 250144
+    )
+    assert row["overage"] > 0 and str(row["count"]) in row["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "forwarding,bypass",
+    [("byte_faithful", False), ("legacy_json_kwarg", False), ("byte_faithful", True)],
+)
+def test_selected_bytes_real_transport(stream, forwarding, bypass):
+    from tests.context_budget_behavior_probe import run_initial
+
+    row = run_initial(small=True, stream=stream, forwarding=forwarding, bypass=bypass)
+    assert row["upstream_calls"] == 1
+    assert row["selected_sha256"] == row["sent_sha256"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("form", ["text", "tool", "redacted"])
+def test_retained_thinking_real_registry_rejects(stream, form):
+    from tests.context_budget_behavior_probe import run_backend
+
+    row = run_backend(stream=stream, form=form)
+    assert row["prepared_count"] < row["threshold"] < row["view_count"]
+    assert row["status"] == 400 and row["sdk_calls"] == 0
+    assert row["kwargs_unchanged"] and row["prepare_calls"] == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_retained_thinking_litellm_prepared_accepts_unchanged(stream):
+    from tests.context_budget_behavior_probe import run_backend
+
+    row = run_backend(stream=stream, reject=False)
+    assert row["status"] == 200 and row["sdk_calls"] == 1
+    assert row["kwargs_unchanged"] and row["retained"] and row["prepare_calls"] == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_converted_accounting_retained_thinking_cross_vendor(stream):
+    from tests.context_budget_behavior_probe import run_backend
+
+    row = run_backend(stream=stream, cross_vendor=True)
+    assert row["status"] == 200 and row["sdk_calls"] == 1
+    assert row["prepared_count"] == row["view_count"] and not row["retained"]
+
+
+def test_retained_thinking_counting_view_none_tool_calls_redacted():
+    from copy import deepcopy
+
+    from headroom.proxy.handlers.anthropic import _context_budget_counting_messages
+    from headroom.tokenizers import get_tokenizer
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "sample", "arguments": "{}"}}
+            ],
+            "thinking_blocks": [
+                {"type": "thinking", "thinking": "sample " * 100, "signature": "s" * 100},
+                {"type": "redacted_thinking", "data": "sample" * 100},
+            ],
+        }
+    ]
+    original = deepcopy(messages)
+    view = _context_budget_counting_messages(messages)
+    tk = get_tokenizer("bedrock/anthropic.claude-sonnet-4-6-v1:0")
+    assert messages == original
+    assert view[0]["content"] == messages[0]["thinking_blocks"]
+    assert "thinking_blocks" not in view[0]
+    assert view[0]["tool_calls"] == messages[0]["tool_calls"]
+    assert tk.count_messages(view) > tk.count_messages(messages)
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_ccr_continuation_buffered_budget_client_delivery(late):
+    _assert_continuation("ccr", late=late)
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_memory_continuation_buffered_budget_client_delivery(late):
+    _assert_continuation("memory", late=late)
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_hook_continuation_buffered_budget_budget_salvage_client_delivery(late):
+    _assert_continuation("hook", late=late)
+
+
+@pytest.mark.parametrize("owner", ["ccr", "memory", "hook"])
+@pytest.mark.parametrize("late", [False, True])
+def test_continuation_evaluation_failure_buffered_budget(owner, late):
+    _assert_continuation(owner, late=late, unavailable=True)
+
+
+def _assert_continuation(owner, *, late, unavailable=False, grace_disabled=False):
+    from tests.context_budget_behavior_probe import run_continuation
+
+    row = run_continuation(owner, late=late, unavailable=unavailable, grace_disabled=grace_disabled)
+    assert row["status"] == (200 if late else (500 if unavailable else 400))
+    assert row["error_type"] == ("api_error" if unavailable else "invalid_request_error")
+    assert ("evaluation unavailable" if unavailable else "overage") in row["message"]
+    assert row["EOF"] and row["ping"] == late
+    if late:
+        assert row["content_type"] == "text/event-stream"
+    assert row["initial_calls"] == 1 and row["refused_continuation_calls"] == 0
+    if owner == "hook":
+        assert row["hook_attempts"] == 2
+
+
+def test_buffered_budget_continuation_evaluation_failure_grace_disabled():
+    _assert_continuation("hook", late=False, unavailable=True, grace_disabled=True)
+
+
+@pytest.mark.parametrize("owner", ["memory", "hook"])
+def test_budget_salvage_ordinary_failures_preserve_response(owner):
+    from tests.context_budget_behavior_probe import run_continuation
+
+    row = run_continuation(owner, ordinary_failure=True)
+    assert row["status"] == 200 and row["ordinary_answer"]
+    assert row["initial_calls"] == 1 and row["refused_continuation_calls"] == 0
+
+
+@pytest.mark.parametrize("owner", ["ccr", "memory", "hook"])
+def test_observe_preservation_continuation_forwards(owner):
+    from tests.context_budget_behavior_probe import run_continuation
+
+    row = run_continuation(owner, mode="observe")
+    assert row["status"] == 200 and row["refused_continuation_calls"] >= 1
+
+
+@pytest.mark.parametrize("error", [RuntimeError, LookupError])
+@pytest.mark.parametrize("mode", ["reject", "observe"])
+def test_reject_evaluation_failure_observe_preservation_estimator(monkeypatch, error, mode):
+    import headroom.proxy.context_budget_policy as policy
+    import headroom.tokenizers as tk
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", mode)
+    monkeypatch.setattr(tk, "get_tokenizer", lambda m: _DummyTokenizer(100))
+
+    def unavailable(**kwargs):
+        raise error("estimator unavailable")
+
+    monkeypatch.setattr(policy, "evaluate", unavailable)
+    handler = _make_handler_subclass()(operator_limit=1000)
+    result = anyio.run(
+        handler.handle_anthropic_messages,
+        _build_request(
+            {
+                "model": "step-router-v1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        ),
+    )
+    assert result.status_code == (500 if mode == "reject" else 200)
+    assert len(handler.upstream_calls) == (0 if mode == "reject" else 1)
+    if mode == "reject":
+        message = json.loads(result.body)["error"]["message"]
+        assert "evaluation unavailable" in message and "counted" not in message
+
+
+def test_reject_evaluation_failure_invalid_margin(monkeypatch):
+    import headroom.tokenizers as tk
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "broken")
+    monkeypatch.setattr(tk, "get_tokenizer", lambda m: _DummyTokenizer(100))
+    handler = _make_handler_subclass()(operator_limit=1000)
+    result = anyio.run(
+        handler.handle_anthropic_messages,
+        _build_request(
+            {
+                "model": "step-router-v1",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+        ),
+    )
+    assert result.status_code == 500 and not handler.upstream_calls
+
+
+def test_handoff_compatibility_default_backend_method():
+    from headroom.backends.base import Backend
+
+    with pytest.raises(NotImplementedError):
+        Backend.prepare_message(object(), {}, {})
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_litellm_prepared_converted_accounting_full_parameters(monkeypatch, stream):
+    from copy import deepcopy
+
+    from headroom.backends import litellm as owner
+    from headroom.tokenizers import get_tokenizer
+
+    with patch.object(owner, "_fetch_bedrock_inference_profiles", return_value={}):
+        backend = owner.LiteLLMBackend(
+            provider="bedrock", region="synthetic-region", profile_name="synthetic-profile"
+        )
+    body = {
+        "model": "bedrock/anthropic.claude-sonnet-4-6-v1:0",
+        "max_tokens": 32,
+        "system": [{"type": "text", "text": "synthetic system"}],
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t", "name": "sample", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t", "content": "result"}],
+            },
+        ],
+        "tools": [
+            {"name": "sample", "input_schema": {"type": "object"}},
+            {"name": "x" * 65, "input_schema": {"type": "object"}},
+        ],
+        "temperature": 0.5,
+        "top_p": 0.8,
+        "stop_sequences": ["stop"],
+        "tool_choice": {"type": "auto"},
+    }
+    original = deepcopy(body)
+    prepared = backend.prepare_message(body, {"x-api-key": "synthetic"}, stream=stream)
+    assert body == original
+    assert (
+        prepared["aws_region_name"] == "synthetic-region"
+        and prepared["aws_profile_name"] == "synthetic-profile"
+    )
+    assert "api_key" not in prepared and prepared["timeout"] > 0
+    assert len(prepared["tools"]) == 1 and len(prepared["messages"]) == 3
+    assert prepared["messages"][0]["role"] == "system" and prepared["messages"][1]["tool_calls"]
+    assert prepared["messages"][2]["tool_call_id"] == "t"
+    assert prepared.get("stream_options") == ({"include_usage": True} if stream else None)
+    tokenizer = get_tokenizer(prepared["model"])
+    assert tokenizer.count_messages(prepared["messages"]) > 0
+    assert tokenizer.count_text(json.dumps(prepared["tools"])) > 0
+    print(
+        f"LiteLLM prepared mode={'streaming' if stream else 'buffered'} system_once=True tool_calls=True filtered_tools=1 region_profile=True timeout=True stream_options={stream} no_io=True"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_litellm_prepared_auth_header_forwarding(stream):
+    from headroom.backends.litellm import LiteLLMBackend
+
+    backend = LiteLLMBackend(provider="anthropic")
+    prepared = backend.prepare_message(
+        {"model": "claude-sonnet-4-6", "messages": []},
+        {"x-api-key": "sk-ant-synthetic"},
+        stream=stream,
+    )
+    assert prepared["api_key"] == "sk-ant-synthetic"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_reject_evaluation_failure_eligible_preparation(monkeypatch, stream):
+    from headroom.backends.litellm import LiteLLMBackend
+    from headroom.proxy.server import create_app
+    from tests.context_budget_behavior_probe import config
+
+    target = "anthropic/claude-sonnet-4-6"
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_MODEL_LIMITS", json.dumps({"context_limits": {target: 1000}}))
+    backend = LiteLLMBackend(provider="anthropic")
+    calls = []
+
+    def broken(*args, **kwargs):
+        calls.append(True)
+        raise LookupError("synthetic preparation failure")
+
+    backend.prepare_message = broken
+    app = create_app(config())
+    app.state.proxy.anthropic_backend = backend
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-6",
+                "stream": stream,
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers={"x-api-key": "synthetic"},
+        )
+    assert result.status_code == 500 and len(calls) == 1
+    assert result.json()["error"]["type"] == "api_error"
+    assert "evaluation unavailable" in result.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_selected_bytes_preservation_boundaries_post_send_rollback_and_observe_preservation_extension(
+    monkeypatch, stream
+):
+    from headroom.pipeline import PipelineExtensionManager, PipelineStage
+    from headroom.proxy.server import create_app
+    from tests.context_budget_behavior_probe import config
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "0")
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"context_limits": {"step-router-v1": 1000}})
+    )
+    mutated = []
+
+    class Shrink:
+        def on_pipeline_event(self, event):
+            if event.stage is (PipelineStage.POST_SEND if stream else PipelineStage.PRE_SEND):
+                event.messages[-1]["content"][0]["content"] = "short"
+                mutated.append(True)
+                raise LookupError("synthetic extension failure")
+
+    app = create_app(config())
+    app.state.proxy.pipeline_extensions = PipelineExtensionManager(
+        extensions=[Shrink()], discover=False
+    )
+    calls = []
+
+    async def forbidden(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("must reject selected signed body")
+
+    app.state.proxy._retry_request = forbidden
+    app.state.proxy._stream_response = forbidden
+    body = {
+        "model": "step-router-v1",
+        "stream": stream,
+        "max_tokens": 32,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "synthetic", "signature": "s"},
+                    {"type": "tool_use", "id": "t", "name": "sample", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t",
+                        "content": "synthetic large output " * 2000,
+                    }
+                ],
+            },
+        ],
+    }
+    with TestClient(app) as client:
+        result = client.post("/v1/messages", json=body, headers={"x-api-key": "synthetic"})
+    assert result.status_code == 400 and mutated and not calls
+    assert "overage" in result.json()["error"]["message"]
+    assert not app.state.proxy._active_streams
+    assert (
+        app.state.proxy.anthropic_pre_upstream_sem._value
+        == app.state.proxy.anthropic_pre_upstream_concurrency
+    )
+    print(
+        f"selected_bytes mode={'streaming' if stream else 'buffered'} real_selector=True extension_LookupError=True rollback=True upstream_calls=0 semaphore_release_once=True active_streams=0"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_capability_identity_discarded_backend_beta_preserves_reject(stream):
+    from tests.context_budget_behavior_probe import run_backend
+
+    row = run_backend(stream=stream, beta=True)
+    assert row["status"] == 400 and row["sdk_calls"] == 0
+
+
+@pytest.mark.parametrize("error", [RuntimeError, LookupError])
+@pytest.mark.parametrize("mode", ["reject", "observe"])
+def test_reject_evaluation_failure_observe_preservation_real_estimator(monkeypatch, error, mode):
+    import httpx
+
+    from headroom.proxy.server import create_app
+    from headroom.tokenizers import get_tokenizer
+    from tests.context_budget_behavior_probe import config, response
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", mode)
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"context_limits": {"step-router-v1": 1000}})
+    )
+    tokenizer = get_tokenizer("step-router-v1")
+    real_count = tokenizer.count_messages
+
+    def broken(messages):
+        if any(message.get("role") == "system" for message in messages):
+            raise error("synthetic real estimator failure")
+        return real_count(messages)
+
+    monkeypatch.setattr(tokenizer, "count_messages", broken)
+    calls = []
+
+    async def sdk(*args, **kwargs):
+        calls.append(True)
+        return httpx.Response(200, json=response())
+
+    app = create_app(config())
+    app.state.proxy._retry_request = sdk
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "step-router-v1",
+                "system": "synthetic system",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 32,
+            },
+            headers={"x-api-key": "synthetic"},
+        )
+    assert result.status_code == (500 if mode == "reject" else 200)
+    assert len(calls) == (0 if mode == "reject" else 1)
+    if mode == "reject":
+        assert result.json()["error"]["type"] == "api_error"
+        assert "counted" not in result.json()["error"]["message"]
+    print(
+        f"real_estimator error={error.__name__} mode={mode} status={result.status_code} upstream_calls={len(calls)} fabricated_count=False"
+    )

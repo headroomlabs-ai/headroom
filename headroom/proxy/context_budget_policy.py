@@ -8,7 +8,7 @@ or the provider.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -21,8 +21,6 @@ class BudgetDecision:
     overage: int
     should_reject: bool
     reason: str
-    # Retained for diagnostic access; not used in evaluation logic.
-    _extra: dict = field(default_factory=dict, compare=False)
 
 
 def resolve_mode() -> str:

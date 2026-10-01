@@ -357,14 +357,20 @@ export HEADROOM_MODEL_LIMITS=/path/to/models.json
 
 ### Context budget guard
 
-When a model's context limit is declared in `HEADROOM_MODEL_LIMITS` or `models.json`, the proxy evaluates every finalized Anthropic `/v1/messages` request against that limit before forwarding. The threshold is `declared_limit - max(HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN, max_tokens)`.
+The proxy checks each finalized Anthropic `/v1/messages` forward against an operator-declared destination limit from `HEADROOM_MODEL_LIMITS` or `models.json`. Inferred model limits never authorize rejection. The threshold is `declared_limit - max(HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN, max_tokens)`.
 
-In the default `observe` mode the proxy logs an over-limit request at WARNING and forwards it unchanged. Set `HEADROOM_CONTEXT_LIMIT_MODE=reject` to have the proxy return a local 400 before any upstream attempt, which stops the provider's own 400 from triggering a client retry storm. Unconfigured installs are unaffected; the guard is a no-op when no limit is declared for the model.
+Direct requests count the selected outbound JSON bytes. LiteLLM and AnyLLM requests count their prepared destination, messages, tools, and output reserve. Converted system content counts once. LiteLLM's retained thinking blocks count through a temporary content view that leaves SDK arguments unchanged; thinking discarded during cross-vendor conversion contributes zero. Token counts are local estimates and may differ from provider accounting.
+
+The default `observe` mode logs overage and forwards. Unknown modes warn and preserve forwarding. With `HEADROOM_CONTEXT_LIMIT_MODE=reject`, measured excess returns HTTP 400 `invalid_request_error` before that upstream attempt. If evaluation is unavailable for a configured reject request, the proxy returns HTTP 500 `api_error` without inventing a token count. A non-positive threshold also rejects. Bypass and passthrough requests preserve forwarding.
+
+Every handler-owned CCR, memory, and response-hook continuation receives a fresh check. Before response commitment, continuation refusals retain their HTTP 400 or 500 status. If a buffered SSE response has already committed HTTP 200 and heartbeats, the proxy emits a terminating `invalid_request_error` or `api_error` SSE event with the same overage or unavailable-evaluation message. The refused continuation makes zero upstream calls. Client retry behavior depends on the client.
+
+A forwarded `context-1m` capability requires an exact raw model declaration to authorize rejection; otherwise it observes. Backend mapping uses the actual destination declaration, including when conversion discards an inbound beta capability.
 
 ```bash
 export HEADROOM_MODEL_LIMITS='{"context_limits":{"step-router-v1":262144}}'
 export HEADROOM_CONTEXT_LIMIT_MODE=reject
-export HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN=4096
+export HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN=12000
 headroom proxy
 ```
 

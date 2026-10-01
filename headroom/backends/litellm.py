@@ -1174,92 +1174,103 @@ class LiteLLMBackend(Backend):
             "usage": usage,
         }
 
+    def prepare_message(
+        self, body: dict[str, Any], headers: dict[str, str], *, stream: bool = False
+    ) -> dict[str, Any]:
+        """Resolve and convert the exact SDK request without I/O."""
+        original_model = body.get("model", "claude-3-5-sonnet-20241022")
+        litellm_model = self.map_model_id(original_model)
+        preserve_thinking = _is_anthropic_family_model(litellm_model)
+        # Convert messages
+        messages = self._convert_messages_for_litellm(
+            body.get("messages", []), preserve_thinking=preserve_thinking
+        )
+
+        # Build kwargs for litellm
+        kwargs: dict[str, Any] = {
+            "model": litellm_model,
+            "messages": messages,
+        }
+
+        # Optional parameters
+        if "max_tokens" in body:
+            kwargs["max_tokens"] = body["max_tokens"]
+        if "temperature" in body:
+            kwargs["temperature"] = body["temperature"]
+        if "top_p" in body:
+            kwargs["top_p"] = body["top_p"]
+        if "stop_sequences" in body:
+            kwargs["stop"] = body["stop_sequences"]
+        # Forward the extended-thinking config to Anthropic-family targets.
+        # Required for consistency with preserved history: Anthropic errors
+        # if an assistant message carries thinking blocks while thinking is
+        # disabled for the turn. Never sent cross-vendor.
+        if preserve_thinking and "thinking" in body:
+            kwargs["thinking"] = body["thinking"]
+
+        # Tools (convert Anthropic format to OpenAI format)
+        if "tools" in body:
+            tools_in = body["tools"]
+            # Bedrock Converse API hard-rejects tool names over 64 chars.
+            # Claude Code injects every globally-added claude.ai MCP connector
+            # tool into every request, even disabled ones; a single oversized
+            # name 401s the whole call. Drop them before conversion instead.
+            if self.provider == "bedrock":
+                tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+            kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
+        if "tool_choice" in body:
+            kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+
+        # System prompt (Anthropic puts it in body, OpenAI in messages)
+        if "system" in body:
+            kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
+
+        # Provider-specific region config
+        if self.region:
+            if self.provider == "bedrock":
+                kwargs["aws_region_name"] = self.region
+            elif self.provider in ("vertex_ai", "vertex_ai_beta"):
+                kwargs["vertex_location"] = self.region
+
+        if self.provider == "bedrock" and self.profile_name:
+            kwargs["aws_profile_name"] = self.profile_name
+
+        # Forward API key from request headers if present.
+        # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
+        # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
+        _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+        if self.provider not in _env_auth_providers:
+            auth_header = headers.get("authorization", headers.get("Authorization", ""))
+            _caller_key = (
+                auth_header[7:]
+                if auth_header.startswith("Bearer ")
+                else headers.get("x-api-key", "")
+            )
+            # Only forward it if it can actually authenticate the TARGET.
+            if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                kwargs["api_key"] = _caller_key
+
+        if stream:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+        kwargs.setdefault("timeout", _upstream_timeout())
+        return kwargs
+
     async def send_message(
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> BackendResponse:
         """Send message via LiteLLM."""
         original_model = body.get("model", "claude-3-5-sonnet-20241022")
-        litellm_model = self.map_model_id(original_model)
-        preserve_thinking = _is_anthropic_family_model(litellm_model)
 
         try:
-            # Convert messages
-            messages = self._convert_messages_for_litellm(
-                body.get("messages", []), preserve_thinking=preserve_thinking
-            )
+            kwargs = prepared if prepared is not None else self.prepare_message(body, headers)
 
-            # Build kwargs for litellm
-            kwargs: dict[str, Any] = {
-                "model": litellm_model,
-                "messages": messages,
-            }
+            logger.debug("LiteLLM request: model=%s", kwargs["model"])
 
-            # Optional parameters
-            if "max_tokens" in body:
-                kwargs["max_tokens"] = body["max_tokens"]
-            if "temperature" in body:
-                kwargs["temperature"] = body["temperature"]
-            if "top_p" in body:
-                kwargs["top_p"] = body["top_p"]
-            if "stop_sequences" in body:
-                kwargs["stop"] = body["stop_sequences"]
-            # Forward the extended-thinking config to Anthropic-family targets.
-            # Required for consistency with preserved history: Anthropic errors
-            # if an assistant message carries thinking blocks while thinking is
-            # disabled for the turn. Never sent cross-vendor.
-            if preserve_thinking and "thinking" in body:
-                kwargs["thinking"] = body["thinking"]
-
-            # Tools (convert Anthropic format to OpenAI format)
-            if "tools" in body:
-                tools_in = body["tools"]
-                # Bedrock Converse API hard-rejects tool names over 64 chars.
-                # Claude Code injects every globally-added claude.ai MCP connector
-                # tool into every request, even disabled ones; a single oversized
-                # name 401s the whole call. Drop them before conversion instead.
-                if self.provider == "bedrock":
-                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
-
-            # System prompt (Anthropic puts it in body, OpenAI in messages)
-            if "system" in body:
-                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
-
-            # Provider-specific region config
-            if self.region:
-                if self.provider == "bedrock":
-                    kwargs["aws_region_name"] = self.region
-                elif self.provider in ("vertex_ai", "vertex_ai_beta"):
-                    kwargs["vertex_location"] = self.region
-
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
-
-            # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
-            if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
-
-            logger.debug(f"LiteLLM request: model={litellm_model}")
-
-            # Make the call
-            # Bounded, always: an upstream that never answers must not
-            # block the caller forever. setdefault so an explicit value wins.
-            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -1303,6 +1314,8 @@ class LiteLLMBackend(Backend):
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream message via LiteLLM.
 
@@ -1311,68 +1324,15 @@ class LiteLLMBackend(Backend):
         are emitted based on what LiteLLM actually returns, not hardcoded.
         """
         original_model = body.get("model", "claude-3-5-sonnet-20241022")
-        litellm_model = self.map_model_id(original_model)
-        preserve_thinking = _is_anthropic_family_model(litellm_model)
 
         try:
-            messages = self._convert_messages_for_litellm(
-                body.get("messages", []), preserve_thinking=preserve_thinking
+            kwargs = (
+                prepared
+                if prepared is not None
+                else self.prepare_message(body, headers, stream=True)
             )
 
-            kwargs: dict[str, Any] = {
-                "model": litellm_model,
-                "messages": messages,
-                "stream": True,
-            }
-
-            if "max_tokens" in body:
-                kwargs["max_tokens"] = body["max_tokens"]
-            if "temperature" in body:
-                kwargs["temperature"] = body["temperature"]
-            if "top_p" in body:
-                kwargs["top_p"] = body["top_p"]
-            if "stop_sequences" in body:
-                kwargs["stop"] = body["stop_sequences"]
-            # Forward extended-thinking config to Anthropic-family targets only
-            # (see send_message for why). Never sent cross-vendor.
-            if preserve_thinking and "thinking" in body:
-                kwargs["thinking"] = body["thinking"]
-            if "tools" in body:
-                tools_in = body["tools"]
-                # Bedrock Converse API hard-rejects tool names over 64 chars.
-                # See send_message for the full rationale; same filter here.
-                if self.provider == "bedrock":
-                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
-            if "system" in body:
-                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
-
-            # Provider-specific region config
-            if self.region:
-                if self.provider == "bedrock":
-                    kwargs["aws_region_name"] = self.region
-                elif self.provider in ("vertex_ai", "vertex_ai_beta"):
-                    kwargs["vertex_location"] = self.region
-
-            if self.provider == "bedrock" and self.profile_name:
-                kwargs["aws_profile_name"] = self.profile_name
-
-            # Forward API key from request headers if present.
-            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
-            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
-            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
-            if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
-                # Only forward it if it can actually authenticate the TARGET.
-                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
-                    kwargs["api_key"] = _caller_key
+            preserve_thinking = _is_anthropic_family_model(kwargs["model"])
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -1394,17 +1354,6 @@ class LiteLLMBackend(Backend):
                 },
             )
 
-            # Request usage in the final streaming chunk so cache metrics
-            # (cache_read_input_tokens / cache_creation_input_tokens) come back at
-            # all. Without this, LiteLLM/Bedrock never emits a usage chunk over SSE
-            # and the caller's cache stats always read 0, even when caching is
-            # working server-side.
-            kwargs["stream_options"] = {"include_usage": True}
-
-            # Stream content — blocks emitted dynamically based on response
-            # Bounded, always: an upstream that never answers must not
-            # block the caller forever. setdefault so an explicit value wins.
-            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
@@ -1763,10 +1712,6 @@ class LiteLLMBackend(Backend):
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
-            # Make the call
-            # Bounded, always: an upstream that never answers must not
-            # block the caller forever. setdefault so an explicit value wins.
-            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1974,7 +1919,6 @@ class LiteLLMBackend(Backend):
 
             # Bounded, always: an upstream that never answers must not
             # block the caller forever. setdefault so an explicit value wins.
-            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             async for chunk in response:

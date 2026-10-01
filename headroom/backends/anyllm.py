@@ -258,42 +258,55 @@ class AnyLLMBackend(Backend):
             "usage": usage,
         }
 
+    def prepare_message(
+        self, body: dict[str, Any], headers: dict[str, str], *, stream: bool = False
+    ) -> dict[str, Any]:
+        """Prepare the existing per-mode SDK arguments without I/O."""
+        original_model = body.get("model", "gpt-4o")
+        messages = self._convert_messages(body.get("messages", []))
+
+        # Add system message if present
+        if "system" in body:
+            system = body["system"]
+            if isinstance(system, str):
+                messages.insert(0, {"role": "system", "content": system})
+            elif isinstance(system, list) and not stream:
+                system_text = " ".join(
+                    s.get("text", "") if isinstance(s, dict) else str(s) for s in system
+                )
+                messages.insert(0, {"role": "system", "content": system_text})
+
+        kwargs: dict[str, Any] = {"model": original_model, "messages": messages}
+
+        if "max_tokens" in body:
+            kwargs["max_tokens"] = body["max_tokens"]
+        if "temperature" in body:
+            kwargs["temperature"] = body["temperature"]
+        if "top_p" in body:
+            kwargs["top_p"] = body["top_p"]
+        if "stop_sequences" in body:
+            kwargs["stop"] = body["stop_sequences"]
+        if "tools" in body:
+            kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
+        if "tool_choice" in body:
+            kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+
+        if stream:
+            kwargs["stream"] = True
+        return kwargs
+
     async def send_message(
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> BackendResponse:
         """Send message via any-llm."""
         original_model = body.get("model", "gpt-4o")
 
         try:
-            messages = self._convert_messages(body.get("messages", []))
-
-            # Add system message if present
-            if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    messages.insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    messages.insert(0, {"role": "system", "content": system_text})
-
-            kwargs: dict[str, Any] = {"model": original_model, "messages": messages}
-
-            if "max_tokens" in body:
-                kwargs["max_tokens"] = body["max_tokens"]
-            if "temperature" in body:
-                kwargs["temperature"] = body["temperature"]
-            if "top_p" in body:
-                kwargs["top_p"] = body["top_p"]
-            if "stop_sequences" in body:
-                kwargs["stop"] = body["stop_sequences"]
-            if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            kwargs = prepared if prepared is not None else self.prepare_message(body, headers)
 
             logger.debug(f"any-llm request: provider={self.provider}, model={original_model}")
 
@@ -314,36 +327,18 @@ class AnyLLMBackend(Backend):
         self,
         body: dict[str, Any],
         headers: dict[str, str],
+        *,
+        prepared: dict[str, Any] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Stream message via any-llm."""
         original_model = body.get("model", "gpt-4o")
 
         try:
-            messages = self._convert_messages(body.get("messages", []))
-
-            if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    messages.insert(0, {"role": "system", "content": system})
-
-            kwargs: dict[str, Any] = {
-                "model": original_model,
-                "messages": messages,
-                "stream": True,
-            }
-
-            if "max_tokens" in body:
-                kwargs["max_tokens"] = body["max_tokens"]
-            if "temperature" in body:
-                kwargs["temperature"] = body["temperature"]
-            if "top_p" in body:
-                kwargs["top_p"] = body["top_p"]
-            if "stop_sequences" in body:
-                kwargs["stop"] = body["stop_sequences"]
-            if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
-            if "tool_choice" in body:
-                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
+            kwargs = (
+                prepared
+                if prepared is not None
+                else self.prepare_message(body, headers, stream=True)
+            )
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
