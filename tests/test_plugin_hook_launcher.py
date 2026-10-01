@@ -96,10 +96,11 @@ def test_manifest_command_recovers_reported_non_login_environment(tmp_path: Path
     path_match = re.search(r"PATH=([^\s\\]+)", body)
     assert path_match is not None
     reporter_path = path_match.group(1)
+    command_body = re.sub(r"\\\r?\n[ \t]*", "", body)
     assert (
         'env -i HOME="$HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin '
         "/bin/sh -c 'headroom init hook ensure'"
-    ) in body
+    ) in command_body
     assert "/bin/sh: headroom: command not found" in body
 
     home = tmp_path / "home"
