@@ -16,7 +16,7 @@
 // don't reference any of these symbols.
 //
 // Issues:
-//   - #355 (https://github.com/chopratejas/headroom/issues/355)
+//   - #355 (https://github.com/headroomlabs-ai/headroom/issues/355)
 //     for the `__isoc23_*` family
 //   - PR #396 dry-run for the `__libc_single_threaded` symbol
 

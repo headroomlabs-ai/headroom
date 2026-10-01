@@ -27,6 +27,20 @@ def test_plugin_manifests_share_core_metadata() -> None:
     assert copilot["hooks"] == "./hooks"
 
 
+def test_plugin_hooks_timeout_exceeds_cold_start_wait() -> None:
+    """The plugin's `ensure` hooks are killed by the host (Claude Code, etc.)
+    at their declared `timeout`, independent of anything inside the process.
+    Headroom's own cold-start path can take up to wait_ready's 45s ceiling
+    (headroom/cli/init.py), so a shorter external timeout makes the hook
+    unwinnable by construction on every session start (#3417)."""
+    hooks = _load_json("plugins/headroom-agent-hooks/hooks/hooks.json")
+    assert isinstance(hooks, dict)
+    for event in ("SessionStart", "PreToolUse"):
+        for entry in hooks["hooks"][event]:
+            for hook in entry["hooks"]:
+                assert hook["timeout"] > 45
+
+
 def test_marketplace_entry_points_to_plugin_root() -> None:
     marketplace = _load_json(".claude-plugin/marketplace.json")
     assert isinstance(marketplace, dict)
@@ -41,7 +55,7 @@ def test_marketplace_entry_points_to_plugin_root() -> None:
 
 
 def test_plugin_metadata_points_to_upstream_repo() -> None:
-    expected_repo = "https://github.com/chopratejas/headroom"
+    expected_repo = "https://github.com/headroomlabs-ai/headroom"
     marketplace = _load_json(".claude-plugin/marketplace.json")
     claude = _load_json("plugins/headroom-agent-hooks/.claude-plugin/plugin.json")
     assert isinstance(marketplace, dict)
@@ -69,11 +83,6 @@ def test_plugin_hooks_share_anchored_launcher_and_rootless_tail() -> None:
     assert commands == [expected, expected]
     assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume"
     assert hooks["hooks"]["PreToolUse"][0]["matcher"] == "Bash|PowerShell"
-    assert all(
-        entry["hooks"][0]["timeout"] == 15
-        for entries in hooks["hooks"].values()
-        for entry in entries
-    )
     launcher = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
     assert launcher.is_file()
     assert b"\r" not in launcher.read_bytes()

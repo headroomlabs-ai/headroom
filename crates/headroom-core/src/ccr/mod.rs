@@ -27,7 +27,7 @@
 //! [`backends::from_config`] selects one at startup and surfaces every
 //! init error to the caller (per `feedback_no_silent_fallbacks.md`).
 //!
-//! [`CompressionStore`]: https://github.com/chopratejas/headroom/blob/main/headroom/cache/compression_store.py
+//! [`CompressionStore`]: https://github.com/headroomlabs-ai/headroom/blob/main/headroom/cache/compression_store.py
 
 pub mod backends;
 

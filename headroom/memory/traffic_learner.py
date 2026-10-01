@@ -62,6 +62,10 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
 
+# Leading `cd <dir> && ` / `cd <dir>; ` prefixes. Agents prepend them to most
+# commands, so they carry no signal about which operation was retried.
+_BASH_LEADING_CD_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|(?:\\.|[^\s\\])+)\s*(?:&&|;)\s*""")
+
 # Agent harnesses can encode orchestration metadata as user-role messages.
 # These prefixes identify whole messages that are not authored by the user.
 _HARNESS_USER_PREFIXES = (
@@ -194,7 +198,7 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     if not cmd:
         return ""
     # Drop paging, line-context flags, and redirections that vary between runs.
-    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", _strip_leading_cd(cmd)).strip()
     # Cut at the first pipe or && so we hash the primary command, not the tail.
     for sep in (" | ", " && "):
         idx = trimmed.find(sep)
@@ -202,6 +206,15 @@ def _normalize_bash_for_hash(cmd: str) -> str:
             trimmed = trimmed[:idx].rstrip()
             break
     return trimmed
+
+
+def _strip_leading_cd(cmd: str) -> str:
+    """Remove leading `cd <dir> &&` / `cd <dir>;` segments from a Bash command."""
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _BASH_LEADING_CD_RE.sub("", cmd, count=1)
+    return cmd
 
 
 # =============================================================================
@@ -372,6 +385,8 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
     arguments, and gets rejected. Genuine retries (extra flag, single
     arg edit) pass via the edit-distance path.
     """
+    failed = _strip_leading_cd(failed)
+    success = _strip_leading_cd(success)
     if not failed or not success or failed == success:
         return False
     bin_a = _bash_first_binary(failed)
@@ -1275,10 +1290,16 @@ class TrafficLearner:
             # Ready to save
             del self._pattern_counts[h]
             self._saved_hashes.add(h)
-            # Trim saved hashes to prevent unbounded growth
+            # Trim saved hashes to prevent unbounded growth, and drop the evicted
+            # hash's persisted-id entry in lockstep. ``_persisted_ids`` is only
+            # ever read behind an ``h in _saved_hashes`` guard (the dedup check
+            # above), so an id for a hash no longer tracked is dead weight;
+            # without this it grew one entry per distinct persisted pattern for
+            # the whole process lifetime while ``_saved_hashes`` stayed bounded.
             if len(self._saved_hashes) > self._dedup_window:
                 # Remove oldest (arbitrary, set is unordered, but prevents growth)
-                self._saved_hashes.pop()
+                evicted = self._saved_hashes.pop()
+                self._persisted_ids.pop(evicted, None)
 
             # Persist the real accumulated count, not the dataclass default.
             pattern.evidence_count = count
@@ -1310,9 +1331,13 @@ class TrafficLearner:
                     },
                 )
                 self._patterns_saved += 1
-                # Track id so future re-sightings bump this row.
+                # Track id so future re-sightings bump this row — but only while
+                # the hash is still within the dedup window. If it was evicted
+                # from ``_saved_hashes`` between enqueue and now, recording its id
+                # would re-leak an entry that can never be read again (the dedup
+                # read at the top of ``_accumulate`` is gated on ``_saved_hashes``).
                 memory_id = getattr(memory, "id", None)
-                if memory_id is not None:
+                if memory_id is not None and pattern.content_hash in self._saved_hashes:
                     self._persisted_ids[pattern.content_hash] = memory_id
                 logger.debug(f"Traffic learner saved pattern: {pattern.content[:80]}")
 
@@ -1341,7 +1366,16 @@ class TrafficLearner:
             try:
                 rows = conn.execute(
                     "SELECT id, content, metadata FROM memories "
-                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
+                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner' "
+                    # Hydrate at most dedup_window rows so a large persisted
+                    # history does not start the in-memory dedup maps oversized
+                    # (they are trimmed to dedup_window in steady state). Keep the
+                    # most-recently-seen patterns; rows without last_seen_at
+                    # (legacy) sort last under DESC and are dropped first, with id
+                    # as a deterministic tie-break.
+                    "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC "
+                    "LIMIT ?",
+                    (self._dedup_window,),
                 ).fetchall()
             except sqlite3.DatabaseError:
                 return []
