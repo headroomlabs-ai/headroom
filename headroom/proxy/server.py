@@ -188,6 +188,7 @@ from headroom.proxy.ssl_context import (
     describe_trust_policy,
     ensure_process_trust_if_owned,
 )
+from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
@@ -1987,15 +1988,19 @@ class HeadroomProxy(
         # honour a pin at all — a proxy resolves the target itself, on its own
         # network. Operator-configured upstreams have no pin and are untouched,
         # so trust_env, limits, HTTP/2 and connection reuse are unchanged.
+        # Keepalive goes on first: pinning hides proxy pools behind a wrapper.
+        _keepalive = self.config.upstream_tcp_keepalive_seconds
         self.http_client = install_upstream_pinning(
-            httpx.AsyncClient(http2=_http2, **_client_kwargs)
+            install_tcp_keepalive(httpx.AsyncClient(http2=_http2, **_client_kwargs), _keepalive)
         )
         # Reuse the primary client when HTTP/2 is already off; otherwise keep a
         # dedicated HTTP/1.1 client for ChatGPT passthrough.
         self.http_client_h1 = (
             self.http_client
             if not _http2
-            else install_upstream_pinning(httpx.AsyncClient(http2=False, **_client_kwargs))
+            else install_upstream_pinning(
+                install_tcp_keepalive(httpx.AsyncClient(http2=False, **_client_kwargs), _keepalive)
+            )
         )
         logger.info("Headroom Proxy started (version %s)", __version__)
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
@@ -5860,6 +5865,11 @@ def _proxy_config_from_env() -> ProxyConfig:
             150,
             min_value=1,
         ),
+        upstream_tcp_keepalive_seconds=_get_env_int(
+            "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+            30,
+            min_value=0,
+        ),
         buffered_ccr_grace_seconds=_get_env_float(
             "HEADROOM_BUFFERED_CCR_GRACE_SECONDS",
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
@@ -6618,6 +6628,11 @@ if __name__ == "__main__":
             "HEADROOM_WRITE_TIMEOUT_SECONDS",
             150,
             min_value=1,
+        ),
+        upstream_tcp_keepalive_seconds=_get_env_int(
+            "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+            30,
+            min_value=0,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings

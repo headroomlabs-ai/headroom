@@ -397,6 +397,13 @@ class ProxyConfig:
     # unreachable: 150s carries a 15MB body -- the largest #3259 reports -- over
     # a ~1 Mbps uplink, and still fires well before the OS gives up at ~180s.
     write_timeout_seconds: int = 150
+    # Seconds an upstream connection may sit silent before TCP keepalive probes
+    # it (0 disables). The read timeout cannot tell a model thinking from a link
+    # that died without a reset (network change, tunnel, NAT drop), so without
+    # this a dead link holds a request for the whole read timeout, per attempt.
+    # Probes go every 10s and give up after 6, so a dead link fails over after
+    # about this + 60s. See headroom/proxy/tcp_keepalive.py.
+    upstream_tcp_keepalive_seconds: int = 30
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600

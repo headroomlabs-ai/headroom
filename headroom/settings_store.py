@@ -578,6 +578,22 @@ SETTINGS: tuple[SettingField, ...] = (
         tier="advanced",
     ),
     SettingField(
+        "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+        "upstream_tcp_keepalive_seconds",
+        "Upstream TCP keepalive (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=0,
+        help=(
+            "Seconds an upstream connection may sit silent before TCP keepalive "
+            "probes it. Default: 30, 0 disables. A link that dies without a reset "
+            "then fails over after about this + 60s instead of waiting out the "
+            "read timeout."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
         "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
         "anthropic_buffered_request_timeout_seconds",
         "Anthropic buffered timeout (s)",
