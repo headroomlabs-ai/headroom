@@ -31,7 +31,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .trained_router import TrainedRouter
 
-from .trained_router import Technique
+# Import the enum from the dependency-free module so importing the compressor
+# does not eagerly import trained_router (and thus torch/transformers) — that
+# eager import crashed on Python 3.13+ (#2513).
+from .image_types import Technique
 
 logger = logging.getLogger(__name__)
 

@@ -9,7 +9,8 @@
     # Cloud mode (managed CCR, TOIN, analytics via Headroom Cloud):
     litellm.callbacks = [HeadroomCallback(api_key="hdr_xxx")]
 
-Works with LiteLLM's completion(), acompletion(), and proxy modes.
+Works with LiteLLM's completion(), acompletion(), the Anthropic Messages
+proxy routes (/v1/messages), and proxy modes.
 Cloud mode requires httpx: pip install httpx
 """
 
@@ -94,6 +95,18 @@ class HeadroomCallback(_CustomLogger):
         """Whether cloud compression is enabled."""
         return self._api_key is not None
 
+    async def aclose(self) -> None:
+        """Close the shared cloud HTTP client, if it was initialized.
+
+        Applications using LiteLLM should await this method during their async
+        shutdown lifecycle. It is safe to call when cloud mode was not used or
+        after the client has already been closed.
+        """
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
     async def async_pre_call_hook(
         self,
         user_api_key_dict: Any = None,
@@ -110,7 +123,16 @@ class HeadroomCallback(_CustomLogger):
         if data is None:
             return None
 
-        if call_type not in ("completion", "acompletion"):
+        # LiteLLM's proxy maps the Anthropic Messages API routes to their own
+        # call types (CallTypes.anthropic_messages for /v1/messages and
+        # /anthropic/v1/messages, plus the async twin), and the payload still
+        # carries "messages" in Anthropic format, which compress() handles.
+        if call_type not in (
+            "completion",
+            "acompletion",
+            "anthropic_messages",
+            "aanthropic_messages",
+        ):
             return data
 
         messages = data.get("messages", [])

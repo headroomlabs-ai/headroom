@@ -84,6 +84,7 @@ require_cmd() {
 
 ensure_host_dirs() {
   mkdir -p \
+    "${HEADROOM_HOST_HOME}/.config/opencode" \
     "${HEADROOM_HOST_HOME}/.headroom" \
     "${HEADROOM_HOST_HOME}/.claude" \
     "${HEADROOM_HOST_HOME}/.codex" \
@@ -119,6 +120,7 @@ append_common_container_args() {
   ref+=(-v "${HEADROOM_HOST_HOME}/.claude:${HEADROOM_CONTAINER_HOME}/.claude")
   ref+=(-v "${HEADROOM_HOST_HOME}/.codex:${HEADROOM_CONTAINER_HOME}/.codex")
   ref+=(-v "${HEADROOM_HOST_HOME}/.gemini:${HEADROOM_CONTAINER_HOME}/.gemini")
+  ref+=(-v "${HEADROOM_HOST_HOME}/.config/opencode:${HEADROOM_CONTAINER_HOME}/.config/opencode")
 
   if command -v id >/dev/null 2>&1; then
     ref+=(--user "$(id -u):$(id -g)")
@@ -184,7 +186,7 @@ start_proxy_container() {
 
   local container_name="headroom-proxy-${port}-$$"
   local args=()
-  args=(docker run -d --rm --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --rm --name "${container_name}" -p "127.0.0.1:${port}:${port}")
   append_common_container_args args
   args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")
   "${args[@]}" >/dev/null
@@ -290,6 +292,29 @@ append_persistent_container_args() {
   fi
 
   append_passthrough_envs "$1"
+}
+
+append_dashboard_gateway_env() {
+  local -n ref=$1
+
+  # This default is safe only because the published dashboard port is bound
+  # to the host loopback interface below. A host request published through
+  # Docker's default bridge reaches the
+  # container from the bridge gateway (for example, 172.17.0.1), not from
+  # 127.0.0.1. Trust only that exact gateway by default so the dashboard's
+  # metadata gate works for the first-party persistent Docker preset while
+  # preserving an explicitly configured allowlist.
+  if [[ -n "${HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS+x}" ]]; then
+    return
+  fi
+
+  local gateway
+  gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [[ -n "${gateway}" ]]; then
+    ref+=(--env "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS=${gateway}/32")
+  else
+    warn "Could not determine Docker bridge gateway; dashboard metadata remains restricted"
+  fi
 }
 
 build_manifest_proxy_args() {
@@ -466,8 +491,9 @@ start_persistent_docker_install() {
 
   docker rm -f "${container_name}" >/dev/null 2>&1 || true
 
-  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "${port}:${port}")
+  args=(docker run -d --restart unless-stopped --name "${container_name}" -p "127.0.0.1:${port}:${port}")
   append_persistent_container_args args
+  append_dashboard_gateway_env args
   args+=(
     --env "HEADROOM_DEPLOYMENT_PROFILE=${profile}"
     --env "HEADROOM_DEPLOYMENT_PRESET=persistent-docker"
@@ -592,6 +618,7 @@ Supported commands:
   aider
   cursor
   openclaw
+  opencode
 
 Notes:
   - GitHub Copilot CLI wrapping is not supported by the Docker-native wrapper.
@@ -1447,11 +1474,13 @@ main() {
         proxy_args+=(--region "${region}")
       fi
 
-      local container_name=""
+      # Keep this in the wrapper's global scope so the EXIT trap can still
+      # stop the proxy after main returns.
+      container_name=""
       if [[ "${no_proxy}" -eq 0 ]]; then
         container_name="$(start_proxy_container "${port}" "${proxy_args[@]}")"
       fi
-      trap 'stop_proxy_container "${container_name}"' EXIT INT TERM
+      trap 'stop_proxy_container "${container_name:-}"' EXIT INT TERM
 
       local prep_args=("${known_args[@]}")
       if [[ "${no_proxy}" -eq 0 ]]; then
@@ -1483,6 +1512,15 @@ EOF
           while true; do
             sleep 1
           done
+          ;;
+        opencode)
+          local opencode_config_file="${HEADROOM_HOST_HOME}/.config/opencode/opencode.json"
+          if [[ -f "${opencode_config_file}" ]]; then
+            OPENCODE_CONFIG_CONTENT="$(<"${opencode_config_file}")" \
+              run_host_tool opencode "${host_args[@]}"
+          else
+            run_host_tool opencode "${host_args[@]}"
+          fi
           ;;
       esac
       ;;
@@ -1533,8 +1571,8 @@ EOF
       run_args=(docker run --rm)
       append_tty_args run_args
       append_common_container_args run_args
-      run_args+=(-p "${port}:${port}")
-      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" "${args[@]}")
+      run_args+=(-p "127.0.0.1:${port}:${port}")
+      run_args+=(--entrypoint headroom "${HEADROOM_IMAGE}" proxy --host 0.0.0.0 --port "${port}" "${args[@]:1}")
       "${run_args[@]}"
       ;;
     *)
@@ -1583,7 +1621,7 @@ Installed wrapper:
 Next steps:
   1. Restart your shell or run: export PATH="${INSTALL_DIR}:\$PATH"
   2. Try: headroom proxy
-  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md
+  3. Docs: https://docs.headroomlabs.ai/docs/docker-install
 EOF
 }
 
