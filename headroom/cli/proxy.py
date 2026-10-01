@@ -527,6 +527,18 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--upstream-tcp-keepalive-seconds",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+    help=(
+        "Seconds an upstream connection may sit silent before TCP keepalive "
+        "probes it (default: 30, 0 disables). A link that dies without a reset "
+        "then fails over after about this + 60s instead of waiting out the read "
+        "timeout. Env: HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-buffered-request-timeout-seconds",
     type=click.IntRange(min=1),
     default=None,
@@ -1055,6 +1067,7 @@ def proxy(
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     write_timeout_seconds: int | None,
+    upstream_tcp_keepalive_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1391,6 +1404,9 @@ def proxy(
         if connect_timeout_seconds is not None
         else 10,
         write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
+        upstream_tcp_keepalive_seconds=(
+            upstream_tcp_keepalive_seconds if upstream_tcp_keepalive_seconds is not None else 30
+        ),
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
