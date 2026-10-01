@@ -1,0 +1,174 @@
+---
+title: Runtime Rollouts
+description: Deterministic runtime feature control for installed Headroom artifacts.
+---
+
+Runtime rollout answers one question: **which behaviors may this already-built
+Headroom artifact expose in this process?** It is separate from the source and
+distribution lifecycle, which decides which commit/artifact is qualified,
+released, packaged, and published.
+
+```bash
+HEADROOM_ROLLOUT_CHANNEL=canary headroom proxy
+```
+
+This runs the installed artifact with canary-eligible runtime features available
+according to that artifact's rollout policy. It does **not** install, select, or
+run a canary release/version of Headroom.
+
+## Channels and feature policy
+
+Channels are ordered `stable < beta < canary < dev`.
+
+| Channel | Purpose |
+|---------|---------|
+| `stable` | Default; behavior eligible for normal production use. |
+| `beta` | Opt-in behavior backed by automated and limited production evidence. |
+| `canary` | Early dogfood behavior still gathering evidence. |
+| `dev` | Local development and maintainer experiments. |
+
+Availability and default enablement are separate registry fields. A feature can
+be available in `canary` but remain off until explicitly requested; another can
+be available and default-enabled in `stable`.
+
+Request a named feature:
+
+```bash
+HEADROOM_ROLLOUT_CHANNEL=canary \
+HEADROOM_FEATURES=tool_result_interceptors \
+headroom proxy --intercept-tool-results
+```
+
+Force it off with the kill switch:
+
+```bash
+HEADROOM_DISABLE_FEATURES=tool_result_interceptors headroom proxy
+```
+
+## Resolution and precedence
+
+CLI arguments, environment variables, and typed configuration are resolved once
+at configuration construction. The immutable snapshot is injected into the
+proxy and transform pipelines; changing the process environment afterward does
+not alter a running proxy.
+
+The existing loopback-only `/admin/runtime-env` endpoint is one narrow
+exception: hot-reloading the legacy `HEADROOM_OUTPUT_SHAPER` alias replaces the
+proxy's immutable snapshot with a newly resolved snapshot. Channel bounds and
+`HEADROOM_DISABLE_FEATURES` still win, and `/stats.rollout` changes with the
+effective running decision. Because these overrides are process-local, the
+endpoint rejects updates when the built-in server uses multiple workers; restart
+the proxy with the desired environment instead. Ambient environment mutation
+remains ignored.
+
+Precedence is deterministic:
+
+| Condition | Result |
+|-----------|--------|
+| Explicit disable | Off, even if defaulted, requested, aliased, or unsafe override is active. |
+| Requested below its availability channel, unsafe override active | On with `unsafe_override`. |
+| Requested below its availability channel | Off with `blocked_by_channel`. |
+| Explicit request in an allowed channel | On with `explicit`. |
+| Enabled legacy alias in an allowed channel | On with `legacy_alias`. |
+| Default-enabled in the active channel | On with `default`. |
+| Otherwise | Off with `not_requested`. |
+
+Legacy feature-specific variables are narrow compatibility aliases only. They
+obey channel bounds and explicit disable precedence.
+
+## Unsafe override and invalid input
+
+`HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES=1` is a break-glass mechanism. It can
+cross a channel boundary for a requested feature, but cannot beat an explicit
+disable. The runtime remains usable for debugging and emergency reproduction,
+while its snapshot reports:
+
+```json
+{
+  "unsafe_override": true,
+  "qualification_eligible": false,
+  "qualification_ineligible_reason": "unsafe_rollout_override_active"
+}
+```
+
+The Python resolver logs a warning and falls back to `stable` for an unknown
+channel; unknown feature names are warned and ignored (fail-closed). Explicit
+Python diagnostics (`headroom rollout status`) and the Rust front proxy's typed
+CLI/environment parser reject unknown channels/features and list valid values
+before startup.
+
+## Machine-readable status and provenance
+
+Inspect a supplied configuration without starting the proxy:
+
+```bash
+headroom rollout status --json
+```
+
+Inspect the actual running process through the supported black-box endpoint:
+
+```bash
+curl http://127.0.0.1:8787/stats
+```
+
+The Python proxy publishes the object at `/stats.rollout`. The Rust front proxy,
+when deployed, publishes its own effective snapshot at `/rollout/status`; this
+keeps each process's distinct feature registry and decisions independently
+observable.
+
+The `/stats.rollout` object and CLI output contain no secrets. They include:
+
+```json
+{
+  "schema_version": 1,
+  "policy_version": "1",
+  "channel": "stable",
+  "unsafe_override": false,
+  "registry_digest": "sha256:...",
+  "snapshot_digest": "sha256:...",
+  "qualification_eligible": true,
+  "features": [
+    {
+      "name": "tool_result_interceptors",
+      "available_in": "canary",
+      "default_enabled_in": null,
+      "requested": false,
+      "disabled": false,
+      "enabled": false,
+      "decision": "not_requested"
+    }
+  ]
+}
+```
+
+`schema_version` versions the external JSON contract. `policy_version` versions
+the rollout rules. `registry_digest` is SHA-256 over canonical, ordered feature
+definitions. `snapshot_digest` identifies the complete effective runtime state.
+Equivalent policies/configurations produce equal digests; material policy or
+decision changes do not.
+
+These identities deliberately remain separate from source SHA, artifact SHA-256,
+runtime payload SHA-256, and future qualification-policy identities. An external
+benchmark can compare `/stats.rollout.registry_digest` and `snapshot_digest`
+between A1 passthrough and B Headroom arms without importing Headroom internals.
+A mismatch makes the future experiment invalid; benchmark logic itself is out of
+scope for runtime rollout.
+
+## Evidence-backed graduation and rollback
+
+Features progress from canary through beta toward stable only with linked
+deterministic, integration, and benchmark evidence. **Bake time is evidence, not
+qualification by itself.** Stable eligibility is followed by release
+qualification before behavior becomes a stable default.
+
+Every rollout-managed behavior must have a fast disable path. Operational
+rollback uses `HEADROOM_DISABLE_FEATURES`; source rollback reverts the defining
+change. The unsafe override is for diagnostics, not promotion or passing release
+evidence.
+
+Contributors should add named registry entries and tests for default behavior,
+explicit request, channel blocking, disable precedence, unsafe behavior,
+decision reasons, and provenance rather than reading rollout variables inside
+implementation components. Python and Rust registries contain features relevant
+to their own runtimes, but share channel ordering, precedence, decision reasons,
+fail-closed invalid-input semantics, and deterministic identity semantics.

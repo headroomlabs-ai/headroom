@@ -23,6 +23,7 @@ import httpx
 import pytest
 import respx
 
+from headroom.proxy.handlers.anthropic import _AnthropicTurnHookUsage
 from headroom.proxy.handlers.openai import (
     CHAT_USAGE_KEYS,
     RESPONSES_USAGE_KEYS,
@@ -147,6 +148,39 @@ def test_never_raises_on_a_shape_it_does_not_recognise() -> None:
     u.settle(object())
     assert u.extra_calls == 8
     assert (u.input_tokens, u.output_tokens, u.cache_read_tokens) == (0, 0, 0)
+
+
+def test_anthropic_accumulator_includes_disjoint_cache_buckets() -> None:
+    usage = _AnthropicTurnHookUsage()
+    first = {
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 25,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 20,
+                "ephemeral_1h_input_tokens": 5,
+            },
+        }
+    }
+    final = {
+        "usage": {
+            "input_tokens": 150,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 70,
+            "cache_creation_input_tokens": 30,
+        }
+    }
+    usage.record(first)
+    usage.record(final)
+    usage.settle(final)
+    assert usage.input_tokens == 175
+    assert usage.output_tokens == 10
+    assert usage.cache_read_tokens == 50
+    assert usage.cache_write_tokens == 25
+    assert usage.cache_write_5m_tokens == 20
+    assert usage.cache_write_1h_tokens == 5
 
 
 # --- handler level: what the unit tests above structurally cannot see -----
@@ -314,3 +348,58 @@ def test_no_hook_registered_bills_exactly_the_one_call(monkeypatch, _no_hooks) -
     o = outcomes[-1]
     assert o.provider_input_tokens == 100
     assert o.output_tokens == 10
+
+
+@respx.mock
+def test_anthropic_bills_original_plus_hook_redrive(monkeypatch, _no_hooks) -> None:
+    """Anthropic A=175 total input, B=250 -> 425; outputs 10+20."""
+    register_turn_hook(_RedriveOnce())
+    app, outcomes = _app_and_outcomes(monkeypatch)
+
+    def response(ident: str, input_tokens: int, output_tokens: int, read: int, write: int):
+        return {
+            "id": ident,
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": ident}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": read,
+                "cache_creation_input_tokens": write,
+            },
+        }
+
+    sent = iter(
+        [
+            response("a", 100, 10, 50, 25),
+            response("b", 150, 20, 70, 30),
+        ]
+    )
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        side_effect=lambda request: httpx.Response(200, json=next(sent))
+    )
+
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers={
+                "x-api-key": "sk-ant-test",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+
+    assert result.status_code == 200
+    outcome = outcomes[-1]
+    assert outcome.provider_input_tokens == 425
+    assert outcome.output_tokens == 30
+    assert outcome.cache_read_tokens == 120
+    assert outcome.cache_write_tokens == 55
+    assert outcome.uncached_input_tokens == 250

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from headroom.proxy.semantic_cache_key import (
+from headroom.proxy.semantic_cache_key_policy import (
     compute_semantic_cache_key,
     strip_cache_control,
 )
@@ -29,6 +29,20 @@ def test_semantic_cache_key_ignores_moved_cache_control() -> None:
     )
 
 
+def test_semantic_cache_key_ignores_moved_message_cache_control() -> None:
+    """cache_control on a message must not fragment the key either (#327 intent)."""
+    messages_with_cc = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}],
+        }
+    ]
+    messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+    assert compute_semantic_cache_key(messages_with_cc, MODEL) == (
+        compute_semantic_cache_key(messages_without_cc, MODEL)
+    )
+
+
 def test_strip_cache_control_recurses_through_dicts_and_lists() -> None:
     assert strip_cache_control(
         {
@@ -41,3 +55,17 @@ def test_strip_cache_control_recurses_through_dicts_and_lists() -> None:
         "system": [{"type": "text", "text": "sys"}],
         "tools": [{"name": "read"}],
     }
+
+
+def test_strip_cache_control_preserves_user_defined_schema_property() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "cache_control": {
+                "type": "boolean",
+                "description": "Flush the application cache",
+            }
+        },
+    }
+
+    assert strip_cache_control(schema) == schema
