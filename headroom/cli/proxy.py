@@ -34,7 +34,6 @@ def ensure_proxy_dependencies() -> None:
         "websockets",
         "onnxruntime",
         "transformers",
-        "watchdog",
     ]
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
@@ -373,7 +372,7 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     type=click.IntRange(min=1),
     envvar="HEADROOM_TPM",
-    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: unlimited.",
 )
 @click.option(
     "--no-ccr",
@@ -512,6 +511,19 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Upstream connection timeout in seconds (1–300, default: 10). "
         "Env: HEADROOM_CONNECT_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--write-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_WRITE_TIMEOUT_SECONDS",
+    help=(
+        "Seconds the upstream send may take before it is abandoned (default: 150). "
+        "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+        "large bodies over a slow link. Lower it to fail over a dead pooled "
+        "connection faster; --connect-timeout-seconds only guards a fresh connect. "
+        "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
     ),
 )
 @click.option(
@@ -1042,6 +1054,7 @@ def proxy(
     retry_max_delay_ms: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    write_timeout_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1124,6 +1137,7 @@ def proxy(
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
+        default_periodic_malloc_trim,
         run_server,
     )
 
@@ -1310,10 +1324,10 @@ def proxy(
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
-        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
+        rate_limit_tokens_per_minute=tpm,
         compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
         periodic_malloc_trim_enabled=_get_env_bool(
-            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+            "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
@@ -1330,12 +1344,22 @@ def proxy(
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-out: --no-ccr disables both halves at once (markers in content
-        # AND the injected retrieve tool). Markers without a tool — or a tool
-        # without markers — are useless, so it is a single switch. Default keeps
-        # CCR fully on.
+        # CCR opt-out: --no-ccr disables every half at once — markers in
+        # content, the injected retrieve tool, AND server-side response
+        # handling. Markers without a tool, or a tool without markers, are
+        # useless, so it is a single switch. Default keeps CCR fully on.
+        #
+        # Response handling has to be part of it. The buffered stream:false
+        # path keys off ``headroom_retrieve`` being present in the *request's*
+        # tools, and a client can advertise that tool on its own — the bundled
+        # OpenCode plugin registers it unconditionally. So with response
+        # handling left on, `--no-ccr` silently kept flipping streaming turns
+        # to buffered whenever history still held a redeemable marker, and the
+        # documented escape hatch for the CCR buffered-stream bugs did nothing
+        # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
+        ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
@@ -1366,6 +1390,7 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
@@ -1522,18 +1547,36 @@ Memory (Multi-Provider):
             "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
         )
 
-    from headroom.telemetry.beacon import is_telemetry_enabled
+    # Build telemetry section for the startup banner.
+    #
+    # HEADROOM_TELEMETRY (local aggregate stats, off by default) and
+    # HEADROOM_BEACON (the anonymous upload beacon, ON by default —
+    # see telemetry/beacon.py) are two independent switches. This banner
+    # used to check only is_telemetry_enabled() and print "DISABLED" for
+    # any operator who had merely turned local stats off, even though the
+    # beacon — the switch that actually ships data off the machine — was
+    # still on and unmentioned. Delegate to format_telemetry_notice(), the
+    # one place that already gets the beacon-vs-local distinction right,
+    # instead of re-deriving (and re-drifting from) the same wording here.
+    from headroom.telemetry.beacon import (
+        format_telemetry_notice,
+        is_beacon_enabled,
+        is_telemetry_enabled,
+    )
 
-    # Build telemetry section for the startup banner. Telemetry is opt-in
-    # (off by default); the disabled line surfaces how to opt in.
-    if is_telemetry_enabled():
-        telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
-            "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
-        )
+    _notice = format_telemetry_notice(prefix="  ")
+    if _notice:
+        telemetry_line = _notice
+    elif is_beacon_enabled() or is_telemetry_enabled():
+        # format_telemetry_notice() returns "" when HEADROOM_TELEMETRY_WARN=off
+        # suppresses the notice text itself — still say ON/OFF plainly rather
+        # than silently showing nothing in the one place an operator is most
+        # likely to be checking.
+        telemetry_line = "  Telemetry:    ON (notice suppressed via HEADROOM_TELEMETRY_WARN=off)"
     else:
         telemetry_line = (
-            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+            "  Telemetry:    OFF (local stats: HEADROOM_TELEMETRY=on to enable | "
+            "beacon: HEADROOM_BEACON=on to enable)"
         )
 
     # Discover proxy extensions (third-party packages registered via the

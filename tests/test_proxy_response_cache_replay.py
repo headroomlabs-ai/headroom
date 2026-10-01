@@ -31,6 +31,11 @@ httpx = pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.cache.backends import InMemoryBackend  # noqa: E402
+from headroom.cache.compression_store import (  # noqa: E402
+    get_compression_store,
+    reset_compression_store,
+)
 from headroom.ccr.tool_injection import create_ccr_tool_definition  # noqa: E402
 from headroom.proxy.helpers import sanitize_forwarded_response_headers  # noqa: E402
 from headroom.proxy.models import CacheEntry  # noqa: E402
@@ -54,9 +59,8 @@ class _CapturingHandler(logging.Handler):
 def proxy_log_capture():
     """Capture ``headroom.proxy`` records.
 
-    ``_setup_file_logging`` sets ``propagate = False`` on this logger, so
-    ``caplog`` (which hangs off the root) never sees them — the same reason
-    ``tests/test_anthropic_stage_timings.py`` attaches its own handler.
+    A direct handler keeps this fixture isolated from unrelated propagation
+    mutations elsewhere in the suite.
     """
     target = logging.getLogger("headroom.proxy")
     handler = _CapturingHandler()
@@ -245,6 +249,16 @@ def test_buffered_ccr_turn_does_not_write_the_response_cache():
         },
     }
 
+    # The buffered conversion needs a marker retrieval could actually expand;
+    # a resident `headroom_retrieve` alone keeps the request streaming (#3071).
+    reset_compression_store()
+    store = get_compression_store(backend=InMemoryBackend())
+    marker = store.store(
+        original=json.dumps({"earlier": "tool output"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+
     with patch("headroom.proxy.server.AnyLLMBackend"):
         app = create_app(_ccr_cache_config())
         with TestClient(app) as client:
@@ -273,7 +287,9 @@ def test_buffered_ccr_turn_does_not_write_the_response_cache():
                     "max_tokens": 64,
                     "stream": True,
                     "tools": [create_ccr_tool_definition("anthropic")],
-                    "messages": [{"role": "user", "content": "hello"}],
+                    "messages": [
+                        {"role": "user", "content": f"hello (earlier at <<ccr:{marker}>>)"}
+                    ],
                 },
             )
 
@@ -282,6 +298,7 @@ def test_buffered_ccr_turn_does_not_write_the_response_cache():
     assert forwarded_bodies and forwarded_bodies[0]["stream"] is False
     # ...and nothing was written to the response cache.
     proxy.cache.set.assert_not_awaited()
+    reset_compression_store()
 
 
 # --------------------------------------------------------------------------

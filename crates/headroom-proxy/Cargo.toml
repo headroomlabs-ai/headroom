@@ -22,8 +22,11 @@ tower = { workspace = true }
 tower-http = { version = "0.7", features = ["trace", "request-id", "util"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Native roots on top of the bundled webpki set: corporate TLS-inspection
+# roots (Zscaler, Netskope, ...) are installed in the OS store, never in
+# Mozilla's list, so webpki alone rejects every re-signed upstream certificate.
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "rustls-tls-native-roots", "http2"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 clap = { workspace = true, features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -92,11 +95,27 @@ async-trait = "0.1"
 # ordering — never persisted, never compared cross-host. Same crate
 # the core uses for the CCR cache_key, so no additional hash backend
 # enters the dep tree.
-md-5 = "0.10"
+md-5 = "0.11"
+# Explicit rustls config for WebSocket upstreams (see src/tls.rs). Both ring
+# and aws-lc-rs are compiled into this binary, so rustls cannot pick a default
+# provider and `ClientConfig::builder()` panics; we name ring explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
+# `wss://` relay test (tests/integration_ws_tls.rs): a local TLS WebSocket
+# echo upstream. `tokio-rustls` is already in the build via reqwest and
+# hyper-rustls at this same version, so no new crate enters the tree; the
+# `ring` feature matches the provider the proxy installs (src/tls.rs).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Throwaway certificate for that upstream, generated at test time so no
+# private key is ever committed (gitleaks would rightly refuse one). rcgen
+# is the generator rustls' own test-suite uses; dev-only, never shipped.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
