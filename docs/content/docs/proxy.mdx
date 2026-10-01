@@ -803,6 +803,22 @@ headroom wrap cursor
 headroom wrap grok-build
 ```
 
+`headroom wrap codex` keeps routing scoped to the Codex process it launches: it
+passes the proxy URL as a `--config` override and never writes it to
+`~/.codex/config.toml`. Codex runs any session started with command-line
+overrides in embedded mode, so a wrapped session does not use Codex's shared
+background server and Codex prints "Running without the shared background
+server". If you want the shared server, write the proxy routing to Codex's own
+config instead, then start `codex` directly:
+
+```bash
+headroom init codex     # this project's .codex/config.toml (trusted projects)
+headroom init -g codex  # ~/.codex/config.toml, for every project
+```
+
+That routing is persistent: it applies to every Codex session in that scope
+until you remove it.
+
 Cursor reads model endpoints from its settings UI, so `headroom wrap cursor`
 does not rewrite Cursor configuration or launch the app. After it starts the
 proxy, copy the printed base URL into Cursor's model settings.

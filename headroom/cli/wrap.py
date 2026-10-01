@@ -2915,6 +2915,13 @@ def _codex_dotted_key(*parts: str) -> str:
     )
 
 
+_CODEX_EMBEDDED_MODE_NOTE = (
+    "Note: session-scoped routing runs Codex without its shared background server "
+    "(embedded mode). To keep the shared server, route through Codex config instead: "
+    "run `headroom init codex` (or `headroom init -g codex`) once, then start `codex` directly."
+)
+
+
 def _codex_session_launch_settings(
     *, port: int, codex_args: tuple[str, ...], environ: dict[str, str]
 ) -> tuple[tuple[str, ...], dict[str, str], list[str]]:
@@ -2974,6 +2981,11 @@ def _codex_session_launch_settings(
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
+    # Routing is passed as ``--config`` so it stays scoped to this process, and
+    # Codex runs any session with command-line overrides in embedded mode,
+    # without its shared background server (#3888). Say so up front, and point
+    # at the persistent alternative that leaves the shared server in play.
+    display.append(_CODEX_EMBEDDED_MODE_NOTE)
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 

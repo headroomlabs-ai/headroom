@@ -115,28 +115,20 @@ The following public upstream advisories remain unresolved. They are included in
 `uv.lock` through optional extras; the presence of a package in that universal
 lockfile does not mean it is installed with every Headroom installation.
 
-### CrewAI / ChromaDB
+### CrewAI / ChromaDB (no longer locked)
 
-The `crewai` extra brings in ChromaDB through CrewAI. The locked ChromaDB 1.1.1
-and the latest published version, 1.5.9, are affected by:
-
-- [GHSA-f4j7-r4q5-qw2c](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c):
-  pre-authentication code injection through model repository configuration.
-- [GHSA-36p7-vc44-83pf](https://github.com/advisories/GHSA-36p7-vc44-83pf):
-  code injection through model repository configuration with `trust_remote_code`.
-- [GHSA-2wm9-hf6c-p5cr](https://github.com/advisories/GHSA-2wm9-hf6c-p5cr):
-  cross-tenant access to collection data.
-- [GHSA-xph7-9rjv-w5fr](https://github.com/advisories/GHSA-xph7-9rjv-w5fr):
-  missing resource-scope checks in `SimpleRBACAuthorizationProvider`.
-
-There is no published patched release. The upstream authorization fix
-[chroma-core/chroma#7602](https://github.com/chroma-core/chroma/pull/7602)
-is still open. Upgrading CrewAI alone also retains ChromaDB. Headroom's CrewAI
-integration wraps tools; it does not start a ChromaDB server or configure its
-authorization. Deployments that separately expose ChromaDB must not rely on its
-affected authorization for tenant isolation. Keep it inaccessible to untrusted
-clients and do not allow untrusted model repository or `trust_remote_code`
-configuration. These exposure restrictions are mitigations, not upstream fixes.
+Headroom no longer provides a `crewai` extra, so CrewAI and ChromaDB are not in
+`uv.lock` and are never installed by Headroom. The CrewAI integration uses
+whichever CrewAI the user installs (`pip install headroom-ai crewai`), and that
+installation owns its dependency exposure. Every current CrewAI release requires
+ChromaDB, which has unpatched advisories in its server
+([GHSA-f4j7-r4q5-qw2c](https://github.com/advisories/GHSA-f4j7-r4q5-qw2c),
+[GHSA-36p7-vc44-83pf](https://github.com/advisories/GHSA-36p7-vc44-83pf),
+[GHSA-2wm9-hf6c-p5cr](https://github.com/advisories/GHSA-2wm9-hf6c-p5cr),
+[GHSA-xph7-9rjv-w5fr](https://github.com/advisories/GHSA-xph7-9rjv-w5fr)).
+Headroom's integration only wraps tools and never starts a ChromaDB server. If you
+run ChromaDB as a server, keep it inaccessible to untrusted clients and follow
+those advisories.
 
 ### Voice training / Accelerate
 
@@ -156,6 +148,6 @@ file-type validation. The proposed fixes
 merging; the latter also explicitly leaves the named-pipe denial of service
 unfixed. Keep the alert open until a released fix covers both cases.
 
-Dependabot ignores only the reviewed unpatched ranges (ChromaDB through 1.5.9
-and Accelerate through 1.15.0). Later releases remain eligible for review. These
+Dependabot ignores only the reviewed unpatched Accelerate range (through 1.15.0).
+Later releases remain eligible for review. These
 update exceptions do not remediate the advisories or dismiss vulnerability alerts.

@@ -1448,7 +1448,10 @@ def test_codex_session_launch_settings_keep_routing_process_local(
     )
     assert env["CODEX_HOME"] == str(codex_home)
     assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9898/v1"
-    assert display == ["OPENAI_BASE_URL=http://127.0.0.1:9898/v1"]
+    assert display == [
+        "OPENAI_BASE_URL=http://127.0.0.1:9898/v1",
+        wrap_mod._CODEX_EMBEDDED_MODE_NOTE,
+    ]
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
@@ -1467,7 +1470,7 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     )
     config_file.write_text(original_config, encoding="utf-8")
 
-    args, env, _ = wrap_mod._codex_session_launch_settings(
+    args, env, display = wrap_mod._codex_session_launch_settings(
         port=9898,
         codex_args=("--profile", "work"),
         environ={"CODEX_HOME": str(codex_home)},
@@ -1482,6 +1485,8 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
         '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
     ) in args
     assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
+    # Custom-provider routing also goes through --config, so the note applies (#3888).
+    assert display[-1] == wrap_mod._CODEX_EMBEDDED_MODE_NOTE
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
