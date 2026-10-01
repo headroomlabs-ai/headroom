@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPRO_FIXTURE = REPO_ROOT / "tests/fixtures/headroom-issue-3039.json"
 
@@ -27,7 +29,28 @@ def _manifest_commands() -> list[str]:
 
 
 LAUNCHER = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
-SHELL = shutil.which("sh") or "/bin/sh"
+
+
+def _posix_shell() -> str | None:
+    shell = shutil.which("sh")
+    if shell:
+        return shell
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            git_root = Path(git).resolve().parents[1]
+            for candidate in (git_root / "bin" / "sh.exe", git_root / "usr" / "bin" / "sh.exe"):
+                if candidate.is_file():
+                    return str(candidate)
+    return None
+
+
+SHELL = _posix_shell()
+if SHELL is None:
+    pytest.skip(
+        "requires a POSIX shell (install Git for Windows or put sh on PATH)",
+        allow_module_level=True,
+    )
 
 
 def _posix(path: Path) -> str:
