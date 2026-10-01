@@ -1213,6 +1213,7 @@ class GeminiHandlerMixin:
             model,
             upstream_base_url=upstream_base_url,
         )
+
     async def handle_gemini_count_tokens(
         self,
         request: Request,
