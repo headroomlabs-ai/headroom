@@ -533,6 +533,56 @@ describe("Headroom OpenCode transport", () => {
     }
   });
 
+  it("hides child process windows on Windows", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({
+      on: vi.fn(),
+      once: vi.fn(),
+      emit: vi.fn(),
+      kill: vi.fn(),
+      killed: false,
+      pid: 123,
+    }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+      childProcess.spawn("node", ["agent.js"]);
+
+      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { windowsHide: boolean };
+      expect(options.windowsHide).toBe(true);
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
+  it("preserves an explicit request to show a child process window on Windows", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({
+      on: vi.fn(),
+      once: vi.fn(),
+      emit: vi.fn(),
+      kill: vi.fn(),
+      killed: false,
+      pid: 123,
+    }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+      childProcess.spawn("node", ["agent.js"], { windowsHide: false });
+
+      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { windowsHide: boolean };
+      expect(options.windowsHide).toBe(false);
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
   it("injects one idempotent hook-shim --import into spawn/exec/execFile/fork children", () => {
     const originalSpawn = childProcess.spawn;
     const originalExec = childProcess.exec;

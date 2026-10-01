@@ -12544,6 +12544,9 @@ function injectOptionsEnv(args, optionIndex, state) {
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : void 0;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...nextArgs[optionIndex] } : {};
   existing.env = withShimEnv(existing.env, state.proxyUrl, state.excludeHosts);
+  if (process.platform === "win32" && existing.windowsHide === void 0) {
+    existing.windowsHide = true;
+  }
   if (isOptions(nextArgs[optionIndex])) {
     nextArgs[optionIndex] = existing;
   } else {
