@@ -237,7 +237,8 @@ jobs:
           - { name: code-slim-nonroot, bake_target: runtime-code-slim-nonroot }
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v6
