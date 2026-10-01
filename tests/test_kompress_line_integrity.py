@@ -41,15 +41,18 @@ class _KeepIndicesModel:
         return [[1.0 if idx in self._keep else 0.0 for idx in range(len(row))] for row in input_ids]
 
 
-def _install_fake_kompress(monkeypatch, keep_indices: set[int]) -> None:
+def _install_fake_kompress(monkeypatch, keep_indices: set[int], *, must_keep: bool = False) -> None:
     model = _KeepIndicesModel(keep_indices)
     monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (model, _Tok(), "onnx"))
     monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
-    monkeypatch.delenv(kc._KOMPRESS_MUST_KEEP_ENV, raising=False)
+    if must_keep:
+        monkeypatch.delenv(kc._KOMPRESS_MUST_KEEP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(kc._KOMPRESS_MUST_KEEP_ENV, "0")
 
 
 def _compress(monkeypatch, content: str, path: str):
-    compressor = KompressCompressor(KompressConfig(enable_ccr=False))
+    compressor = KompressCompressor(KompressConfig(enable_ccr=False, min_input_words=10))
     if path == "compress":
         monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
         return compressor.compress(content)
@@ -97,7 +100,7 @@ def test_compress_keeps_tabular_row_intact(monkeypatch, path):
     ]
     content = "\n".join(rows)
 
-    _install_fake_kompress(monkeypatch, keep_indices=set())
+    _install_fake_kompress(monkeypatch, keep_indices=set(), must_keep=True)
 
     result = _compress(monkeypatch, content, path)
 
