@@ -62,6 +62,10 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
 
+# Leading `cd <dir> && ` / `cd <dir>; ` prefixes. Agents prepend them to most
+# commands, so they carry no signal about which operation was retried.
+_BASH_LEADING_CD_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|(?:\\.|[^\s\\])+)\s*(?:&&|;)\s*""")
+
 # Agent harnesses can encode orchestration metadata as user-role messages.
 # These prefixes identify whole messages that are not authored by the user.
 _HARNESS_USER_PREFIXES = (
@@ -194,7 +198,7 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     if not cmd:
         return ""
     # Drop paging, line-context flags, and redirections that vary between runs.
-    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", _strip_leading_cd(cmd)).strip()
     # Cut at the first pipe or && so we hash the primary command, not the tail.
     for sep in (" | ", " && "):
         idx = trimmed.find(sep)
@@ -202,6 +206,15 @@ def _normalize_bash_for_hash(cmd: str) -> str:
             trimmed = trimmed[:idx].rstrip()
             break
     return trimmed
+
+
+def _strip_leading_cd(cmd: str) -> str:
+    """Remove leading `cd <dir> &&` / `cd <dir>;` segments from a Bash command."""
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _BASH_LEADING_CD_RE.sub("", cmd, count=1)
+    return cmd
 
 
 # =============================================================================
@@ -372,6 +385,8 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
     arguments, and gets rejected. Genuine retries (extra flag, single
     arg edit) pass via the edit-distance path.
     """
+    failed = _strip_leading_cd(failed)
+    success = _strip_leading_cd(success)
     if not failed or not success or failed == success:
         return False
     bin_a = _bash_first_binary(failed)

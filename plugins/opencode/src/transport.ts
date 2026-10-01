@@ -135,6 +135,9 @@ function injectOptionsEnv(args: unknown[], optionIndex: number, state: Transport
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : undefined;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...(nextArgs[optionIndex] as Record<string, unknown>) } : {};
   existing.env = withShimEnv(existing.env as NodeJS.ProcessEnv | undefined, state.proxyUrl, state.excludeHosts);
+  if (process.platform === "win32" && existing.windowsHide === undefined) {
+    existing.windowsHide = true;
+  }
 
   if (isOptions(nextArgs[optionIndex])) {
     nextArgs[optionIndex] = existing;
