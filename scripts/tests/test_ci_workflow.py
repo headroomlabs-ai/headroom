@@ -23,6 +23,7 @@ def test_sharded_ci_uploads_only_explicit_coverage_reports() -> None:
 
     assert "files: coverage-${{ matrix.shard }}.xml" in upload_step
     assert "disable_search: true" in upload_step
+    assert "if: ${{ !cancelled() }}" in upload_step.split("uses:", 1)[0]
 
 
 def test_sharded_ci_disables_process_killing_hard_watchdog() -> None:

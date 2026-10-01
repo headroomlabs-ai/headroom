@@ -73,6 +73,11 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     # test its own store so proxy/CLI startup cannot load developer settings and
     # saves cannot rewrite them. Tests of path precedence can override this.
     monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
+    # (#3845), so every test that enters the proxy lifespan armed the 90s
+    # production watchdog inside pytest; it hard-exits the process with code 1
+    # and no summary. Tests of the watchdog set the variable themselves.
+    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
 
 
 # The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,

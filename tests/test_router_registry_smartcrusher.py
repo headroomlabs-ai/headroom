@@ -144,12 +144,15 @@ def test_smart_crusher_kompress_fallback_matches_direct(monkeypatch: pytest.Monk
         lambda: SimpleNamespace(crush=lambda c, query="", bias=1.0: SimpleNamespace(compressed=c)),
     )
     # Kompress shrinks (fallback_tokens < compressed_tokens) so it is adopted.
-    monkeypatch.setattr(router, "_try_ml_compressor", lambda c, ctx, q: ("KOMPRESSED::" + c, 3))
+    # The fallback is measured with the router's estimator, not the count the
+    # ML compressor reports, so the mock must actually return less text.
+    kompressed = "KOMPRESSED::" + _JSON[:40]
+    monkeypatch.setattr(router, "_try_ml_compressor", lambda c, ctx, q: (kompressed, 3))
     out, tokens, chain = router._apply_strategy_to_content(
         _JSON, CompressionStrategy.SMART_CRUSHER, "ctx", bias=1.0
     )
-    assert out == "KOMPRESSED::" + _JSON
-    assert tokens == 3
+    assert out == kompressed
+    assert tokens == _estimate_tokens(kompressed)
     assert chain == [
         CompressionStrategy.SMART_CRUSHER.value,
         CompressionStrategy.KOMPRESS.value,

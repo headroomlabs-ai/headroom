@@ -68,6 +68,21 @@ _HEALTHY = textwrap.dedent(
 )
 
 
+_SWAPPED_STDERR = textwrap.dedent(
+    """
+    import io, sys, time
+    from headroom.proxy.hard_watchdog import start_hard_watchdog
+
+    assert start_hard_watchdog()
+    # What redirect_stderr(StringIO()), click's CliRunner and pytest's capsys
+    # do: a stderr without a fileno while the heartbeat keeps ticking.
+    sys.stderr = io.StringIO()
+    time.sleep(12)  # well past the 5s deadline; the GIL is free throughout
+    print("SURVIVED", flush=True)
+    """
+)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="libc lookup is POSIX-only")
 def test_seized_gil_is_dumped_and_exited():
     proc = subprocess.run(
@@ -104,3 +119,22 @@ def test_disabled_by_env(monkeypatch):
 
     monkeypatch.setattr(hard_watchdog, "_started", type(hard_watchdog._started)())
     assert hard_watchdog.start_hard_watchdog() is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="keep the pair symmetric")
+def test_swapped_stderr_does_not_kill_the_heartbeat():
+    proc = subprocess.run(
+        [sys.executable, "-c", _SWAPPED_STDERR],
+        env={"HEADROOM_HARD_WATCHDOG_SECS": "5", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=40,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "SURVIVED" in proc.stdout
+
+
+def test_pytest_never_arms_the_production_watchdog():
+    """The conftest scrub must not strip CI's opt-out (#3845): ~100 test files
+    enter the proxy lifespan, and an armed watchdog hard-exits the whole shard."""
+    assert _resolve_secs() == 0.0
