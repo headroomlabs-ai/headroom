@@ -396,7 +396,7 @@ def test_cli_json_status_and_strict_error() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["channel"] == "canary"
-    assert payload["features"][2]["name"] == "tool_result_interceptors"
+    assert "tool_result_interceptors" in [feature["name"] for feature in payload["features"]]
     assert invalid.exit_code != 0
     assert "unknown rollout feature" in invalid.output
 

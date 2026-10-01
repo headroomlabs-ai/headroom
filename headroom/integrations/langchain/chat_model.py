@@ -33,7 +33,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -350,7 +350,7 @@ class HeadroomChatModel(BaseChatModel):
         # Create metrics
         metrics = OptimizationMetrics(
             request_id=request_id,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,
@@ -570,6 +570,16 @@ class HeadroomChatModel(BaseChatModel):
             "total_tokens_before": sum(m.tokens_before for m in self._metrics_history),
             "total_tokens_after": sum(m.tokens_after for m in self._metrics_history),
         }
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get metrics from the optimization history (see wiki/langchain.md).
+
+        Same aggregate data as get_savings_summary(), with a ``tokens_saved``
+        key so ``llm.get_metrics()['tokens_saved']`` works as documented.
+        """
+        summary = self.get_savings_summary()
+        summary["tokens_saved"] = summary["total_tokens_saved"]
+        return summary
 
 
 class HeadroomCallbackHandler(BaseCallbackHandler):
@@ -910,7 +920,7 @@ class HeadroomRunnable:
         # Track metrics
         metrics = OptimizationMetrics(
             request_id=str(uuid4()),
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             tokens_before=result.tokens_before,
             tokens_after=result.tokens_after,
             tokens_saved=result.tokens_before - result.tokens_after,

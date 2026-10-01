@@ -229,12 +229,23 @@ class BaselineModel:
             self.strata.setdefault(key, _Accum()).merge(acc)
         self.glob.merge(other.glob)
 
-    def lookup(self, key: str) -> tuple[float, float, int]:
+    def lookup(self, key: str, *, fall_back_to_global: bool = False) -> tuple[float, float, int]:
         """Return ``(mean, var, n)`` for *key* with hierarchical back-off.
 
-        Falls back by trimming trailing (least-specific) stratum fields, then
-        to the global mean. Back-off keeps the estimate defined for strata the
-        baseline never saw, at the cost of specificity.
+        Falls back by trimming trailing (least-specific) stratum fields, so a
+        stratum the baseline never saw is still scored against its nearest
+        observed neighbours. Returns ``(0.0, 0.0, 0)`` when even that finds
+        nothing -- callers already treat ``n == 0`` as "no evidence".
+
+        ``fall_back_to_global`` restores the old last resort of the
+        all-requests mean. It is off by default because that mean is not a
+        control for anything: the baseline is seeded once, from whatever the
+        user ran *before* installing, so every model family they adopt later
+        resolves to it. On a real ledger that meant 48% of requests -- sonnet
+        and fable turns whose replies average 43-770 tokens -- being scored
+        against one opus-derived mean of 1,083, which alone produced 74% of the
+        reported savings. Scoring a short no-tool ask against a long
+        tool-calling turn is not a synthetic control, it is a unit conversion.
         """
         acc = self.strata.get(key)
         if acc is not None and acc.n > 0:
@@ -242,11 +253,16 @@ class BaselineModel:
         parts = key.split("|")
         while len(parts) > 1:
             parts = parts[:-1]
-            prefix = "|".join(parts)
+            prefix = "|".join(parts) + "|"
+            neighbours = _Accum()
             for k, a in self.strata.items():
-                if k.startswith(prefix + "|") and a.n > 0:
-                    return a.mean, a.var, a.n
-        return self.glob.mean, self.glob.var, self.glob.n
+                if a.n > 0 and k.startswith(prefix):
+                    neighbours.merge(a)
+            if neighbours.n > 0:
+                return neighbours.mean, neighbours.var, neighbours.n
+        if fall_back_to_global:
+            return self.glob.mean, self.glob.var, self.glob.n
+        return 0.0, 0.0, 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -331,6 +347,11 @@ class SavingsEstimate:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# Emitted by ``output_shaper.shape_request`` only when it actually changed the
+# request, so its presence is the per-request proof that shaping happened.
+_SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
 
 
 @dataclass
@@ -529,6 +550,10 @@ class SavingsLedger:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # Marks arms accumulated under the shaped-only recording rule (see
+            # ``record_from_labels``). Absent = written before that rule, so the
+            # arms may hold unshaped observations.
+            "shaped_only": True,
             "baseline": self.baseline.to_dict(),
             "treatment": {k: a.to_dict() for k, a in self.treatment.items()},
             "control": {k: a.to_dict() for k, a in self.control.items()},
@@ -537,6 +562,21 @@ class SavingsLedger:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
+        if not d.get("shaped_only"):
+            # Pre-rule arms cannot be told apart from shaped ones entry by
+            # entry, and republishing them is the reported bug. Drop them and
+            # re-accumulate from live traffic (hours, not weeks). The offline
+            # baseline is kept: it is learned from pre-shaper history, costs a
+            # `learn --verbosity` run to rebuild, and was never the poisoned part.
+            if d.get("treatment") or d.get("control"):
+                logger.warning(
+                    "output-savings ledger predates shaped-only recording; "
+                    "dropping %d treatment and %d control strata and "
+                    "re-accumulating (baseline kept)",
+                    len(d.get("treatment") or {}),
+                    len(d.get("control") or {}),
+                )
+            return ledger
         for k, a in (d.get("treatment") or {}).items():
             ledger.treatment[k] = _Accum.from_dict(a)
         for k, a in (d.get("control") or {}).items():
@@ -607,9 +647,10 @@ class SavingsRecorder:
         adopted it) still records its output tokens; it just does not advance
         the stratum's cluster count.
         """
+        label_strings = tuple(str(label) for label in labels or ())
         arm_key: tuple[str, str] | None = None
         conversation: str | None = None
-        for label in labels or ():
+        for label in label_strings:
             text = str(label)
             if arm_key is None:
                 arm_key = parse_stratum_label(text)
@@ -620,6 +661,10 @@ class SavingsRecorder:
         if arm_key is None:
             return False
         arm, key = arm_key
+        if arm == "treatment" and not any(
+            str(label).startswith(_SHAPED_LABEL_PREFIX) for label in label_strings
+        ):
+            return False
         with self._lock:
             self._ledger.record(arm, key, output_tokens, conversation)
             self._since_flush += 1

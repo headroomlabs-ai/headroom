@@ -56,9 +56,25 @@ Skip for greetings/small talk. If nothing: <memory>{"memories": []}</memory>"""
 class ParsedResponse:
     """Response with extracted memories."""
 
-    content: str  # The actual response (without memory block)
+    content: str | None  # The actual response (without memory block); None for tool-call turns
     memories: list[dict[str, Any]]  # Extracted memories
-    raw: str  # Original full response
+    raw: str | None  # Original full response
+
+
+def _append_instruction(content: Any, instruction: str) -> Any:
+    """Append the memory instruction to a system prompt's content.
+
+    ``content`` may be a plain string or a list of content-part dicts (OpenAI
+    allows ``content`` as a list; Anthropic system prompts are commonly a list of
+    ``{"type": "text", ...}`` blocks). Concatenating a str onto a list raises
+    ``TypeError``, so a list gets the instruction appended as a trailing text
+    part instead. Any other shape falls back to a string join.
+    """
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": instruction}]
+    if isinstance(content, str):
+        return content + instruction
+    return f"{content}{instruction}" if content else instruction
 
 
 def inject_memory_instruction(
@@ -83,7 +99,7 @@ def inject_memory_instruction(
         if msg.get("role") == "system":
             messages[i] = {
                 **msg,
-                "content": msg.get("content", "") + instruction,
+                "content": _append_instruction(msg.get("content", ""), instruction),
             }
             has_system = True
             break
@@ -101,17 +117,27 @@ def inject_memory_instruction(
     return messages
 
 
-def parse_response_with_memory(response_text: str) -> ParsedResponse:
+def parse_response_with_memory(response_text: str | None) -> ParsedResponse:
     """Parse LLM response to extract memories.
 
     Args:
-        response_text: Raw LLM response
+        response_text: Raw LLM response. May be ``None`` when the model answered
+            with tool/function calls instead of text.
 
     Returns:
         ParsedResponse with content and memories separated
     """
     memories: list[dict[str, Any]] = []
     content = response_text
+
+    # A chat completion's ``message.content`` is ``None`` whenever the model
+    # answers with tool/function calls instead of text, so the two call sites
+    # here forward ``None`` (and any non-str payload) straight in. ``re.search``
+    # on a non-str raises ``TypeError``, which crashed the whole request. Return
+    # the payload untouched — preserving ``None`` so a tool-call response is not
+    # coerced to text — with no memories to extract.
+    if not isinstance(response_text, str):
+        return ParsedResponse(content=response_text, memories=memories, raw=response_text)
 
     # Extract <memory> block
     memory_pattern = r"<memory>\s*(.*?)\s*</memory>"
@@ -179,7 +205,7 @@ class InlineMemoryWrapper:
         model: str = "gpt-4o-mini",
         short_instruction: bool = True,
         **kwargs: Any,
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> tuple[str | None, list[dict[str, Any]]]:
         """Send chat request and extract memories inline.
 
         Args:
@@ -213,7 +239,7 @@ class InlineMemoryWrapper:
         messages: list[dict[str, Any]],
         model: str = "gpt-4o-mini",
         **kwargs: Any,
-    ) -> tuple[Any, str, list[dict[str, Any]]]:
+    ) -> tuple[Any, str | None, list[dict[str, Any]]]:
         """Send chat request and return full response object.
 
         Args:
