@@ -1019,6 +1019,15 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--factory-api-url",
+    default=None,
+    help=(
+        "Factory Droid upstream for /api/* (used by `headroom wrap droid`). "
+        "/api/llm/a/v1/messages is compressed; other /api/* paths pass "
+        "through verbatim. (env: FACTORY_TARGET_API_URL)"
+    ),
+)
+@click.option(
     "--telemetry",
     is_flag=True,
     help="Opt in to anonymous usage telemetry — off by default (env: HEADROOM_TELEMETRY=on)",
@@ -1154,6 +1163,7 @@ def proxy(
     bedrock_region: str | None,
     bedrock_profile: str | None,
     bedrock_api_url: str | None,
+    factory_api_url: str | None,
     telemetry: bool,
     no_telemetry: bool,
     stateless: bool,
@@ -1532,6 +1542,7 @@ def proxy(
         # CLI flag > env > unset. Matches the BEDROCK_TARGET_API_URL naming of
         # the sibling *_TARGET_API_URL passthrough overrides.
         bedrock_api_url=bedrock_api_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        factory_api_url=factory_api_url or os.environ.get("FACTORY_TARGET_API_URL"),
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
@@ -1577,6 +1588,12 @@ def proxy(
     openai_url = provider_api_targets.openai
     cloudcode_url = provider_api_targets.cloudcode
     vertex_url = provider_api_targets.vertex
+    factory_route_line = (
+        f"\n  /api/*                          → {config.factory_api_url}  "
+        "(Factory Droid; /api/llm/a/v1/messages compressed)"
+        if config.factory_api_url
+        else ""
+    )
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -1780,7 +1797,7 @@ Routing:
   /v1/chat/completions            → {openai_url}
   /v1/responses                   → {openai_url}  (HTTP + WebSocket)
   /v1internal:streamGenerateContent → {cloudcode_url}
-  /v1/projects/.../publishers/... → {vertex_url}
+  /v1/projects/.../publishers/... → {vertex_url}{factory_route_line}
 
 Usage:
 {usage_section}
