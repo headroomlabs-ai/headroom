@@ -448,6 +448,8 @@ def overlay_cached_prefix(
     current_original_messages: list[dict[str, Any]],
     previous_original_messages: list[dict[str, Any]] | None,
     previous_forwarded_messages: list[dict[str, Any]] | None,
+    *,
+    confirmed_frozen_count: int | None = None,
 ) -> list[dict[str, Any]]:
     """Replay a positional, non-inflating cached prefix when it is safe.
 
@@ -471,6 +473,20 @@ def overlay_cached_prefix(
     compact UTF-8 JSON for the replayed result must not exceed the optimized
     candidate. These bounds prefer a cache miss to corrupting or inflating a
     client's live history.
+
+    ``confirmed_frozen_count`` bounds UNCONDITIONAL replay. Leading positions
+    the provider has already confirmed cached (a message count derived from
+    ``cache_read_input_tokens``) are always replayed byte-identical: the
+    replay source there is exactly what the provider hashed, so changing
+    those bytes can only bust the cache. Beyond the floor the size bound
+    still arbitrates each turn: a shrinking replay (the pipeline emitted
+    original bytes for a frozen message) is repaired, while an inflating one
+    (fresh compression improved on the forwarded form) is declined so the
+    improvement reaches the wire. When the provider count collapses (cold
+    cache, TTL lapse) the floor collapses with it and every accumulated
+    improvement lands at once - the natural re-baselining that keeps
+    long-session growth bounded (#3026). Callers with no provider-confirmed
+    count pass None and keep the fully size-bounded behavior.
     """
     prev_orig = previous_original_messages
     prev_fwd = previous_forwarded_messages
@@ -548,15 +564,16 @@ def overlay_cached_prefix(
                     + [merged]
                     + list(optimized_messages[message_index + 1 :])
                 )
-                replayed_bytes = _compact_json_bytes(replayed)
-                optimized_bytes = _compact_json_bytes(optimized_messages)
-                if (
-                    replayed_bytes is None
-                    or optimized_bytes is None
-                    or len(replayed_bytes) > len(optimized_bytes)
-                ):
-                    logger.debug("overlay: block replay inflated compact JSON — skipping")
-                    return optimized_messages
+                if message_index >= max(confirmed_frozen_count or 0, 0):
+                    replayed_bytes = _compact_json_bytes(replayed)
+                    optimized_bytes = _compact_json_bytes(optimized_messages)
+                    if (
+                        replayed_bytes is None
+                        or optimized_bytes is None
+                        or len(replayed_bytes) > len(optimized_bytes)
+                    ):
+                        logger.debug("overlay: block replay inflated compact JSON — skipping")
+                        return optimized_messages
                 return replayed
     # Append-only guard on CONTENT ONLY, message-by-message. Replay the
     # previously-forwarded (cached, compressed) bytes for the longest LEADING
@@ -611,8 +628,24 @@ def overlay_cached_prefix(
         or optimized_bytes is None
         or len(replayed_bytes) > len(optimized_bytes)
     ):
-        logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
-        return optimized_messages
+        # Something in the replay is byte-larger than this turn's fresh form:
+        # fresh compression improved on already-forwarded bytes. Landing the
+        # improvement is only safe OUTSIDE the provider-confirmed prefix -
+        # inside it, the improvement would change bytes the provider has
+        # already cached and bust the whole suffix. Split at the confirmed
+        # floor: replay the confirmed region unconditionally, forward
+        # everything beyond it fresh so the improvement reaches the wire.
+        floor = min(k, max(confirmed_frozen_count or 0, 0))
+        if floor <= 0:
+            logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
+            return optimized_messages
+        logger.debug(
+            "overlay: replay inflated beyond the confirmed floor — replaying %d/%d "
+            "confirmed messages, forwarding the rest fresh",
+            floor,
+            k,
+        )
+        return list(prev_fwd[:floor]) + list(optimized_messages[floor:])
     return replayed
 
 
@@ -837,6 +870,77 @@ def normalize_message_cache_control(
     return out if changed else messages
 
 
+def mirror_client_message_cache_control(
+    messages: list[dict[str, Any]],
+    client_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+
+    OpenAI-compatible clients that talk to Anthropic models through a gateway
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
+    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
+    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
+    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
+    ``normalize_message_cache_control`` only sees block markers
+    (``_client_marker_positions`` reads list content), so after
+    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
+    forwarded messages, these markers ride along untouched. A client that marks
+    three places per request (system, the newest tool call, the newest tool
+    result) ends up forwarding four, then five and more, and the gateway's
+    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
+    blocks with cache_control may be provided. Found 6``).
+
+    The client's current request is the authority for these markers, the same
+    rule the block-level normalizer applies: on each message and on each of its
+    ``tool_calls``, drop the marker unless the client put one there in this
+    request, in which case copy the client's own value. Content — and any
+    block-level marker in it — is left alone, so the replayed bytes the provider
+    cached stay byte-identical.
+
+    Index alignment is the invariant (the pipeline preserves message count and
+    each message's tool calls); where it does not hold, that message or list is
+    returned unchanged rather than guessing, and the breakpoint budget guard
+    still bounds the total.
+    """
+    if not isinstance(client_messages, list) or len(client_messages) != len(messages):
+        return messages
+    changed = False
+    out: list[dict[str, Any]] = []
+    for msg, client in zip(messages, client_messages):
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        new_msg, msg_changed = _mirror_marker(msg, client)
+        calls = new_msg.get("tool_calls")
+        client_calls = client.get("tool_calls") if isinstance(client, dict) else None
+        if (
+            isinstance(calls, list)
+            and isinstance(client_calls, list)
+            and len(calls) == len(client_calls)
+        ):
+            mirrored = [_mirror_marker(c, cc) for c, cc in zip(calls, client_calls)]
+            if any(c for _, c in mirrored):
+                new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
+                msg_changed = True
+        out.append(new_msg)
+        changed = changed or msg_changed
+    return out if changed else messages
+
+
+def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
+    """Give ``holder`` the client's own ``cache_control`` (or none); report change."""
+    if not isinstance(holder, dict):
+        return holder, False
+    client_marker = client_holder.get("cache_control") if isinstance(client_holder, dict) else None
+    if isinstance(client_marker, dict):
+        if holder.get("cache_control") == client_marker:
+            return holder, False
+        return {**holder, "cache_control": dict(client_marker)}, True
+    if "cache_control" in holder:
+        return {k: v for k, v in holder.items() if k != "cache_control"}, True
+    return holder, False
+
+
 class PrefixCacheTracker:
     """Tracks provider prefix cache state across turns in a session.
 
@@ -964,6 +1068,26 @@ class PrefixCacheTracker:
 
     def get_last_forwarded_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._last_forwarded_messages)
+
+    def record_returned(
+        self,
+        original_messages: list[dict[str, Any]],
+        returned_messages: list[dict[str, Any]],
+    ) -> None:
+        """Record the compressed form handed back to a compress-only caller.
+
+        Sidecar mode (session-aware ``/v1/compress``): Headroom does not
+        forward upstream, but whatever it RETURNS is what the caller forwards
+        — the same fact ``update_from_response`` records in proxy mode, just
+        captured at return time instead of send time. Only the transcript
+        snapshots and the activity clock move here; frozen-prefix counts are
+        left untouched because no provider response has confirmed anything
+        yet — they advance when the caller relays usage via ``/v1/usage``
+        (``update_from_response``), or stay at their conservative local value.
+        """
+        self._last_activity = time.time()
+        self._last_original_messages = copy.deepcopy(original_messages)
+        self._last_forwarded_messages = copy.deepcopy(returned_messages)
 
     def resolved_cache_ttl_seconds(self) -> int:
         """Effective prompt-cache lifetime for this session's provider."""
@@ -1248,6 +1372,26 @@ class SessionTrackerStore:
         # but different tool profiles must never share frozen-prefix state.
         self._lineage_affinities: dict[str, str | None] = {}
         self._lineage_counter = itertools.count(1)
+
+    def peek(self, session_id: str) -> PrefixCacheTracker | None:
+        """Return the live tracker for ``session_id``, else None.
+
+        Never creates: lookup paths that must not leave a footprint (e.g. the
+        ``/v1/usage`` unknown-session check, where ``get_or_create`` would let
+        a flood of novel ids grow the store unboundedly within each TTL
+        window) use this instead of :meth:`get_or_create`.
+
+        A TTL-expired-but-unswept tracker answers None too: the sweep runs
+        lazily from get_or_create at 60s granularity, so without this check an
+        expired session would keep answering with stale pre-expiry state — and
+        a caller that then touched it (``update_from_response`` stamps
+        ``_last_activity``) would resurrect the dead tracker indefinitely,
+        making the documented 404-on-expired contract nondeterministic.
+        """
+        tracker = self._trackers.get(session_id)
+        if tracker is None or tracker.is_expired:
+            return None
+        return tracker
 
     def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""

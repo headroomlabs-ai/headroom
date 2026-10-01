@@ -195,7 +195,13 @@ class _FakeWebSocket:
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = dict(headers or {"authorization": "Bearer test"})
+        self.headers = dict(
+            headers
+            or {
+                "authorization": "Bearer test",
+                "user-agent": "codex-cli/0.5",
+            }
+        )
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends
@@ -412,7 +418,8 @@ async def test_ws_first_frame_output_shaper_rewrites_without_compression(monkeyp
     sent = json.loads(upstream.sent[0])
     payload = sent["response"]
     assert "<headroom_output_shaping>" in payload["instructions"]
-    assert payload["text"]["verbosity"] == "low"
+    # text.verbosity is no longer injected: steering is the only lever.
+    assert "text" not in payload
     assert any(t == "output_shaper:verbosity:L2" for t in outcomes[-1].transforms_applied)
 
 

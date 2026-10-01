@@ -1,6 +1,7 @@
 """Analyze headroom proxy logs for performance insights.
 
-Parses PERF log lines from ~/.headroom/logs/proxy.log* and produces
+Parses PERF log lines from ~/.headroom/logs/proxy-*.log* (per-worker and
+per-port) and the legacy ~/.headroom/logs/proxy.log* fallback, and produces
 actionable reports on token savings, cache efficiency, and transform impact.
 
 Cost accounting is **cache-aware**: saved tokens that would have been served
@@ -11,6 +12,7 @@ Anthropic), not the full input price.  This prevents overstating dollar savings.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import asdict, dataclass, field
@@ -24,6 +26,14 @@ log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
 DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
+
+# Runtime-log filenames that carry PERF records: the legacy shared
+# ``proxy.log``, per-port ``proxy-<port>.log``, and worker-specific
+# ``proxy-<port>-<pid>.log`` (port and PID are digits), each with optional
+# rotation suffix ``.1``..``.5``. A positive match (not a
+# ``proxy-stdio`` blacklist) so unrelated files like ``proxy-stdio-8787.log``
+# or a hypothetical ``proxy-errors.log`` are never ingested as PERF input.
+_PERF_LOG_FILE_RE = re.compile(r"proxy(?:-\d+){0,2}\.log(?:\.\d+)?$")
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -312,7 +322,13 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
         if report.newest_kept_ts is None or ts_str > report.newest_kept_ts:
             report.newest_kept_ts = ts_str
 
-    # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
+    # Collect log files across every proxy instance:
+    #   - per-worker runtime logs: proxy-<port>-<pid>.log, rotations
+    #   - standard per-port runtime logs: proxy-<port>.log, rotations
+    #   - legacy shared log (backward compat): proxy.log, proxy.log.1, ...
+    # Selected by a positive filename match (``_PERF_LOG_FILE_RE``), so the
+    # proxy-stdio-*.log captures (stdout/stderr, not PERF records) and any other
+    # ``proxy-<word>.log`` are never fed to the parser.
     #
     # A rotated file last written before the cutoff cannot contain a record
     # inside the window, so skip it without opening it. Without this the cost
@@ -327,7 +343,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     # are stat'd once and the value reused for the sort.
     cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
     dated_files: list[tuple[float, Path]] = []
-    for path in log_dir.glob("proxy.log*"):
+    candidates = [p for p in log_dir.glob("proxy*.log*") if _PERF_LOG_FILE_RE.fullmatch(p.name)]
+    for path in candidates:
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -337,7 +354,9 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.log_files_skipped += 1
             continue
         dated_files.append((mtime, path))
-    log_files = [path for _, path in sorted(dated_files, key=lambda pair: pair[0])]
+    # Secondary key on the path keeps ordering deterministic when two files
+    # share an mtime (glob order is not stable).
+    log_files = [path for _, path in sorted(dated_files, key=lambda pair: (pair[0], str(pair[1])))]
 
     for log_file in log_files:
         report.log_files_read += 1
@@ -497,6 +516,29 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     return report
 
 
+def _as_number(value: object, cast: type) -> int | float:
+    """Coerce a self-reported savings figure, or 0 if it is not a number.
+
+    `savings=` is base64 JSON written by whatever plugin recorded it, and
+    `decode()` validates only that each item is a dict -- so a source can put a
+    string like "lots" in `tokens`. An isinstance check does not save you here:
+    `str` passes it and `int("lots")` then raises, which took down the WHOLE
+    report rather than skipping one bad row. A report must not be crashable by
+    the data it reports on.
+    """
+    try:
+        out = cast(value)  # type: ignore[call-arg]
+    except (TypeError, ValueError, OverflowError):
+        return cast(0)  # type: ignore[call-arg,no-any-return]
+    # Finiteness only, matching what the WRITE side enforces (see MAX_STAGE_MS in
+    # savings_attribution): inf/nan survive a float() cast and render as "inf",
+    # which is not a measurement. A merely large finite value is left alone --
+    # capping it here would invent a limit the recording side does not have.
+    if isinstance(out, float) and not math.isfinite(out):
+        return cast(0)  # type: ignore[call-arg,no-any-return]
+    return out  # type: ignore[no-any-return]
+
+
 def format_report(report: PerfReport) -> str:
     """Format a PerfReport into a human-readable string."""
     lines: list[str] = []
@@ -579,19 +621,37 @@ def format_report(report: PerfReport) -> str:
         lines.append("Per-Model Breakdown")
         lines.append("-" * 40)
         for model, model_recs in sorted(by_model.items()):
+            # Same all-layers construction as the headline above. This loop used to
+            # sum ``tokens_saved`` alone, so every row reported message compression
+            # only while the headline it sat under counted deferral too. The rows
+            # then failed to add up to the total printed inches above them — in the
+            # report that prompted this, four rows summing to 36,071 under a
+            # headline of 625,277, because 589,206 tokens of tool-schema deferral
+            # had no row to land in. A tool-heavy model read "0 tokens saved".
             m_saved = sum(r.tokens_saved for r in model_recs)
+            m_tool_saved = sum(r.tool_saved for r in model_recs)
+            m_headline_saved = m_saved + m_tool_saved
             m_before = sum(r.tokens_before for r in model_recs)
-            m_pct = (m_saved / m_before * 100) if m_before > 0 else 0
+            m_headline_before = m_before + m_tool_saved
+            m_pct = (m_headline_saved / m_headline_before * 100) if m_headline_before > 0 else 0
             list_price = _get_list_price(model)
             price_str = f"${list_price:.2f}/MTok" if list_price else "unknown"
             est_str = (
-                f"  ~${m_saved * list_price / 1_000_000:.2f} at list price" if list_price else ""
+                f"  ~${m_headline_saved * list_price / 1_000_000:.2f} at list price"
+                if list_price
+                else ""
             )
             lines.append(
                 f"  {model}: {len(model_recs)} reqs, "
-                f"{m_saved:,} tokens saved ({m_pct:.0f}%), "
+                f"{m_headline_saved:,} tokens saved ({m_pct:.0f}%), "
                 f"list price {price_str}{est_str}"
             )
+            # Only split the row when there is a split to show; a compression-only
+            # model keeps the single-line shape it has always had.
+            if m_tool_saved > 0:
+                lines.append(
+                    f"      · messages {max(0, m_saved):,}  · tool schemas {m_tool_saved:,}"
+                )
         lines.append("  * Actual bill savings depend on provider caching behavior")
         lines.append("")
 
@@ -743,6 +803,49 @@ def format_report(report: PerfReport) -> str:
                 "— this table sees only engines that emit a Transform line, counts "
                 "per stage, and does not check whether the mutation shipped"
             )
+        lines.append("")
+
+    # Savings attributed to a named source (extensions, plugins, hooks).
+    #
+    # The PERF line has carried this all along in `savings=` and the parser has
+    # decoded it into `savings_breakdown` since it was added -- but nothing ever
+    # RENDERED it, so an operator reading this report could not see that a paid
+    # extension had contributed anything at all.
+    #
+    # USD is reported next to tokens rather than folded into the headline because
+    # the two are different quantities and one source cannot produce both. A
+    # router that sends the SAME tokens to a cheaper model saves dollars and
+    # exactly zero tokens; every token-savings channel in the proxy would record
+    # it as nothing. Showing `$` beside a `0 tokens` row is the honest rendering
+    # of that, and collapsing them into one number would be an invented saving.
+    by_source: dict[tuple[str, bool], dict[str, float]] = {}
+    for record in report.perf_records:
+        for item in getattr(record, "savings_breakdown", ()) or ():
+            source = str(item.get("source") or "other")
+            realized = bool(item.get("realized", True))
+            row = by_source.setdefault((source, realized), {"events": 0, "tokens": 0, "usd": 0.0})
+            row["events"] += 1
+            row["tokens"] += max(0, _as_number(item.get("tokens"), int))
+            row["usd"] += _as_number(item.get("usd"), float)
+    if by_source:
+        lines.append("Savings by Source")
+        lines.append("-" * 40)
+        for (source, realized), row in sorted(
+            by_source.items(), key=lambda kv: (-kv[1]["usd"], -kv[1]["tokens"])
+        ):
+            usd = f"  ${row['usd']:,.2f}" if row["usd"] else ""
+            # "projected" is not a hedge: an unrealized row is a saving the
+            # source computed against a baseline that did not run, so it cannot
+            # be reconciled against the bill the way a realized one can.
+            tag = "" if realized else "  (projected)"
+            lines.append(
+                f"  {source}: {int(row['events']):,} events, "
+                f"{int(row['tokens']):,} tokens{usd}{tag}"
+            )
+        lines.append(
+            "  Sources self-report. A row with 0 tokens and a $ figure changed the "
+            "MODEL, not the payload — no tokens were removed."
+        )
         lines.append("")
 
     # Router routing breakdown
