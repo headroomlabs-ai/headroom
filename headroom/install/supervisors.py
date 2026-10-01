@@ -337,6 +337,22 @@ def _windows_health_trigger() -> str:
     )
 
 
+def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
+    """Parse schtasks XML when its declaration does not match stdout bytes."""
+    if isinstance(raw, bytes):
+        try:
+            return ElementTree.fromstring(raw)
+        except ElementTree.ParseError:
+            raw = raw.decode(errors="replace")
+    normalized = re.sub(
+        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>',
+        '<?xml version="1.0"?>',
+        raw,
+        count=1,
+    )
+    return ElementTree.fromstring(normalized)
+
+
 def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> None:
     """Register a task and verify its principal from Task Scheduler's XML."""
 
@@ -364,7 +380,7 @@ def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> 
             ) from exc
 
         try:
-            task = ElementTree.fromstring(query.stdout or "")
+            task = _parse_windows_task_xml(query.stdout or b"")
         except ElementTree.ParseError as exc:
             raise _WindowsTaskRegistrationError(
                 f"Could not parse registered Windows task {name!r}", task_created=True

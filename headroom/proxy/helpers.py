@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
+from headroom.cache.compression_cache import _is_tool_result_message
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -93,7 +94,11 @@ from headroom.proxy.tool_definition_serialization import (
     serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
+    CcrToolInjectionMode,
     ToolInjectionStickyMode,
+)
+from headroom.proxy.tool_injection_config import (
+    get_ccr_tool_injection_mode as _get_ccr_tool_injection_mode,
 )
 from headroom.proxy.tool_injection_config import (
     get_tool_injection_sticky_mode as _get_tool_injection_sticky_mode,
@@ -1841,11 +1846,10 @@ def _setup_file_logging(
             return
         _warn_once_if_owner_only_unsupported(log_path)
         # Attach to the headroom root logger so all sub-loggers are captured.
-        # Disable propagation to root to avoid duplicate writes when
-        # wrap.py redirects stderr to the same log file.
+        # Keep root propagation enabled for container stdout/stderr while
+        # this handler writes the separate port/worker-specific proxy log.
         headroom_logger = logging.getLogger("headroom")
         headroom_logger.setLevel(logging.INFO)
-        headroom_logger.propagate = False
         # Decide BEFORE constructing the handler: constructing a
         # RotatingFileHandler opens (creates) the file, so building one only to
         # discard it would leave an empty stray worker log and leak
@@ -2287,6 +2291,15 @@ def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     return _get_tool_injection_sticky_mode()
 
 
+def get_ccr_tool_injection_mode() -> CcrToolInjectionMode:
+    """Return when the CCR retrieval tool enters the tools array.
+
+    Read at request time so operators can flip behaviour without a restart.
+    Unknown values raise loudly per the no-silent-fallback build constraint.
+    """
+    return _get_ccr_tool_injection_mode()
+
+
 def get_tool_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionToolTracker` (sessions cap)."""
     return _get_tool_tracker_max_sessions()
@@ -2390,6 +2403,7 @@ def apply_session_sticky_memory_tools(
     existing_tools: list[dict[str, Any]] | None,
     memory_tools_to_inject: list[dict[str, Any]],
     inject_this_turn: bool,
+    client_declared_tools: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on memory tool injection per `SessionToolTracker`.
 
@@ -2418,6 +2432,11 @@ def apply_session_sticky_memory_tools(
     ``inject_this_turn`` flag drives the decision verbatim. We log the
     bypass once so operators can see it.
 
+    ``client_declared_tools`` is False when the inbound request omitted
+    tools or explicitly sent an empty list. In that case memory tools are
+    never added, including sticky replay, because the client cannot service
+    them.
+
     Returns ``(updated_tools, was_injected)``. The returned list is a
     fresh list (caller-safe). ``was_injected`` is True iff at least one
     memory tool was added to the list.
@@ -2426,6 +2445,16 @@ def apply_session_sticky_memory_tools(
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if not client_declared_tools:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip_no_client_tools",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -2686,6 +2715,7 @@ def apply_session_sticky_ccr_tool(
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
     history_has_ccr_reference: bool = False,
+    allow_eager: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2741,7 +2771,9 @@ def apply_session_sticky_ccr_tool(
     # definition and the provider rejects the request because history still
     # references it (#2440).
     if not session_id:
-        if not (has_compressed_content_this_turn or history_has_ccr_reference):
+        # See the fresh-session branch below for what gates eager injection.
+        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+        if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2757,7 +2789,7 @@ def apply_session_sticky_ccr_tool(
             session_id=None,
             decision="inject_first_time"
             if has_compressed_content_this_turn
-            else "inject_history_reference",
+            else ("inject_history_reference" if history_has_ccr_reference else "inject_eager"),
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2807,8 +2839,37 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, True
 
-    # Fresh session — only inject when this turn produced compressed content.
-    if not has_compressed_content_this_turn:
+    # Fresh session. `tools` is the head of Anthropic's cache key, so the
+    # moment this tool enters the array decides what it costs. Waiting for the
+    # first compression means entering against a fully warm prefix and
+    # invalidating all of it — measured on a customer session at 113,888 tokens
+    # of cache write to save 2,205 tokens of content, a ~594-turn payback that
+    # no session reaches. The definition is ~119 tokens; injecting it on the
+    # first request instead folds that cost into the cache write the session
+    # was always going to pay, and the array never changes again.
+    #
+    # The historical gate is still reachable via HEADROOM_CCR_TOOL_INJECTION=lazy
+    # for operators who would rather keep the tool out of conversations that
+    # never compress. A spurious call costs a round trip, not an error: an
+    # unknown hash resolves to a structured {"status": "missing"} tool result
+    # (see CCRResponseHandler._execute_retrieval), not an exception or a 400.
+    #
+    # Eager injection needs three things to be true, because it is the one path
+    # that touches the tools array before anything has been compressed:
+    #
+    #   allow_eager -- the caller confirms it may rewrite this request's tools
+    #     at all. Under `--no-optimize` or a bypass header nothing will ever be
+    #     compressed, so the tool would be permanently unredeemable; the old
+    #     gate got this for free because no compression meant no injection.
+    #   a non-empty client tools array -- adding the first entry would turn a
+    #     no-tools request into a tools request and let the model emit tool_use
+    #     blocks the client never expected (#728). Such a client also has no
+    #     tool results to compress, so there is no warm tools segment to
+    #     protect. The cache problem is a harness problem, and harnesses always
+    #     send tools.
+    #   the eager mode -- operators can restore the historical gate.
+    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+    if not (eager or has_compressed_content_this_turn):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2824,7 +2885,7 @@ def apply_session_sticky_ccr_tool(
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
-        decision="inject_first_time",
+        decision="inject_first_time" if has_compressed_content_this_turn else "inject_eager",
         tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )
@@ -2832,7 +2893,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -2963,8 +3024,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
 
     # Content-Length is an optimization only, not the enforcement boundary: it
-    # can be absent, understated, or belong to a chunked transfer. The
-    # streaming loop below is what actually bounds every case (#3479).
+    # can be absent, understated, or belong to a chunked transfer (the
+    # original gap this fixes, #3326). The streaming loop below is what
+    # actually bounds every case, chunked or not (#3479).
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -2986,8 +3048,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             )
     raw: bytes = bytes(chunks)
     # Cache like Starlette's own body() would, so any other .body() caller on
-    # this request (there is none today, but future callers get the same
-    # semantics) sees the bytes already read rather than a consumed stream.
+    # this request (e.g. a handler's except-branch falling open to a verbatim
+    # forward after a decode failure) sees the bytes already read rather than
+    # a consumed stream.
     request._body = raw
 
     # Every branch below decompresses incrementally against
@@ -3953,6 +4016,17 @@ _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
 _CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
+def _tool_entry_name(entry: dict[str, Any]) -> str | None:
+    """Return the name a tool-search entry carries, or ``None``.
+
+    Server-side blocks use ``tool_name``; be liberal about ``name``. The one
+    precedence rule for this file, so every reader agrees on an entry that
+    carries both keys.
+    """
+    name = entry.get("tool_name") or entry.get("name")
+    return str(name) if name else None
+
+
 def _tool_search_reference_names(content: Any) -> list[str]:
     """Return the ``tool_reference`` names carried by a tool-search result block.
 
@@ -3965,11 +4039,62 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     names = []
     for entry in entries:
         if isinstance(entry, dict) and entry.get("type") == "tool_reference":
-            # Server-side blocks use ``tool_name``; be liberal about ``name``.
-            name = entry.get("tool_name") or entry.get("name")
+            name = _tool_entry_name(entry)
             if name:
-                names.append(str(name))
+                names.append(name)
     return names
+
+
+def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
+    """Drop ``tool_reference`` entries in ``tools`` that name a typed search tool.
+
+    Anthropic occasionally returns ``tool_search_tool_regex`` as a hit inside its
+    own match-all result (empty ``input``). Claude Code adds every hit to the
+    session's loaded-tool set and replays it as a ``tool_reference`` in ``tools``
+    on later turns, so upstream then 400s with "Tool reference
+    'tool_search_tool_regex' not found in available tools" — a typed search tool
+    is the search mechanism, never a reference target. The block repair below
+    cannot reach this: the poison is in the tools array, not the history, which
+    is why ``/compact`` does not clear it and the session stays dead.
+
+    Scoped to the search mechanisms this request actually carries: the names are
+    derived from entries whose ``type`` starts with the typed-search prefix (the
+    same signal ``strip_unsupported_tool_search_blocks`` keys on), and a
+    ``tool_reference`` is dropped only when its name matches one of them exactly.
+    Matching on the name prefix alone would also remove a legitimate client tool
+    that merely happens to be called ``tool_search_tool_*`` — a typeless deferred
+    tool with such a name is a normal reference target, not a mechanism.
+
+    Returns ``(tools, entries_removed)``, and the ORIGINAL ``tools`` object when
+    nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(tools, list):
+        return tools, 0
+
+    # The search mechanisms present on THIS request, identified by type. Names
+    # on both sides go through _tool_entry_name, so a mechanism shaped like a
+    # server-side block (``tool_name``) registers too.
+    mechanism_names = {
+        name
+        for t in tools
+        if isinstance(t, dict)
+        and str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        and (name := _tool_entry_name(t))
+    }
+    if not mechanism_names:
+        return tools, 0
+
+    kept = [
+        t
+        for t in tools
+        if not (
+            isinstance(t, dict)
+            and t.get("type") == "tool_reference"
+            and _tool_entry_name(t) in mechanism_names
+        )
+    ]
+    removed = len(tools) - len(kept)
+    return (kept, removed) if removed else (tools, 0)
 
 
 # Stand-in for a tool-search block the outbound tools array cannot support. Text
@@ -4223,7 +4348,19 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
         if touched:
             changed = True
             repaired = dict(message)
-            repaired["content"] = new_content
+            # Anthropic requires a user turn's tool_result blocks to lead its
+            # content. When headroom_retrieve ran in parallel with another tool,
+            # neutralizing its result in place leaves [text, tool_result(sibling)]
+            # and the request 400s ("tool_use ids were found without tool_result
+            # blocks immediately after"). Stable-partition so surviving
+            # tool_results stay first; a no-op for assistant turns, which carry none.
+            repaired["content"] = [
+                b for b in new_content if isinstance(b, dict) and b.get("type") == "tool_result"
+            ] + [
+                b
+                for b in new_content
+                if not (isinstance(b, dict) and b.get("type") == "tool_result")
+            ]
             out.append(repaired)
         else:
             out.append(message)
@@ -4370,3 +4507,78 @@ def inject_tool_search_deferral_openai(
     if deferred == 0:
         return tools  # nothing to defer → don't perturb the request / cache prefix
     return out
+
+
+_KEEP_LAST_TURNS_INSTRUCTION_ROLES = frozenset({"system", "developer"})
+
+
+def apply_keep_last_turns(
+    messages: list[dict[str, Any]],
+    n: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Trim ``messages`` to the last *n* conversation turns.
+
+    A "turn" starts at a genuine user message and runs up to (but not
+    including) the next one — so a tool-calling round trip stays part of
+    the turn that triggered it, however many messages it spans:
+    ``user -> assistant(tool_calls) -> tool -> tool -> assistant`` is one
+    turn, not the two-message ``user, assistant`` pair a fixed-size slice
+    would assume. A message only starts a *new* turn when its role is
+    ``"user"`` AND it is not itself a tool-result continuation of the
+    previous turn — Anthropic represents tool results as ``role="user"``
+    messages (``content`` blocks of type ``tool_result``), so a bare
+    role check would misfire on ordinary Anthropic tool use and orphan the
+    tool_use/tool_result pairing exactly like the arithmetic slice did.
+
+    ``system``/``developer`` messages are application instructions, not
+    historical conversation turns — OpenAI keeps them inline in the same
+    ``messages`` array a client sends, so without this they'd be silently
+    dropped the moment *n* trims far enough back to reach them. They are
+    never counted as, or dropped by, turn trimming, and are kept in their
+    original relative position rather than hoisted to the front.
+
+    The trailing turn (the last turn-start through the end of the list) is
+    always kept in full regardless of *n* — it is the current, not-yet-
+    answered request. *n* counts complete turns before that one.
+
+    Returns ``(trimmed_messages, n_dropped)`` — the caller can log
+    *n_dropped* and append ``keep_last_turns:{n}:{n_dropped}_dropped``
+    to ``transforms_applied``. *n_dropped* counts only messages actually
+    removed — a retained system/developer message never counts as dropped
+    even though the turn-boundary cutoff logically falls past it. When
+    nothing is dropped (n_dropped == 0) the original list is returned
+    unchanged so callers can detect a no-op with an identity check.
+
+    Invariants:
+    - n < 0 is treated as no-op (invalid, never trim).
+    - A dropped prefix always ends exactly on a turn boundary: every
+      message belonging to a retained turn (including its tool_calls/
+      tool_result messages) is kept, and every message belonging to a
+      dropped turn is dropped — never a partial turn.
+    - Every system/developer message survives, in its original order,
+      regardless of *n*.
+    """
+    if n < 0 or not messages:
+        return messages, 0
+    turn_starts = [
+        i
+        for i, msg in enumerate(messages)
+        if msg.get("role") == "user" and not _is_tool_result_message(msg)
+    ]
+    if not turn_starts:
+        return messages, 0
+    prior_turns = len(turn_starts) - 1
+    if n >= prior_turns:
+        return messages, 0
+    tail = turn_starts[prior_turns - n]
+    if tail == 0:
+        return messages, 0
+    result = [
+        msg
+        for i, msg in enumerate(messages)
+        if msg.get("role") in _KEEP_LAST_TURNS_INSTRUCTION_ROLES or i >= tail
+    ]
+    dropped = len(messages) - len(result)
+    if dropped == 0:
+        return messages, 0
+    return result, dropped
