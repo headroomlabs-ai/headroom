@@ -178,7 +178,8 @@ def test_stream_generate_content_preserves_sse_and_native_parts(
     assert not any(key.lower().startswith("x-headroom-") for key in outbound_headers)
 
 
-def test_adjacent_custom_base_path_stays_passthrough() -> None:
+def test_adjacent_custom_base_path_stays_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", PLUGIN_BASE_URL)
     captured: dict[str, object] = {}
 
     async def fake_passthrough(
