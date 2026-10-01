@@ -93,10 +93,10 @@ from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -3642,7 +3642,12 @@ class OpenAIHandlerMixin:
             handler_path,
             custom_upstream_base_url or "",
         )
-        openai_chat_outcome_provider = custom_chat_provider or "openai"
+        # Fixed taxonomy from the shared helper (zen, zai, meta, openai); any
+        # other custom base is the shared "custom" bucket. Never derive the
+        # label from the request-controlled hostname — see the review on #3759.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai"
+        )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
@@ -4349,6 +4354,19 @@ class OpenAIHandlerMixin:
                 openai_prefix_tracker.get_last_forwarded_messages(),
                 confirmed_frozen_count=_openai_confirmed_frozen,
             ).messages
+
+        # Both replays above forward earlier turns' messages byte-identical,
+        # including the cache_control each carried back then. Chat Completions
+        # clients mark the message dict and an assistant's tool_calls, which the
+        # block-level normalizer does not see, so without this the markers
+        # accumulate turn over turn and an Anthropic-backed gateway rejects the
+        # request (more than four breakpoints). Content is untouched: only the
+        # markers move.
+        from headroom.cache.prefix_tracker import mirror_client_message_cache_control
+
+        optimized_messages = mirror_client_message_cache_control(
+            optimized_messages, original_client_messages
+        )
 
         # Memory: inject context and tools for OpenAI requests.
         #
