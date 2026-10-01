@@ -8,6 +8,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from headroom.config import WASTE_SIGNAL_ALIASES, WASTE_SIGNAL_KEYS
+
 SCHEMA_VERSION = 5
 MAX_PROVIDER_VALUES = 32
 MAX_STACK_VALUES = 64
@@ -19,21 +21,6 @@ KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
 # Mirrors RATE_LIMIT_SOURCES in prometheus_metrics: "headroom" is our own
 # limiter refusing the request, "upstream" is the provider refusing it.
 RATE_LIMIT_SOURCES = frozenset({"headroom", "upstream"})
-# Names must match ``WasteSignals.to_dict()`` in headroom/config.py — the
-# parser emits ``json_bloat``; an allowlist that says ``json_noise`` silently
-# shoves the largest waste category into the catch-all bucket.
-KNOWN_WASTE_SIGNALS = frozenset(
-    {
-        "json_bloat",
-        "html_noise",
-        "base64",
-        "whitespace",
-        "dynamic_date",
-        "repetition",
-        "reread",
-        "reread_compressed",
-    }
-)
 
 
 def utc_now() -> datetime:
@@ -68,6 +55,13 @@ def _label(value: Any) -> str:
         return "other"
     value = value.strip()
     return value[:MAX_LABEL_LENGTH] if value else "other"
+
+
+def _normalize_waste_signal_name(name: object) -> str:
+    if not isinstance(name, str):
+        return "unknown"
+    normalized = WASTE_SIGNAL_ALIASES.get(name, name)
+    return normalized if normalized in WASTE_SIGNAL_KEYS else "unknown"
 
 
 def _model_entry(raw: Any = None) -> dict[str, Any]:
@@ -254,13 +248,9 @@ class PersistentMetricsState:
                 "compression_savings_usd"
             ]
             result["cost"]["savings_basis"] = "list"
-        # Record-time puts unrecognised names in ``other`` (see
-        # ``record_request``); load-time must do the same, or every restart
-        # relabels the whole ``other`` bucket as ``unknown`` and the two
-        # grow side by side.
-        result["waste_signals"] = self._normalize_enum_map(
-            source.get("waste_signals"), KNOWN_WASTE_SIGNALS, fallback="other"
-        )
+        # Use the same canonical vocabulary for persisted and live signals so
+        # aliases and old catch-all names cannot create parallel buckets.
+        result["waste_signals"] = self._normalize_waste_signal_map(source.get("waste_signals"))
 
         raw_models = _dict_or_empty(source.get("models"))
         raw_tracked = _dict_or_empty(raw_models.get("tracked"))
@@ -297,6 +287,16 @@ class PersistentMetricsState:
         for key, value in raw.items():
             label = key if isinstance(key, str) and key in allowed | {fallback} else fallback
             result[label] = result.get(label, 0) + _coerce_int(value)
+        return result
+
+    @staticmethod
+    def _normalize_waste_signal_map(raw: Any) -> dict[str, int]:
+        result: dict[str, int] = {}
+        if not isinstance(raw, dict):
+            return result
+        for key, value in raw.items():
+            bucket = _normalize_waste_signal_name(key)
+            result[bucket] = result.get(bucket, 0) + _coerce_int(value)
         return result
 
     @staticmethod
@@ -467,7 +467,7 @@ class PersistentMetricsState:
 
         if isinstance(waste_signals, dict):
             for name, token_count in waste_signals.items():
-                bucket = name if isinstance(name, str) and name in KNOWN_WASTE_SIGNALS else "other"
+                bucket = _normalize_waste_signal_name(name)
                 self._state["waste_signals"][bucket] = self._state["waste_signals"].get(
                     bucket, 0
                 ) + _coerce_int(token_count)

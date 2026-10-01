@@ -1537,6 +1537,7 @@
                         <div class="px-4 py-8 text-center">
                             <div class="text-xs text-gray-500 mb-3">No per-project data yet.</div>
                             <div class="text-xs text-gray-600 font-mono leading-relaxed">
+                                Add to each project's <span class="text-gray-400">.claude/settings.local.json</span>:<br>
                                 <span class="text-accent" x-text="'ANTHROPIC_BASE_URL: ' + window.location.origin + '/p/&lt;project-name&gt;'"></span>
                             </div>
                         </div>
@@ -2045,11 +2046,12 @@
                 pollInterval: null,
                 polling_: false,
                 statsPollMs: 5000,
-                lifetimePollMs: 30000,
-                historyPollMs: 30000,
+                viewPollMs: 30000,
                 feedPollMs: 5000,
-                lastLifetimeFetchMs: 0,
-                lastHistoryFetchMs: 0,
+                viewRefreshers: {
+                    lifetime: { lastFetchedAt: 0, fetchMethod: 'fetchLifetimeStats' },
+                    history: { lastFetchedAt: 0, fetchMethod: 'fetchHistoryStats' },
+                },
                 lastFeedFetchMs: 0,
                 feedOpen: false,
                 transformations: [],
@@ -2088,28 +2090,26 @@
                     try {
                         await this.fetchStats();
 
-                        const now = Date.now();
-                        if (this.viewMode === 'lifetime' && (force || now - this.lastLifetimeFetchMs >= this.lifetimePollMs)) {
-                            await this.fetchLifetimeStats();
-                        }
-                        if (this.viewMode === 'history' && (force || now - this.lastHistoryFetchMs >= this.historyPollMs)) {
-                            await this.fetchHistoryStats();
-                        }
-                        if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
-                            await this.fetchTransformations();
-                        }
-                    } finally {
-                        this.polling_ = false;
+                    await this.refreshActiveView(force);
+                    const now = Date.now();
+                    if (this.feedOpen && (force || now - this.lastFeedFetchMs >= this.feedPollMs)) {
+                        await this.fetchTransformations();
                     }
+                } finally {
+                    this.polling_ = false;
+                }
                 },
 
                 async setViewMode(mode) {
                     this.viewMode = mode;
-                    if (mode === 'lifetime') {
-                        await this.fetchLifetimeStats();
-                    }
-                    if (mode === 'history') {
-                        await this.fetchHistoryStats();
+                    await this.refreshActiveView(true);
+                },
+
+                async refreshActiveView(force = false) {
+                    const refresher = this.viewRefreshers[this.viewMode];
+                    if (!refresher) return;
+                    if (force || Date.now() - refresher.lastFetchedAt >= this.viewPollMs) {
+                        await this[refresher.fetchMethod]();
                     }
                 },
 
@@ -2167,7 +2167,7 @@
                         const response = await fetch('/stats-lifetime');
                         if (response.ok) {
                             this.lifetimeStats = await response.json();
-                            this.lastLifetimeFetchMs = Date.now();
+                            this.viewRefreshers.lifetime.lastFetchedAt = Date.now();
                         }
                     } catch (e) {
                         console.error('Failed to fetch lifetime stats:', e);
@@ -2178,7 +2178,7 @@
                         const response = await fetch('/stats-history');
                         if (response.ok) {
                             this.historyStats = await response.json();
-                            this.lastHistoryFetchMs = Date.now();
+                            this.viewRefreshers.history.lastFetchedAt = Date.now();
                         }
                     } catch (e) {
                         console.error('Failed to fetch history stats:', e);

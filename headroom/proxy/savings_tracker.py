@@ -882,6 +882,9 @@ class SavingsTracker:
         self._needs_schema_save = False
         self._state = self._load_state()
         self._persistent_metrics = PersistentMetricsState(self._state.pop("lifetime_metrics", None))
+        if self._needs_schema_save and not self._stateless:
+            with self._lock:
+                self._save_locked()
         # Negative-savings warning state. A deployment that loses money loses it
         # on most turns, not one, so warning per turn would bury the signal in
         # its own repetition. Accumulate instead and emit a summary no more than
