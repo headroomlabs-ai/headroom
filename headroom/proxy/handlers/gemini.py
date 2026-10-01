@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
@@ -46,6 +48,8 @@ class _GeminiContinuationError(Exception):
 
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
+
+    cost_tracker: CostTracker | None = None
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
@@ -398,10 +402,20 @@ class GeminiHandlerMixin:
             rate_key = headers.get("x-goog-api-key", "default")[:20]
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider=provider_name)
+                await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Convert Gemini format to messages for optimization
@@ -517,6 +531,15 @@ class GeminiHandlerMixin:
 
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=provider_name)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
 
         # Optimization
         transforms_applied: list[str] = []
@@ -1004,6 +1027,7 @@ class GeminiHandlerMixin:
         request: Request,
     ) -> StreamingResponse | JSONResponse:
         """Handle Pi/OpenClaw Google Cloud Code Assist and Antigravity streaming requests."""
+        from fastapi import HTTPException
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
@@ -1061,6 +1085,16 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_cca,
             request_id=request_id,
         )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
 
         system_instruction = request_payload.get("systemInstruction")
         optimization_system_instruction = None if is_antigravity else system_instruction
@@ -1173,6 +1207,7 @@ class GeminiHandlerMixin:
         model: str,
     ) -> StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
+        from fastapi import HTTPException
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
@@ -1215,6 +1250,16 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem_stream,
             request_id=request_id,
         )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
+                )
 
         # Token counting (offloaded off the event loop — GH #1701). Reuse the
         # shared _dict_parts coercion and keep only str text values: count_text

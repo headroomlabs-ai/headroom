@@ -4,6 +4,8 @@
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
 //! `--upstream`. See RUST_DEV.md for the operator runbook.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 
 use clap::Parser;

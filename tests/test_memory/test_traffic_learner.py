@@ -412,6 +412,41 @@ class TestTrafficLearner:
         assert pattern.content_hash not in learner._pattern_counts  # removed on promotion
         assert pattern.content_hash in learner._saved_hashes
 
+    def test_persisted_ids_bounded_in_lockstep_with_saved_hashes(self):
+        """``_persisted_ids`` (content_hash -> memory row id) must not outgrow
+        ``_saved_hashes``. The dedup read only consults ``_persisted_ids`` behind
+        an ``h in _saved_hashes`` guard, so an id whose hash has been evicted from
+        the dedup window is dead weight; previously it accumulated one entry per
+        distinct persisted pattern for the whole process lifetime while
+        ``_saved_hashes`` stayed trimmed to ``dedup_window``.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=1, dedup_window=4)
+
+        async def feed() -> None:
+            for i in range(200):
+                pattern = ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content=f"distinct preference number {i}",
+                    importance=0.5,
+                )
+                await learner._accumulate(pattern)  # first sight -> pending
+                await learner._accumulate(pattern)  # second -> promote to saved
+                # Emulate the async save worker recording the row id, using the
+                # same "still tracked" guard the worker now applies.
+                if pattern.content_hash in learner._saved_hashes:
+                    learner._persisted_ids[pattern.content_hash] = f"mem-{i}"
+
+        asyncio.run(feed())
+
+        # _saved_hashes stays bounded (existing behavior).
+        assert len(learner._saved_hashes) <= 4
+        # _persisted_ids no longer leaks: it never holds an id for a hash that is
+        # no longer in the dedup window, so it stays bounded too.
+        assert set(learner._persisted_ids).issubset(learner._saved_hashes)
+        assert len(learner._persisted_ids) <= 4  # not 200
+
     @pytest.mark.asyncio
     async def test_dedup(self, learner: TrafficLearner):
         """Test that identical patterns are deduplicated."""
@@ -1445,6 +1480,59 @@ class TestHydrateEdgeCases:
         await learner._hydrate_persisted_state()
         assert learner._saved_hashes == set()
         assert learner._persisted_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
+        """A persisted history larger than dedup_window must not start the
+        in-memory dedup maps oversized. Hydration keeps at most dedup_window
+        rows (the most-recently-seen), and both maps stay bounded with matching
+        keys — otherwise a long-lived install boots with an unbounded leak that
+        only trims one entry at a time."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        window = 5
+        total = 20
+        conn = _sql.connect(db)
+        try:
+            for i in range(total):
+                conn.execute(
+                    "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        f"id-{i:02d}",
+                        f"Command `cmd{i}` fails; use `alt{i}` instead.",
+                        _json.dumps(
+                            {
+                                "source": "traffic_learner",
+                                "category": "error_recovery",
+                                "evidence_count": 2,
+                                # Higher i == more recently seen; hydration keeps
+                                # the newest `window` of these.
+                                "last_seen_at": f"2026-01-01T00:{i:02d}:00+00:00",
+                            }
+                        ),
+                        "[]",
+                        0.7,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=2, dedup_window=window)
+        await learner._hydrate_persisted_state()
+
+        # Both maps are bounded to the window and hold exactly the same keys.
+        assert len(learner._saved_hashes) <= window
+        assert len(learner._persisted_ids) <= window
+        assert set(learner._persisted_ids) == set(learner._saved_hashes)
+        # The retained rows are the most-recently-seen ones (ids 15..19).
+        assert set(learner._persisted_ids.values()) == {f"id-{i:02d}" for i in range(15, 20)}
 
 
 class TestBumpEdgeCases:
