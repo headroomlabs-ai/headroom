@@ -1275,7 +1275,11 @@ def test_ruby_source_code_routes_to_code_aware_compressor(
     class FakeRubyCompressor:
         def compress(self, content: str, language: str | None = None, context: str = ""):
             calls.append((content, language))
-            return SimpleNamespace(compressed=content.replace("first = 1", "# omitted"))
+            return SimpleNamespace(
+                compressed=content.replace("first = 1", "# omitted")
+                .replace("second = first + 1", "")
+                .replace("third = second + 1", "")
+            )
 
     monkeypatch.setattr(router, "_get_code_compressor", lambda: FakeRubyCompressor())
     monkeypatch.setattr(
