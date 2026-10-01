@@ -12,8 +12,16 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
+from headroom.pricing.deepseek_tiers import (
+    LEGACY_MODEL_IDS,
+    OFF_PEAK_RATES_PER_1M,
+)
+from headroom.pricing.deepseek_tiers import (
+    rates_for as _deepseek_rates_for,
+)
 from headroom.pricing.litellm_model_resolution import (
     pricing_lookup_candidates,
     resolve_litellm_model_name,
@@ -241,9 +249,8 @@ def pricing_per_1m(model: str) -> tuple[float, float] | None:
 
     The tuple shape providers already use for their own tables, so a provider can
     prefer this over a hand-maintained copy with a single call. ``None`` means
-    "LiteLLM can't answer" — either it isn't installed (the dependency is gated
-    ``python_version < '3.14'``) or it doesn't know the model — which is the
-    provider's cue to fall back.
+    "LiteLLM can't answer" — either it isn't installed or it doesn't know the
+    model — which is the provider's cue to fall back.
 
     A found-but-zero price is returned as ``0.0`` rather than treated as missing:
     some models genuinely are free, and ``savings_ledger`` already made this call
@@ -287,6 +294,7 @@ def estimate_cost_from_tokens(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cached_tokens: int = 0,
+    now: datetime | None = None,
 ) -> float | None:
     """Cost for one request from token counts, using LiteLLM's own cost model.
 
@@ -296,15 +304,34 @@ def estimate_cost_from_tokens(
     Sonnet 4 / 4.5 family a prompt over 200K re-prices the *whole* request --
     input, output and cache alike. ``litellm.cost_per_token`` applies both.
 
+    DeepSeek flash/pro do not go through litellm at all: the vendor prices them
+    on Beijing peak/off-peak tiers (see
+    :mod:`headroom.pricing.deepseek_tiers`), and ``now`` selects the tier. A
+    ``now`` of ``None`` reads the wall clock, which is what live traffic wants.
+
     ``input_tokens`` is the TOTAL prompt, ``cached_tokens`` included. LiteLLM
     subtracts the cached portion itself and tests the long-context threshold
     against the total, so passing a cache-exclusive count would both
     double-discount the cached tokens and understate the threshold.
 
-    Returns ``None`` when LiteLLM is unavailable (the dependency is gated
-    ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
-    to fall back to its own table.
+    Returns ``None`` when LiteLLM is unavailable or doesn't know the model --
+    the caller's cue to fall back to its own table. The DeepSeek flash/pro ids
+    priced by the tier branch above are the exception: they never reach
+    LiteLLM, so they are priced the same way whether or not it is installed.
     """
+    # DeepSeek flash/pro are priced from the vendor's peak/off-peak card, which
+    # litellm cannot express: model_cost holds one flat rate per model. The tier
+    # is selected from the request instant, so this runs before - and without -
+    # litellm.
+    tier = _deepseek_rates_for(model, now)
+    if tier is not None:
+        uncached = max(input_tokens - cached_tokens, 0)
+        return (
+            (uncached / 1_000_000) * tier.input_per_1m
+            + (cached_tokens / 1_000_000) * tier.cache_hit_per_1m
+            + (output_tokens / 1_000_000) * tier.output_per_1m
+        )
+
     if not LITELLM_AVAILABLE:
         return None
     candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
@@ -335,53 +362,77 @@ def list_available_models() -> list[str]:
 
 
 # ============================================================
-# DeepSeek V4 pricing injection
+# DeepSeek pricing injection
 # ============================================================
-# Vendored LiteLLM JSON predates DeepSeek V4 models. Inject pricing at
-# import time so the primary cost-per-token path resolves them. Once
-# upstream litellm adds these entries, injection becomes a no-op.
-# ============================================================
+#
+# The vendor prices DeepSeek flash/pro on Beijing peak/off-peak tiers. litellm's
+# model_cost holds one flat rate per model, so these keys carry the OFF-PEAK
+# figure - the same choice the rest of Headroom's flat tables make - and
+# estimate_cost_from_tokens() prices real requests from the tier module instead.
+# The per-token figures are derived from OFF_PEAK_RATES_PER_1M, so a rate change
+# in deepseek_tiers moves this table with it.
+#
+# These rows are assigned, not fill-if-absent: upstream ships deepseek-flash at
+# the PEAK rate ($0.30/$1.20), so a fill-if-absent rule would make the flat
+# figure depend on the installed litellm version.
+
+
+def _deepseek_flat_row(canonical: str) -> dict[str, float | str | int]:
+    """Off-peak litellm row for ``canonical``, derived from the tier table."""
+    cache_hit, miss, out = OFF_PEAK_RATES_PER_1M[canonical]
+    per_token = 1_000_000
+    return {
+        "input_cost_per_token": miss / per_token,
+        "output_cost_per_token": out / per_token,
+        "cache_read_input_token_cost": cache_hit / per_token,
+        "input_cost_per_token_cache_hit": cache_hit / per_token,
+        "litellm_provider": "deepseek",
+        "max_tokens": 393_216,
+        "max_input_tokens": 1_000_000,
+        # 393_216 = 384 x 1024; the vendor page states the same cap as "384K".
+        "max_output_tokens": 393_216,
+    }
+
+
+#: litellm ids → the tier-table id whose off-peak row prices them: every current
+#: id maps to itself, and the retired ids resolve through ``LEGACY_MODEL_IDS``,
+#: so a new retired id reaches this table without a second edit.
+_DEEPSEEK_LITELLM_IDS: dict[str, str] = {
+    **{model_id: model_id for model_id in OFF_PEAK_RATES_PER_1M},
+    **LEGACY_MODEL_IDS,
+}
 
 _DEEPSEEK_V4_PRICING: dict[str, dict[str, float | str | int]] = {
-    "deepseek-v4-flash": {
-        "input_cost_per_token": 0.14 / 1_000_000,
-        "output_cost_per_token": 0.28 / 1_000_000,
-        "cache_read_input_token_cost": 0.0028 / 1_000_000,
-        "input_cost_per_token_cache_hit": 0.0028 / 1_000_000,
-        "litellm_provider": "deepseek",
-        "max_tokens": 384_000,
-        "max_input_tokens": 1_000_000,
-        "max_output_tokens": 384_000,
-    },
-    "deepseek-v4-pro": {
-        "input_cost_per_token": 0.435 / 1_000_000,
-        "output_cost_per_token": 0.87 / 1_000_000,
-        "cache_read_input_token_cost": 0.003625 / 1_000_000,
-        "input_cost_per_token_cache_hit": 0.003625 / 1_000_000,
-        "litellm_provider": "deepseek",
-        "max_tokens": 384_000,
-        "max_input_tokens": 1_000_000,
-        "max_output_tokens": 384_000,
-    },
+    model_id: _deepseek_flat_row(canonical) for model_id, canonical in _DEEPSEEK_LITELLM_IDS.items()
 }
 
 
 def _inject_deepseek_pricing() -> None:
-    """Inject DeepSeek V4 pricing into litellm's model_cost dict.
+    """Write DeepSeek off-peak flat rows into litellm's ``model_cost``.
 
-    Only injects entries not already present, so upstream litellm additions
-    (once available) take precedence. Both bare and provider-prefixed keys
-    are added so resolve_litellm_model() catches them via its deepseek/
-    prefix loop.
+    Upstream litellm may already define some of these ids - at the vendor's peak
+    rate - so every key is assigned rather than skipped, which keeps the flat
+    figure identical across litellm versions. Both bare and provider-prefixed
+    keys are written because ``resolve_litellm_model()`` resolves DeepSeek ids
+    through its ``deepseek/`` prefix rule.
+
+    Each row is merged over whatever upstream holds for that key: our cost and
+    cap fields win by construction, while unrelated upstream metadata (capability
+    flags, fields we do not set) survives. The ``**`` merge builds a fresh dict,
+    so the injected rows stay independent of ``_DEEPSEEK_V4_PRICING``.
     """
     if not LITELLM_AVAILABLE:
         return
     for model_name, pricing in _DEEPSEEK_V4_PRICING.items():
-        if model_name not in litellm.model_cost:
-            litellm.model_cost[model_name] = pricing
+        litellm.model_cost[model_name] = {
+            **litellm.model_cost.get(model_name, {}),
+            **pricing,
+        }
         prefixed = f"deepseek/{model_name}"
-        if prefixed not in litellm.model_cost:
-            litellm.model_cost[prefixed] = pricing
+        litellm.model_cost[prefixed] = {
+            **litellm.model_cost.get(prefixed, {}),
+            **pricing,
+        }
 
 
 _inject_deepseek_pricing()

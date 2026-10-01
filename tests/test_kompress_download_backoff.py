@@ -74,8 +74,48 @@ def test_backoff_window_elapsing_allows_another_attempt(monkeypatch):
     assert len(started) == 2, "backoff never expires"
 
 
-def test_success_clears_the_backoff(monkeypatch):
+@pytest.mark.parametrize(
+    ("failures", "window"),
+    [
+        (1, 5.0),
+        (2, 10.0),
+        (3, 20.0),
+        (4, 40.0),
+        (5, 80.0),
+        (6, 160.0),
+        (7, 300.0),
+        (8, 300.0),
+        (1024, 300.0),
+        (1025, 300.0),
+        (10**100, 300.0),
+    ],
+)
+def test_retry_resumes_when_backoff_window_expires(monkeypatch, failures, window):
+    started = _spawned(monkeypatch, fails=True)
+    now = 1000.0
+    monkeypatch.setattr(kc.time, "monotonic", lambda: now)
+    with kc._download_threads_lock:
+        kc._download_failures["some/model"] = (failures, now)
+
+    now += window - 0.5
+    kc.ensure_background_download("some/model")
+    _drain()
+    assert not started, "retried before the capped backoff elapsed"
+
+    now += 0.5
+    kc.ensure_background_download("some/model")
+    _drain()
+    assert started == ["some/model"], "capped backoff never expires"
+
+
+@pytest.mark.parametrize("failures", [1, 1025])
+def test_success_clears_the_backoff(monkeypatch, failures):
     _spawned(monkeypatch, fails=False)
+    with kc._download_threads_lock:
+        kc._download_failures["some/model"] = (
+            failures,
+            kc.time.monotonic() - kc._DOWNLOAD_RETRY_MAX_SECONDS,
+        )
     kc.ensure_background_download("some/model")
     _drain()
     assert "some/model" not in kc._download_failures

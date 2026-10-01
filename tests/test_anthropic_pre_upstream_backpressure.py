@@ -39,6 +39,7 @@ from fastapi.testclient import TestClient
 
 from headroom.cli.proxy import proxy as proxy_cli
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+from headroom.proxy.helpers import MAX_MESSAGE_ARRAY_LENGTH, MAX_REQUEST_BODY_SIZE
 from headroom.proxy.models import CacheEntry, ProxyConfig
 from headroom.proxy.server import HeadroomProxy, create_app
 
@@ -136,8 +137,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -291,8 +290,8 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
-    payload = json.dumps(body).encode("utf-8")
+def _build_request(body: dict | bytes, headers: dict[str, str]) -> Request:
+    payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
 
     async def receive():
         return {"type": "http.request", "body": payload, "more_body": False}
@@ -723,8 +722,6 @@ def test_compression_is_not_bypassed_when_gated(stage_log_capture):
         mode="token",
         cache_enabled=False,
         rate_limit_enabled=False,
-        fallback_enabled=False,
-        fallback_provider=None,
         prefix_freeze_enabled=False,
         memory_enabled=False,
         anthropic_pre_upstream_concurrency=2,
@@ -848,11 +845,12 @@ def test_auto_computed_default_on_this_machine():
 
 # --------------------------------------------------------------------------- #
 # Semaphore released on HTTPException / early-exit paths even with an         #
-# already-held permit. Explicitly covers the 4 pre-upstream early exits:     #
+# already-held permit. Explicitly covers the pre-upstream early exits:       #
 #   - rate_limiter deny (429)                                                 #
 #   - cost_tracker block (429)                                                #
 #   - security scan block (403)                                               #
 #   - cache hit (200)                                                         #
+#   - oversized body (413), invalid JSON (400), too many messages (400)       #
 # Each test holds 1 permit of a Semaphore(2) with a concurrent request,      #
 # then verifies the handler restores ``_value`` to the original after        #
 # the early return.                                                           #
@@ -910,7 +908,15 @@ class _CacheHit:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["rate_limiter", "cost_tracker", "security", "cache"],
+    [
+        "rate_limiter",
+        "cost_tracker",
+        "security",
+        "cache",
+        "oversized_body",
+        "invalid_json",
+        "too_many_messages",
+    ],
 )
 def test_early_exit_paths_release_semaphore_under_contention(scenario):
     """Hold one permit of a Semaphore(1) with a concurrent request, trigger
@@ -931,13 +937,19 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
         elif scenario == "cache":
             handler.cache = _CacheHit()
 
-        req = _build_request(
-            {
-                "model": "claude-3-5-sonnet-latest",
-                "messages": [{"role": "user", "content": "hello"}],
-            },
-            {"authorization": "Bearer sk-ant-api-test"},
-        )
+        body: dict | bytes = {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        headers = {"authorization": "Bearer sk-ant-api-test"}
+        if scenario == "oversized_body":
+            headers["content-length"] = str(MAX_REQUEST_BODY_SIZE + 1)
+        elif scenario == "invalid_json":
+            body = b"{not json"
+        elif scenario == "too_many_messages":
+            body["messages"] = [{"role": "user", "content": "hi"}] * (MAX_MESSAGE_ARRAY_LENGTH + 1)
+        req = _build_request(body, headers)
+        expected_status = {"oversized_body": 413, "invalid_json": 400, "too_many_messages": 400}
 
         # Drive several iterations to confirm each early-exit call fully
         # releases the semaphore rather than leaking a permit AND that the
@@ -968,6 +980,8 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
                 # security returns a JSONResponse; cache returns a Response.
                 assert raised is None, f"{scenario}: unexpected exception {raised!r}"
                 assert result is not None
+                if scenario in expected_status:
+                    assert result.status_code == expected_status[scenario], result.body
             assert sem._value == original_value, (
                 f"{scenario}: semaphore leak got={sem._value}, want={original_value}"
             )

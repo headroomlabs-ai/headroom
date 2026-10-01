@@ -54,7 +54,7 @@ client = HeadroomClient(
 ```bash
 headroom proxy \
   --port 8787 \              # Port to listen on
-  --host 0.0.0.0 \           # Host to bind to
+  --host 127.0.0.1 \         # Host to bind to
   --budget 10.00 \           # Daily budget limit in USD
   --log-file headroom.jsonl  # Log file path
 ```

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,115 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_release_slack_payload_reports_the_completed_github_release(tmp_path: Path) -> None:
+    """A release notification must identify the exact published artifact boundary."""
+    output = tmp_path / "payload.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "actions" / "release-slack-notification" / "build_payload.py"),
+            "--release-name",
+            "Headroom 1.2.3",
+            "--tag",
+            "v1.2.3",
+            "--url",
+            "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3",
+            "--repository",
+            "headroomlabs-ai/headroom",
+            "--actor",
+            "release<bot>",
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["text"] == (
+        "Headroom 1.2.3 (v1.2.3) GitHub Release assets are ready: "
+        "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3"
+    )
+    assert payload["blocks"] == [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Headroom 1.2.3 is ready", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": "*Tag*\n`v1.2.3`"},
+                {"type": "mrkdwn", "text": "*Repository*\n`headroomlabs-ai/headroom`"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "GitHub Release assets are ready. "
+                    "<https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3|"
+                    "View release notes and downloads>"
+                ),
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Published by `release&lt;bot&gt;` after the release asset job completed.",
+                }
+            ],
+        },
+    ]
+
+
+def test_release_workflow_notifies_slack_only_after_github_release_assets_are_ready() -> None:
+    """PR/manual runs and failed asset publication must never reach Slack delivery."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["notify-release"]
+
+    assert job["needs"] == "create-release"
+    condition = str(job["if"])
+    assert "github.event_name == 'release'" in condition
+    assert "github.event.action == 'published'" in condition
+    assert "needs.create-release.result == 'success'" in condition
+
+    notify_step = next(
+        step
+        for step in job["steps"]
+        if step.get("uses") == "./.github/actions/release-slack-notification"
+    )
+    assert notify_step["with"]["url"] == "${{ github.event.release.html_url }}"
+    assert notify_step["with"]["tag"] == "${{ github.event.release.tag_name }}"
+    assert notify_step["with"]["webhook-url"] == "${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}"
+
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "release-slack-notification" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    build_step = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Build Slack release payload"
+    )
+    assert "build_payload.py" in build_step["run"]
+    assert build_step["env"]["RELEASE_URL"] == "${{ inputs.url }}"
+
+    post_step = next(
+        step for step in action["runs"]["steps"] if step.get("name") == "Post release to Slack"
+    )
+    assert str(post_step["if"]) == "${{ !env.ACT }}"
+    assert post_step["env"] == {"SLACK_RELEASES_WEBHOOK_URL": "${{ inputs.webhook-url }}"}
+    assert '--data-binary @"$RUNNER_TEMP/slack-release-payload.json"' in post_step["run"]
+    assert "--fail-with-body" in post_step["run"]
+    assert "webhook-url" not in str(build_step)
 
 
 def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> None:
@@ -69,6 +181,36 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "id: image-name" in content
     assert "tr '[:upper:]' '[:lower:]'" in content
     assert "steps.image-name.outputs.image_name" in content
+
+
+def test_docker_bake_metadata_never_travels_through_env() -> None:
+    """Bake metadata must reach scripts through a file, never through ``env:``.
+
+    The runner exports every ``env:`` entry when it spawns bash, and bake
+    metadata for the larger targets exceeds the kernel's per-string limit, so
+    the step dies with "Argument list too long" before its script runs.
+    f3d5392c fixed this by piping the JSON through a heredoc file; the arm64
+    rework (ed36676c) reintroduced an unused ``env: BAKE_METADATA`` beside that
+    heredoc, and every build job of a Docker run can fail on it again.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+
+    offenders = [
+        f"{job_name} / {step.get('name', step.get('id'))} / {key}"
+        for job_name, job in workflow["jobs"].items()
+        for step in job.get("steps", [])
+        for key, value in (step.get("env") or {}).items()
+        if "outputs.metadata" in str(value)
+    ]
+    assert not offenders, f"bake metadata passed via env (E2BIG risk): {offenders}"
+
+    export = next(
+        step
+        for step in workflow["jobs"]["docker-build"]["steps"]
+        if step.get("name") == "Export digest"
+    )
+    assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
+    assert "${{ steps.bake.outputs.metadata }}" in export["run"]
 
 
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
