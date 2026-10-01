@@ -796,6 +796,9 @@ class TestDoctorCommand:
         """Point all filesystem/network surfaces at controlled fakes."""
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
+        monkeypatch.setattr(
+            doctor_mod, "codex_project_config_path", lambda: tmp_path / "project-codex.toml"
+        )
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
         for var in (

@@ -221,6 +221,25 @@ function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
   return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
 }
 
+// Only recognized LLM API endpoints route through Headroom; any other path
+// (WebFetch, registries, GitHub, unknown services) must reach its original URL
+// untouched. A bare suffix match keeps provider-prefixed variants working
+// (/api/coding/paas/v4/chat/completions, /base/v1/messages, ...).
+//
+// Native Gemini model-generation endpoints use colon-action suffixes
+// (:generateContent, :streamGenerateContent). These are matched by exact
+// suffix so that lookalike paths containing the marker but not ending with it
+// (e.g. /v1/models/gemini:generateContent/status) remain unrouted.
+function isLlmEndpointPath(pathname: string): boolean {
+  return (
+    pathname.endsWith("/chat/completions") ||
+    pathname.endsWith("/responses") ||
+    pathname.endsWith("/messages") ||
+    pathname.endsWith(":generateContent") ||
+    pathname.endsWith(":streamGenerateContent")
+  );
+}
+
 function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
@@ -234,7 +253,7 @@ function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (isExcludedHost(url.hostname, excludeHosts)) {
     return false;
   }
-  return true;
+  return isLlmEndpointPath(url.pathname);
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {
@@ -465,20 +484,13 @@ function wrapGet(request: HttpRequest | HttpsRequest): HttpGet | HttpsGet {
   } as HttpGet | HttpsGet;
 }
 
+// http2.connect() has no request path at connect time, so the authority alone
+// cannot prove LLM traffic. Direct HTTP/2 connections always pass through
+// untouched: rejecting external authorities turned WebFetch into a proxy
+// error (#3633).
 function wrapHttp2Connect(originalConnect: Http2Connect): Http2Connect {
-  return function headroomHttp2Connect(this: unknown, authority: string | URL, ...args: unknown[]) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy, state.excludeHosts)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. ` +
-            "Use fetch, http, or https so traffic can be routed through Headroom.",
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  return function headroomHttp2Connect(this: unknown, ...args: unknown[]) {
+    return Reflect.apply(originalConnect, this, args);
   } as Http2Connect;
 }
 

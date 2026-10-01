@@ -2403,6 +2403,7 @@ def apply_session_sticky_memory_tools(
     existing_tools: list[dict[str, Any]] | None,
     memory_tools_to_inject: list[dict[str, Any]],
     inject_this_turn: bool,
+    client_declared_tools: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on memory tool injection per `SessionToolTracker`.
 
@@ -2431,6 +2432,11 @@ def apply_session_sticky_memory_tools(
     ``inject_this_turn`` flag drives the decision verbatim. We log the
     bypass once so operators can see it.
 
+    ``client_declared_tools`` is False when the inbound request omitted
+    tools or explicitly sent an empty list. In that case memory tools are
+    never added, including sticky replay, because the client cannot service
+    them.
+
     Returns ``(updated_tools, was_injected)``. The returned list is a
     fresh list (caller-safe). ``was_injected`` is True iff at least one
     memory tool was added to the list.
@@ -2439,6 +2445,16 @@ def apply_session_sticky_memory_tools(
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if not client_declared_tools:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip_no_client_tools",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -2877,7 +2893,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -3008,8 +3024,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
 
     # Content-Length is an optimization only, not the enforcement boundary: it
-    # can be absent, understated, or belong to a chunked transfer. The
-    # streaming loop below is what actually bounds every case (#3479).
+    # can be absent, understated, or belong to a chunked transfer (the
+    # original gap this fixes, #3326). The streaming loop below is what
+    # actually bounds every case, chunked or not (#3479).
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -3031,8 +3048,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             )
     raw: bytes = bytes(chunks)
     # Cache like Starlette's own body() would, so any other .body() caller on
-    # this request (there is none today, but future callers get the same
-    # semantics) sees the bytes already read rather than a consumed stream.
+    # this request (e.g. a handler's except-branch falling open to a verbatim
+    # forward after a decode failure) sees the bytes already read rather than
+    # a consumed stream.
     request._body = raw
 
     # Every branch below decompresses incrementally against
@@ -3998,6 +4016,17 @@ _TOOL_SEARCH_RESULT_TYPE = "tool_search_tool_result"
 _CLIENT_TOOL_REF_PLACEHOLDER = "[tool reference no longer available]"
 
 
+def _tool_entry_name(entry: dict[str, Any]) -> str | None:
+    """Return the name a tool-search entry carries, or ``None``.
+
+    Server-side blocks use ``tool_name``; be liberal about ``name``. The one
+    precedence rule for this file, so every reader agrees on an entry that
+    carries both keys.
+    """
+    name = entry.get("tool_name") or entry.get("name")
+    return str(name) if name else None
+
+
 def _tool_search_reference_names(content: Any) -> list[str]:
     """Return the ``tool_reference`` names carried by a tool-search result block.
 
@@ -4010,11 +4039,62 @@ def _tool_search_reference_names(content: Any) -> list[str]:
     names = []
     for entry in entries:
         if isinstance(entry, dict) and entry.get("type") == "tool_reference":
-            # Server-side blocks use ``tool_name``; be liberal about ``name``.
-            name = entry.get("tool_name") or entry.get("name")
+            name = _tool_entry_name(entry)
             if name:
-                names.append(str(name))
+                names.append(name)
     return names
+
+
+def strip_unsupported_tool_search_references(tools: Any) -> tuple[Any, int]:
+    """Drop ``tool_reference`` entries in ``tools`` that name a typed search tool.
+
+    Anthropic occasionally returns ``tool_search_tool_regex`` as a hit inside its
+    own match-all result (empty ``input``). Claude Code adds every hit to the
+    session's loaded-tool set and replays it as a ``tool_reference`` in ``tools``
+    on later turns, so upstream then 400s with "Tool reference
+    'tool_search_tool_regex' not found in available tools" — a typed search tool
+    is the search mechanism, never a reference target. The block repair below
+    cannot reach this: the poison is in the tools array, not the history, which
+    is why ``/compact`` does not clear it and the session stays dead.
+
+    Scoped to the search mechanisms this request actually carries: the names are
+    derived from entries whose ``type`` starts with the typed-search prefix (the
+    same signal ``strip_unsupported_tool_search_blocks`` keys on), and a
+    ``tool_reference`` is dropped only when its name matches one of them exactly.
+    Matching on the name prefix alone would also remove a legitimate client tool
+    that merely happens to be called ``tool_search_tool_*`` — a typeless deferred
+    tool with such a name is a normal reference target, not a mechanism.
+
+    Returns ``(tools, entries_removed)``, and the ORIGINAL ``tools`` object when
+    nothing was removed — callers rely on identity to skip the write-back.
+    """
+    if not isinstance(tools, list):
+        return tools, 0
+
+    # The search mechanisms present on THIS request, identified by type. Names
+    # on both sides go through _tool_entry_name, so a mechanism shaped like a
+    # server-side block (``tool_name``) registers too.
+    mechanism_names = {
+        name
+        for t in tools
+        if isinstance(t, dict)
+        and str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+        and (name := _tool_entry_name(t))
+    }
+    if not mechanism_names:
+        return tools, 0
+
+    kept = [
+        t
+        for t in tools
+        if not (
+            isinstance(t, dict)
+            and t.get("type") == "tool_reference"
+            and _tool_entry_name(t) in mechanism_names
+        )
+    ]
+    removed = len(tools) - len(kept)
+    return (kept, removed) if removed else (tools, 0)
 
 
 # Stand-in for a tool-search block the outbound tools array cannot support. Text
@@ -4268,7 +4348,19 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
         if touched:
             changed = True
             repaired = dict(message)
-            repaired["content"] = new_content
+            # Anthropic requires a user turn's tool_result blocks to lead its
+            # content. When headroom_retrieve ran in parallel with another tool,
+            # neutralizing its result in place leaves [text, tool_result(sibling)]
+            # and the request 400s ("tool_use ids were found without tool_result
+            # blocks immediately after"). Stable-partition so surviving
+            # tool_results stay first; a no-op for assistant turns, which carry none.
+            repaired["content"] = [
+                b for b in new_content if isinstance(b, dict) and b.get("type") == "tool_result"
+            ] + [
+                b
+                for b in new_content
+                if not (isinstance(b, dict) and b.get("type") == "tool_result")
+            ]
             out.append(repaired)
         else:
             out.append(message)

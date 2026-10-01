@@ -107,6 +107,15 @@ webpki-roots = "0.26"
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = "0.6"
+# `wss://` relay test (tests/integration_ws_tls.rs): a local TLS WebSocket
+# echo upstream. `tokio-rustls` is already in the build via reqwest and
+# hyper-rustls at this same version, so no new crate enters the tree; the
+# `ring` feature matches the provider the proxy installs (src/tls.rs).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Throwaway certificate for that upstream, generated at test time so no
+# private key is ever committed (gitleaks would rightly refuse one). rcgen
+# is the generator rustls' own test-suite uses; dev-only, never shipped.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"

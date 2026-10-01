@@ -179,6 +179,7 @@ from headroom.proxy.project_context import (
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
+from headroom.proxy.request_body_limit import RequestBodyLimitMiddleware
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
@@ -3731,6 +3732,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # hard connection failure. Mutating scope["headers"] before call_next
         # makes every downstream classify_client(headers) read "codex".
         if should_stamp_codex_client(path, headers):
+            request.scope["headroom_codex_client_stamped"] = True
             request.scope["headers"].append((b"x-client", b"codex"))
         client = getattr(request, "client", None)
         client_addr = ""
@@ -3818,6 +3820,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # headers, and an audit trail for state-mutating admin endpoints.
     # WebSocket handshakes are covered separately — see the
     # WebSocketAuthMiddleware registration just below this block.
+    #
+    # Ordering contract. Starlette's ``add_middleware`` prepends, so the LAST
+    # layer registered is the OUTERMOST at request time. Everything below is
+    # therefore registered inner-to-outer, and the order is load-bearing:
+    #
+    #   1. third-party extensions (``install_all``)   — innermost of the three
+    #   2. RequestBodyLimitMiddleware                 — bounds bodies before
+    #                                                    any extension buffers one
+    #   3. _security_gate + WebSocketAuthMiddleware   — outermost: auth first
+    #
+    # Extensions used to install *after* the gate, which made their middleware
+    # the outermost layer: an extension that answered a request itself, or
+    # buffered its body, or rewrote ``Authorization``, did so before the proxy
+    # token was ever checked. ``tests/test_proxy_extension_ordering.py`` pins
+    # the order; ``extensions.py`` documents it for extension authors.
     _proxy_token = config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN") or None
     # Pre-encode once for constant-time comparison (compare_digest on str raises
     # TypeError for non-ASCII input, which would turn a 401 into a 500).
@@ -3846,6 +3863,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
         )
+
+    # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
+    # the `headroom.proxy_extension` entry-point group, but **opt-in only**:
+    # only names listed in config.proxy_extensions (CLI: --proxy-extension,
+    # env: HEADROOM_PROXY_EXTENSIONS) actually get installed. Discovery alone
+    # never runs third-party code. An extension that raises from its install()
+    # disables *itself*: `install_all` logs it, prints a SKIPPED line to stderr
+    # and the proxy keeps serving without that extension (extensions.py).
+    # One bad plugin must not brick the proxy. Note the consequence: a plugin
+    # whose licence gate raises is absent, not fatal — the feature fails closed,
+    # the process does not.
+    #
+    # Installed HERE, before the body limit and the security gate are
+    # registered, so any middleware an extension adds sits INSIDE both (see the
+    # ordering contract above). Routes an extension registers are unaffected
+    # by position. ``_proxy_token`` was read above, before extensions ran, so
+    # an extension cannot change which credential the gate enforces.
+    from headroom.proxy.extensions import install_all as _install_extensions
+
+    _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
+
+    # Body ceiling for everything inside it (extensions and handlers alike).
+    # The handlers keep their own streaming check — this layer exists so that
+    # an extension middleware reading the body is bounded too, and so a
+    # declared oversize Content-Length is refused before any body is read.
+    app.add_middleware(RequestBodyLimitMiddleware)
 
     # Delegates so the HTTP gate and WebSocketAuthMiddleware read a credential
     # by exactly one rule; they guard the same token on two transports.
@@ -3896,20 +3939,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Added after it, which makes it the outermost layer — an unauthenticated
     # handshake is refused before any project-prefix or routing work happens.
     app.add_middleware(WebSocketAuthMiddleware, proxy_token=_proxy_token)
-
-    # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
-    # the `headroom.proxy_extension` entry-point group, but **opt-in only**:
-    # only names listed in config.proxy_extensions (CLI: --proxy-extension,
-    # env: HEADROOM_PROXY_EXTENSIONS) actually get installed. Discovery alone
-    # never runs third-party code. An extension that raises from its install()
-    # disables *itself*: `install_all` logs it, prints a SKIPPED line to stderr
-    # and the proxy keeps serving without that extension (extensions.py:169-183).
-    # One bad plugin must not brick the proxy. Note the consequence: a plugin
-    # whose licence gate raises is absent, not fatal — the feature fails closed,
-    # the process does not.
-    from headroom.proxy.extensions import install_all as _install_extensions
-
-    _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
 
     # Health & Metrics
     @app.get("/livez")

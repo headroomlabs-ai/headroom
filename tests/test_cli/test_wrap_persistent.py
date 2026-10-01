@@ -69,6 +69,11 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
     calls: list[str] = []
 
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    # A bare TCP accept no longer proves the listener is Headroom;
+    # identify it via /health so the recovery path still applies.
+    monkeypatch.setattr(
+        wrap_cli, "_query_proxy_health", lambda port: {"version": "0.0.0-test", "config": {}}
+    )
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(
@@ -100,6 +105,11 @@ def test_ensure_proxy_recovers_persistent_deployment_when_socket_is_bound(monkey
 
 def test_ensure_proxy_rejects_unhealthy_persistent_deployment(monkeypatch) -> None:
     monkeypatch.setattr(wrap_cli, "_check_proxy", lambda port: True)
+    # Headroom-identified listener: a foreign squatter would fall
+    # through to a fresh port instead of raising.
+    monkeypatch.setattr(
+        wrap_cli, "_query_proxy_health", lambda port: {"version": "0.0.0-test", "config": {}}
+    )
     monkeypatch.setattr(wrap_cli, "_find_persistent_manifest", lambda port: _Manifest())
     monkeypatch.setattr("headroom.install.health.probe_ready", lambda url: False)
     monkeypatch.setattr(wrap_cli, "_recover_persistent_proxy", lambda port: False)
@@ -353,6 +363,28 @@ def test_proxy_version_restart_ignores_non_release_source_labels(monkeypatch) ->
 
     monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.29.1")
     assert wrap_cli._proxy_needs_version_restart({"version": "0.29.0"}) is True
+
+
+def test_proxy_version_restart_strips_dev_suffix_on_both_sides(monkeypatch) -> None:
+    """A dev-built proxy must be compared by its base release, like the CLI is.
+
+    Regression: "0.34.0-dev" failed the release regex, normalized to None, and
+    the check never fired, so a stale source-built proxy was silently reused
+    forever (observed: a 21-day-old 0.34.0-dev proxy reused by a 0.37.0-dev
+    wrap).
+    """
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.37.0-dev")
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.34.0-dev"}) is True
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.37.0-dev"}) is False
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.36.4"}) is True
+
+    monkeypatch.setattr(wrap_cli, "_HEADROOM_VERSION", "0.37.0")
+    assert wrap_cli._proxy_needs_version_restart({"version": "0.36.4-dev"}) is True
+
+    # Unparseable running versions still never trigger a restart.
+    assert wrap_cli._proxy_needs_version_restart({"version": "unknown"}) is False
+    assert wrap_cli._proxy_needs_version_restart(None) is False
+    assert wrap_cli._proxy_needs_version_restart({}) is False
 
 
 def test_ensure_proxy_restarts_ephemeral_proxy_for_openai_api_url_mismatch(monkeypatch) -> None:

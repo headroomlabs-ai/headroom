@@ -367,6 +367,27 @@ describe("anthropicToOpenAI", () => {
     ]);
     expect(result).toEqual([]);
   });
+
+  it("flattens array-content tool_result blocks to newline-joined text", () => {
+    const result = anthropicToOpenAI([
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tu_1",
+            content: [
+              { type: "text", text: "row 1" },
+              { type: "text", text: "row 2" },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(result).toEqual([
+      { role: "tool", content: "row 1\nrow 2", tool_call_id: "tu_1" },
+    ]);
+  });
 });
 
 describe("openAIToAnthropic", () => {
@@ -617,3 +638,44 @@ describe("round-trip conversion", () => {
     });
   });
 });
+
+describe("openAIToVercel tool names", () => {
+  it("carries the tool name from the matching tool-call onto the tool-result part", () => {
+    const msgs: OpenAIMessage[] = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "tc_1", type: "function", function: { name: "getWeather", arguments: '{"city":"Paris"}' } },
+        ],
+      },
+      { role: "tool", content: '{"tempC":21}', tool_call_id: "tc_1" },
+    ];
+    const result = openAIToVercel(msgs);
+    expect(result[1].content[0]).toEqual({
+      type: "tool-result",
+      toolCallId: "tc_1",
+      toolName: "getWeather",
+      output: { type: "json", value: { tempC: 21 } },
+    });
+  });
+
+  it("preserves tool names through a Vercel -> OpenAI -> Vercel round trip", () => {
+    const original = [
+      { role: "user", content: [{ type: "text", text: "weather in Paris?" }] },
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "call_1", toolName: "getWeather", input: { city: "Paris" } }],
+      },
+      {
+        role: "tool",
+        content: [
+          { type: "tool-result", toolCallId: "call_1", toolName: "getWeather", output: { type: "json", value: { tempC: 21 } } },
+        ],
+      },
+    ];
+    const back = openAIToVercel(vercelToOpenAI(original));
+    expect(back[2].content[0].toolName).toBe("getWeather");
+  });
+});
+
