@@ -22,14 +22,38 @@ function Require-Command {
 function Ensure-PathEntry {
     param([string]$PathEntry)
 
-    $currentPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    # Persist to the User PATH by default. The 'User' scope lives in
+    # HKCU\Environment and is NOT redirected by a HOME/USERPROFILE override, so a
+    # caller that must not mutate the real persistent PATH (the installer test
+    # suite, which runs this against a throwaway fake home) sets
+    # HEADROOM_INSTALL_PATH_SCOPE=Process to keep the update ephemeral instead of
+    # leaking the temp shim dir into the developer's actual user PATH (#2970).
+    #
+    # Only those two persistence modes are supported. The value is handed to
+    # .NET's EnvironmentVariableTarget, whose 'Machine' member would rewrite the
+    # SYSTEM-wide PATH if this variable were inherited by an elevated installer,
+    # and a typo would otherwise fail late with an opaque enum-conversion error.
+    # Normalize case-insensitively and allow-list 'User'/'Process', failing early
+    # and clearly for 'Machine' or anything else.
+    $scope = 'User'
+    if ($env:HEADROOM_INSTALL_PATH_SCOPE) {
+        switch ($env:HEADROOM_INSTALL_PATH_SCOPE.Trim().ToLowerInvariant()) {
+            'user' { $scope = 'User' }
+            'process' { $scope = 'Process' }
+            default {
+                throw "HEADROOM_INSTALL_PATH_SCOPE must be 'User' or 'Process' (got '$($env:HEADROOM_INSTALL_PATH_SCOPE)'); 'Machine' and other targets are not supported."
+            }
+        }
+    }
+
+    $currentPath = [Environment]::GetEnvironmentVariable('Path', $scope)
     $parts = @()
     if ($currentPath) {
         $parts = $currentPath -split ';' | Where-Object { $_ }
     }
     if ($parts -notcontains $PathEntry) {
         $newPath = @($PathEntry) + $parts
-        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), 'User')
+        [Environment]::SetEnvironmentVariable('Path', ($newPath -join ';'), $scope)
     }
 }
 
@@ -170,14 +194,10 @@ function Get-SharedDockerArgs {
 function Add-TtyArgs {
     param($ArgsList)
 
+    # MCP stdio always uses a pipe for stdin. Docker only forwards stdin when
+    # explicitly given -i, regardless of whether the host console is redirected.
+    $ArgsList.Add('-i')
     if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-        $ArgsList.Add('-it')
-        return
-    }
-    if (-not [Console]::IsInputRedirected) {
-        $ArgsList.Add('-i')
-    }
-    if (-not [Console]::IsOutputRedirected) {
         $ArgsList.Add('-t')
     }
 }
@@ -233,7 +253,7 @@ function Start-ProxyContainer {
 
     $containerName = "headroom-proxy-$Port-$PID"
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
     $dockerArgs.AddRange((Get-SharedDockerArgs))
     $dockerArgs.Add($HeadroomImage)
     $dockerArgs.Add('--host')
@@ -1703,7 +1723,7 @@ switch ($args[0]) {
     'proxy' {
         $port = 8787
         $forwardArgs = New-Object System.Collections.Generic.List[string]
-        foreach ($arg in $args) { $forwardArgs.Add($arg) }
+        for ($i = 1; $i -lt $args.Count; $i++) { $forwardArgs.Add($args[$i]) }
         for ($i = 1; $i -lt $args.Count; $i++) {
             if ($args[$i] -eq '--port' -or $args[$i] -eq '-p') {
                 Require-OptionValue -Arguments $args -Index $i -Option $args[$i]
@@ -1719,11 +1739,16 @@ switch ($args[0]) {
         $dockerArgs = New-Object System.Collections.Generic.List[string]
         $dockerArgs.AddRange([string[]]@('run','--rm'))
         Add-TtyArgs -ArgsList $dockerArgs
-        $dockerArgs.AddRange([string[]]@('-p',"$port`:$port"))
+        $dockerArgs.AddRange([string[]]@('-p',"127.0.0.1`:$port`:$port"))
         $dockerArgs.AddRange((Get-SharedDockerArgs))
         $dockerArgs.Add('--entrypoint')
         $dockerArgs.Add('headroom')
         $dockerArgs.Add($HeadroomImage)
+        $dockerArgs.Add('proxy')
+        $dockerArgs.Add('--host')
+        $dockerArgs.Add('0.0.0.0')
+        $dockerArgs.Add('--port')
+        $dockerArgs.Add("$port")
         foreach ($arg in $forwardArgs) {
             $dockerArgs.Add($arg)
         }
@@ -1779,4 +1804,4 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Restart PowerShell"
 Write-Host "  2. Try: headroom proxy"
-Write-Host "  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md"
+Write-Host "  3. Docs: https://docs.headroomlabs.ai/docs/docker-install"

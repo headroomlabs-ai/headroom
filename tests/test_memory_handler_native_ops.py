@@ -1357,7 +1357,7 @@ async def test_ensure_initialized_fast_paths_and_qdrant_variants(
         "qdrant_api_key": None,
         "neo4j_uri": "neo4j://localhost:7687",
         "neo4j_user": "neo4j",
-        "neo4j_password": "password",
+        "neo4j_password": "",
         "enable_graph": True,
     }
 
