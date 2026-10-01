@@ -201,7 +201,7 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.compression_max_workers = 4
         self._compression_in_flight = 0
         self._compression_in_flight_max = 0
-        self._compression_leaked_threads = 0
+        self._compression_timed_out_workers_total = 0
         self._compression_metrics_lock = _threading.Lock()
         self._upstream_delay_s = upstream_delay_s
         self._raise_during_critical = raise_during_critical
@@ -234,7 +234,7 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
                 with self._compression_metrics_lock:
                     self._compression_in_flight -= 1
                     if elapsed > timeout:
-                        self._compression_leaked_threads += 1
+                        self._compression_timed_out_workers_total += 1
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         return await asyncio.wait_for(future, timeout=timeout)

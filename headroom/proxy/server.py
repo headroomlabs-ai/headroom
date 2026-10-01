@@ -1316,9 +1316,10 @@ class HeadroomProxy(
         #      sharing the loop's default executor (file IO, etc.).
         #   2. Tasks that exceed ``COMPRESSION_TIMEOUT_SECONDS`` and complete
         #      *after* the asyncio future was cancelled are counted in the
-        #      ``compression_leaked_threads`` gauge — Python cannot preempt
-        #      the worker, so this is the only signal that some pool slots
-        #      are sitting on stuck work.
+        #      ``compression_timed_out_workers_total`` counter — Python cannot
+        #      preempt the worker, so this is the only signal that some pool
+        #      slots sat on work past its deadline. Cumulative: it counts
+        #      workers that finished late, not threads still stuck (#3653).
         _compression_max_cfg = config.compression_max_workers
         if _compression_max_cfg is None:
             _compression_max = max(1, os.cpu_count() or 1)
@@ -1364,9 +1365,12 @@ class HeadroomProxy(
         self._compression_in_flight_max: int = 0
         self._compression_run_seconds_total: float = 0.0
         self._compression_run_seconds_max: float = 0.0
-        # Counter: threads that finished AFTER their asyncio future hit the
-        # timeout. Stuck-thread leak indicator.
-        self._compression_leaked_threads: int = 0
+        # Counter: workers that finished AFTER their asyncio future hit the
+        # timeout. Cumulative total, never decremented: a late-finishing
+        # worker is counted once when it exits. It does NOT report live
+        # stuck threads — a steady value means past timeouts, not a
+        # growing leak (#3653).
+        self._compression_timed_out_workers_total: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
         # asyncio waiter times out, so accepting more compression while those
         # workers are still running can multiply slow calls into a saturated
@@ -1630,7 +1634,7 @@ class HeadroomProxy(
         preempt running CPython bytecode or in-flight Rust calls. The
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
-        ``_compression_leaked_threads`` from the worker's ``finally``
+        ``_compression_timed_out_workers_total`` from the worker's ``finally``
         block after it eventually finishes. While such workers hold half the
         pool (``_compression_quarantine_threshold``), new calls raise
         :class:`CompressionQuarantinedError` immediately so callers apply the
@@ -1644,11 +1648,11 @@ class HeadroomProxy(
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
                 raise asyncio Cancellation; if it does, the wrapper still
-                decrements the in-flight gauge but the leaked-thread
+                decrements the in-flight gauge but the timed-out-worker
                 counter may double-count.
             timeout: Wall-clock timeout for the asyncio side. The
-                executor worker keeps running past this (Python limitation
-                — see above), but at least the awaiter unblocks.
+            executor worker keeps running past this (Python limitation
+            — see above), but at least the awaiter unblocks.
 
         Returns:
             Whatever ``fn()`` returns.
@@ -1779,7 +1783,7 @@ class HeadroomProxy(
                     if elapsed > self._compression_run_seconds_max:
                         self._compression_run_seconds_max = elapsed
                     if state["timed_out"]:
-                        self._compression_leaked_threads += 1
+                        self._compression_timed_out_workers_total += 1
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
                         state["timeout_debt_recorded"] = False
@@ -3682,7 +3686,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_in_flight_max = proxy._compression_in_flight_max
             _comp_run_total = proxy._compression_run_seconds_total
             _comp_run_max = proxy._compression_run_seconds_max
-            _comp_leaked = proxy._compression_leaked_threads
+            _comp_leaked = proxy._compression_timed_out_workers_total
             _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
             _comp_quarantine_active = (
                 _comp_timed_out_in_flight >= proxy._compression_quarantine_threshold
@@ -3718,6 +3722,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
+                # Canonical name: this is a cumulative count of workers that
+                # finished after their deadline, not live stuck threads.
+                # `leaked_threads_total` is kept as a deprecated alias so
+                # existing dashboards and watchdogs keep working (#3653).
+                "timed_out_workers_total": _comp_leaked,
                 "quarantine_active": _comp_quarantine_active,
                 "timed_out_workers": _comp_timed_out_in_flight,
                 "timed_out_workers_max": _comp_timed_out_in_flight_max,
