@@ -242,9 +242,6 @@
                                  higher on long sessions and must not take this slot. -->
                             <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                         </div>
-                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
-                            <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
-                        </div>
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed" x-show="(stats.tokens?.new_input_tokens || 0) > 0">
                             <span x-text="'Of new input: ' + (stats.tokens?.new_input_savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of the tokens that newly entered context (uncached + cache write), which is what compression can touch. The headline above recounts the session's cached history on every turn, so it reads low on a long session even when compression is working."></span>
                         </div>

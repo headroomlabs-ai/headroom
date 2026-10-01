@@ -429,6 +429,7 @@ def awaitable_width(page: Page, locator) -> float:
     assert box is not None
     return box["width"]
 
+
 def test_dashboard_canonical_metric_homes_at_responsive_viewports(tmp_path: Path) -> None:
     configured_artifact_dir = os.environ.get("HEADROOM_PLAYWRIGHT_ARTIFACT_DIR", "").strip()
     artifact_dir = (

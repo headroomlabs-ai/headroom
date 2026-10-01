@@ -166,6 +166,7 @@ def test_expired_display_session_preserves_session_lifetime_fallback() -> None:
         expect(page.get_by_text("$7.20", exact=True)).to_be_visible()
         browser.close()
 
+
 def test_history_keeps_one_lifetime_total_and_retains_checkpoints() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
