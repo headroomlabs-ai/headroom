@@ -117,6 +117,14 @@ def _two_block_messages(salt: str = "a") -> list[dict]:
     router's content cache.
     """
     return [
+        # Naming tool_uses: an unnamed tool_result is treated as an excluded tool.
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": f"toolu_{n}", "name": "Bash", "input": {}}
+                for n in range(2)
+            ],
+        },
         {
             "role": "user",
             "content": [
@@ -130,7 +138,7 @@ def _two_block_messages(salt: str = "a") -> list[dict]:
                 }
                 for n in range(2)
             ],
-        }
+        },
     ]
 
 

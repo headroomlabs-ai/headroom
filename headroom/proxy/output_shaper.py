@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.proxy import runtime_env
+from headroom.proxy.anthropic_threads import is_thread_continue
 from headroom.proxy.output_steering import (
     apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
@@ -380,6 +381,10 @@ def shape_request(
     assert result.labels is not None  # __post_init__ guarantees this
 
     level = settings.verbosity_level if level_override is None else level_override
+    # A Thread continue turn must resend system byte-identical to the stored
+    # thread or the API 400s, so never steer it.
+    if is_thread_continue(body):
+        level = 0
     if level > 0 and apply_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")

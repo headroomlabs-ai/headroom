@@ -20,6 +20,8 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
+from headroom.tool_name_registry import record_from_sse as _record_tool_names
+from headroom.tool_name_registry import thread_pinned_of
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -782,6 +784,7 @@ class StreamingMixin:
         session_key: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -828,6 +831,7 @@ class StreamingMixin:
                 session_key=session_key,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                thread_scope=thread_scope,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -860,6 +864,7 @@ class StreamingMixin:
         session_key: str,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        thread_scope: str = "",
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1259,8 +1264,16 @@ class StreamingMixin:
             try:
                 async with contextlib.aclosing(upstream_response) as response:
                     sse_chunk_index = 0
+                    _sse_rest = b""
+                    _thread_forwarded = thread_pinned_of(body)
                     async for chunk in response.aiter_bytes():
                         sse_chunk_index += 1
+                        if provider == "anthropic":
+                            # Learn tool_use_id -> name for Thread continue turns
+                            # (tool_use is upstream there); carry the partial line.
+                            _sse_rest = _record_tool_names(
+                                thread_scope, _sse_rest + chunk, _thread_forwarded
+                            )
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
