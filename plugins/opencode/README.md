@@ -53,6 +53,22 @@ export default async function plugin(input) {
 - exposes the `headroom_retrieve` tool.
 - publishes `HEADROOM_PROXY_URL` in the plugin output env.
 - defaults to `http://127.0.0.1:8787` when no proxy URL is supplied.
+- skips routing for hosts listed in `excludeHosts` (or `HEADROOM_OPENCODE_EXCLUDE_HOSTS`); those requests go straight upstream with no compression or telemetry.
+
+To keep a provider off the proxy, list its host. An entry matches the host and all of its subdomains, and `.example.com` / `*.example.com` are accepted as spellings of `example.com`:
+
+```jsonc
+// opencode.json
+{
+  "plugin": [["/path/to/headroom/providers/opencode/_dist/entry.opencode.js", { "excludeHosts": ["opencode.ai"] }]]
+}
+```
+
+or, for `headroom wrap opencode` and spawned Node child processes, set the environment variable before launching:
+
+```bash
+HEADROOM_OPENCODE_EXCLUDE_HOSTS="opencode.ai,.corp.internal" headroom wrap opencode
+```
 
 ## Retrieve Tool
 
@@ -100,6 +116,7 @@ The provider config exposes these as `headroom/<model>` and defaults to `headroo
 | Variable | Used by | Description |
 |---|---|---|
 | `HEADROOM_PROXY_URL` | Native plugin | Proxy URL used by `HeadroomPlugin` |
+| `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Native plugin | Comma-separated hosts (and their subdomains) that bypass the proxy; the `excludeHosts` plugin option takes precedence |
 | `OPENCODE_CONFIG_CONTENT` | OpenCode wrapper | Generated OpenCode provider, model, and MCP config |
 
 ## License

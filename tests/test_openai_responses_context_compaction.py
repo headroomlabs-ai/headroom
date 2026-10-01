@@ -12,6 +12,7 @@ from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
+    _estimate_tokens,
 )
 
 
@@ -432,7 +433,8 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     )
 
     assert compressed == "short summary"
-    assert compressed_tokens == 2
+    # Measured with the router's estimator, the unit of the strategy result.
+    assert compressed_tokens == _estimate_tokens("short summary")
     # The fallback chain must record both strategies it tried.
     assert strategy_chain == ["smart_crusher", "kompress"]
 

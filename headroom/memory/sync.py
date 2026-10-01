@@ -134,7 +134,7 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
 def _save_sync_state(state_path: Path, state: dict[str, Any]) -> None:
     """Save sync state to disk."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8", newline="\n")
 
 
 def _db_fingerprint(memories: list[Any]) -> str:

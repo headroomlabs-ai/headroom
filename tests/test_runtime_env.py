@@ -4,6 +4,8 @@ and the wrap-side push that keeps a reused proxy in sync without a restart.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from headroom.proxy import runtime_env as rt
@@ -13,8 +15,24 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from headroom.proxy import server as proxy_server  # noqa: E402
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 from headroom.rollout import resolve_rollout  # noqa: E402
+
+_RUNTIME_ENV_BODY_CAP = 64 * 1024
+
+
+def _json_object_of_size(total_bytes: int) -> bytes:
+    """Build ``{"BOGUS":"...padding..."}`` at an exact byte length.
+
+    ``BOGUS`` is not a registered knob, so a request built with this is
+    expected to be *accepted* (200, ``applied == {}``) once it clears the
+    size gate -- it isolates the size check from override semantics.
+    """
+    prefix, suffix = b'{"BOGUS":"', b'"}'
+    pad_len = total_bytes - len(prefix) - len(suffix)
+    assert pad_len >= 0, f"{total_bytes} bytes is too small for the JSON skeleton"
+    return prefix + b"x" * pad_len + suffix
 
 
 @pytest.fixture(autouse=True)
@@ -245,6 +263,126 @@ def test_admin_runtime_env_is_loopback_only():
         resp = external.post("/admin/runtime-env", json={"HEADROOM_OUTPUT_SHAPER": "1"})
     assert resp.status_code == 404  # invisible to non-loopback callers
     assert rt.getenv("HEADROOM_OUTPUT_SHAPER") is None  # nothing applied
+
+
+# ---------------------------------------------------------------------------
+# request body size limit is enforced against streamed bytes, not
+# Content-Length (V-001 follow-up: the header is client-controlled and must
+# never be trusted as the enforcement boundary)
+# ---------------------------------------------------------------------------
+
+
+def _streaming_client(app):
+    """An httpx client that drives ``app`` over ASGI without TestClient's
+    requests-based transport -- needed so a generator body can be sent
+    without httpx computing a Content-Length for us.
+    """
+    import httpx
+
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    return httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1")
+
+
+async def _chunked(body: bytes, chunk_size: int = 4096):
+    for i in range(0, len(body), chunk_size):
+        yield body[i : i + chunk_size]
+
+
+async def test_admin_runtime_env_accepts_body_at_the_cap_without_content_length(monkeypatch):
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    body = _json_object_of_size(_RUNTIME_ENV_BODY_CAP)
+
+    async with _streaming_client(app) as client:
+        resp = await client.post(
+            "/admin/runtime-env",
+            content=_chunked(body),
+            headers={"content-type": "application/json"},
+        )
+
+    assert "content-length" not in resp.request.headers
+    assert resp.status_code == 200
+    assert resp.json()["applied"] == {}
+
+
+async def test_admin_runtime_env_rejects_oversized_chunked_body(monkeypatch):
+    """No Content-Length at all (the chunked/streamed case) must still be capped."""
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    body = _json_object_of_size(_RUNTIME_ENV_BODY_CAP + 1000)
+
+    json_loads_calls = []
+    real_loads = json.loads
+    monkeypatch.setattr(
+        proxy_server.json,
+        "loads",
+        lambda *a, **k: json_loads_calls.append(a) or real_loads(*a, **k),
+    )
+
+    async with _streaming_client(app) as client:
+        resp = await client.post(
+            "/admin/runtime-env",
+            content=_chunked(body),
+            headers={"content-type": "application/json"},
+        )
+
+    assert "content-length" not in resp.request.headers
+    assert resp.status_code == 413
+    assert real_loads(resp.content) == {"error": "request body too large"}
+    assert not json_loads_calls  # the oversized body was never parsed
+    assert rt.getenv("HEADROOM_OUTPUT_SHAPER") is None
+
+
+async def test_admin_runtime_env_rejects_body_exceeding_declared_content_length(monkeypatch):
+    """A Content-Length that understates the real body must not let it through.
+
+    httpx does not recompute Content-Length for an explicit header, so this
+    sends a deliberately wrong ``Content-Length: 1`` alongside a body that
+    actually streams well past the 64 KiB cap -- exactly the mismatch the
+    original Content-Length-only guard was blind to.
+    """
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    app = create_app(config)
+    body = _json_object_of_size(_RUNTIME_ENV_BODY_CAP + 1000)
+
+    json_loads_calls = []
+    real_loads = json.loads
+    monkeypatch.setattr(
+        proxy_server.json,
+        "loads",
+        lambda *a, **k: json_loads_calls.append(a) or real_loads(*a, **k),
+    )
+
+    async with _streaming_client(app) as client:
+        resp = await client.post(
+            "/admin/runtime-env",
+            content=_chunked(body),
+            headers={"content-type": "application/json", "content-length": "1"},
+        )
+
+    assert resp.request.headers["content-length"] == "1"
+    assert resp.status_code == 413
+    assert real_loads(resp.content) == {"error": "request body too large"}
+    assert not json_loads_calls  # the oversized body was never parsed
+    assert rt.getenv("HEADROOM_OUTPUT_SHAPER") is None
 
 
 # ---------------------------------------------------------------------------
