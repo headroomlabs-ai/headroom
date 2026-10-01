@@ -20,6 +20,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from headroom.backends.base import BackendResponse
 from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
+from headroom.proxy.handlers.openai import _openai_rate_limit_key
 from headroom.proxy.server import ProxyConfig, create_app
 from tests.test_observability_metrics import _collect_metrics
 
@@ -1297,7 +1298,7 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
         """Headroom's own limiter, refusing only ``limited_auth``."""
 
         async def check_request(self, key: str = "default") -> tuple[bool, float]:
-            return key != limited_auth, 1.0
+            return key != _openai_rate_limit_key({"authorization": limited_auth}), 1.0
 
         async def check_tokens(self, key: str, tokens: int) -> tuple[bool, float]:
             return True, 0.0
