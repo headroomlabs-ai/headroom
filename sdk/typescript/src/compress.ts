@@ -25,6 +25,7 @@ export async function compress(
     model,
     tokenBudget,
     hooks,
+    config,
     ...clientOptions
   } = options;
 
@@ -57,7 +58,7 @@ export async function compress(
 
   // 5. Compress via proxy
   const client = providedClient ?? new HeadroomClient(clientOptions);
-  const result = await client.compress(openaiMessages, { model, tokenBudget });
+  const result = await client.compress(openaiMessages, { model, tokenBudget, config });
 
   // 6. Convert compressed messages back to original format
   const outputMessages = fromOpenAI(result.messages, inputFormat);

@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -60,6 +61,10 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+-A\s*\d+|\s+-B\s*\d+|\s+-C\s*\d+"
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
+
+# Leading `cd <dir> && ` / `cd <dir>; ` prefixes. Agents prepend them to most
+# commands, so they carry no signal about which operation was retried.
+_BASH_LEADING_CD_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|(?:\\.|[^\s\\])+)\s*(?:&&|;)\s*""")
 
 # Agent harnesses can encode orchestration metadata as user-role messages.
 # These prefixes identify whole messages that are not authored by the user.
@@ -193,7 +198,7 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     if not cmd:
         return ""
     # Drop paging, line-context flags, and redirections that vary between runs.
-    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", _strip_leading_cd(cmd)).strip()
     # Cut at the first pipe or && so we hash the primary command, not the tail.
     for sep in (" | ", " && "):
         idx = trimmed.find(sep)
@@ -201,6 +206,15 @@ def _normalize_bash_for_hash(cmd: str) -> str:
             trimmed = trimmed[:idx].rstrip()
             break
     return trimmed
+
+
+def _strip_leading_cd(cmd: str) -> str:
+    """Remove leading `cd <dir> &&` / `cd <dir>;` segments from a Bash command."""
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _BASH_LEADING_CD_RE.sub("", cmd, count=1)
+    return cmd
 
 
 # =============================================================================
@@ -371,6 +385,8 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
     arguments, and gets rejected. Genuine retries (extra flag, single
     arg edit) pass via the edit-distance path.
     """
+    failed = _strip_leading_cd(failed)
+    success = _strip_leading_cd(success)
     if not failed or not success or failed == success:
         return False
     bin_a = _bash_first_binary(failed)
@@ -450,6 +466,7 @@ class TrafficLearner:
         max_history: int = 20,
         dedup_window: int = 100,
         min_evidence: int = 5,
+        max_pending_patterns: int = 2048,
     ) -> None:
         """Initialize the traffic learner.
 
@@ -468,12 +485,19 @@ class TrafficLearner:
         self.agent_type = agent_type
         self._max_history = max_history
         self._min_evidence = min_evidence
+        self._max_pending_patterns = max_pending_patterns
 
         # Recent tool call history for error→recovery matching
         self._tool_history: list[dict[str, Any]] = []
 
-        # Pattern accumulator: hash → (pattern, count)
-        self._pattern_counts: dict[str, tuple[ExtractedPattern, int]] = {}
+        # Pattern accumulator: hash → (pattern, count). LRU-ordered and capped:
+        # a pattern that is seen once but never reaches ``min_evidence`` would
+        # otherwise linger here forever, so this dict grew unbounded over a
+        # long-lived proxy's traffic (the sibling ``_saved_hashes`` is trimmed
+        # to ``dedup_window`` for the same reason; this one was missed). Evicting
+        # the least-recently-corroborated pending pattern is safe: if it recurs
+        # it simply restarts accumulation.
+        self._pattern_counts: OrderedDict[str, tuple[ExtractedPattern, int]] = OrderedDict()
 
         # Dedup: hashes of patterns already saved to DB
         self._saved_hashes: set[str] = set()
@@ -1250,7 +1274,13 @@ class TrafficLearner:
             existing, count = self._pattern_counts[h]
             count += 1
             self._pattern_counts[h] = (existing, count)
+            # Mark as most-recently-corroborated so it survives LRU eviction.
+            self._pattern_counts.move_to_end(h)
         else:
+            # Bound the pending accumulator so one-off patterns can't grow it
+            # without limit; drop the least-recently-corroborated pending entry.
+            if len(self._pattern_counts) >= self._max_pending_patterns:
+                self._pattern_counts.popitem(last=False)
             self._pattern_counts[h] = (pattern, 1)
             return  # First sighting — wait for more evidence
 
@@ -1260,10 +1290,16 @@ class TrafficLearner:
             # Ready to save
             del self._pattern_counts[h]
             self._saved_hashes.add(h)
-            # Trim saved hashes to prevent unbounded growth
+            # Trim saved hashes to prevent unbounded growth, and drop the evicted
+            # hash's persisted-id entry in lockstep. ``_persisted_ids`` is only
+            # ever read behind an ``h in _saved_hashes`` guard (the dedup check
+            # above), so an id for a hash no longer tracked is dead weight;
+            # without this it grew one entry per distinct persisted pattern for
+            # the whole process lifetime while ``_saved_hashes`` stayed bounded.
             if len(self._saved_hashes) > self._dedup_window:
                 # Remove oldest (arbitrary, set is unordered, but prevents growth)
-                self._saved_hashes.pop()
+                evicted = self._saved_hashes.pop()
+                self._persisted_ids.pop(evicted, None)
 
             # Persist the real accumulated count, not the dataclass default.
             pattern.evidence_count = count
@@ -1295,9 +1331,13 @@ class TrafficLearner:
                     },
                 )
                 self._patterns_saved += 1
-                # Track id so future re-sightings bump this row.
+                # Track id so future re-sightings bump this row — but only while
+                # the hash is still within the dedup window. If it was evicted
+                # from ``_saved_hashes`` between enqueue and now, recording its id
+                # would re-leak an entry that can never be read again (the dedup
+                # read at the top of ``_accumulate`` is gated on ``_saved_hashes``).
                 memory_id = getattr(memory, "id", None)
-                if memory_id is not None:
+                if memory_id is not None and pattern.content_hash in self._saved_hashes:
                     self._persisted_ids[pattern.content_hash] = memory_id
                 logger.debug(f"Traffic learner saved pattern: {pattern.content[:80]}")
 
@@ -1326,7 +1366,16 @@ class TrafficLearner:
             try:
                 rows = conn.execute(
                     "SELECT id, content, metadata FROM memories "
-                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
+                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner' "
+                    # Hydrate at most dedup_window rows so a large persisted
+                    # history does not start the in-memory dedup maps oversized
+                    # (they are trimmed to dedup_window in steady state). Keep the
+                    # most-recently-seen patterns; rows without last_seen_at
+                    # (legacy) sort last under DESC and are dropped first, with id
+                    # as a deterministic tie-break.
+                    "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC "
+                    "LIMIT ?",
+                    (self._dedup_window,),
                 ).fetchall()
             except sqlite3.DatabaseError:
                 return []
@@ -1374,10 +1423,10 @@ class TrafficLearner:
 
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        def _bump() -> None:
+        def _bump() -> bool:
             conn = sqlite3.connect(str(db_path))
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
                     "metadata, '$.evidence_count', "
                     "COALESCE(json_extract(metadata, '$.evidence_count'), 0) + 1, "
@@ -1386,13 +1435,26 @@ class TrafficLearner:
                     (now_iso, memory_id),
                 )
                 conn.commit()
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
         try:
-            await asyncio.to_thread(_bump)
+            updated = await asyncio.to_thread(_bump)
         except Exception as e:
             logger.debug("Traffic learner evidence bump failed for %s: %s", memory_id, e)
+            return
+
+        refresh = getattr(self._backend, "refresh_memory_indexes", None)
+        if updated and refresh is not None:
+            try:
+                await refresh(memory_id)
+            except Exception as e:
+                logger.debug(
+                    "Traffic learner evidence index refresh failed for %s: %s",
+                    memory_id,
+                    e,
+                )
 
     # =========================================================================
     # Convenience: Extract from Anthropic messages format
@@ -1448,6 +1510,11 @@ class TrafficLearner:
                         "input": tool_use.get("input", {}),
                         "output": str(result_content),
                         "is_error": block.get("is_error", False) or _is_error(str(result_content)),
+                        # Stable per-turn identity (the tool_use/tool_result id).
+                        # Lets a caller dedup a replayed transcript so the same
+                        # result is not counted as evidence twice — used by the
+                        # Codex WebSocket ingestion path.
+                        "call_id": tool_use_id,
                     }
                 )
 

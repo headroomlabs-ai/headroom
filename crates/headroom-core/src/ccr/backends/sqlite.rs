@@ -16,8 +16,8 @@
 //! The TTL is an **idle window** (#2604): every successful `get`
 //! restarts the row's clock via `last_accessed`, bounded by an absolute
 //! max lifetime measured from `created_at`. On every `get` we
-//! lazy-purge stale rows (`WHERE last_accessed + ttl_seconds <= now OR
-//! created_at + max_lifetime <= now`) — no background reaper thread,
+//! lazy-purge stale rows (`WHERE last_accessed + ttl_seconds < now OR
+//! created_at + max_lifetime < now`) — no background reaper thread,
 //! no cron. DBs created by pre-sliding builds are migrated in place
 //! (the `last_accessed` column is added, backfilled from `created_at`).
 //!
@@ -153,10 +153,13 @@ impl SqliteCcrStore {
     /// absolute max lifetime. Lazy — invoked from `get`. Returns the
     /// number of rows purged.
     fn purge_expired(&self, conn: &Connection, now: u64) -> rusqlite::Result<usize> {
+        // Timestamps have whole-second resolution. Use a strict boundary so
+        // truncation can extend a cache entry by less than one second but can
+        // never expire it before the configured idle or lifetime window.
         let purged = conn.execute(
             "DELETE FROM ccr_entries
-             WHERE last_accessed + ttl_seconds <= ?1
-                OR created_at + ?2 <= ?1",
+             WHERE last_accessed + ttl_seconds < ?1
+                OR created_at + ?2 < ?1",
             params![now as i64, self.max_lifetime_seconds as i64],
         )?;
         Ok(purged)
@@ -169,6 +172,58 @@ impl SqliteCcrStore {
             // fall through to 0 rather than panic in the unlikely case.
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn get_at(&self, hash: &str, now: u64) -> Option<String> {
+        let conn = self.conn.lock().expect("ccr sqlite mutex poisoned");
+
+        // Lazy purge sweep, then the real lookup. Both happen under
+        // the same mutex so the row we read is guaranteed not to have
+        // been just-deleted by another caller.
+        if let Err(err) = self.purge_expired(&conn, now) {
+            tracing::warn!(
+                target = "ccr.sqlite",
+                error = %err,
+                "ccr_sqlite_purge_failed"
+            );
+        }
+
+        let row: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT original FROM ccr_entries
+                 WHERE hash = ?1
+                   AND last_accessed + ttl_seconds >= ?2
+                   AND created_at + ?3 >= ?2",
+                params![hash, now as i64, self.max_lifetime_seconds as i64],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    target = "ccr.sqlite",
+                    hash = %hash,
+                    error = %err,
+                    "ccr_sqlite_get_failed"
+                );
+                None
+            });
+
+        let row = row?;
+        // Sliding idle window (#2604): a successful hit restarts the
+        // row's idle clock. Still under the same mutex as the lookup.
+        if let Err(err) = conn.execute(
+            "UPDATE ccr_entries SET last_accessed = ?2 WHERE hash = ?1",
+            params![hash, now as i64],
+        ) {
+            tracing::warn!(
+                target = "ccr.sqlite",
+                hash = %hash,
+                error = %err,
+                "ccr_sqlite_touch_failed"
+            );
+        }
+
+        String::from_utf8(row).ok()
     }
 }
 
@@ -210,56 +265,7 @@ impl CcrStore for SqliteCcrStore {
     }
 
     fn get(&self, hash: &str) -> Option<String> {
-        let now = Self::now_unix_seconds();
-        let conn = self.conn.lock().expect("ccr sqlite mutex poisoned");
-
-        // Lazy purge sweep, then the real lookup. Both happen under
-        // the same mutex so the row we read is guaranteed not to have
-        // been just-deleted by another caller.
-        if let Err(err) = self.purge_expired(&conn, now) {
-            tracing::warn!(
-                target = "ccr.sqlite",
-                error = %err,
-                "ccr_sqlite_purge_failed"
-            );
-        }
-
-        let row: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT original FROM ccr_entries
-                 WHERE hash = ?1
-                   AND last_accessed + ttl_seconds > ?2
-                   AND created_at + ?3 > ?2",
-                params![hash, now as i64, self.max_lifetime_seconds as i64],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    target = "ccr.sqlite",
-                    hash = %hash,
-                    error = %err,
-                    "ccr_sqlite_get_failed"
-                );
-                None
-            });
-
-        let row = row?;
-        // Sliding idle window (#2604): a successful hit restarts the
-        // row's idle clock. Still under the same mutex as the lookup.
-        if let Err(err) = conn.execute(
-            "UPDATE ccr_entries SET last_accessed = ?2 WHERE hash = ?1",
-            params![hash, now as i64],
-        ) {
-            tracing::warn!(
-                target = "ccr.sqlite",
-                hash = %hash,
-                error = %err,
-                "ccr_sqlite_touch_failed"
-            );
-        }
-
-        String::from_utf8(row).ok()
+        self.get_at(hash, Self::now_unix_seconds())
     }
 
     fn len(&self) -> usize {
@@ -269,5 +275,58 @@ impl CcrStore for SqliteCcrStore {
         })
         .map(|n| n.max(0) as usize)
         .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with_row(
+        idle_ttl: u64,
+        max_lifetime: u64,
+        created_at: u64,
+        last_accessed: u64,
+    ) -> (tempfile::TempDir, SqliteCcrStore, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteCcrStore::open_with_ttls(dir.path().join("ccr.sqlite"), idle_ttl, max_lifetime)
+                .expect("open sqlite store");
+        let hash = "boundary-entry".to_string();
+        {
+            let conn = store.conn.lock().expect("ccr sqlite mutex poisoned");
+            conn.execute(
+                "INSERT INTO ccr_entries
+                    (hash, original, created_at, ttl_seconds, last_accessed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &hash,
+                    b"payload".as_slice(),
+                    created_at as i64,
+                    idle_ttl as i64,
+                    last_accessed as i64,
+                ],
+            )
+            .expect("insert boundary row");
+        }
+        (dir, store, hash)
+    }
+
+    #[test]
+    fn exact_idle_ttl_boundary_is_still_valid() {
+        let (_dir, store, hash) = store_with_row(5, 20, 100, 100);
+
+        assert_eq!(store.get_at(&hash, 105).as_deref(), Some("payload"));
+        assert_eq!(store.get_at(&hash, 111), None);
+        assert_eq!(store.len(), 0, "expired row must be purged");
+    }
+
+    #[test]
+    fn exact_max_lifetime_boundary_is_still_valid() {
+        let (_dir, store, hash) = store_with_row(5, 10, 100, 108);
+
+        assert_eq!(store.get_at(&hash, 110).as_deref(), Some("payload"));
+        assert_eq!(store.get_at(&hash, 111), None);
+        assert_eq!(store.len(), 0, "expired row must be purged");
     }
 }
