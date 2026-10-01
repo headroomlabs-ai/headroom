@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from headroom.cache.backends import InMemoryBackend
+from headroom.cache.compression_feedback import CompressionHints
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.loopback_guard import is_ip_literal_host_header
 from headroom.proxy.server import ProxyConfig, create_app
@@ -30,6 +31,11 @@ GATED = [
     ("get", "/v1/toin/stats"),
     ("get", "/v1/toin/patterns"),
     ("get", "/v1/toin/pattern/example"),
+    # #2927 guarded the eight telemetry/TOIN routes the issue enumerated but
+    # left these two siblings open, and their payload carries the same raw
+    # agent query text (``common_queries``, built from ``event.query``).
+    ("get", "/v1/feedback"),
+    ("get", "/v1/feedback/example"),
 ]
 
 
@@ -117,6 +123,135 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+# Mutating routes reachable from loopback. `require_loopback` cannot stop a
+# remote page from POSTing to a known 127.0.0.1 URL: a "simple" cross-origin
+# request (Content-Type: text/plain carrying JSON) skips preflight, and the
+# browser still sends the real loopback Host header. Only `Origin` betrays the
+# attacker, and only `require_same_origin` inspects it.
+CSRF_GUARDED = [
+    "/stats/reset",
+    "/cache/clear",
+    "/v1/retrieve",
+    "/v1/telemetry/import",
+    "/admin/runtime-env",
+]
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_cross_origin_post_rejected(path: str) -> None:
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "https://attacker.example", "Content-Type": "text/plain"},
+        content="{}",
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_sandboxed_null_origin_post_rejected(path: str) -> None:
+    # A sandboxed iframe or file:// page sends the opaque literal "null".
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "null", "Content-Type": "text/plain"},
+        content="{}",
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_loopback_origin_post_allowed(path: str) -> None:
+    # The local dashboard is same-origin on loopback and must keep working.
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "http://127.0.0.1"},
+        json={},
+    )
+    assert resp.status_code != 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_originless_post_allowed(path: str) -> None:
+    # CLI tools and the TypeScript SDK send no Origin header at all; the guard
+    # must pass them through or it breaks every non-browser client.
+    resp = _loopback_client().post(path, json={})
+    assert resp.status_code != 403, resp.text
+
+
+def _feedback_with_query_text():
+    """A feedback singleton whose patterns carry raw agent query text."""
+
+    class FakePattern:
+        total_compressions = 8
+        total_retrievals = 2
+        retrieval_rate = 0.25
+        full_retrieval_rate = 0.1
+        search_rate = 0.5
+        common_queries = {"find the customer api key rotation runbook": 3}
+        queried_fields = {"internal_field_name": 2}
+
+    class FakeFeedback:
+        def get_stats(self):
+            return {
+                "total_compressions": 8,
+                "total_retrievals": 2,
+                "global_retrieval_rate": 0.25,
+                "tools_tracked": 1,
+                "tool_patterns": {
+                    "Grep": {
+                        "compressions": 8,
+                        "retrievals": 2,
+                        "retrieval_rate": 0.25,
+                        "full_rate": 0.1,
+                        "search_rate": 0.5,
+                        "common_queries": ["find the customer api key rotation runbook"],
+                        "queried_fields": ["internal_field_name"],
+                    }
+                },
+            }
+
+        def get_compression_hints(self, tool_name):
+            # The real implementation is annotated ``-> CompressionHints`` and
+            # always returns one, so the double must too.
+            return CompressionHints()
+
+        def get_all_patterns(self):
+            return {"Grep": FakePattern()}
+
+    return FakeFeedback()
+
+
+def test_feedback_stats_exclude_agent_query_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "headroom.proxy.server.get_compression_feedback",
+        _feedback_with_query_text,
+    )
+    response = _loopback_client().get("/v1/feedback")
+
+    assert response.status_code == 200
+    pattern = response.json()["feedback"]["tool_patterns"]["Grep"]
+    assert "common_queries" not in pattern
+    assert "queried_fields" not in pattern
+    # The aggregate counters the endpoint exists to expose still survive.
+    assert pattern["retrieval_rate"] == 0.25
+    assert "customer api key rotation" not in response.text
+
+
+def test_feedback_tool_detail_excludes_agent_query_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "headroom.proxy.server.get_compression_feedback",
+        _feedback_with_query_text,
+    )
+    response = _loopback_client().get("/v1/feedback/Grep")
+
+    assert response.status_code == 200
+    pattern = response.json()["pattern"]
+    assert "common_queries" not in pattern
+    assert "queried_fields" not in pattern
+    assert pattern["retrieval_rate"] == 0.25
+    assert "customer api key rotation" not in response.text
+    assert "internal_field_name" not in response.text
 
 
 # CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).

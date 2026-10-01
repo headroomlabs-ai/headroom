@@ -84,6 +84,14 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
             "input_tokens_optimized": 60,
             "tokens_saved": 40,
             "savings_percent": 40.0,
+            "savings_breakdown": [
+                {
+                    "source": "tool_search",
+                    "tokens": 40,
+                    "usd": 0.0,
+                    "realized": True,
+                }
+            ],
         }
     )
     second_log = FakeLogEntry(
@@ -104,6 +112,14 @@ def test_stats_refreshes_recent_requests_when_cached() -> None:
         first_response = client.get("/stats?cached=1")
         assert first_response.status_code == 200
         assert first_response.json()["recent_requests"][-1]["model"] == "gpt-4.1"
+        assert first_response.json()["recent_requests"][-1]["savings_breakdown"] == [
+            {
+                "source": "tool_search",
+                "tokens": 40,
+                "usd": 0.0,
+                "realized": True,
+            }
+        ]
 
         logger.logs = [first_log, second_log]
         second_response = client.get("/stats?cached=1")

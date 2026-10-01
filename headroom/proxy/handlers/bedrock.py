@@ -76,6 +76,8 @@ class BedrockHandlerMixin:
         from headroom.proxy.helpers import (
             COMPRESSION_TIMEOUT_SECONDS,
             MAX_MESSAGE_ARRAY_LENGTH,
+            MAX_REQUEST_BODY_SIZE,
+            RequestBodyTooLarge,
             _headroom_bypass_enabled,
             _strip_internal_headers,
             extract_tags,
@@ -134,12 +136,34 @@ class BedrockHandlerMixin:
             if isinstance(err, ClientDisconnect):
                 logger.debug("[%s] %s client disconnected during body read", request_id, LOG_TAG)
                 return Response(status_code=204)
+            if isinstance(err, RequestBodyTooLarge):
+                # The read aborted mid-stream once the size ceiling was
+                # crossed, so there is no raw body to fail open with, and
+                # forwarding one anyway would defeat the ceiling. Reject.
+                logger.warning("[%s] %s request body too large: %s", request_id, LOG_TAG, err)
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "type": "request_too_large",
+                            "message": (
+                                f"Request body too large. Maximum size is "
+                                f"{MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB"
+                            ),
+                        }
+                    },
+                )
             logger.warning(
                 "[%s] %s could not parse body; forwarding verbatim: %s",
                 request_id,
                 LOG_TAG,
                 err,
             )
+            # The raw bytes were already fully read by
+            # read_request_json_with_bytes before it failed decoding them,
+            # and it caches them onto request._body the same way Starlette's
+            # own Request.body() would, so this returns the cached bytes
+            # instead of re-draining an already-consumed stream.
             raw_only = await request.body()
             return await self._forward_bedrock(
                 url=url,
