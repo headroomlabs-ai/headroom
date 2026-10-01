@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -38,7 +39,8 @@ from fastapi.testclient import TestClient
 
 from headroom.cli.proxy import proxy as proxy_cli
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.models import ProxyConfig
+from headroom.proxy.helpers import MAX_MESSAGE_ARRAY_LENGTH, MAX_REQUEST_BODY_SIZE
+from headroom.proxy.models import CacheEntry, ProxyConfig
 from headroom.proxy.server import HeadroomProxy, create_app
 
 # --------------------------------------------------------------------------- #
@@ -135,8 +137,6 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
             mode="token",
             cache_enabled=False,
             rate_limit_enabled=False,
-            fallback_enabled=False,
-            fallback_provider=None,
             prefix_freeze_enabled=False,
             memory_enabled=False,
         )
@@ -290,8 +290,8 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         )
 
 
-def _build_request(body: dict, headers: dict[str, str]) -> Request:
-    payload = json.dumps(body).encode("utf-8")
+def _build_request(body: dict | bytes, headers: dict[str, str]) -> Request:
+    payload = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
 
     async def receive():
         return {"type": "http.request", "body": payload, "more_body": False}
@@ -484,8 +484,23 @@ def test_unbounded_mode_no_semaphore_instance():
 def test_unbounded_mode_requests_run_concurrently():
     """With concurrency=0 (sem disabled), two slow requests overlap."""
 
-    async def _run() -> float:
-        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=None, upstream_delay_s=0.10)
+    async def _run() -> None:
+        both_entered = asyncio.Event()
+        entered = 0
+
+        class _OverlapHandler(_DummyAnthropicHandler):
+            async def _retry_request(self, *args, **kwargs):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+                # Neither request can finish until both reach upstream. A
+                # serialized handler deadlocks here instead of merely running
+                # slower; the timeout below only bounds that failure.
+                await both_entered.wait()
+                return await super()._retry_request(*args, **kwargs)
+
+        handler = _OverlapHandler(anthropic_pre_upstream_sem=None)
         reqs = [
             _build_request(
                 {
@@ -496,15 +511,15 @@ def test_unbounded_mode_requests_run_concurrently():
             )
             for i in range(2)
         ]
-        start = time.perf_counter()
-        await asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs))
-        return time.perf_counter() - start
+        responses = await asyncio.wait_for(
+            asyncio.gather(*(handler.handle_anthropic_messages(r) for r in reqs)),
+            timeout=10,
+        )
+        assert entered == 2
+        assert all(response.status_code == 200 for response in responses)
 
     with _tokenizer_patch():
-        elapsed = anyio.run(_run)
-    # Unbounded -> both sleeps run in parallel. Total should be ~0.10 s,
-    # nowhere near 0.20 s.
-    assert elapsed < 0.18, elapsed
+        anyio.run(_run)
 
 
 # --------------------------------------------------------------------------- #
@@ -707,8 +722,6 @@ def test_compression_is_not_bypassed_when_gated(stage_log_capture):
         mode="token",
         cache_enabled=False,
         rate_limit_enabled=False,
-        fallback_enabled=False,
-        fallback_provider=None,
         prefix_freeze_enabled=False,
         memory_enabled=False,
         anthropic_pre_upstream_concurrency=2,
@@ -832,11 +845,12 @@ def test_auto_computed_default_on_this_machine():
 
 # --------------------------------------------------------------------------- #
 # Semaphore released on HTTPException / early-exit paths even with an         #
-# already-held permit. Explicitly covers the 4 pre-upstream early exits:     #
+# already-held permit. Explicitly covers the pre-upstream early exits:       #
 #   - rate_limiter deny (429)                                                 #
 #   - cost_tracker block (429)                                                #
 #   - security scan block (403)                                               #
 #   - cache hit (200)                                                         #
+#   - oversized body (413), invalid JSON (400), too many messages (400)       #
 # Each test holds 1 permit of a Semaphore(2) with a concurrent request,      #
 # then verifies the handler restores ``_value`` to the original after        #
 # the early return.                                                           #
@@ -870,12 +884,20 @@ class _SecurityBlock:
 
 
 class _CacheHit:
-    class _Entry:
-        response_headers: dict = {}
-        response_body: bytes = b'{"id":"cached","type":"message","role":"assistant","content":[{"type":"text","text":"hit"}]}'
-
     def __init__(self) -> None:
-        self._entry = self._Entry()
+        # A real ``CacheEntry`` rather than a hand-rolled stand-in: the
+        # cache-hit path reads more of the entry than just the body (it logs
+        # the entry's age and hit count), and a partial fake drifts out of
+        # sync with it silently.
+        self._entry = CacheEntry(
+            response_body=(
+                b'{"id":"cached","type":"message","role":"assistant",'
+                b'"content":[{"type":"text","text":"hit"}]}'
+            ),
+            response_headers={},
+            created_at=datetime.now(),
+            ttl_seconds=3600,
+        )
 
     async def get(self, _messages, _model, **_kwargs):
         return self._entry
@@ -886,7 +908,15 @@ class _CacheHit:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["rate_limiter", "cost_tracker", "security", "cache"],
+    [
+        "rate_limiter",
+        "cost_tracker",
+        "security",
+        "cache",
+        "oversized_body",
+        "invalid_json",
+        "too_many_messages",
+    ],
 )
 def test_early_exit_paths_release_semaphore_under_contention(scenario):
     """Hold one permit of a Semaphore(1) with a concurrent request, trigger
@@ -907,13 +937,19 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
         elif scenario == "cache":
             handler.cache = _CacheHit()
 
-        req = _build_request(
-            {
-                "model": "claude-3-5-sonnet-latest",
-                "messages": [{"role": "user", "content": "hello"}],
-            },
-            {"authorization": "Bearer sk-ant-api-test"},
-        )
+        body: dict | bytes = {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        headers = {"authorization": "Bearer sk-ant-api-test"}
+        if scenario == "oversized_body":
+            headers["content-length"] = str(MAX_REQUEST_BODY_SIZE + 1)
+        elif scenario == "invalid_json":
+            body = b"{not json"
+        elif scenario == "too_many_messages":
+            body["messages"] = [{"role": "user", "content": "hi"}] * (MAX_MESSAGE_ARRAY_LENGTH + 1)
+        req = _build_request(body, headers)
+        expected_status = {"oversized_body": 413, "invalid_json": 400, "too_many_messages": 400}
 
         # Drive several iterations to confirm each early-exit call fully
         # releases the semaphore rather than leaking a permit AND that the
@@ -944,6 +980,8 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
                 # security returns a JSONResponse; cache returns a Response.
                 assert raised is None, f"{scenario}: unexpected exception {raised!r}"
                 assert result is not None
+                if scenario in expected_status:
+                    assert result.status_code == expected_status[scenario], result.body
             assert sem._value == original_value, (
                 f"{scenario}: semaphore leak got={sem._value}, want={original_value}"
             )
@@ -1085,3 +1123,74 @@ def test_response_cache_keys_on_lookup_messages_not_mutated():
     assert cache.set_messages == cache.get_messages
     # And specifically the raw lookup messages, not the scanner's rewrite.
     assert cache.set_messages == [{"role": "user", "content": "hello"}]
+
+
+# --------------------------------------------------------------------------- #
+# Backpressure must not bust the provider prompt cache: the compression        #
+# pipeline is skipped under saturation, but the previously-forwarded          #
+# (compressed) prefix must still be replayed byte-identical. Forwarding raw   #
+# originals would mismatch the bytes the provider cached — busting every      #
+# gated session's prefix exactly when the proxy is busiest.                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_backpressure_passthrough_replays_cached_prefix(stage_log_capture):
+    prev_original = [{"role": "user", "content": "ORIGINAL " * 6000}]
+    prev_forwarded = [{"role": "user", "content": "[compressed-form]"}]
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # saturate: the request's acquire will time out
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.optimize = True
+        handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
+        handler.anthropic_pipeline = SimpleNamespace(apply=MagicMock())
+
+        tracker = SimpleNamespace(
+            _cached_token_count=0,
+            get_frozen_message_count=lambda: 0,
+            get_last_original_messages=lambda: copy.deepcopy(prev_original),
+            get_last_forwarded_messages=lambda: copy.deepcopy(prev_forwarded),
+            update_from_response=lambda *a, **k: None,
+            record_request=lambda *a, **k: None,
+        )
+        handler.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *a, **k: "sess-1",
+            get_or_create=lambda *a, **k: tracker,
+            resolve_tracker=lambda *a, **k: tracker,
+        )
+
+        forwarded_bodies: list[dict] = []
+        orig_retry = handler._retry_request
+
+        async def _capturing_retry(method, url, headers, body, **kw):
+            forwarded_bodies.append(copy.deepcopy(body))
+            return await orig_retry(method, url, headers, body, **kw)
+
+        handler._retry_request = _capturing_retry
+
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": copy.deepcopy(prev_original)
+                + [{"role": "user", "content": "next turn"}],
+            },
+            {"authorization": "Bearer sk-ant-api-test"},
+        )
+        try:
+            response = await handler.handle_anthropic_messages(req)
+            assert response.status_code == 200
+            # Saturation must still skip the CPU-bound pipeline...
+            assert not handler.anthropic_pipeline.apply.called
+        finally:
+            sem.release()
+
+        assert forwarded_bodies, "request never reached upstream"
+        sent = forwarded_bodies[-1]["messages"]
+        # ...but the forwarded prefix must be last turn's exact bytes, not the
+        # raw original (which the provider never cached).
+        assert sent[0]["content"] == "[compressed-form]"
+        assert sent[-1]["content"] == "next turn"
+
+    with _tokenizer_patch():
+        anyio.run(_run)

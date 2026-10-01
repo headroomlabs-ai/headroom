@@ -109,9 +109,40 @@ def test_run_server_installs_cancelled_error_filter(monkeypatch: pytest.MonkeyPa
 
     from headroom.proxy.server import run_server
 
-    run_server(ProxyConfig(), print_banner=False)
+    # `uvicorn.error` is a process-global logger and run_server only installs
+    # the filter when one is not already attached. Any earlier test in the
+    # session that reached run_server therefore leaves it installed, and this
+    # test would observe zero installs. Isolate the global state rather than
+    # depend on test ordering.
+    uvicorn_error_logger = logging.getLogger("uvicorn.error")
+    preexisting = [
+        item
+        for item in uvicorn_error_logger.filters
+        if isinstance(item, _SuppressCancelledErrorFilter)
+    ]
+    for item in preexisting:
+        uvicorn_error_logger.removeFilter(item)
 
-    assert len(installed_filters) == 1, "Expected exactly one _SuppressCancelledErrorFilter"
+    try:
+        run_server(ProxyConfig(), print_banner=False)
+
+        assert len(installed_filters) == 1, "Expected exactly one _SuppressCancelledErrorFilter"
+
+        # The idempotence guard is the real contract: a second call must not
+        # stack a duplicate filter on the shared logger.
+        run_server(ProxyConfig(), print_banner=False)
+        attached = [
+            item
+            for item in uvicorn_error_logger.filters
+            if isinstance(item, _SuppressCancelledErrorFilter)
+        ]
+        assert len(attached) == 1, f"filter stacked on repeat calls: {len(attached)}"
+    finally:
+        for item in list(uvicorn_error_logger.filters):
+            if isinstance(item, _SuppressCancelledErrorFilter):
+                uvicorn_error_logger.removeFilter(item)
+        for item in preexisting:
+            original_add_filter(uvicorn_error_logger, item)
 
 
 # ---------------------------------------------------------------------------

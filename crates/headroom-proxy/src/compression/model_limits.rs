@@ -175,6 +175,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_5_generation_models_present() {
+        // Missing entries fall through to the 128K default, so the
+        // compressor would trim these 1M-window models far too early.
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "global.anthropic.claude-sonnet-5-5",
+            "vertex_ai/claude-sonnet-5-5",
+        ] {
+            assert_eq!(context_window_for(model), 1_000_000, "{model}");
+        }
+    }
+
+    #[test]
     fn current_gpt_models_present() {
         assert_eq!(context_window_for("gpt-4o-mini"), 128_000);
         assert_eq!(context_window_for("gpt-4-turbo"), 128_000);
