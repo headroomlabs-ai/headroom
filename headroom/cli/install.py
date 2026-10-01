@@ -24,7 +24,7 @@ from headroom.install.models import (
     SupervisorKind,
 )
 from headroom.install.paths import recovery_manifest_path
-from headroom.install.planner import build_manifest
+from headroom.install.planner import build_manifest, build_tool_envs
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
@@ -35,6 +35,7 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
 from headroom.install.state import (
     ManifestError,
@@ -214,6 +215,20 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
         stop_runtime(manifest)
     except Exception as exc:
         errors.append(("runtime stop", exc))
+    try:
+        if not wait_stopped(manifest):
+            timeout_error = click.ClickException(
+                f"Deployment '{manifest.profile}' is still answering on "
+                f"{manifest.health_url} after stop."
+            )
+            if errors:
+                errors.append(("runtime shutdown", timeout_error))
+            else:
+                raise timeout_error
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        errors.append(("runtime shutdown", exc))
     if errors:
         raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in errors))
 
@@ -229,7 +244,77 @@ def _deactivate_deployment_mutations(
         save_manifest(manifest)
 
 
+def _reconcile_tool_envs(manifest: DeploymentManifest) -> dict[str, list[str]]:
+    """Add managed env vars introduced since this manifest was written.
+
+    ``tool_envs`` is built once, by ``build_manifest`` during ``headroom
+    install``, and then stored. Every later lifecycle command re-applies the
+    STORED map, so a variable added to a provider's install env afterwards never
+    reaches a deployment that already exists -- not on ``start``, not on
+    ``restart``, and not on a Headroom upgrade. The only cure was reinstalling,
+    which nobody does for a proxy that is working.
+
+    That is not hypothetical. ``ENABLE_TOOL_SEARCH`` was added to Claude's
+    install env on 2026-06-19 to stop Claude Code inlining every MCP schema when
+    it sees a custom ``ANTHROPIC_BASE_URL`` (GH #746). A deployment installed
+    before that date keeps getting the base URL written without it, so the
+    client is pointed at the proxy AND has its own tool-schema deferral switched
+    off -- the expensive half of the change with none of the mitigation.
+
+    Missing keys are ADDED; existing values are never overwritten. The stored
+    value may legitimately differ from a fresh build (a hand-edited port, a
+    deployment pinned to something specific), and healing an omission is a much
+    smaller claim than re-deciding a setting the manifest already records.
+    Returns the names added per target, for reporting.
+    """
+
+    added: dict[str, list[str]] = {}
+    for target, values in pending_tool_envs(manifest).items():
+        stored = manifest.tool_envs.get(target)
+        if not isinstance(stored, dict):
+            # Absent, or hand-edited into something that is not a mapping. Either
+            # way the managed values are what this deployment should have, and
+            # ``stored.update`` on a string would crash a lifecycle command.
+            manifest.tool_envs[target] = dict(values)
+        else:
+            stored.update(values)
+        added[target] = sorted(values)
+    return added
+
+
+def pending_tool_envs(manifest: DeploymentManifest) -> dict[str, dict[str, str]]:
+    """Managed env vars this manifest is missing, WITHOUT mutating it.
+
+    Split out so a lifecycle command can ask "is there anything to apply?"
+    before deciding to re-apply mutations. ``install start`` skips activation
+    entirely for a deployment that is already healthy and already has mutations
+    recorded -- which is every normally-installed working deployment, i.e.
+    exactly the population that needs reconciling. Asking first is what lets it
+    re-apply only when something is genuinely missing.
+
+    Targets whose managed env is empty are omitted, so a no-op reconcile does
+    not rewrite the manifest and bump ``updated_at`` for no visible reason.
+    """
+
+    current = build_tool_envs(manifest.port, manifest.backend, list(manifest.targets))
+    pending: dict[str, dict[str, str]] = {}
+    for target, values in current.items():
+        if not values:
+            continue
+        stored = manifest.tool_envs.get(target)
+        missing = (
+            dict(values)
+            if not isinstance(stored, dict)
+            else {name: value for name, value in values.items() if name not in stored}
+        )
+        if missing:
+            pending[target] = missing
+    return pending
+
+
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
+    for target, names in sorted(_reconcile_tool_envs(manifest).items()):
+        click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
     try:
         manifest.mutations = apply_mutations(manifest)
         _save_apply_manifest(manifest)
@@ -978,7 +1063,10 @@ def install_start(profile: str) -> None:
     if not probe_ready(manifest.health_url):
         _deactivate_deployment_mutations(manifest)
     _start_deployment(manifest)
-    if probe_ready(manifest.health_url) and not manifest.mutations:
+    # ``not manifest.mutations`` alone skipped activation for every healthy,
+    # normally-installed deployment -- which is precisely the population whose
+    # stored env is stale. Re-apply when reconciliation has something to add.
+    if probe_ready(manifest.health_url) and (not manifest.mutations or pending_tool_envs(manifest)):
         _activate_deployment_mutations(manifest)
     click.echo(f"Started deployment '{profile}'.")
 

@@ -628,6 +628,42 @@ def test_buffered_ccr_rejects_malformed_success_as_502() -> None:
     assert b"gateway timeout" not in response.content
 
 
+def test_buffered_ccr_rejects_ping_only_sse_as_502() -> None:
+    """A 200 SSE body is not a successful answer to a stream:false request.
+
+    A provider that ignores the buffered flip can return only keepalives. The
+    client asked for SSE, but the upstream did not, so relaying the shell as a
+    successful stream loses the turn behind a valid-looking 200 (#3266).
+    """
+    config = _make_config()
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = app.state.proxy
+            proxy._retry_request = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    content=b'event: ping\ndata: {"type":"ping"}\n\n',
+                    headers={"content-type": "text/event-stream"},
+                )
+            )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [create_ccr_tool_definition("anthropic")],
+                    "messages": [{"role": "user", "content": _buffered("ping only")}],
+                },
+            )
+
+    assert response.status_code == 502
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert response.json()["error"]["type"] == "upstream_protocol_error"
+
+
 @pytest.mark.asyncio
 async def test_buffered_ccr_late_failure_returns_sanitized_json_error() -> None:
     """A slow crash gets the same 502 the fast one does, not a downgraded 200."""

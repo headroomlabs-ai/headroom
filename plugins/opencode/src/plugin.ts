@@ -8,6 +8,7 @@ import { installHeadroomTransport } from "./transport.js";
 export interface HeadroomOpenCodePluginOptions {
   proxyUrl?: string;
   project?: string;
+  excludeHosts?: string[];
   backend?: string;
   debug?: boolean;
 }
@@ -36,6 +37,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
   });
 

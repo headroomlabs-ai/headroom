@@ -18,6 +18,30 @@ Each ``install`` callable is invoked with the FastAPI ``app`` and the
 OSS makes no assumptions about what extensions do. The interface is
 deliberately minimal; extensions own the complexity behind it.
 
+Where extension middleware sits
+-------------------------------
+
+``install_all`` runs **before** the proxy registers its inbound security gate
+and its request-body ceiling, and Starlette builds the stack so that the last
+layer registered is the outermost. Middleware an extension adds therefore
+always runs *inside* both, and an extension author can rely on two things
+without re-implementing them:
+
+  * a request that reaches extension middleware has already passed
+    ``HEADROOM_PROXY_TOKEN`` (when one is configured) — an extension never sees,
+    answers, buffers, or rewrites headers on an unauthenticated request, on
+    either transport (HTTP or WebSocket);
+  * a request body that reaches extension middleware is already bounded by
+    :data:`headroom.proxy.helpers.MAX_REQUEST_BODY_SIZE` — an extension that
+    buffers the body cannot be made to hold more than that.
+
+The flip side is a constraint: extension middleware cannot act as the
+proxy's authentication layer, because the proxy's own gate runs first. An
+extension that needs its own inbound auth applies it in addition to, not
+instead of, the proxy token. ``install_all`` records every middleware entry an
+extension adds on ``app.state.extension_middleware`` so the ordering can be
+asserted by tests rather than assumed.
+
 Reporting what an extension saved, and what it cost
 ---------------------------------------------------
 
@@ -164,9 +188,17 @@ def install_all(
     wildcard = "*" in enabled_set
     installed: list[str] = []
     failed: list[str] = []
+    # Middleware entries added by extensions, in registration order. Starlette
+    # prepends on ``add_middleware``, so the entries an install() adds are
+    # whatever is new at the FRONT of ``app.user_middleware`` afterwards. Kept
+    # on ``app.state`` so the ordering contract in the module docstring is
+    # something the test suite can check against the real app.
+    middleware_list = getattr(app, "user_middleware", None)
+    added_middleware: list[Any] = []
     for name, install in discovered:
         if not wildcard and name not in enabled_set:
             continue
+        before = len(middleware_list) if isinstance(middleware_list, list) else 0
         try:
             install(app, config)
         except Exception as exc:  # noqa: BLE001 — one bad extension must not brick the proxy
@@ -182,7 +214,16 @@ def install_all(
             failed.append(name)
             continue
         installed.append(name)
+        if isinstance(middleware_list, list):
+            added_middleware.extend(middleware_list[: len(middleware_list) - before])
         log.info("proxy extension installed: %s", name)
+
+    state = getattr(app, "state", None)
+    if state is not None:
+        try:
+            state.extension_middleware = added_middleware
+        except Exception:  # noqa: BLE001 — a bare test double may not accept attributes
+            log.debug("could not record extension middleware on app.state", exc_info=True)
 
     if failed:
         skipped = ",".join(sorted(failed))

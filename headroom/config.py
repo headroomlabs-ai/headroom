@@ -231,10 +231,31 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         # Copilot CLI's file-read tool (its `Read` equivalent): raw file bytes
         # the model byte-patches against.
         "view",
+        # Cursor's file-read tool, the same category as `Read` and `view`. Its
+        # absence here was not a decision: without it Cursor's raw source took
+        # the LOSSY path, which is strictly worse than the fold that
+        # DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS protects it from. Protecting a read
+        # tool needs both halves -- excluded here so it is never lossily
+        # compressed, and named below so it is never folded either -- and a
+        # plugin that supplies only the first half cannot be relied on to be
+        # installed.
+        "read_file",
+        # Skill bodies (Claude Code's `Skill` tool) are INSTRUCTIONS, not tool
+        # output, and lossy compression on a directive does not degrade it --
+        # it inverts it. "do not guess at model names" losing its "not" is a
+        # correctness failure, not a quality tradeoff. Measured across 40 real
+        # SKILL.md bodies on the lossy path: only 73.5% of negations (not,
+        # never, avoid, unless, without) and 65.5% of modals (must, always,
+        # only, required) survived; two skills kept 0/2 and 1/6 of theirs.
+        # Bodies load on demand and are read once, so the tokens at stake are
+        # small and the downside is unbounded. Named below as well, because
+        # protecting a tool needs both halves.
+        "Skill",
         # Lowercase variants for case-insensitive matching
         "read",
         "glob",
         "grep",
+        "skill",
         "write",
         "edit",
         "web_search",
@@ -244,11 +265,15 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
 
 # These excluded web-tool results must remain byte-faithful. Even the
 # excluded-tool lossless fold rewrites formatted JSON.
-# Three independent consumers key off this frozenset, all in
-# transforms/content_router.py: ContentRouter's two per-block CCR-retrieve
-# guards, and _cross_turn_dedup_messages's verbatim_tool_ids -- the latter has
-# no dedicated guard of its own, so removing headroom_retrieve from here would
-# silently reopen the retrieval loop for that path with cross-turn dedup on.
+# Five consumers key off this frozenset, across two modules -- a name added here
+# is protected on every wire shape, not just the one you happened to test:
+# transforms/content_router.py has ContentRouter's two per-block excluded-tool
+# guards (OpenAI chat + Anthropic blocks) and _cross_turn_dedup_messages's
+# verbatim_tool_ids; proxy/handlers/openai.py builds verbatim_excluded_call_ids
+# for the Responses excluded-tool guard and for the Responses dedup's
+# protected_call_ids. The dedup consumers have no dedicated guard of their own,
+# so removing headroom_retrieve from here would silently reopen the retrieval
+# loop for those paths with cross-turn dedup on.
 DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
     {
         "WebSearch",
@@ -260,6 +285,66 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         # line/byte-precise edits against it, and even "lossless" JSON rewrites
         # or cross-turn dedup folds break old_str matching and force re-reads.
         "view",
+    }
+)
+
+# File-READ tools whose output the excluded-tool lossless fold must never
+# REWRITE. A strictly weaker protection than DEFAULT_VERBATIM_EXCLUDE_TOOLS
+# above, and that gap is the whole reason there are two sets: this one gates only
+# the fold, so these tools keep cross-turn dedup and the age-based fall-through.
+#
+# The failure being fixed: a read tool that returns raw file bytes (Codex-style
+# `read`, custom agents, /v1/compress callers naming their own tools) hands
+# `_lossless_compact_excluded` a pretty-printed JSON file, which json-min's it.
+# That fold is data-lossless and the proxy can invert it -- but the inverse runs
+# on OUR side, while the copy that has to match on disk is typed by the MODEL out
+# of the bytes it was SHOWN. It builds `Edit(old_string=...)` from minified JSON,
+# the file on disk is still pretty-printed, the edit misses, and the retry turn
+# costs far more than the fold saved. The log fold (repeats rewritten to
+# `... (repeated N times)`) and the search fold (path hoisted into a heading)
+# destroy an Edit anchor the same way, so this gates the fold as a whole rather
+# than the JSON branch alone. DEFAULT_EXCLUDE_TOOLS has claimed since forever
+# that Read "Returns exact file content needed for Edit tool's old_string
+# matching"; this is what makes that true instead of aspirational.
+#
+# Why NOT just add these to DEFAULT_VERBATIM_EXCLUDE_TOOLS, which would have been
+# the one-line fix: that set also gates cross-turn dedup and the age-based lossy
+# fall-through, and neither shares the failure mode. Dedup replaces a repeat with
+# an in-context pointer to an EARLIER copy that is never rewritten (the
+# keep-earliest invariant in transforms/cross_turn_dedup.py), so the true bytes
+# stay physically in the window for the model to copy from; the fold leaves them
+# nowhere at all. Measured on one file read three times, dedup is worth ~66% of
+# those tokens -- the largest Read-side saving there is, and the one that still
+# fires on Claude Code's `cat -n`-shaped Read output, where the fold never fires
+# in the first place. Buying byte-exactness with dedup would be paying the large
+# bill to plug the small leak. `view` stays in the stricter set above: that was a
+# deliberate, documented call for Copilot and loosening it is not this change's
+# business.
+DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
+    {
+        "Read",
+        "read",
+        # Cursor's `Read` equivalent. Named here for a reason worth stating,
+        # because it is counter-intuitive: adding a read tool to the proxy's
+        # EXCLUDE set to keep it away from lossy compression makes things WORSE
+        # on its own. Exclusion is exactly what routes a tool INTO the
+        # excluded-tool fold, and the pluggable provider on that path is handed
+        # content with no tool name, so it cannot tell a file read from a grep
+        # and will happily rewrite raw source. Protecting a read tool takes
+        # both halves: excluded from the lossy path, and named here to stay out
+        # of the fold. Caught by scripts/verify-lossless-coverage.py in the
+        # partner-trial repo, which reported `read_file` reaching the provider
+        # seam once the plugin started excluding it.
+        "read_file",
+        # Skill bodies. The other half of the protection added above: excluding
+        # `Skill` from the lossy path routes it INTO the excluded-tool fold, and
+        # the fold rewrites what the model is SHOWN. On tool output that is a
+        # fair trade; on a directive it is not, because the folds that collapse
+        # repeated lines or hoist paths into headings can merge two distinct
+        # instructions into one. Skill bodies are prose and fold poorly anyway,
+        # so this costs close to nothing and removes the whole class.
+        "Skill",
+        "skill",
     }
 )
 
@@ -275,7 +360,9 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
     aliases = [name]
     lname = name.lower()
 
-    if lname.startswith("mcp__"):
+    if lname == "headroom_headroom_retrieve":
+        aliases.append("headroom_retrieve")
+    elif lname.startswith("mcp__"):
         # OpenAI-style MCP wrappers use mcp__server__tool. Custom agents that
         # speak Anthropic sometimes emit the same wrapper as mcp_Server_tool.
         parts = name.split("__", 2)
@@ -294,32 +381,78 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
 # Hermes Agent's deferred-tool bridge. Hermes loads on-demand tools via a
 # `tool_search`/`tool_describe`/`tool_call` indirection; on the wire the
 # emitted tool call is named `tool_call` and the REAL tool name lives in the
-# arguments payload (`{"name": "...", "arguments": {...}}`). Tool exclusion /
-# protect lists match on the real name, so we must unwrap this bridge before
-# building the tool_call_id -> name map, or whitelists silently no-op for all
-# deferred tools.
+# arguments payload. Tool exclusion / protect lists match on the real name, so
+# we must unwrap this bridge before building the tool_call_id -> name map, or
+# whitelists silently no-op for all deferred tools.
+#
+# Two payload shapes, mirroring Hermes' own `normalize_tool_call_entries`
+# (tools/tool_search_validation.py):
+#   - batch (advertised): {"calls": [{"name": ..., "arguments": {...}}, ...]}
+#     where `calls` may also arrive as a JSON string or a bare object;
+#   - legacy single:      {"name": ..., "arguments": {...}}.
+# Only the legacy shape was handled before, so once Hermes advertised the
+# batch shape every deferred tool (headroom_retrieve included, #3837) resolved
+# to the wrapper name and its exclusion stopped firing.
 _HERMES_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def _load_json_value(raw: Any) -> Any:
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    return raw
+
+
+def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
+    """Resolve a Hermes deferred ``tool_call`` wrapper to ``(real_name, real_arguments)``.
+
+    Non-wrapper names pass through with their arguments unchanged. A batch
+    resolves when every entry names the same tool (Hermes rejects multi-local
+    batches, so in practice a batch of more than one is connector-only); a
+    mixed batch has no single real name. Malformed or ambiguous wrappers fail
+    open and return ``(name, arguments)`` unchanged (caller decides what that
+    means).
+    """
+    if name != _HERMES_TOOL_CALL_WRAPPER:
+        return name, arguments
+    payload = _load_json_value(arguments)
+    if not isinstance(payload, dict):
+        return name, arguments
+
+    calls = payload.get("calls")
+    if calls is None:
+        entries: list[Any] = [payload]
+    else:
+        calls = _load_json_value(calls)
+        if isinstance(calls, dict):
+            calls = [calls]
+        if not isinstance(calls, list) or not calls:
+            return name, arguments
+        entries = calls
+
+    names: set[str] = set()
+    for entry in entries:
+        inner = entry.get("name") if isinstance(entry, dict) else None
+        if not isinstance(inner, str) or not inner.strip():
+            return name, arguments
+        names.add(inner.strip())
+    if len(names) != 1:
+        return name, arguments
+    real_name = names.pop()
+    # Per-call arguments are only meaningful for a single call; a batch keeps
+    # the wrapper payload so nothing downstream reads one entry as the whole.
+    real_arguments = entries[0].get("arguments") if len(entries) == 1 else arguments
+    return real_name, real_arguments
 
 
 def unwrap_tool_call_name(name: str, arguments: Any) -> str:
     """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
 
-    Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
-    fail open and return the wrapper name (caller decides what that means).
+    See :func:`unwrap_tool_call`; this returns only the name.
     """
-    if name != _HERMES_TOOL_CALL_WRAPPER:
-        return name
-    raw = arguments
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
-            return name
-    if isinstance(raw, dict):
-        inner = raw.get("name")
-        if isinstance(inner, str) and inner.strip():
-            return inner.strip()
-    return name
+    return unwrap_tool_call(name, arguments)[0]
 
 
 def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:
@@ -791,6 +924,22 @@ class CachePrefixMetrics:
 
 
 @dataclass
+class MessageDecision:
+    """Per-message compression decision recorded in diagnostics mode.
+
+    Collected by ContentRouter when ``collect_diagnostics=True`` is passed
+    as a kwarg (set automatically when ``CompressConfig.diagnostics`` is True
+    or ``HEADROOM_DIAGNOSTICS=1`` is set in the environment).
+    """
+
+    message_index: int
+    role: str
+    tokens_before: int
+    tokens_after: int
+    action: str
+
+
+@dataclass
 class TransformResult:
     """Output of a transform operation."""
 
@@ -804,6 +953,7 @@ class TransformResult:
     cache_metrics: CachePrefixMetrics | None = None  # Populated by CacheAligner
     timing: dict[str, float] = field(default_factory=dict)  # transform_name → ms
     waste_signals: WasteSignals | None = None  # Detected waste in original messages
+    message_decisions: list[MessageDecision] = field(default_factory=list)
 
     @property
     def transforms_summary(self) -> dict[str, int]:

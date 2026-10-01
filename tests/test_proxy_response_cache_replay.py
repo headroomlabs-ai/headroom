@@ -59,9 +59,8 @@ class _CapturingHandler(logging.Handler):
 def proxy_log_capture():
     """Capture ``headroom.proxy`` records.
 
-    ``_setup_file_logging`` sets ``propagate = False`` on this logger, so
-    ``caplog`` (which hangs off the root) never sees them — the same reason
-    ``tests/test_anthropic_stage_timings.py`` attaches its own handler.
+    A direct handler keeps this fixture isolated from unrelated propagation
+    mutations elsewhere in the suite.
     """
     target = logging.getLogger("headroom.proxy")
     handler = _CapturingHandler()

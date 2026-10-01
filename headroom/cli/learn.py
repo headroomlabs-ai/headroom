@@ -208,6 +208,11 @@ def learn(
 
     analyzer = SessionAnalyzer(model=resolved_model)
 
+    def _on_progress(detail: str) -> None:
+        # Reuses the exact "  Analyzing with ..." prefix so wrapper UIs that
+        # whitelist known stage-line prefixes keep parsing without changes.
+        click.echo(f"  Analyzing with {resolved_model}... ({detail})")
+
     # Determine which agents to scan
     agent_configs: list[tuple[str, LearnPlugin]] = []
 
@@ -290,7 +295,7 @@ def learn(
                 continue
 
             click.echo(f"  Analyzing with {resolved_model}...")
-            result_data = analyzer.analyze(proj, sessions)
+            result_data = analyzer.analyze(proj, sessions, on_progress=_on_progress)
             total_projects += 1
             total_failures += result_data.total_failures
 
