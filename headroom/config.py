@@ -381,32 +381,78 @@ def _tool_name_aliases(name: str) -> tuple[str, ...]:
 # Hermes Agent's deferred-tool bridge. Hermes loads on-demand tools via a
 # `tool_search`/`tool_describe`/`tool_call` indirection; on the wire the
 # emitted tool call is named `tool_call` and the REAL tool name lives in the
-# arguments payload (`{"name": "...", "arguments": {...}}`). Tool exclusion /
-# protect lists match on the real name, so we must unwrap this bridge before
-# building the tool_call_id -> name map, or whitelists silently no-op for all
-# deferred tools.
+# arguments payload. Tool exclusion / protect lists match on the real name, so
+# we must unwrap this bridge before building the tool_call_id -> name map, or
+# whitelists silently no-op for all deferred tools.
+#
+# Two payload shapes, mirroring Hermes' own `normalize_tool_call_entries`
+# (tools/tool_search_validation.py):
+#   - batch (advertised): {"calls": [{"name": ..., "arguments": {...}}, ...]}
+#     where `calls` may also arrive as a JSON string or a bare object;
+#   - legacy single:      {"name": ..., "arguments": {...}}.
+# Only the legacy shape was handled before, so once Hermes advertised the
+# batch shape every deferred tool (headroom_retrieve included, #3837) resolved
+# to the wrapper name and its exclusion stopped firing.
 _HERMES_TOOL_CALL_WRAPPER = "tool_call"
+
+
+def _load_json_value(raw: Any) -> Any:
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    return raw
+
+
+def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
+    """Resolve a Hermes deferred ``tool_call`` wrapper to ``(real_name, real_arguments)``.
+
+    Non-wrapper names pass through with their arguments unchanged. A batch
+    resolves when every entry names the same tool (Hermes rejects multi-local
+    batches, so in practice a batch of more than one is connector-only); a
+    mixed batch has no single real name. Malformed or ambiguous wrappers fail
+    open and return ``(name, arguments)`` unchanged (caller decides what that
+    means).
+    """
+    if name != _HERMES_TOOL_CALL_WRAPPER:
+        return name, arguments
+    payload = _load_json_value(arguments)
+    if not isinstance(payload, dict):
+        return name, arguments
+
+    calls = payload.get("calls")
+    if calls is None:
+        entries: list[Any] = [payload]
+    else:
+        calls = _load_json_value(calls)
+        if isinstance(calls, dict):
+            calls = [calls]
+        if not isinstance(calls, list) or not calls:
+            return name, arguments
+        entries = calls
+
+    names: set[str] = set()
+    for entry in entries:
+        inner = entry.get("name") if isinstance(entry, dict) else None
+        if not isinstance(inner, str) or not inner.strip():
+            return name, arguments
+        names.add(inner.strip())
+    if len(names) != 1:
+        return name, arguments
+    real_name = names.pop()
+    # Per-call arguments are only meaningful for a single call; a batch keeps
+    # the wrapper payload so nothing downstream reads one entry as the whole.
+    real_arguments = entries[0].get("arguments") if len(entries) == 1 else arguments
+    return real_name, real_arguments
 
 
 def unwrap_tool_call_name(name: str, arguments: Any) -> str:
     """Extract the real tool name from a Hermes deferred ``tool_call`` wrapper.
 
-    Non-wrapper names pass through unchanged. Malformed/unparseable wrappers
-    fail open and return the wrapper name (caller decides what that means).
+    See :func:`unwrap_tool_call`; this returns only the name.
     """
-    if name != _HERMES_TOOL_CALL_WRAPPER:
-        return name
-    raw = arguments
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
-            return name
-    if isinstance(raw, dict):
-        inner = raw.get("name")
-        if isinstance(inner, str) and inner.strip():
-            return inner.strip()
-    return name
+    return unwrap_tool_call(name, arguments)[0]
 
 
 def is_tool_excluded(name: str, exclude_tools: Iterable[str]) -> bool:

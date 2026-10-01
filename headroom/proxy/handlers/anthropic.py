@@ -365,7 +365,9 @@ class AnthropicHandlerMixin:
         (``headroom/memory/storage_router.py``) so CCR and memory always
         agree on which project a request belongs to. Tier order matches:
         ``x-headroom-project-id`` → ``x-headroom-cwd`` → CLI override →
-        ``cwd:`` line in the system prompt.
+        ``cwd:`` line in the system prompt. ``x-headroom-project`` is only a
+        human-readable savings label and is intentionally not an identity
+        signal.
 
         Returns:
             ``(workspace_key, workspace_label)``. If no signal yields a
@@ -1299,7 +1301,8 @@ class AnthropicHandlerMixin:
                 # Per-project memory routing (GH #462). Build the context
                 # once here so save / search / inject all resolve against
                 # the same workspace. Tier order: explicit project-id /
-                # cwd headers → CLI override → system prompt env block.
+                # cwd / project headers → CLI override → system prompt env
+                # block.
                 from headroom.memory.storage_router import (
                     RequestContext as _MemRequestContext,
                 )
@@ -2532,6 +2535,12 @@ class AnthropicHandlerMixin:
                         existing_tools=tools,
                         has_compressed_content_this_turn=injector.has_compressed_content,
                         history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
+                        # `preserve_tool_order` is this handler's existing name
+                        # for "leave the client's tools alone" (bypass, or
+                        # optimization off). Those requests never compress, so
+                        # injecting ahead of a compression that will not happen
+                        # would leave an unredeemable tool in the array.
+                        allow_eager=not preserve_tool_order,
                     )
                     if ccr_tool_injected:
                         logger.debug(
@@ -2588,8 +2597,8 @@ class AnthropicHandlerMixin:
                     elif self.ccr_context_tracker and not ccr_workspace_key:
                         logger.info(
                             f"[{request_id}] CCR: workspace unresolved; skipping "
-                            "track_compression (fail-closed — no x-headroom-cwd / "
-                            "x-headroom-project-id header and no cwd: in system prompt)"
+                            "track_compression (fail-closed — no workspace header "
+                            "and no cwd: in system prompt)"
                         )
 
             # CCR Proactive Expansion: Check if current query needs expanded context.
@@ -2791,6 +2800,7 @@ class AnthropicHandlerMixin:
                     existing_tools=tools,
                     memory_tools_to_inject=memory_tool_defs,
                     inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    client_declared_tools=bool(_original_tools),
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
@@ -3241,7 +3251,27 @@ class AnthropicHandlerMixin:
             # and the prefix is untouched) AND the turn hooks (a hook may rewrite the
             # tools array, and repairing before it validated against a stale view).
             # Nothing past this point mutates `body["tools"]` on the outbound path.
-            from headroom.proxy.helpers import strip_unsupported_tool_search_blocks
+            from headroom.proxy.helpers import (
+                strip_unsupported_tool_search_blocks,
+                strip_unsupported_tool_search_references,
+            )
+
+            # The tools array is repaired first: it shrinks what a history
+            # tool_reference can resolve against, so the block repair below has to
+            # validate against the final view (same reason as the ORDERING note).
+            _ts_tools, _ts_refs_dropped = strip_unsupported_tool_search_references(
+                body.get("tools")
+            )
+            if _ts_refs_dropped:
+                body["tools"] = tools = _ts_tools
+                body_mutation_tracker.mark_mutated("tool_search_reference_repair")
+                transforms_applied.append(f"router:tool_search_ref_repair:{_ts_refs_dropped}refs")
+                logger.info(
+                    "[%s] Tool search: dropped %d unresolvable tool_reference "
+                    "entr(y/ies) naming a typed search tool",
+                    request_id,
+                    _ts_refs_dropped,
+                )
 
             _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
                 body.get("messages"), body.get("tools")
@@ -5100,6 +5130,19 @@ class AnthropicHandlerMixin:
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
 
+                # An untrusted TLS-inspection root is the one failure worth
+                # spelling out: it is environmental, never transient, and the
+                # message names only the certificate issuer and the fix.
+                from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+                # Probe the host that actually failed: `url` is the per-request
+                # upstream (Copilot, a custom gateway) once it has been built;
+                # an exception raised before that point never reached a host.
+                _failed_url = locals().get("url")
+                tls_hint = await describe_upstream_failure_async(
+                    e, _failed_url if isinstance(_failed_url, str) else self.ANTHROPIC_API_URL
+                )
+
                 # Return sanitized error message to client (don't expose internal details)
                 return JSONResponse(
                     status_code=502,
@@ -5107,7 +5150,8 @@ class AnthropicHandlerMixin:
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": "An error occurred while processing your request. Please try again.",
+                            "message": tls_hint
+                            or "An error occurred while processing your request. Please try again.",
                         },
                     },
                 )

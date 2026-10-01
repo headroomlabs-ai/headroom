@@ -12,6 +12,7 @@ from headroom.install.supervisors import (
     _linux_service_unit,
     _linux_task_spec,
     _macos_launchd_plist,
+    _parse_windows_task_xml,
     _register_windows_task,
     _render_unix_runner,
     _render_windows_runner,
@@ -92,6 +93,36 @@ def test_register_windows_task_verifies_queried_logon_type(monkeypatch) -> None:
         "headroom-default-health",
     ]
     assert calls[1] == ["schtasks", "/Query", "/TN", "headroom-default-health", "/XML"]
+
+
+def test_register_windows_task_accepts_mismatched_xml_encoding(monkeypatch) -> None:
+    task_xml = (
+        b'<?xml version="1.0" encoding="UTF-16"?>'
+        b'<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        b"<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
+        b"</Task>"
+    )
+
+    def fake_run(command: list[str], **kwargs):
+        if command[1] == "/Query":
+            return _LaunchctlResult(stdout=task_xml)
+        return _LaunchctlResult()
+
+    monkeypatch.setattr("headroom.install.supervisors.subprocess.run", fake_run)
+
+    _register_windows_task("headroom-default-health", "<Task />", expected_logon_type="S4U")
+
+
+def test_parse_windows_task_xml_accepts_valid_bytes() -> None:
+    task = _parse_windows_task_xml(b"<Task><LogonType>S4U</LogonType></Task>")
+
+    assert task.find("LogonType").text == "S4U"
+
+
+def test_parse_windows_task_xml_accepts_text() -> None:
+    task = _parse_windows_task_xml("<Task><LogonType>InteractiveToken</LogonType></Task>")
+
+    assert task.find("LogonType").text == "InteractiveToken"
 
 
 def test_register_windows_task_rejects_logon_type_downgrade(monkeypatch) -> None:

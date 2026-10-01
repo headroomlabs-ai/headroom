@@ -339,6 +339,8 @@ with a privileged job.
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
+| `HEADROOM_CERT_STORE` | `system,bundled` | Trusted roots for upstream TLS: OS certificate store and/or certifi. See [Corporate Networks](/docs/corporate-networks). |
+| `HEADROOM_CA_BUNDLE` | unset | Extra PEM roots (e.g. a Zscaler root) added to the trusted set. |
 
 ### Performance
 
