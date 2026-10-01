@@ -28,7 +28,8 @@ def perf(hours: float, raw: bool, output_format: str) -> None:
     """Analyze proxy performance from logs.
 
     \b
-    Reads logs from ~/.headroom/logs/proxy.log and shows:
+    Reads logs from ~/.headroom/logs/proxy-*.log (per-worker and per-port,
+    with the legacy proxy.log as a fallback) and shows:
     - Token savings and compression effectiveness
     - Cache hit rates and prefix stability
     - Transform and routing breakdown

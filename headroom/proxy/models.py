@@ -42,6 +42,16 @@ def _qdrant_env_port_or_default() -> int:
         return qdrant_env.DEFAULT_QDRANT_PORT
 
 
+def default_periodic_malloc_trim() -> bool:
+    """Platforms where the periodic allocator trim is on unless opted out.
+
+    Shared by ``ProxyConfig``'s default and by the two call sites that build a
+    config explicitly (``headroom proxy`` and ``_proxy_config_from_env``), so the
+    platform scope cannot drift between them.
+    """
+    return sys.platform in ("darwin", "linux")
+
+
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -319,7 +329,10 @@ class ProxyConfig:
     # Rate limiting
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 60
-    rate_limit_tokens_per_minute: int = 100000
+    # None = no token limit. Before 0.39.0 the token bucket was never consumed,
+    # so an implicit default here throttled every large-context agent session
+    # the moment #3350 started enforcing it. Opt in with --tpm / HEADROOM_TPM.
+    rate_limit_tokens_per_minute: int | None = None
 
     # Retry
     retry_enabled: bool = True
@@ -361,13 +374,29 @@ class ProxyConfig:
     # (repeatable); env: HEADROOM_COMPRESSORS.
     compressors: set[str] | None = None
 
-    # Fallback
-    fallback_enabled: bool = False
-    fallback_provider: str | None = None
-
     # Timeouts
     request_timeout_seconds: int = 300
     connect_timeout_seconds: int = 10
+    # Sending the request is a different operation from waiting for the model to
+    # answer, but `write` used to inherit `request_timeout_seconds`, so pushing
+    # bytes got the same 300s budget as a model thinking. That left the write
+    # phase effectively unbounded in practice: when an upstream stops draining —
+    # a pooled socket whose peer went away over a laptop sleep, a network change,
+    # a NAT timeout — the send blocks until the OS gives up retransmitting
+    # (~180-220s on macOS), which is *under* 300s, so no timeout ever fired and
+    # the proxy hung, retried, and hung again (#3259).
+    #
+    # This bounds the WHOLE body send, not one chunk of it. httpx hands a bytes
+    # body to the transport as a single write, so on HTTP/1.1 the entire upload
+    # runs inside one timer -- measured: a 16MB body against a peer draining
+    # steadily at ~1MB/s raises WriteTimeout at exactly the configured bound,
+    # healthy peer or not. On HTTP/2 the body is split by flow control and the
+    # waiting-for-window part is charged to `read`, so only real socket writes
+    # count against it. The default has to clear the slower of those two while
+    # staying under the OS retransmit ceiling that made the inherited 300s
+    # unreachable: 150s carries a 15MB body -- the largest #3259 reports -- over
+    # a ~1 Mbps uplink, and still fires well before the OS gives up at ~180s.
+    write_timeout_seconds: int = 150
     # Anthropic buffered reads can legitimately run longer than the generic
     # proxy request cap. Keep the generic timeout unchanged elsewhere.
     anthropic_buffered_request_timeout_seconds: int = 600
@@ -450,12 +479,13 @@ class ProxyConfig:
     # Periodic allocator trim. Long-lived proxies processing large concurrent
     # request bodies ratchet RSS through freed-but-retained allocator pages;
     # this returns them to the OS (malloc_zone_pressure_relief on macOS,
-    # malloc_trim on glibc). Default-on only on macOS, where the retained-page
-    # ratchet is the documented failure (#2820); an opt-in elsewhere via
-    # HEADROOM_MALLOC_TRIM=1 so glibc deployments do not silently take on a
-    # once-a-minute allocator purge they did not ask for. Envs:
-    # HEADROOM_MALLOC_TRIM=0/1, HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
-    periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
+    # malloc_trim on glibc). Default-on where a trim call exists: macOS, where
+    # the retained-page ratchet was first documented (#2820), and glibc Linux,
+    # which ratchets the same way (a coding-agent session took one proxy to
+    # 100 GB RSS on a 128 GB host with the trim off). Platforms without a trim
+    # call disable the task themselves. Envs: HEADROOM_MALLOC_TRIM=0/1,
+    # HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = field(default_factory=default_periodic_malloc_trim)
     malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments

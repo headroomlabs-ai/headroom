@@ -20,6 +20,7 @@ from ..models import (
     ToolCall,
 )
 from ..writer import ClaudeCodeWriter, ContextWriter
+from ._paths import path_exists as _path_exists
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +88,12 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                 if _path_exists(claude_md):
                     context_file = claude_md
 
+            # `entry` itself stats fine (its parent is ours) but a project dir
+            # left behind by a root-run session is not traversable, so stat-ing
+            # anything under it raises PermissionError. Treat that as absent.
             memory_dir = entry / "memory"
-            memory_file = memory_dir / "MEMORY.md" if memory_dir.exists() else None
-            if memory_file and not memory_file.exists():
+            memory_file = memory_dir / "MEMORY.md" if _path_exists(memory_dir) else None
+            if memory_file and not _path_exists(memory_file):
                 memory_file = None
 
             jsonl_files = list(entry.glob("*.jsonl"))
@@ -366,23 +370,6 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
 # =============================================================================
 # Path Decode Helpers (Claude Code specific)
 # =============================================================================
-
-
-def _path_exists(path: Path) -> bool:
-    """Like ``Path.exists()`` but treats an unreadable path as absent.
-
-    ``_decode_project_path`` probes speculative candidate paths (e.g.
-    ``/home/marco/rocha`` when reconstructing ``/home/marco-rocha/...``). A
-    candidate can collide with another user's directory whose parent isn't
-    stat-able, and ``Path.exists()`` calls ``os.stat`` which then raises
-    ``PermissionError`` instead of returning ``False`` — crashing the whole
-    ``learn`` command (issue #2443). Match ``_greedy_path_decode``'s existing
-    ``OSError`` handling and treat any such error as "does not exist".
-    """
-    try:
-        return path.exists()
-    except OSError:
-        return False
 
 
 def _decode_windows_path(drive: str, parts: list[str]) -> Path | None:

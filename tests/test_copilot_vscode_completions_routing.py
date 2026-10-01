@@ -408,7 +408,7 @@ def test_a_copilot_upstream_is_authenticated(monkeypatch: pytest.MonkeyPatch, ur
         token = "test-copilot-token"
 
     class _Provider:
-        async def get_api_token(self):  # noqa: ANN202
+        async def get_api_token(self, *, integration_id=None):  # noqa: ANN001, ANN202
             return _Token()
 
     monkeypatch.setattr(copilot_auth, "get_copilot_token_provider", lambda: _Provider())
@@ -424,7 +424,7 @@ def test_a_non_copilot_upstream_is_never_given_copilot_credentials(
     """The widened gate must not start handing Copilot tokens to other hosts."""
 
     class _Provider:
-        async def get_api_token(self):  # noqa: ANN202
+        async def get_api_token(self, *, integration_id=None):  # noqa: ANN001, ANN202
             raise AssertionError("must not mint a Copilot token for a non-Copilot host")
 
     monkeypatch.setattr(copilot_auth, "get_copilot_token_provider", lambda: _Provider())
@@ -522,7 +522,7 @@ def test_an_operator_override_gateway_receives_credentials(
         token = "test-copilot-token"
 
     class _Provider:
-        async def get_api_token(self):  # noqa: ANN202
+        async def get_api_token(self, *, integration_id=None):  # noqa: ANN001, ANN202
             return _Token()
 
     monkeypatch.setenv("GITHUB_COPILOT_PROXY_URL", "https://gw.corp.internal")

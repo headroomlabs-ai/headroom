@@ -177,3 +177,24 @@ def test_check_rust_core_returns_loaded_when_extension_present(
     status, error = server._check_rust_core()
     assert status == "loaded"
     assert error is None
+
+
+def test_proxy_refuses_marker_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A loadable but stale extension is still a required-core failure."""
+    import sys
+    from types import SimpleNamespace
+
+    from headroom.proxy import server
+
+    monkeypatch.delenv("HEADROOM_REQUIRE_RUST_CORE", raising=False)
+    original = sys.modules.get("headroom._core")
+    sys.modules["headroom._core"] = SimpleNamespace(hello=lambda: "stale-core")
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            server._check_rust_core()
+        assert exc_info.value.code == 78
+    finally:
+        if original is None:
+            sys.modules.pop("headroom._core", None)
+        else:
+            sys.modules["headroom._core"] = original

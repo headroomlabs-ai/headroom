@@ -284,7 +284,7 @@ def test_real_tool_use_stream_reconstructs_tool_input() -> None:
     # id/name/input and the real `caller` field is dropped on reconstruction.
     # Out of scope here (this is fidelity, not a shape crash); see the
     # `server_tool_use` cases below for the copy-through path itself.
-    assert "caller" not in block
+    assert block["caller"] == {"type": "direct"}
 
 
 def test_real_thinking_stream_reconstructs_both_blocks() -> None:
