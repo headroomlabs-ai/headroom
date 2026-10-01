@@ -33,10 +33,10 @@ jobs:
       run:
         working-directory: plugins/opencode
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: ">=24.16.0 <25"
           cache: npm
           cache-dependency-path: plugins/opencode/package-lock.json
       - run: npm ci
