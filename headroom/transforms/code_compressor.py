@@ -16,7 +16,7 @@ Supported Languages (Tier 1):
 - Python, JavaScript, TypeScript
 
 Supported Languages (Tier 2):
-- Go, Rust, Java, C, C++, C#, PHP, Ruby
+ - Go, Rust, Java, C, C++, C#, PHP, Ruby
 - Bash (validated and preserved losslessly)
 
 Compression Strategy:

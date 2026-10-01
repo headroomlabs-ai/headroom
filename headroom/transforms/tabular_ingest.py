@@ -62,9 +62,21 @@ class TabularCompressionResult:
 
 
 def parse_csv(content: str, delimiter: str = ",") -> tuple[list[str], list[list[str]]]:
-    """Parse delimited text via the stdlib csv reader."""
+    """Parse delimited text via the stdlib csv reader.
+
+    Returns no rows when the reader refuses the text. The one that reaches real
+    content is ``csv.field_size_limit``, 128 KB per cell by default: a single
+    pasted document or base64 blob in one column raises
+    ``Error: field larger than field limit (131072)`` for the whole file.
+    Raising that limit is process-global state a library should not be setting
+    on its host, so the table is treated as non-tabular instead and the caller
+    passes the text through verbatim, as it already does for a ragged table.
+    """
     reader = csv.reader(io.StringIO(content), delimiter=delimiter)
-    parsed = [row for row in reader if any(cell.strip() for cell in row)]
+    try:
+        parsed = [row for row in reader if any(cell.strip() for cell in row)]
+    except csv.Error:
+        return [], []
     if not parsed:
         return [], []
     headers = [h.strip() for h in parsed[0]]
@@ -140,6 +152,11 @@ def parse_tabular(
     # didn't (#1652). Treat them as non-tabular and pass through verbatim.
     width = len(headers)
     if any(len(row) != width for row in rows):
+        return None
+    # The detector finds fixed-width columns by single-space gutters, but the
+    # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
+    # one cell per line. That is not a table; leave it verbatim.
+    if fmt == "fixed_width" and width < 2:
         return None
     return headers, rows, fmt
 

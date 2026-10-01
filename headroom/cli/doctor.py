@@ -25,7 +25,11 @@ import click
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
-from headroom.install.paths import claude_settings_path, codex_config_path
+from headroom.install.paths import (
+    claude_settings_path,
+    codex_config_path,
+    codex_project_config_path,
+)
 from headroom.install.state import list_manifests
 from headroom.paths import savings_path
 from headroom.providers.claude import (
@@ -41,6 +45,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
+from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
@@ -115,6 +120,166 @@ def check_proxy_liveness(livez: dict[str, Any] | None, base_url: str) -> CheckRe
         status=PASS,
         summary=f"running at {base_url} ({uptime_text}, {format_version_label(version)})",
     )
+
+
+def note_live_proxy_elsewhere(check: CheckResult, live_port: int | None) -> CheckResult:
+    """Point an unreachable-proxy row at a live Headroom proxy on another port."""
+    if live_port is None or check.status == PASS:
+        return check
+    check.summary += f"; a Headroom proxy IS running on port {live_port}"
+    check.hint = (
+        f"re-run with: headroom doctor --port {live_port} "
+        f"(or export HEADROOM_PORT={live_port}); to use port {live_port} from agents, "
+        f"re-run `headroom wrap <agent> --port {live_port}` / `headroom init --port {live_port} "
+        "<agent>`"
+    )
+    return check
+
+
+def check_proxy_readiness(
+    livez: dict[str, Any] | None, readyz: dict[str, Any] | None, base_url: str
+) -> CheckResult:
+    """Is the live proxy also *ready* (``/readyz``: upstream reachable, warmed up)?
+
+    ``/livez`` only proves the event loop answers. ``/readyz`` answers 503 --
+    which the probe reports as ``None`` -- while the upstream check fails or
+    startup work is pending, so a live-but-unready proxy is a WARN, not a FAIL.
+    """
+    name = "readiness"
+    if livez is None:
+        return CheckResult(name=name, status=SKIP, summary="proxy not reachable")
+    if readyz is not None and (readyz.get("ready") or readyz.get("status") == "healthy"):
+        return CheckResult(name=name, status=PASS, summary="/readyz reports ready")
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary="proxy is live but /readyz is not ready (upstream unreachable or still starting)",
+        hint=f"inspect component state: curl {base_url}/health",
+    )
+
+
+_HOOK_MARKERS = {"claude": "headroom-init-claude", "codex": "headroom-init-codex"}
+
+
+def _hook_commands(payload: Any) -> list[str]:
+    """Every ``command`` string under a Claude/Codex-style ``hooks`` mapping."""
+    commands: list[str] = []
+    hooks = payload.get("hooks") if isinstance(payload, dict) else None
+    if not isinstance(hooks, dict):
+        return commands
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            items = entry.get("hooks") if isinstance(entry, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict) and item.get("command"):
+                        commands.append(str(item["command"]))
+            elif isinstance(entry, dict) and entry.get("command"):
+                commands.append(str(entry["command"]))
+    return commands
+
+
+def _missing_hook_executable(command: str) -> str | None:
+    """The hook command's program when it no longer resolves, else None."""
+    import shlex
+    import shutil
+
+    try:
+        tokens = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    program = tokens[0].strip('"')
+    if Path(program).exists() or shutil.which(program):
+        return None
+    return program
+
+
+def check_installed_hooks(expected: Sequence[tuple[str, str, Path, str]]) -> CheckResult:
+    """Are the hooks ``headroom init`` installed still present and runnable?
+
+    ``expected`` holds ``(agent, scope_label, hooks_file, init_command)`` for
+    each agent an init deployment manifest says was configured. A missing
+    hook means the proxy is never auto-started for new sessions; a hook whose
+    program vanished (uninstalled venv, moved checkout) fails silently.
+    """
+    name = "hooks"
+    if not expected:
+        return CheckResult(name=name, status=SKIP, summary="no `headroom init` hooks expected")
+    problems: list[str] = []
+    fixes: list[str] = []
+    installed: list[str] = []
+    for agent, scope, path, fix in expected:
+        marker = _HOOK_MARKERS.get(agent, f"headroom-init-{agent}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            problems.append(f"{agent} ({scope}): could not parse {path}")
+            fixes.append(fix)
+            continue
+        commands = [cmd for cmd in _hook_commands(payload) if marker in cmd]
+        if not commands:
+            problems.append(f"{agent} ({scope}): no Headroom hook in {path}")
+            fixes.append(fix)
+            continue
+        missing = {prog for cmd in commands if (prog := _missing_hook_executable(cmd))}
+        if missing:
+            problems.append(
+                f"{agent} ({scope}): hook program not found: {', '.join(sorted(missing))}"
+            )
+            fixes.append(fix)
+            continue
+        installed.append(f"{agent} ({scope})")
+    if problems:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="; ".join(problems),
+            hint="re-install with: " + " && ".join(dict.fromkeys(fixes)),
+        )
+    return CheckResult(name=name, status=PASS, summary="installed for " + ", ".join(installed))
+
+
+def expected_init_hooks(
+    manifests: Sequence[Any], cwd: Path | None = None
+) -> list[tuple[str, str, Path, str]]:
+    """Hook files ``headroom init`` should have written, from its deployment manifests."""
+    from headroom.install.paths import codex_hooks_path
+
+    from .init import _GLOBAL_PROFILE, _local_profile
+
+    root = cwd or Path.cwd()
+    try:
+        local_profile = _local_profile(root)
+    except Exception:  # noqa: BLE001 - odd cwd names must not crash doctor
+        local_profile = None
+    expected: list[tuple[str, str, Path, str]] = []
+    for manifest in manifests:
+        profile = getattr(manifest, "profile", "")
+        if profile == _GLOBAL_PROFILE:
+            scope, flag = "user", " -g"
+        elif local_profile is not None and profile == local_profile:
+            scope, flag = "project", ""
+        else:
+            continue
+        port = getattr(manifest, "port", 8787)
+        port_flag = f" --port {port}" if port != 8787 else ""
+        for agent in getattr(manifest, "targets", []) or []:
+            if agent == "claude":
+                path = (
+                    claude_settings_path()
+                    if scope == "user"
+                    else root / ".claude" / "settings.local.json"
+                )
+            elif agent == "codex":
+                path = codex_hooks_path() if scope == "user" else root / ".codex" / "hooks.json"
+            else:
+                continue
+            expected.append((agent, scope, path, f"headroom init{flag}{port_flag} {agent}"))
+    return expected
 
 
 def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckResult:
@@ -400,36 +565,65 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
     )
 
 
-def check_codex_routing(config_path: Path, port: int) -> CheckResult:
+def codex_active_base_url(text: str) -> tuple[str, str | None]:
+    """Return ``(provider_id, base_url)`` for the active Codex provider in ``text``."""
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    provider_id = active_match.group(1) if active_match else "headroom"
+    return provider_id, _codex_provider_base_url(text, provider_id)
+
+
+def check_codex_routing(
+    config_path: Path,
+    port: int,
+    project_config_paths: Sequence[Path] | None = None,
+) -> CheckResult:
     """Is Codex configured to route through the proxy?
 
     Detection prefers the active ``model_provider`` section's loopback
     ``base_url``, while retaining the ``[model_providers.headroom]`` fallback
     emitted by persistent and wrap installs. Best-effort matching keeps
     malformed TOML a WARN instead of a crash.
+
+    ``config_path`` is the user config (``$CODEX_HOME/config.toml``, so a
+    relocated Codex home is inspected rather than ``~/.codex``). Codex layers a
+    trusted project's ``.codex/config.toml`` over it, and ``headroom init
+    codex`` without ``-g`` writes there, so project candidates are consulted
+    first and the summary names the file that supplied the routing.
     """
     name = "codex"
-    if not config_path.exists():
+    candidates = [*(project_config_paths or []), config_path]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
         return CheckResult(
             name=name,
             status=WARN,
-            summary="not routed (no ~/.codex/config.toml)",
+            summary=f"not routed (no {config_path})",
             hint="wrap it: headroom wrap codex",
         )
-    try:
-        text = config_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return CheckResult(name=name, status=WARN, summary=f"could not read {config_path}: {exc}")
-    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
-    provider_id = active_match.group(1) if active_match else "headroom"
-    base_url = _codex_provider_base_url(text, provider_id)
-    if base_url is None:
+    first_error: CheckResult | None = None
+    found: tuple[Path, str, str, str] | None = None
+    for candidate in existing:
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            first_error = first_error or CheckResult(
+                name=name, status=WARN, summary=f"could not read {candidate}: {exc}"
+            )
+            continue
+        provider_id, base_url = codex_active_base_url(text)
+        if base_url is not None:
+            found = (candidate, text, provider_id, base_url)
+            break
+    if found is None:
+        if first_error is not None:
+            return first_error
         return CheckResult(
             name=name,
             status=WARN,
             summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
+    config_path, text, provider_id, base_url = found
     routing = _classify_routing_url(name, base_url, port, source=str(config_path))
     if routing.status != PASS:
         return routing
@@ -480,6 +674,167 @@ def _codex_block_missing_openai_auth(
         return codex_uses_chatgpt_auth(config_path.parent / "auth.json")
     except Exception:  # pragma: no cover - never let a doctor check crash
         return False
+
+
+def check_trust_policy(policy: Mapping[str, Any]) -> CheckResult:
+    """Which certificates the proxy trusts for its upstream connections.
+
+    Corporate TLS inspection (Zscaler, Netskope, ...) re-signs every upstream
+    certificate with a company root that IT installs in the OS store. The proxy
+    only accepts it when the OS store is in use or the root is supplied as a
+    bundle, so this line answers "will Headroom trust what my network presents?"
+    """
+    replacement = policy.get("replacement_bundle")
+    additive = policy.get("additive_bundles") or []
+    extras = ", ".join(f"{b['env_var']}={b['path']}" for b in additive)
+    if replacement:
+        return CheckResult(
+            name="tls trust",
+            status=PASS,
+            summary=f"only {replacement['env_var']}={replacement['path']}",
+            hint=(
+                f"{replacement['env_var']} replaces every other trust source; the OS "
+                "certificate store is not consulted. Unset it to trust the OS store."
+            ),
+        )
+    if policy.get("system_store_active"):
+        sources = "OS certificate store" + (
+            " + certifi" if "bundled" in policy.get("cert_store", []) else ""
+        )
+        return CheckResult(
+            name="tls trust",
+            status=PASS,
+            summary=sources + (f" + {extras}" if extras else ""),
+        )
+    reason = (
+        "HEADROOM_CERT_STORE excludes 'system'"
+        if policy.get("system_store_available")
+        else "the truststore package is not installed"
+    )
+    return CheckResult(
+        name="tls trust",
+        status=WARN,
+        summary="certifi bundle only" + (f" + {extras}" if extras else ""),
+        hint=(
+            f"The OS certificate store is not used ({reason}), so a corporate "
+            "TLS-inspection root is only trusted if you pass it via HEADROOM_CA_BUNDLE."
+        ),
+    )
+
+
+def check_proxy_env(environ: Mapping[str, str]) -> CheckResult | None:
+    """Warn when an HTTP(S) proxy would capture the agent's loopback traffic."""
+    from headroom.proxy.tls_diagnostics import loopback_no_proxy_gap
+
+    gap = loopback_no_proxy_gap(environ)
+    if gap is None:
+        return None
+    return CheckResult(
+        name="proxy env",
+        status=WARN,
+        summary=f"{gap} is set but NO_PROXY does not exempt 127.0.0.1/localhost",
+        hint=(
+            "Agents may send their requests to Headroom through the corporate proxy, "
+            "which cannot reach this machine. `headroom wrap` fixes this for the "
+            "processes it launches; for other setups add "
+            "NO_PROXY=127.0.0.1,localhost,::1."
+        ),
+    )
+
+
+# (label, url, required). Required endpoints fail the check; the rest only warn
+# because Headroom degrades (no ML compression, estimated token counts) rather
+# than breaking when they are unreachable.
+NETWORK_ENDPOINTS: tuple[tuple[str, str, bool], ...] = (
+    ("api.anthropic.com", "https://api.anthropic.com/v1/models", True),
+    ("api.openai.com", "https://api.openai.com/v1/models", True),
+    ("api.githubcopilot.com", "https://api.githubcopilot.com/models", False),
+    ("huggingface.co (models)", "https://huggingface.co/api/models?limit=1", False),
+    (
+        "openaipublic (tiktoken)",
+        "https://openaipublic.blob.core.windows.net/encodings/",
+        False,
+    ),
+)
+
+
+def check_network_endpoints(reports: Sequence[Any], required: set[str]) -> list[CheckResult]:
+    """Turn :class:`EndpointReport`s into doctor rows, plus an IT summary row."""
+    results: list[CheckResult] = []
+    vendors: set[str] = set()
+    failing_hosts: list[str] = []
+    for report in reports:
+        vendor = report.chain.inspection_vendor
+        if vendor:
+            vendors.add(vendor)
+        inspected = f"; TLS inspected by {vendor}" if vendor else ""
+        host = urlsplit_host(report.url)
+        if report.ok:
+            results.append(
+                CheckResult(
+                    name=f"net {report.name}",
+                    status=PASS,
+                    summary=(
+                        f"reachable, certificate trusted (HTTP {report.status}, "
+                        f"{report.elapsed_ms:.0f} ms){inspected}"
+                    ),
+                )
+            )
+            continue
+        failing_hosts.append(host)
+        status = FAIL if report.name in required else WARN
+        if report.block_page:
+            summary = f"blocked by a network gateway (HTTP {report.status}){inspected}"
+        elif report.chain.issuer and "verify" in (report.error or "").lower():
+            summary = f"certificate not trusted (issued by {report.chain.issuer})"
+        else:
+            summary = (report.error or "unreachable").split(". ")[0][:160]
+        results.append(
+            CheckResult(
+                name=f"net {report.name}", status=status, summary=summary, hint=report.error
+            )
+        )
+    if failing_hosts:
+        who = " / ".join(sorted(vendors)) or "your TLS-inspection gateway"
+        results.append(
+            CheckResult(
+                name="it request",
+                status=WARN,
+                summary=f"{len(failing_hosts)} endpoint(s) need a network change",
+                hint=(
+                    f"Text for your IT team: Headroom (a local AI coding proxy) needs HTTPS "
+                    f"access to {', '.join(failing_hosts)}. Either confirm the {who} root "
+                    "certificate is deployed to the operating system certificate store on "
+                    "developer machines, or exempt these domains from TLS inspection and "
+                    "cloud-app blocking. Please do not exempt 'python' as a process; the "
+                    "certificate fix is sufficient."
+                ),
+            )
+        )
+    return results
+
+
+def urlsplit_host(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).hostname or url
+
+
+def run_network_probes(extra_urls: Sequence[str]) -> tuple[list[Any], set[str]]:
+    """Probe every endpoint concurrently; returns (reports, required names)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from headroom.proxy.tls_diagnostics import probe_endpoint
+
+    targets = [(label, url) for label, url, _ in NETWORK_ENDPOINTS]
+    required = {label for label, _, req in NETWORK_ENDPOINTS if req}
+    for url in extra_urls:
+        label = urlsplit_host(url)
+        targets.append((label, url))
+        required.add(label)
+    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        reports = list(pool.map(lambda t: probe_endpoint(*t), targets))
+    return reports, required
 
 
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
@@ -579,6 +934,48 @@ def check_savings(stats: dict[str, Any] | None, savings_file: Path) -> CheckResu
     if freshness:
         summary += f" — last request {freshness}"
     return CheckResult(name=name, status=PASS, summary=f"{summary} ({source})")
+
+
+def check_kompress_health(health: dict[str, Any] | None) -> CheckResult:
+    """Report whether the optional Kompress model can actually run.
+
+    ``/livez`` only proves that the proxy process is alive, and ``/stats``
+    cannot distinguish a healthy zero-savings workload from a cold Kompress
+    model. The health payload has the component-level readiness state needed
+    to explain the "ML extras installed, but every request passes through"
+    failure mode.
+    """
+    name = "kompress"
+    if health is None:
+        return CheckResult(name=name, status=SKIP, summary="proxy health endpoint not reachable")
+
+    checks = health.get("checks")
+    component = checks.get(name) if isinstance(checks, dict) else None
+    if not isinstance(component, dict):
+        return CheckResult(
+            name=name,
+            status=WARN,
+            summary="proxy does not report Kompress readiness (older version?)",
+            hint="restart the proxy on the current version",
+        )
+
+    if not bool(component.get("enabled", True)):
+        return CheckResult(name=name, status=PASS, summary="disabled")
+
+    backend = component.get("backend")
+    backend_text = f" ({backend})" if backend else ""
+    if bool(component.get("ready")):
+        return CheckResult(name=name, status=PASS, summary=f"ready{backend_text}")
+
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary=f"not ready{backend_text} — content compression is passing through",
+        hint=(
+            "pre-download the Kompress model and retry; inspect /debug/warmup "
+            "for the resolved load state"
+        ),
+    )
 
 
 def check_budget(stats: dict[str, Any] | None) -> CheckResult:
@@ -709,7 +1106,23 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
-def doctor(port: int, emit_json: bool) -> None:
+@click.option(
+    "--network",
+    is_flag=True,
+    help=(
+        "Also test HTTPS to the provider APIs and model hosts: who signed the "
+        "certificate (Zscaler, Netskope, ...), whether Headroom trusts it, and "
+        "whether a gateway block page is in the way."
+    ),
+)
+@click.option(
+    "--network-url",
+    "network_urls",
+    multiple=True,
+    metavar="URL",
+    help="Extra upstream URL to test with --network (repeatable), e.g. a custom gateway.",
+)
+def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, ...]) -> None:
     """Check that the Headroom proxy and client routing are working.
 
     \b
@@ -720,13 +1133,28 @@ def doctor(port: int, emit_json: bool) -> None:
     """
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
+    readyz = probe_json(f"{base_url}/readyz", timeout=3.0) if livez else None
+    health = probe_json(f"{base_url}/health", timeout=5.0) if livez else None
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
     installed = get_version()
+    manifests = list_manifests()
+    live_elsewhere = None
+    if livez is None:
+        # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
+        # deployment manifests, the project's wrap marker), probed in parallel.
+        live_elsewhere = find_live_proxy_elsewhere(
+            port,
+            manifests=manifests,
+            probe=lambda p: is_headroom_livez(
+                probe_json(f"http://127.0.0.1:{p}/livez", timeout=0.5)
+            ),
+        )
 
     project_claude_settings = Path.cwd() / ".claude" / "settings.json"
     project_local_claude_settings = Path.cwd() / ".claude" / "settings.local.json"
     checks = [
-        check_proxy_liveness(livez, base_url),
+        note_live_proxy_elsewhere(check_proxy_liveness(livez, base_url), live_elsewhere),
+        check_proxy_readiness(livez, readyz, base_url),
         check_version_drift(livez, installed),
         check_claude_routing(
             claude_settings_path(),
@@ -734,11 +1162,28 @@ def doctor(port: int, emit_json: bool) -> None:
             [project_local_claude_settings, project_claude_settings],
         ),
         check_wrap_marker_staleness(project_local_claude_settings),
-        check_codex_routing(codex_config_path(), port),
+        check_codex_routing(codex_config_path(), port, [codex_project_config_path()]),
+        check_installed_hooks(expected_init_hooks(manifests)),
         check_shell_env(os.environ, port),
+        check_kompress_health(health),
         check_savings(stats, savings_path()),
         check_budget(stats),
     ]
+    from headroom.proxy.ssl_context import describe_trust_policy
+
+    # Prefer the running proxy's own policy (its env can differ from this
+    # shell's under launchd/systemd); fall back to what this shell would use.
+    proxy_tls = ((health or {}).get("config") or {}).get("tls")
+    trust_row = check_trust_policy(proxy_tls or describe_trust_policy())
+    if not proxy_tls:
+        trust_row.summary += " (this shell; proxy not reporting)"
+    checks.append(trust_row)
+    proxy_env_check = check_proxy_env(os.environ)
+    if proxy_env_check is not None:
+        checks.append(proxy_env_check)
+    if network or network_urls:
+        reports, required = run_network_probes(network_urls)
+        checks.extend(check_network_endpoints(reports, required))
     auth_conflict_check = check_claude_auth_conflict(
         claude_settings_path(),
         project_claude_settings,
@@ -758,7 +1203,7 @@ def doctor(port: int, emit_json: bool) -> None:
     desktop_check = check_claude_desktop(claude_desktop_config_dir())
     if desktop_check is not None:
         checks.append(desktop_check)
-    deployments = check_deployments(list_manifests())
+    deployments = check_deployments(manifests)
     if deployments is not None:
         checks.append(deployments)
 

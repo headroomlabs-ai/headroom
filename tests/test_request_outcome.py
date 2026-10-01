@@ -417,8 +417,8 @@ async def test_funnel_emits_perf_log_with_canonical_shape(
     tok_after, tok_saved, cache_read, cache_write, cache_hit_pct,
     opt_ms, transforms — in that order, space-separated."""
     h = _FunnelHarness()
-    # Direct handler attach: caplog otherwise drops propagation-disabled
-    # records (the proxy disables ``headroom.*`` propagation once started).
+    # Direct handler attach keeps capture isolated from unrelated propagation
+    # mutations elsewhere in the suite.
     target = logging.getLogger("headroom.proxy")
     captured: list[logging.LogRecord] = []
 

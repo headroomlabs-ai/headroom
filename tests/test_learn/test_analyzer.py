@@ -15,6 +15,7 @@ from headroom.learn.analyzer import (
     _call_cli_llm,
     _call_llm,
     _detect_default_model,
+    _output_snippet,
     _parse_llm_response,
     _resolve_timeout_secs,
     _strip_fenced_json,
@@ -970,6 +971,31 @@ class TestCallCliLlm:
         ):
             with pytest.raises(RuntimeError, match="unparseable output"):
                 _call_cli_llm("test digest", "claude-cli")
+
+    def test_claude_cli_unparseable_result_shows_both_ends(self):
+        # A head-only excerpt of a long answer is valid-looking JSON in every
+        # case; the reason it did not parse -- truncated mid-value, or prose
+        # after the closing fence -- is only visible at the end.
+        payload = '```json\n{"context_file_rules": [' + '{"section": "x"}, ' * 400 + "]}\n```"
+        payload += "\n\nLet me know if you want this in another shape!"
+        with patch(
+            "headroom.learn.analyzer.subprocess.Popen",
+            _fake_claude_popen(stdout_lines=[_result_event(payload)]),
+        ):
+            with pytest.raises(RuntimeError) as exc_info:
+                _call_cli_llm("test digest", "claude-cli")
+        message = str(exc_info.value)
+        assert "unparseable output" in message
+        assert "```json" in message, "head is missing"
+        assert "another shape" in message, "tail is missing"
+        assert "chars omitted" in message
+        # Still bounded: the excerpt cannot grow with the payload.
+        assert len(message) < len(payload)
+
+    def test_output_snippet_leaves_short_output_alone(self):
+        assert _output_snippet("short") == "short"
+        edge = "x" * 2000
+        assert _output_snippet(edge) == edge
 
     def test_claude_cli_not_installed_raises(self):
         popen = MagicMock(side_effect=FileNotFoundError("No such file or directory: 'claude'"))

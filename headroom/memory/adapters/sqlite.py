@@ -9,6 +9,7 @@ Provides persistent storage for Memory objects with full support for:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
@@ -20,6 +21,8 @@ from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
@@ -73,15 +76,20 @@ class SQLiteMemoryStore:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -550,9 +558,22 @@ class SQLiteMemoryStore:
                 # while blocking malicious attempts like "'] OR 1=1--"
                 if not _validate_metadata_key(key):
                     continue
-                # Use JSON extraction for metadata filtering
+                # Use JSON extraction for metadata filtering.
+                #
+                # ``json_extract`` returns a NATIVE SQLite value (INTEGER / REAL /
+                # TEXT), so a scalar filter must bind the native Python value.
+                # Binding ``json.dumps(value)`` instead compared the numeric/boolean
+                # column against its text form ("5", "true") — and SQLite never
+                # equates ``5 = '5'`` — so an int/float/bool metadata filter matched
+                # nothing. ``bool`` is a subclass of ``int``, so it is covered here
+                # (a JSON ``true`` extracts to 1, and Python ``True`` binds to 1).
+                # A non-scalar value (dict/list) is not a bindable SQLite type, so it
+                # keeps the JSON-text comparison rather than raising.
                 conditions.append(f"json_extract(metadata, '$.{key}') = ?")
-                params.append(json.dumps(value) if not isinstance(value, str) else value)
+                if isinstance(value, (str, int, float)):
+                    params.append(value)
+                else:
+                    params.append(json.dumps(value))
 
         return conditions, params
 
