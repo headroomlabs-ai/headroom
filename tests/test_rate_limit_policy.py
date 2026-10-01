@@ -57,6 +57,46 @@ def test_consume_from_bucket_denies_and_reports_wait_time() -> None:
     assert wait_seconds == 0.5
 
 
+def test_consume_from_bucket_admits_request_larger_than_bucket_once_full() -> None:
+    # 0.39.0 enforced TPM with a 100k default; a 232k-token coding-agent turn
+    # was refused forever with a Retry-After that never came true.
+    allowed, remaining, wait_seconds = consume_from_bucket(
+        available_tokens=100_000,
+        requested_tokens=232_000,
+        rate_per_minute=100_000,
+    )
+
+    assert allowed is True
+    assert remaining == -132_000
+    assert wait_seconds == 0
+
+
+def test_consume_from_bucket_oversized_request_waits_only_for_a_full_bucket() -> None:
+    allowed, remaining, wait_seconds = consume_from_bucket(
+        available_tokens=40_000,
+        requested_tokens=232_000,
+        rate_per_minute=100_000,
+    )
+
+    assert allowed is False
+    assert remaining == 40_000
+    assert wait_seconds == 36
+
+
+def test_consume_from_bucket_debt_delays_the_next_request() -> None:
+    # Charged in full, so the average rate holds: after the 232k request the
+    # next small one waits out the 132k debt plus its own tokens.
+    allowed, remaining, wait_seconds = consume_from_bucket(
+        available_tokens=-132_000,
+        requested_tokens=1_000,
+        rate_per_minute=100_000,
+    )
+
+    assert allowed is False
+    assert remaining == -132_000
+    assert wait_seconds == 79.8
+
+
 def test_stale_bucket_keys_returns_only_old_buckets() -> None:
     assert stale_bucket_keys(
         {"fresh": 950, "edge": 400, "stale": 399},

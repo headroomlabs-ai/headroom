@@ -356,9 +356,54 @@ async def test_prometheus_metrics_reads_late_configured_otel_metrics() -> None:
         await metrics.record_rate_limited(provider="anthropic", model="claude-sonnet")
 
         assert spy.failed_calls == [{"provider": "openai", "model": None}]
-        assert spy.rate_limited_calls == [{"provider": "anthropic", "model": "claude-sonnet"}]
+        # ``source`` reaches OTel too — the split must not exist in Prometheus only.
+        assert spy.rate_limited_calls == [
+            {"provider": "anthropic", "model": "claude-sonnet", "source": "headroom"}
+        ]
     finally:
         reset_otel_metrics()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_forwards_rate_limit_source_to_otel() -> None:
+    """An upstream 429 must reach OTel labelled as upstream, not as our own limiter."""
+
+    spy = _SpyProxyMetrics()
+    metrics = PrometheusMetrics(stateless=True)
+    set_otel_metrics(spy)  # type: ignore[arg-type]
+
+    try:
+        await metrics.record_rate_limited(provider="anthropic", source="upstream")
+        await metrics.record_rate_limited(provider="anthropic", source="headroom")
+        # An unrecognised value is clamped rather than exported as a new label.
+        await metrics.record_rate_limited(provider="anthropic", source="nonsense")
+
+        assert [call["source"] for call in spy.rate_limited_calls] == [
+            "upstream",
+            "headroom",
+            "headroom",
+        ]
+    finally:
+        reset_otel_metrics()
+
+
+def test_otel_rate_limited_counter_carries_source_attribute() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_proxy_rate_limited(provider="anthropic", source="upstream")
+    otel_metrics.record_proxy_rate_limited(provider="openai", source="headroom")
+
+    metrics = _collect_metrics(reader)
+    upstream = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="anthropic", source="upstream"
+    )
+    headroom_side = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="openai", source="headroom"
+    )
+    assert upstream.value == 1
+    assert headroom_side.value == 1
 
 
 @pytest.mark.asyncio

@@ -102,14 +102,31 @@ class BackendResolver:
     def default(self) -> Any:
         return self._default
 
-    def for_request(self, request: Any, *, body: dict | None = None) -> Any:
-        """The backend to serve this request. Falls back to the default."""
+    def for_request(
+        self,
+        request: Any,
+        *,
+        body: dict | None = None,
+        native_providers: tuple[str, ...] = _NATIVE,
+    ) -> Any:
+        """The backend to serve this request. Falls back to the default.
+
+        ``native_providers`` names the provider(s) whose wire format the caller
+        already holds, so no translating backend is needed. It defaults to
+        ``_NATIVE`` (``anthropic``) for the Anthropic handler, whose body is
+        Anthropic-shaped. The OpenAI handler passes ``("openai",)``: for an
+        OpenAI-shape request, *anthropic* is NOT native — it needs the litellm
+        openai->anthropic translation — so a Claude target must not be
+        short-circuited to the default backend. One proxy instance serves both
+        wires from a single shared resolver, so native-ness cannot live on the
+        resolver; it must be supplied per dispatch site.
+        """
         advice = advice_from(request)
         if advice is None:
             return self._default
 
         provider = advice.provider or _provider_of(advice.model)
-        if not provider or provider in _NATIVE:
+        if not provider or provider in native_providers:
             # Same protocol the proxy already speaks -- a `body["model"]`
             # rewrite is enough and the extension has already done it. Nothing
             # to switch.
