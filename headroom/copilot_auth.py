@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -25,6 +26,7 @@ from headroom import paths
 from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+from headroom.proxy import ssl_context as proxy_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,15 @@ _OAUTH_TOKEN_KEYS = (
     "accessToken",
 )
 _EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry", "expires")
+
+
+def _urlopen(request: urllib_request.Request, *, timeout: float) -> Any:
+    """Open a GitHub request with Headroom's configured corporate trust roots."""
+
+    context = proxy_ssl_context.build_urlopen_context()
+    if context is not None:
+        return urllib_request.urlopen(request, timeout=timeout, context=context)
+    return urllib_request.urlopen(request, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -623,6 +634,39 @@ def read_headroom_copilot_oauth_token() -> str | None:
     return token.strip() if isinstance(token, str) and token.strip() else None
 
 
+def _write_private_text(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path`` so it is never world/group readable.
+
+    The token file holds a GitHub Copilot OAuth refresh token. Rather than
+    create-or-narrow the destination in place — which fails *open* if a pre-write
+    ``chmod`` is refused (the secret still lands in a wide file), and is exposed
+    to a symlink/path-replacement race between the check and the ``open`` — write
+    the secret to a fresh private temp file and atomically rename it into place:
+
+    * ``tempfile.mkstemp`` creates the temp with ``0o600`` and ``O_EXCL`` (it
+      never follows a symlink and never reuses an attacker-planted file), so the
+      secret is private from birth.
+    * ``os.replace`` swaps it into place atomically; the destination inherits the
+      temp's ``0o600`` mode. The existing file is never opened, ``chmod``-ed, or
+      truncated, so a permission/platform error fails **closed** — it raises
+      before the old file is touched (old contents preserved) and the temp is
+      cleaned up, rather than leaving a secret in a readable file.
+
+    On Windows POSIX bits do not apply, but ``mkstemp`` still restricts the file
+    to the owner and ``os.replace`` is atomic.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def save_headroom_copilot_oauth_token(
     token: str,
     *,
@@ -643,11 +687,7 @@ def save_headroom_copilot_oauth_token(
         "domain": _github_oauth_domain(domain),
         "created_at": int(time.time()),
     }
-    path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    _write_private_text(path, json.dumps(body, indent=2, sort_keys=True) + "\n")
     return path
 
 
@@ -672,7 +712,7 @@ def start_copilot_device_authorization(
         },
         method="POST",
     )
-    with urllib_request.urlopen(request, timeout=timeout) as response:
+    with _urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8", errors="replace"))
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -710,7 +750,7 @@ def poll_copilot_device_authorization(
             },
             method="POST",
         )
-        with urllib_request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
         if not isinstance(payload, dict):
             raise RuntimeError("GitHub device authorization returned an invalid response.")
@@ -778,7 +818,9 @@ def read_cached_oauth_token() -> str | None:
     return None
 
 
-def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+def iter_oauth_token_candidates(
+    *, include_platform_secret_stores: bool = True
+) -> list[CopilotTokenCandidate]:
     """Return reusable token candidates in safest-first discovery order."""
 
     candidates: list[CopilotTokenCandidate] = []
@@ -804,6 +846,38 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 )
             )
 
+    if include_platform_secret_stores:
+        candidates.extend(_platform_secret_store_oauth_token_candidates())
+
+    candidates.extend(_read_file_oauth_token_candidates())
+
+    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
+        token = os.environ.get(env_var, "").strip()
+        if token:
+            candidates.append(
+                CopilotTokenCandidate(
+                    token=token,
+                    source=f"env:{env_var}",
+                    confidence="generic-github",
+                )
+            )
+
+    gh_token = _read_gh_cli_oauth_token()
+    if gh_token:
+        candidates.append(
+            CopilotTokenCandidate(
+                token=gh_token,
+                source="gh-cli",
+                confidence="generic-github",
+            )
+        )
+
+    return _dedupe_token_candidates(candidates)
+
+
+def _platform_secret_store_oauth_token_candidates() -> list[CopilotTokenCandidate]:
+    """Return OAuth candidates from platform credential stores."""
+    candidates: list[CopilotTokenCandidate] = []
     windows_copilot_token = _read_windows_copilot_cli_oauth_token()
     if windows_copilot_token:
         candidates.append(
@@ -833,31 +907,7 @@ def iter_oauth_token_candidates() -> list[CopilotTokenCandidate]:
                 confidence="high",
             )
         )
-
-    candidates.extend(_read_file_oauth_token_candidates())
-
-    for env_var in _GENERIC_GITHUB_TOKEN_ENV_VARS:
-        token = os.environ.get(env_var, "").strip()
-        if token:
-            candidates.append(
-                CopilotTokenCandidate(
-                    token=token,
-                    source=f"env:{env_var}",
-                    confidence="generic-github",
-                )
-            )
-
-    gh_token = _read_gh_cli_oauth_token()
-    if gh_token:
-        candidates.append(
-            CopilotTokenCandidate(
-                token=gh_token,
-                source="gh-cli",
-                confidence="generic-github",
-            )
-        )
-
-    return _dedupe_token_candidates(candidates)
+    return candidates
 
 
 def _read_file_oauth_token_candidates() -> list[CopilotTokenCandidate]:
@@ -1123,9 +1173,34 @@ def resolve_subscription_bearer_token_details() -> CopilotSubscriptionTokenResol
                 api_url=_subscription_api_url_from_user_info_payload(payload),
             )
 
-    for candidate in iter_oauth_token_candidates():
+    attempted_tokens: set[str] = set()
+    resolution = _resolve_subscription_oauth_token_candidates(
+        iter_oauth_token_candidates(include_platform_secret_stores=False),
+        attempted_tokens=attempted_tokens,
+    )
+    if resolution is not None:
+        return resolution
+
+    return _resolve_subscription_oauth_token_candidates(
+        [
+            candidate
+            for candidate in _platform_secret_store_oauth_token_candidates()
+            if candidate.token not in attempted_tokens
+        ]
+    )
+
+
+def _resolve_subscription_oauth_token_candidates(
+    candidates: list[CopilotTokenCandidate],
+    *,
+    attempted_tokens: set[str] | None = None,
+) -> CopilotSubscriptionTokenResolution | None:
+    """Return the first candidate GitHub accepts for subscription APIs."""
+    for candidate in candidates:
         if not candidate.validate_for_subscription:
             continue
+        if attempted_tokens is not None:
+            attempted_tokens.add(candidate.token)
         if _is_copilot_api_token(candidate.token):
             payload = _fetch_copilot_user_info(candidate.token)
             if payload is not None:
@@ -1351,7 +1426,7 @@ def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
     headers = _copilot_token_exchange_headers(token)
     request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
     try:
-        with urllib_request.urlopen(request, timeout=10.0) as response:
+        with _urlopen(request, timeout=10.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         logger.debug("Unable to resolve Copilot API URL from user info: %s", exc)
@@ -1467,7 +1542,7 @@ class CopilotTokenProvider:
     def _exchange_token_sync(headers: dict[str, str]) -> dict[str, Any]:
         request = urllib_request.Request(_token_exchange_url(), headers=headers, method="GET")
         try:
-            with urllib_request.urlopen(request, timeout=10.0) as response:
+            with _urlopen(request, timeout=10.0) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 if not isinstance(payload, dict):
                     return {}
