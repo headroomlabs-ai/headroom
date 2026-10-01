@@ -38,6 +38,11 @@ DIRECT_ENCODED_QUERY_STREAM_URL = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _allow_fake_plugin_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.example")
+
+
 def _config() -> ProxyConfig:
     return ProxyConfig(
         optimize=False,
@@ -403,6 +408,37 @@ def test_native_streaming_preserves_query_and_adds_sse_once(
     assert response.status_code == 200, response.text
     assert response.content == b"data: query\n\n"
     assert captured["url"] == expected_url
+
+
+@pytest.mark.parametrize(
+    ("path", "handler_name"),
+    [
+        ("/v1beta/models/gemini-2.5-flash:generateContent", "handle_gemini_generate_content"),
+        (
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            "handle_gemini_stream_generate_content",
+        ),
+        ("/v1beta/models/gemini-2.5-flash:countTokens", "handle_gemini_count_tokens"),
+    ],
+    ids=["generate", "stream", "count"],
+)
+def test_native_gemini_routes_reject_loopback_custom_base_before_handler(
+    monkeypatch: pytest.MonkeyPatch, path: str, handler_name: str
+) -> None:
+    monkeypatch.delenv("HEADROOM_ALLOWED_BASE_URLS", raising=False)
+    app = create_app(_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        handler = AsyncMock(return_value=JSONResponse({"ok": True}))
+        setattr(proxy, handler_name, handler)
+        response = client.post(
+            path,
+            headers={"x-headroom-base-url": "http://127.0.0.1:12345"},
+            json={"contents": []},
+        )
+
+    assert response.status_code == 400
+    handler.assert_not_awaited()
 
 
 def test_gemini_count_tokens_follows_the_same_tagged_upstream() -> None:

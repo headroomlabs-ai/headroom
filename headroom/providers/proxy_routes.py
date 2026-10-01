@@ -137,6 +137,9 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
         handler_kwargs: dict[str, str] = {}
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base and spec.supports_custom_base_url:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             handler_kwargs["upstream_base_url"] = custom_base.rstrip("/")
         if spec.path_param is None:
             return await handler(request, **handler_kwargs)
