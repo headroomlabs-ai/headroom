@@ -13,11 +13,14 @@ JSON file holding a top-level ``mcpServers`` object::
       }
     }
 
-The on-disk location has moved between Antigravity releases — community
-install guides cite both ``~/.gemini/antigravity/mcp_config.json`` (the
-current documented location) and ``~/.gemini/config/mcp_config.json`` —
-so this registrar probes the known candidates in order and uses the first
-one that exists, falling back to the current location when none does yet.
+The on-disk location has moved between Antigravity releases — Google's
+current Antigravity codelab identifies ``~/.gemini/config/mcp_config.json``
+as the active Desktop config, while older guides cite
+``~/.gemini/antigravity/mcp_config.json`` — so this registrar treats the
+former as authoritative: it probes the known candidates in order and uses
+the first one that exists, falling back to the current location when none
+does yet. Uninstall removes the entry from every candidate that still holds
+it, so a stale duplicate in the legacy location can never survive.
 
 Only global configuration is supported: Antigravity does not read
 per-project MCP files.
@@ -39,11 +42,11 @@ logger = logging.getLogger(__name__)
 
 
 def _config_candidates(home: Path) -> list[Path]:
-    """Known Antigravity MCP config locations, newest first."""
+    """Known Antigravity MCP config locations, current first."""
     gemini_dir = home / ".gemini"
     return [
-        gemini_dir / "antigravity" / "mcp_config.json",
         gemini_dir / "config" / "mcp_config.json",
+        gemini_dir / "antigravity" / "mcp_config.json",
     ]
 
 
@@ -76,7 +79,12 @@ class AntigravityRegistrar(MCPRegistrar):
 
     def detect(self) -> bool:
         home = self._home
-        if (home / ".gemini" / "antigravity").is_dir():
+        gemini_dir = home / ".gemini"
+        if (gemini_dir / "antigravity").is_dir():
+            return True
+        # The current Desktop config lives directly under ~/.gemini/config;
+        # an install that has not created its MCP file yet still counts.
+        if (gemini_dir / "config").is_dir():
             return True
         return any(candidate.exists() for candidate in _config_candidates(home))
 
@@ -127,17 +135,25 @@ class AntigravityRegistrar(MCPRegistrar):
         return RegisterResult(RegisterStatus.REGISTERED, f"{verb} {spec.name} in {config_path}")
 
     def unregister_server(self, server_name: str) -> bool:
-        config_path = self._resolve_config()
-        data = self._load_config()
-        if not isinstance(data, dict):
-            return False
-        servers = data.get("mcpServers")
-        if not isinstance(servers, dict) or server_name not in servers:
-            return False
-        del servers[server_name]
-        try:
-            fsutil.write_text(config_path, json.dumps(data, indent=2) + "\n")
-        except OSError:
+        removed = False
+        for config_path in _config_candidates(self._home):
+            if not config_path.exists():
+                continue
+            data = self._load_config(config_path)
+            if not isinstance(data, dict):
+                # Refuse to touch a file that does not parse — the same rule
+                # register_server follows — and keep checking the rest.
+                continue
+            servers = data.get("mcpServers")
+            if not isinstance(servers, dict) or server_name not in servers:
+                continue
+            del servers[server_name]
+            try:
+                fsutil.write_text(config_path, json.dumps(data, indent=2) + "\n")
+            except OSError:
+                continue
+            removed = True
+        if not removed:
             return False
         # Antigravity caches each MCP server under ~/.gemini/<surface>/mcp/;
         # a removed entry keeps loading from cache until that directory goes.
@@ -148,17 +164,17 @@ class AntigravityRegistrar(MCPRegistrar):
                 pass
         return True
 
-    def _load_config(self) -> dict[str, Any] | None:
-        """Load the resolved config file.
+    def _load_config(self, config_path: Path | None = None) -> dict[str, Any] | None:
+        """Load a config file, defaulting to the resolved one.
 
         Returns ``None`` when the file does not exist or does not parse;
         callers distinguish those cases via :meth:`_resolve_config` + exists.
         """
-        config_path = self._resolve_config()
-        if not config_path.exists():
+        path = config_path if config_path is not None else self._resolve_config()
+        if not path.exists():
             return None
         try:
-            data = json.loads(fsutil.read_text(config_path))
+            data = json.loads(fsutil.read_text(path))
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return None
         return data if isinstance(data, dict) else None
