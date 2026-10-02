@@ -571,3 +571,495 @@ class TestGeminiWriter:
         assert len(result.files_written) == 1
         # Dry run should NOT create the file
         assert not (tmp_path / "GEMINI.md").exists()
+
+    def test_writer_respects_custom_target(self, tmp_path):
+        proj = ProjectInfo(name="test", project_path=tmp_path, data_path=tmp_path)
+        recs = [
+            Recommendation(
+                target=RecommendationTarget.CONTEXT_FILE,
+                section="Commands",
+                content="- Run with rtk",
+            ),
+        ]
+        writer = GeminiWriter(context_target="AGENTS.md")
+        result = writer.write(recs, proj, dry_run=False)
+
+        assert len(result.files_written) == 1
+        assert result.files_written[0].name == "AGENTS.md"
+        assert (tmp_path / "AGENTS.md").exists()
+        assert "Run with rtk" in (tmp_path / "AGENTS.md").read_text()
+
+
+# =============================================================================
+# Google Antigravity Discovery & Parsing
+# =============================================================================
+
+
+def _setup_antigravity_dir(
+    tmp_path: Path,
+    app_type: str = "antigravity-cli",
+    conv_id: str = "conv-abc-123",
+) -> tuple[Path, Path]:
+    """Create ~/.gemini/<app>/brain/<conv_id>/.system_generated/logs/ structure."""
+    gemini_dir = tmp_path / ".gemini"
+    logs_dir = gemini_dir / app_type / "brain" / conv_id / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True)
+    return gemini_dir, logs_dir
+
+
+class TestAntigravityDiscoveryAndParsing:
+    def test_detects_antigravity_cli(self, tmp_path):
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-cli")
+        (logs_dir / "transcript.jsonl").write_text('{"step_index":0}\n')
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        assert scanner.detect() is True
+
+    def test_detects_antigravity_ide(self, tmp_path):
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-ide")
+        (logs_dir / "transcript.jsonl").write_text('{"step_index":0}\n')
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        assert scanner.detect() is True
+
+    def test_discovers_antigravity_project_from_cwd(self, tmp_path):
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        (project_dir / "AGENTS.md").write_text("# Existing Agents\n")
+
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-cli")
+        lines = [
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>\nFix bug\n</USER_REQUEST>",
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": "npm test", "Cwd": str(project_dir)},
+                        }
+                    ],
+                }
+            ),
+        ]
+        (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].project_path == project_dir
+        assert projects[0].name == "my-project"
+        assert projects[0].context_file == project_dir / "AGENTS.md"
+
+    def test_scans_antigravity_transcript_tool_calls_and_errors(self, tmp_path):
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-cli")
+        lines = [
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>\nRun lint\n</USER_REQUEST>",
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "content": "Running lint now",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": "npm run lint", "Cwd": str(project_dir)},
+                        }
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "ERROR",
+                    "content": "ESLint output (JSON parse failed: EOF while parsing a value)",
+                }
+            ),
+        ]
+        (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+        assert len(projects) == 1
+
+        sessions = scanner.scan_project(projects[0])
+        assert len(sessions) == 1
+        assert len(sessions[0].tool_calls) == 1
+        tc = sessions[0].tool_calls[0]
+        assert tc.name == "Bash"
+        assert tc.is_error is True
+        assert "npm run lint" in str(tc.input_data)
+        user_events = [e for e in sessions[0].events if e.type == "user_message"]
+        assert len(user_events) == 1
+        assert user_events[0].text == "Run lint"
+
+    def test_scan_skips_malformed_transcript_lines(self, tmp_path):
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-cli")
+        lines = [
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>\nRun lint\n</USER_REQUEST>",
+                }
+            ),
+            '{"step_index": 1, "source": "MODEL", "type": "PLAN',
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": "npm run lint", "Cwd": str(project_dir)},
+                        }
+                    ],
+                }
+            ),
+            # Partially written final line of a live append-only transcript
+            '{"step_index": 3, "source": "MODEL", "type": "GEN',
+        ]
+        (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+        assert len(projects) == 1
+
+        sessions = scanner.scan_project(projects[0])
+        assert len(sessions) == 1
+        assert len(sessions[0].tool_calls) == 1
+        assert "npm run lint" in str(sessions[0].tool_calls[0].input_data)
+        user_events = [e for e in sessions[0].events if e.type == "user_message"]
+        assert [e.text for e in user_events] == ["Run lint"]
+
+    def test_discovers_antigravity_project_from_workspace_mapping(self, tmp_path):
+        project_dir = tmp_path / "workspace-proj"
+        project_dir.mkdir()
+
+        gemini_dir, logs_dir = _setup_antigravity_dir(tmp_path, "antigravity-ide")
+        lines = [
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "content": f"Active workspaces:\n{project_dir} -> MyCorpus\n",
+                }
+            ),
+        ]
+        (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].project_path == project_dir
+        assert projects[0].name == "workspace-proj"
+
+    def test_single_project_shared_across_gemini_cli_and_antigravity_cli_and_ide(self, tmp_path):
+        project_dir = tmp_path / "shared-proj"
+        project_dir.mkdir()
+        (project_dir / "AGENTS.md").write_text("# Shared Project Agents\n")
+
+        gemini_dir = tmp_path / ".gemini"
+
+        # 1. Legacy Gemini CLI session
+        chats_dir = gemini_dir / "tmp" / "hash-proj" / "chats"
+        chats_dir.mkdir(parents=True)
+        session_json = {
+            "id": "gemini-cli-sess-1",
+            "cwd": str(project_dir),
+            "messages": [
+                {"role": "user", "parts": [{"text": "run test"}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "run_shell_command",
+                                "args": {"command": "npm test"},
+                            }
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": "run_shell_command",
+                                "response": {"output": "pass"},
+                            }
+                        }
+                    ],
+                },
+            ],
+        }
+        (chats_dir / "session-1.json").write_text(json.dumps(session_json))
+
+        # 2. Two Antigravity CLI conversations
+        for conv in ("conv-cli-1", "conv-cli-2"):
+            logs_dir = (
+                gemini_dir / "antigravity-cli" / "brain" / conv / ".system_generated" / "logs"
+            )
+            logs_dir.mkdir(parents=True)
+            lines = [
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "content": f"CLI task in {conv}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "npm test", "Cwd": str(project_dir)},
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Tests passed",
+                    }
+                ),
+            ]
+            (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        # 3. Two Antigravity IDE conversations
+        for conv in ("conv-ide-1", "conv-ide-2"):
+            logs_dir = (
+                gemini_dir / "antigravity-ide" / "brain" / conv / ".system_generated" / "logs"
+            )
+            logs_dir.mkdir(parents=True)
+            lines = [
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "source": "USER_EXPLICIT",
+                        "content": f"IDE task in {conv}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "source": "MODEL",
+                        "tool_calls": [
+                            {
+                                "name": "run_command",
+                                "args": {"CommandLine": "npm run build", "Cwd": str(project_dir)},
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "GENERIC",
+                        "source": "MODEL",
+                        "status": "DONE",
+                        "content": "Build succeeded",
+                    }
+                ),
+            ]
+            (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+
+        # Exactly 1 project discovered, with aggregated source paths
+        assert len(projects) == 1
+        proj = projects[0]
+        assert proj.project_path == project_dir
+        assert len(proj.data_paths) == 3
+        assert chats_dir in proj.data_paths
+        assert (gemini_dir / "antigravity-cli" / "brain") in proj.data_paths
+        assert (gemini_dir / "antigravity-ide" / "brain") in proj.data_paths
+
+        # Scan project aggregates all 5 sessions across all 3 locations
+        sessions = scanner.scan_project(proj)
+        assert len(sessions) == 5
+
+        # All session IDs must be unique
+        session_ids = [s.session_id for s in sessions]
+        assert len(set(session_ids)) == 5
+        assert ".system_generated" not in session_ids
+
+        # All tool call IDs must be unique
+        all_tool_call_ids = [tc.tool_call_id for s in sessions for tc in s.tool_calls]
+        assert len(all_tool_call_ids) == 5
+        assert len(set(all_tool_call_ids)) == 5
+
+    def test_distinct_session_and_tool_call_ids_across_conversations_and_sources(self, tmp_path):
+        project_dir = tmp_path / "id-test-proj"
+        project_dir.mkdir()
+        gemini_dir = tmp_path / ".gemini"
+
+        # Setup identical conversation subfolder names across different sources (CLI vs IDE)
+        # to ensure the source prefix disambiguates them.
+        for app in ("antigravity-cli", "antigravity-ide"):
+            for conv in ("conv-shared", "conv-extra"):
+                logs_dir = gemini_dir / app / "brain" / conv / ".system_generated" / "logs"
+                logs_dir.mkdir(parents=True)
+                lines = [
+                    json.dumps(
+                        {
+                            "step_index": 0,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "content": "task",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "PLANNER_RESPONSE",
+                            "source": "MODEL",
+                            "tool_calls": [
+                                {
+                                    "name": "run_command",
+                                    "args": {"CommandLine": "ls", "Cwd": str(project_dir)},
+                                },
+                                {
+                                    "name": "run_command",
+                                    "args": {"CommandLine": "pwd", "Cwd": str(project_dir)},
+                                },
+                            ],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 2,
+                            "type": "GENERIC",
+                            "source": "MODEL",
+                            "status": "DONE",
+                            "content": "ok",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 3,
+                            "type": "GENERIC",
+                            "source": "MODEL",
+                            "status": "DONE",
+                            "content": "ok",
+                        }
+                    ),
+                ]
+                (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        projects = scanner.discover_projects()
+        assert len(projects) == 1
+
+        sessions = scanner.scan_project(projects[0])
+        assert len(sessions) == 4
+
+        # Distinct session IDs derived from conversation and source
+        session_ids = [s.session_id for s in sessions]
+        assert len(set(session_ids)) == 4
+        assert ".system_generated" not in session_ids
+        assert "antigravity-cli_conv-shared" in session_ids
+        assert "antigravity-ide_conv-shared" in session_ids
+
+        # Distinct tool call IDs
+        call_ids = [tc.tool_call_id for s in sessions for tc in s.tool_calls]
+        assert len(call_ids) == 8
+        assert len(set(call_ids)) == 8
+
+    def test_discovery_skips_non_object_records_without_error(self, tmp_path):
+        project_dir = tmp_path / "resilient-proj"
+        project_dir.mkdir()
+
+        gemini_dir, logs_dir = _setup_antigravity_dir(
+            tmp_path, "antigravity-cli", "conv-corrupt-start"
+        )
+        # Prepend null, string, number, array, boolean records before valid step
+        lines = [
+            "null",
+            '"just a bare string"',
+            "42",
+            "[1, 2, 3]",
+            "true",
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Hello",
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": "make test", "Cwd": str(project_dir)},
+                        }
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "source": "MODEL",
+                    "status": "DONE",
+                    "content": "Pass",
+                }
+            ),
+        ]
+        (logs_dir / "transcript.jsonl").write_text("\n".join(lines))
+
+        scanner = GeminiScanner(gemini_dir=gemini_dir)
+        # Must not raise AttributeError: 'NoneType' object has no attribute 'get'
+        projects = scanner.discover_projects()
+        assert len(projects) == 1
+        assert projects[0].project_path == project_dir
+
+        sessions = scanner.scan_project(projects[0])
+        assert len(sessions) == 1
+        assert len(sessions[0].tool_calls) == 1
+        assert sessions[0].tool_calls[0].name == "Bash"

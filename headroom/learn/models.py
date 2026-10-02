@@ -134,6 +134,11 @@ class ProjectInfo:
     data_path: Path  # Where conversation logs are stored
     context_file: Path | None = None  # CLAUDE.md / .cursorrules / AGENTS.md
     memory_file: Path | None = None  # MEMORY.md or equivalent
+    data_paths: list[Path] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.data_paths and self.data_path:
+            self.data_paths = [self.data_path]
 
 
 # =============================================================================
