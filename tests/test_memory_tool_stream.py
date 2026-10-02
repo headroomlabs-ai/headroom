@@ -383,3 +383,254 @@ class TestContinuationEdgeCases:
         events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
         deltas = [e for e in events if e["type"] == "message_delta"]
         assert deltas[0]["usage"]["output_tokens"] == 10
+
+
+class TestFrameParsingEdgeCases:
+    """Frames the filter cannot interpret pass through to the client untouched."""
+
+    @pytest.mark.parametrize(
+        "frame",
+        [
+            b": keep-alive\n\n",
+            b"event: ping\n\n",
+            b"event: content_block_delta\ndata: {not json\n\n",
+            b"event: content_block_delta\ndata: [1, 2]\n\n",
+            b'event: ping\ndata: {"type": "ping"}\n\n',
+            b'event: content_block_delta\ndata: {"type": "content_block_delta", "index": "0"}\n\n',
+        ],
+    )
+    def test_uninterpretable_frame_is_forwarded_verbatim(self, frame: bytes) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        assert flt.feed(frame) == [frame]
+
+    def test_hidden_call_with_non_object_input_is_not_run(self) -> None:
+        raw = _sse([SAVE], "tool_use").replace(
+            json.dumps(json.dumps(SAVE["input"])).encode(), json.dumps("[1]").encode(), 1
+        )
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(raw)
+        assert flt.hid_tool_calls
+        assert flt.hidden_calls() == []
+
+    def test_hidden_call_with_input_in_its_start_frame(self) -> None:
+        raw = b"".join(
+            [
+                _frame({"type": "content_block_start", "index": 0, "content_block": SAVE}),
+                _frame({"type": "content_block_stop", "index": 0}),
+            ]
+        )
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        assert flt.feed(raw) == []
+        assert flt.hidden_calls() == [SAVE]
+
+    def test_message_delta_without_stop_reason_keeps_none(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_frame({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}))
+        assert flt.stop_reason is None
+
+    def test_unterminated_trailing_frame_is_flushed_with_the_tail(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT], "end_turn"))
+        flt.feed(b"event: ping\ndata: {")
+        assert flt.closing_frames()[-1] == b"event: ping\ndata: {"
+        assert flt.closing_frames()[-1] != b"event: ping\ndata: {"
+
+
+class TestUpstreamErrorFrame:
+    def test_anthropic_error_envelope_passes_through(self) -> None:
+        from headroom.proxy.handlers.streaming import _upstream_error_frame
+
+        envelope = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+        [event] = _events(_upstream_error_frame(json.dumps(envelope).encode(), "req-1"))
+        assert event == envelope
+
+    @pytest.mark.parametrize(
+        "body", [b"<html>Bad Gateway</html>", b"\xff\xfe", b'{"detail": "nope"}']
+    )
+    def test_other_bodies_become_the_public_error(self, body: bytes) -> None:
+        from headroom.proxy.handlers.streaming import _upstream_error_frame
+
+        raw = _upstream_error_frame(body, "req-1")
+        assert raw.startswith(b"event: error\n")
+        [event] = _events(raw)
+        assert event["type"] == "error"
+        assert body.decode("utf-8", "replace") not in json.dumps(event)
+
+
+class TestContinuationFallbacks:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outbound", [b"not json", json.dumps({"model": "claude-test", "messages": "hi"}).encode()]
+    )
+    async def test_unreadable_request_body_ends_the_turn_after_running_calls(
+        self, outbound: bytes
+    ) -> None:
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+
+        events = await _drain(
+            proxy._continue_memory_tool_stream(
+                flt,
+                response,
+                url="https://api.anthropic.com/v1/messages",
+                outbound_headers={"x-api-key": "sk-test"},
+                outbound_bytes=outbound,
+                memory_user_id="user-1",
+                memory_request_ctx=None,
+                server_memory_tool_names=MEMORY_TOOLS,
+                stream_state={},
+                request_id="test-mem",
+            )
+        )
+
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        assert proxy.http_client.send.await_count == 0
+        assert events[0]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_round_limit_stops_continuing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([], SAVE_RESULT)
+        monkeypatch.setattr(type(proxy), "_MEMORY_CONTINUATION_MAX_ROUNDS", 0)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+
+        events = await _drain(_continue(proxy, flt, response))
+
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        assert proxy.http_client.send.await_count == 0
+        assert events[0]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_failed_continuation_round_sends_an_error_event(self) -> None:
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([], SAVE_RESULT)
+        failed = MagicMock()
+        failed.status_code = 529
+        envelope = {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}
+        failed.aread = AsyncMock(return_value=json.dumps(envelope).encode())
+        failed.aclose = AsyncMock()
+        proxy.http_client.send = AsyncMock(return_value=failed)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+
+        events = await _drain(_continue(proxy, flt, response))
+
+        assert proxy.http_client.send.await_count == 1
+        assert events == [envelope]
+        failed.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_calls_are_not_run_without_a_memory_user(self) -> None:
+        proxy = _proxy([], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT, SAVE], "tool_use"))
+
+        events = await _drain(
+            proxy._continue_memory_tool_stream(
+                flt,
+                None,
+                url="https://api.anthropic.com/v1/messages",
+                outbound_headers={"x-api-key": "sk-test"},
+                outbound_bytes=b"{}",
+                memory_user_id=None,
+                memory_request_ctx=None,
+                server_memory_tool_names=MEMORY_TOOLS,
+                stream_state={},
+                request_id="test-mem",
+            )
+        )
+
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+        assert events[0]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_round_without_usage_still_continues(self) -> None:
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([_sse([{"type": "text", "text": "Saved."}], "end_turn")], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+        response.pop("usage", None)
+
+        events = await _drain(_continue(proxy, flt, response))
+
+        assert proxy.http_client.send.await_count == 1
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saved."]
+        assert events[-2]["delta"]["stop_reason"] == "end_turn"
+
+
+class TestStreamingMemoryFallbacks:
+    @pytest.mark.asyncio
+    async def test_client_handled_memory_calls_still_run_without_server_tools(self) -> None:
+        raw = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([raw], SAVE_RESULT)
+        proxy.memory_handler.has_memory_tool_calls = MagicMock(return_value=True)
+        events = await _client_view(proxy)
+
+        assert events == _events(raw)
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("server_tools", [MEMORY_TOOLS, frozenset()])
+    async def test_subscription_credential_error_ends_the_message(
+        self, server_tools: frozenset[str]
+    ) -> None:
+        refusal = {
+            "type": "text",
+            "text": "This credential is only authorized for use with Claude Code.",
+        }
+        proxy = _proxy([_sse([refusal], "end_turn")], SAVE_RESULT)
+        events = await _client_view(proxy, server_memory_tool_names=server_tools)
+
+        assert proxy.http_client.send.await_count == 1
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+        assert [e["type"] for e in events][-2:] == ["message_delta", "message_stop"]
+
+    @pytest.mark.asyncio
+    async def test_buffer_cap_still_runs_withheld_calls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.helpers as helpers
+
+        proxy = _proxy([_sse([TEXT, SAVE], "tool_use")], SAVE_RESULT)
+        monkeypatch.setattr(helpers, "MAX_SSE_BUFFER_SIZE", 64)
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        assert not any(e.get("content_block", {}).get("type") == "tool_use" for e in events)
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        assert proxy.http_client.send.await_count == 1
+        deltas = [e for e in events if e["type"] == "message_delta"]
+        assert deltas[-1]["delta"]["stop_reason"] == "end_turn"
+
+
+class TestServerMemoryToolNames:
+    def test_injected_memory_tools_are_server_side(self) -> None:
+        from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+        tools = [
+            {"name": "Bash"},
+            {"name": "memory_save"},
+            {"name": "memory_search"},
+            {"type": "memory_20250818", "name": "memory"},
+            {"type": "web_search"},
+            "not-a-tool",
+        ]
+        names = AnthropicHandlerMixin._server_memory_tool_names(tools, [{"name": "Bash"}])
+        assert names == frozenset({"memory_save", "memory_search", "memory"})
+
+    def test_client_declared_memory_tool_stays_with_the_client(self) -> None:
+        from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
+
+        tools = [{"name": "memory_save"}, {"name": "memory_search"}]
+        names = AnthropicHandlerMixin._server_memory_tool_names(
+            tools, [{"name": "memory_save"}, "junk"]
+        )
+        assert names == frozenset({"memory_search"})
+        assert AnthropicHandlerMixin._server_memory_tool_names(None, None) == frozenset()
