@@ -2730,6 +2730,9 @@ class AnthropicHandlerMixin:
             # /v1/messages just as on /v1/responses.
             memory_context_injected = False
             memory_tools_injected = False
+            # Memory tools this proxy injected and must execute itself; the
+            # streaming path withholds their calls from the client.
+            server_memory_tool_names: frozenset[str] = frozenset()
             if memory_decision.inject:
                 # Search and inject memory context
                 if self.memory_handler.config.inject_context:
@@ -2841,6 +2844,22 @@ class AnthropicHandlerMixin:
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
+                    from headroom.proxy.memory_handler import (
+                        MEMORY_TOOL_NAMES,
+                        NATIVE_MEMORY_TOOL_NAME,
+                    )
+
+                    client_tool_names = {
+                        t.get("name") for t in _original_tools or [] if isinstance(t, dict)
+                    }
+                    server_memory_tool_names = frozenset(
+                        name
+                        for t in tools
+                        if isinstance(t, dict)
+                        and isinstance(name := t.get("name"), str)
+                        and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+                        and name not in client_tool_names
+                    )
                     tool_names = [
                         t.get("name") or t.get("type", "")
                         for t in tools
@@ -4060,6 +4079,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        server_memory_tool_names=server_memory_tool_names,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
