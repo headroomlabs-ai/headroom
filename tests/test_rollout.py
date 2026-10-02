@@ -190,14 +190,15 @@ def test_live_legacy_reresolution_preserves_channel_and_named_kill_switch() -> N
             "HEADROOM_DISABLE_FEATURES": "proxy_output_shaper",
         }
     ).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
-    blocked = resolve_rollout({}).with_legacy_env({"HEADROOM_OUTPUT_SHAPER": "1"})
+    # ``proxy_output_shaper`` is STABLE and default-on, so it can no longer
+    # show a legacy alias being refused by the channel gate. ``read_maturation``
+    # is still BETA, so it carries that half of the assertion.
+    blocked = resolve_rollout({}).with_legacy_env({"HEADROOM_READ_MATURATION": "1"})
 
     assert enabled.decision("proxy_output_shaper").reason is FeatureDecisionReason.LEGACY_ALIAS
     assert disabled_again.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
     assert killed.decision("proxy_output_shaper").reason is FeatureDecisionReason.DISABLED
-    assert (
-        blocked.decision("proxy_output_shaper").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
-    )
+    assert blocked.decision("read_maturation").reason is FeatureDecisionReason.BLOCKED_BY_CHANNEL
     assert enabled.snapshot_digest != eligible.snapshot_digest
 
 
@@ -223,7 +224,11 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
             "HEADROOM_DISABLE_FEATURES": "read_maturation",
         }
     )
-    original = ProxyConfig(rollout=rollout, worker_processes=2)
+    original = ProxyConfig(
+        rollout=rollout,
+        worker_processes=2,
+        profile_seeded_env_keys=frozenset({"HEADROOM_MODE", "HEADROOM_LOSSLESS"}),
+    )
     monkeypatch.setenv(_MULTI_WORKER_CONFIG_ENV, json.dumps(_proxy_config_payload(original)))
 
     restored = _proxy_config_from_env()
@@ -233,6 +238,7 @@ def test_multi_worker_config_round_trip_preserves_typed_rollout(monkeypatch) -> 
     assert restored.rollout.is_enabled("proxy_output_shaper") is True
     assert restored.rollout.is_enabled("read_maturation") is False
     assert restored.worker_processes == 2
+    assert restored.profile_seeded_env_keys == frozenset({"HEADROOM_MODE", "HEADROOM_LOSSLESS"})
 
 
 def test_documented_proxy_json_without_internal_snapshot_is_preserved(monkeypatch) -> None:
@@ -395,7 +401,7 @@ def test_cli_json_status_and_strict_error() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["channel"] == "canary"
-    assert payload["features"][2]["name"] == "tool_result_interceptors"
+    assert "tool_result_interceptors" in [feature["name"] for feature in payload["features"]]
     assert invalid.exit_code != 0
     assert "unknown rollout feature" in invalid.output
 

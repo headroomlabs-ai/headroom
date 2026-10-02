@@ -459,6 +459,8 @@ class SubscriptionTracker(QuotaTracker):
     # ------------------------------------------------------------------
 
     def _persist_state(self) -> None:
+        if not _paths.persistence_allowed("subscription quota state"):
+            return
         try:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -12,7 +13,11 @@ from headroom.copilot_auth import (
 )
 from headroom.providers.codex import resolve_codex_routing
 from headroom.providers.codex.endpoints import CHATGPT_BACKEND_API_URL
+from headroom.providers.codex.runtime import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
+from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
+from headroom.providers.grok.runtime import is_grok_cli_request
 from headroom.providers.vertex import vertex_target_for_location as _vertex_target_for_location
+from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 LEGACY_API_TARGET_ATTRS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_URL",
@@ -34,6 +39,46 @@ def vertex_target_for_location(proxy: Any, location: str) -> str:
     return _vertex_target_for_location(api_target(proxy, "vertex"), location)
 
 
+logger = logging.getLogger("headroom.proxy")
+
+
+def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
+    """Return True when Grok CLI traffic should be redirected to ``api.x.ai``.
+
+    Grok CLI cannot set ``x-headroom-base-url``, so a shared proxy started for
+    Claude/Codex has to recognize it from wire signals or it forwards xAI
+    session tokens to ``api.openai.com``.
+
+    Only applies while the OpenAI target is still the default. An operator who
+    pointed the proxy at a gateway (LiteLLM, Azure, self-hosted vLLM) chose it
+    for every OpenAI-compatible client; a client User-Agent must not silently
+    bypass that.
+
+    This gate is URL policy only. It does not keep operator-configured
+    ``OPENAI_TARGET_API_HEADERS`` away from xAI — those extras are configured
+    independently of the target URL, so a default-URL proxy can still redirect
+    here. The direct OpenAI HTTP handlers enforce credential isolation
+    separately by suppressing configured extras when their OpenAI-compatible
+    upstream candidate is the xAI host. Configured backend transports retain
+    their existing header policy.
+    """
+    if not is_grok_cli_request(headers):
+        return False
+    return openai_target.rstrip("/") == DEFAULT_OPENAI_API_URL
+
+
+def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
+    """Resolve upstream for OpenAI-compatible metadata/passthrough traffic.
+
+    Routes official Grok CLI to ``api.x.ai`` so ``GET /v1/models`` and catch-all
+    passthrough succeed on a shared proxy whose OpenAI target is the default.
+    """
+    target = api_target(proxy, "openai")
+    if route_grok_to_xai(headers, target):
+        return XAI_API_URL
+    return target
+
+
 def select_passthrough_base_url(
     proxy: Any, headers: Mapping[str, str], path: str | None = None
 ) -> str:
@@ -46,7 +91,14 @@ def select_passthrough_base_url(
     if headers.get("api-key"):
         azure_base = headers.get("x-headroom-base-url", "")
         if azure_base:
-            return azure_base.rstrip("/")
+            # Validate here, not only at the routes. `api-key` is attacker-
+            # supplied too, so this branch is reachable by anyone who can send
+            # a header, and it returns the destination the caller named. Routes
+            # that forgot to guard turned the proxy into an SSRF relay into
+            # loopback/RFC1918/cloud-metadata space (CVE-2026-77775).
+            if is_safe_upstream_url(azure_base):
+                return azure_base.rstrip("/")
+            logger.warning("ignoring unsafe x-headroom-base-url override: %r", azure_base)
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
     target = api_target(proxy, provider_name)
     if (
@@ -83,4 +135,10 @@ def select_passthrough_base_url(
         # extension sends none of them — so a request that took one of those
         # branches is not Copilot's and keeps the upstream it asked for.
         return copilot_completions_base_url()
+    if provider_name == "openai":
+        # Grok CLI reaches passthrough the same way, recognized by wire signals
+        # rather than path, and only while the OpenAI target is still the
+        # default. Checked after Copilot because that branch keys on a path only
+        # Copilot emits, so it is the narrower claim on this fall-through.
+        return openai_compatible_base_url(proxy, headers)
     return target

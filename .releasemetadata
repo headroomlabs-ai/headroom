@@ -1,10 +1,10 @@
 {
-  "version": "0.36.1",
+  "version": "0.39.1",
   "packages": {
-    "pypi": "0.36.1",
-    "npm-sdk": "0.36.1",
-    "npm-openclaw": "0.36.1",
-    "npm-opencode": "0.36.1",
-    "agent-hooks-plugin": "0.36.1"
+    "pypi": "0.39.1",
+    "npm-sdk": "0.39.1",
+    "npm-openclaw": "0.39.1",
+    "npm-opencode": "0.39.1",
+    "agent-hooks-plugin": "0.39.1"
   }
 }

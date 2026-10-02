@@ -460,6 +460,13 @@ class ToolIntelligenceNetwork:
         # Storage backend
         if backend is not None:
             self._backend = backend
+        elif toin_backend_disabled():
+            # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win
+            # over storage_path. Deciding this from the factory's return value
+            # cannot work: it returns None both for "no backend configured" and
+            # for "explicitly disabled", and the default storage_path is never
+            # empty, so "none" silently reinstated the filesystem backend.
+            self._backend = None
         elif self._config.storage_path:
             self._backend = FileSystemTOINBackend(
                 self._config.storage_path,
@@ -565,6 +572,23 @@ class ToolIntelligenceNetwork:
             model_family: Target model family (`claude-3-5`, `gpt-4o`, …).
                 Defaults to `DEFAULT_MODEL_FAMILY` when not provided.
         """
+        # The beacon's copy of this event is taken BEFORE the enabled check.
+        # TOIN's own store is gated on HEADROOM_TELEMETRY, which is opt-in and
+        # therefore off across almost the whole fleet -- so recording after the
+        # gate would mean the network in "Tool Output Intelligence Network"
+        # only ever sees the installs that least need it.
+        #
+        # Costs nothing extra: `tool_signature` was already built by the
+        # caller, and `record_tool_shape` reads a handful of its integer
+        # attributes and no hash at all. Off by default and never raises, like
+        # every other beacon entry point.
+        try:
+            from headroom.telemetry.session import record_tool_shape
+
+            record_tool_shape(tool_signature, original_tokens, compressed_tokens)
+        except Exception:  # pragma: no cover - telemetry must never break a request
+            logger.debug("beacon: tool shape recording failed", exc_info=True)
+
         # HIGH FIX: Check enabled FIRST to avoid computing structure_hash if disabled
         # This saves CPU when TOIN is turned off
         if not self._config.enabled:
@@ -1605,6 +1629,17 @@ _toin_lock = threading.Lock()
 TOIN_BACKEND_ENV_VAR = "HEADROOM_TOIN_BACKEND"
 
 
+def toin_backend_disabled() -> bool:
+    """True when ``HEADROOM_TOIN_BACKEND=none`` asks for in-memory-only TOIN.
+
+    Kept separate from :func:`_create_default_toin_backend` because that
+    function communicates only through its return value, and ``None`` there
+    already means "no explicit backend, fall back to the default". The two
+    cases need to be distinguishable.
+    """
+    return (os.environ.get(TOIN_BACKEND_ENV_VAR) or "").strip().lower() == "none"
+
+
 def _create_default_toin_backend() -> Any:
     """Create a TOIN backend from env (e.g. HEADROOM_TOIN_BACKEND=redis).
 
@@ -1615,7 +1650,9 @@ def _create_default_toin_backend() -> Any:
     if not backend_type or backend_type == "filesystem":
         return None
     if backend_type == "none":
-        return None  # Explicit in-memory-only (e.g. --stateless mode)
+        # Handled by toin_backend_disabled() in ToolIntelligenceNetwork.__init__,
+        # which is the only place that can tell "disabled" from "use the default".
+        return None
     try:
         from importlib.metadata import entry_points
 
