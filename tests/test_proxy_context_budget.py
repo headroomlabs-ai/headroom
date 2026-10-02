@@ -783,6 +783,56 @@ def test_destination_identity_uses_cost_router_destination_limit(
         assert handler.upstream_bodies[-1]["model"] == target_model
 
 
+@pytest.mark.parametrize("mode, expected_status", [("reject", 500), ("observe", 200)])
+@pytest.mark.parametrize("error_type", [LookupError, asyncio.TimeoutError])
+def test_destination_identity_reject_evaluation_failure_counting(
+    monkeypatch, mode, expected_status, error_type
+):
+    """Destination counting errors stop reject requests and preserve observe fallback."""
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", mode)
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    import headroom.tokenizers as tokenizers
+
+    source_model = "step-source-v1"
+    target_model = "step-target-v1"
+    handler = _make_handler_subclass()(operator_limit=None)
+    handler.anthropic_provider._operator_context_limits[target_model] = 100_000
+    counted_models = []
+
+    def get_tokenizer(model):
+        counted_models.append(model)
+        if model == target_model:
+            raise error_type("destination counting failed")
+        return _DummyTokenizer(1)
+
+    monkeypatch.setattr(tokenizers, "get_tokenizer", get_tokenizer)
+    request = _build_request(
+        {
+            "model": source_model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+
+    async def run_request():
+        return await handler.handle_anthropic_messages(request, model_override=target_model)
+
+    response = anyio.run(run_request)
+
+    assert response.status_code == expected_status
+    assert target_model in counted_models
+    if mode == "reject":
+        assert json.loads(response.body)["error"] == {
+            "type": "api_error",
+            "message": "Context budget evaluation unavailable for the configured reject request.",
+        }
+        assert handler.upstream_calls == []
+    else:
+        assert len(handler.upstream_calls) == 1
+        assert handler.upstream_bodies[-1]["model"] == source_model
+        assert target_model in handler._token_count_fallback_models
+
+
 def test_destination_identity_uses_backend_resolver_model_and_tokenizer(monkeypatch):
     """A backend route is checked against its rewritten model and tokenizer."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")

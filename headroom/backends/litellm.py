@@ -1712,6 +1712,7 @@ class LiteLLMBackend(Backend):
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1919,6 +1920,7 @@ class LiteLLMBackend(Backend):
 
             # Bounded, always: an upstream that never answers must not
             # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             async for chunk in response:
