@@ -267,8 +267,10 @@ fn sqlite_max_lifetime_caps_sliding_window() {
     // the idle window or the entry dies of idleness and the assertion below
     // passes without ever exercising the ceiling — the thing under test.
     // 0.7s gaps read as at most 1s apparent, comfortably under the 2s idle
-    // window, while the 4 of them carry total age past 3s.
-    for _ in 0..4 {
+    // window. Five gaps carry total age to at least 4s, which is strictly
+    // beyond the 3s ceiling even after unix-second truncation. Four gaps
+    // only reach 3.3s and can land exactly on the now-valid 3s boundary.
+    for _ in 0..5 {
         std::thread::sleep(Duration::from_millis(700));
         let _ = store.get(&hash);
     }

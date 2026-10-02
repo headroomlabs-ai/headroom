@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from headroom.tokenizers import get_tokenizer
-from headroom.tokenizers.base import count_content_blocks
+from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
 
 from .base import Provider
 
@@ -98,6 +98,7 @@ _DEFAULT_CONTEXT_LIMITS: dict[str, int] = {
     "deepseek-r1-0528": 131072,
     "deepseek-reasoner": 131072,
     "deepseek-v4": 1048576,
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-chat": 131072,
@@ -178,9 +179,9 @@ class OpenAICompatibleTokenCounter:
         tool_calls = message.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
-                func = tc.get("function", {})
-                tokens += self.count_text(func.get("name", ""))
-                tokens += self.count_text(func.get("arguments", ""))
+                func = tc.get("function") or {}
+                tokens += self.count_text(coerce_countable_text(func.get("name")))
+                tokens += self.count_text(coerce_countable_text(func.get("arguments")))
                 tokens += 10
 
         tool_call_id = message.get("tool_call_id")
@@ -313,10 +314,13 @@ class OpenAICompatibleProvider(Provider):
         if model_lower in _DEFAULT_CONTEXT_LIMITS:
             return _DEFAULT_CONTEXT_LIMITS[model_lower]
 
-        # Prefix match
-        for prefix, limit in _DEFAULT_CONTEXT_LIMITS.items():
+        # Prefix match, longest prefix first. Plain dict order let a shorter
+        # family shadow a longer one: "deepseek-v4-flash-vision-exp" hit the
+        # "deepseek-v4" entry and got 1_048_576 instead of the 1_000_000 the
+        # model registry, the OpenAI provider and the pricing tables agree on.
+        for prefix in sorted(_DEFAULT_CONTEXT_LIMITS, key=len, reverse=True):
             if model_lower.startswith(prefix):
-                return limit
+                return _DEFAULT_CONTEXT_LIMITS[prefix]
 
         # Default to 128K for modern models
         return 128000

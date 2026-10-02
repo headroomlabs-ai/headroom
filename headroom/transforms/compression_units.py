@@ -52,8 +52,10 @@ class CompressionUnit:
 # - compressor_noop:   router returned identical bytes (no compression possible)
 # - already_compressed: input already carried a CCR retrieval marker
 # - rejected_not_smaller: compressor produced output >= input tokens
-# - cache_hit:         result returned from result_cache (placeholder; not
-#                      currently wired into the unit path — see follow-up)
+# - cache_hit:         reserved; cached unit reuse is caller-level (the OpenAI
+#                      Responses handler's unit-result cache) and is surfaced
+#                      via RouterCompressionResult.cache_hit, not as a reason
+#                      here — no code path produces this category today
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
@@ -114,6 +116,7 @@ _LOSSY_UNMARKED_STRATEGIES = {
     CompressionStrategy.KOMPRESS.value,
     CompressionStrategy.TEXT.value,
     CompressionStrategy.CODE_AWARE.value,
+    CompressionStrategy.HTML.value,
 }
 
 

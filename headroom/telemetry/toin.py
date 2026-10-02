@@ -97,6 +97,13 @@ DEFAULT_MODEL_FAMILY: Final[str] = "unknown"
 # environment; this is the production default the Rust proxy expects.
 DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH: Final[int] = 50
 
+# TOIN is a diagnostic learning store, not an archive. Keep its default
+# footprint bounded so a long-lived proxy cannot turn observations into an
+# unbounded memory/disk liability.
+DEFAULT_MAX_PATTERNS: Final[int] = 10_000
+DEFAULT_MAX_STORAGE_BYTES: Final[int] = 128 * 1024 * 1024
+MAX_QUERY_PATTERN_LENGTH: Final[int] = 512
+
 # Aggregation-key serialization separator. Used to encode the
 # `(auth_mode, model_family, sig_hash)` tuple as a string for JSON
 # storage (JSON object keys must be strings) and for cross-instance
@@ -391,6 +398,8 @@ class TOINConfig:
     # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
+    max_patterns: int = DEFAULT_MAX_PATTERNS
+    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
 
     # Network learning thresholds
     min_samples_for_recommendation: int = 10
@@ -451,8 +460,18 @@ class ToolIntelligenceNetwork:
         # Storage backend
         if backend is not None:
             self._backend = backend
+        elif toin_backend_disabled():
+            # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win
+            # over storage_path. Deciding this from the factory's return value
+            # cannot work: it returns None both for "no backend configured" and
+            # for "explicitly disabled", and the default storage_path is never
+            # empty, so "none" silently reinstated the filesystem backend.
+            self._backend = None
         elif self._config.storage_path:
-            self._backend = FileSystemTOINBackend(self._config.storage_path)
+            self._backend = FileSystemTOINBackend(
+                self._config.storage_path,
+                max_load_bytes=self._config.max_storage_bytes,
+            )
         else:
             self._backend = None
 
@@ -553,6 +572,23 @@ class ToolIntelligenceNetwork:
             model_family: Target model family (`claude-3-5`, `gpt-4o`, …).
                 Defaults to `DEFAULT_MODEL_FAMILY` when not provided.
         """
+        # The beacon's copy of this event is taken BEFORE the enabled check.
+        # TOIN's own store is gated on HEADROOM_TELEMETRY, which is opt-in and
+        # therefore off across almost the whole fleet -- so recording after the
+        # gate would mean the network in "Tool Output Intelligence Network"
+        # only ever sees the installs that least need it.
+        #
+        # Costs nothing extra: `tool_signature` was already built by the
+        # caller, and `record_tool_shape` reads a handful of its integer
+        # attributes and no hash at all. Off by default and never raises, like
+        # every other beacon entry point.
+        try:
+            from headroom.telemetry.session import record_tool_shape
+
+            record_tool_shape(tool_signature, original_tokens, compressed_tokens)
+        except Exception:  # pragma: no cover - telemetry must never break a request
+            logger.debug("beacon: tool shape recording failed", exc_info=True)
+
         # HIGH FIX: Check enabled FIRST to avoid computing structure_hash if disabled
         # This saves CPU when TOIN is turned off
         if not self._config.enabled:
@@ -696,6 +732,7 @@ class ToolIntelligenceNetwork:
             pattern.last_updated = time.time()
             pattern.confidence = self._calculate_confidence(pattern)
             self._dirty = True
+            self._prune_patterns_locked()
 
         # Auto-save if needed (outside lock)
         self._maybe_auto_save()
@@ -774,6 +811,59 @@ class ToolIntelligenceNetwork:
                 reverse=True,
             )[:100]
             pattern.field_semantics = dict(sorted_fields)
+
+    def _prune_patterns_locked(self) -> None:
+        """Bound the pattern table, evicting least-useful observations first.
+
+        The lock must be held by the caller. Patterns below the publish
+        threshold are disposable learning noise; within each class, oldest
+        observations are evicted first. If every pattern is mature, oldest
+        wins, keeping the table bounded without silently preferring a tenant.
+        """
+        limit = max(1, self._config.max_patterns)
+        if len(self._patterns) <= limit:
+            return
+
+        excess = len(self._patterns) - limit
+        evict = sorted(
+            self._patterns,
+            key=lambda key: (
+                self._patterns[key].sample_size >= DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH,
+                self._patterns[key].last_updated,
+            ),
+        )[:excess]
+        for key in evict:
+            del self._patterns[key]
+
+        logger.info(
+            "TOIN pattern table pruned",
+            extra={
+                "event": "toin_patterns_pruned",
+                "evicted": excess,
+                "remaining": len(self._patterns),
+            },
+        )
+
+    def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
+        """Remove legacy raw query keys from a loaded pattern."""
+        import re
+
+        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        changed = False
+        frequencies: dict[str, int] = {}
+        for raw_key, count in pattern.query_pattern_frequency.items():
+            if safe_pattern.fullmatch(raw_key) and len(raw_key) <= MAX_QUERY_PATTERN_LENGTH:
+                frequencies[raw_key] = max(0, int(count))
+            else:
+                changed = True
+        if frequencies != pattern.query_pattern_frequency:
+            changed = True
+            pattern.query_pattern_frequency = frequencies
+        safe_common = [key for key in pattern.common_query_patterns if key in frequencies]
+        if safe_common != pattern.common_query_patterns:
+            changed = True
+            pattern.common_query_patterns = safe_common[: self._config.max_query_patterns]
+        return changed
 
     def record_retrieval(
         self,
@@ -949,6 +1039,7 @@ class ToolIntelligenceNetwork:
 
             pattern.last_updated = time.time()
             self._dirty = True
+            self._prune_patterns_locked()
 
         self._maybe_auto_save()
 
@@ -1050,14 +1141,22 @@ class ToolIntelligenceNetwork:
         if not query:
             return None
 
-        # Simple pattern extraction: replace values after : or =
+        # Only retain structured field/value predicates. Returning an
+        # unchanged free-form prompt here would persist the prompt verbatim,
+        # violating TOIN's privacy contract (and can produce multi-MB keys).
         import re
 
         # Match field:value or field="value" patterns, but don't include spaces in unquoted values
-        pattern = re.sub(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', r"\1:*", query)
+        matches = re.findall(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', query)
+        if not matches:
+            return None
+
+        # Preserve useful field shape while dropping operators, values, and
+        # all unrelated text (which may contain arbitrary prompt data).
+        pattern = " ".join(f"{field}:*" for field in matches)
 
         # Remove if it's just generic
-        if pattern in ("*", ""):
+        if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:
             return None
 
         return pattern
@@ -1217,6 +1316,7 @@ class ToolIntelligenceNetwork:
             for serialized_key, pattern_dict in patterns_data.items():
                 key = _deserialize_pattern_key(serialized_key)
                 imported = ToolPattern.from_dict(pattern_dict)
+                self._sanitize_loaded_pattern(imported)
                 # Make sure dataclass fields agree with the dict key — pre-B5
                 # dumps don't carry auth_mode/model_family on the pattern;
                 # promote from the (possibly default) key.
@@ -1241,6 +1341,7 @@ class ToolIntelligenceNetwork:
                             # CRITICAL: Always increment user_count (even after cap)
                             pattern.user_count += 1
 
+            self._prune_patterns_locked()
             self._dirty = True
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
@@ -1472,7 +1573,15 @@ class ToolIntelligenceNetwork:
             data = self._backend.load()
             if data:
                 self.import_patterns(data)
-                self._dirty = False
+                with self._lock:
+                    changed = any(
+                        self._sanitize_loaded_pattern(pattern)
+                        for pattern in self._patterns.values()
+                    )
+                    before = len(self._patterns)
+                    self._prune_patterns_locked()
+                    changed = changed or len(self._patterns) != before
+                    self._dirty = changed
         except Exception as e:
             logger.warning(
                 "TOIN storage load failed",
@@ -1520,6 +1629,17 @@ _toin_lock = threading.Lock()
 TOIN_BACKEND_ENV_VAR = "HEADROOM_TOIN_BACKEND"
 
 
+def toin_backend_disabled() -> bool:
+    """True when ``HEADROOM_TOIN_BACKEND=none`` asks for in-memory-only TOIN.
+
+    Kept separate from :func:`_create_default_toin_backend` because that
+    function communicates only through its return value, and ``None`` there
+    already means "no explicit backend, fall back to the default". The two
+    cases need to be distinguishable.
+    """
+    return (os.environ.get(TOIN_BACKEND_ENV_VAR) or "").strip().lower() == "none"
+
+
 def _create_default_toin_backend() -> Any:
     """Create a TOIN backend from env (e.g. HEADROOM_TOIN_BACKEND=redis).
 
@@ -1530,7 +1650,9 @@ def _create_default_toin_backend() -> Any:
     if not backend_type or backend_type == "filesystem":
         return None
     if backend_type == "none":
-        return None  # Explicit in-memory-only (e.g. --stateless mode)
+        # Handled by toin_backend_disabled() in ToolIntelligenceNetwork.__init__,
+        # which is the only place that can tell "disabled" from "use the default".
+        return None
     try:
         from importlib.metadata import entry_points
 
