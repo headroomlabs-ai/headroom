@@ -53,6 +53,11 @@ def _thinking_for_stream(payload: object) -> ThinkingTokens:
         return ThinkingTokens()
 
 
+def _sse_dict(value: Any) -> dict[str, Any]:
+    """Return an upstream SSE object, or an empty object for a wrong-shaped value."""
+    return value if isinstance(value, dict) else {}
+
+
 def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
     """Extract `usage.completion_tokens` from a single SSE chunk if present.
 
@@ -201,6 +206,8 @@ class StreamingMixin:
                     data = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(data, dict):
+                    continue
 
                 usage = {}
 
@@ -210,8 +217,7 @@ class StreamingMixin:
                     event_type = data.get("type", "")
 
                     if event_type == "message_start":
-                        msg = data.get("message", {})
-                        msg_usage = msg.get("usage", {})
+                        msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
                         if msg_usage:
                             usage["input_tokens"] = msg_usage.get("input_tokens", 0)
                             usage["cache_read_input_tokens"] = msg_usage.get(
@@ -227,24 +233,24 @@ class StreamingMixin:
                             usage["cache_creation_ephemeral_1h_input_tokens"] = cache_write_1h
 
                     elif event_type == "message_delta":
-                        delta_usage = data.get("usage", {})
+                        delta_usage = _sse_dict(data.get("usage"))
                         if delta_usage:
                             usage["output_tokens"] = delta_usage.get("output_tokens", 0)
 
                 elif provider == "openai":
                     # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
-                    chunk_usage = data.get("usage")
+                    chunk_usage = _sse_dict(data.get("usage"))
                     if chunk_usage:
                         usage["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
                         usage["output_tokens"] = chunk_usage.get("completion_tokens", 0)
                         # OpenAI has cached tokens in prompt_tokens_details
-                        details = chunk_usage.get("prompt_tokens_details") or {}
+                        details = _sse_dict(chunk_usage.get("prompt_tokens_details"))
                         usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
 
                 elif provider == "gemini":
                     # Gemini sends usageMetadata in each streaming chunk
                     # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-                    usage_meta = data.get("usageMetadata")
+                    usage_meta = _sse_dict(data.get("usageMetadata"))
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                         usage["output_tokens"] = gemini_output_tokens(usage_meta)
@@ -297,12 +303,13 @@ class StreamingMixin:
                 data = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(data, dict):
+                continue
 
             if provider == "anthropic":
                 event_type = data.get("type", "")
                 if event_type == "message_start":
-                    msg = data.get("message", {})
-                    msg_usage = msg.get("usage", {})
+                    msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
                     if msg_usage:
                         usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
                         usage_found["cache_read_input_tokens"] = msg_usage.get(
@@ -322,7 +329,7 @@ class StreamingMixin:
                             f"cache_write={usage_found.get('cache_creation_input_tokens')}"
                         )
                 elif event_type == "message_delta":
-                    delta_usage = data.get("usage", {})
+                    delta_usage = _sse_dict(data.get("usage"))
                     if delta_usage:
                         usage_found["output_tokens"] = delta_usage.get("output_tokens", 0)
 
@@ -362,7 +369,7 @@ class StreamingMixin:
                         )
 
             elif provider == "gemini":
-                usage_meta = data.get("usageMetadata")
+                usage_meta = _sse_dict(data.get("usageMetadata"))
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                     usage_found["output_tokens"] = gemini_output_tokens(usage_meta)
