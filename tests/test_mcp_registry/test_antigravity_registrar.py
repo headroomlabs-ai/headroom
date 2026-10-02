@@ -262,3 +262,39 @@ def test_install_everywhere_registers_with_only_config_dir(tmp_path: Path) -> No
     assert results["antigravity"].status == RegisterStatus.REGISTERED
     assert registrar.get_server("headroom") is not None
     assert (tmp_path / ".gemini" / "config" / "mcp_config.json").exists()
+
+
+def test_register_prefers_current_location_when_config_dir_exists(tmp_path: Path) -> None:
+    """Registration must land in the active Desktop config, not a stale legacy file.
+
+    With ``~/.gemini/config/`` present (the current Desktop install marker)
+    and a legacy ``~/.gemini/antigravity/mcp_config.json`` also on disk, the
+    registration goes to ``~/.gemini/config/mcp_config.json`` — the location
+    the running IDE actually reads.
+    """
+    legacy = _legacy_config_path(tmp_path)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"mcpServers": {"other": {"command": "other-cmd"}}}))
+    (tmp_path / ".gemini" / "config").mkdir(parents=True)
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    current = _config_path(tmp_path)
+    servers = json.loads(current.read_text())["mcpServers"]
+    assert servers["headroom"]["command"] == "/usr/bin/headroom"
+    # The legacy file is left alone.
+    assert "headroom" not in json.loads(legacy.read_text())["mcpServers"]
+
+
+def test_register_uses_legacy_location_when_no_config_dir(tmp_path: Path) -> None:
+    """A legacy-only install still registers into its existing config file."""
+    legacy = _legacy_config_path(tmp_path)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"mcpServers": {}}))
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    assert "headroom" in json.loads(legacy.read_text())["mcpServers"]
+    assert not _config_path(tmp_path).exists()

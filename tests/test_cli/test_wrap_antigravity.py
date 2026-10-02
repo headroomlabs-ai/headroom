@@ -63,3 +63,35 @@ def test_wrap_antigravity_setup_lines_render_actual_port(monkeypatch) -> None:
     rendered = "\n".join(call.args[0] for call in echo_mock.call_args_list)
     assert "http://127.0.0.1:9999/v1" in rendered
     assert "Antigravity" in rendered
+
+
+def test_wrap_antigravity_honors_headroom_port_env(monkeypatch) -> None:
+    """HEADROOM_PORT configures the proxy port like every other wrap command."""
+    monkeypatch.setenv("HEADROOM_PORT", "9999")
+    monkeypatch.delenv("HEADROOM_PORT_DISCOVERY", raising=False)
+    captured: dict[str, Any] = {}
+
+    def fake_watcher(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+        result = CliRunner().invoke(main, ["wrap", "antigravity"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+
+
+def test_wrap_antigravity_explicit_port_overrides_env(monkeypatch) -> None:
+    """An explicit --port always wins over HEADROOM_PORT."""
+    monkeypatch.setenv("HEADROOM_PORT", "9999")
+    monkeypatch.delenv("HEADROOM_PORT_DISCOVERY", raising=False)
+    captured: dict[str, Any] = {}
+
+    def fake_watcher(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod, "_run_proxy_only_watcher", side_effect=fake_watcher):
+        result = CliRunner().invoke(main, ["wrap", "antigravity", "--port", "7777"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 7777
