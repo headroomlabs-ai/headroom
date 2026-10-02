@@ -87,16 +87,46 @@ class MemoryToolStreamFilter:
         self._forward_message_start = forward_message_start
         self._buffer = bytearray()
         self._index_map: dict[int, int] = {}
-        self._hidden_indices: set[int] = set()
+        # Withheld tool_use blocks by upstream index, with their streamed
+        # input JSON, so the calls can run even when the whole response
+        # cannot be reconstructed (buffer cap, unparseable stream).
+        self._hidden: dict[int, tuple[dict[str, Any], list[str]]] = {}
         self.next_index = index_offset
-        self.hidden_tool_names: list[str] = []
         self.visible_tool_use = False
         self.stop_reason: str | None = None
         self._tail: list[tuple[str, dict[str, Any] | None, bytes]] = []
 
     @property
     def hid_tool_calls(self) -> bool:
-        return bool(self.hidden_tool_names)
+        return bool(self._hidden)
+
+    @property
+    def hidden_tool_names(self) -> list[str]:
+        return [block["name"] for block, _ in self._hidden.values()]
+
+    def hidden_calls(self) -> list[dict[str, Any]]:
+        """The withheld ``tool_use`` blocks whose input parsed completely.
+
+        A call cut off mid-input (e.g. ``max_tokens``) is left out rather
+        than run with a partial argument.
+        """
+        calls: list[dict[str, Any]] = []
+        for block, parts in self._hidden.values():
+            tool_input: Any = block.get("input") or {}
+            if parts:
+                try:
+                    tool_input = json.loads("".join(parts))
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "Memory: skipping %s call %s with incomplete input",
+                        block.get("name"),
+                        block.get("id"),
+                    )
+                    continue
+            if not isinstance(tool_input, dict):
+                continue
+            calls.append({**block, "input": tool_input})
+        return calls
 
     def feed(self, chunk: bytes) -> list[bytes]:
         """Consume upstream bytes; return the frames to forward now."""
@@ -141,52 +171,75 @@ class MemoryToolStreamFilter:
                 and block.get("type") == "tool_use"
                 and block.get("name") in self._tool_names
             ):
-                self._hidden_indices.add(upstream_index)
-                self.hidden_tool_names.append(block["name"])
+                self._hidden[upstream_index] = (block, [])
                 return None
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 self.visible_tool_use = True
             self._index_map[upstream_index] = self.next_index
             self.next_index += 1
 
-        if upstream_index in self._hidden_indices:
+        if upstream_index in self._hidden:
+            delta = payload.get("delta")
+            if (
+                event_name == "content_block_delta"
+                and isinstance(delta, dict)
+                and delta.get("type") == "input_json_delta"
+            ):
+                self._hidden[upstream_index][1].append(str(delta.get("partial_json", "")))
             return None
         client_index = self._index_map.get(upstream_index, upstream_index)
         if client_index == upstream_index:
             return frame
         return _render_frame(event_name, {**payload, "index": client_index})
 
-    def closing_frames(self) -> list[bytes]:
+    def closing_frames(self, *, prior_usage: dict[str, int] | None = None) -> list[bytes]:
         """End the client message after this round without a continuation."""
         ends_on_hidden_call = (
             self.hid_tool_calls and not self.visible_tool_use and self.stop_reason == "tool_use"
         )
-        return self.tail_frames(stop_reason="end_turn" if ends_on_hidden_call else None)
+        return self.tail_frames(
+            stop_reason="end_turn" if ends_on_hidden_call else None,
+            prior_usage=prior_usage,
+        )
 
-    def tail_frames(self, *, stop_reason: str | None = None) -> list[bytes]:
+    def tail_frames(
+        self,
+        *,
+        stop_reason: str | None = None,
+        prior_usage: dict[str, int] | None = None,
+    ) -> list[bytes]:
         """Return the held ``message_delta`` / ``message_stop`` frames.
 
         ``stop_reason`` replaces the upstream stop reason, e.g. ``end_turn``
         when the only tool calls were withheld memory calls: a ``tool_use``
         stop with no visible ``tool_use`` block leaves the client waiting on
         a tool it was never shown.
+
+        ``prior_usage`` holds earlier continuation rounds' usage. Their
+        ``message_delta`` frames never reach the client, so it is added to
+        this one: ``output_tokens`` always, other counters where the delta
+        reports them.
         """
         frames: list[bytes] = []
         for event_name, payload, raw in self._tail:
             if (
-                stop_reason is not None
-                and event_name == "message_delta"
-                and payload is not None
-                and isinstance(payload.get("delta"), dict)
+                event_name != "message_delta"
+                or payload is None
+                or not isinstance(payload.get("delta"), dict)
+                or (stop_reason is None and not prior_usage)
             ):
-                frames.append(
-                    _render_frame(
-                        event_name,
-                        {**payload, "delta": {**payload["delta"], "stop_reason": stop_reason}},
-                    )
-                )
-            else:
                 frames.append(raw)
+                continue
+            rendered = dict(payload)
+            if stop_reason is not None:
+                rendered["delta"] = {**payload["delta"], "stop_reason": stop_reason}
+            if prior_usage:
+                usage = dict(payload.get("usage") or {})
+                for key, value in prior_usage.items():
+                    if key == "output_tokens" or isinstance(usage.get(key), int):
+                        usage[key] = int(usage.get(key) or 0) + value
+                rendered["usage"] = usage
+            frames.append(_render_frame(event_name, rendered))
         if self._buffer:
             # An unterminated trailing frame: pass it through untouched.
             frames.append(bytes(self._buffer))

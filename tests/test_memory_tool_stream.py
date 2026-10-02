@@ -293,3 +293,93 @@ class TestStreamingMemoryContinuation:
         proxy.memory_handler.has_memory_tool_calls = MagicMock(return_value=False)
         events = await _client_view(proxy)
         assert events == _events(raw)
+
+
+class TestRecordedMemoryCalls:
+    def test_hidden_call_input_is_rebuilt_from_stream(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT, SAVE], "tool_use"))
+        assert flt.hidden_calls() == [SAVE]
+
+    def test_call_with_truncated_input_is_not_run(self) -> None:
+        raw = _sse([SAVE], "max_tokens").replace(b'\\"deploy region', b'\\"deploy', 1)
+        raw = raw.replace(b'ap-southeast-1\\"}', b"ap-southeast-1", 1)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(raw)
+        assert flt.hid_tool_calls
+        assert flt.hidden_calls() == []
+
+    def test_prior_rounds_usage_is_added_to_the_final_delta(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT], "end_turn"))
+        tail = _events(b"".join(flt.closing_frames(prior_usage={"output_tokens": 7})))
+        assert tail[0]["usage"]["output_tokens"] == 12
+
+
+async def _drain(gen: Any) -> list[dict[str, Any]]:
+    return _events(b"".join([frame async for frame in gen]))
+
+
+def _continue(proxy: HeadroomProxy, flt: MemoryToolStreamFilter, response: Any) -> Any:
+    body = {"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]}
+    return proxy._continue_memory_tool_stream(
+        flt,
+        response,
+        url="https://api.anthropic.com/v1/messages",
+        outbound_headers={"x-api-key": "sk-test", "content-length": "1"},
+        outbound_bytes=json.dumps(body).encode(),
+        memory_user_id="user-1",
+        memory_request_ctx=None,
+        server_memory_tool_names=MEMORY_TOOLS,
+        stream_state={},
+        request_id="test-mem",
+    )
+
+
+class TestContinuationEdgeCases:
+    @pytest.mark.asyncio
+    async def test_unrebuilt_round_still_runs_its_memory_calls(self) -> None:
+        proxy = _proxy([], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_sse([TEXT, SAVE], "tool_use"))
+
+        events = await _drain(_continue(proxy, flt, None))
+
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        ran = proxy.memory_handler.handle_memory_tool_calls.await_args.args[0]["content"]
+        assert ran == [SAVE]
+        assert proxy.http_client.send.await_count == 0
+        assert events[0]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_continuation_over_the_buffer_cap_is_not_continued_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.helpers as helpers
+
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        proxy = _proxy([_sse([SAVE], "tool_use")], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+        monkeypatch.setattr(helpers, "MAX_SSE_BUFFER_SIZE", 64)
+
+        events = await _drain(_continue(proxy, flt, response))
+
+        assert proxy.http_client.send.await_count == 1
+        assert proxy.memory_handler.handle_memory_tool_calls.await_count == 2
+        assert [e["type"] for e in events][-2:] == ["message_delta", "message_stop"]
+        assert events[-2]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_client_sees_output_usage_of_every_round(self) -> None:
+        proxy = _proxy(
+            [
+                _sse([TEXT, SAVE], "tool_use"),
+                _sse([{"type": "text", "text": "Saved."}], "end_turn"),
+            ],
+            SAVE_RESULT,
+        )
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+        deltas = [e for e in events if e["type"] == "message_delta"]
+        assert deltas[0]["usage"]["output_tokens"] == 10

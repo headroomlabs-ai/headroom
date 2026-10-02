@@ -501,6 +501,8 @@ class StreamingMixin:
         client tool still has its memory calls executed, but the turn goes back
         to the client, which cannot carry the memory results.
         """
+        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
+
         try:
             base_body = json.loads(outbound_bytes)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -521,6 +523,8 @@ class StreamingMixin:
         # What the client received across rounds; the prefix tracker must see
         # this, not round one, because it is what the client sends back.
         visible_content: list[Any] = []
+        # Usage of rounds whose message_delta the client never receives.
+        prior_usage: dict[str, int] = {}
         while True:
             content: list[Any] = []
             if response is not None:
@@ -532,32 +536,37 @@ class StreamingMixin:
                     "content": list(visible_content),
                 }
 
-            if response is None or not memory_filter.hid_tool_calls:
-                for frame in memory_filter.closing_frames():
+            if not memory_filter.hid_tool_calls:
+                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
                     yield frame
                 return
 
-            memory_calls = [block for block in content if is_memory_call(block)]
+            # Run the calls the filter recorded, so they are not lost when the
+            # round could not be reconstructed. Only the proxy's own calls: a
+            # memory-named tool the client declared is the client's to run.
+            memory_calls = memory_filter.hidden_calls()
             tool_results: list[dict[str, Any]] = []
             if memory_calls and memory_user_id is not None and self.memory_handler is not None:
-                # Only the proxy's own calls: a memory-named tool the client
-                # declared is the client's to run.
                 tool_results = await self.memory_handler.handle_memory_tool_calls(
-                    {**response, "content": memory_calls},
+                    {"content": memory_calls},
                     memory_user_id,
                     "anthropic",
                     request_context=memory_request_ctx,
                 )
             logger.info(
-                f"[{request_id}] Memory: Executed {len(tool_results)}/{len(memory_calls)} "
-                "proxy-handled tool call(s) withheld from the SSE stream"
+                f"[{request_id}] Memory: Executed {len(tool_results)}/"
+                f"{len(memory_filter.hidden_tool_names)} proxy-handled tool call(s) "
+                "withheld from the SSE stream"
             )
 
+            replayable = response is not None and len(tool_results) == sum(
+                1 for block in content if is_memory_call(block)
+            )
             can_continue = (
                 memory_filter.stop_reason == "tool_use"
                 and not memory_filter.visible_tool_use
                 and messages is not None
-                and len(tool_results) == len(memory_calls)
+                and replayable
                 and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
             )
             if not can_continue:
@@ -571,11 +580,21 @@ class StreamingMixin:
                         f"[{request_id}] Memory: Stopped after {rounds} continuation "
                         "round(s) that only called memory tools"
                     )
-                for frame in memory_filter.closing_frames():
+                elif not replayable:
+                    logger.warning(
+                        f"[{request_id}] Memory: Could not rebuild the round for a "
+                        "continuation; ending the turn after running its memory calls"
+                    )
+                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
                     yield frame
                 return
 
-            assert messages is not None and isinstance(base_body, dict)
+            assert response is not None and messages is not None and isinstance(base_body, dict)
+            round_usage = response.get("usage")
+            if isinstance(round_usage, dict):
+                for key in _ROUND_USAGE_KEYS:
+                    if isinstance(value := round_usage.get(key), int):
+                        prior_usage[key] = prior_usage.get(key, 0) + value
             messages = [
                 *messages,
                 {"role": "assistant", "content": content},
@@ -602,12 +621,25 @@ class StreamingMixin:
                     index_offset=memory_filter.next_index,
                     forward_message_start=False,
                 )
-                round_bytes = bytearray()
+                # Same cap as the first round's buffer; past it the round is
+                # still streamed, just not rebuilt for a further continuation.
+                round_bytes: bytearray | None = bytearray()
                 async for chunk in upstream.aiter_bytes():
-                    round_bytes.extend(chunk)
+                    if round_bytes is not None:
+                        round_bytes.extend(chunk)
+                        if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
+                            logger.warning(
+                                f"[{request_id}] Memory: Continuation round {rounds} "
+                                "exceeded the SSE buffer cap"
+                            )
+                            round_bytes = None
                     for frame in memory_filter.feed(chunk):
                         yield frame
-            response = self._parse_sse_to_response(round_bytes.decode("utf-8"), "anthropic")
+            response = (
+                self._parse_sse_to_response(round_bytes.decode("utf-8"), "anthropic")
+                if round_bytes is not None
+                else None
+            )
             _add_round_usage(stream_state, response)
             logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
 
@@ -1605,8 +1637,19 @@ class StreamingMixin:
 
                 if memory_filter is not None:
                     # Memory detection was skipped (empty stream or buffer cap):
-                    # release the held message tail unchanged in substance.
-                    for frame in memory_filter.closing_frames():
+                    # still run the withheld calls, then end the message.
+                    async for frame in self._continue_memory_tool_stream(
+                        memory_filter,
+                        None,
+                        url=url,
+                        outbound_headers=outbound_headers,
+                        outbound_bytes=outbound_bytes,
+                        memory_user_id=memory_user_id,
+                        memory_request_ctx=memory_request_ctx,
+                        server_memory_tool_names=server_memory_tool_names or frozenset(),
+                        stream_state=stream_state,
+                        request_id=request_id,
+                    ):
                         yield frame
 
                 # CCR Feedback: Record headroom_retrieve tool calls for TOIN learning.
