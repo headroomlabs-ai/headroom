@@ -4,15 +4,114 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from headroom.memory.backends import direct_mem0
 from headroom.memory.backends.direct_mem0 import DirectMem0Adapter, Mem0Config
+from headroom.memory.models import Memory
 
 
 def _adapter() -> DirectMem0Adapter:
     return DirectMem0Adapter(Mem0Config(enable_graph=True))
+
+
+async def _start_background_save(adapter: DirectMem0Adapter, content: str = "fact") -> str:
+    result = await adapter.save_memory(
+        content=content,
+        user_id="alice",
+        importance=0.8,
+        background=True,
+    )
+    assert isinstance(result, Memory)
+    return str(result.metadata["_task_id"])
+
+
+async def _wait_for_completion_callback(adapter: DirectMem0Adapter, task_id: str) -> None:
+    for _ in range(10):
+        if task_id not in adapter._background_tasks:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"Completion callback did not run for {task_id}")
+
+
+@pytest.fixture
+def initialized_adapter() -> DirectMem0Adapter:
+    adapter = DirectMem0Adapter(Mem0Config(enable_graph=False))
+    adapter._initialized = True
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_background_completion_is_captured_without_polling(
+    initialized_adapter: DirectMem0Adapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored_memory = Memory(content="stored", user_id="alice")
+
+    async def save(**kwargs: Any) -> Memory:
+        return stored_memory
+
+    monkeypatch.setattr(initialized_adapter, "_save_memory_internal", save)
+    task_id = await _start_background_save(initialized_adapter)
+    await _wait_for_completion_callback(initialized_adapter, task_id)
+
+    assert initialized_adapter.get_pending_tasks() == []
+    assert initialized_adapter.get_task_status(task_id) == {
+        "status": "completed",
+        "result": stored_memory,
+    }
+
+
+@pytest.mark.asyncio
+async def test_background_exception_is_captured_without_polling(
+    initialized_adapter: DirectMem0Adapter,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def fail(**kwargs: Any) -> Memory:
+        raise RuntimeError("save failed")
+
+    monkeypatch.setattr(initialized_adapter, "_save_memory_internal", fail)
+    task_id = await _start_background_save(initialized_adapter)
+    await _wait_for_completion_callback(initialized_adapter, task_id)
+
+    assert initialized_adapter.get_task_status(task_id) == {
+        "status": "failed",
+        "error": "save failed",
+    }
+    assert f"task_id={task_id}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_completed_task_results_are_bounded_and_expire(
+    initialized_adapter: DirectMem0Adapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+
+    async def save(**kwargs: Any) -> Memory:
+        return Memory(content="stored", user_id="alice")
+
+    monkeypatch.setattr(initialized_adapter, "_save_memory_internal", save)
+    monkeypatch.setattr(direct_mem0, "_MAX_TASK_RESULTS", 2)
+    monkeypatch.setattr(direct_mem0, "_TASK_RESULT_TTL_SECONDS", 10)
+    monkeypatch.setattr(direct_mem0, "monotonic", lambda: now)
+
+    task_ids: list[str] = []
+    for index in range(3):
+        now = float(index)
+        task_id = await _start_background_save(initialized_adapter, f"fact-{index}")
+        await _wait_for_completion_callback(initialized_adapter, task_id)
+        task_ids.append(task_id)
+
+    assert initialized_adapter.get_task_status(task_ids[0])["status"] == "not_found"
+    assert initialized_adapter.get_task_status(task_ids[1])["status"] == "completed"
+    now = 12.0
+    assert initialized_adapter.get_task_status(task_ids[1])["status"] == "not_found"
+    assert initialized_adapter.get_task_status(task_ids[2])["status"] == "not_found"
 
 
 @pytest.mark.asyncio
@@ -152,6 +251,9 @@ async def test_concurrent_close_calls_serialize_resource_cleanup() -> None:
     await close_started.wait()
     second = asyncio.create_task(adapter.close())
     await asyncio.sleep(0)
+
+    with pytest.raises(RuntimeError, match="adapter is closing"):
+        await adapter.save_memory("too late", "user-1", 0.5, background=True)
 
     resource.close.assert_awaited_once_with()
     assert not first.done()
