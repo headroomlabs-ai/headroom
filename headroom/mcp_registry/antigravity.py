@@ -170,6 +170,15 @@ class AntigravityRegistrar(MCPRegistrar):
             removed = True
         if not removed:
             return False
+        # Antigravity caches each MCP server under ~/.gemini/<surface>/mcp/;
+        # a removed entry keeps loading from cache until that directory goes.
+        # Clear it whenever at least one config entry was removed, even if a
+        # failed write means this still reports False below.
+        for cache_dir in _mcp_cache_dirs(self._home, server_name):
+            try:
+                shutil.rmtree(cache_dir)
+            except OSError:
+                pass
         if remaining:
             logger.warning(
                 "could not remove %r from %s; the server stays registered there",
@@ -177,13 +186,6 @@ class AntigravityRegistrar(MCPRegistrar):
                 ", ".join(str(path) for path in remaining),
             )
             return False
-        # Antigravity caches each MCP server under ~/.gemini/<surface>/mcp/;
-        # a removed entry keeps loading from cache until that directory goes.
-        for cache_dir in _mcp_cache_dirs(self._home, server_name):
-            try:
-                shutil.rmtree(cache_dir)
-            except OSError:
-                pass
         return True
 
     def _load_config(self, config_path: Path | None = None) -> dict[str, Any] | None:
