@@ -61,6 +61,22 @@ class ParsedResponse:
     raw: str | None  # Original full response
 
 
+def _append_instruction(content: Any, instruction: str) -> Any:
+    """Append the memory instruction to a system prompt's content.
+
+    ``content`` may be a plain string or a list of content-part dicts (OpenAI
+    allows ``content`` as a list; Anthropic system prompts are commonly a list of
+    ``{"type": "text", ...}`` blocks). Concatenating a str onto a list raises
+    ``TypeError``, so a list gets the instruction appended as a trailing text
+    part instead. Any other shape falls back to a string join.
+    """
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": instruction}]
+    if isinstance(content, str):
+        return content + instruction
+    return f"{content}{instruction}" if content else instruction
+
+
 def inject_memory_instruction(
     messages: list[dict[str, Any]],
     short: bool = True,
@@ -83,7 +99,7 @@ def inject_memory_instruction(
         if msg.get("role") == "system":
             messages[i] = {
                 **msg,
-                "content": msg.get("content", "") + instruction,
+                "content": _append_instruction(msg.get("content", ""), instruction),
             }
             has_system = True
             break

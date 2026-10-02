@@ -8,20 +8,20 @@ and priority ranking. Subclasses implement format-specific rendering.
 from __future__ import annotations
 
 import hashlib
-import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Marker delimiters for Headroom-managed sections (matches learn/writer.py)
+from ...managed_block import block_pattern, sanitize_block_text
+
+# Marker delimiters for Headroom-managed sections (matches learn/writer.py).
+# Same block pattern and same content sanitising: memory content is
+# extracted from conversations, so it is as attacker-influenced as tool output.
 MARKER_START = "<!-- headroom:memory:start -->"
 MARKER_END = "<!-- headroom:memory:end -->"
-MARKER_PATTERN = re.compile(
-    re.escape(MARKER_START) + r".*?" + re.escape(MARKER_END),
-    re.DOTALL,
-)
+MARKER_PATTERN = block_pattern(MARKER_START, MARKER_END)
 
 
 @dataclass
@@ -147,8 +147,9 @@ class AgentWriter(ABC):
         if not budgeted:
             return result
 
-        # Format in agent-specific way
-        formatted = self.format_memories(budgeted)
+        # Format in agent-specific way, then make sure nothing in the memory
+        # text can close our markers or hide itself from the reader.
+        formatted = sanitize_block_text(self.format_memories(budgeted))
 
         # Wrap in markers
         section = f"{MARKER_START}\n{formatted}\n{MARKER_END}"
@@ -165,7 +166,7 @@ class AgentWriter(ABC):
 
         if not dry_run:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(full_content, encoding="utf-8")
+            target.write_text(full_content, encoding="utf-8", newline="\n")
 
         return result
 

@@ -9,6 +9,7 @@ without passing any upstream headers — silently dropping ratelimit info.
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -496,42 +497,69 @@ class TestStreamingRatelimitHeaderForwarding:
 
         mock_request = MagicMock()
         proxy.http_client.build_request = MagicMock(return_value=mock_request)
-        proxy.http_client.send = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
-
-        result = await proxy._stream_response(
-            url="https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": "sk-test"},
-            body={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 100,
-                "stream": True,
-                "messages": [{"role": "user", "content": "hi"}],
-            },
-            provider="anthropic",
-            model="claude-sonnet-4-20250514",
-            request_id="test-error",
-            original_tokens=10,
-            optimized_tokens=10,
-            tokens_saved=0,
-            transforms_applied=[],
-            tags={},
-            optimization_latency=0.0,
+        proxy.http_client.send = AsyncMock(
+            side_effect=httpx.ConnectError("Connection refused to 10.0.0.7:443")
         )
 
-        # Should return a StreamingResponse with error SSE event
-        assert result.media_type == "text/event-stream"
+        # Attach directly to the proxy logger: caplog does not reliably see
+        # ``headroom.*`` records once proxy logging is configured.
+        records: list[logging.LogRecord] = []
 
-        # Consume the generator to get the error event
-        chunks = []
-        async for chunk in result.body_iterator:
-            chunks.append(chunk)
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        handler = _Collect(level=logging.DEBUG)
+        proxy_logger = logging.getLogger("headroom.proxy")
+        proxy_logger.addHandler(handler)
+        try:
+            result = await proxy._stream_response(
+                url="https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": "sk-test"},
+                body={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 100,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                provider="anthropic",
+                model="claude-sonnet-4-20250514",
+                request_id="test-error",
+                original_tokens=10,
+                optimized_tokens=10,
+                tokens_saved=0,
+                transforms_applied=[],
+                tags={},
+                optimization_latency=0.0,
+            )
+
+            # Should return a StreamingResponse with error SSE event
+            assert result.media_type == "text/event-stream"
+
+            # Consume the generator to get the error event
+            chunks = []
+            async for chunk in result.body_iterator:
+                chunks.append(chunk)
+        finally:
+            proxy_logger.removeHandler(handler)
 
         assert len(chunks) == 1
         raw = chunks[0].decode("utf-8")
         assert "event: error" in raw
         error_data = json.loads(raw.split("data: ")[1].strip())
         assert error_data["error"]["type"] == "connection_error"
-        assert "Connection refused" in error_data["error"]["message"]
+        # Client sees the fixed vocabulary plus a correlation id, never the
+        # transport text (which can carry upstream hosts and addresses).
+        assert error_data["error"]["code"] == "upstream_unreachable"
+        assert error_data["request_id"] == "test-error"
+        assert "request_id=test-error" in error_data["error"]["message"]
+        assert "Connection refused" not in raw
+        assert "10.0.0.7" not in raw
+        # The operator still gets the full detail, keyed by the same id.
+        logged = [r.getMessage() for r in records]
+        assert any(
+            "[test-error]" in m and "Connection refused to 10.0.0.7:443" in m for m in logged
+        ), logged
 
     @pytest.mark.asyncio
     async def test_connect_timeout_retries_before_returning_stream(self):

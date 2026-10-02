@@ -50,6 +50,8 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     # exist inside the container and would keep /readyz at 503 (#2803). The proxy
     # resolves the DB under its own cwd, which is the bind-mounted ~/.headroom.
     assert "--memory-db-path" not in manifest.proxy_args
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
 
 
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
@@ -97,6 +99,8 @@ def test_build_manifest_falls_back_from_windows_service_to_task(monkeypatch) -> 
 
     assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
     assert manifest.supervisor_kind == "task"
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
 
 
 def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targets() -> None:
@@ -416,3 +420,31 @@ def test_detect_targets_finds_antigravity_config_dir(monkeypatch, tmp_path) -> N
     from headroom.install.planner import detect_targets
 
     assert ToolTarget.ANTIGRAVITY.value in detect_targets()
+
+
+def test_build_manifest_for_persistent_service_uses_safe_model_backends() -> None:
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert manifest.base_env["HEADROOM_EMBEDDER_RUNTIME"] == "cpu"
+    assert manifest.base_env["HEADROOM_KOMPRESS_BACKEND"] == "onnx"
+
+
+def test_persistent_service_explicit_model_backends_override_safe_defaults() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            extra_env={
+                "HEADROOM_EMBEDDER_RUNTIME": "pytorch_mps",
+                "HEADROOM_KOMPRESS_BACKEND": "pytorch_mps",
+            }
+        )
+    )
+
+    assert manifest.base_env["HEADROOM_EMBEDDER_RUNTIME"] == "pytorch_mps"
+    assert manifest.base_env["HEADROOM_KOMPRESS_BACKEND"] == "pytorch_mps"
+
+
+def test_persistent_task_does_not_inherit_service_backend_defaults() -> None:
+    manifest = build_manifest(**_base_manifest_kwargs(preset=InstallPreset.PERSISTENT_TASK.value))
+
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
