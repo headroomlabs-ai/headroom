@@ -36,6 +36,9 @@ _PRICING_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 # Models whose price came from the built-in table rather than LiteLLM.
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
+# Models that fell through every price source to the unknown-model default
+# (issue #3732). A cost computed from one of these is a guess, not a lookup.
+_UNKNOWN_PRICING_MODELS: set[str] = set()
 
 TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
@@ -757,7 +760,41 @@ class OpenAIProvider(Provider):
         if family and family in _PATTERN_DEFAULTS:
             return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"])
 
+        # Completely unknown: the GPT-4o-tier default. A number is genuinely
+        # required here (callers must never get None for a model nobody knows),
+        # but it is a guess, not a lookup -- record it and say so loudly
+        # (issue #3732). Anything downstream that treats this price as measured
+        # (budgets, cost cards) is enforcing against a fabrication.
+        self._warn_unknown_pricing(model)
         return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+
+    def pricing_is_estimated(self, model: str) -> bool:
+        """True when ``model``'s price is the unknown-model default, not a lookup.
+
+        Lets callers (cost card, budget enforcement) distinguish a guessed
+        price from a resolved one (issue #3732). The default tuple is still
+        returned by :meth:`_get_pricing` -- a number is genuinely required
+        there -- but it is now visibly a default: the first call also emits
+        the once-per-model warning from :meth:`_warn_unknown_pricing`.
+        """
+        self._get_pricing(model)
+        return model in _UNKNOWN_PRICING_MODELS
+
+    def _warn_unknown_pricing(self, model: str) -> None:
+        """Warn once per model priced at the unknown-model default (issue #3732)."""
+        if model in _UNKNOWN_PRICING_MODELS:
+            return
+        _UNKNOWN_PRICING_MODELS.add(model)
+        in_price, out_price = cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+        logger.warning(
+            "No pricing found for model '%s' in explicit config, LiteLLM, or the "
+            "built-in table -- using the GPT-4o-tier default ($%.2f/$%.2f per 1M "
+            "tokens). This cost is a GUESS. To price it explicitly, set the "
+            "HEADROOM_MODEL_LIMITS env var or add it to ~/.headroom/models.json.",
+            model,
+            in_price,
+            out_price,
+        )
 
     def _warn_pricing_fallback(self, model: str) -> None:
         """Warn once per model that pricing came from the built-in table."""

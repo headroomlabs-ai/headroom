@@ -90,3 +90,62 @@ def test_unknown_model_still_returns_a_usable_default() -> None:
 
     assert got is not None
     assert got[0] > 0
+
+
+def test_unknown_model_warns_once_and_is_flagged_estimated(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The unknown-model default must be loud and distinguishable (issue #3732).
+
+    Fails before the fix: no warning was emitted at all (only a debug log via
+    the generic fallback path) and callers had no way to tell the $2.50/$10.00
+    tuple apart from a real price lookup.
+    """
+    import logging
+
+    import headroom.pricing.litellm_pricing as lp
+    import headroom.providers.openai as openai_mod
+
+    monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
+    # Isolation: the unknown-model registry is module-global.
+    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+
+    provider = OpenAIProvider()
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        got = provider._get_pricing("no-such-model-warns-once")
+        provider._get_pricing("no-such-model-warns-once")
+
+    # Still a usable number -- a number is genuinely required here.
+    assert got == (2.50, 10.00)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "no-such-model-warns-once" in warnings[0].getMessage()
+    assert "GUESS" in warnings[0].getMessage()
+
+    # ...but now it is representable as a guess.
+    assert provider.pricing_is_estimated("no-such-model-warns-once") is True
+
+
+def test_resolved_prices_are_not_flagged_estimated(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Table hits and explicit config are decisions, not guesses (issue #3732)."""
+    import logging
+
+    import headroom.pricing.litellm_pricing as lp
+    import headroom.providers.openai as openai_mod
+
+    monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
+    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+
+    provider = OpenAIProvider()
+    provider._pricing_overrides["my-custom-model"] = (1.0, 2.0)
+
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        assert provider._get_pricing("gpt-4.1-nano") == (0.10, 0.40)
+        assert provider._get_pricing("my-custom-model") == (1.0, 2.0)
+        assert provider.pricing_is_estimated("gpt-4.1-nano") is False
+        assert provider.pricing_is_estimated("my-custom-model") is False
+
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
