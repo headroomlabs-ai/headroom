@@ -1300,9 +1300,12 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress TOIN filesystem persistence, and export the flag
+    # so code that runs before the proxy records it (the update check) and
+    # child processes see the same answer as paths.process_is_stateless().
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_STATELESS"] = "1"
 
     # Licence token (HEADROOM_LICENSE; HEADROOM_LICENSE_KEY is a deprecated
     # alias). Having one set never enables outbound usage reporting: that

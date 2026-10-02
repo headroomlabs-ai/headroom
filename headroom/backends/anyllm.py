@@ -12,6 +12,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
 from .base import Backend, BackendResponse, StreamEvent
@@ -500,7 +501,7 @@ class AnyLLMBackend(Backend):
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -596,7 +597,9 @@ class AnyLLMBackend(Backend):
         error_type = "api_error"
         status_code = 500
 
-        error_message = format_exception_message(e)
+        # Provider API errors keep their text; transport failures are reduced
+        # to the public vocabulary (see proxy/public_errors).
+        error_message = client_message(e, format_exception_message(e))
         error_str = str(e).lower()
         if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
@@ -664,7 +667,7 @@ class AnyLLMBackend(Backend):
             logger.error(f"any-llm OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": error_message,
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

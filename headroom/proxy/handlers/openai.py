@@ -77,6 +77,7 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.copilot import model_prefers_responses_api
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.proxy_targets import route_grok_to_xai
+from headroom.proxy import public_errors
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -5131,13 +5132,11 @@ class OpenAIHandlerMixin:
                 logger.error(f"[{request_id}] Backend error: {e}")
                 return JSONResponse(
                     status_code=500,
-                    content={
-                        "error": {
-                            "message": str(e),
-                            "type": "api_error",
-                            "code": "backend_error",
-                        }
-                    },
+                    content=public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        request_id=str(request_id),
+                        error_type="api_error",
+                    ),
                 )
 
         # Direct OpenAI API (no backend configured). Reuse the upstream resolved
@@ -10875,12 +10874,10 @@ class OpenAIHandlerMixin:
             await self.metrics.record_failed(provider="compress")
             return JSONResponse(
                 status_code=503,
-                content={
-                    "error": {
-                        "type": "compression_error",
-                        "message": str(e),
-                    }
-                },
+                content=public_errors.openai_error_body(
+                    public_errors.classify_or_internal(e),
+                    error_type="compression_error",
+                ),
             )
 
     async def handle_compress_usage(self, request: Request) -> JSONResponse:
@@ -11267,12 +11264,11 @@ class OpenAIHandlerMixin:
             tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
-                    {
-                        "error": {
-                            "type": "connection_error",
-                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
-                        }
-                    }
+                    public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        error_type="connection_error",
+                        hint=tls_hint,
+                    )
                 ),
                 status_code=502,
                 media_type="application/json",
@@ -11458,12 +11454,11 @@ class OpenAIHandlerMixin:
             tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
-                    {
-                        "error": {
-                            "type": "connection_error",
-                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
-                        }
-                    }
+                    public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        error_type="connection_error",
+                        hint=tls_hint,
+                    )
                 ),
                 status_code=502,
                 media_type="application/json",

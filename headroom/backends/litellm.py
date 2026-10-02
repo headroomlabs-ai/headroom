@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
 from .base import Backend, BackendResponse, StreamEvent
@@ -1285,6 +1286,9 @@ class LiteLLMBackend(Backend):
         except Exception as e:
             error_message = format_exception_message(e)
             logger.error(f"LiteLLM error: {error_message}")
+            # Provider API errors keep their text; transport failures are
+            # reduced to the public vocabulary (see proxy/public_errors).
+            error_message = client_message(e, error_message)
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1638,7 +1642,7 @@ class LiteLLMBackend(Backend):
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -1832,6 +1836,7 @@ class LiteLLMBackend(Backend):
         except Exception as e:
             error_message = format_exception_message(e)
             logger.error(f"LiteLLM OpenAI error: {error_message}")
+            error_message = client_message(e, error_message)
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1943,7 +1948,7 @@ class LiteLLMBackend(Backend):
             logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": error_message,
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

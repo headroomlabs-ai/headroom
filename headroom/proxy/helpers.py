@@ -301,11 +301,20 @@ def extract_tags(headers: Any) -> dict[str, str]:
 
     Header name match is case-insensitive; the returned key has the
     ``x-headroom-`` prefix stripped.
+
+    Credential-bearing headers are never tags. ``x-headroom-proxy-token`` is
+    the proxy's own bearer and gateways (Kong, Envoy, LiteLLM) send it on every
+    turn; before this filter it landed in ``RequestOutcome.tags`` and from
+    there in the request log, dashboard facets and every export that carries
+    tags. The rule lives in :mod:`internal_header_policy` so producers and
+    consumers of tags agree on it.
     """
+    from headroom.proxy.internal_header_policy import is_credential_header
+
     return {
         k.lower().replace("x-headroom-", ""): v
         for k, v in headers.items()
-        if k.lower().startswith("x-headroom-")
+        if k.lower().startswith("x-headroom-") and not is_credential_header(k)
     }
 
 

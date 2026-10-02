@@ -377,7 +377,8 @@ async def test_send_message_returns_error_response(monkeypatch: pytest.MonkeyPat
 
     assert result.status_code == 401
     assert result.body["error"]["type"] == "authentication_error"
-    assert result.error == "authentication api_key missing"
+    # Unclassified exception text stays in the server log, never the client.
+    assert result.error == "The proxy could not complete the request."
 
 
 @pytest.mark.asyncio
@@ -416,7 +417,7 @@ async def test_stream_message_yields_events_and_error(monkeypatch: pytest.Monkey
     instance_error.raise_error = RuntimeError("stream broke")
     error_events = [event async for event in backend_error.stream_message({"messages": []}, {})]
     assert error_events[-1].event_type == "error"
-    assert error_events[-1].data["error"]["message"] == "stream broke"
+    assert error_events[-1].data["error"]["message"] == "The proxy could not complete the request."
 
 
 def _tool_call_delta(*, index, tc_id=None, name=None, arguments=None):  # noqa: ANN001, ANN202
