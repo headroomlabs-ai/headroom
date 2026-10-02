@@ -235,10 +235,10 @@ agno = [
 strands = [
     "strands-agents>=0.1.0",
 ]
-# CrewAI agent framework integration
-crewai = [
-    "crewai>=1.15.21",
-]
+# CrewAI: no extra on purpose. The integration only wraps CrewAI tools, so it
+# uses whatever CrewAI the user already has (`pip install headroom-ai crewai`).
+# An extra here would put CrewAI's own dependency tree (including chromadb,
+# which has unpatched server-side CVEs) into our lockfile and security alerts.
 # AutoGen agent framework integration
 autogen = [
     "autogen-agentchat>=0.7",

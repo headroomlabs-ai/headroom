@@ -13,6 +13,7 @@ This is a drop-in replacement for InMemoryGraphStore that:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -25,6 +26,8 @@ from typing import TYPE_CHECKING, Any
 from .graph_models import Entity, Relationship, RelationshipDirection, Subgraph
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from ..tracker import ComponentStats
 
 logger = logging.getLogger(__name__)
@@ -74,11 +77,12 @@ class SQLiteGraphStore:
         self._lock = RLock()
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
@@ -90,7 +94,11 @@ class SQLiteGraphStore:
         # Enable foreign keys
         conn.execute("PRAGMA foreign_keys = ON")
 
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""

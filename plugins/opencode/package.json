@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.2",
-    "headroom-ai": "^0.37.0"
+    "headroom-ai": "^0.39.1"
   },
   "peerDependencies": {
     "@ai-sdk/openai-compatible": "*",
