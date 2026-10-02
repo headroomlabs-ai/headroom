@@ -53,6 +53,18 @@ def test_process_stateless_env(monkeypatch, value, expected):
     assert paths.process_is_stateless() is expected
 
 
+def test_install_id_stays_in_memory_when_stateless(tmp_path, monkeypatch):
+    from headroom.telemetry import session
+
+    workspace = tmp_path / "state"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setattr(session, "_install_id", None)
+    paths.set_process_stateless(True)
+
+    assert len(session.install_id()) == 32
+    assert not workspace.exists()
+
+
 # ---- output-savings recorder ----------------------------------------------
 
 
