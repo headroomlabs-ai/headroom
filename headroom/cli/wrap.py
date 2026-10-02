@@ -316,7 +316,15 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {"antigravity", "claude", "codex", "cursor", "grok", "grok_build", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+    "opencode",
+}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -7608,9 +7616,7 @@ def antigravity(
         return
 
     def _print_antigravity_setup(actual_port: int) -> None:
-        for line in _render_antigravity_setup_lines(
-            actual_port, project=_project_name_from_cwd()
-        ):
+        for line in _render_antigravity_setup_lines(actual_port, project=_project_name_from_cwd()):
             click.echo(line)
 
     _run_proxy_only_watcher(

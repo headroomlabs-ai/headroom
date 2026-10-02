@@ -24,11 +24,22 @@ def _spec() -> ServerSpec:
 
 
 def _config_path(tmp_path: Path) -> Path:
+    return tmp_path / ".gemini" / "config" / "mcp_config.json"
+
+
+def _legacy_config_path(tmp_path: Path) -> Path:
     return tmp_path / ".gemini" / "antigravity" / "mcp_config.json"
 
 
 def test_detect_true_when_antigravity_dir_exists(tmp_path: Path) -> None:
     (tmp_path / ".gemini" / "antigravity").mkdir(parents=True)
+    assert _make_registrar(tmp_path).detect() is True
+
+
+def test_detect_true_when_config_dir_exists(tmp_path: Path) -> None:
+    # The current Desktop config lives directly under ~/.gemini/config; an
+    # install that has not created its MCP file yet still counts.
+    (tmp_path / ".gemini" / "config").mkdir(parents=True)
     assert _make_registrar(tmp_path).detect() is True
 
 
@@ -56,8 +67,8 @@ def test_register_creates_config_with_mcp_servers(tmp_path: Path) -> None:
     assert entry["env"] == {"HEADROOM_PROXY_URL": "http://127.0.0.1:8787"}
 
 
-def test_register_prefers_existing_alternate_location(tmp_path: Path) -> None:
-    legacy = tmp_path / ".gemini" / "config" / "mcp_config.json"
+def test_register_uses_legacy_location_when_current_missing(tmp_path: Path) -> None:
+    legacy = _legacy_config_path(tmp_path)
     legacy.parent.mkdir(parents=True)
     legacy.write_text(json.dumps({"mcpServers": {}}))
 
@@ -67,8 +78,38 @@ def test_register_prefers_existing_alternate_location(tmp_path: Path) -> None:
     assert json.loads(legacy.read_text())["mcpServers"]["headroom"]["command"] == (
         "/usr/bin/headroom"
     )
-    # The default location is left alone when the alternate already exists.
+    # The current location is left alone when the legacy one already exists.
     assert not _config_path(tmp_path).exists()
+
+
+def test_register_prefers_current_location_when_both_exist(tmp_path: Path) -> None:
+    current = _config_path(tmp_path)
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps({"mcpServers": {}}))
+    legacy = _legacy_config_path(tmp_path)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"mcpServers": {}}))
+
+    result = _make_registrar(tmp_path).register_server(_spec())
+
+    assert result.status == RegisterStatus.REGISTERED
+    assert "headroom" in json.loads(current.read_text())["mcpServers"]
+    # The stale legacy file is not touched: the IDE reads the current one.
+    assert "headroom" not in json.loads(legacy.read_text())["mcpServers"]
+
+
+def test_get_server_reads_current_location_when_both_exist(tmp_path: Path) -> None:
+    current = _config_path(tmp_path)
+    current.parent.mkdir(parents=True)
+    current.write_text(json.dumps({"mcpServers": {"headroom": {"command": "/current/headroom"}}}))
+    legacy = _legacy_config_path(tmp_path)
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"mcpServers": {"headroom": {"command": "/stale/headroom"}}}))
+
+    server = _make_registrar(tmp_path).get_server("headroom")
+
+    assert server is not None
+    assert server.command == "/current/headroom"
 
 
 def test_register_is_idempotent(tmp_path: Path) -> None:
@@ -162,6 +203,30 @@ def test_unregister_returns_false_when_absent(tmp_path: Path) -> None:
     assert _make_registrar(tmp_path).unregister_server("headroom") is False
 
 
+def test_unregister_removes_entry_from_all_locations(tmp_path: Path) -> None:
+    registrar = _make_registrar(tmp_path)
+    for path in (_config_path(tmp_path), _legacy_config_path(tmp_path)):
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "headroom": {"command": "/usr/bin/headroom"},
+                        "other": {"command": "other-server"},
+                    }
+                }
+            )
+        )
+
+    assert registrar.unregister_server("headroom") is True
+
+    for path in (_config_path(tmp_path), _legacy_config_path(tmp_path)):
+        payload = json.loads(path.read_text())
+        assert "headroom" not in payload["mcpServers"]
+        # Unrelated entries are preserved in both files.
+        assert payload["mcpServers"]["other"] == {"command": "other-server"}
+
+
 def test_registrar_name_and_display_name() -> None:
     registrar = AntigravityRegistrar(home_dir=Path("/nonexistent"))
     assert registrar.name == "antigravity"
@@ -182,3 +247,18 @@ def test_install_everywhere_installs_into_detected_antigravity(tmp_path: Path) -
     assert set(results) == {"antigravity"}
     assert results["antigravity"].status == RegisterStatus.REGISTERED
     assert registrar.get_server("headroom") is not None
+
+
+def test_install_everywhere_registers_with_only_config_dir(tmp_path: Path) -> None:
+    # First-time setup: only the current Desktop config directory exists, no
+    # MCP file yet. An explicit install must attempt registration instead of
+    # bailing out as NOT_DETECTED.
+    (tmp_path / ".gemini" / "config").mkdir(parents=True)
+    registrar = AntigravityRegistrar(home_dir=tmp_path)
+
+    results = install_everywhere(registrars=[registrar], agents=["antigravity"])
+
+    assert set(results) == {"antigravity"}
+    assert results["antigravity"].status == RegisterStatus.REGISTERED
+    assert registrar.get_server("headroom") is not None
+    assert (tmp_path / ".gemini" / "config" / "mcp_config.json").exists()

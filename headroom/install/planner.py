@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 
 import click
 
@@ -34,6 +35,7 @@ SUPPORTED_TARGETS = [
     ToolTarget.GROK,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
+    ToolTarget.ANTIGRAVITY,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
@@ -62,6 +64,8 @@ def detect_targets() -> list[str]:
             detected.append(target.value)
             continue
         if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
+            detected.append(target.value)
+        if target == ToolTarget.ANTIGRAVITY and (Path.home() / ".gemini").is_dir():
             detected.append(target.value)
     return detected
 
