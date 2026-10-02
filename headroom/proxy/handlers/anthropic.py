@@ -3635,7 +3635,8 @@ class AnthropicHandlerMixin:
 
                     _cbp_tokenizer_model = sanitize_anthropic_model_id(_cbp_model)
                     if (
-                        isinstance(model, str)
+                        _cbp_mode != "reject"
+                        and isinstance(model, str)
                         and sanitize_anthropic_model_id(model) == _cbp_tokenizer_model
                     ):
                         _cbp_tokenizer = tokenizer
