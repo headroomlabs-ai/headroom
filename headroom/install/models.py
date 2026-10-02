@@ -102,9 +102,13 @@ class DeploymentManifest:
     backend: str
     anyllm_provider: str | None = None
     region: str | None = None
-    proxy_mode: str = "cache"
+    proxy_mode: str | None = None
     memory_enabled: bool = False
     memory_db_path: str = ""
+    learn_enabled: bool | None = None
+    memory_storage_mode: str = "project"
+    traffic_learning_min_evidence: int = 5
+    memory_project_root: str = ""
     telemetry_enabled: bool = True
     image: str = "ghcr.io/headroomlabs-ai/headroom:latest"
     service_name: str = "headroom"
