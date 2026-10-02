@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.public_errors import client_message
 from headroom.utils import format_exception_message
 
 from .base import Backend, BackendResponse, StreamEvent
@@ -1274,6 +1275,9 @@ class LiteLLMBackend(Backend):
         except Exception as e:
             error_message = format_exception_message(e)
             logger.error(f"LiteLLM error: {error_message}")
+            # Provider API errors keep their text; transport failures are
+            # reduced to the public vocabulary (see proxy/public_errors).
+            error_message = client_message(e, error_message)
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1689,7 +1693,7 @@ class LiteLLMBackend(Backend):
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -1886,6 +1890,7 @@ class LiteLLMBackend(Backend):
         except Exception as e:
             error_message = format_exception_message(e)
             logger.error(f"LiteLLM OpenAI error: {error_message}")
+            error_message = client_message(e, error_message)
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1979,6 +1984,15 @@ class LiteLLMBackend(Backend):
 
             async for chunk in response:
                 chunk_dict = chunk.model_dump(exclude_none=True, exclude_unset=True)
+                # Report the model the client requested, not the LiteLLM-mapped
+                # provider slug (e.g. "openrouter/qwen3",
+                # "bedrock/us.anthropic.claude-..."). send_openai_message already
+                # rewrites the model to original_model on the non-streaming path;
+                # without this the streaming and non-streaming responses disagree
+                # and OpenAI clients that key cost/telemetry on the model field
+                # see an unrecognized name for every streamed request.
+                if "model" in chunk_dict:
+                    chunk_dict["model"] = original_model
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
             yield "data: [DONE]\n\n"
@@ -1988,7 +2002,7 @@ class LiteLLMBackend(Backend):
             logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": error_message,
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }
