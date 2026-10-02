@@ -197,3 +197,38 @@ def test_passthrough_handler_roots_profile_at_origin_and_strips_region_domain():
     assert not forwarded & stale, "filtered body must not carry the upstream's validators"
     assert response.headers["x-request-id"] == "req-1"
     assert response.headers["content-type"] == "application/json"
+
+
+class TestModeWarningOnEveryReusePath:
+    """Bob requests token mode; every path that hands it an existing proxy warns
+    when that proxy runs a different mode, not only the ordinary reuse return."""
+
+    @pytest.fixture
+    def cache_mode_proxy(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_MODE", "token")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_foreign_listener", lambda _p: False)
+        monkeypatch.setattr(
+            wrap_mod, "_query_proxy_health", lambda _p: {"config": {"mode": "cache"}}
+        )
+        lines: list[str] = []
+        monkeypatch.setattr("click.echo", lambda msg="", *a, **k: lines.append(str(msg)))
+        return lines
+
+    def test_no_proxy_warns(self, cache_mode_proxy):
+        assert wrap_mod._ensure_proxy_unlocked(8787, True) == (None, 8787)
+        assert any("'token' mode" in line for line in cache_mode_proxy)
+
+    def test_recovered_persistent_proxy_warns(self, monkeypatch, cache_mode_proxy):
+        from types import SimpleNamespace
+
+        import headroom.install.health as install_health
+
+        manifest = SimpleNamespace(profile="p", health_url="http://127.0.0.1:8787/readyz")
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: manifest)
+        monkeypatch.setattr(install_health, "probe_ready", lambda _url: False)
+        monkeypatch.setattr(wrap_mod, "_recover_persistent_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
+
+        assert wrap_mod._ensure_proxy_unlocked(8787, False) == (None, 8787)
+        assert any("'token' mode" in line for line in cache_mode_proxy)

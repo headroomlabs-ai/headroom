@@ -4725,6 +4725,7 @@ def _ensure_proxy_unlocked(
                                 missing.append("code-graph")
 
                             if not missing:
+                                _warn_proxy_mode_mismatch(running_config)
                                 return None, port
                             flags_str = ", ".join(f"--{f}" for f in missing)
                             click.echo(
@@ -5009,23 +5010,25 @@ def _ensure_proxy_unlocked(
     else:
         if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url:
+        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
-            running_vertex_url = (
-                _normalize_proxy_api_url(running_config.get("vertex_api_url"))
-                if running_config is not None
-                else None
-            )
-            requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-            if running_vertex_url != requested_vertex_url:
-                click.echo(
-                    "  Warning: --no-proxy is set, but the running proxy does not "
-                    "advertise the requested Vertex target. Requests may still go "
-                    "to the proxy's existing Vertex upstream."
+            if vertex_api_url or clear_vertex_api_url:
+                running_vertex_url = (
+                    _normalize_proxy_api_url(running_config.get("vertex_api_url"))
+                    if running_config is not None
+                    else None
                 )
+                requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                if running_vertex_url != requested_vertex_url:
+                    click.echo(
+                        "  Warning: --no-proxy is set, but the running proxy does not "
+                        "advertise the requested Vertex target. Requests may still go "
+                        "to the proxy's existing Vertex upstream."
+                    )
+            _warn_proxy_mode_mismatch(running_config)
         return None, port
 
 
