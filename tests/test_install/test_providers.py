@@ -936,17 +936,19 @@ def test_planner_resolve_all_includes_antigravity() -> None:
     assert "antigravity" in targets
 
 
-def test_planner_detect_targets_includes_antigravity_with_gemini_dir(
+def test_planner_detect_targets_ignores_bare_gemini_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from pathlib import Path as StdPath
 
     from headroom.install.planner import detect_targets
 
+    # Gemini CLI keeps its own session data under ~/.gemini/, so the shared
+    # home directory alone must not count as an Antigravity install.
     (tmp_path / ".gemini").mkdir()
     monkeypatch.setattr(StdPath, "home", classmethod(lambda cls: tmp_path))
 
-    assert "antigravity" in detect_targets()
+    assert "antigravity" not in detect_targets()
 
 
 # ---------------------------------------------------------------------------
