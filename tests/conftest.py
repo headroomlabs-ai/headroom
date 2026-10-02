@@ -250,13 +250,11 @@ def _null_binary_pins():
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    Two sources disable propagation on the headroom logger tree and never
-    restore it, which then makes later `caplog`-based assertions flaky in
+    A benchmark helper disables propagation on the headroom logger tree and
+    never restores it, which then makes later `caplog`-based assertions flaky in
     full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
     on the chain silently drops the records):
 
-    - ``headroom.proxy.helpers._setup_file_logging`` sets
-      ``getLogger("headroom").propagate = False`` on proxy startup.
     - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
       (exercised by ``test_claude_session_mode_benchmark``) sets
       ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,

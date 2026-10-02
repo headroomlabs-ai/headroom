@@ -169,6 +169,10 @@ def build_manifest(
         "HEADROOM_MODE": proxy_mode,
         "HEADROOM_BACKEND": backend,
     }
+    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+        # Keep native services away from Metal-specific model backends by default.
+        base_env["HEADROOM_EMBEDDER_RUNTIME"] = "cpu"
+        base_env["HEADROOM_KOMPRESS_BACKEND"] = "onnx"
     if anyllm_provider:
         base_env["HEADROOM_ANYLLM_PROVIDER"] = anyllm_provider
     if region:

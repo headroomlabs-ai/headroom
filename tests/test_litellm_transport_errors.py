@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,7 +18,17 @@ from fastapi.testclient import TestClient  # noqa: E402
 from headroom.backends.anyllm import AnyLLMBackend  # noqa: E402
 from headroom.backends.base import BackendResponse  # noqa: E402
 from headroom.backends.litellm import LiteLLMBackend  # noqa: E402
+from headroom.proxy.public_errors import (  # noqa: E402
+    UPSTREAM_PROTOCOL_ERROR,
+    UPSTREAM_TIMEOUT,
+    public_message,
+)
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
+
+# Transport exceptions never surface their own text (it names the upstream host);
+# an empty-message ReadError/ReadTimeout maps to the fixed vocabulary instead.
+_PROTOCOL = public_message(UPSTREAM_PROTOCOL_ERROR)
+_TIMEOUT = public_message(UPSTREAM_TIMEOUT)
 
 _BODY = {
     "model": "claude-sonnet-4-20250514",
@@ -39,8 +50,8 @@ async def test_send_message_names_transport_error_without_message() -> None:
         result = await backend.send_message(_BODY, {})
 
     assert result.status_code == 500
-    assert result.error == "ReadError (no message)"
-    assert result.body["error"]["message"] == "ReadError (no message)"
+    assert result.error == _PROTOCOL
+    assert result.body["error"]["message"] == _PROTOCOL
 
 
 @pytest.mark.asyncio
@@ -57,7 +68,7 @@ async def test_stream_message_names_transport_error_without_message() -> None:
         events = [event async for event in backend.stream_message(_BODY, {})]
 
     error_event = next(event for event in events if event.event_type == "error")
-    assert error_event.data["error"]["message"] == "ReadTimeout (no message)"
+    assert error_event.data["error"]["message"] == _TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -71,8 +82,8 @@ async def test_anyllm_backend_names_transport_error_without_message() -> None:
         result = await backend.send_message(_BODY, {})
 
     assert result.status_code == 500
-    assert result.error == "ReadError (no message)"
-    assert result.body["error"]["message"] == "ReadError (no message)"
+    assert result.error == _PROTOCOL
+    assert result.body["error"]["message"] == _PROTOCOL
 
 
 @pytest.mark.asyncio
@@ -86,7 +97,7 @@ async def test_anyllm_stream_backend_names_transport_error_without_message() -> 
         events = [event async for event in backend.stream_message(_BODY, {})]
 
     error_event = next(event for event in events if event.event_type == "error")
-    assert error_event.data["error"]["message"] == "ReadTimeout (no message)"
+    assert error_event.data["error"]["message"] == _TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -108,10 +119,10 @@ async def test_openai_backend_boundaries_name_transport_errors_without_message()
         litellm_backend = LiteLLMBackend(provider="openrouter")
         litellm_result = await litellm_backend.send_openai_message(_BODY, {})
 
-    assert anyllm_result.body["error"]["message"] == "ReadError (no message)"
-    assert anyllm_result.error == "ReadError (no message)"
-    assert litellm_result.body["error"]["message"] == "ReadTimeout (no message)"
-    assert litellm_result.error == "ReadTimeout (no message)"
+    assert anyllm_result.body["error"]["message"] == _PROTOCOL
+    assert anyllm_result.error == _PROTOCOL
+    assert litellm_result.body["error"]["message"] == _TIMEOUT
+    assert litellm_result.error == _TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -133,8 +144,8 @@ async def test_openai_stream_boundaries_name_transport_errors_without_message() 
         litellm_backend = LiteLLMBackend(provider="openrouter")
         litellm_chunks = [chunk async for chunk in litellm_backend.stream_openai_message(_BODY, {})]
 
-    assert '"message": "ReadError (no message)"' in anyllm_chunks[0]
-    assert '"message": "ReadTimeout (no message)"' in litellm_chunks[0]
+    assert f'"message": {json.dumps(_PROTOCOL)}' in anyllm_chunks[0]
+    assert f'"message": {json.dumps(_TIMEOUT)}' in litellm_chunks[0]
 
 
 def _erroring_anthropic_backend() -> MagicMock:
@@ -187,7 +198,9 @@ def test_anthropic_proxy_names_nonstream_transport_error_without_message() -> No
             )
 
     assert response.status_code == 500
-    assert response.json()["error"]["message"] == "ReadError (no message)"
+    # Proxy-level replies append the request id for log correlation.
+    assert response.json()["error"]["message"].startswith(_PROTOCOL)
+    assert response.json()["error"]["code"] == UPSTREAM_PROTOCOL_ERROR
 
 
 def test_bedrock_stream_names_transport_error_without_message() -> None:
@@ -202,4 +215,5 @@ def test_bedrock_stream_names_transport_error_without_message() -> None:
             )
 
     assert response.status_code == 200
-    assert '"message": "ReadTimeout (no message)"' in response.text
+    assert _TIMEOUT in response.text
+    assert '"code": "upstream_timeout"' in response.text
