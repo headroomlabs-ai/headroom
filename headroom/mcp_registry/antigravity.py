@@ -71,11 +71,21 @@ class AntigravityRegistrar(MCPRegistrar):
         self._home = home_dir if home_dir is not None else Path.home()
 
     def _resolve_config(self) -> Path:
-        """Return the config file to use: first existing candidate, else default."""
-        for candidate in _config_candidates(self._home):
+        """Return the config file to use.
+
+        The current Desktop location (``~/.gemini/config/mcp_config.json``)
+        is authoritative: when its parent directory exists the IDE reads
+        that location, so a stale legacy file must not capture the
+        registration. Otherwise use the first existing candidate, falling
+        back to the current location when none does yet.
+        """
+        candidates = _config_candidates(self._home)
+        if candidates[0].parent.is_dir():
+            return candidates[0]
+        for candidate in candidates:
             if candidate.exists():
                 return candidate
-        return _config_candidates(self._home)[0]
+        return candidates[0]
 
     def detect(self) -> bool:
         home = self._home
