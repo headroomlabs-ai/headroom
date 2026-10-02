@@ -183,6 +183,77 @@ class _Backend:
         yield  # pragma: no cover
 
 
+class _FailingBackend(_Backend):
+    async def stream_message(self, body, headers):
+        self.served = True
+        yield SimpleNamespace(
+            event_type="message_start",
+            raw_sse="event: message_start\ndata: {}\n\n",
+            data={},
+        )
+        raise RuntimeError("stream finalization failed")
+
+
+class _ErrorEventBackend(_Backend):
+    async def stream_message(self, body, headers):
+        self.served = True
+        yield SimpleNamespace(
+            event_type="error",
+            raw_sse='event: error\ndata: {"error": {"type": "api_error"}}\n\n',
+            data={"error": {"type": "api_error"}},
+        )
+
+    async def stream_openai_message(self, body, headers):
+        self.served = True
+        yield 'data: {"type": "er'
+        yield 'ror", "message": "provider failed"}\n\n'
+        yield "data: [DONE]\n\n"
+
+
+async def _drive_with_outcome(handler, backend):
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    response = await StreamingMixin._stream_response_bedrock(
+        handler,
+        {"messages": []},
+        {},
+        "anthropic",
+        "m",
+        "rid",
+        0,
+        0,
+        0,
+        [],
+        {},
+        0.0,
+        backend=backend,
+    )
+    async for _ in response.body_iterator:
+        pass
+
+
+async def _drive_openai_with_outcome(handler, backend):
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    response = await StreamingMixin._stream_openai_via_backend(
+        handler,
+        {"messages": []},
+        {},
+        "m",
+        "rid",
+        0.0,
+        0,
+        0,
+        0,
+        [],
+        {},
+        0.0,
+        backend=backend,
+    )
+    async for _ in response.body_iterator:
+        pass
+
+
 async def _drive(handler, **kw):
     from headroom.proxy.handlers.streaming import StreamingMixin
 
@@ -238,6 +309,72 @@ def test_streaming_without_a_route_uses_the_configured_backend():
     configured = _Backend("anthropic")
     asyncio.run(_drive(_handler(configured)))
     assert configured.served
+
+
+def test_failed_stream_finalization_is_not_counted_as_completed():
+    backend = _FailingBackend("anthropic")
+    outcomes = []
+
+    async def record_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(backend)
+    handler._extract_anthropic_cache_ttl_metrics = lambda usage: (0, 0)
+    handler._record_request_outcome = record_outcome
+    asyncio.run(_drive_with_outcome(handler, backend))
+
+    assert len(outcomes) == 1
+    assert outcomes[0].status_code == 502
+
+
+def test_stream_outcome_status_preserves_success_and_reclassifies_failure():
+    from headroom.proxy.handlers.streaming import _stream_outcome_status
+
+    assert _stream_outcome_status(200, True) == 200
+    assert _stream_outcome_status(200, False) == 502
+    assert _stream_outcome_status(529, False) == 502
+
+
+def test_sse_error_detection_handles_native_and_split_events():
+    from headroom.proxy.handlers.streaming import _sse_contains_error_event
+
+    assert _sse_contains_error_event(b'event: error\ndata: {"type":"error"}\n\n')
+    assert _sse_contains_error_event(b'data: {"type":"er' + b'ror"}\n\n')
+    assert not _sse_contains_error_event(b'data: {"type":"message"}\n\n')
+
+
+def test_backend_error_event_is_not_counted_as_completed():
+    backend = _ErrorEventBackend("anthropic")
+    outcomes = []
+
+    async def record_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(backend)
+    handler._extract_anthropic_cache_ttl_metrics = lambda usage: (0, 0)
+    handler._record_request_outcome = record_outcome
+    asyncio.run(_drive_with_outcome(handler, backend))
+
+    assert backend.served
+    assert len(outcomes) == 1
+    assert outcomes[0].status_code == 502
+
+
+def test_openai_backend_error_event_is_not_counted_as_completed():
+    backend = _ErrorEventBackend("openai")
+    outcomes = []
+
+    async def record_outcome(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(backend)
+    handler._parse_sse_usage_from_buffer = lambda state, provider: None
+    handler._record_request_outcome = record_outcome
+    asyncio.run(_drive_openai_with_outcome(handler, backend))
+
+    assert backend.served
+    assert len(outcomes) == 1
+    assert outcomes[0].status_code == 502
 
 
 async def _drive_openai(handler, **kw):
