@@ -518,10 +518,17 @@ class AnthropicHandlerMixin:
             headers=sanitize_forwarded_response_headers(response.headers, "content-type"),
         )
 
-    async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
+    async def _count_tokens_offloaded(  # noqa: ANN201
+        self,
+        model,
+        messages,
+        *,
+        fail_open: bool = True,  # noqa: ANN001
+    ):
+>>>>>>> 685151f4 (fix(proxy): preserve budget and timeout guarantees)
         from headroom.proxy.token_counting import count_tokens_offloaded
 
-        return await count_tokens_offloaded(self, model, messages)
+        return await count_tokens_offloaded(self, model, messages, fail_open=fail_open)
 
     def _resolve_ccr_workspace(
         self,
@@ -3921,6 +3928,7 @@ class AnthropicHandlerMixin:
                         _cbp_tokenizer, _cbp_counted_tokens = await self._count_tokens_offloaded(
                             _cbp_tokenizer_model,
                             _cbp_final_messages,
+                            fail_open=_cbp_mode != "reject",
                         )
                     if final_body.get("tools"):
                         _cbp_counted_tokens += _cbp_tokenizer.count_text(
