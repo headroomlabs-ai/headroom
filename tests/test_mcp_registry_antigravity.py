@@ -28,7 +28,9 @@ def test_antigravity_registrar_register_writes_current_location(tmp_path: Path) 
     assert "headroom" in _servers(_config_candidates(tmp_path)[0])
 
 
-def test_antigravity_unregister_removes_entry_from_every_candidate(tmp_path: Path) -> None:
+def test_antigravity_unregister_removes_entry_from_every_candidate(
+    tmp_path: Path,
+) -> None:
     registrar = AntigravityRegistrar(home_dir=tmp_path)
     for candidate in _config_candidates(tmp_path):
         _write_config(candidate, {"headroom": {"command": "headroom"}})
