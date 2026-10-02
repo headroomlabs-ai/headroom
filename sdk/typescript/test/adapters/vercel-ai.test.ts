@@ -240,11 +240,13 @@ describe("withHeadroom", () => {
       provider: "test-provider",
       modelId: "test-model",
       supportedUrls: {},
+      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
+      // maps over `content`, so the fixture must carry it.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "response",
-        usage: { promptTokens: 10, completionTokens: 5 },
+        content: [{ type: "text", text: "response" }],
         finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        warnings: [],
       }),
       doStream: vi.fn(),
     };
@@ -277,11 +279,13 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
+      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
+      // maps over `content`, so the fixture must carry it.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "ok",
-        usage: { promptTokens: 5, completionTokens: 3 },
+        content: [{ type: "text", text: "ok" }],
         finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        warnings: [],
       }),
       doStream: vi.fn(),
     };
@@ -311,11 +315,13 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
+      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
+      // maps over `content`, so the fixture must carry it.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "ok",
-        usage: { promptTokens: 5, completionTokens: 3 },
+        content: [{ type: "text", text: "ok" }],
         finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        warnings: [],
       }),
       doStream: vi.fn(),
     };
