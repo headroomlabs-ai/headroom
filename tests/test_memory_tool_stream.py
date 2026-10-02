@@ -361,6 +361,27 @@ class TestContinuationEdgeCases:
         assert events[0]["delta"]["stop_reason"] == "end_turn"
 
     @pytest.mark.asyncio
+    async def test_continuation_keeps_streaming_past_the_buffer_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.helpers as helpers
+
+        round_one = _sse([TEXT, SAVE], "tool_use")
+        reply = _sse([{"type": "text", "text": "Saved."}], "end_turn")
+        proxy = _proxy([reply], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(round_one)
+        response = proxy._parse_sse_to_response(round_one.decode(), "anthropic")
+        # _proxy splits each body in two; the second chunk arrives past the cap.
+        monkeypatch.setattr(helpers, "MAX_SSE_BUFFER_SIZE", 16)
+
+        events = await _drain(_continue(proxy, flt, response))
+
+        texts = [e["delta"]["text"] for e in events if e["type"] == "content_block_delta"]
+        assert texts == ["Saved."]
+        assert [e["type"] for e in events][-2:] == ["message_delta", "message_stop"]
+
+    @pytest.mark.asyncio
     async def test_interrupted_call_is_not_run(self) -> None:
         raw = _sse([TEXT, SAVE], "tool_use")
         raw = raw[: raw.rindex(b"event: content_block_stop")]
@@ -438,6 +459,18 @@ class TestFrameParsingEdgeCases:
         raw = b"".join(
             [
                 _frame({"type": "content_block_start", "index": 0, "content_block": SAVE}),
+                _frame({"type": "content_block_stop", "index": 0}),
+            ]
+        )
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        assert flt.feed(raw) == []
+        assert flt.hidden_calls() == [SAVE]
+
+    def test_other_delta_on_hidden_block_is_withheld(self) -> None:
+        raw = b"".join(
+            [
+                _frame({"type": "content_block_start", "index": 0, "content_block": SAVE}),
+                _frame({"type": "content_block_delta", "index": 0, "delta": {"type": "x"}}),
                 _frame({"type": "content_block_stop", "index": 0}),
             ]
         )
@@ -656,3 +689,65 @@ class TestServerMemoryToolNames:
         )
         assert names == frozenset({"memory_search"})
         assert AnthropicHandlerMixin._server_memory_tool_names(None, None) == frozenset()
+
+
+class TestHandlerPassesServerMemoryTools:
+    def test_injected_memory_tools_reach_the_stream(self) -> None:
+        from types import SimpleNamespace
+
+        from fastapi.responses import StreamingResponse
+        from fastapi.testclient import TestClient
+
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        captured: dict[str, Any] = {}
+
+        async def fake_stream_response(*args: Any, **kwargs: Any) -> StreamingResponse:
+            captured.update(kwargs)
+
+            async def gen() -> Any:
+                yield b""
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        memory_tools = [
+            {"name": name, "description": name, "input_schema": {"type": "object"}}
+            for name in sorted(MEMORY_TOOLS)
+        ]
+        with TestClient(create_app(config)) as client:
+            proxy = client.app.state.proxy
+            proxy.memory_handler = SimpleNamespace(
+                config=SimpleNamespace(inject_context=False, inject_tools=True),
+                compute_memory_tool_definitions=lambda provider: memory_tools,
+                get_beta_headers=lambda: {},
+                has_memory_tool_calls=lambda resp, provider: False,
+            )
+            proxy._stream_response = fake_stream_response
+            client.post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "test-key",
+                    "anthropic-version": "2023-06-01",
+                    "x-headroom-user-id": "u1",
+                },
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+                    "messages": [{"role": "user", "content": "remember the deploy region"}],
+                },
+            )
+
+        assert captured["server_memory_tool_names"] == MEMORY_TOOLS
