@@ -110,11 +110,15 @@ class AntigravityRegistrar(MCPRegistrar):
             return None
         return _entry_to_spec(server_name, entry)
 
-    def register_server(self, spec: ServerSpec, *, force: bool = False) -> RegisterResult:
+    def register_server(
+        self, spec: ServerSpec, *, force: bool = False
+    ) -> RegisterResult:
         existing = self.get_server(spec.name)
 
         if existing is not None and _specs_equivalent(existing, spec):
-            return RegisterResult(RegisterStatus.ALREADY, "matches current configuration")
+            return RegisterResult(
+                RegisterStatus.ALREADY, "matches current configuration"
+            )
 
         if existing is not None and not force:
             return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
@@ -140,9 +144,13 @@ class AntigravityRegistrar(MCPRegistrar):
             config_path.parent.mkdir(parents=True, exist_ok=True)
             fsutil.write_text(config_path, json.dumps(payload, indent=2) + "\n")
         except OSError as exc:
-            return RegisterResult(RegisterStatus.FAILED, f"could not write {config_path}: {exc}")
+            return RegisterResult(
+                RegisterStatus.FAILED, f"could not write {config_path}: {exc}"
+            )
         verb = "updated" if existing is not None else "wrote"
-        return RegisterResult(RegisterStatus.REGISTERED, f"{verb} {spec.name} in {config_path}")
+        return RegisterResult(
+            RegisterStatus.REGISTERED, f"{verb} {spec.name} in {config_path}"
+        )
 
     def unregister_server(self, server_name: str) -> bool:
         removed = False
@@ -208,7 +216,11 @@ def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:
     args_value = entry.get("args", [])
     args = tuple(str(x) for x in args_value) if isinstance(args_value, list) else ()
     env_value = entry.get("env", {})
-    env = {str(k): str(v) for k, v in env_value.items()} if isinstance(env_value, dict) else {}
+    env = (
+        {str(k): str(v) for k, v in env_value.items()}
+        if isinstance(env_value, dict)
+        else {}
+    )
     return ServerSpec(
         name=name,
         command=str(entry.get("command", "")),

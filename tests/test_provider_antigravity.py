@@ -73,7 +73,9 @@ def test_antigravity_render_setup_lines_project_attribution() -> None:
 def test_antigravity_install_registry_includes_antigravity() -> None:
     from headroom.providers.install_registry import build_install_target_envs
 
-    result = build_install_target_envs(port=1234, backend="ignored", targets=["antigravity"])
+    result = build_install_target_envs(
+        port=1234, backend="ignored", targets=["antigravity"]
+    )
     assert result["antigravity"]["OPENAI_BASE_URL"] == "http://127.0.0.1:1234/v1"
     assert result["antigravity"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1234"
 
