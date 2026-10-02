@@ -104,6 +104,10 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command
     assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in command
+    assert (
+        f"{_mount_source(str(tmp_path), '.config/litellm')}:/tmp/headroom-home/.config/litellm"
+        in joined
+    )
 
 
 def test_build_runtime_command_preserves_non_ascii_ambient_token(
@@ -251,6 +255,7 @@ def test_build_runtime_command_for_docker_matches_wrapper_parity(
     assert (tmp_path / ".claude").is_dir()
     assert (tmp_path / ".codex").is_dir()
     assert (tmp_path / ".gemini").is_dir()
+    assert (tmp_path / ".config" / "litellm").is_dir()
     assert "--env" in command
     joined = " ".join(command)
     assert "ANTHROPIC_API_KEY" in joined
