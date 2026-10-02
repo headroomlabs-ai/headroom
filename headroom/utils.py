@@ -20,6 +20,12 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
+def format_exception_message(exc: BaseException) -> str:
+    """Return exception text with a useful fallback for empty messages."""
+    message = str(exc)
+    return message or f"{type(exc).__name__} (no message)"
+
+
 def compute_hash(data: str | bytes) -> str:
     """Compute SHA256 hash, returning hex string."""
     if isinstance(data, str):
@@ -43,12 +49,23 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
     return hashlib.md5(data).hexdigest()[:length]  # nosec B324
 
 
-def extract_user_query(messages: list[dict[str, Any]]) -> str:
+def extract_user_query(
+    messages: list[dict[str, Any]], *, latest_user_turn_only: bool = False
+) -> str:
     """Extract the most recent user question from messages.
 
     Used to pass context through the compression pipeline so transforms like
     SmartCrusher can score items by relevance to the user's actual question,
     not just by statistical properties (position, anomaly, boundary).
+
+    Args:
+        messages: Conversation messages, oldest first.
+        latest_user_turn_only: Stop at the newest user message instead of
+            walking back through earlier ones when it yields no text. Callers
+            that treat the query as "what this turn is about" want this: on a
+            tool_result continuation turn the newest user message carries no
+            text, and resurrecting an older turn's question would make them
+            act on a stale intent.
     """
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -61,6 +78,8 @@ def extract_user_query(messages: list[dict[str, Any]]) -> str:
                         text = str(block.get("text", "")).strip()
                         if text:
                             return text
+            if latest_user_turn_only:
+                return ""
     return ""
 
 
@@ -100,9 +119,19 @@ def compute_prefix_hash(messages: list[dict[str, Any]], prefix_count: int | None
 
 
 def format_timestamp(dt: datetime | None = None) -> str:
-    """Format datetime as ISO8601 string."""
+    """Format a datetime as an ISO 8601 UTC string with a ``Z`` suffix.
+
+    A timezone-aware ``dt`` is converted to UTC first; a naive ``dt`` is assumed
+    to already be UTC. This keeps the output valid: appending ``Z`` to an aware
+    datetime's ``isoformat()`` would emit ``...+00:00Z`` (which even
+    ``datetime.fromisoformat`` rejects), and for a non-UTC offset it would label
+    the wrong instant as UTC. Shipped integrations pass
+    ``datetime.now(timezone.utc)`` (aware), so this path is live.
+    """
     if dt is None:
-        dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.isoformat() + "Z"
 
 

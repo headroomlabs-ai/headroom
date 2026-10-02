@@ -116,6 +116,23 @@ class TestCommandsRelatedAsRetry:
         )
         assert not _commands_related_as_retry(failed, success)
 
+    def test_shared_cd_prefix_alone_is_not_retry(self):
+        # Agents prefix most commands with the same `cd <repo> &&`; that shared
+        # prefix used to satisfy both the binary and the token-overlap checks.
+        cd = 'cd "C:\\Users\\dev\\my-project" && '
+        assert not _commands_related_as_retry(
+            cd + "npx vitest run src/form.test.tsx", cd + "git add -A && git commit -F -"
+        )
+        assert not _commands_related_as_retry(
+            "cd /home/dev/my-project && sed -n '90,130p' app/actions.ts",
+            "cd /home/dev/my-project && cat components/icons.ts",
+        )
+
+    def test_cd_prefixed_retry_still_matches(self):
+        assert _commands_related_as_retry(
+            "cd /home/dev/proj && cargo build", "cd /home/dev/proj && cargo build --release"
+        )
+
     def test_empty_or_equal_commands_rejected(self):
         assert not _commands_related_as_retry("", "ls")
         assert not _commands_related_as_retry("ls", "")
@@ -361,6 +378,91 @@ class TestTrafficLearner:
 
         stats = learner.get_stats()
         assert stats["patterns_extracted"] >= 3
+
+    def test_pending_accumulator_is_bounded(self):
+        """One-off patterns that never reach ``min_evidence`` must not grow the
+        pending ``_pattern_counts`` accumulator without bound — the sibling
+        ``_saved_hashes`` is already trimmed to ``dedup_window`` and this one was
+        missed, so a long-lived proxy leaked memory across varied traffic. It is
+        now LRU-capped at ``max_pending_patterns``.
+
+        Sync test (drives the async accumulate via ``asyncio.run``) so it runs
+        without the pytest-asyncio plugin.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=5, max_pending_patterns=8)
+
+        async def feed_one_offs() -> None:
+            for i in range(500):
+                await learner._accumulate(
+                    ExtractedPattern(
+                        category=PatternCategory.PREFERENCE,
+                        content=f"one-off pattern number {i}",
+                        importance=0.5,
+                    )
+                )
+
+        asyncio.run(feed_one_offs())
+        assert len(learner._pattern_counts) <= 8  # capped, not 500
+
+    def test_pending_accumulator_lru_still_promotes_corroborated_pattern(self):
+        """Capping the accumulator must not break promotion: a pattern
+        corroborated to ``min_evidence`` without interruption is still removed
+        from pending and recorded in ``_saved_hashes``."""
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=3, max_pending_patterns=100)
+        pattern = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="corroborated preference",
+            importance=0.5,
+        )
+
+        async def corroborate() -> None:
+            await learner._accumulate(pattern)  # count 1
+            await learner._accumulate(pattern)  # count 2
+            assert pattern.content_hash in learner._pattern_counts
+            await learner._accumulate(pattern)  # count 3 == min_evidence -> promote
+
+        asyncio.run(corroborate())
+        assert pattern.content_hash not in learner._pattern_counts  # removed on promotion
+        assert pattern.content_hash in learner._saved_hashes
+
+    def test_persisted_ids_bounded_in_lockstep_with_saved_hashes(self):
+        """``_persisted_ids`` (content_hash -> memory row id) must not outgrow
+        ``_saved_hashes``. The dedup read only consults ``_persisted_ids`` behind
+        an ``h in _saved_hashes`` guard, so an id whose hash has been evicted from
+        the dedup window is dead weight; previously it accumulated one entry per
+        distinct persisted pattern for the whole process lifetime while
+        ``_saved_hashes`` stayed trimmed to ``dedup_window``.
+        """
+        import asyncio
+
+        learner = TrafficLearner(backend=None, min_evidence=1, dedup_window=4)
+
+        async def feed() -> None:
+            for i in range(200):
+                pattern = ExtractedPattern(
+                    category=PatternCategory.PREFERENCE,
+                    content=f"distinct preference number {i}",
+                    importance=0.5,
+                )
+                await learner._accumulate(pattern)  # first sight -> pending
+                await learner._accumulate(pattern)  # second -> promote to saved
+                # Emulate the async save worker recording the row id, using the
+                # same "still tracked" guard the worker now applies.
+                if pattern.content_hash in learner._saved_hashes:
+                    learner._persisted_ids[pattern.content_hash] = f"mem-{i}"
+
+        asyncio.run(feed())
+
+        # _saved_hashes stays bounded (existing behavior).
+        assert len(learner._saved_hashes) <= 4
+        # _persisted_ids no longer leaks: it never holds an id for a hash that is
+        # no longer in the dedup window, so it stays bounded too.
+        assert set(learner._persisted_ids).issubset(learner._saved_hashes)
+        assert len(learner._persisted_ids) <= 4  # not 200
 
     @pytest.mark.asyncio
     async def test_dedup(self, learner: TrafficLearner):
@@ -854,6 +956,10 @@ class _FakeBackend:
 
         self._config = _types.SimpleNamespace(db_path=str(db_path))
         self._db_path = str(db_path)
+        self.refreshed_ids = []
+
+    async def refresh_memory_indexes(self, memory_id: str):
+        self.refreshed_ids.append(memory_id)
 
     async def save_memory(
         self,
@@ -1392,6 +1498,59 @@ class TestHydrateEdgeCases:
         assert learner._saved_hashes == set()
         assert learner._persisted_ids == {}
 
+    @pytest.mark.asyncio
+    async def test_hydration_is_bounded_to_dedup_window(self, tmp_path):
+        """A persisted history larger than dedup_window must not start the
+        in-memory dedup maps oversized. Hydration keeps at most dedup_window
+        rows (the most-recently-seen), and both maps stay bounded with matching
+        keys — otherwise a long-lived install boots with an unbounded leak that
+        only trims one entry at a time."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        window = 5
+        total = 20
+        conn = _sql.connect(db)
+        try:
+            for i in range(total):
+                conn.execute(
+                    "INSERT INTO memories (id, content, metadata, entity_refs, importance) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        f"id-{i:02d}",
+                        f"Command `cmd{i}` fails; use `alt{i}` instead.",
+                        _json.dumps(
+                            {
+                                "source": "traffic_learner",
+                                "category": "error_recovery",
+                                "evidence_count": 2,
+                                # Higher i == more recently seen; hydration keeps
+                                # the newest `window` of these.
+                                "last_seen_at": f"2026-01-01T00:{i:02d}:00+00:00",
+                            }
+                        ),
+                        "[]",
+                        0.7,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=2, dedup_window=window)
+        await learner._hydrate_persisted_state()
+
+        # Both maps are bounded to the window and hold exactly the same keys.
+        assert len(learner._saved_hashes) <= window
+        assert len(learner._persisted_ids) <= window
+        assert set(learner._persisted_ids) == set(learner._saved_hashes)
+        # The retained rows are the most-recently-seen ones (ids 15..19).
+        assert set(learner._persisted_ids.values()) == {f"id-{i:02d}" for i in range(15, 20)}
+
 
 class TestBumpEdgeCases:
     @pytest.mark.asyncio
@@ -1415,6 +1574,7 @@ class TestBumpEdgeCases:
         learner = TrafficLearner(backend=backend, min_evidence=1)
         await learner._bump_persisted_evidence("no-such-id")
         assert _read_traffic_rows(db) == []
+        assert backend.refreshed_ids == []
 
 
 # =============================================================================
@@ -1787,7 +1947,15 @@ class TestNormalizeBashForHash:
 
     def test_cuts_at_first_chain(self):
         # && boundary collapses to just the primary command
-        assert _normalize_bash_for_hash("cd /tmp && ls") == "cd /tmp"
+        assert _normalize_bash_for_hash("make build && ls") == "make build"
+
+    def test_strips_leading_cd(self):
+        # A `cd` prefix is not the primary command; keeping it collapsed every
+        # cd-prefixed recovery in a project onto one hash key.
+        assert _normalize_bash_for_hash("cd /tmp && ls") == "ls"
+        assert _normalize_bash_for_hash('cd "C:\\a b"; cd sub && cargo check') == "cargo check"
+        assert _normalize_bash_for_hash(r"cd /home/dev/my\ project && cargo check") == "cargo check"
+        assert _normalize_bash_for_hash("cd /tmp") == "cd /tmp"
 
 
 class TestParseIsoTimestamp:
@@ -2042,6 +2210,7 @@ class TestBumpPersistsLastSeenAt:
         # Should be parseable back.
         parsed = _parse_iso_timestamp(meta["last_seen_at"])
         assert parsed is not None
+        assert backend.refreshed_ids == ["row-1"]
 
 
 class TestHydrateLegacyRow:
@@ -2435,3 +2604,97 @@ class TestExtractPreferencesSentenceBoundary:
         assert not out[0].content.endswith(".")
         assert not out[0].content.endswith("!")
         assert not out[0].content.endswith("?")
+
+
+# =============================================================================
+# Pending-state persistence across restarts
+# =============================================================================
+
+
+class TestPendingStatePersistence:
+    """Sub-threshold evidence must survive process restarts (sidecar JSON)."""
+
+    _PATTERN_KWARGS = {
+        "category": PatternCategory.ENVIRONMENT,
+        "content": "Use /usr/bin/python3 for system scripts.",
+        "importance": 0.6,
+    }
+
+    @pytest.mark.asyncio
+    async def test_pending_evidence_survives_restart(self, tmp_path):
+        """2 sightings before restart + 1 after = saved with evidence_count 3."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(2):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await first.stop()
+
+        sidecar = tmp_path / "pending_patterns.json"
+        assert sidecar.exists()
+        assert _read_traffic_rows(db) == []  # still below threshold
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 1
+        await second._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(second, 1, db)
+        await second.stop()
+
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_corrupt_pending_file_is_ignored(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        (tmp_path / "pending_patterns.json").write_text("{not json")
+
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await learner.start()  # must not raise
+        assert learner.get_stats()["pending_patterns"] == 0
+        await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_already_saved_pattern_not_rehydrated_as_pending(self, tmp_path):
+        """A sidecar entry whose hash is already persisted is skipped on load."""
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(3):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(first, 1, db)
+        await first.stop()
+
+        # Handcraft a stale sidecar claiming the saved pattern is still pending.
+        h = ExtractedPattern(**self._PATTERN_KWARGS).content_hash
+        (tmp_path / "pending_patterns.json").write_text(
+            _json.dumps(
+                {
+                    "version": 1,
+                    "patterns": [
+                        {
+                            "category": "environment",
+                            "content": self._PATTERN_KWARGS["content"],
+                            "importance": 0.6,
+                            "count": 2,
+                            "entity_refs": [],
+                            "metadata": {},
+                            "content_hash": h,
+                        }
+                    ],
+                }
+            )
+        )
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 0
+        await second.stop()
