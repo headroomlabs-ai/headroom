@@ -91,6 +91,8 @@ class MemoryToolStreamFilter:
         # input JSON, so the calls can run even when the whole response
         # cannot be reconstructed (buffer cap, unparseable stream).
         self._hidden: dict[int, tuple[dict[str, Any], list[str]]] = {}
+        # Upstream indices of withheld blocks whose content_block_stop arrived.
+        self._hidden_stopped: set[int] = set()
         self.next_index = index_offset
         self.visible_tool_use = False
         self.stop_reason: str | None = None
@@ -105,13 +107,22 @@ class MemoryToolStreamFilter:
         return [block["name"] for block, _ in self._hidden.values()]
 
     def hidden_calls(self) -> list[dict[str, Any]]:
-        """The withheld ``tool_use`` blocks whose input parsed completely.
+        """The withheld ``tool_use`` blocks that finished with a complete input.
 
-        A call cut off mid-input (e.g. ``max_tokens``) is left out rather
-        than run with a partial argument.
+        A call cut off mid-input (e.g. ``max_tokens``) or whose block never
+        reached ``content_block_stop`` (the stream ended early) is left out
+        rather than run: the model never finished requesting it, and some
+        memory tools mutate state.
         """
         calls: list[dict[str, Any]] = []
-        for block, parts in self._hidden.values():
+        for upstream_index, (block, parts) in self._hidden.items():
+            if upstream_index not in self._hidden_stopped:
+                logger.warning(
+                    "Memory: skipping %s call %s whose block never finished",
+                    block.get("name"),
+                    block.get("id"),
+                )
+                continue
             tool_input: Any = block.get("input") or {}
             if parts:
                 try:
@@ -186,6 +197,8 @@ class MemoryToolStreamFilter:
                 and delta.get("type") == "input_json_delta"
             ):
                 self._hidden[upstream_index][1].append(str(delta.get("partial_json", "")))
+            elif event_name == "content_block_stop":
+                self._hidden_stopped.add(upstream_index)
             return None
         client_index = self._index_map.get(upstream_index, upstream_index)
         if client_index == upstream_index:

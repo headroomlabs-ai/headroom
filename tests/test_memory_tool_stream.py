@@ -309,6 +309,15 @@ class TestRecordedMemoryCalls:
         assert flt.hid_tool_calls
         assert flt.hidden_calls() == []
 
+    def test_call_whose_block_never_stopped_is_not_run(self) -> None:
+        # Complete, valid input, but the stream ends before content_block_stop.
+        raw = _sse([SAVE], "tool_use")
+        raw = raw[: raw.index(b"event: content_block_stop")]
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(raw)
+        assert flt.hid_tool_calls
+        assert flt.hidden_calls() == []
+
     def test_prior_rounds_usage_is_added_to_the_final_delta(self) -> None:
         flt = MemoryToolStreamFilter(MEMORY_TOOLS)
         flt.feed(_sse([TEXT], "end_turn"))
@@ -350,6 +359,19 @@ class TestContinuationEdgeCases:
         assert ran == [SAVE]
         assert proxy.http_client.send.await_count == 0
         assert events[0]["delta"]["stop_reason"] == "end_turn"
+
+    @pytest.mark.asyncio
+    async def test_interrupted_call_is_not_run(self) -> None:
+        raw = _sse([TEXT, SAVE], "tool_use")
+        raw = raw[: raw.rindex(b"event: content_block_stop")]
+        proxy = _proxy([], SAVE_RESULT)
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(raw)
+
+        await _drain(_continue(proxy, flt, None))
+
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+        assert proxy.http_client.send.await_count == 0
 
     @pytest.mark.asyncio
     async def test_continuation_over_the_buffer_cap_is_not_continued_again(
