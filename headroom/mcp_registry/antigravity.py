@@ -146,6 +146,7 @@ class AntigravityRegistrar(MCPRegistrar):
 
     def unregister_server(self, server_name: str) -> bool:
         removed = False
+        remaining: list[Path] = []
         for config_path in _config_candidates(self._home):
             if not config_path.exists():
                 continue
@@ -161,9 +162,20 @@ class AntigravityRegistrar(MCPRegistrar):
             try:
                 fsutil.write_text(config_path, json.dumps(data, indent=2) + "\n")
             except OSError:
+                # The write failed, so this config still registers the
+                # server. Record it and report failure instead of claiming a
+                # removal that the untouched file contradicts.
+                remaining.append(config_path)
                 continue
             removed = True
         if not removed:
+            return False
+        if remaining:
+            logger.warning(
+                "could not remove %r from %s; the server stays registered there",
+                server_name,
+                ", ".join(str(path) for path in remaining),
+            )
             return False
         # Antigravity caches each MCP server under ~/.gemini/<surface>/mcp/;
         # a removed entry keeps loading from cache until that directory goes.
