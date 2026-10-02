@@ -833,6 +833,120 @@ def test_destination_identity_reject_evaluation_failure_counting(
         assert target_model in handler._token_count_fallback_models
 
 
+@pytest.mark.parametrize("mode, expected_status", [("reject", 500), ("observe", 200)])
+@pytest.mark.parametrize(
+    "failure", ["resolution", "count_timeout", "quarantine", "missing_executor"]
+)
+def test_destination_identity_unchanged_counting_failure(
+    monkeypatch, mode, expected_status, failure
+):
+    """Reject admission refuses unassessed input even when the model stays the same."""
+    import threading
+    import time
+
+    import headroom.tokenizers as tokenizers
+    from headroom.proxy.server import HeadroomProxy
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", mode)
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setattr("headroom.proxy.helpers.COMPRESSION_TIMEOUT_SECONDS", 0.02)
+    handler = _make_handler_subclass()(operator_limit=100_000)
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowCounter(_DummyTokenizer):
+        def count_messages(self, messages):
+            started.set()
+            release.wait(2)
+            return super().count_messages(messages)
+
+    def get_tokenizer(_model):
+        if failure == "resolution":
+            raise LookupError("synthetic tokenizer resolution failure")
+        return SlowCounter(1) if failure == "count_timeout" else _DummyTokenizer(1)
+
+    monkeypatch.setattr(tokenizers, "get_tokenizer", get_tokenizer)
+    if failure == "missing_executor":
+        handler._run_compression_in_executor = None
+    elif failure == "quarantine":
+        handler._compression_timed_out_in_flight = 1
+        handler._compression_quarantine_deadline = time.monotonic() + 60
+        handler._compression_quarantine_skips = 0
+        handler.metrics.record_compression_quarantine = MagicMock()
+        handler._run_compression_in_executor = HeadroomProxy._run_compression_in_executor.__get__(
+            handler
+        )
+
+    request = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+    try:
+        response = anyio.run(handler.handle_anthropic_messages, request)
+        assert response.status_code == expected_status
+        if failure == "count_timeout":
+            assert started.is_set()
+        if failure == "quarantine":
+            assert handler._compression_quarantine_skips >= 1
+        if mode == "reject":
+            assert json.loads(response.body)["error"] == {
+                "type": "api_error",
+                "message": "Context budget evaluation unavailable for the configured reject request.",
+            }
+            assert handler.upstream_calls == []
+        else:
+            assert len(handler.upstream_calls) == 1
+    finally:
+        release.set()
+        handler._compression_executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("initial_failure", [False, True])
+def test_destination_identity_unchanged_registered_estimator_and_recovery(
+    monkeypatch, initial_failure
+):
+    """A registry estimator and recovered strict count both allow assessed requests."""
+    import headroom.tokenizers as tokenizers
+    from headroom.tokenizers import EstimatingTokenCounter
+
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    handler = _make_handler_subclass()(operator_limit=100_000)
+    resolutions = []
+    registered_counter = EstimatingTokenCounter()
+    monkeypatch.setitem(
+        tokenizers.TokenizerRegistry()._tokenizers, "step-router-v1", registered_counter
+    )
+    resolve_tokenizer = tokenizers.get_tokenizer
+
+    def get_tokenizer(model):
+        resolutions.append(model)
+        if initial_failure and len(resolutions) == 1:
+            raise LookupError("synthetic transient resolution failure")
+        counter = resolve_tokenizer(model)
+        assert counter is registered_counter
+        return counter
+
+    monkeypatch.setattr(tokenizers, "get_tokenizer", get_tokenizer)
+    request = _build_request(
+        {
+            "model": "step-router-v1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        }
+    )
+    try:
+        response = anyio.run(handler.handle_anthropic_messages, request)
+        assert response.status_code == 200
+        assert len(handler.upstream_calls) == 1
+        assert len(resolutions) >= 2
+    finally:
+        handler._compression_executor.shutdown(wait=True)
+
+
 def test_destination_identity_uses_backend_resolver_model_and_tokenizer(monkeypatch):
     """A backend route is checked against its rewritten model and tokenizer."""
     monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
