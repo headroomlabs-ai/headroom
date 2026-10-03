@@ -74,9 +74,9 @@ it necessarily handles both your traffic and your credentials. The
 full — what is written to disk, with what permissions and retention, what leaves the
 host, and what the local admin surface does and does not allow. The summary:
 
-- **Provider API keys are forwarded, not persisted.** Keys supplied via environment
+- **Interactive provider API keys are forwarded.** Keys supplied via environment
   variables or request headers are used to authenticate the upstream call and are not
-  written to disk or emitted to logs. The one exception is deliberate: the
+  written to disk or emitted to logs. Settings can also persist keys: the
   `ANTHROPIC_TARGET_API_HEADERS` / `OPENAI_TARGET_API_HEADERS` header maps, if you set
   them through the dashboard settings GUI, are persisted to `~/.headroom/settings.json`
   in plaintext — and a header map is where a gateway key typically goes.
@@ -84,6 +84,29 @@ host, and what the local admin surface does and does not allow. The summary:
   GitHub Copilot OAuth refresh token to `~/.headroom/copilot_auth.json` (relocatable via
   `$HEADROOM_COPILOT_AUTH_FILE`). It is plaintext JSON, written with `0600` permissions
   on a best-effort basis.
+- **Persistent installs store supplied environment values.** Every value passed
+  to `headroom install --env KEY=VALUE` is stored verbatim and in cleartext. Supervisors (launchd, systemd, Task
+  Scheduler, cron) start the proxy from a bare environment, so `--env` is the
+  only channel by which a provider API key reaches a supervised proxy — and
+  if you pass one, it is written to
+  `~/.headroom/deploy/<profile>/manifest.json` (mode `0600`) and `export`ed in
+  cleartext by the generated runner scripts `run-headroom.sh` /
+  `ensure-headroom.sh` (mode `0700`) in the same directory (mode `0700`).
+  The installer sets those modes and then reads them back: where the
+  platform enforces POSIX permission bits it refuses to leave behind a runner
+  script it could not restrict, and warns if the profile directory could not
+  be narrowed. On Windows the bits are advisory — access is governed by ACLs —
+  so the modes above are requested but not enforced there, and protection
+  comes from the account's own profile directory instead. Where they do hold,
+  the files are owner-only, not encrypted: anything that can read the account
+  — the user themself, root, a home-directory backup or sync — can read the
+  key, and rotating it requires re-running `headroom install apply`.
+  With the Docker runtime the same values are additionally passed as `docker
+  run --env NAME=VALUE`, which places them in the container process's command
+  line and so in `ps` output for other users on the host. Prefer a
+  supervisor-native secret facility (systemd `LoadCredential=` /
+  `EnvironmentFile=` on an owner-only file, a macOS keychain helper) over
+  `--env` for long-lived provider keys.
 - **Cached request content is written to disk.** CCR stores pre-compression originals —
   tool outputs, file contents, retrieved chunks — in a local SQLite database
   (`~/.headroom/ccr_store.db`, `0600`) so they can be retrieved after compression. Entries
