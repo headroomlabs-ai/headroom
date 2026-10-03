@@ -2694,7 +2694,10 @@ class AnthropicHandlerMixin:
                                 )
 
             # Traffic Learner: Extract patterns from inbound tool results
-            if self.traffic_learner:
+            if self.traffic_learner and not (
+                self.memory_handler
+                and self.memory_handler.is_project_unresolved(memory_request_ctx)
+            ):
                 try:
                     # Wire backend on first use (lazy init after memory handler is ready)
                     if (

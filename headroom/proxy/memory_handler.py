@@ -185,12 +185,18 @@ class MemoryHandler:
         self.config = config
         self.agent_type = agent_type
         self._backend: LocalBackend | Any = None
-        # Per-project routing for the local backend. Built in
-        # ``_init_backend_locked`` so a single, shared resolver / LRU is
-        # kept on the handler. Qdrant deployments use composite user-id
-        # partitioning instead (see ``_compose_effective_user_id``) — the
-        # router stays None in that case.
-        self._router: BackendRouter | None = None
+        storage_root = (
+            Path(config.storage_root)
+            if config.storage_root
+            else (Path(config.db_path).resolve().parent / "memories")
+        )
+        self._router = BackendRouter(
+            BackendRouterConfig(
+                mode=config.storage_mode,
+                root_dir=storage_root,
+                global_db_path=Path(config.db_path).resolve(),
+            )
+        )
         self._initialized = False
         # Async singleflight guard for backend init. Ensures concurrent first
         # callers land on one init (double-checked pattern inside
@@ -407,19 +413,8 @@ class MemoryHandler:
             # remains the GLOBAL-mode fallback / legacy compatibility
             # backend; callers that pass a ``RequestContext`` route
             # through ``self._router`` instead.
-            storage_root = (
-                Path(self.config.storage_root)
-                if self.config.storage_root
-                else (Path(self.config.db_path).resolve().parent / "memories")
-            )
             global_db_path = Path(self.config.db_path).resolve()
-            router_cfg = BackendRouterConfig(
-                mode=self.config.storage_mode,
-                root_dir=storage_root,
-                global_db_path=global_db_path,
-                backend_config_template=backend_config,
-            )
-            self._router = BackendRouter(router_cfg)
+            self._router._config.backend_config_template = backend_config
             # Seed the router's LRU with the already-initialized
             # legacy backend so GLOBAL-mode requests reuse it instead
             # of opening a second handle to the same file.
@@ -428,7 +423,7 @@ class MemoryHandler:
             logger.info(
                 "event=memory_router_initialized mode=%s root=%s global_db=%s",
                 self.config.storage_mode.value,
-                storage_root,
+                self._router._config.root_dir,
                 global_db_path,
             )
 
@@ -667,13 +662,27 @@ class MemoryHandler:
         # Non-local backends: derive scope but keep one shared backend
         # and compose the user_id so the partition lives in the user_id
         # column instead of in a separate file.
-        scope = self._router._resolve_scope(request_context)
+        scope = self._router.scope_for(request_context)
+        if scope.db_path is None:
+            return None, scope, base_user_id
         composed = (
             base_user_id
             if scope.project_key is None or scope.mode is MemoryStorageMode.GLOBAL
             else f"{base_user_id}::{scope.project_key}"
         )
         return self._backend, scope, composed
+
+    def is_project_unresolved(self, request_context: RequestContext | None) -> bool:
+        """Return whether fail-closed project routing has no usable target."""
+
+        if request_context is None or self._router is None:
+            return False
+        scope = self._router.scope_for(request_context)
+        return (
+            scope.mode is MemoryStorageMode.PROJECT
+            and scope.project_key is None
+            and scope.db_path is None
+        )
 
     @staticmethod
     def _unresolved_project_error(scope: ResolvedScope | None) -> str | None:
@@ -1144,6 +1153,8 @@ your responses, not to drive new actions."""
         """
         tool_calls = self._extract_tool_calls(response, provider)
         results: list[dict[str, Any]] = []
+        project_unresolved = self.is_project_unresolved(request_context)
+        unresolved_result = json.dumps({"status": "skipped", "reason": "project_unresolved"})
 
         for tc in tool_calls:
             # `tc.get("function", {})` returns None for an explicit
@@ -1168,8 +1179,14 @@ your responses, not to drive new actions."""
                     input_data = {}
 
             # Handle native memory tool
-            if tool_name == NATIVE_MEMORY_TOOL_NAME:
-                result_content = await self._execute_native_memory_tool(input_data, user_id)
+            if tool_name in ({NATIVE_MEMORY_TOOL_NAME} | MEMORY_TOOL_NAMES) and project_unresolved:
+                result_content = unresolved_result
+            elif tool_name == NATIVE_MEMORY_TOOL_NAME:
+                result_content = await self._execute_native_memory_tool(
+                    input_data,
+                    user_id,
+                    request_context=request_context,
+                )
             elif tool_name in MEMORY_TOOL_NAMES:
                 # Custom memory tools need backend
                 await self._ensure_initialized()
@@ -1217,7 +1234,12 @@ your responses, not to drive new actions."""
         request_context: RequestContext | None = None,
     ) -> str:
         """Execute a memory tool and return result string."""
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
         try:
+            await self._ensure_initialized()
+            if self._backend is None:
+                return json.dumps({"status": "error", "error": "Memory backend not initialized"})
             if tool_name == "memory_save":
                 return await self._execute_save(input_data, user_id, provider, request_context)
             elif tool_name == "memory_search":
@@ -1576,7 +1598,13 @@ your responses, not to drive new actions."""
     #   str_replace                 → Update memory content
     # =========================================================================
 
-    async def _execute_native_memory_tool(self, input_data: dict[str, Any], user_id: str) -> str:
+    async def _execute_native_memory_tool(
+        self,
+        input_data: dict[str, Any],
+        user_id: str,
+        *,
+        request_context: RequestContext | None = None,
+    ) -> str:
         """Execute Anthropic's native memory tool with semantic backend.
 
         This is a TRANSLATION LAYER: Claude thinks it's doing file operations,
@@ -1590,6 +1618,9 @@ your responses, not to drive new actions."""
         - delete: Remove from vector store
         - rename: Update memory tags/path
         """
+        if self.is_project_unresolved(request_context):
+            return json.dumps({"status": "skipped", "reason": "project_unresolved"})
+
         # Ensure our semantic backend is initialized
         await self._ensure_initialized()
 

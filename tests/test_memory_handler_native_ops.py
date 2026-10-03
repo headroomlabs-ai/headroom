@@ -1007,7 +1007,7 @@ async def test_search_and_format_context_and_handle_memory_tool_calls(
     ):  # noqa: ANN001
         return f"ran:{tool_name}:{user_id}:{provider}:{input_data}"
 
-    async def fake_execute_native(input_data, user_id):  # noqa: ANN001
+    async def fake_execute_native(input_data, user_id, request_context=None):  # noqa: ANN001
         return f"native:{user_id}:{input_data}"
 
     monkeypatch.setattr(handler, "_ensure_initialized", fake_ensure_initialized)
