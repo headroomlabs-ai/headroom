@@ -16,11 +16,13 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import reset_compression_store
 from headroom.offline import apply_offline_env, is_offline
 from headroom.proxy.audit import is_auditable_path
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
 from headroom.proxy.server import (
     ProxyConfig,
     WebSocketAuthMiddleware,
@@ -108,6 +110,36 @@ class TestInboundAuthToken:
         with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
             assert c.get("/livez").status_code == 200
             assert c.get("/readyz").status_code in (200, 503)  # ready/not-ready, never 401
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/healthz"),  # no Python route: lands on the catch-all
+            ("POST", "/health"),
+            ("PUT", "/livez"),
+            ("DELETE", "/readyz"),
+            ("HEAD", "/livez"),  # @app.get does not register HEAD
+        ],
+    )
+    def test_health_exemption_does_not_reach_passthrough(self, monkeypatch, method, path):
+        """Only GET probes are exempt from the token.
+
+        Any other request on a health path is not served by the health handler
+        but by the catch-all passthrough, which relays it upstream. Exempting
+        those turned the proxy into an unauthenticated relay.
+        """
+        relayed: list[tuple[str, str]] = []
+
+        async def _spy_passthrough(self, request, base_url, *args, **kwargs):
+            relayed.append((request.method, request.url.path))
+            return JSONResponse({"relayed_to": base_url})
+
+        monkeypatch.setattr(OpenAIHandlerMixin, "handle_passthrough", _spy_passthrough)
+        app = _make_app(proxy_token="s3cr3t-token")
+        with TestClient(app, base_url="http://testserver", client=NONLOOPBACK) as c:
+            resp = c.request(method, path)
+        assert resp.status_code == 401
+        assert relayed == []
 
 
 # ──────────────────── 2.1b inbound auth token over WebSocket ──────────────
