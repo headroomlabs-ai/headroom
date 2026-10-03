@@ -432,6 +432,25 @@ class AnthropicHandlerMixin:
         return (name, canonical)
 
     @staticmethod
+    def _server_memory_tool_names(tools: Any, client_tools: Any) -> frozenset[str]:
+        """Memory tools in ``tools`` that the proxy injected and must run itself.
+
+        A memory tool the client declared stays the client's: its calls are
+        forwarded, not withheld.
+        """
+        from headroom.proxy.memory_handler import MEMORY_TOOL_NAMES, NATIVE_MEMORY_TOOL_NAME
+
+        client_tool_names = {t.get("name") for t in client_tools or [] if isinstance(t, dict)}
+        return frozenset(
+            name
+            for t in tools or []
+            if isinstance(t, dict)
+            and isinstance(name := t.get("name"), str)
+            and (name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME)
+            and name not in client_tool_names
+        )
+
+    @staticmethod
     def _has_headroom_retrieve_tool(tools: Any) -> bool:
         """Return True when the final Anthropic tool list includes CCR retrieve."""
         if not isinstance(tools, list):
@@ -2730,6 +2749,9 @@ class AnthropicHandlerMixin:
             # /v1/messages just as on /v1/responses.
             memory_context_injected = False
             memory_tools_injected = False
+            # Memory tools this proxy injected and must execute itself; the
+            # streaming path withholds their calls from the client.
+            server_memory_tool_names: frozenset[str] = frozenset()
             if memory_decision.inject:
                 # Search and inject memory context
                 if self.memory_handler.config.inject_context:
@@ -2841,6 +2863,9 @@ class AnthropicHandlerMixin:
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
+                    server_memory_tool_names = self._server_memory_tool_names(
+                        tools, _original_tools
+                    )
                     tool_names = [
                         t.get("name") or t.get("type", "")
                         for t in tools
@@ -4060,6 +4085,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        server_memory_tool_names=server_memory_tool_names,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
