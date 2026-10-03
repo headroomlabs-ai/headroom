@@ -84,6 +84,14 @@ def _sleep_worker(
     return messages, None
 
 
+def _hang_worker(
+    messages: list[dict[str, Any]],
+    provider: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    time.sleep(60)
+    return messages, None
+
+
 def _abort_worker(
     messages: list[dict[str, Any]],
     provider: str,
@@ -108,13 +116,28 @@ def _image_pool() -> ProcessPoolExecutor:
         return _IMAGE_POOL
 
 
-def _reset_image_pool() -> None:
+def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
+    """Drop ``pool`` (default: the current one) and kill its worker.
+
+    ``shutdown(wait=False)`` alone never stops a worker that is still running
+    an abandoned call: after a timeout it ran the image to the end, its result
+    discarded, while the next request cold-loaded the models in a fresh worker
+    beside it. Only the current pool is unpublished, so a call that fails
+    after another request already rebuilt the pool leaves the rebuilt one alone.
+    """
     global _IMAGE_POOL
     with _IMAGE_POOL_LOCK:
-        pool = _IMAGE_POOL
-        _IMAGE_POOL = None
-    if pool is not None:
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool is None:
+            pool = _IMAGE_POOL
+        if _IMAGE_POOL is pool:
+            _IMAGE_POOL = None
+    if pool is None:
+        return
+    # shutdown() sets _processes to None, so take the workers first.
+    workers = list((pool._processes or {}).values())
+    pool.shutdown(wait=False, cancel_futures=True)
+    for worker in workers:
+        worker.kill()
 
 
 async def run_image_compression_isolated(
@@ -124,21 +147,23 @@ async def run_image_compression_isolated(
     timeout: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     loop = asyncio.get_running_loop()
+    pool: ProcessPoolExecutor | None = None
     try:
-        future = loop.run_in_executor(_image_pool(), _IMAGE_WORKER, messages, provider)
+        pool = _image_pool()
+        future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider)
         return await asyncio.wait_for(future, timeout=timeout)
     except BrokenProcessPool:
         logger.warning("Image compression worker crashed; forwarding original image payload")
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None
     except TimeoutError:
         logger.warning("Image compression worker timed out; forwarding original image payload")
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None
     except Exception as exc:
         logger.warning(
             "Image compression worker failed (%s); forwarding original image payload",
             type(exc).__name__,
         )
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None
