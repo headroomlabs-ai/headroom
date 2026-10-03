@@ -249,9 +249,16 @@ def _open_regular_file_under_root(
             st = os.fstat(file_fd)
             if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
                 return None
-            with os.fdopen(file_fd, "r", encoding="utf-8") as f:
+            with os.fdopen(file_fd, "rb") as f:
                 file_fd = -1  # ownership transferred to the file object
-                return f.read()
+                data = f.read(max_bytes + 1)
+            # fstat can go stale by read time -- a regular file can grow
+            # between the two. Bound the read itself rather than trust the
+            # earlier size check; one byte past the cap is enough to detect
+            # an overflow without ever reading an unbounded amount.
+            if len(data) > max_bytes:
+                return None
+            return data.decode("utf-8")
         except (OSError, UnicodeDecodeError):
             return None
     finally:

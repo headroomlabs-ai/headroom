@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -567,6 +568,31 @@ def test_open_regular_file_under_root_proceeds_from_plain_sync_context(tmp_path)
     f = tmp_path / "x.py"
     f.write_text("content", encoding="utf-8")
     assert _open_regular_file_under_root(str(f), tmp_path, 10_000) == "content"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dir_fd disk verification unavailable on Windows; falls back to UNKNOWN"
+    " (see test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported)",
+)
+def test_open_regular_file_under_root_rejects_growth_between_stat_and_read(tmp_path, monkeypatch):
+    """A file that grows past max_bytes between the fstat check and the
+    read must fail closed to None, not return the oversized content -- the
+    fstat result can go stale by the time the read actually runs. The file
+    genuinely contains >max_bytes on disk; only the fstat result lies, so a
+    passing test proves the read itself is bounded, not that fstat was
+    merely re-checked."""
+    f = tmp_path / "x.py"
+    f.write_bytes(b"x" * 1_000_001)
+
+    real_fstat = os.fstat
+
+    def lying_fstat(fd):
+        real_st = real_fstat(fd)
+        return SimpleNamespace(st_mode=real_st.st_mode, st_size=1)
+
+    monkeypatch.setattr(os, "fstat", lying_fstat)
+    assert _open_regular_file_under_root("x.py", tmp_path, max_bytes=8) is None
 
 
 def test_open_regular_file_under_root_falls_back_unknown_when_dir_fd_unsupported(
