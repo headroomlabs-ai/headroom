@@ -109,7 +109,7 @@ class RoutedCompressionUnit:
 
 
 _CCR_MARKER_RE = re.compile(
-    r"(?m)^.*(?:Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>).*$"
+    r"(?m)^.*(?:Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>|\[ccr:[^\]\s]+\]).*$"
 )
 
 _LOSSY_UNMARKED_STRATEGIES = {

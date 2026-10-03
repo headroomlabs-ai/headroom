@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from ..ccr.marker import terse_marker, terse_markers_enabled
 from ..config import TransformResult
 from ..tokenizer import Tokenizer
 from .base import Transform
@@ -1499,12 +1500,15 @@ class CodeAwareCompressor(Transform):
 
                     # Use the actual config attribute (not the wrong name)
                     ttl_min = max(1, self.config.ccr_ttl // 60)
-                    compressed += (
-                        f"\n# [{original_tokens - compressed_tokens} tokens compressed."
-                        f"{summary_str}"
-                        f" Retrieve more: hash={cache_key}."
-                        f" Expires in {ttl_min}m.]"
-                    )
+                    if terse_markers_enabled():
+                        compressed += f"\n# {terse_marker(cache_key)}"
+                    else:
+                        compressed += (
+                            f"\n# [{original_tokens - compressed_tokens} tokens compressed."
+                            f"{summary_str}"
+                            f" Retrieve more: hash={cache_key}."
+                            f" Expires in {ttl_min}m.]"
+                        )
 
             return CodeCompressionResult(
                 compressed=compressed,

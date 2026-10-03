@@ -415,16 +415,27 @@ class TestParseToolCall:
 class TestHashSecurityValidation:
     """Test hash validation security measures.
 
-    CCR hashes are 12 hex chars (SmartCrusher) or 24 hex chars (legacy
-    bracket markers / compression_store). Any other length or non-hex input
-    is rejected to prevent hash spoofing with malformed hashes.
+    A CCR id is a hex prefix of the content hash — from the adaptive labeler's
+    minimum width (HEADROOM_CCR_SHORT_LABELS issues ids this short) up to the full
+    24-hex hash. Widths below the minimum, over-length, or non-hex input are
+    rejected as malformed; anything in range is accepted (the store still only
+    resolves ids it actually issued, so a made-up in-range id simply misses).
     """
 
-    def test_rejects_short_hash(self):
-        """Rejects hash that's too short (potential spoofing attack)."""
+    def test_accepts_short_adaptive_label(self):
+        """A 6-char id is a valid adaptive short label now (was rejected under the old 12/24 rule)."""
         tool_call = {
             "name": CCR_TOOL_NAME,
-            "input": {"hash": "abc123"},  # Only 6 chars
+            "input": {"hash": "abc123"},  # 6 hex chars — an adaptive short label
+        }
+
+        assert parse_tool_call(tool_call, "anthropic") == "abc123"
+
+    def test_rejects_below_min_width_hash(self):
+        """Rejects an id shorter than the adaptive labeler's minimum width."""
+        tool_call = {
+            "name": CCR_TOOL_NAME,
+            "input": {"hash": "a"},  # 1 char — below the minimum label width
         }
 
         hash_key = parse_tool_call(tool_call, "anthropic")

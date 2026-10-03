@@ -329,12 +329,12 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
     assert continuation_client.post_calls == []
 
 
-def test_unresolved_ccr_only_streams_through_as_200() -> None:
+def test_unresolved_ccr_only_fails_closed_as_502() -> None:
     """CCR-only turn that never resolves: the model keeps re-emitting
     headroom_retrieve so the continuation exhausts its retrieval rounds with a
-    residual marker and no accompanying client tool. Per #2089 the streaming
-    path streams the residual headroom_retrieve back as a 200 SSE so the client
-    can resolve or retry it, matching the non-streaming path."""
+    residual marker and no accompanying client tool. Unlike the legal mixed-tool
+    case from #2089, there is no client-owned tool to justify passing the turn
+    through, so the buffered streaming path fails closed with an SSE error."""
     config = _make_config()
     persistent_ccr = _message_response(
         [
@@ -376,9 +376,9 @@ def test_unresolved_ccr_only_streams_through_as_200() -> None:
                 },
             )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 502, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "headroom_retrieve" in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" in resp.text
 
 
 @pytest.mark.asyncio

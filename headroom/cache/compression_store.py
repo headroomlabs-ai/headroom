@@ -235,6 +235,7 @@ class CompressionStore:
         default_ttl: int = DEFAULT_CCR_TTL_SECONDS,
         enable_feedback: bool = True,
         backend: CompressionStoreBackend | None = None,
+        short_labels: bool | None = None,
     ):
         """Initialize the compression store.
 
@@ -250,9 +251,28 @@ class CompressionStore:
         """
         # Import here to avoid circular imports
         from .backends import InMemoryBackend
+        from .label_allocator import CcrLabelAllocator
 
         self._backend: CompressionStoreBackend = backend or InMemoryBackend()
         self._lock = threading.Lock()
+
+        # Token-efficient CCR labels: hand each stored content hash the shortest
+        # prefix of itself that is unique among live entries instead of the full
+        # 24-hex, so a retrieval marker costs ~1-2 tokens instead of ~12. Opt-in
+        # (HEADROOM_CCR_SHORT_LABELS) while it proves out; correct for a single
+        # proxy process (the default is 1 worker). The label IS the storage key,
+        # so retrieve() resolves it unchanged. Multi-worker assignment
+        # consistency is a follow-up (needs atomic reservation in the backend).
+        if short_labels is None:
+            short_labels = os.environ.get("HEADROOM_CCR_SHORT_LABELS", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self._label_allocator: CcrLabelAllocator | None = (
+            CcrLabelAllocator() if short_labels else None
+        )
         self._max_entries = max_entries
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
@@ -357,6 +377,14 @@ class CompressionStore:
             # persistence-side effect — the same content always hashes
             # deterministically under whichever function is in use.
             hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
+            # Token-efficient label (opt-in): replace the full 24-hex key with the
+            # shortest unique prefix. Idempotent (same content -> same label) and
+            # prefix-monotonic, so the emitted marker text stays prompt-cache
+            # stable. The label is a valid hex string and becomes the storage key,
+            # so every downstream path (retrieve, /v1/retrieve, hex validation)
+            # keeps working. Skipped when a producer supplies its own hash above.
+            if self._label_allocator is not None:
+                hash_key = self._label_allocator.label_for(hash_key)
 
         # Refuse to persist a bare CCR marker as an entry's "original"
         # (#2694). A marker is a *pointer* to content, never content: an
