@@ -81,6 +81,43 @@ def test_setup_file_logging_targets_per_port_file(workspace: Path) -> None:
             logger.addHandler(h)
 
 
+def test_setup_file_logging_keeps_root_propagation_and_writes_once_per_sink(
+    workspace: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger = logging.getLogger("headroom")
+    original_handlers = list(logger.handlers)
+    original_propagate = logger.propagate
+    for handler in original_handlers:
+        logger.removeHandler(handler)
+
+    try:
+        logger.propagate = True
+        with caplog.at_level(logging.INFO):
+            _setup_file_logging(8888)
+            logger.info("propagation-regression-record")
+
+        for handler in logger.handlers:
+            handler.flush()
+
+        propagated = [
+            record
+            for record in caplog.records
+            if record.getMessage() == "propagation-regression-record"
+        ]
+        file_text = (workspace / "logs" / "proxy-8888.log").read_text()
+        assert len(propagated) == 1
+        assert file_text.count("propagation-regression-record") == 1
+    finally:
+        for handler in list(logger.handlers):
+            if isinstance(handler, RotatingFileHandler):
+                handler.close()
+                logger.removeHandler(handler)
+        logger.propagate = original_propagate
+        for handler in original_handlers:
+            logger.addHandler(handler)
+
+
 def test_setup_file_logging_targets_worker_file(workspace: Path) -> None:
     logger = logging.getLogger("headroom")
     original = list(logger.handlers)

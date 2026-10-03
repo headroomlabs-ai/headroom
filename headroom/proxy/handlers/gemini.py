@@ -61,6 +61,50 @@ class GeminiHandlerMixin:
 
         return await count_texts_offloaded(self, model, texts)
 
+    def _gemini_replay_forwarded_prefix(
+        self,
+        optimized_messages: list[dict],
+        messages: list[dict],
+        prefix_tracker,  # noqa: ANN001 - PrefixCacheTracker (avoid runtime import)
+        frozen_count: int,
+        tokenizer,  # noqa: ANN001
+    ):
+        """Replay the previously forwarded (compressed) prefix byte-identical (#3394).
+
+        ``frozen_message_count`` only stops the pipeline from RECOMPRESSING the
+        prefix; the freeze branch then forwards the client's ORIGINAL bytes -
+        but Gemini's implicit cache holds the COMPRESSED form forwarded last
+        turn, so raw originals would bust it. ``finalize_turn`` overlays the
+        tracker's last-forwarded (compressed) bytes over the pipeline output.
+        Self-guarded: no-op unless this turn provably extends the previous one
+        (positional, append-only, non-inflating); a decline forwards the
+        pipeline's own output.
+        """
+        from headroom.proxy.session_engine import finalize_turn
+
+        return finalize_turn(
+            optimized_messages,
+            messages,
+            prefix_tracker.get_last_original_messages(),
+            prefix_tracker.get_last_forwarded_messages(),
+            count_tokens=tokenizer.count_messages,
+            confirmed_frozen_count=frozen_count,
+        )
+
+    def _gemini_resolve_prefix_tracker(self, request, model, messages):  # noqa: ANN001, ANN202
+        """Session tracker + freeze floor for this Gemini conversation (#3394).
+
+        Mirrors the Anthropic/OpenAI handlers: the tracker is fed from the
+        response's cache usage (buffered: ``update_from_response`` after the
+        upstream reply; streaming: the ``prefix_tracker`` param of
+        ``_stream_response``) so the next turn freezes the forwarded prefix.
+        """
+        session_id = self.session_tracker_store.compute_session_id(request, model, messages)
+        tracker = self.session_tracker_store.resolve_tracker(
+            session_id, "gemini", messages=messages
+        )
+        return tracker, tracker.get_frozen_message_count()
+
     def _is_cloudcode_antigravity_request(
         self, body: dict[str, Any], headers: dict[str, str]
     ) -> bool:
@@ -529,8 +573,22 @@ class GeminiHandlerMixin:
                     headers=response_headers,
                 )
 
+        # Prefix freeze floor + compressed-prefix replay (#3394).
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
+
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
+
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=provider_name)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
 
         # Optimization
         transforms_applied: list[str] = []
@@ -565,6 +623,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         waste_messages=waste_messages,
                         **proxy_pipeline_kwargs(self.config),
                     ),
@@ -591,6 +650,21 @@ class GeminiHandlerMixin:
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
+
+        if _decision.should_compress:
+            # Replay last turn's compressed prefix over this turn's output so
+            # the frozen region goes out byte-identical (#3394). Gated on the
+            # compression decision: a bypassed request's bytes stay untouched.
+            _final = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            )
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
         tokens_saved = original_tokens - optimized_tokens
         optimization_latency = (time.time() - start_time) * 1000
@@ -777,6 +851,8 @@ class GeminiHandlerMixin:
                     tags,
                     optimization_latency,
                     outcome_provider=provider_name,
+                    prefix_tracker=gemini_prefix_tracker,
+                    original_messages=messages,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
@@ -905,6 +981,20 @@ class GeminiHandlerMixin:
                     )
 
                 uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
+
+                # Feed the prefix tracker (#3394). Gemini reports cache reads
+                # only (cachedContentTokenCount); implicit caching exposes no
+                # write counter, so the uncached input portion is the write
+                # proxy - the same inference the OpenAI path makes. Only a
+                # clean 200 with a parsed body feeds the tracker: nothing was
+                # cached for an error or an unparseable response.
+                if response.status_code == 200 and isinstance(resp_json, dict):
+                    gemini_prefix_tracker.update_from_response(
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=max(total_input_tokens - cache_read_tokens, 0),
+                        messages=optimized_messages,
+                        original_messages=messages,
+                    )
 
                 # optimized_tokens carries Gemini's own promptTokenCount, which is
                 # on the provider's tokenizer scale (it feeds billing/dashboard),
@@ -1098,6 +1188,11 @@ class GeminiHandlerMixin:
             if isinstance(contents, list) and idx < len(contents)
         }
 
+        # Prefix freeze floor + compressed-prefix replay (#3394).
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
+
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
         if not messages:
@@ -1131,6 +1226,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         waste_messages=waste_messages,
                         **proxy_pipeline_kwargs(self.config),
                     ),
@@ -1152,6 +1248,24 @@ class GeminiHandlerMixin:
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
+
+        # Replay BEFORE the contents/systemInstruction conversion below: the
+        # payload is rebuilt from the replayed messages, so the frozen prefix
+        # goes upstream byte-identical (#3394 review).
+        if _decision.should_compress:
+            # Replay last turn's compressed prefix over this turn's output so
+            # the frozen region goes out byte-identical (#3394). Gated on the
+            # compression decision: a bypassed request's bytes stay untouched.
+            _final = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            )
+            optimized_messages = _final.messages
+            if _final.tokens is not None:
+                optimized_tokens = _final.tokens
 
         if optimized_messages != messages:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
@@ -1190,6 +1304,8 @@ class GeminiHandlerMixin:
             transforms_applied,
             tags,
             optimization_latency,
+            prefix_tracker=gemini_prefix_tracker,
+            original_messages=messages,
         )
 
     async def handle_gemini_stream_generate_content(
@@ -1375,6 +1491,13 @@ class GeminiHandlerMixin:
                 headers=response_headers,
             )
 
+        # Prefix freeze floor + compressed-prefix replay (#3394). Read-only:
+        # countTokens feeds the shared session's freeze floor into the pipeline
+        # but has no usage to feed back into the tracker.
+        gemini_prefix_tracker, gemini_frozen_count = self._gemini_resolve_prefix_tracker(
+            request, model, messages
+        )
+
         # Token counting (original, offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
@@ -1410,6 +1533,7 @@ class GeminiHandlerMixin:
                         model=model,
                         model_limit=context_limit,
                         context=extract_user_query(messages),
+                        frozen_message_count=gemini_frozen_count,
                         **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1419,6 +1543,17 @@ class GeminiHandlerMixin:
                     transforms_applied = result.transforms_applied
             except Exception as e:
                 logger.warning(f"[{request_id}] Gemini countTokens optimization failed: {e}")
+
+        if _decision.should_compress:
+            # Same compressed-prefix replay as generateContent (#3394), so the
+            # count previews what the real call would forward.
+            optimized_messages = self._gemini_replay_forwarded_prefix(
+                optimized_messages,
+                messages,
+                gemini_prefix_tracker,
+                gemini_frozen_count,
+                tokenizer,
+            ).messages
 
         # Convert back to Gemini format for the API call
         if optimized_messages != messages:

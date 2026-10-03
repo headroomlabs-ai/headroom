@@ -63,11 +63,32 @@ def test_router_applies_elision_when_no_compressor_wins():
     assert "content elided" not in off.compress(html, context="tool_result").compressed
 
 
+# These exercise the DENSE-LINE ELIDER, so they must pin the router to it.
+# Without `enable_html_extractor=False` the strategy chosen depends on whether
+# the optional `html` extra is installed: with `trafilatura` present the router
+# picks HTMLExtractor instead, which strips <script>/<style> and returns only
+# the visible text -- so the assertions below were silently testing a different
+# compressor. CI does not install that extra (it runs `--extra proxy`), so both
+# tests passed there and failed in any full-extras checkout, including at the
+# commit that introduced them.
+#
+# NOTE the reason they fail under HTMLExtractor is a real defect, not just a
+# routing surprise: on `<html><head><script>{3.2kB}</script></head>
+# <body>hi there</body></html>` it emits `hi there` -- 3232 chars to 8, logged
+# as 99.8% savings -- with NO `Retrieve original: hash=` marker, so the script
+# is unrecoverable through CCR. With an empty <body> its output is blank, the
+# router rejects it ("must never blank a non-empty block") and falls back to
+# elision, which is why only the prose cases fail. Tracked separately; pinning
+# the strategy here keeps that bug from hiding inside an elider test.
 def test_elided_block_carries_a_retrievable_marker():
     from headroom.cache.compression_store import get_compression_store
 
     html = "<html><head><script>" + MINIFIED_JS + "</script></head><body>hi there</body></html>"
-    router = ContentRouter(ContentRouterConfig(enable_kompress=False, min_section_tokens=10))
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_kompress=False, enable_html_extractor=False, min_section_tokens=10
+        )
+    )
     out = router.compress(html, context="tool_result").compressed
     assert "Retrieve original: hash=" in out
     key = out.rsplit("hash=", 1)[1].rstrip("]\n")
@@ -96,7 +117,13 @@ def test_messages_path_keeps_elided_tool_result(tokenizer):
         {"role": "assistant", "content": "ok"},
         {"role": "user", "content": "and now?"},
     ]
-    router = ContentRouter(ContentRouterConfig(enable_kompress=False, min_section_tokens=10))
+    # Same strategy pin as the test above: the elider, not whichever compressor
+    # the installed extras happen to make available.
+    router = ContentRouter(
+        ContentRouterConfig(
+            enable_kompress=False, enable_html_extractor=False, min_section_tokens=10
+        )
+    )
     result = router.apply(messages, tokenizer)
     block = result.messages[2]["content"][0]["content"]
     text = block if isinstance(block, str) else block[0]["text"]

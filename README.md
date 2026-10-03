@@ -121,9 +121,10 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 Launch a wrapped agent session each time, so the setup runs. `headroom wrap`
 starts a local proxy, installs **[Serena](https://github.com/oraios/serena)** for
 semantic code navigation, and launches the agent configured to route through
-Headroom. Serena is registered at user scope (for Claude Code, in
-`~/.claude.json`), so it stays available in your other projects until you run
-`headroom unwrap`. Skip it with `--code-memory none`.
+Headroom. For Claude Code, Serena is registered for the wrapped project only
+(as a `local`-scope MCP server in `~/.claude.json`). Use
+`--code-memory-scope user` to make it available in every project, or
+`--code-memory none` to skip it. `headroom unwrap` removes either registration.
 
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
@@ -252,6 +253,8 @@ Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `zcode`). Registry authors should use the canonical [`server.json`](server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
 
+For Anthropic `/v1/messages`, `--mode cache` skips automatic `--memory` context injection so the provider prefix remains stable. OpenAI chat/responses and Gemini append memory to the live-zone tail. Use `--mode token` when you need automatic memory context on the Anthropic path.
+
 <details>
 <summary><b>GitHub Copilot CLI subscription mode</b></summary>
 
@@ -322,6 +325,8 @@ project you will open in VS Code:
 ```bash
 pip install "headroom-ai[proxy]"
 headroom wrap vscode-claude
+# Optional: persist Claude Code's client-owned 1M model selector
+headroom wrap vscode-claude --1m
 ```
 
 Reload the VS Code window on first run. Keep the wrapper terminal running while
@@ -329,6 +334,16 @@ you use the Claude Code panel; the dashboard or proxy log printed at startup
 shows requests and savings. Your Anthropic authentication and selected model are
 preserved. `Ctrl+C` stops the proxy; `headroom unwrap vscode-claude` restores the
 settings that existed before setup.
+
+With `--1m`, Headroom writes the resolved `[1m]` model selector to Claude Code's
+top-level user setting and restores the exact prior model on
+`headroom unwrap vscode-claude` or when setup runs again without `--1m`. Use
+`headroom wrap vscode-claude --no-configure --1m` to print the setting without
+writing files.
+
+Claude Code and Anthropic own 1M model support and account eligibility. Local
+tests prove persisted settings and restoration, not a live entitled VS Code
+session or the resulting context window.
 [Full guide →](https://docs.headroomlabs.ai/docs/vscode-claude-code)
 
 </details>
@@ -371,7 +386,7 @@ reduction, and blocks under `min_input_words` come back byte-identical.
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types. It keeps error items, values outside the normal statistical range, and first/last boundaries, selected from field-variance statistics rather than a keyword list.
-- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++ and Perl.
+- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, C#, PHP.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction through a trained ML router.
 - **CacheAligner** — flags volatile content that would bust a provider KV-cache prefix; never rewrites prompts.
@@ -513,11 +528,19 @@ published for Windows (`win_amd64`), Linux (`x86_64` / `aarch64`) and macOS
 (Apple Silicon and Intel), so those platforms never need a local Rust toolchain —
 the Rust-first step above is only for the sdist fallback when no wheel matches.
 
-Two runtime assets are fetched over TLS. If they are blocked, trust your
-corporate CA through `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
+**At runtime** Headroom verifies upstream TLS against the operating system's
+certificate store — where IT installs the Zscaler / Netskope / Palo Alto root —
+plus certifi's public roots, so a managed machine normally needs no setup.
+`headroom doctor --network` shows who signed each upstream certificate, whether
+Headroom trusts it, and whether a gateway block page is in the way. If the root
+is not in the OS store, export it as PEM and set
+`HEADROOM_CA_BUNDLE=/path/to/root.pem` (`NODE_EXTRA_CA_CERTS` also works). Full
+guide and the domain list for IT: [Corporate networks](https://docs.headroomlabs.ai/docs/corporate-networks).
 
-- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Or pre-provide it with `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
-- **`huggingface.co`** — the `kompress-base` model. Pre-download it and run with `HF_HUB_OFFLINE=1`, or point `HF_ENDPOINT` at a trusted mirror.
+Two download hosts can still need attention:
+
+- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core, fetched with Mozilla's roots only. Pre-provide it with `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
+- **`huggingface.co`** — the `kompress-base` model (Python, OS store) and the Rust core's embedding model (Mozilla's roots only). If the domain is blocked, pre-download and run with `HF_HUB_OFFLINE=1`, or point `HF_ENDPOINT` at a trusted mirror.
 
 Running with compression disabled (pure gateway) needs neither asset.
 
@@ -540,8 +563,9 @@ export ORT_DYLIB_PATH="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
 `ORT_PREFER_DYNAMIC_LINK=1` is required — without it `ORT_STRATEGY=system` still
 attempts static linking, which the Homebrew keg does not provide.
 
-**"Basic Constraints of CA cert not marked critical"** is a different failure. If
-TLS fails with:
+**"Basic Constraints of CA cert not marked critical"** only occurs with
+`HEADROOM_CERT_STORE=bundled` (the OS store verifies these roots fine). If TLS
+fails with:
 
 ```
 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
@@ -563,10 +587,9 @@ signature, expiry and hostname checks all stay on.
 HEADROOM_TLS_STRICT=0 headroom proxy --port 8787
 ```
 
-The Rust core's ONNX download uses a separate TLS stack (rustls / OS trust store)
-and is unaffected by `HEADROOM_TLS_STRICT`. On Windows the corporate root must be
-in the **machine** certificate store — browsers already trust it there — or
-pre-provision ONNX Runtime with `ORT_STRATEGY=system` to skip the download.
+The Rust core's downloads use rustls with Mozilla's roots and are unaffected by
+`HEADROOM_TLS_STRICT` and the CA variables; pre-provision ONNX Runtime with
+`ORT_STRATEGY=system` and models via `HF_ENDPOINT` as above.
 
 </details>
 

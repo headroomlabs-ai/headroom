@@ -121,7 +121,9 @@ def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch
 def test_deepseek_model_aliases_resolve_to_expected_tokenizers() -> None:
     assert get_tokenizer_name("deepseek-v3.2") == "deepseek-ai/DeepSeek-V3.2"
     assert get_tokenizer_name("deepseek-v4-pro") == "deepseek-ai/DeepSeek-V4-Pro"
-    assert get_tokenizer_name("deepseek-v4-flash") == "deepseek-ai/DeepSeek-V4-Flash"
+    assert get_tokenizer_name("deepseek-v4-flash") == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert get_tokenizer_name("deepseek-flash") == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert get_tokenizer_name("deepseek-v4-flash-vision-exp") == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert get_tokenizer_name("deepseek-r1") == "deepseek-ai/DeepSeek-R1"
     assert get_tokenizer_name("deepseek-r1-0528") == "deepseek-ai/DeepSeek-R1-0528"
 

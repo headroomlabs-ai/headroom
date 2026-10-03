@@ -358,8 +358,10 @@ class UsageReporter:
         self._last_report_time = datetime.now(timezone.utc)
 
     def _save_cache(self) -> None:
-        """Save license info to local cache file."""
+        """Save license info to local cache file (skipped in stateless mode)."""
         if self._license_info is None:
+            return
+        if not _paths.persistence_allowed("licence validation cache"):
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)

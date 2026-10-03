@@ -21,6 +21,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.public_errors import client_message
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,7 @@ try:
     _env_snapshot = set(_os.environ)
     import litellm
     from litellm import acompletion
+    from litellm.utils import supports_prompt_caching
 
     for _leaked_key in set(_os.environ) - _env_snapshot:
         del _os.environ[_leaked_key]
@@ -76,6 +80,7 @@ except ImportError:
     LITELLM_AVAILABLE = False
     litellm = None  # type: ignore
     acompletion = None  # type: ignore
+    supports_prompt_caching = None  # type: ignore
 
 
 # =============================================================================
@@ -178,6 +183,49 @@ def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
         and not key.startswith("x-headroom-")
         and not key.startswith("x_headroom_")
     }
+
+
+def _place_system_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``messages`` with an ephemeral cache breakpoint on the first system message.
+
+    litellm turns the marker into a Bedrock Converse ``cachePoint``, which caches
+    every tool and system block before it. The first system message is marked
+    (not the last) so a client that appends volatile system messages later does
+    not turn every turn into a cache write. Returned unchanged when the client
+    already placed markers anywhere (it owns breakpoint placement then) or when
+    there is no system message with content to mark. Never mutates the input:
+    the proxy still reads ``body["messages"]`` after the request is built.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if "cache_control" in message or (
+            isinstance(content, list)
+            and any(isinstance(block, dict) and "cache_control" in block for block in content)
+        ):
+            return messages
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            marked = {**message, "cache_control": {"type": "ephemeral"}}
+        elif isinstance(content, list):
+            # litellm only reads block-level markers off list content.
+            blocks = list(content)
+            for block_index in range(len(blocks) - 1, -1, -1):
+                block = blocks[block_index]
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    blocks[block_index] = {**block, "cache_control": {"type": "ephemeral"}}
+                    break
+            else:
+                continue
+            marked = {**message, "content": blocks}
+        else:
+            continue
+        return [*messages[:index], marked, *messages[index + 1 :]]
+    return messages
 
 
 def _fetch_bedrock_inference_profiles(
@@ -558,8 +606,8 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def _convert_tool_choice(choice: Any) -> Any:
     """Convert Anthropic tool_choice to OpenAI format.
 
-    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "tool", "name": "..."}
-    OpenAI:    "auto", "required", {"type": "function", "function": {"name": "..."}}
+    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
+    OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
     """
     if isinstance(choice, str):
         return choice
@@ -569,6 +617,13 @@ def _convert_tool_choice(choice: Any) -> Any:
             return "auto"
         if choice_type == "any":
             return "required"
+        if choice_type == "none":
+            # Anthropic's {"type": "none"} means "do not use any tool this turn".
+            # Without this branch it fell through to the "auto" default below,
+            # inverting the instruction into "you may use tools" — the model
+            # could then call a tool the client explicitly forbade. OpenAI's
+            # equivalent is the string "none".
+            return "none"
         if choice_type == "tool":
             return {"type": "function", "function": {"name": choice.get("name", "")}}
     return "auto"
@@ -586,6 +641,23 @@ def _parse_tool_arguments(arguments: Any) -> Any:
         except (json.JSONDecodeError, TypeError):
             return arguments
     return arguments
+
+
+def _anthropic_image_to_openai(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert an Anthropic ``image`` block to an OpenAI ``image_url`` part.
+
+    Same mapping as ``AnyLLMBackend._convert_content_blocks``. Returns None for a
+    source type it does not know, so that block is skipped as before.
+    """
+    source = block.get("source") or {}
+    if source.get("type") == "base64":
+        media_type = source.get("media_type", "image/png")
+        url = f"data:{media_type};base64,{source.get('data', '')}"
+    elif source.get("type") == "url":
+        url = source.get("url", "")
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
 def _is_anthropic_family_model(litellm_model: str) -> bool:
@@ -755,6 +827,15 @@ class LiteLLMBackend(Backend):
                 f"from HEADROOM_BEDROCK_MODEL_MAP: {sorted(self._model_overrides)}"
             )
 
+        # Opt-in (rollout feature): mark the system prompt for Bedrock prompt
+        # caching on the OpenAI-format path, where clients such as OpenAI-compat
+        # gateways never send `cache_control` themselves.
+        from headroom.rollout import resolve_rollout
+
+        self._openai_prompt_caching = provider == "bedrock" and resolve_rollout().is_enabled(
+            "bedrock_openai_prompt_caching"
+        )
+
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
 
     @property
@@ -884,6 +965,9 @@ class LiteLLMBackend(Backend):
                 tool_use_blocks = []
                 tool_result_blocks = []
                 thinking_blocks: list[dict[str, Any]] = []
+                # Ordered text + image parts; only used when the turn has an image.
+                parts: list[dict[str, Any]] = []
+                has_image = False
 
                 for block in content:
                     if not isinstance(block, dict):
@@ -891,6 +975,12 @@ class LiteLLMBackend(Backend):
                     block_type = block.get("type", "")
                     if block_type == "text":
                         text_parts.append(block.get("text", ""))
+                        parts.append({"type": "text", "text": block.get("text", "")})
+                    elif block_type == "image":
+                        image_part = _anthropic_image_to_openai(block)
+                        if image_part:
+                            parts.append(image_part)
+                            has_image = True
                     elif block_type == "tool_use":
                         tool_use_blocks.append(block)
                     elif block_type == "tool_result":
@@ -915,9 +1005,18 @@ class LiteLLMBackend(Backend):
                     for tr in tool_result_blocks:
                         tr_content = tr.get("content", "")
                         if isinstance(tr_content, list):
-                            tr_content = "\n".join(
-                                b.get("text", "") for b in tr_content if b.get("type") == "text"
-                            )
+                            # A tool_result content list is usually
+                            # ``{"type":"text",...}`` blocks, but a client may put
+                            # a bare string in the list. ``b.get`` on a str raised
+                            # AttributeError and 500'd the whole request; accept
+                            # bare strings and skip non-text/other blocks.
+                            text_pieces: list[str] = []
+                            for b in tr_content:
+                                if isinstance(b, str):
+                                    text_pieces.append(b)
+                                elif isinstance(b, dict) and b.get("type") == "text":
+                                    text_pieces.append(b.get("text", ""))
+                            tr_content = "\n".join(text_pieces)
                         tool_msg: dict[str, Any] = {
                             "role": "tool",
                             "tool_call_id": tr["tool_use_id"],
@@ -966,6 +1065,10 @@ class LiteLLMBackend(Backend):
                     "role": role,
                     "content": "\n".join(text_parts) if text_parts else "",
                 }
+                # User turns only: litellm's Bedrock transform raises on an
+                # assistant-turn image, which this code has always dropped.
+                if has_image and role == "user":
+                    simple_msg["content"] = parts
                 if preserve_thinking and thinking_blocks and role == "assistant":
                     simple_msg["thinking_blocks"] = thinking_blocks
                 converted.append(simple_msg)
@@ -1177,7 +1280,11 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM error: {error_message}")
+            # Provider API errors keep their text; transport failures are
+            # reduced to the public vocabulary (see proxy/public_errors).
+            error_message = client_message(e, error_message)
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1197,10 +1304,10 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "type": "error",
-                    "error": {"type": error_type, "message": str(e)},
+                    "error": {"type": error_type, "message": error_message},
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_message(
@@ -1324,6 +1431,14 @@ class LiteLLMBackend(Backend):
             final_input_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
+            # Real output-token count from the trailing usage chunk. The
+            # ``output_tokens`` counter incremented per content_block_delta below
+            # is only a delta *count* (one per SSE chunk), which undercounts the
+            # true token total several-fold. Prefer the provider's
+            # completion_tokens when the usage chunk carries it, exactly like the
+            # non-streaming path (_anthropic_usage_from_litellm), and fall back to
+            # the delta count only when no usage chunk arrives.
+            final_output_tokens = 0
 
             # Extended thinking is BUFFERED, not streamed live. A thinking block
             # is only legal to replay if it leads the turn and carries a real
@@ -1426,6 +1541,7 @@ class LiteLLMBackend(Backend):
                     final_cache_write_tokens = int(
                         getattr(cu, "cache_creation_input_tokens", 0) or 0
                     )
+                    final_output_tokens = int(getattr(cu, "completion_tokens", 0) or 0)
 
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
@@ -1562,9 +1678,21 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
-            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            delta_usage: dict[str, Any] = {"output_tokens": final_output_tokens or output_tokens}
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
-                delta_usage["input_tokens"] = final_input_tokens
+                # LiteLLM's prompt_tokens is the *total* prompt size, inclusive
+                # of the cache-read and cache-write tokens (Bedrock reports raw
+                # inputTokens and LiteLLM's AmazonConverseConfig._transform_usage
+                # adds cacheReadInputTokens + cacheWriteInputTokens onto it).
+                # Anthropic's input_tokens must exclude both, since the cache
+                # fields below report them separately and clients treat the three
+                # buckets as disjoint. Without the subtraction a cached streaming
+                # turn double-counts the cached prefix in input_tokens at the full
+                # input rate. Mirrors the non-streaming path in
+                # _anthropic_usage_from_litellm (#1345 / #1848).
+                delta_usage["input_tokens"] = max(
+                    final_input_tokens - final_cache_read_tokens - final_cache_write_tokens, 0
+                )
                 if final_cache_read_tokens:
                     delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
                 if final_cache_write_tokens:
@@ -1587,12 +1715,13 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -1635,6 +1764,9 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
@@ -1784,7 +1916,9 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI error: {error_message}")
+            error_message = client_message(e, error_message)
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1804,13 +1938,13 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "error": {
-                        "message": str(e),
+                        "message": error_message,
                         "type": error_type,
                         "code": error_type,
                     }
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_openai_message(
@@ -1842,6 +1976,9 @@ class LiteLLMBackend(Backend):
             extra_body = _build_openai_extra_body(body)
             if extra_body:
                 kwargs["extra_body"] = extra_body
+
+            if self._openai_prompt_caching and supports_prompt_caching(model=litellm_model):
+                kwargs["messages"] = _place_system_cache_control(kwargs["messages"])
 
             # Provider-specific region config
             if self.region:
@@ -1875,15 +2012,25 @@ class LiteLLMBackend(Backend):
 
             async for chunk in response:
                 chunk_dict = chunk.model_dump(exclude_none=True, exclude_unset=True)
+                # Report the model the client requested, not the LiteLLM-mapped
+                # provider slug (e.g. "openrouter/qwen3",
+                # "bedrock/us.anthropic.claude-..."). send_openai_message already
+                # rewrites the model to original_model on the non-streaming path;
+                # without this the streaming and non-streaming responses disagree
+                # and OpenAI clients that key cost/telemetry on the model field
+                # see an unrecognized name for every streamed request.
+                if "model" in chunk_dict:
+                    chunk_dict["model"] = original_model
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

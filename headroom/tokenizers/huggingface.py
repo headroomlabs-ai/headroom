@@ -80,9 +80,12 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
     "deepseek-r1": "deepseek-ai/DeepSeek-R1",
     "deepseek-r1-0528": "deepseek-ai/DeepSeek-R1-0528",
     "deepseek-reasoner": "deepseek-ai/DeepSeek-R1",
-    # DeepSeek V4 family (2025-2026)
+    # DeepSeek V4 family (2025-2026). The retired v4-flash ids are still
+    # accepted on the wire but served by V4.1-Flash, so they resolve there.
+    "deepseek-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
     "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
-    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-ai/DeepSeek-V4.1-Flash",
     # DeepSeek API aliases (routed through the proxy)
     "deepseek-chat": "deepseek-ai/DeepSeek-V3",
     "deepseek-r1-distill-qwen": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
