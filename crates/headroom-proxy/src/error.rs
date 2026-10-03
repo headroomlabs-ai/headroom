@@ -55,30 +55,163 @@ impl From<crate::upstream_path::PathError> for ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
+        let internal_detail = self.to_string();
+        let (status, client_msg) = match &self {
             ProxyError::Upstream(e) if e.is_timeout() => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("upstream timeout: {e}"),
+                "upstream request timed out".to_string(),
             ),
             ProxyError::Upstream(e) if e.is_connect() => (
                 StatusCode::BAD_GATEWAY,
-                format!("upstream connect error: {e}"),
+                "failed to connect to upstream".to_string(),
             ),
-            ProxyError::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::InvalidUpstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::InvalidHeader(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ProxyError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
+            ProxyError::Upstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream request failed".to_string(),
+            ),
+            ProxyError::InvalidUpstream(_) => (
+                StatusCode::BAD_GATEWAY,
+                "invalid upstream configuration".to_string(),
+            ),
+            ProxyError::InvalidHeader(detail) => {
+                (StatusCode::BAD_REQUEST, format!("invalid header: {detail}"))
+            }
+            ProxyError::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail.clone()),
             ProxyError::InvalidPath(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            ProxyError::WebSocket(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
-            ProxyError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            ProxyError::WebSocket(_) => (
+                StatusCode::BAD_GATEWAY,
+                "websocket upstream error".to_string(),
+            ),
+            ProxyError::Io(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
             // CompressionStartup is a startup-time error, not a
             // per-request one — but if it ever surfaces in the
             // handler path, surface as 500 rather than panic.
-            ProxyError::CompressionStartup(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
-            }
+            ProxyError::CompressionStartup(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
         };
-        tracing::warn!(error = %msg, "proxy error");
-        (status, msg).into_response()
+        tracing::warn!(error = %internal_detail, status = status.as_u16(), "proxy error");
+        (status, client_msg).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::time::Duration;
+
+    async fn response_body(error: ProxyError) -> (StatusCode, String) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn internal_upstream_configuration_is_not_returned_to_client() {
+        let secret = "http://10.23.45.67:9443/private";
+        let (status, body) = response_body(ProxyError::InvalidUpstream(secret.to_string())).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "invalid upstream configuration");
+        assert!(!body.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn websocket_and_io_details_are_not_returned_to_client() {
+        let (_, websocket_body) =
+            response_body(ProxyError::WebSocket("dial tcp 10.0.0.8:443".to_string())).await;
+        assert_eq!(websocket_body, "websocket upstream error");
+
+        let (_, io_body) =
+            response_body(ProxyError::Io(std::io::Error::other("/srv/internal/token"))).await;
+        assert_eq!(io_body, "internal server error");
+    }
+
+    #[tokio::test]
+    async fn compression_startup_detail_is_not_returned_to_client() {
+        let (status, body) = response_body(ProxyError::CompressionStartup(
+            "failed to load /srv/models/private-tokenizer.bin".to_string(),
+        ))
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal server error");
+    }
+
+    #[tokio::test]
+    async fn reqwest_builder_and_connect_details_are_not_returned_to_client() {
+        let builder_error = reqwest::Client::new()
+            .get("://invalid-internal-url")
+            .send()
+            .await
+            .unwrap_err();
+        let (status, body) = response_body(ProxyError::Upstream(builder_error)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "upstream request failed");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let connect_error = reqwest::Client::new()
+            .get(format!("http://{address}/private"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(connect_error.is_connect());
+        let (status, body) = response_body(ProxyError::Upstream(connect_error)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body, "failed to connect to upstream");
+        assert!(!body.contains(&address.to_string()));
+    }
+
+    #[tokio::test]
+    async fn reqwest_timeout_detail_is_not_returned_to_client() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let timeout_error = reqwest::Client::builder()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/private"))
+            .send()
+            .await
+            .unwrap_err();
+        server.abort();
+
+        assert!(timeout_error.is_timeout());
+        let (status, body) = response_body(ProxyError::Upstream(timeout_error)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body, "upstream request timed out");
+        assert!(!body.contains(&address.to_string()));
+    }
+
+    #[tokio::test]
+    async fn client_caused_error_details_remain_available() {
+        let (status, body) =
+            response_body(ProxyError::InvalidHeader("bad client header".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid header: bad client header");
+
+        let (status, body) = response_body(ProxyError::PayloadTooLarge(
+            "limit is 1024 bytes".to_string(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body, "limit is 1024 bytes");
+
+        let (status, body) =
+            response_body(ProxyError::InvalidPath("dot segment".to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "request path rejected: dot segment");
     }
 }
