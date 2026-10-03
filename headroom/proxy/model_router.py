@@ -44,6 +44,15 @@ class ModelRoute:
     min_input_tokens: int | None = None
     """Match only when estimated input tokens are >= this."""
 
+    max_output_tokens: int | None = None
+    """Match only when the request's own ``max_tokens`` is <= this.
+
+    The caller's declared output budget is the best "this turn is trivial"
+    signal at routing time: a tiny prompt asking for 4000 output tokens may
+    want a long answer from the strong model. A request that declares no
+    ``max_tokens`` does NOT match (an unbounded response is not a trivial
+    turn), so the rule can never widen to unbounded requests."""
+
     require_no_tools: bool = False
     """Match only when the request declares no tools (a proxy for low-risk work)."""
 
@@ -61,7 +70,14 @@ class ModelRoute:
     name: str = ""
     """Human-readable label surfaced in decision logs."""
 
-    def matches(self, *, model: str, input_tokens: int, has_tools: bool) -> bool:
+    def matches(
+        self,
+        *,
+        model: str,
+        input_tokens: int,
+        has_tools: bool,
+        max_tokens: int | None = None,
+    ) -> bool:
         """True when every set condition is satisfied for this request."""
         if self.from_models and model not in self.from_models:
             return False
@@ -72,6 +88,10 @@ class ModelRoute:
         if self.max_input_tokens is not None and input_tokens > self.max_input_tokens:
             return False
         if self.min_input_tokens is not None and input_tokens < self.min_input_tokens:
+            return False
+        if self.max_output_tokens is not None and (
+            max_tokens is None or max_tokens > self.max_output_tokens
+        ):
             return False
         # A rule whose ``to_model`` equals the current model still MATCHES (strict
         # first-match-wins): it is a no-op (``changed`` is False) that short-circuits
@@ -132,7 +152,14 @@ class ModelRouter:
     def enabled(self) -> bool:
         return self._config.enabled and bool(self._config.routes)
 
-    def select(self, *, model: str, input_tokens: int, has_tools: bool) -> ModelDecision:
+    def select(
+        self,
+        *,
+        model: str,
+        input_tokens: int,
+        has_tools: bool,
+        max_tokens: int | None = None,
+    ) -> ModelDecision:
         """Return the routing decision for a request.
 
         Never raises: on a disabled router or no matching rule, returns a
@@ -144,11 +171,14 @@ class ModelRouter:
             return ModelDecision(model, model, matched=False, reason="no source model")
 
         for route in self._config.routes:
-            if route.matches(model=model, input_tokens=input_tokens, has_tools=has_tools):
+            if route.matches(
+                model=model, input_tokens=input_tokens, has_tools=has_tools, max_tokens=max_tokens
+            ):
                 reason = (
                     f"matched rule {route.name or route.to_model!r}: "
                     f"{model} -> {route.to_model} "
-                    f"(input_tokens={input_tokens}, has_tools={has_tools})"
+                    f"(input_tokens={input_tokens}, has_tools={has_tools}, "
+                    f"max_tokens={max_tokens})"
                 )
                 return ModelDecision(
                     original_model=model,
@@ -187,6 +217,18 @@ def estimate_input_tokens(messages: object, tools: object = None, system: object
         return 0
 
 
+def request_max_tokens(body: object) -> int | None:
+    """Return the request's ``max_tokens``, or ``None`` if absent or not an integer.
+
+    Booleans and non-integers are treated as absent so a malformed client value
+    can never satisfy a ``max_output_tokens`` bound. It never raises.
+    """
+    value = body.get("max_tokens") if isinstance(body, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
 
@@ -219,6 +261,7 @@ _ALLOWED_ROUTE_KEYS = frozenset(
         "to_model",
         "max_input_tokens",
         "min_input_tokens",
+        "max_output_tokens",
         "require_no_tools",
         "require_tools",
         "from_models",
@@ -252,7 +295,8 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
 
     max_tokens = _strict_opt_int(entry, "max_input_tokens", index)
     min_tokens = _strict_opt_int(entry, "min_input_tokens", index)
-    if max_tokens is _INVALID or min_tokens is _INVALID:
+    max_output = _strict_opt_int(entry, "max_output_tokens", index)
+    if max_tokens is _INVALID or min_tokens is _INVALID or max_output is _INVALID:
         return None
 
     require_no_tools = entry.get("require_no_tools", False)
@@ -280,6 +324,7 @@ def _route_from_entry(entry: object, index: int) -> ModelRoute | None:
         to_model=to_model,
         max_input_tokens=max_tokens,  # type: ignore[arg-type]
         min_input_tokens=min_tokens,  # type: ignore[arg-type]
+        max_output_tokens=max_output,  # type: ignore[arg-type]
         require_no_tools=require_no_tools,
         require_tools=require_tools,
         from_models=tuple(from_models_raw),

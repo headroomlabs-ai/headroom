@@ -62,7 +62,7 @@ from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
-from headroom.proxy.model_router import estimate_input_tokens
+from headroom.proxy.model_router import estimate_input_tokens, request_max_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
@@ -883,6 +883,7 @@ class AnthropicHandlerMixin:
             model=model,
             input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
             has_tools=bool(body.get("tools")),
+            max_tokens=request_max_tokens(body),
         )
         logger.info("model routing decision: %s", decision.reason)
         if not decision.changed:

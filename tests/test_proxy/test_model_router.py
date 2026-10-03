@@ -8,6 +8,7 @@ from headroom.proxy.model_router import (
     ModelRouter,
     ModelRouterConfig,
     estimate_input_tokens,
+    request_max_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,28 @@ def test_route_require_tools_and_require_no_tools_never_matches() -> None:
     route = ModelRoute(to_model="x", require_tools=True, require_no_tools=True)
     assert not route.matches(model="m", input_tokens=1, has_tools=True)
     assert not route.matches(model="m", input_tokens=1, has_tools=False)
+
+
+def test_route_max_output_tokens_bounds_declared_budget() -> None:
+    # Issue #2765: a tiny prompt asking for a long answer must not downshift.
+    route = ModelRoute(to_model="cheap", max_input_tokens=4096, max_output_tokens=512)
+    assert route.matches(model="strong", input_tokens=10, has_tools=False, max_tokens=512)
+    assert route.matches(model="strong", input_tokens=10, has_tools=False, max_tokens=1)
+    assert not route.matches(model="strong", input_tokens=10, has_tools=False, max_tokens=4000)
+
+
+def test_route_max_output_tokens_absent_budget_does_not_match() -> None:
+    # An unbounded response is not a trivial turn: absent max_tokens never
+    # satisfies the bound, so the rule cannot widen to unbounded requests.
+    route = ModelRoute(to_model="cheap", max_output_tokens=512)
+    assert not route.matches(model="strong", input_tokens=10, has_tools=False)
+    assert not route.matches(model="strong", input_tokens=10, has_tools=False, max_tokens=None)
+
+
+def test_route_without_max_output_tokens_ignores_budget() -> None:
+    route = ModelRoute(to_model="cheap", max_input_tokens=4096)
+    assert route.matches(model="strong", input_tokens=10, has_tools=False, max_tokens=100_000)
+    assert route.matches(model="strong", input_tokens=10, has_tools=False)
 
 
 def test_route_matches_even_for_same_model() -> None:
@@ -282,3 +305,42 @@ def test_estimate_input_tokens_counts_system_string() -> None:
 def test_estimate_input_tokens_counts_system_blocks() -> None:
     blocks = [{"type": "text", "text": "x" * 4000}]
     assert estimate_input_tokens([{"content": "hi"}], system=blocks) > 100
+
+
+def test_select_passes_max_tokens_to_rules() -> None:
+    router = ModelRouter(
+        ModelRouterConfig(
+            enabled=True,
+            routes=(ModelRoute(to_model="cheap", max_output_tokens=512, name="trivial"),),
+        )
+    )
+    small = router.select(model="strong", input_tokens=10, has_tools=False, max_tokens=256)
+    assert small.changed and small.routed_model == "cheap"
+    assert "max_tokens=256" in small.reason
+    large = router.select(model="strong", input_tokens=10, has_tools=False, max_tokens=4000)
+    assert not large.matched and large.routed_model == "strong"
+
+
+def test_from_env_parses_max_output_tokens() -> None:
+    cfg = ModelRouterConfig.from_env(
+        "1", '[{"to_model": "cheap", "max_input_tokens": 4096, "max_output_tokens": 512}]'
+    )
+    assert cfg.enabled
+    assert cfg.routes[0].max_output_tokens == 512
+
+
+def test_from_env_malformed_max_output_tokens_skips_route() -> None:
+    for bad in ('"lots"', "true", "-1"):
+        cfg = ModelRouterConfig.from_env(
+            "1", f'[{{"to_model": "cheap", "max_output_tokens": {bad}}}]'
+        )
+        assert not cfg.routes, bad
+
+
+def test_request_max_tokens() -> None:
+    assert request_max_tokens({"max_tokens": 4000}) == 4000
+    assert request_max_tokens({}) is None
+    assert request_max_tokens({"max_tokens": True}) is None
+    assert request_max_tokens({"max_tokens": "4000"}) is None
+    assert request_max_tokens({"max_tokens": 1.5}) is None
+    assert request_max_tokens(None) is None
