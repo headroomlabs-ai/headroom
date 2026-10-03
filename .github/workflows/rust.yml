@@ -208,32 +208,10 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
 
-  audit:
-    name: audit
-    needs: rust-changes
-    if: needs.rust-changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit + cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit,cargo-deny
-      # Blocking. Soft-failing this made it useless: RUSTSEC-2026-0258 (h2,
-      # unbounded empty DATA frames -> unbounded memory or a panic) was
-      # reported by this job for as long as it existed and never turned a run
-      # red, so nobody acted on it. Accepted advisories go in audit.toml with
-      # a written reason rather than being swallowed wholesale here.
-      - name: cargo audit
-        run: cargo audit
-      - name: cargo deny check licenses
-        continue-on-error: true
-        run: cargo deny check licenses
+  # The Rust dependency advisory scan (`cargo audit`) moved to security.yml,
+  # where it runs on every PR and push regardless of which paths changed. Here
+  # it sat behind the `rust-changes` filter and this workflow's schedule, and
+  # that combination let three weeks pass with no scan at all.
 
   # Blocking on every PR that touches Rust. Safe to harden now because the
   # harness fails only on a Diff — `parity-run` sets `any_diffs` inside the
