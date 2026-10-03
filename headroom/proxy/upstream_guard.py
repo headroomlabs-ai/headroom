@@ -205,8 +205,11 @@ def clear_validated_addresses() -> None:
     _PIN_SCOPE.set(None)
 
 
-def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | None:
-    raw = os.environ.get(ALLOWED_BASE_URLS_ENV)
+def allowlisted_destinations(
+    env: str = ALLOWED_BASE_URLS_ENV,
+) -> tuple[set[str], set[tuple[str, str, int]]] | None:
+    """Parse a comma-separated host/URL list from ``env``; ``None`` when unset."""
+    raw = os.environ.get(env)
     if not raw or not raw.strip():
         return None
     hosts: set[str] = set()
@@ -231,6 +234,26 @@ def _allowlisted_destinations() -> tuple[set[str], set[tuple[str, str, int]]] | 
             port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
         origins.add((parsed.scheme.lower(), parsed.hostname.lower(), port))
     return hosts, origins
+
+
+def destination_listed(
+    allow: tuple[set[str], set[tuple[str, str, int]]],
+    scheme: str,
+    host: str,
+    port: int | None,
+) -> bool:
+    """Whether a destination matches a parsed host/origin list.
+
+    A bare host admits every port for that host; a URL admits only its exact
+    origin, with the scheme's default port filled in when ``port`` is ``None``.
+    """
+    hosts, origins = allow
+    if host.lower() in hosts:
+        return True
+    scheme = scheme.lower()
+    if port is None:
+        port = 443 if scheme in {"https", "wss"} else 80
+    return (scheme, host.lower(), port) in origins
 
 
 # RFC 6052 / RFC 8215: these IPv6 prefixes embed an IPv4 address in their low
@@ -307,18 +330,13 @@ def is_safe_upstream_url(url: str, *, scope: dict[str, UpstreamPin] | None = Non
     if not host:
         return False
 
-    allow = _allowlisted_destinations()
+    allow = allowlisted_destinations()
     if allow is not None:
-        hosts, origins = allow
-        if host.lower() in hosts:
-            return True
         try:
             port = parsed.port
         except ValueError:
-            return False
-        if port is None:
-            port = 443 if parsed.scheme.lower() in {"https", "wss"} else 80
-        return (parsed.scheme.lower(), host.lower(), port) in origins
+            port = -1  # matches no origin; a listed bare host still passes, as before
+        return destination_listed(allow, parsed.scheme, host, port)
 
     try:
         infos = _RESOLVER_POOL.submit(
