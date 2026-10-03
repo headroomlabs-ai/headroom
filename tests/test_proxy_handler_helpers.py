@@ -945,6 +945,50 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     ) == [{"role": "user", "content": [{"type": "text", "text": "hello\n\nctx"}]}]
 
 
+def test_append_context_skips_trailing_system_message() -> None:
+    # Claude Code 2.1.x request shape: the user turn is followed by a
+    # role="system" message carrying the environment and the cache breakpoint.
+    trailing_system = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    user_turn = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+            {"type": "text", "text": "question"},
+        ],
+    }
+    inject = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn
+
+    assert inject([user_turn, trailing_system], "memory", frozen_message_count=0) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<system-reminder>ctx</system-reminder>\n\nmemory"},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        trailing_system,
+    ]
+    # The user turn is still subject to the frozen prefix.
+    messages = [user_turn, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=1) is messages
+    # Skipping system messages never reaches past a non-user turn.
+    messages = [user_turn, {"role": "assistant", "content": "ok"}, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    # Tool-result-only turns have no text block to extend.
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]},
+        trailing_system,
+    ]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    messages = [trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+
+
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:
     image_message = {
         "role": "user",

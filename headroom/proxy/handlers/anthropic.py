@@ -636,6 +636,11 @@ class AnthropicHandlerMixin:
         first text block of the latest user message is mutated, which is by
         definition the live zone.
 
+        Trailing ``role: "system"`` messages are skipped when locating that
+        turn: Claude Code appends one after the user message (environment
+        context carrying the cache breakpoint), and it is not a conversational
+        turn. It is left byte-identical.
+
         Returns the input list unchanged if no eligible user text block
         exists (e.g., the last message is an assistant turn or a tool
         result, or the user message has no text block).
@@ -644,7 +649,9 @@ class AnthropicHandlerMixin:
             return messages
 
         i = len(messages) - 1
-        if i < frozen_message_count:
+        while i >= 0 and messages[i].get("role") == "system":
+            i -= 1
+        if i < 0 or i < frozen_message_count:
             return messages
         msg = messages[i]
         if msg.get("role") != "user":
