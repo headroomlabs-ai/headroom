@@ -133,6 +133,7 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_rate_limit: bool = False,
     no_http2: bool = False,
     code_aware: bool | None = None,
     intercept_tool_results: bool = False,
@@ -173,6 +174,10 @@ def build_manifest(
         "HEADROOM_MODE": proxy_mode,
         "HEADROOM_BACKEND": backend,
     }
+    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+        # Keep native services away from Metal-specific model backends by default.
+        base_env["HEADROOM_EMBEDDER_RUNTIME"] = "cpu"
+        base_env["HEADROOM_KOMPRESS_BACKEND"] = "onnx"
     if anyllm_provider:
         base_env["HEADROOM_ANYLLM_PROVIDER"] = anyllm_provider
     if region:
@@ -235,6 +240,11 @@ def build_manifest(
         backend,
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
+    # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
+    # Persist the flag so reinstalls don't silently reintroduce throttling.
+    # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)
+    if no_rate_limit:
+        proxy_args.append("--no-rate-limit")
     if memory_enabled:
         proxy_args.append("--memory")
         # `_paths.memory_db_path()` resolves against the HOST home. A container

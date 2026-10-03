@@ -1312,12 +1312,20 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress TOIN filesystem persistence, and export the flag
+    # so code that runs before the proxy records it (the update check) and
+    # child processes see the same answer as paths.process_is_stateless().
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_STATELESS"] = "1"
 
-    # License key for managed/enterprise deployments (optional)
-    license_key = os.environ.get("HEADROOM_LICENSE_KEY")
+    # Licence token (HEADROOM_LICENSE; HEADROOM_LICENSE_KEY is a deprecated
+    # alias). Having one set never enables outbound usage reporting: that
+    # needs the explicit HEADROOM_USAGE_REPORTING=1 opt-in.
+    from headroom.license_env import resolve_license_token, usage_reporting_enabled
+
+    license_key = resolve_license_token()
+    usage_reporting = usage_reporting_enabled()
 
     # Qdrant connection for the qdrant-neo4j backend. CLI flags default
     # to None; when omitted we let ProxyConfig's default_factory resolve
@@ -1490,6 +1498,7 @@ def proxy(
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
+        usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
         # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
@@ -1515,9 +1524,16 @@ def proxy(
     if config.memory_enabled:
         memory_status = "ENABLED (multi-provider)"
 
-    license_status = "OSS (no license key)"
+    license_status = "OSS (no licence)"
     if license_key:
-        license_status = f"MANAGED (key={license_key[:8]}...)"
+        # Never print licence material, not even a prefix.
+        if not usage_reporting:
+            reporting = "off"
+        elif config.offline:
+            reporting = "suppressed by HEADROOM_OFFLINE"
+        else:
+            reporting = "ON"
+        license_status = f"LICENSED (usage reporting {reporting})"
 
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
