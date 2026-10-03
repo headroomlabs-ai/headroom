@@ -84,3 +84,27 @@ def test_output_tokens_none_coerced_to_zero() -> None:
     )
     assert usage["output_tokens"] == 0
     assert isinstance(usage["output_tokens"], int)
+
+
+def test_to_anthropic_response_empty_choices_returns_empty_turn() -> None:
+    # A content-filtered / usage-only upstream response can be HTTP 200 with an
+    # empty choices list (e.g. Azure OpenAI content filtering). Indexing
+    # choices[0] would raise IndexError and 500 the request; the converter must
+    # return a valid empty assistant turn, the way the streaming path already
+    # `continue`s on an empty-choice chunk. _to_anthropic_response uses no
+    # instance state, so exercise it on a bare instance.
+    backend = object.__new__(litellm_backend.LiteLLMBackend)
+    response = SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(prompt_tokens=42, completion_tokens=0),
+    )
+
+    converted = backend._to_anthropic_response(response, "claude-sonnet")
+
+    assert converted["type"] == "message"
+    assert converted["role"] == "assistant"
+    assert converted["model"] == "claude-sonnet"
+    assert converted["content"] == []
+    assert converted["stop_reason"] == "end_turn"
+    assert converted["usage"]["input_tokens"] == 42
+    assert converted["usage"]["output_tokens"] == 0

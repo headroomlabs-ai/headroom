@@ -12,6 +12,9 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from headroom.proxy.public_errors import client_message
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,44 @@ try:
 except ImportError:
     ANYLLM_AVAILABLE = False
     AnyLLM = None  # type: ignore
+
+
+def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    """Convert an Anthropic tool definition to the OpenAI function shape.
+
+    any-llm speaks OpenAI, so an Anthropic ``{name, description, input_schema}``
+    tool must become ``{type: function, function: {name, description,
+    parameters}}`` before it is forwarded, or the provider ignores/rejects the
+    tools array and the model never calls a tool. Mirrors the LiteLLM backend's
+    converter so both OpenAI-compatible backends send the same shape.
+    """
+    func: dict[str, Any] = {"name": tool.get("name", "")}
+    if "description" in tool:
+        func["description"] = tool["description"]
+    if "input_schema" in tool:
+        func["parameters"] = tool["input_schema"]
+    return {"type": "function", "function": func}
+
+
+def _convert_tool_choice(choice: Any) -> Any:
+    """Convert an Anthropic ``tool_choice`` to the OpenAI shape (mirrors LiteLLM).
+
+    Anthropic: ``{"type": "auto"}``, ``{"type": "any"}``, ``{"type": "tool",
+    "name": ...}``. OpenAI: ``"auto"``, ``"required"``, ``{"type": "function",
+    "function": {"name": ...}}``. Passing the raw Anthropic dict through makes
+    the provider reject or ignore it.
+    """
+    if isinstance(choice, str):
+        return choice
+    if isinstance(choice, dict):
+        choice_type = choice.get("type", "auto")
+        if choice_type == "auto":
+            return "auto"
+        if choice_type == "any":
+            return "required"
+        if choice_type == "tool":
+            return {"type": "function", "function": {"name": choice.get("name", "")}}
+    return "auto"
 
 
 class AnyLLMBackend(Backend):
@@ -143,6 +184,30 @@ class AnyLLMBackend(Backend):
         """Convert any-llm/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already skips this (`if ... and chunk.choices`);
+        # indexing ``choices[0]`` here would instead raise IndexError and 500
+        # the request. Return a valid empty assistant turn.
+        if not getattr(response, "choices", None):
+            usage = {"input_tokens": 0, "output_tokens": 0}
+            if getattr(response, "usage", None):
+                usage = {
+                    "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                }
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": usage,
+            }
+
         choice = response.choices[0]
         message = choice.message
 
@@ -227,9 +292,9 @@ class AnyLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = body["tools"]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
             if "tool_choice" in body:
-                kwargs["tool_choice"] = body["tool_choice"]
+                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
             logger.debug(f"any-llm request: provider={self.provider}, model={original_model}")
 
@@ -243,7 +308,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm error: {e}")
+            logger.error(f"any-llm error: {format_exception_message(e)}")
             return self._error_response(e)
 
     async def stream_message(
@@ -277,9 +342,9 @@ class AnyLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = body["tools"]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
             if "tool_choice" in body:
-                kwargs["tool_choice"] = body["tool_choice"]
+                kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -300,42 +365,131 @@ class AnyLLMBackend(Backend):
                 },
             )
 
-            yield StreamEvent(
-                event_type="content_block_start",
-                data={
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-
             stream_response = await self.llm.acompletion(**kwargs)
             output_tokens = 0
+            # Stream text immediately in a single text block, but BUFFER tool
+            # calls and emit them as complete blocks at the end. OpenAI streams
+            # parallel tool calls interleaved by index (index 0 and 1 introduced
+            # together, then a fragment for 0, then for 1), while Anthropic
+            # requires each content block to be fully emitted — start, deltas,
+            # stop — before the next opens. Reassembling per index and flushing
+            # complete blocks keeps every delta inside its own block's start/stop
+            # for any interleaving. (The previous version pre-opened one text
+            # block and dropped tool calls entirely; a naive open-on-new-index
+            # instead mis-sequenced parallel calls, emitting a fragment for an
+            # already-stopped block.)
+            current_block_index = -1
+            text_block_open = False
+            # provider tool index -> {"id", "name", "arguments"}, first-seen order
+            tool_calls: dict[int, dict[str, Any]] = {}
+            tool_order: list[int] = []
+            stop_reason = "end_turn"
 
             async for chunk in cast(AsyncIterator[Any], stream_response):
-                if hasattr(chunk, "choices") and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    if hasattr(delta, "content") and delta.content:
+                if not (hasattr(chunk, "choices") and chunk.choices):
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+
+                # Map OpenAI finish_reason to the Anthropic stop_reason so a tool
+                # call or a length truncation is not reported as end_turn.
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                elif finish_reason == "length":
+                    stop_reason = "max_tokens"
+                elif finish_reason == "stop":
+                    stop_reason = "end_turn"
+
+                if getattr(delta, "tool_calls", None):
+                    for tc in delta.tool_calls:
+                        idx = tc.index if getattr(tc, "index", None) is not None else 0
+                        buf = tool_calls.get(idx)
+                        if buf is None:
+                            buf = {"id": None, "name": "", "arguments": ""}
+                            tool_calls[idx] = buf
+                            tool_order.append(idx)
+                        if getattr(tc, "id", None):
+                            buf["id"] = tc.id
+                        func = getattr(tc, "function", None)
+                        if func is not None:
+                            if getattr(func, "name", None):
+                                buf["name"] = func.name
+                            if getattr(func, "arguments", None):
+                                buf["arguments"] += func.arguments
+
+                elif getattr(delta, "content", None):
+                    if not text_block_open:
+                        current_block_index += 1
+                        text_block_open = True
                         yield StreamEvent(
-                            event_type="content_block_delta",
+                            event_type="content_block_start",
                             data={
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": delta.content},
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "text", "text": ""},
                             },
                         )
-                        output_tokens += 1
+                    yield StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "text_delta", "text": delta.content},
+                        },
+                    )
+                    output_tokens += 1
 
-            yield StreamEvent(
-                event_type="content_block_stop",
-                data={"type": "content_block_stop", "index": 0},
-            )
+            # Close the text block before any tool blocks (Anthropic orders
+            # content blocks sequentially, text then tool_use).
+            if text_block_open:
+                yield StreamEvent(
+                    event_type="content_block_stop",
+                    data={"type": "content_block_stop", "index": current_block_index},
+                )
+
+            # Flush each buffered tool call as a complete, self-contained block:
+            # start, one input_json_delta with the reassembled arguments, stop.
+            for idx in tool_order:
+                buf = tool_calls[idx]
+                current_block_index += 1
+                tool_id = buf["id"] or f"toolu_{uuid.uuid4().hex[:24]}"
+                yield StreamEvent(
+                    event_type="content_block_start",
+                    data={
+                        "type": "content_block_start",
+                        "index": current_block_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": buf["name"],
+                            "input": {},
+                        },
+                    },
+                )
+                if buf["arguments"]:
+                    yield StreamEvent(
+                        event_type="content_block_delta",
+                        data={
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": buf["arguments"],
+                            },
+                        },
+                    )
+                    output_tokens += 1
+                yield StreamEvent(
+                    event_type="content_block_stop",
+                    data={"type": "content_block_stop", "index": current_block_index},
+                )
 
             yield StreamEvent(
                 event_type="message_delta",
                 data={
                     "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                     "usage": {"output_tokens": output_tokens},
                 },
             )
@@ -346,12 +500,13 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -439,7 +594,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI error: {e}")
+            logger.error(f"any-llm OpenAI error: {format_exception_message(e)}")
             return self._error_response(e, openai_format=True)
 
     def _error_response(self, e: Exception, openai_format: bool = False) -> BackendResponse:
@@ -447,6 +602,9 @@ class AnyLLMBackend(Backend):
         error_type = "api_error"
         status_code = 500
 
+        # Provider API errors keep their text; transport failures are reduced
+        # to the public vocabulary (see proxy/public_errors).
+        error_message = client_message(e, format_exception_message(e))
         error_str = str(e).lower()
         if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
@@ -460,11 +618,11 @@ class AnyLLMBackend(Backend):
 
         body: dict[str, Any]
         if openai_format:
-            body = {"error": {"message": str(e), "type": error_type, "code": error_type}}
+            body = {"error": {"message": error_message, "type": error_type, "code": error_type}}
         else:
-            body = {"type": "error", "error": {"type": error_type, "message": str(e)}}
+            body = {"type": "error", "error": {"type": error_type, "message": error_message}}
 
-        return BackendResponse(body=body, status_code=status_code, error=str(e))
+        return BackendResponse(body=body, status_code=status_code, error=error_message)
 
     async def stream_openai_message(
         self,
@@ -510,10 +668,11 @@ class AnyLLMBackend(Backend):
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

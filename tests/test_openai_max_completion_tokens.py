@@ -14,9 +14,15 @@ from headroom.proxy.handlers.openai import _normalize_openai_max_tokens
 
 def test_renames_legacy_max_tokens():
     body = {"model": "gpt-5.3-chat-latest", "max_tokens": 256, "messages": []}
-    _normalize_openai_max_tokens(body)
+    _normalize_openai_max_tokens(body, backend_owns_translation=False)
     assert "max_tokens" not in body
     assert body["max_completion_tokens"] == 256
+
+
+def test_backend_owned_translation_preserves_max_tokens():
+    body = {"model": "claude-sonnet-4-6", "max_tokens": 32, "messages": []}
+    _normalize_openai_max_tokens(body, backend_owns_translation=True)
+    assert body == {"model": "claude-sonnet-4-6", "max_tokens": 32, "messages": []}
 
 
 def test_preserves_existing_max_completion_tokens_and_drops_legacy():

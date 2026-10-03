@@ -16,6 +16,8 @@ don't need a real provider:
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -89,6 +91,21 @@ def _make_mock_backend(response_body: dict, status_code: int = 200) -> MagicMock
         )
     )
     return backend
+
+
+def _make_litellm_response() -> SimpleNamespace:
+    return SimpleNamespace(
+        id="resp_2392",
+        created=123456,
+        choices=[
+            SimpleNamespace(
+                index=0,
+                finish_reason="stop",
+                message=SimpleNamespace(role="assistant", content="ok", tool_calls=None),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+    )
 
 
 def _install_tracker_stub(client: TestClient) -> _RecordingTracker:
@@ -194,6 +211,40 @@ def test_backend_response_falls_back_to_openai_cached_tokens_when_bedrock_keys_a
     assert call["cache_read_tokens"] == 200
     # No cache_creation_input_tokens → inferred = prompt_tokens - cache_read = 500 - 200 = 300
     assert call["cache_write_tokens"] == 300
+
+
+def test_litellm_vertex_backend_path_preserves_max_tokens_and_vendor_fields():
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        backend="litellm-vertex",
+    )
+
+    with (
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+        patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+    ):
+        mock_acomp.return_value = _make_litellm_response()
+        app = create_app(config)
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 32,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert response.status_code == 200, response.text
+    kwargs = mock_acomp.await_args.kwargs
+    assert kwargs["max_tokens"] == 32
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert "max_completion_tokens" not in kwargs["extra_body"]
 
 
 def test_backend_response_with_ccr_tool_call_is_intercepted_and_resolved():
@@ -309,10 +360,22 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
         "usage": {"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55},
     }
 
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level=logging.DEBUG)
+    proxy_logger = logging.getLogger("headroom.proxy")
+
     mock_backend = _make_mock_backend(tool_call_response)
     with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock_backend):
         app = create_app(config)
         with TestClient(app) as client:
+            # Attach after startup: proxy logging setup would otherwise
+            # detach a handler added earlier (caplog has the same problem).
+            proxy_logger.addHandler(handler)
             _install_tracker_stub(client)
             proxy = client.app.state.proxy
             failing_handler = MagicMock()
@@ -331,6 +394,7 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
                 },
                 headers={"Authorization": "Bearer test-key"},
             )
+            proxy_logger.removeHandler(handler)
 
     # The outer `try/except Exception` on the backend block converts the
     # re-raise into a 500 response. The critical assertion is that the
@@ -347,7 +411,14 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
         or body.get("choices", [{}])[0].get("message", {}).get("tool_calls") is None
     )
     assert "error" in body
-    assert "ccr-store-blew-up" in body["error"]["message"]
+    # The client gets the fixed vocabulary and a correlation id, not the
+    # exception text; the operator log keeps the detail under that id.
+    assert body["error"]["code"] == "internal_error"
+    request_id = body["error"]["request_id"]
+    assert request_id and f"request_id={request_id}" in body["error"]["message"]
+    assert "ccr-store-blew-up" not in resp.text
+    logged = [r.getMessage() for r in records]
+    assert any(f"[{request_id}]" in m and "ccr-store-blew-up" in m for m in logged), logged
 
 
 def test_backend_streaming_passes_prefix_tracker_through():

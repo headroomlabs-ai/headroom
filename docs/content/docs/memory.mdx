@@ -86,16 +86,20 @@ response = client2.chat.completions.create(
 
 ## Memory Categories
 
-Memories are categorized for better organization and retrieval:
+There is no dedicated `category` field on `Memory` or parameter on `add()`
+(`headroom/memory/models.py`, `headroom/memory/core.py`) -- store a
+free-form category string in the `metadata` dict instead, e.g.
+`metadata={"category": "fact"}`. These are the conventional category values
+used in Headroom's own examples for organization and retrieval:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
-| `PREFERENCE` | Likes, dislikes, preferred approaches | "Prefers Python", "Likes dark mode" |
-| `FACT` | Identity, role, constraints | "Works at fintech startup", "Senior engineer" |
-| `CONTEXT` | Current goals, ongoing tasks | "Migrating to microservices", "Working on auth" |
-| `ENTITY` | Information about entities | "Project Apollo uses React", "Team lead is Sarah" |
-| `DECISION` | Decisions made | "Chose PostgreSQL over MySQL" |
-| `INSIGHT` | Derived insights | "User tends to prefer typed languages" |
+| `"preference"` | Likes, dislikes, preferred approaches | "Prefers Python", "Likes dark mode" |
+| `"fact"` | Identity, role, constraints | "Works at fintech startup", "Senior engineer" |
+| `"context"` | Current goals, ongoing tasks | "Migrating to microservices", "Working on auth" |
+| `"entity"` | Information about entities | "Project Apollo uses React", "Team lead is Sarah" |
+| `"decision"` | Decisions made | "Chose PostgreSQL over MySQL" |
+| `"insight"` | Derived insights | "User tends to prefer typed languages" |
 
 ## Memory API
 
@@ -122,9 +126,10 @@ all_memories = client.memory.get_all()
 client.memory.clear()
 
 # Get stats
+# `stats()` currently returns only {"total": N} -- there is no
+# per-category breakdown (`headroom/memory/wrapper.py:342-348`).
 stats = client.memory.stats()
 print(f"Total memories: {stats['total']}")
-print(f"By category: {stats['categories']}")
 ```
 
 ## Temporal Versioning
@@ -132,15 +137,17 @@ print(f"By category: {stats['categories']}")
 When facts change, Headroom creates a **supersession chain** that preserves history:
 
 ```python
-from headroom.memory import HierarchicalMemory, MemoryCategory
+from headroom.memory import HierarchicalMemory, MemoryFilter
 
 memory = await HierarchicalMemory.create()
 
 # Original fact
+# `category` is a convention, not a keyword argument -- `add()` has no
+# `category` param (`headroom/memory/core.py`); store it in `metadata`.
 orig = await memory.add(
     content="User works at Google",
     user_id="alice",
-    category=MemoryCategory.FACT,
+    metadata={"category": "fact"},
 )
 
 # User changes jobs -- supersede the old memory

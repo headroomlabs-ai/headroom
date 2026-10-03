@@ -105,13 +105,23 @@ class CompressOutput:
     """Pure-data output from :meth:`Compressor.compress`.
 
     Attributes:
-        content: The compressed content.
+        content: The compressed content (or the original content unchanged when
+            ``compressed`` is ``False``).
         tokens_before: Token count of the input content.
         tokens_after: Token count of the compressed content.
         lossless: Whether this particular result is losslessly reversible.
         markers: Marker strings describing what was applied (e.g. for routing).
         recoverable: ``hash -> original`` map for recovering dropped content.
         warnings: Non-fatal warning strings emitted during compression.
+        compressed: Whether the compressor actually compressed/extracted the
+            content. ``True`` (the default) means compression/extraction was
+            applied and :attr:`content` is the transformed result; ``False``
+            means the compressor did not compress — a passthrough — and
+            :attr:`content` is the original input unchanged. Defaults to ``True``
+            so existing and external compressors that do not set it are
+            unaffected (treated as having compressed). Callers can read this to
+            distinguish a real (possibly no-shrink) result from a passthrough and
+            run their own fallback on a passthrough.
     """
 
     content: str
@@ -121,6 +131,7 @@ class CompressOutput:
     markers: list[str] = field(default_factory=list)
     recoverable: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    compressed: bool = True
 
 
 @runtime_checkable
@@ -133,7 +144,13 @@ class Compressor(Protocol):
         ...
 
     def compress(self, inp: CompressInput) -> CompressOutput:
-        """Compress ``inp`` and return a :class:`CompressOutput`."""
+        """Compress ``inp`` and return a :class:`CompressOutput`.
+
+        A compressor that does not compress the input (a passthrough) should
+        return ``CompressOutput(content=inp.content, compressed=False, ...)``;
+        the ``compressed`` flag defaults to ``True`` so a compressor that always
+        transforms need not set it.
+        """
         ...
 
 

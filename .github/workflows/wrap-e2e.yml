@@ -9,7 +9,6 @@ on:
     paths:
       - 'headroom/cli/**'
       - 'headroom/providers/**'
-      - 'headroom/rtk/**'
       - 'crates/**'
       - 'docker/**'
       - 'Dockerfile'

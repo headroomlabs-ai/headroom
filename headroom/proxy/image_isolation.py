@@ -16,27 +16,42 @@ logger = logging.getLogger("headroom.proxy")
 _IMAGE_POOL_LOCK = threading.Lock()
 _IMAGE_POOL: ProcessPoolExecutor | None = None
 
+# Per-worker-process cached compressor. The image pool is a persistent
+# single-worker ProcessPoolExecutor, so building a fresh ImageCompressor (and,
+# inside it, a fresh ONNX router loading native ort.InferenceSession models) on
+# every call accumulated native memory in the worker and grew RSS to 1+ GB over
+# a day (#2513). Load the models once per worker and reuse them.
+_WORKER_COMPRESSOR: Any = None
+
+
+def _get_worker_compressor() -> Any:
+    global _WORKER_COMPRESSOR
+    if _WORKER_COMPRESSOR is None:
+        from headroom.image import ImageCompressor
+
+        instance = ImageCompressor()
+        # Shared across calls in this worker: don't let a per-call close() unload
+        # the models the next call reuses.
+        instance._is_singleton = True
+        _WORKER_COMPRESSOR = instance
+    return _WORKER_COMPRESSOR
+
 
 def _compress_messages_worker(
     messages: list[dict[str, Any]],
     provider: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    from headroom.image import ImageCompressor
-
-    compressor = ImageCompressor()
-    try:
-        compressed = compressor.compress(messages, provider=provider)
-        if compressor.last_result is None:
-            return compressed, None
-        return compressed, {
-            "technique": compressor.last_result.technique.value,
-            "original_tokens": compressor.last_result.original_tokens,
-            "compressed_tokens": compressor.last_result.compressed_tokens,
-            "confidence": compressor.last_result.confidence,
-            "savings_percent": compressor.last_result.savings_percent,
-        }
-    finally:
-        compressor.close()
+    compressor = _get_worker_compressor()
+    compressed = compressor.compress(messages, provider=provider)
+    if compressor.last_result is None:
+        return compressed, None
+    return compressed, {
+        "technique": compressor.last_result.technique.value,
+        "original_tokens": compressor.last_result.original_tokens,
+        "compressed_tokens": compressor.last_result.compressed_tokens,
+        "confidence": compressor.last_result.confidence,
+        "savings_percent": compressor.last_result.savings_percent,
+    }
 
 
 def _success_worker(
@@ -69,6 +84,14 @@ def _sleep_worker(
     return messages, None
 
 
+def _hang_worker(
+    messages: list[dict[str, Any]],
+    provider: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    time.sleep(60)
+    return messages, None
+
+
 def _abort_worker(
     messages: list[dict[str, Any]],
     provider: str,
@@ -93,13 +116,28 @@ def _image_pool() -> ProcessPoolExecutor:
         return _IMAGE_POOL
 
 
-def _reset_image_pool() -> None:
+def _reset_image_pool(pool: ProcessPoolExecutor | None = None) -> None:
+    """Drop ``pool`` (default: the current one) and kill its worker.
+
+    ``shutdown(wait=False)`` alone never stops a worker that is still running
+    an abandoned call: after a timeout it ran the image to the end, its result
+    discarded, while the next request cold-loaded the models in a fresh worker
+    beside it. Only the current pool is unpublished, so a call that fails
+    after another request already rebuilt the pool leaves the rebuilt one alone.
+    """
     global _IMAGE_POOL
     with _IMAGE_POOL_LOCK:
-        pool = _IMAGE_POOL
-        _IMAGE_POOL = None
-    if pool is not None:
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool is None:
+            pool = _IMAGE_POOL
+        if _IMAGE_POOL is pool:
+            _IMAGE_POOL = None
+    if pool is None:
+        return
+    # shutdown() sets _processes to None, so take the workers first.
+    workers = list((pool._processes or {}).values())
+    pool.shutdown(wait=False, cancel_futures=True)
+    for worker in workers:
+        worker.kill()
 
 
 async def run_image_compression_isolated(
@@ -109,21 +147,23 @@ async def run_image_compression_isolated(
     timeout: float,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     loop = asyncio.get_running_loop()
+    pool: ProcessPoolExecutor | None = None
     try:
-        future = loop.run_in_executor(_image_pool(), _IMAGE_WORKER, messages, provider)
+        pool = _image_pool()
+        future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider)
         return await asyncio.wait_for(future, timeout=timeout)
     except BrokenProcessPool:
         logger.warning("Image compression worker crashed; forwarding original image payload")
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None
     except TimeoutError:
         logger.warning("Image compression worker timed out; forwarding original image payload")
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None
     except Exception as exc:
         logger.warning(
             "Image compression worker failed (%s); forwarding original image payload",
             type(exc).__name__,
         )
-        _reset_image_pool()
+        _reset_image_pool(pool)
         return messages, None

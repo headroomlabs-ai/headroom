@@ -2,43 +2,6 @@ import Link from 'next/link';
 import { Button } from './button';
 import { CodeBlock } from './code-block';
 
-// --- Live Stats Grid ---
-
-const liveStats = [
-  { value: '$176.6K', label: 'Cost Saved' },
-  { value: '1.19M', label: 'Requests Optimized' },
-  { value: '889', label: 'Active Instances' },
-  { value: '14', label: 'Active Days' },
-];
-
-export function LiveStats() {
-  return (
-    <div className="not-prose">
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 my-8">
-        {liveStats.map((s) => (
-          <div
-            key={s.label}
-            className="flex flex-col items-center p-5 rounded-xl border border-fd-border bg-fd-card"
-          >
-            <span className="text-2xl font-bold text-fd-foreground">
-              {s.value}
-            </span>
-            <span className="mt-1 text-sm text-fd-muted-foreground">
-              {s.label}
-            </span>
-          </div>
-        ))}
-      </div>
-      <Link
-        href="/docs/community-savings"
-        className="text-sm font-medium hover:underline"
-      >
-        View detailed charts and breakdowns &rarr;
-      </Link>
-    </div>
-  );
-}
-
 // --- Key Features Grid ---
 
 const features: {

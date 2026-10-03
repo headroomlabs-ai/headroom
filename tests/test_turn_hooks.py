@@ -59,6 +59,36 @@ async def test_response_runner_returns_input_unchanged_when_empty():
 # --- on_request mutation -----------------------------------------------------
 
 
+def test_stream_safe_filter_runs_only_optted_in_hooks_on_stream():
+    """On a streamed turn only ``stream_safe`` hooks' on_request runs (fold-only,
+    no re-drive); buffered runs all. A hook that may re-drive stays buffered-only."""
+    ran: list[str] = []
+
+    class Fold:
+        name = "fold"
+        stream_safe = True  # opts in — safe on streaming
+
+        def on_request(self, ctx: TurnContext) -> None:
+            ran.append("fold")
+
+    class Redrive:  # no stream_safe attr → buffered-only (default)
+        name = "redrive"
+
+        def on_request(self, ctx: TurnContext) -> None:
+            ran.append("redrive")
+
+    register_turn_hook(Fold())
+    register_turn_hook(Redrive())
+
+    ran.clear()
+    run_request_hooks(_ctx(), stream_safe_only=True)  # streaming turn
+    assert ran == ["fold"]
+
+    ran.clear()
+    run_request_hooks(_ctx())  # buffered turn (default)
+    assert ran == ["fold", "redrive"]
+
+
 def test_on_request_may_mutate_ctx():
     class Shrink:
         name = "shrink"
@@ -70,6 +100,41 @@ def test_on_request_may_mutate_ctx():
     ctx = _ctx(tools=[{"name": "keep"}, {"name": "drop_me"}])
     run_request_hooks(ctx)
     assert ctx.tools == [{"name": "keep"}]
+
+
+def test_request_runner_attributes_savings_with_handler_counters():
+    class Shrink:
+        name = "internal-hook-name"
+        savings_source = "tool_search"
+
+        def on_request(self, ctx: TurnContext) -> None:
+            ctx.tools = (ctx.tools or [])[:1]
+            ctx.messages[0]["content"] = "short"
+
+    register_turn_hook(Shrink())
+    tags = {}
+    ctx = _ctx(
+        messages=[{"role": "user", "content": "a much longer value"}],
+        tools=[{"name": "keep"}, {"name": "drop"}],
+        tags=tags,
+        count_messages=lambda messages: len(messages[0]["content"]),
+        count_tools=lambda tools: len(tools or []),
+    )
+
+    run_request_hooks(ctx)
+
+    from headroom.proxy.savings_attribution import from_tags
+
+    assert from_tags(tags) == [
+        {
+            "source": "tool_search",
+            "realized": True,
+            "estimated": False,
+            "tokens": 15,
+            "usd": 0.0,
+            "details": {"message_tokens_saved": 14, "tool_tokens_saved": 1},
+        }
+    ]
 
 
 # --- on_response replacement + re-drive loop ---------------------------------
