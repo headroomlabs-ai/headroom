@@ -463,6 +463,7 @@ async def _fetch_and_store_usage(url: str, headers: dict[str, str]) -> None:
 def maybe_schedule_usage_poll(
     request_headers: dict[str, str],
     *,
+    from_local_operator: bool = False,
     url: str = CODEX_USAGE_URL,
     min_interval_s: float = USAGE_POLL_MIN_INTERVAL_S,
 ) -> bool:
@@ -471,7 +472,14 @@ def maybe_schedule_usage_poll(
     Safe to call on every Codex request: scoped to ChatGPT-session traffic via
     :func:`_build_usage_headers` and internally throttled to at most one live
     poll per ``min_interval_s``. Returns ``True`` when a poll was scheduled.
+
+    The poll spends the *caller's* bearer, so it runs only when
+    ``from_local_operator`` is true (the handler passes
+    :func:`headroom.subscription.credential_policy.is_local_operator_connection`).
+    A network caller on a shared proxy never drives it (VAPT 01-F16).
     """
+    if not from_local_operator:
+        return False
     headers = _build_usage_headers(request_headers)
     if headers is None:
         return False

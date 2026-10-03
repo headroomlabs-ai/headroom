@@ -10,7 +10,7 @@
 #   3. point your LLM client at http://localhost:8787  (proxy)
 #
 # Just want the proxy without the memory features? You can run the proxy image
-# on its own (`docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom`); the two
+# on its own (`docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom --host 0.0.0.0 --port 8787`); the two
 # database services below are only required for the memory/relevance features.
 #
 # Ports published on the host — all bound to 127.0.0.1 (this machine only):

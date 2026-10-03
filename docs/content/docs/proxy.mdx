@@ -13,8 +13,10 @@ Running a local OpenAI-compatible model? See [Local LLM prefill benchmarking](/d
 # Basic usage
 headroom proxy
 
-# Custom host and port
-headroom proxy --host 0.0.0.0 --port 8080
+# Deliberate public access, with the existing token protocol
+HEADROOM_PROXY_TOKEN='replace-with-a-secret' headroom proxy --host 0.0.0.0 --port 8080
+# Send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller.
 
 # With logging and budget
 headroom proxy \
@@ -89,6 +91,8 @@ Avoid setting process-wide variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_P
 
 `headroom wrap` registers **[Serena](https://github.com/oraios/serena)** as the code-memory MCP for semantic, symbol-level code navigation. Serena runs on demand via `uvx` — Headroom downloads and executes no binary of its own — and indexes the current project locally. Pass `--code-memory none` to register no code-memory MCP.
 
+For Claude Code, the entry is written at `local` scope, which means it applies to the directory you wrapped and nothing else. That keeps a Serena that cannot start from breaking Claude Code sessions in unrelated projects. Pass `--code-memory-scope user` (or set `HEADROOM_CODE_MEMORY_SCOPE=user`) to register it machine-wide instead, which is how releases before this change behaved. If an earlier version already registered Serena machine-wide, the next `headroom wrap claude` moves it into the project scope for you — but only when Headroom installed that entry itself; a Serena you registered by hand is left alone.
+
 > **Upgrading from tokensave?** Earlier releases registered a `tokensave` MCP server (a downloaded Rust binary). tokensave has been retired in favour of Serena. On your next `headroom wrap` / `headroom unwrap`, Headroom removes the `tokensave` MCP entry it installed and switches you to Serena — nothing to migrate, since both are just indexes rebuilt from your source. The leftover `tokensave` binary in `~/.local/bin` and any `.tokensave/` folders are unused and safe to delete.
 
 By default, the proxy uses the shared **ContentRouter** pipeline. It routes text, logs, JSON, code, images, and tool outputs through the currently enabled compressors and preserves reversible CCR markers where applicable.
@@ -114,7 +118,7 @@ headroom proxy --mode cache
 
 An unrecognized `HEADROOM_SAVINGS_PROFILE` value logs a warning and falls back to `coding` (the same default an unset variable resolves to) — the proxy never fails to start over a bad profile name. `balanced` is used only as a last-resort fallback when the runtime has no `coding` entry at all (old-runtime/new-client version skew). See `headroom/agent_savings.py` for each profile's full set of knobs.
 
-Because the default `coding` profile uses **cache** mode (and the proxy's own default mode is also `cache`), Headroom runs in cache mode out of the box. Mode precedence: an explicit `--mode` wins, otherwise `HEADROOM_MODE` (which a profile seeds), otherwise the `cache` default. To run token mode, pass `--mode token` or choose a token-mode profile:
+Because the default `coding` profile uses **cache** mode (and the proxy's own default mode is also `cache`), Headroom runs in cache mode out of the box. For a direct `headroom proxy` invocation, mode precedence is `--mode` > `HEADROOM_MODE` > the `cache` default. The selected `HEADROOM_SAVINGS_PROFILE` does not provide a third-level mode fallback after startup; wrapped launches may seed `HEADROOM_MODE` before starting the proxy. To run token mode, pass `--mode token` or set `HEADROOM_MODE=token`:
 
 ```bash
 # Aggressive ~90% token-savings profile
@@ -125,7 +129,7 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --port 8787
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools |
+| `--memory` | `false` | Enable persistent user memory and provider-appropriate memory tools. In `--mode cache`, automatic context injection is skipped only for Anthropic `/v1/messages` to preserve prefix stability; OpenAI chat/responses and Gemini append memory to the live-zone tail. Use `--mode token` for automatic memory context on the Anthropic path. |
 | `--memory-db-path` | `{cwd}/.headroom/memory.db` | Override the memory SQLite path |
 | `--no-memory-tools` | `false` | Disable automatic memory tool injection |
 | `--no-memory-context` | `false` | Disable automatic memory context injection |
@@ -173,17 +177,20 @@ HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy
 
 **`general`** — Token-mode compression for non-coding conversations. No turn protection (`protect_recent=0` — nothing code-positional to preserve) and does not compress user or system messages. Uses the standard lossless pipeline.
 
-### Profiles override CLI flags
+### Profile defaults and overrides
 
-A profile's `proxy_mode` setting overrides the `--mode` flag. The `coding` profile sets `proxy_mode="cache"`, so `--mode token` has **no effect** when coding is active:
+Profiles seed compression settings. For a direct `headroom proxy` invocation, explicit mode settings take precedence in this order: `--mode` (CLI) > `HEADROOM_MODE` (environment) > the `cache` default. The selected profile does not replace that final fallback, but wrapped launches may pre-seed `HEADROOM_MODE`. The `coding` profile defaults to `cache`, and an explicit `--mode token` still takes effect:
 
 ```bash
-# These are equivalent — coding's cache mode always wins
+# Coding's default mode is cache
 headroom proxy
-headroom proxy --mode token          # --mode token is silently overridden
+# An explicit CLI mode overrides the profile default
+headroom proxy --mode token
+# An explicit environment mode also overrides the profile default
+HEADROOM_MODE=token HEADROOM_SAVINGS_PROFILE=coding headroom proxy
 ```
 
-To run in token mode, switch to a profile that uses it:
+You can also choose a profile whose default is token mode:
 
 ```bash
 HEADROOM_SAVINGS_PROFILE=agent-90 headroom proxy --mode token
@@ -272,7 +279,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 | `--connect-timeout-seconds` | `10` | Upstream connect timeout (seconds). |
 | `--retry-max-attempts` | `3` | Upstream retries on transient failure. |
 | `--limit-concurrency` | `1000` | Concurrent connections before returning 503. |
-| `--rpm` / `--tpm` | `60` / `100000` | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
+| `--rpm` / `--tpm` | `60` / unlimited | Requests- and tokens-per-minute rate limits (disable with `--no-rate-limit`). |
 | `--budget` / `--budget-period` | none / `daily` | Spend cap in USD per period; over-budget requests get 429. |
 | `--workers` / `HEADROOM_WORKERS` | `1` | Uvicorn worker processes. |
 
@@ -296,22 +303,51 @@ Rewrite the upstream model per request — for example, send small, tool-free ca
 | `--telemetry` / `HEADROOM_TELEMETRY` | off | **Local-only** usage stats for your own `/stats`, `/metrics`, and dashboard. Nothing leaves the machine. |
 | `--log-file` / `HEADROOM_LOG_FILE` | none | JSONL request/response log. |
 | `--log-messages` | `false` | Include full message bodies in the log (may contain sensitive data). |
+| `HEADROOM_LOG_PAYLOAD_PREVIEW` | `off` | Include up to 4 KB of the retrieved [CCR](/docs/ccr) payload in each `headroom_retrieve` line of the runtime log (`~/.headroom/logs/proxy-<port>.log`). Off by default: the payload is verbatim tool-result content and can carry source code, credentials the redactor does not recognize, or customer data; the log otherwise records byte counts only. Turn it on with `1`/`true`/`yes`/`on`. Do not share a log captured with this on. |
 | `HEADROOM_LOG_LEVEL` | `warning` | uvicorn's log level (`critical`, `error`, `warning`, `info`, `debug`, `trace`). Raise to `info` for the per-request access log when diagnosing a deployed proxy. An unrecognized value warns and falls back to `warning`. |
 | `HEADROOM_OTEL_METRICS_ENABLED` | `false` | Export OpenTelemetry metrics (`HEADROOM_OTEL_METRICS_ENDPOINT`, …). See [OTLP export](/docs/metrics#opentelemetry-otlp-export). |
 | `HEADROOM_LANGFUSE_ENABLED` | `false` | Emit Langfuse traces (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`). |
 
 See [Metrics](/docs/metrics) for the Prometheus and Grafana setup.
 
+#### Who can read the logs
+
+Headroom writes the runtime log (`~/.headroom/logs/proxy-<port>.log`) and, when
+`--log-file` is set, the JSONL request log. Both can hold request and response
+content — `--log-messages` bodies, wire-debug dumps, and CCR payload previews
+when they are enabled.
+
+- **Linux and macOS:** every log file Headroom creates is `0600`, owner-read/write
+  only, and so is every rotated backup (`proxy-8000.log.1`, …). This is not
+  conditional on which content switch is on. If the log path already exists as a
+  symlink, Headroom refuses to log rather than write through it, and says so.
+- **Windows:** **Headroom does not restrict the log file.** Read access on NTFS is
+  decided by the file's ACL; `chmod` there only toggles the read-only attribute,
+  and Python has no API for setting an ACL, so Headroom does not claim a
+  protection it cannot establish. The log inherits the ACL of the directory it
+  is written into, and the proxy logs a warning at startup saying so. Keep
+  `%USERPROFILE%\.headroom` (or your chosen `--log-file` path) off shared
+  volumes and out of directories with broadened permissions.
+
+A log shipper or sidecar running as a different user or group cannot read the
+runtime log on Linux/macOS. Run the collector as the same user, or copy the file
+with a privileged job.
+
+
 ### Security and networking
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
-| `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress). Required to run Headroom as a gateway/sidecar; without it remote callers get `404`. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. |
+| `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
+| `HEADROOM_LICENSE` | unset | Licence token, read by core and every licensed extension. `HEADROOM_LICENSE_KEY` is a deprecated alias for one release and logs a warning. A licence on its own sends nothing to Headroom. |
+| `HEADROOM_USAGE_REPORTING` | `false` | Set `1` to let the proxy validate the licence and post aggregate usage counts (no content) to the Headroom cloud. Off unless set; `HEADROOM_OFFLINE` still overrides it. |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
+| `HEADROOM_CERT_STORE` | `system,bundled` | Trusted roots for upstream TLS: OS certificate store and/or certifi. See [Corporate Networks](/docs/corporate-networks). |
+| `HEADROOM_CA_BUNDLE` | unset | Extra PEM roots (e.g. a Zscaler root) added to the trusted set. |
 
 ### Performance
 
@@ -435,7 +471,7 @@ If `HEADROOM_KOMPRESS_ENDPOINT` is set, Kompress inference is offloaded over HTT
 <Callout type="warning" title="Loopback-only by default">
 This route is restricted to loopback callers and answers everyone else with **`404`**, not `403` — deliberately, so it stays invisible to external scanners. A gateway calling it from another host or pod therefore sees what looks like a missing route.
 
-Both the client IP and the inbound `Host:` header must name loopback. To allow remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set.
+Both the client IP and the inbound `Host:` header must name loopback. In container environments (Docker/Podman), requests forwarded from the container host gateway are also admitted under loopback `Host:` headers. To allow arbitrary remote callers, set `HEADROOM_COMPRESS_ALLOW_REMOTE=1`. `HEADROOM_PROXY_TOKEN` still applies if set. The same policy applies to [`POST /v1/usage`](#relaying-provider-usage-post-v1usage).
 </Callout>
 
 #### Message format
@@ -685,7 +721,7 @@ The response half. Same exposure rules as `/v1/compress`: loopback-only unless `
 | `latency_ms` | number | no | Gateway-measured provider latency, added to the turn's recorded latency. Must be non-negative. |
 | `round` | integer | no | Which provider call this response answers: `0` for the original forward, `n` for the `n`-th re-drive (the `round` this endpoint returned). Makes the call idempotent: a retried relay for a round already answered gets the same `redrive` answer again instead of being fed to the hook, and its usage is not billed twice. A round ahead of the turn is a `400`. |
 | `usage` | object | no | The provider's usage block, in any accepted shape (below). |
-| `response` | object | no | The full provider response JSON. **Required** when the turn carries `redrive`. |
+| `response` | object | no | The full provider response JSON. **Required** when the turn carries `redrive` and the provider call succeeded (`2xx`). A failed call closes the turn with its `status` alone. |
 | `model` | string | no | Provider-reported model. Accepted, not read today. |
 
 Accepted `usage` shapes — the whole provider response body works too, since a nested `usage` key is descended into once:
@@ -706,11 +742,12 @@ There are two answers. `done` ends the turn:
   "response": null,
   "frozen_message_count": 12,
   "usage_applied": true,
-  "rounds": 0
+  "rounds": 0,
+  "billed_usage": { "input_tokens": 3120, "output_tokens": 212, "cache_read_input_tokens": 20414 }
 }
 ```
 
-`response` is a replacement to send to the client when a hook produced one; otherwise it is `null` and you forward the provider response you already hold. `frozen_message_count` is the session's count after the usage was applied (`null` for a stateless turn). `usage_applied` is `false` when the usage carried no cache signal, the session had expired, or its lock was busy — never an error, since the turn is finishing and there is nothing to retry with. After `done` the turn is gone.
+`response` is what to send to the client. On a turn with no re-drive it is the hook's replacement when there is one, otherwise `null` and you forward the provider response you already hold. After one or more re-drives it is never `null`: it is the hook's replacement or the latest provider response, with `usage` set to the whole turn's bill. `frozen_message_count` is the session's count after the usage was applied (`null` for a stateless turn). `usage_applied` is `false` when the usage carried no cache signal, the session had expired, or its lock was busy — never an error, since the turn is finishing and there is nothing to retry with. `billed_usage` is what the provider billed for the whole turn: every counter, cache reads and writes included, summed across all rounds, in Anthropic keys (`null` when no usage was relayed). That total is the re-driven `response`'s `usage`, since the client made one call. After `done` the turn is gone.
 
 `redrive` asks for another provider call:
 
@@ -723,7 +760,7 @@ There are two answers. `done` ends the turn:
 }
 ```
 
-Send `request` to the provider exactly as given — it is the provider body with the hook's messages and possibly reloaded tools — and post the provider's JSON back under the same `turn_id`. Past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and `response: null`. Hook failures never fail the turn either: the answer is `done` with `response: null` and the gateway forwards what it holds.
+Send `request` to the provider exactly as given — it is the provider body with the hook's messages and possibly reloaded tools — and post the provider's JSON back under the same `turn_id`. Past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and the latest provider response. Hook failures never fail the turn either: the answer is `done`, with the latest provider response after a re-drive, or `response: null` before one, and the gateway forwards what it gets.
 
 | Status | Body | When |
 | --- | --- | --- |
@@ -767,6 +804,22 @@ headroom wrap cursor
 # Grok Build (updates ~/.grok/config.toml and starts the proxy)
 headroom wrap grok-build
 ```
+
+`headroom wrap codex` keeps routing scoped to the Codex process it launches: it
+passes the proxy URL as a `--config` override and never writes it to
+`~/.codex/config.toml`. Codex runs any session started with command-line
+overrides in embedded mode, so a wrapped session does not use Codex's shared
+background server and Codex prints "Running without the shared background
+server". If you want the shared server, write the proxy routing to Codex's own
+config instead, then start `codex` directly:
+
+```bash
+headroom init codex     # this project's .codex/config.toml (trusted projects)
+headroom init -g codex  # ~/.codex/config.toml, for every project
+```
+
+That routing is persistent: it applies to every Codex session in that scope
+until you remove it.
 
 Cursor reads model endpoints from its settings UI, so `headroom wrap cursor`
 does not rewrite Cursor configuration or launch the app. After it starts the
@@ -901,7 +954,9 @@ Rewriting the request body invalidates the caller's **SigV4** signature (it cove
 ## Environment variables
 
 ```bash
+# For deliberate public access, configure the existing token and send it from callers.
 export HEADROOM_HOST=0.0.0.0
+export HEADROOM_PROXY_TOKEN='replace-with-a-secret'
 export HEADROOM_PORT=8787
 export HEADROOM_BUDGET=100.0
 
@@ -928,6 +983,8 @@ gunicorn "headroom.proxy.server:create_app()" \
   --workers 4 \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker
+# Callers must send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret`.
 ```
 
 `headroom.proxy.server` has no module-level `app` object — it exposes a `create_app(config: ProxyConfig | None = None) -> FastAPI` factory, so gunicorn's import string must call it.
@@ -941,8 +998,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y build-essential && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 EXPOSE 8787
-CMD ["headroom", "proxy", "--host", "0.0.0.0"]
+CMD ["headroom", "proxy", "--host", "0.0.0.0", "--port", "8787"]
 ```
+
+Run this image with an explicit token and a deliberate publication choice:
+
+```bash
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e HEADROOM_PROXY_TOKEN='replace-with-a-secret' \
+  headroom-proxy
+```
+
+Callers must send `Authorization: Bearer replace-with-a-secret` or
+`X-Headroom-Proxy-Token: replace-with-a-secret`. For network access, replace
+the host-side `127.0.0.1` with an intentional public address and keep the
+token configured.
 
 <Callout type="info" title="Build dependencies">
 `build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension compiled from source. It is removed after installation to keep the image slim.
