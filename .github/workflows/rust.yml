@@ -74,13 +74,14 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install stable toolchain
         # Pin action code to @stable (latest fixes), toolchain version
-        # via input. The @1.95.0 ref shipped action code that errors on
+        # via input. The explicit version keeps CI aligned with the
+        # repository's rust-toolchain.toml.
         # ubuntu-latest with `detected conflict: 'bin/cargo-clippy'`
         # because the pre-installed runner Rust collides with the
         # clippy-preview component install.
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.98.1
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -160,7 +161,7 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.98.1
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
       - name: cargo test simulator-backed proxy e2e
@@ -192,6 +193,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
         uses: PyO3/maturin-action@v1
         # Maturin reads `[tool.maturin]` from the root `pyproject.toml`
@@ -218,7 +222,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit + cargo-deny
         uses: taiki-e/install-action@v2
@@ -254,7 +258,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.98.1
       - uses: Swatinem/rust-cache@v2
       # No Python toolchain: headroom-parity links headroom-core directly and
       # never crosses into the interpreter, so the venv + maturin + `pip

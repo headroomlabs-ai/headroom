@@ -160,13 +160,12 @@ impl CcrStore for InMemoryCcrStore {
         // load this manifested as "I just stored it; why is it gone?"
         // `remove_if` closes the window because the shard write lock
         // is held across both the predicate evaluation and the removal.
-        if let Some(mut entry) = self.map.get_mut(hash) {
+        {
+            let mut entry = self.map.get_mut(hash)?;
             if !entry.is_expired(self.ttl, self.max_lifetime) {
                 entry.last_accessed = Instant::now();
                 return Some(entry.payload.clone());
             }
-        } else {
-            return None;
         }
         // Out-of-band path: the entry exists and looks expired. Re-check
         // under the shard write lock; if it's still expired, evict.

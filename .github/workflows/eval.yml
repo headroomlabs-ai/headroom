@@ -34,7 +34,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.98.1 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -104,7 +104,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.95.0 # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.98.1 # Keep in sync with rust-toolchain.toml.
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
