@@ -57,7 +57,13 @@ import logging
 
 import httpx
 
-from .kompress_compressor import KompressConfig, KompressResult, store_kompress_in_ccr
+from .kompress_compressor import (
+    KompressConfig,
+    KompressResult,
+    ccr_retrieval_marker,
+    payload_tokens,
+    store_kompress_in_ccr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +100,6 @@ _MIN_WORDS = 10
 
 # Accept-any-shrink CCR gate, identical to KompressCompressor.compress: only
 # store + mark when the shrink is worth the retrieval marker's own cost.
-_CCR_RATIO_GATE = 0.8
 
 
 class RemoteKompressCompressor:
@@ -179,9 +184,32 @@ class RemoteKompressCompressor:
         target_ratio: float | None = None,
         *,
         allow_download: bool = True,
+        ccr_original: str | None = None,
     ) -> KompressResult:
+        """Compress via the remote endpoint.
+
+        ``ccr_original`` mirrors :meth:`KompressCompressor.compress`: text to
+        store in CCR instead of ``content``, used when ``content`` is a
+        tag-protected placeholder intermediate ({{HEADROOM_TAG_N}}). It is
+        accepted here because this class promises to be a DROP-IN for the local
+        compressor at the ContentRouter seam (see the module docstring) — and it
+        was not. ContentRouter passes the kwarg whenever custom tags are
+        protected, so on any deployment with HEADROOM_KOMPRESS_ENDPOINT set,
+        every such request raised
+
+            TypeError: RemoteKompressCompressor.compress() got an unexpected
+            keyword argument 'ccr_original'
+
+        which ContentRouter caught with a broad ``except Exception`` and logged
+        as ``Kompress failed: ...``. Compression silently degraded to zero on the
+        whole deployment while the proxy kept reporting success.
+        """
         n_words = len(content.split())
-        if n_words < _MIN_WORDS:
+        # Same floor contract as the in-process compressor: lossy
+        # word-dropping below config.min_input_words is a net loss (the
+        # retrieval marker alone is ~20 words) and garbles short
+        # instruction-like blocks. _MIN_WORDS stays the hard clamp.
+        if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
 
         try:
@@ -215,18 +243,40 @@ class RemoteKompressCompressor:
         # CCR stays PROXY-LOCAL: endpoint is stateless (enable_ccr=False), so we
         # store the mapping + append the retrieval marker here — same policy and
         # marker format as KompressCompressor.compress.
-        if self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE:
-            cache_key = store_kompress_in_ccr(content, compressed, result.original_tokens)
+        if self.config.enable_ccr and compressed != content:
+            # Same gate as KompressCompressor: the marked payload must save
+            # tokens, and a result that cannot pay for the marker passes through.
+            # Store the PRE-protection text when the caller supplied it. ``content``
+            # may be the tag-protected placeholder intermediate, and storing that
+            # makes a later full retrieval hand back {{HEADROOM_TAG_N}} instead of
+            # the real block — the exact loss ``ccr_original`` exists to prevent.
+            # Same resolution order as KompressCompressor.compress.
+            ccr_source = ccr_original if ccr_original is not None else content
+            # The endpoint's ``original_tokens`` describes ``content``, so it does
+            # not describe a different ``ccr_source``; count that one locally.
+            # Unchanged on the common path where no override was passed.
+            ccr_source_tokens = (
+                len(ccr_source.split()) if ccr_original is not None else result.original_tokens
+            )
+            cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens)
             if cache_key:
-                result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                source_lines = content.count("\n") + 1
-                line_word = "line" if source_lines == 1 else "lines"
-                result.compressed += (
-                    f"\n[{result.original_tokens} items compressed to "
-                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
-                    f" Retrieve more: hash={cache_key}]"
+                marked = compressed + ccr_retrieval_marker(
+                    result.original_tokens, result.compressed_tokens, ccr_source, cache_key
+                )
+                # Whole original against whole marked candidate, one unit,
+                # and the accounting reports that measurement.
+                original_tokens = payload_tokens(content)
+                compressed_tokens = payload_tokens(marked)
+                if compressed_tokens >= original_tokens:
+                    return self._passthrough(content, n_words)
+                result.cache_key = cache_key
+                result.compressed = marked
+                result.original_tokens = original_tokens
+                result.compressed_tokens = compressed_tokens
+                result.compression_ratio = (
+                    compressed_tokens / original_tokens if original_tokens else 1.0
                 )
 
         return result

@@ -387,7 +387,7 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {k: v for k, v in seen[0].items() if k != "timing"} == expected
+        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
 
 
 # --- production route: the Codex WebSocket handler ---------------------------

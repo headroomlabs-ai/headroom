@@ -383,14 +383,17 @@ class TestUsagePollGating:
         # No running event loop -> cannot schedule.
         assert (
             maybe_schedule_usage_poll(
-                {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
+                {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"},
+                from_local_operator=True,
             )
             is False
         )
 
     def test_maybe_schedule_skips_non_codex(self):
         async def run():
-            return maybe_schedule_usage_poll({"authorization": "Bearer a.b.c"})
+            return maybe_schedule_usage_poll(
+                {"authorization": "Bearer a.b.c"}, from_local_operator=True
+            )
 
         assert asyncio.run(run()) is False
 
@@ -409,8 +412,8 @@ class TestUsagePollGating:
 
         async def run():
             req = {"authorization": "Bearer a.b.c", "chatgpt-account-id": "acct"}
-            first = maybe_schedule_usage_poll(req, min_interval_s=60.0)
-            second = maybe_schedule_usage_poll(req, min_interval_s=60.0)
+            first = maybe_schedule_usage_poll(req, from_local_operator=True, min_interval_s=60.0)
+            second = maybe_schedule_usage_poll(req, from_local_operator=True, min_interval_s=60.0)
             # Let the scheduled task run.
             await asyncio.sleep(0)
             return first, second

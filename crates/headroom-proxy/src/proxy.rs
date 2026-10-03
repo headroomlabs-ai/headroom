@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -25,7 +25,7 @@ use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
-use crate::health::{healthz, healthz_upstream};
+use crate::health::{healthz, healthz_upstream, rollout_status};
 use crate::websocket::ws_handler;
 // Phase F PR-F1: imported as `classify_auth_mode` to make the call
 // site self-documenting. `AuthMode` is re-exported under the same
@@ -97,7 +97,19 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
-        let client = reqwest::Client::builder()
+        // Two rustls crypto providers are linked into this binary (ring via
+        // reqwest, aws-lc-rs via the AWS SDK), so anything that reaches for
+        // the process default — reqwest below, tokio-tungstenite, any future
+        // dependency — would panic without one. Pin it before the first TLS
+        // client is built. Idempotent; see `crate::tls`.
+        crate::tls::install_process_crypto_provider();
+        let mut builder = reqwest::Client::builder();
+        // Corporate roots handed over as PEM files, added on top of the
+        // bundled + OS roots (see `crate::tls`).
+        for cert in crate::tls::extra_root_certificates() {
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .connect_timeout(config.upstream_connect_timeout)
             .timeout(config.upstream_timeout)
             // Don't auto-follow redirects: pass them through verbatim.
@@ -157,6 +169,7 @@ pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
+        .route("/rollout/status", get(rollout_status))
         // PR-D3: Prometheus scrape endpoint. Renders the global
         // registry in text format. The handler is stateless — no
         // `AppState` needed — and idempotent across concurrent
@@ -188,14 +201,14 @@ pub fn build_app(state: AppState) -> Router {
         // publisher endpoints look like
         // `POST /v1beta1/projects/{p}/locations/{l}/publishers/anthropic/models/{m}:rawPredict`
         // (and `:streamRawPredict`). The trailing `:<verb>` is awkward
-        // in axum's `:param` syntax, so we capture the entire trailing
-        // segment as `:model_action` and split on the last `:` inside
+        // in axum's `{param}` syntax, so we capture the entire trailing
+        // segment as `{model_action}` and split on the last `:` inside
         // the dispatcher. Both verbs share the same axum route shape
         // — matchit can't distinguish two patterns that overlap on the
         // literal parameter. The verb dispatch lives in
         // [`crate::vertex::handle_vertex_predict_dispatch`].
         .route(
-            "/v1beta1/projects/:project/locations/:location/publishers/anthropic/models/:model_action",
+            "/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}",
             post(crate::vertex::handle_vertex_predict_dispatch),
         );
 
@@ -218,11 +231,11 @@ pub fn build_app(state: AppState) -> Router {
         // Bedrock handlers identically.
         let bedrock_router: Router<AppState> = Router::new()
             .route(
-                "/model/:model_id/invoke",
+                "/model/{model_id}/invoke",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             .route(
-                "/model/:model_id/converse",
+                "/model/{model_id}/converse",
                 post(crate::bedrock::invoke::handle_invoke),
             )
             // PR-D2/PR-D5: streaming counterparts. Bedrock's protocol is
@@ -234,11 +247,11 @@ pub fn build_app(state: AppState) -> Router {
             // processing pipeline, so both route to the same handler.
             // See `bedrock::invoke_streaming`.
             .route(
-                "/model/:model_id/invoke-with-response-stream",
+                "/model/{model_id}/invoke-with-response-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route(
-                "/model/:model_id/converse-stream",
+                "/model/{model_id}/converse-stream",
                 post(crate::bedrock::invoke_streaming::handle_invoke_streaming),
             )
             .route_layer(axum::middleware::from_fn(
@@ -280,18 +293,18 @@ pub fn build_app(state: AppState) -> Router {
                 post(crate::handlers::conversations::handle_conversations_create),
             )
             .route(
-                "/v1/conversations/:conversation_id",
+                "/v1/conversations/{conversation_id}",
                 get(crate::handlers::conversations::handle_conversations_get)
                     .post(crate::handlers::conversations::handle_conversations_update)
                     .delete(crate::handlers::conversations::handle_conversations_delete),
             )
             .route(
-                "/v1/conversations/:conversation_id/items",
+                "/v1/conversations/{conversation_id}/items",
                 post(crate::handlers::conversations::handle_conversations_items_create)
                     .get(crate::handlers::conversations::handle_conversations_items_list),
             )
             .route(
-                "/v1/conversations/:conversation_id/items/:item_id",
+                "/v1/conversations/{conversation_id}/items/{item_id}",
                 get(crate::handlers::conversations::handle_conversations_item_get)
                     .delete(crate::handlers::conversations::handle_conversations_item_delete),
             );
@@ -314,17 +327,22 @@ pub fn build_app(state: AppState) -> Router {
 async fn catch_all(
     State(state): State<AppState>,
     ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
-    ws: Option<WebSocketUpgrade>,
     req: Request<Body>,
 ) -> Response<Body> {
-    if is_websocket_upgrade(req.headers()) {
-        if let Some(ws) = ws {
+    let (mut parts, body) = req.into_parts();
+    if is_websocket_upgrade(&parts.headers) {
+        // axum 0.8 requires optional extractors to opt in explicitly, and
+        // WebSocketUpgrade intentionally does not. Extract it only after the
+        // upgrade headers have identified this as a WebSocket request.
+        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            let req = Request::from_parts(parts, body);
             return ws_handler(ws, state, client_addr, req).await;
         }
         // Header says websocket but axum didn't extract it (likely missing
         // Sec-WebSocket-Key) — fall through to HTTP forwarding which will
         // surface the upstream error.
     }
+    let req = Request::from_parts(parts, body);
     forward_http(state, client_addr, req)
         .await
         .unwrap_or_else(|e| e.into_response())
@@ -367,30 +385,21 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
-    Ok(join_upstream_path(base, uri.path(), uri.query()))
+    join_upstream_path(base, uri.path(), uri.query())
 }
 
 /// Shared path-join helper used by HTTP and WebSocket handlers.
-/// Appends `path` to `base`, preserving any base path prefix, then sets `query`.
-pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str>) -> url::Url {
-    let mut joined = base.clone();
-    // Strip trailing slash from base path so "http://x:1/api" + "/v1/foo"
-    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
-    let base_path = joined.path().trim_end_matches('/').to_string();
-    let combined = if path.is_empty() || path == "/" {
-        if base_path.is_empty() {
-            "/".to_string()
-        } else {
-            base_path
-        }
-    } else if base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_path}{path}")
-    };
-    joined.set_path(&combined);
-    joined.set_query(query);
-    joined
+/// Appends `path` to `base`, preserving any base path prefix, then sets
+/// `query`. Rejects (400) any path the URL parser would rewrite — dot
+/// segments, backslashes — so the upstream always receives exactly the path
+/// the client sent, under exactly the configured prefix. See
+/// [`crate::upstream_path`].
+pub(crate) fn join_upstream_path(
+    base: &url::Url,
+    path: &str,
+    query: Option<&str>,
+) -> Result<url::Url, ProxyError> {
+    Ok(crate::upstream_path::join_request_path(base, path, query)?)
 }
 
 /// Forward an HTTP request to the upstream and stream the response back.
@@ -1686,5 +1695,15 @@ mod tests {
         let uri: Uri = "/".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/");
+    }
+
+    #[test]
+    fn url_build_refuses_to_escape_base_path() {
+        // `url::Url::set_path` would resolve this to `/tenant-b/v1/messages`.
+        let base: url::Url = "http://gw/tenant-a".parse().unwrap();
+        let uri: Uri = "/../tenant-b/v1/messages".parse().unwrap();
+        let err = build_upstream_url(&base, &uri).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPath(_)), "{err:?}");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }

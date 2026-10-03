@@ -21,12 +21,18 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.ccr.tool_injection import CCR_TOOL_NAME
 from headroom.proxy.server import ProxyConfig, create_app
 from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
 
 _SEARCH_TOOL = {"type": "tool_search_tool_20250917", "name": "tool_search"}
 _GREP = {"name": "Grep", "description": "search files", "input_schema": {"type": "object"}}
 _READ = {"name": "Read", "description": "read a file", "input_schema": {"type": "object"}}
+_CCR_TOOL = {
+    "name": CCR_TOOL_NAME,
+    "description": "retrieve compressed content",
+    "input_schema": {"type": "object"},
+}
 
 # A transcript that already carries a resolved tool-search round trip for `Grep`.
 _POISONED_MESSAGES = [
@@ -53,6 +59,31 @@ _POISONED_MESSAGES = [
     {"role": "user", "content": "now use it"},
 ]
 
+_CCR_POISONED_MESSAGES = [
+    {"role": "user", "content": "expand the saved result"},
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_ccr_1",
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": "abc123def456abc123def456"},
+            }
+        ],
+    },
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_ccr_1",
+                "content": "the expanded result",
+            }
+        ],
+    },
+]
+
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
@@ -77,7 +108,12 @@ class _InertHook:
         return None
 
 
-def _run(hook) -> dict:  # noqa: ANN001
+def _run(
+    hook,  # noqa: ANN001
+    *,
+    messages: list[dict] = _POISONED_MESSAGES,
+    tools: list[dict] | None = None,
+) -> dict:
     """POST a poisoned transcript through the handler, return the forwarded body."""
     captured: dict[str, object] = {}
     register_turn_hook(hook)
@@ -123,8 +159,8 @@ def _run(hook) -> dict:  # noqa: ANN001
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 64,
-                "messages": _POISONED_MESSAGES,
-                "tools": [_SEARCH_TOOL, _GREP, _READ],
+                "messages": messages,
+                "tools": tools or [_SEARCH_TOOL, _GREP, _READ],
             },
         )
         assert response.status_code == 200
@@ -174,3 +210,30 @@ def test_repair_leaves_resolvable_history_alone_when_the_hook_keeps_the_tool() -
 
     assert _referenced_tool_names(forwarded) == ["Grep"]
     assert "tool_search_tool_result" in _block_types(forwarded)
+
+
+def test_ccr_repair_sees_the_tools_array_the_hook_left_behind() -> None:
+    """CCR repair also runs after a hook removes headroom_retrieve."""
+    forwarded = _run(
+        _DropToolHook(CCR_TOOL_NAME),
+        messages=_CCR_POISONED_MESSAGES,
+        tools=[_CCR_TOOL, _READ],
+    )
+
+    assert CCR_TOOL_NAME not in [t.get("name") for t in forwarded["tools"]]
+    assert "tool_use" not in _block_types(forwarded)
+    assert "tool_result" not in _block_types(forwarded)
+    assert forwarded["messages"][2]["content"] == [{"type": "text", "text": "the expanded result"}]
+
+
+def test_ccr_repair_leaves_resolvable_history_when_hook_keeps_tool() -> None:
+    """CCR history remains structured when the final tools array declares it."""
+    forwarded = _run(
+        _InertHook(),
+        messages=_CCR_POISONED_MESSAGES,
+        tools=[_CCR_TOOL, _READ],
+    )
+
+    assert CCR_TOOL_NAME in [t.get("name") for t in forwarded["tools"]]
+    assert "tool_use" in _block_types(forwarded)
+    assert "tool_result" in _block_types(forwarded)
