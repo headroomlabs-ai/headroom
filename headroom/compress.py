@@ -60,12 +60,15 @@ import logging
 import os
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .agent_savings import apply_agent_savings_profile
 from .observability import get_otel_metrics
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .utils import extract_user_query as _extract_user_query
+
+if TYPE_CHECKING:
+    from .config import MessageDecision
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +156,13 @@ class CompressConfig:
     Requires the optional relevance dependencies and is disabled by default so
     compression never loads an embedding model solely for diagnostics.
     Env var: HEADROOM_SEMANTIC_SCORE_ENABLED (true/false)."""
+    diagnostics: bool = False
+    """Collect per-message compression decisions.  Also enabled by the
+    ``HEADROOM_DIAGNOSTICS=1`` environment variable.  When True, the returned
+    :class:`CompressResult` carries a ``diagnostics`` list of
+    :class:`~headroom.config.MessageDecision` objects — one per message —
+    describing which action was taken (compressed, protected, skipped …) and
+    how many tokens were spent before/after."""
 
 
 @dataclass
@@ -177,6 +187,7 @@ class CompressResult:
     compression_ratio: float = 0.0
     transforms_applied: list[str] = field(default_factory=list)
     semantic_score: float | None = None
+    diagnostics: list[MessageDecision] | None = None
 
 
 def compress(
@@ -235,18 +246,25 @@ def compress(
     if cfg.savings_profile:
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
+    collect_diagnostics = cfg.diagnostics or os.environ.get("HEADROOM_DIAGNOSTICS", "") == "1"
+
     pipeline = _get_pipeline()
     pipeline_extensions = PipelineExtensionManager(hooks=hooks, discover=False)
 
     try:
         # Compute biases from hooks if provided
         biases = None
+        # Hard per-message veto. Separate from ``biases`` because a bias is a
+        # soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        protect = None
         if hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             ctx = CompressContext(model=model)
             messages = hooks.pre_compress(messages, ctx)
             biases = hooks.compute_biases(messages, ctx)
+            protect = collect_protected(hooks, messages, ctx)
 
         received_event = pipeline_extensions.emit(
             PipelineStage.INPUT_RECEIVED,
@@ -268,6 +286,7 @@ def compress(
             model_limit=model_limit,
             context=context,
             biases=biases,
+            protect=protect,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
             compress_system_messages=cfg.compress_system_messages,
@@ -277,6 +296,7 @@ def compress(
             min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
             frozen_message_count=cfg.frozen_message_count,
+            collect_diagnostics=collect_diagnostics,
         )
 
         tokens_before = result.tokens_before
@@ -380,6 +400,7 @@ def compress(
             compression_ratio=ratio,
             transforms_applied=result.transforms_applied,
             semantic_score=semantic_score_value,
+            diagnostics=result.message_decisions if collect_diagnostics else None,
         )
 
     except Exception as e:

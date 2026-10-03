@@ -179,7 +179,11 @@ def has_plaintext_reasoning(messages: list[dict[str, Any]]) -> bool:
 
 
 def cold_recompact_messages(
-    messages: list[dict[str, Any]], *, tokenizer: Any, context: str = ""
+    messages: list[dict[str, Any]],
+    *,
+    tokenizer: Any,
+    context: str = "",
+    cross_turn_dedup_recoverable: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Lossless whole-prefix recompaction for a confirmed-cold turn.
 
@@ -191,6 +195,15 @@ def cold_recompact_messages(
     preserve nothing. Lossless + prefix-monotonic ⇒ deterministic per content ⇒
     the recompacted prefix re-caches and stays byte-stable on later warm turns.
 
+    ``cross_turn_dedup_recoverable`` is forwarded to the router's dedup gate:
+    pass False on paths where a bare ``[↑NL same as msg M]`` pointer cannot be
+    resolved — no CCR retrieval tool can be injected and the client never shows
+    the model numbered messages (OpenAI chat-completions streaming, e.g.
+    ``wrap copilot``). The fold is then skipped and the bytes stay verbatim;
+    the lossless folds still run. The Anthropic cache-mode caller keeps the
+    default True (the in-context reference resolves there and the retrieval
+    tool is injectable).
+
     Returns (new_messages, transforms_applied). Fail-open: returns the input
     unchanged on any error (never breaks the request).
     """
@@ -200,8 +213,17 @@ def cold_recompact_messages(
             ContentRouterConfig,
         )
 
+        # enable_cross_turn_dedup stays on: whether the fold may EMIT pointers
+        # is decided per-path by the router's recoverability gate below, not
+        # hardcoded here.
         router = ContentRouter(ContentRouterConfig(lossless=True, enable_cross_turn_dedup=True))
-        res = router.apply(list(messages), tokenizer, frozen_message_count=0, context=context)
+        res = router.apply(
+            list(messages),
+            tokenizer,
+            frozen_message_count=0,
+            context=context,
+            cross_turn_dedup_recoverable=cross_turn_dedup_recoverable,
+        )
         return res.messages, list(res.transforms_applied)
     except Exception as e:  # never break the request
         log.warning("cold-prefix recompaction failed (%s); leaving prefix unchanged", e)

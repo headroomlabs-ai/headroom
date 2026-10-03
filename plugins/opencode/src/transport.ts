@@ -9,7 +9,9 @@ const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
 const BASE_URL_HEADER = "x-headroom-base-url";
 const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
+const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
 type FetchArgs = Parameters<typeof fetch>;
@@ -25,12 +27,16 @@ type ChildFork = typeof childProcess.fork;
 
 interface InstallOptions {
   proxyUrl: string;
+  project?: string;
+  excludeHosts?: string[];
   debug?: boolean;
 }
 
 interface TransportState {
   refs: number;
   proxyUrl: string;
+  project: string | undefined;
+  excludeHosts: string[];
   debug: boolean;
   originalFetch: typeof fetch;
   originalHttpRequest: HttpRequest;
@@ -84,9 +90,26 @@ function withNodeImportOption(existing: string | undefined, shim: string): strin
   return parts.join(" ");
 }
 
-function withShimEnv(env: NodeJS.ProcessEnv | Record<string, unknown> | undefined, proxyUrl: string): NodeJS.ProcessEnv {
+// The exported variable mirrors the EFFECTIVE list, not merely a non-empty
+// one: an explicit `excludeHosts: []` overrides a pre-existing variable for
+// this process, so a child that inherited the stale value would bypass hosts
+// the parent routes. Delete it when the resolved list is empty.
+function withExcludeHostsEnv(env: NodeJS.ProcessEnv, excludeHosts: string[]): void {
+  if (excludeHosts.length > 0) {
+    env[EXCLUDE_HOSTS_ENV] = excludeHosts.join(",");
+  } else {
+    delete env[EXCLUDE_HOSTS_ENV];
+  }
+}
+
+function withShimEnv(
+  env: NodeJS.ProcessEnv | Record<string, unknown> | undefined,
+  proxyUrl: string,
+  excludeHosts: string[],
+): NodeJS.ProcessEnv {
   const nextEnv = { ...(env ?? process.env) } as NodeJS.ProcessEnv;
   nextEnv[PROXY_ENV] = proxyUrl;
+  withExcludeHostsEnv(nextEnv, excludeHosts);
   const shim = shimImportSpecifier();
   if (shim) {
     nextEnv.NODE_OPTIONS = withNodeImportOption(nextEnv.NODE_OPTIONS, shim);
@@ -94,8 +117,9 @@ function withShimEnv(env: NodeJS.ProcessEnv | Record<string, unknown> | undefine
   return nextEnv;
 }
 
-function installProcessEnv(proxyUrl: string): void {
+function installProcessEnv(proxyUrl: string, excludeHosts: string[]): void {
   process.env[PROXY_ENV] = proxyUrl;
+  withExcludeHostsEnv(process.env, excludeHosts);
   const shim = shimImportSpecifier();
   if (shim) {
     process.env.NODE_OPTIONS = withNodeImportOption(process.env.NODE_OPTIONS, shim);
@@ -106,11 +130,14 @@ function isOptions(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && !(value instanceof URL);
 }
 
-function injectOptionsEnv(args: unknown[], optionIndex: number, proxyUrl: string): unknown[] {
+function injectOptionsEnv(args: unknown[], optionIndex: number, state: TransportState): unknown[] {
   const nextArgs = [...args];
   const callback = typeof nextArgs.at(-1) === "function" ? nextArgs.pop() : undefined;
   const existing = isOptions(nextArgs[optionIndex]) ? { ...(nextArgs[optionIndex] as Record<string, unknown>) } : {};
-  existing.env = withShimEnv(existing.env as NodeJS.ProcessEnv | undefined, proxyUrl);
+  existing.env = withShimEnv(existing.env as NodeJS.ProcessEnv | undefined, state.proxyUrl, state.excludeHosts);
+  if (process.platform === "win32" && existing.windowsHide === undefined) {
+    existing.windowsHide = true;
+  }
 
   if (isOptions(nextArgs[optionIndex])) {
     nextArgs[optionIndex] = existing;
@@ -131,7 +158,7 @@ function wrapSpawn(originalSpawn: ChildSpawn): ChildSpawn {
       return Reflect.apply(originalSpawn, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalSpawn, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildSpawn;
 }
 
@@ -141,7 +168,7 @@ function wrapExec(originalExec: ChildExec): ChildExec {
     if (!state) {
       return Reflect.apply(originalExec, this, args);
     }
-    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state.proxyUrl));
+    return Reflect.apply(originalExec, this, injectOptionsEnv(args, 1, state));
   } as ChildExec;
 }
 
@@ -152,7 +179,7 @@ function wrapExecFile(originalExecFile: ChildExecFile): ChildExecFile {
       return Reflect.apply(originalExecFile, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalExecFile, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildExecFile;
 }
 
@@ -163,7 +190,7 @@ function wrapFork(originalFork: ChildFork): ChildFork {
       return Reflect.apply(originalFork, this, args);
     }
     const optionIndex = Array.isArray(args[1]) ? 2 : 1;
-    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state.proxyUrl));
+    return Reflect.apply(originalFork, this, injectOptionsEnv(args, optionIndex, state));
   } as ChildFork;
 }
 
@@ -176,7 +203,47 @@ function isLoopback(hostname: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
-function shouldRoute(url: URL, proxy: URL): boolean {
+// "example.com", ".example.com" and "*.example.com" all mean the host itself
+// plus every subdomain. Entries are bare hosts: no scheme, port, or path. A
+// string is the comma-separated env form; plugin options arrive from untyped
+// JSON, so a lone string there is treated the same way instead of iterated
+// character by character.
+function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
+  const hosts = new Set<string>();
+  for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
+    const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
+    if (host) {
+      hosts.add(host);
+    }
+  }
+  return [...hosts];
+}
+
+function isExcludedHost(hostname: string, excludeHosts: string[]): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  return excludeHosts.some((host) => normalized === host || normalized.endsWith(`.${host}`));
+}
+
+// Only recognized LLM API endpoints route through Headroom; any other path
+// (WebFetch, registries, GitHub, unknown services) must reach its original URL
+// untouched. A bare suffix match keeps provider-prefixed variants working
+// (/api/coding/paas/v4/chat/completions, /base/v1/messages, ...).
+//
+// Native Gemini model-generation endpoints use colon-action suffixes
+// (:generateContent, :streamGenerateContent). These are matched by exact
+// suffix so that lookalike paths containing the marker but not ending with it
+// (e.g. /v1/models/gemini:generateContent/status) remain unrouted.
+function isLlmEndpointPath(pathname: string): boolean {
+  return (
+    pathname.endsWith("/chat/completions") ||
+    pathname.endsWith("/responses") ||
+    pathname.endsWith("/messages") ||
+    pathname.endsWith(":generateContent") ||
+    pathname.endsWith(":streamGenerateContent")
+  );
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -186,7 +253,10 @@ function shouldRoute(url: URL, proxy: URL): boolean {
   if (url.origin === proxy.origin) {
     return false;
   }
-  return true;
+  if (isExcludedHost(url.hostname, excludeHosts)) {
+    return false;
+  }
+  return isLlmEndpointPath(url.pathname);
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {
@@ -233,6 +303,7 @@ function mergeFetchHeaders(
   init: RequestInit | undefined,
   upstream: URL | undefined,
   originalPath: string | undefined = undefined,
+  project: string | undefined = undefined,
 ): Headers {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   if (init?.headers) {
@@ -245,19 +316,28 @@ function mergeFetchHeaders(
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
   }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
+  }
   return headers;
 }
 
-function withRoutedFetchInput(input: RequestInfo | URL, init: RequestInit | undefined, proxy: URL): FetchArgs {
+function withRoutedFetchInput(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  proxy: URL,
+  project: string | undefined,
+  excludeHosts: string[],
+): FetchArgs {
   const upstream = requestUrl(input);
-  if (!shouldRoute(upstream, proxy)) {
+  if (!shouldRoute(upstream, proxy, excludeHosts)) {
     return [input, init];
   }
 
   const { url: nextUrl, originalPath } = routedUrlForOpenCode(upstream, proxy);
   const nextInit = {
     ...init,
-    headers: mergeFetchHeaders(input, init, upstream, originalPath),
+    headers: mergeFetchHeaders(input, init, upstream, originalPath, project),
   };
 
   if (input instanceof Request) {
@@ -314,11 +394,15 @@ function headersForNodeRequest(
   options: Record<string, unknown>,
   upstream: URL,
   originalPath: string | undefined,
+  project: string | undefined,
 ): Record<string, string> {
   const headers = new Headers(options.headers as HeadersInit | undefined);
   headers.set(BASE_URL_HEADER, upstream.origin);
   if (originalPath) {
     headers.set(ORIGINAL_PATH_HEADER, originalPath);
+  }
+  if (project) {
+    headers.set(PROJECT_HEADER, project);
   }
   headers.delete("host");
 
@@ -329,8 +413,13 @@ function headersForNodeRequest(
   return result;
 }
 
-function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, unknown> | undefined {
-  if (!parts.url || !shouldRoute(parts.url, proxy)) {
+function routedNodeOptions(
+  parts: NodeRequestParts,
+  proxy: URL,
+  project: string | undefined,
+  excludeHosts: string[],
+): Record<string, unknown> | undefined {
+  if (!parts.url || !shouldRoute(parts.url, proxy, excludeHosts)) {
     return undefined;
   }
 
@@ -362,7 +451,7 @@ function routedNodeOptions(parts: NodeRequestParts, proxy: URL): Record<string, 
     hostname: nextUrl.hostname,
     port: nextUrl.port || undefined,
     path: `${nextUrl.pathname}${nextUrl.search}`,
-    headers: headersForNodeRequest(parts.options, parts.url, originalPath),
+    headers: headersForNodeRequest(parts.options, parts.url, originalPath, project),
   };
 }
 
@@ -379,7 +468,7 @@ function wrapRequest(
 
     const proxy = normalizeProxyUrl(state.proxyUrl);
     const parts = splitNodeArgs(args);
-    const nextOptions = routedNodeOptions(parts, proxy);
+    const nextOptions = routedNodeOptions(parts, proxy, state.project, state.excludeHosts);
     if (!nextOptions) {
       return Reflect.apply(originalRequest, this, args);
     }
@@ -398,36 +487,34 @@ function wrapGet(request: HttpRequest | HttpsRequest): HttpGet | HttpsGet {
   } as HttpGet | HttpsGet;
 }
 
+// http2.connect() has no request path at connect time, so the authority alone
+// cannot prove LLM traffic. Direct HTTP/2 connections always pass through
+// untouched: rejecting external authorities turned WebFetch into a proxy
+// error (#3633).
 function wrapHttp2Connect(originalConnect: Http2Connect): Http2Connect {
-  return function headroomHttp2Connect(this: unknown, authority: string | URL, ...args: unknown[]) {
-    const state = getState();
-    if (state) {
-      const proxy = normalizeProxyUrl(state.proxyUrl);
-      const upstream = authority instanceof URL ? authority : new URL(String(authority));
-      if (shouldRoute(upstream, proxy)) {
-        throw new Error(
-          `Headroom OpenCode wrap blocked direct HTTP/2 connection to ${upstream.origin}. ` +
-            "Use fetch, http, or https so traffic can be routed through Headroom.",
-        );
-      }
-    }
-    return Reflect.apply(originalConnect, this, [authority, ...args]);
+  return function headroomHttp2Connect(this: unknown, ...args: unknown[]) {
+    return Reflect.apply(originalConnect, this, args);
   } as Http2Connect;
 }
 
 export function installHeadroomTransport(options: InstallOptions): () => void {
+  const excludeHosts = normalizeExcludeHosts(options.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
   const existing = getState();
   if (existing) {
     existing.refs += 1;
     existing.proxyUrl = options.proxyUrl;
+    existing.project = options.project;
+    existing.excludeHosts = excludeHosts;
     existing.debug = Boolean(options.debug);
-    installProcessEnv(options.proxyUrl);
+    installProcessEnv(options.proxyUrl, excludeHosts);
     return () => uninstallHeadroomTransport();
   }
 
   const state: TransportState = {
     refs: 1,
     proxyUrl: options.proxyUrl,
+    project: options.project,
+    excludeHosts,
     debug: Boolean(options.debug),
     originalFetch: globalThis.fetch,
     originalHttpRequest: http.request,
@@ -442,14 +529,14 @@ export function installHeadroomTransport(options: InstallOptions): () => void {
   };
 
   setState(state);
-  installProcessEnv(options.proxyUrl);
+  installProcessEnv(options.proxyUrl, excludeHosts);
   globalThis.fetch = async (...args: FetchArgs) => {
     const current = getState();
     if (!current) {
       return state.originalFetch(...args);
     }
     const proxy = normalizeProxyUrl(current.proxyUrl);
-    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy);
+    const [nextInput, nextInit] = withRoutedFetchInput(args[0], args[1], proxy, current.project, current.excludeHosts);
     return state.originalFetch(nextInput, nextInit);
   };
 

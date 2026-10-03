@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 try:
     import tomllib
@@ -99,8 +101,45 @@ def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
     tokens = data.get("tokens")
     if isinstance(tokens, dict):
         account_id = tokens.get("account_id")
-        return isinstance(account_id, str) and bool(account_id.strip())
+        if isinstance(account_id, str) and account_id.strip():
+            return True
+        return _id_token_carries_chatgpt_account(tokens.get("id_token"))
     return False
+
+
+def _id_token_carries_chatgpt_account(raw: Any) -> bool:
+    """Whether an ``id_token`` carries the ChatGPT account claim (#3206).
+
+    Newer Codex releases can write an ``auth.json`` with neither ``auth_mode``
+    nor a top-level ``tokens.account_id``; the account identity lives only in
+    the ``id_token`` claims. Those configs then read as API-key mode, so
+    ``requires_openai_auth`` is omitted, Codex attaches no Authorization
+    header, and every request 401s with "Missing bearer".
+
+    The payload is decoded, not verified. This is a local config file the user
+    already owns, and the result only decides which key we write into their own
+    ``config.toml`` -- nothing is authenticated or authorised on the strength
+    of it. An API-key user has no ChatGPT id_token, so this cannot resurrect
+    the forced-OAuth-login regression in #406.
+    """
+    if not isinstance(raw, str):
+        return False
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return False
+    if not isinstance(claims, dict):
+        return False
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claim, dict):
+        return False
+    account_id = auth_claim.get("chatgpt_account_id")
+    return isinstance(account_id, str) and bool(account_id.strip())
 
 
 def build_provider_section(

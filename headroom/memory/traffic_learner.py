@@ -62,6 +62,10 @@ _BASH_VOLATILE_SUFFIX_RE = re.compile(
     r"|\s+2>&1|\s+2>/dev/null)+\s*$"
 )
 
+# Leading `cd <dir> && ` / `cd <dir>; ` prefixes. Agents prepend them to most
+# commands, so they carry no signal about which operation was retried.
+_BASH_LEADING_CD_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|(?:\\.|[^\s\\])+)\s*(?:&&|;)\s*""")
+
 # Agent harnesses can encode orchestration metadata as user-role messages.
 # These prefixes identify whole messages that are not authored by the user.
 _HARNESS_USER_PREFIXES = (
@@ -194,7 +198,7 @@ def _normalize_bash_for_hash(cmd: str) -> str:
     if not cmd:
         return ""
     # Drop paging, line-context flags, and redirections that vary between runs.
-    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", cmd).strip()
+    trimmed = _BASH_VOLATILE_SUFFIX_RE.sub("", _strip_leading_cd(cmd)).strip()
     # Cut at the first pipe or && so we hash the primary command, not the tail.
     for sep in (" | ", " && "):
         idx = trimmed.find(sep)
@@ -202,6 +206,15 @@ def _normalize_bash_for_hash(cmd: str) -> str:
             trimmed = trimmed[:idx].rstrip()
             break
     return trimmed
+
+
+def _strip_leading_cd(cmd: str) -> str:
+    """Remove leading `cd <dir> &&` / `cd <dir>;` segments from a Bash command."""
+    prev = None
+    while prev != cmd:
+        prev = cmd
+        cmd = _BASH_LEADING_CD_RE.sub("", cmd, count=1)
+    return cmd
 
 
 # =============================================================================
@@ -372,6 +385,8 @@ def _commands_related_as_retry(failed: str, success: str) -> bool:
     arguments, and gets rejected. Genuine retries (extra flag, single
     arg edit) pass via the edit-distance path.
     """
+    failed = _strip_leading_cd(failed)
+    success = _strip_leading_cd(success)
     if not failed or not success or failed == success:
         return False
     bin_a = _bash_first_binary(failed)
@@ -525,6 +540,10 @@ class TrafficLearner:
         # Hydrate persisted dedup state before workers spin up so cross-session
         # re-sightings bump existing rows instead of creating duplicates.
         await self._hydrate_persisted_state()
+        # Rehydrate sub-threshold evidence from the previous process. Without
+        # this every restart zeroed pending counts, so users with short or
+        # restart-heavy sessions could never cross min_evidence.
+        await self._load_pending_state()
         if self._save_task is None or self._save_task.done():
             self._save_task = asyncio.create_task(self._save_worker())
         if self._flush_task is None or self._flush_task.done():
@@ -569,6 +588,9 @@ class TrafficLearner:
             except Exception:
                 break
 
+        # Snapshot sub-threshold evidence so it survives the restart.
+        await self._save_pending_state()
+
         # Final flush on shutdown — bypass debounce.
         await self.flush_to_file()
 
@@ -586,6 +608,9 @@ class TrafficLearner:
                 self._flush_dirty = False
                 self._last_flush_at = time.monotonic()
                 await self.flush_to_file()
+                # Same debounce cycle also snapshots pending evidence, so a
+                # crash (vs clean stop) loses at most one debounce window.
+                await self._save_pending_state()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -831,6 +856,7 @@ class TrafficLearner:
             "patterns_extracted": self._patterns_extracted,
             "patterns_saved": self._patterns_saved,
             "pending_patterns": len(self._pattern_counts),
+            "min_evidence": self._min_evidence,
             "history_size": len(self._tool_history),
         }
 
@@ -1275,10 +1301,16 @@ class TrafficLearner:
             # Ready to save
             del self._pattern_counts[h]
             self._saved_hashes.add(h)
-            # Trim saved hashes to prevent unbounded growth
+            # Trim saved hashes to prevent unbounded growth, and drop the evicted
+            # hash's persisted-id entry in lockstep. ``_persisted_ids`` is only
+            # ever read behind an ``h in _saved_hashes`` guard (the dedup check
+            # above), so an id for a hash no longer tracked is dead weight;
+            # without this it grew one entry per distinct persisted pattern for
+            # the whole process lifetime while ``_saved_hashes`` stayed bounded.
             if len(self._saved_hashes) > self._dedup_window:
                 # Remove oldest (arbitrary, set is unordered, but prevents growth)
-                self._saved_hashes.pop()
+                evicted = self._saved_hashes.pop()
+                self._persisted_ids.pop(evicted, None)
 
             # Persist the real accumulated count, not the dataclass default.
             pattern.evidence_count = count
@@ -1310,9 +1342,13 @@ class TrafficLearner:
                     },
                 )
                 self._patterns_saved += 1
-                # Track id so future re-sightings bump this row.
+                # Track id so future re-sightings bump this row — but only while
+                # the hash is still within the dedup window. If it was evicted
+                # from ``_saved_hashes`` between enqueue and now, recording its id
+                # would re-leak an entry that can never be read again (the dedup
+                # read at the top of ``_accumulate`` is gated on ``_saved_hashes``).
                 memory_id = getattr(memory, "id", None)
-                if memory_id is not None:
+                if memory_id is not None and pattern.content_hash in self._saved_hashes:
                     self._persisted_ids[pattern.content_hash] = memory_id
                 logger.debug(f"Traffic learner saved pattern: {pattern.content[:80]}")
 
@@ -1341,7 +1377,16 @@ class TrafficLearner:
             try:
                 rows = conn.execute(
                     "SELECT id, content, metadata FROM memories "
-                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
+                    "WHERE json_extract(metadata, '$.source') = 'traffic_learner' "
+                    # Hydrate at most dedup_window rows so a large persisted
+                    # history does not start the in-memory dedup maps oversized
+                    # (they are trimmed to dedup_window in steady state). Keep the
+                    # most-recently-seen patterns; rows without last_seen_at
+                    # (legacy) sort last under DESC and are dropped first, with id
+                    # as a deterministic tie-break.
+                    "ORDER BY json_extract(metadata, '$.last_seen_at') DESC, id DESC "
+                    "LIMIT ?",
+                    (self._dedup_window,),
                 ).fetchall()
             except sqlite3.DatabaseError:
                 return []
@@ -1380,6 +1425,82 @@ class TrafficLearner:
             # If multiple rows share the same content (legacy duplicates),
             # last-wins — we only need one id to target the bump.
             self._persisted_ids[h] = memory_id
+
+    def _pending_state_path(self) -> Path | None:
+        """Sidecar JSON next to memory.db holding sub-threshold evidence."""
+        db_path = _resolve_backend_db_path(self._backend)
+        if db_path is None:
+            return None
+        return db_path.with_name("pending_patterns.json")
+
+    async def _save_pending_state(self) -> None:
+        """Snapshot the pending accumulator so evidence survives restarts.
+
+        Best-effort: failures are logged at debug and never propagate — the
+        accumulator degrades gracefully back to per-process behavior.
+        """
+        path = self._pending_state_path()
+        if path is None:
+            return
+        entries = [
+            {
+                "category": pattern.category.value,
+                "content": pattern.content,
+                "importance": pattern.importance,
+                "count": count,
+                "entity_refs": pattern.entity_refs,
+                "metadata": pattern.metadata,
+                "content_hash": h,
+            }
+            for h, (pattern, count) in self._pattern_counts.items()
+        ]
+
+        def _write() -> None:
+            # tmp + rename so a crash mid-write can't truncate the file.
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"version": 1, "patterns": entries}))
+            os.replace(tmp, path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception as e:
+            logger.debug("Traffic learner pending-state save failed: %s", e)
+
+    async def _load_pending_state(self) -> None:
+        """Rehydrate sub-threshold evidence saved by a previous process.
+
+        Runs after _hydrate_persisted_state so entries whose pattern crossed
+        the threshold in the meantime (hash now in _saved_hashes) are skipped;
+        their re-sightings bump the persisted row instead. Unreadable or
+        malformed files are ignored — the next snapshot overwrites them.
+        """
+        path = self._pending_state_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(await asyncio.to_thread(path.read_text))
+        except Exception as e:
+            logger.debug("Traffic learner pending-state load failed: %s", e)
+            return
+        entries = data.get("patterns") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return
+        for entry in entries[: self._max_pending_patterns]:
+            try:
+                h = entry["content_hash"]
+                if not h or h in self._saved_hashes or h in self._pattern_counts:
+                    continue
+                pattern = ExtractedPattern(
+                    category=PatternCategory(entry["category"]),
+                    content=entry["content"],
+                    importance=float(entry.get("importance", 0.5)),
+                    entity_refs=list(entry.get("entity_refs", [])),
+                    metadata=dict(entry.get("metadata", {})),
+                    content_hash=h,
+                )
+                self._pattern_counts[h] = (pattern, max(1, int(entry.get("count", 1))))
+            except Exception:
+                continue
 
     async def _bump_persisted_evidence(self, memory_id: str) -> None:
         """Atomically increment a persisted row's metadata.evidence_count."""
@@ -1748,6 +1869,14 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
     """
     from headroom.learn.models import Recommendation, RecommendationTarget
 
+    # Authoritative lifecycle signal for the item-level merge in the writer:
+    # every pattern the learner still holds for this project, captured before
+    # any per-category ranking or capping so that an item omitted from a
+    # rendered section is not mistaken for an expired one. `_collect_all_patterns`
+    # already dropped rows that no longer exist in memory.db, so an id missing
+    # here means the pattern is gone, not merely unrendered.
+    active_item_ids = frozenset(p.content_hash for p in patterns if p.content_hash)
+
     by_category: dict[PatternCategory, list[ExtractedPattern]] = {}
     for p in patterns:
         by_category.setdefault(p.category, []).append(p)
@@ -1769,7 +1898,15 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             items.sort(key=lambda p: p.evidence_count, reverse=True)
         if not items:
             continue
-        bullets = "\n".join(f"- {p.content}" for p in items)
+        preserve_prior_items = category is not PatternCategory.ERROR_RECOVERY
+        bullets = "\n".join(
+            (
+                f"- {p.content} <!-- headroom:pattern-id:{p.content_hash} -->"
+                if preserve_prior_items
+                else f"- {p.content}"
+            )
+            for p in items
+        )
         recs.append(
             Recommendation(
                 target=target,
@@ -1777,6 +1914,12 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
                 content=bullets,
                 confidence=max((p.importance for p in items), default=0.5),
                 evidence_count=sum(p.evidence_count for p in items),
+                preserve_prior_items=preserve_prior_items,
+                # error_recovery is rebuilt from scratch on every render and
+                # `_refine_error_recovery` deliberately drops rows, so the
+                # pre-refine set above is not its lifecycle signal; it must
+                # stay unset while that section replaces rather than merges.
+                active_item_ids=active_item_ids if preserve_prior_items else None,
             )
         )
     return recs

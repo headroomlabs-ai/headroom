@@ -97,6 +97,7 @@ def test_publish_command_writes_toml(fresh_toin: ToolIntelligenceNetwork, tmp_pa
 
     row = rec_list[0]
     assert set(row.keys()) == {
+        "tenant_key",
         "auth_mode",
         "model_family",
         "structure_hash",
@@ -105,6 +106,8 @@ def test_publish_command_writes_toml(fresh_toin: ToolIntelligenceNetwork, tmp_pa
         "confidence",
         "observations",
     }
+    # PR-F3: tenant_key defaults to "global" when no explicit one is set.
+    assert row["tenant_key"] == "global"
     assert row["auth_mode"] == "payg"
     assert row["model_family"] == "claude-3-5"
     assert row["structure_hash"] == sig.structure_hash
