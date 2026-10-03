@@ -1998,6 +1998,16 @@ class ContentRouterConfig:
     search_group_by_file: bool = False
 
 
+# Domain routing values derived from kompress-v4 evaluation with 20 samples
+# per content type and a >=95% must-keep survival threshold. Values below 1.0
+# make Kompress more aggressive; unlisted domains retain the caller's bias.
+_DOMAIN_BIAS_MULTIPLIERS: dict[ContentType, float] = {
+    ContentType.BUILD_OUTPUT: 0.50,
+    ContentType.SOURCE_CODE: 0.50,
+    ContentType.SEARCH_RESULTS: 0.70,
+}
+
+
 @dataclass
 class _PerRequestRuntimeState:
     """Per-``apply()``-call state, isolated across concurrent requests (#3486).
@@ -2794,6 +2804,11 @@ class ContentRouter(Transform):
                         else "content_detection"
                     ),
                 )
+
+            # Preserve explicit force-Kompress behavior: domain routing only
+            # applies when normal content detection selected the strategy.
+            if not force_kompress:
+                bias *= _DOMAIN_BIAS_MULTIPLIERS.get(detection.content_type, 1.0)
 
             if strategy == CompressionStrategy.MIXED:
                 result = self._compress_mixed(content, context, question, bias=bias)
