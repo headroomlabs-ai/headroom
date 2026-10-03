@@ -77,6 +77,34 @@ def test_native_compose_keeps_host_publication_loopback_and_optional_token() -> 
     assert proxy["command"] == ["--host", "0.0.0.0", "--port", "${HEADROOM_PORT:-8787}"]
 
 
+def test_native_compose_lets_the_host_dashboard_read_its_data(monkeypatch) -> None:
+    """The compose proxy must serve /stats-history to the host browser, which
+    reaches the 127.0.0.1 publication as the compose network's gateway."""
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    compose = yaml.safe_load(
+        (ROOT / "docker" / "docker-compose.native.yml").read_text(encoding="utf-8")
+    )
+    proxy = compose["services"]["proxy"]
+    assert proxy["ports"][0].startswith("127.0.0.1:")
+
+    for name, value in proxy["environment"].items():
+        if name != "HOME" and not name.endswith("_DIR"):
+            # "${VAR:-default}" with VAR unset, as compose resolves it.
+            value = value.split(":-", 1)[1].rstrip("}") if value.startswith("${") else value
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.18.0.1")
+    host = proxy["command"][proxy["command"].index("--host") + 1]
+    app = create_app(ProxyConfig(host=host, optimize=False, cache_enabled=False))
+
+    browser = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.18.0.1", 1))
+    assert browser.get("/stats-history").status_code == 200
+    other_container = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.18.0.5", 1))
+    assert other_container.get("/stats-history").status_code == 404
+
+
 def test_differential_capture_compose_keeps_proxy_internal_and_host_ports_loopback() -> None:
     compose = yaml.safe_load(
         (ROOT / "docker" / "differential-network-capture" / "docker-compose.yml").read_text(

@@ -15,13 +15,18 @@ from typing import Any, cast
 
 from headroom._subprocess import pid_alive, run
 
+from ..proxy.bind_policy import OPEN_BIND_ACK_ENV
 from .health import probe_ready
 from .models import DeploymentManifest, InstallPreset, RuntimeKind, SupervisorKind
 from .paths import log_path, pid_path, profile_root
 from .state import load_manifest
 
 # Inside the container the proxy must listen on every interface so the
-# host-side published port (127.0.0.1:<port>) can reach it.
+# host-side published port (127.0.0.1:<port>) can reach it. The proxy refuses
+# a non-loopback bind with no HEADROOM_PROXY_TOKEN unless it is acknowledged;
+# this launcher always publishes on 127.0.0.1, so it acknowledges (see
+# build_runtime_command). A token in the host env still flows through the
+# HEADROOM_ passthrough and takes precedence over the acknowledgement.
 CONTAINER_BIND_HOST = "0.0.0.0"  # noqa: S104 — container-internal bind, published only on 127.0.0.1
 # proxy_args always starts with the host flag/value pair (see planner.py); we
 # drop it and substitute CONTAINER_BIND_HOST for the in-container bind.
@@ -136,6 +141,10 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         manifest.container_name,
         "-p",
         f"127.0.0.1:{manifest.port}:{manifest.port}",
+        # Loopback-only publication is what makes the in-container 0.0.0.0
+        # bind acceptable without a token; say so explicitly to the proxy.
+        "--env",
+        f"{OPEN_BIND_ACK_ENV}=1",
         "--workdir",
         container_home,
         "--env",

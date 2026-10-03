@@ -1374,7 +1374,11 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
             assert lifetime["rate_limited_by_source"] == {"headroom": 250, "upstream": 250}
 
             # Prometheus export: every provider series is from the fixed set.
-            export = client.get("/metrics").text
+            # /metrics is an operator route: read it as the local operator does.
+            operator = TestClient(
+                client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+            )
+            export = operator.get("/metrics").text
             assert set(re.findall(r'provider="([^"]+)"', export)) <= fixed_providers | {"unknown"}
             assert 'headroom_requests_by_provider{provider="zai"} 10' in export
             assert 'headroom_requests_by_provider{provider="custom"} 250' in export

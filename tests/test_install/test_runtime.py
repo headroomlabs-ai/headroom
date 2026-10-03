@@ -100,10 +100,61 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     assert "HEADROOM_DEPLOYMENT_PRESET=persistent-docker" in joined
     assert "127.0.0.1:8787:8787" in joined
     assert "ghcr.io/headroomlabs-ai/headroom:latest" in command
+    # The container binds 0.0.0.0 behind a loopback-only publication; the
+    # proxy refuses that bind without a token unless acknowledged, and this
+    # launcher is the canonical case for the acknowledgement.
+    assert "--host 0.0.0.0" in joined
+    assert "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1" in command
+    assert command[command.index("HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1") - 1] == "--env"
     # Canonical Headroom filesystem contract (issue #175) forwarded into
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command
     assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in command
+
+
+def test_build_runtime_command_lets_the_host_dashboard_read_its_data(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The container this command starts must serve /stats-history to the host
+    browser, which reaches the 127.0.0.1 publication as the bridge gateway."""
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+    command = build_runtime_command(manifest)
+    assert "127.0.0.1:8787:8787" in command
+
+    # Recreate the container's environment (minus its filesystem paths) and
+    # the container's view of its bridge gateway.
+    for index, arg in enumerate(command):
+        if arg == "--env" and "=" in command[index + 1]:
+            name, value = command[index + 1].split("=", 1)
+            if name != "HOME" and not name.endswith("_DIR"):
+                monkeypatch.setenv(name, value)
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    host = command[command.index(manifest.image) + 2]
+    app = create_app(ProxyConfig(host=host, optimize=False, cache_enabled=False))
+
+    browser = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.1", 1))
+    assert browser.get("/stats-history").status_code == 200
+    other_container = TestClient(app, base_url="http://127.0.0.1:8787", client=("172.17.0.5", 1))
+    assert other_container.get("/stats-history").status_code == 404
 
 
 def test_build_runtime_command_preserves_non_ascii_ambient_token(

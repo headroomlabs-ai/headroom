@@ -248,7 +248,10 @@ class TestCLIProxyEnvVars:
             result = runner.invoke(
                 main,
                 ["proxy"],
-                env={"HEADROOM_HOST": "0.0.0.0"},
+                # 0.0.0.0 with no token is refused at startup since the bind
+                # policy landed (tests/test_proxy_bind_policy.py); this test is
+                # about env→config plumbing, so authenticate the bind.
+                env={"HEADROOM_HOST": "0.0.0.0", "HEADROOM_PROXY_TOKEN": "env-test-token"},
                 catch_exceptions=False,
             )
 
