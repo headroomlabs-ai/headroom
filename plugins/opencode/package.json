@@ -1,6 +1,6 @@
 {
   "name": "headroom-opencode",
-  "version": "0.37.0",
+  "version": "0.39.1",
   "description": "Headroom proxy integration plugin for OpenCode - routes LLM traffic through the Headroom proxy for token compression",
   "type": "module",
   "main": "./dist/index.js",
@@ -19,7 +19,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.18.2",
-    "headroom-ai": "^0.37.0"
+    "headroom-ai": "^0.39.1"
   },
   "peerDependencies": {
     "@ai-sdk/openai-compatible": "*",

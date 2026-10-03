@@ -75,11 +75,38 @@ def _app_and_outcomes(monkeypatch, **overrides):
     return app, outcomes
 
 
-def _post(app, *, stream: bool, tools: list[dict] | None):
+@pytest.fixture
+def ccr_marker() -> str:
+    """A marker this proxy actually owns, so retrieval could really fire.
+
+    The buffered path is only taken when the outgoing body carries a redeemable
+    marker (#3071); ``headroom_retrieve`` has nothing to expand otherwise. The
+    buffered tests are about what happens *on* that path, so they have to earn it.
+    """
+    from headroom.cache.backends import InMemoryBackend
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
+
+    reset_compression_store()
+    store = get_compression_store(backend=InMemoryBackend())
+    hash_key = store.store(
+        "the original, uncompressed tool output",
+        "<<ccr:placeholder>>",
+        original_tokens=100,
+        compressed_tokens=5,
+        tool_name="Read",
+    )
+    try:
+        yield hash_key
+    finally:
+        reset_compression_store()
+
+
+def _post(app, *, stream: bool, tools: list[dict] | None, marker: str | None = None):
+    text = "hi" if marker is None else f"hi, earlier output is at <<ccr:{marker}>>"
     body: dict[str, Any] = {
         "model": "claude-opus-5",
         "max_tokens": 256,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": text}],
     }
     if stream:
         body["stream"] = True
@@ -108,14 +135,14 @@ def test_non_stream_turn_records_provider_usage(monkeypatch) -> None:
 
 
 @respx.mock
-def test_buffered_ccr_turn_records_provider_usage(monkeypatch) -> None:
+def test_buffered_ccr_turn_records_provider_usage(monkeypatch, ccr_marker: str) -> None:
     """A stream:true + headroom_retrieve turn must book the same usage block."""
     app, outcomes = _app_and_outcomes(monkeypatch)
     route = respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(200, json=_RESPONSE)
     )
 
-    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL])
+    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], marker=ccr_marker)
 
     assert r.status_code == 200
     # The handler must have buffered it: upstream saw stream:false.
@@ -136,14 +163,14 @@ def test_buffered_ccr_turn_records_provider_usage(monkeypatch) -> None:
 
 
 @respx.mock
-def test_buffered_ccr_records_usage_with_compression_on(monkeypatch) -> None:
+def test_buffered_ccr_records_usage_with_compression_on(monkeypatch, ccr_marker: str) -> None:
     """Same turn with the live token-mode pipeline running, as in production."""
     app, outcomes = _app_and_outcomes(monkeypatch, optimize=True, mode="token")
     respx.post("https://api.anthropic.com/v1/messages").mock(
         return_value=httpx.Response(200, json=_RESPONSE)
     )
 
-    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL])
+    r = _post(app, stream=True, tools=[_RETRIEVE_TOOL], marker=ccr_marker)
 
     assert r.status_code == 200
     assert outcomes, "an outcome must be recorded"

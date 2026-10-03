@@ -531,9 +531,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # limit is the one 4xx a user is expected to act on (back off, raise a cap),
     # and folding it into a generic failure count hides exactly that. Both
     # counters are already exported and neither feeds savings.
+    #
+    # source="upstream": this funnel only ever sees a 429 the PROVIDER returned.
+    # Headroom's own limiter rejects before a request is ever sent and records
+    # source="headroom" from the handler. The two are acted on differently —
+    # raise our cap vs. back off / shard keys — so they must stay separable
+    # (issue #3696). ``outcome.provider`` is the already-Copilot-relabelled
+    # value, matching every other provider-labelled metric on this path.
     if outcome.status_code >= 400:
         if outcome.status_code == 429:
-            await handler.metrics.record_rate_limited(provider=outcome.provider)
+            await handler.metrics.record_rate_limited(provider=outcome.provider, source="upstream")
         else:
             await handler.metrics.record_failed(provider=outcome.provider)
         return
@@ -671,6 +678,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
+        # Already handed to the cost tracker below; the metrics path needs it
+        # too now that it prices savings cache-aware. An inferred write is the
+        # same tokens as `uncached_input_tokens` and carries no write premium,
+        # so counting it as a write would both double it and apply a premium
+        # OpenAI never charges.
+        cache_inferred=outcome.cache_inferred,
     )
 
     # 2. Cost tracker (optional).

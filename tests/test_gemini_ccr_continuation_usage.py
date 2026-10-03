@@ -91,6 +91,10 @@ class _Handler(GeminiHandlerMixin):
         self.memory_handler = None
         self.rate_limiter = None
         self.usage_reporter = None
+        # The mixin resolves a prefix tracker for the freeze floor (#3394).
+        from headroom.cache.prefix_tracker import SessionTrackerStore
+
+        self.session_tracker_store = SessionTrackerStore()
         self.config = SimpleNamespace(
             optimize=False,
             anthropic_pre_upstream_memory_context_timeout_seconds=0.1,

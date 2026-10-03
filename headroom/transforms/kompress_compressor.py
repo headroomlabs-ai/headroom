@@ -17,12 +17,14 @@ from __future__ import annotations
 import contextlib
 import gc
 import hashlib
+import itertools
 import logging
 import os
 import re
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from ..config import TransformResult
@@ -68,6 +70,16 @@ _KOMPRESS_MUST_KEEP_RE = re.compile(
     r"|(?i:\b(?:not|never|none|cannot|can't|don't|doesn't|didn't|won't|shouldn't"
     r"|mustn't|isn't|aren't|avoid|refuse|prohibited|forbidden|disallow|unless"
     r"|except|without|must|should|shall|required|always|only|mandatory)\b)"
+    # Boolean connectives, for the same reason as the directive words above:
+    # they decide WHICH predicates have to hold, so dropping one does not
+    # weaken the statement, it changes the condition. Negation was pinned but
+    # conjunction was not, so one line could lose its `or` and keep its `not`
+    # (issue #3545: 12 of 40 `or` lost from a repeated Python return line,
+    # while the same word survived 48/48 in prose). The surviving text is the
+    # dangerous part -- `a == b not c.startswith(d)` still reads as code, and
+    # nothing marks it as altered. Uppercase `AND`/`OR` were already held by
+    # the ALLCAPS class; only the lowercase forms leaked.
+    r"|(?i:\b(?:and|or|nor|xor)\b)"
 )
 _KOMPRESS_MUST_KEEP_ENV = "HEADROOM_KOMPRESS_MUST_KEEP"
 KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
@@ -85,6 +97,56 @@ def _add_kompress_must_keep_words(
     for word_idx, word in enumerate(chunk_words):
         if _KOMPRESS_MUST_KEEP_RE.search(word):
             kept_ids.add(word_idx + chunk_start)
+
+
+_TABULAR_ROW_SPLIT_RE = re.compile(r"\s{2,}")
+
+
+def _words_by_line(content: str) -> tuple[list[str], list[int]]:
+    """Split into words like content.split(), plus each word's source line index.
+
+    Reconstruction must never join words that came from different source lines
+    onto one line -- doing so can glue unrelated facts together (#3099).
+    """
+    words: list[str] = []
+    line_ids: list[int] = []
+    for line_idx, line in enumerate(content.split("\n")):
+        for word in line.split():
+            words.append(word)
+            line_ids.append(line_idx)
+    return words, line_ids
+
+
+def _join_kept_words_by_line(words: list[str], line_ids: list[int], kept_ids: set[int]) -> str:
+    """Rejoin kept words, starting a new line wherever they crossed a line boundary."""
+    parts: list[str] = []
+    prev_line: int | None = None
+    for i in sorted(kept_ids):
+        if prev_line is not None:
+            parts.append("\n" if line_ids[i] != prev_line else " ")
+        parts.append(words[i])
+        prev_line = line_ids[i]
+    return "".join(parts)
+
+
+def _tabular_protected_line_ids(content: str) -> set[int]:
+    """Flag lines in a run of >=3 consecutive lines with a consistent fixed-width
+    column count (ls -l, ps, etc.), so compression keeps each such row whole
+    instead of dropping individual fields inconsistently row to row (#3099).
+    Shares the must-keep toggle: HEADROOM_KOMPRESS_MUST_KEEP=0 disables this too.
+    """
+    if os.environ.get(_KOMPRESS_MUST_KEEP_ENV, "1") == "0":
+        return set()
+    cols_per_line = [
+        len(_TABULAR_ROW_SPLIT_RE.split(line.strip())) if line.strip() else 0
+        for line in content.split("\n")
+    ]
+    protected: set[int] = set()
+    for cols, group in itertools.groupby(enumerate(cols_per_line), key=lambda p: p[1]):
+        indices = [idx for idx, _ in group]
+        if cols >= 3 and len(indices) >= 3:
+            protected.update(indices)
+    return protected
 
 
 # ONNX artifacts are resolved against the model repo in this order, falling
@@ -484,6 +546,7 @@ def _kompress_content_signature(content: str) -> Any:
     )
 
 
+@lru_cache(maxsize=1)
 def _is_onnx_available() -> bool:
     """Check if ONNX Runtime is available (lightweight, no torch needed)."""
     try:
@@ -491,10 +554,13 @@ def _is_onnx_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # OSError: the package is installed but its native library will not
+        # load. See _is_pytorch_available for the full case.
         return False
 
 
+@lru_cache(maxsize=1)
 def _is_pytorch_available() -> bool:
     """Check if full PyTorch stack is available (requires [ml] extra)."""
     try:
@@ -503,7 +569,14 @@ def _is_pytorch_available() -> bool:
         import transformers  # noqa: F401
 
         return True
-    except ImportError:
+    except (ImportError, OSError):
+        # An installed-but-unloadable native dependency raises OSError, not
+        # ImportError: on Windows without the MSVC redistributable, importing
+        # torch fails with WinError 126 loading c10.dll. Catching only
+        # ImportError let that escape a probe whose contract is to return a
+        # bool, and callers guard the call with `except ImportError` too, so it
+        # propagated into the request path instead of degrading to "no
+        # kompress".
         return False
 
 
@@ -933,8 +1006,6 @@ def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
         padding=True,
         return_tensors="pt",
     )
-    input_ids = encoding["input_ids"].to(device)
-    attention_mask = encoding["attention_mask"].to(device)
     semaphore, _wait_ms = _acquire_execution_slot(
         "pytorch",
         device,
@@ -943,6 +1014,8 @@ def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
     assert semaphore is not None
     with contextlib.ExitStack() as stack:
         stack.callback(semaphore.release)
+        input_ids = encoding["input_ids"].to(device)
+        attention_mask = encoding["attention_mask"].to(device)
         scores = model.get_scores(input_ids, attention_mask)
         _ = scores[0].detach().cpu()
 
@@ -1097,10 +1170,13 @@ def _download_retry_blocked(model_id: str) -> bool:
     if entry is None:
         return False
     failures, last_attempt = entry
-    window = min(
-        _DOWNLOAD_RETRY_MAX_SECONDS,
-        _DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
-    )
+    # Stop doubling at the cap: computing 2 ** (failures - 1) first can
+    # overflow when converted to float after a long run of failed downloads.
+    window = min(_DOWNLOAD_RETRY_BASE_SECONDS, _DOWNLOAD_RETRY_MAX_SECONDS)
+    for _ in range(failures - 1):
+        if window >= _DOWNLOAD_RETRY_MAX_SECONDS:
+            break
+        window = min(window * 2, _DOWNLOAD_RETRY_MAX_SECONDS)
     return bool((time.monotonic() - last_attempt) < window)
 
 
@@ -1345,6 +1421,7 @@ def ccr_retrieval_marker(
     return (
         f"\n[{n_words} words compressed to {compressed_count}"
         f" (from {source_lines} source {line_word})."
+        " Original content preserved."
         f" Retrieve more: hash={cache_key}]"
     )
 
@@ -1402,6 +1479,14 @@ class KompressCompressor(Transform):
     """
 
     name: str = "kompress_compressor"
+
+    # ``compress()`` accepts ``_deadline_started_at``, so a caller that
+    # compresses many blocks for ONE request can hand every call the same
+    # origin and have the deadline bound the request. Duck-typed rather than
+    # isinstance-checked at the call site because ``RemoteKompressCompressor``
+    # is the other compressor the router may get back and its ``compress()``
+    # does not take the argument.
+    shares_request_deadline: bool = True
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
@@ -1495,12 +1580,21 @@ class KompressCompressor(Transform):
         )
         input_ids = encoding["input_ids"]
         attention_mask = encoding["attention_mask"]
-        if not is_onnx:
-            device = next(model.parameters()).device
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+        device_type = _model_device_type(model, backend)
+        semaphore, _wait_ms = _acquire_execution_slot(
+            backend,
+            device_type,
+            timeout_seconds=None,
+        )
+        assert semaphore is not None
         started = time.perf_counter()
-        model.get_keep_mask(input_ids, attention_mask)
+        with contextlib.ExitStack() as stack:
+            stack.callback(semaphore.release)
+            if not is_onnx:
+                device = next(model.parameters()).device
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+            model.get_keep_mask(input_ids, attention_mask)
         return time.perf_counter() - started
 
     def is_ready(self) -> bool:
@@ -1559,11 +1653,13 @@ class KompressCompressor(Transform):
             KompressResult with compressed text.
         """
         t_deadline = time.perf_counter() if _deadline_started_at is None else _deadline_started_at
-        words = content.split()
+        words, line_ids = _words_by_line(content)
         n_words = len(words)
 
         if n_words < max(10, self.config.min_input_words) or self._degraded_reason is not None:
             return self._passthrough(content, n_words)
+
+        protected_line_ids = _tabular_protected_line_ids(content)
 
         # Cooperative wall-clock budget (#1171): kompress ONNX inference is
         # O(tokens) and non-preemptible once the request's asyncio timeout fires,
@@ -1654,8 +1750,6 @@ class KompressCompressor(Transform):
 
                 if not is_onnx:
                     device = next(model.parameters()).device
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
 
                 request_remaining: float | None = None
                 if deadline_s:
@@ -1702,6 +1796,9 @@ class KompressCompressor(Transform):
 
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
+                    if not is_onnx:
+                        input_ids = input_ids.to(device)
+                        attention_mask = attention_mask.to(device)
                     inference_started = time.perf_counter()
                     if target_ratio is not None:
                         scores = model.get_scores(input_ids, attention_mask)
@@ -1744,6 +1841,10 @@ class KompressCompressor(Transform):
                 # reconstruct from context. Disable via HEADROOM_KOMPRESS_MUST_KEEP=0.
                 _add_kompress_must_keep_words(kept_ids, chunk_words, chunk_start)
 
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids:
+                    kept_ids.add(i)
+
             if not kept_ids:
                 if inference_ms >= 1000.0:
                     logger.info(
@@ -1758,7 +1859,7 @@ class KompressCompressor(Transform):
                 return self._passthrough(content, n_words)
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             cache_key: str | None = None
             original_tokens = n_words
@@ -1977,7 +2078,14 @@ class KompressCompressor(Transform):
             ]
 
         results: list[KompressResult | None] = [None] * n
-        word_lists: list[list[str]] = [c.split() for c in contents]
+        word_lists: list[list[str]] = []
+        line_id_lists: list[list[int]] = []
+        protected_line_ids_list: list[set[int]] = []
+        for c in contents:
+            words, line_ids = _words_by_line(c)
+            word_lists.append(words)
+            line_id_lists.append(line_ids)
+            protected_line_ids_list.append(_tabular_protected_line_ids(c))
 
         # Short texts short-circuit to passthrough — no model call needed.
         max_chunk_words = self.config.chunk_words
@@ -2065,8 +2173,6 @@ class KompressCompressor(Transform):
 
                 if not is_onnx:
                     device = next(model.parameters()).device
-                    input_ids = input_ids.to(device)
-                    attention_mask = attention_mask.to(device)
 
                 request_remaining: float | None = None
                 if deadline_s:
@@ -2103,6 +2209,9 @@ class KompressCompressor(Transform):
 
                 with contextlib.ExitStack() as stack:
                     stack.callback(semaphore.release)
+                    if not is_onnx:
+                        input_ids = input_ids.to(device)
+                        attention_mask = attention_mask.to(device)
                     inference_started = time.perf_counter()
                     scores = model.get_scores(input_ids, attention_mask)
                     inference_ms += (time.perf_counter() - inference_started) * 1000
@@ -2158,14 +2267,19 @@ class KompressCompressor(Transform):
                 continue
             content = contents[text_idx]
             words = word_lists[text_idx]
+            line_ids = line_id_lists[text_idx]
             n_words = len(words)
+
+            for i, line_id in enumerate(line_ids):
+                if line_id in protected_line_ids_list[text_idx]:
+                    kept_ids.add(i)
 
             if not kept_ids:
                 results[text_idx] = self._passthrough(content, n_words)
                 continue
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
-            compressed = " ".join(compressed_words)
+            compressed = _join_kept_words_by_line(words, line_ids, kept_ids)
             compressed_count = len(compressed_words)
             cache_key: str | None = None
             original_tokens = n_words

@@ -20,6 +20,7 @@ from headroom.cli.doctor import (
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_kompress_health,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
@@ -43,6 +44,38 @@ STATS_OK = {
     },
     "cost": {"budget_limit_usd": 10.0, "budget_period": "daily"},
 }
+
+
+class TestKompressHealth:
+    def test_missing_health_endpoint_skips(self):
+        result = check_kompress_health(None)
+        assert result.status == SKIP
+        assert "health endpoint" in result.summary
+
+    def test_older_proxy_without_component_warns(self):
+        result = check_kompress_health({"checks": {}})
+        assert result.status == WARN
+        assert "readiness" in result.summary
+
+    def test_disabled_passes(self):
+        result = check_kompress_health({"checks": {"kompress": {"enabled": False}}})
+        assert result.status == PASS
+        assert result.summary == "disabled"
+
+    def test_ready_reports_backend(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": True, "backend": "onnx"}}}
+        )
+        assert result.status == PASS
+        assert result.summary == "ready (onnx)"
+
+    def test_cold_model_warns_with_action(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": False, "status": "degraded"}}}
+        )
+        assert result.status == WARN
+        assert "passing through" in result.summary
+        assert "/debug/warmup" in (result.hint or "")
 
 
 class TestProxyLiveness:
@@ -151,6 +184,42 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+    def test_foundry_url_passes(self, tmp_path):
+        # In Foundry mode ANTHROPIC_BASE_URL is absent by design; routing lives
+        # in ANTHROPIC_FOUNDRY_BASE_URL. doctor must recognize it as routed.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_USE_FOUNDRY": "1",
+                        "ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == PASS
+
+    def test_foundry_without_base_url_warns(self, tmp_path):
+        # Foundry mode on but no upstream URL configured: still unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
+    def test_foundry_url_ignored_without_flag(self, tmp_path):
+        # Without CLAUDE_CODE_USE_FOUNDRY the foundry URL is not consulted, so a
+        # settings file carrying only the foundry key reads as unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
 
 
 class TestClaudeDesktop:
@@ -763,6 +832,9 @@ class TestDoctorCommand:
         """Point all filesystem/network surfaces at controlled fakes."""
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
+        monkeypatch.setattr(
+            doctor_mod, "codex_project_config_path", lambda: tmp_path / "project-codex.toml"
+        )
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
         for var in (
