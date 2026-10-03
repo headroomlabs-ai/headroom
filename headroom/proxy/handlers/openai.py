@@ -63,6 +63,7 @@ from headroom.copilot_auth import (
     is_copilot_api_url,
 )
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.codex.project_context import CodexProjectContextResolver
 from headroom.providers.codex.responses import (
     codex_responses_http_url,
     codex_responses_websocket_url,
@@ -6014,10 +6015,6 @@ class OpenAIHandlerMixin:
         bind_scope(tags, request.scope)
         client = classify_client(headers)
 
-        # Learn from the original client payload before memory context or
-        # compression mutates it. This mirrors the Anthropic ingestion path.
-        await self._observe_openai_responses_traffic(body, request_id=request_id)
-
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -6052,7 +6049,11 @@ class OpenAIHandlerMixin:
         headers = {
             key: value
             for key, value in headers.items()
-            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+            if key.lower()
+            not in {
+                _CODEX_RESPONSES_LITE_HEADER,
+                "x-codex-turn-metadata",
+            }
         }
         log_outbound_headers(
             forwarder="openai_responses",
@@ -6062,6 +6063,56 @@ class OpenAIHandlerMixin:
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
+        codex_project = None
+        codex_project_root_override = (
+            getattr(getattr(self.memory_handler, "config", None), "project_root_override", "")
+            or getattr(self.config, "memory_project_root_override", "")
+            or None
+        )
+        if client == "codex":
+            codex_project = await CodexProjectContextResolver().resolve_async(
+                headers=dict(request.headers),
+                body=body,
+                project_root_override=codex_project_root_override,
+            )
+            tags["codex_project_context"] = codex_project.reason
+            if codex_project.project_key and classify_project(request.headers) is None:
+                set_current_project(codex_project.project_key)
+        codex_project_scope_required = client == "codex" and (
+            is_chatgpt_auth
+            or bool(request.headers.get("x-codex-turn-metadata"))
+            or "codex" in str(request.headers.get("user-agent") or "").lower()
+            or any(
+                isinstance(container, dict)
+                and isinstance(container.get("client_metadata"), dict)
+                and bool(container["client_metadata"].get("thread_id"))
+                for container in (
+                    body,
+                    body.get("response") if isinstance(body.get("response"), dict) else {},
+                )
+            )
+        )
+        codex_project_features_allowed = not codex_project_scope_required or bool(
+            codex_project
+            and (
+                codex_project.cwd is not None
+                or codex_project.source
+                in {
+                    "x-headroom-project-id",
+                    "x-headroom-cwd",
+                    "configured-project-root",
+                }
+            )
+        )
+        resolved_project_root_override = codex_project_root_override or (
+            str(codex_project.cwd) if codex_project and codex_project.cwd else None
+        )
+        # The shared learner cannot isolate project state. Scoped Codex turns
+        # skip learning until a project-scoped learner is available.
+        if not codex_project_scope_required and (
+            codex_project is None or codex_project.reason == "metadata_missing"
+        ):
+            await self._observe_openai_responses_traffic(body, request_id=request_id)
         memory_client = (
             "codex"
             if is_chatgpt_auth
@@ -6117,7 +6168,7 @@ class OpenAIHandlerMixin:
         # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
         memory_user_id: str | None = None
         memory_request_ctx = None
-        if self.memory_handler:
+        if self.memory_handler and codex_project_features_allowed:
             memory_user_id = resolve_memory_identity(request)
             from headroom.memory.storage_router import (
                 RequestContext as _MemRequestContext,
@@ -6130,9 +6181,7 @@ class OpenAIHandlerMixin:
                 headers=dict(request.headers),
                 system_prompt=_extract_sys_prompt(body),
                 base_user_id=memory_user_id,
-                project_root_override=(
-                    getattr(self.memory_handler.config, "project_root_override", "") or None
-                ),
+                project_root_override=resolved_project_root_override,
             )
 
         # Rate limiting
@@ -6201,11 +6250,13 @@ class OpenAIHandlerMixin:
 
         responses_memory_decision = MemoryDecision.decide(
             headers=request.headers,
-            memory_handler=self.memory_handler,
+            memory_handler=self.memory_handler if codex_project_features_allowed else None,
             memory_user_id=memory_user_id,
             mode_name=get_memory_injection_mode(),
         )
         responses_memory_decision.apply_to_tags(tags)
+        if not codex_project_features_allowed:
+            tags["memory_skip_reason"] = "project_unresolved"
         if responses_memory_decision.inject:
             try:
                 # Memory context now routes exclusively to the live-zone tail
@@ -6602,7 +6653,9 @@ class OpenAIHandlerMixin:
         )
         buffered_stream_ccr = _should_buffer_openai_responses_stream_ccr(
             stream=stream,
-            ccr_response_handler_enabled=_ccr_response_handler_enabled,
+            ccr_response_handler_enabled=(
+                _ccr_response_handler_enabled and codex_project_features_allowed
+            ),
             tools=body.get("tools"),
             is_chatgpt_auth=is_chatgpt_auth,
             upstream_base_url=upstream_base_url,
@@ -7427,7 +7480,11 @@ class OpenAIHandlerMixin:
         upstream_headers = {
             key: value
             for key, value in upstream_headers.items()
-            if key.lower() != _CODEX_RESPONSES_LITE_HEADER
+            if key.lower()
+            not in {
+                _CODEX_RESPONSES_LITE_HEADER,
+                "x-codex-turn-metadata",
+            }
         }
         ws_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
@@ -7875,22 +7932,6 @@ class OpenAIHandlerMixin:
             # the full history; reconnect replays it wholesale) is not counted
             # as new evidence. Seeded from the first frame as a baseline.
             ws_learner_seen_call_ids: set[str] = set()
-            # Baseline the first frame's transcript into the learner: record its
-            # tool-call ids as seen WITHOUT learning, so a reconnect that replays
-            # this history adds no spurious evidence. Later frames learn only the
-            # results appended after this point. `body` here is the original
-            # client frame (parsed before memory injection / compression).
-            if isinstance(body, dict) and body:
-                _ws_first_inner = (
-                    body["response"] if isinstance(body.get("response"), dict) else body
-                )
-                if isinstance(_ws_first_inner, dict):
-                    await self._observe_openai_ws_response_create(
-                        _ws_first_inner,
-                        seen_call_ids=ws_learner_seen_call_ids,
-                        baseline=True,
-                        request_id=request_id,
-                    )
             ws_client_frames_total = 1
             ws_upstream_frames_total = 0
             ws_cancel_frames = 0
@@ -8004,23 +8045,142 @@ class OpenAIHandlerMixin:
 
             memory_user_id: str | None = None
             memory_request_ctx = None
+            ws_project_resolver = CodexProjectContextResolver()
+            ws_pinned_project_cwd = None
+            ws_turn_project_key = classify_project(ws_headers)
+            ws_project_scope_required = client == "codex" and (
+                is_chatgpt_auth
+                or "codex" in str(_header_get(ws_headers, "user-agent") or "").lower()
+            )
+            ws_turn_project_features_allowed = not ws_project_scope_required
+            ws_turn_learning_allowed = not ws_project_scope_required
+            ws_first_project_resolution = True
+            ws_memory_generation = 0
+            ws_memory_response_pending = False
+            ws_memory_overlap = False
+            ws_project_root_override = (
+                getattr(
+                    getattr(self.memory_handler, "config", None),
+                    "project_root_override",
+                    "",
+                )
+                or getattr(self.config, "memory_project_root_override", "")
+                or None
+            )
             from headroom.proxy.helpers import get_memory_injection_mode, log_memory_injection
             from headroom.proxy.memory_decision import MemoryDecision
             from headroom.proxy.memory_query import MemoryQuery
 
             async def _prepare_memory_frame(frame_body: dict[str, Any], frame_raw: str) -> str:
                 nonlocal memory_user_id, memory_request_ctx
+                nonlocal ws_pinned_project_cwd, ws_turn_project_key
+                nonlocal ws_turn_project_features_allowed
+                nonlocal ws_turn_learning_allowed, ws_first_project_resolution
+                nonlocal ws_project_scope_required
+                nonlocal ws_memory_generation
+                nonlocal ws_memory_response_pending, ws_memory_overlap
+
+                # Without turn IDs on response events, overlapping creates are
+                # ambiguous. Keep forwarding, but disable tool interception.
+                ws_memory_overlap = ws_memory_overlap or ws_memory_response_pending
+                ws_memory_response_pending = True
+                ws_memory_generation += 1
+                memory_user_id = None
+                memory_request_ctx = None
+                first_project_resolution = ws_first_project_resolution
+                ws_first_project_resolution = False
+
+                resolved_project_root_override = ws_project_root_override
+                if client == "codex":
+                    # Handshake turn metadata describes only the first frame.
+                    # Frame metadata takes precedence, including invalid metadata.
+                    containers = ws_project_resolver._body_containers(frame_body)
+                    frame_has_project_metadata = any(
+                        any(
+                            key in container for key in ("cwd", "working_directory", "project_root")
+                        )
+                        or (
+                            "client_metadata" in container
+                            and (
+                                not isinstance(container["client_metadata"], dict)
+                                or any(
+                                    key in container["client_metadata"]
+                                    for key in (
+                                        "thread_id",
+                                        "turn_id",
+                                        "cwd",
+                                        "working_directory",
+                                        "project_root",
+                                    )
+                                )
+                            )
+                        )
+                        for container in containers
+                    )
+                    project_headers = {
+                        key: value
+                        for key, value in ws_headers.items()
+                        if key.lower() != "x-codex-turn-metadata"
+                        or (first_project_resolution and not frame_has_project_metadata)
+                    }
+                    resolved_project = await ws_project_resolver.resolve_async(
+                        headers=project_headers,
+                        body=frame_body,
+                        pinned_cwd=ws_pinned_project_cwd,
+                        project_root_override=ws_project_root_override,
+                    )
+                    ws_tags["codex_project_context"] = resolved_project.reason
+                    frame_project_scope_required = (
+                        ws_project_scope_required or resolved_project.reason != "metadata_missing"
+                    )
+                    ws_project_scope_required = frame_project_scope_required
+                    # The shared TrafficLearner has no per-project state or routing.
+                    # Skip scoped turns until a project-scoped learner is available.
+                    ws_turn_learning_allowed = not frame_project_scope_required
+                    ws_turn_project_features_allowed = (
+                        not frame_project_scope_required
+                        or resolved_project.cwd is not None
+                        or resolved_project.source
+                        in {
+                            "x-headroom-project-id",
+                            "x-headroom-cwd",
+                            "configured-project-root",
+                        }
+                    )
+                    if resolved_project.cwd is not None:
+                        if ws_pinned_project_cwd is None:
+                            ws_pinned_project_cwd = resolved_project.cwd
+                        resolved_project_root_override = str(resolved_project.cwd)
+                    ws_turn_project_key = classify_project(ws_headers) or (
+                        resolved_project.project_key if ws_turn_project_features_allowed else None
+                    )
+
+                if first_project_resolution and ws_turn_learning_allowed:
+                    inner_payload = frame_body.get("response", frame_body)
+                    if isinstance(inner_payload, dict):
+                        await self._observe_openai_ws_response_create(
+                            inner_payload,
+                            seen_call_ids=ws_learner_seen_call_ids,
+                            baseline=True,
+                            request_id=request_id,
+                        )
 
                 memory_user_id_candidate = (
-                    resolve_memory_identity(websocket) if self.memory_handler else None
+                    resolve_memory_identity(websocket)
+                    if self.memory_handler and ws_turn_project_features_allowed
+                    else None
                 )
                 memory_decision = MemoryDecision.decide(
                     headers=ws_headers,
-                    memory_handler=self.memory_handler,
+                    memory_handler=(
+                        self.memory_handler if ws_turn_project_features_allowed else None
+                    ),
                     memory_user_id=memory_user_id_candidate,
                     mode_name=get_memory_injection_mode(),
                 )
                 memory_decision.apply_to_tags(ws_tags)
+                if not ws_turn_project_features_allowed:
+                    ws_tags["memory_skip_reason"] = "project_unresolved"
                 if not memory_decision.inject:
                     return frame_raw
 
@@ -8042,9 +8202,7 @@ class OpenAIHandlerMixin:
                         headers=dict(ws_headers),
                         system_prompt=str(ws_response_body.get("instructions") or ""),
                         base_user_id=memory_user_id,
-                        project_root_override=(
-                            getattr(self.memory_handler.config, "project_root_override", "") or None
-                        ),
+                        project_root_override=resolved_project_root_override,
                     )
 
                     # Debug: log what Codex sends so we can see the full tool list
@@ -8618,12 +8776,13 @@ class OpenAIHandlerMixin:
                         # Learn from this turn's newly appended tool results.
                         # Dedup against the per-connection baseline so the
                         # replayed transcript prefix is not re-counted.
-                        await self._observe_openai_ws_response_create(
-                            inner_payload,
-                            seen_call_ids=ws_learner_seen_call_ids,
-                            baseline=False,
-                            request_id=request_id,
-                        )
+                        if ws_turn_learning_allowed:
+                            await self._observe_openai_ws_response_create(
+                                inner_payload,
+                                seen_call_ids=ws_learner_seen_call_ids,
+                                baseline=False,
+                                request_id=request_id,
+                            )
                         store_forced = _ensure_chatgpt_responses_store_false(
                             inner_payload,
                             is_chatgpt_auth=is_chatgpt_auth,
@@ -9083,6 +9242,7 @@ class OpenAIHandlerMixin:
                         # over ``upstream_disconnect``.
                         nonlocal response_completed_seen
                         nonlocal upstream_relay_error
+                        nonlocal ws_memory_response_pending
                         nonlocal ws_input_tokens_total, ws_output_tokens_total
                         nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
                         nonlocal ws_uncached_input_tokens_total
@@ -9103,6 +9263,11 @@ class OpenAIHandlerMixin:
                         suppress_response = False
                         pending_fcs: list[dict[str, Any]] = []
                         response_output_items: list[dict[str, Any]] = []
+                        response_memory_generation = ws_memory_generation
+                        response_memory_user_id = memory_user_id
+                        response_memory_request_ctx = memory_request_ctx
+                        response_input = list(current_response_input)
+                        response_template = dict(current_response_template)
 
                         def _reset() -> None:
                             nonlocal decided, suppress_response
@@ -9222,6 +9387,7 @@ class OpenAIHandlerMixin:
                                     conversation_key=ws_conversation_key,
                                     conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
+                                    project=ws_turn_project_key,
                                 )
                             )
 
@@ -9334,6 +9500,17 @@ class OpenAIHandlerMixin:
 
                                 if event_type == "response.created":
                                     response_started_ms = time.perf_counter() * 1000.0
+                                    response_memory_generation = ws_memory_generation
+                                    response_memory_user_id = memory_user_id
+                                    response_memory_request_ctx = memory_request_ctx
+                                    response_input = list(current_response_input)
+                                    response_template = dict(current_response_template)
+                                if event_type in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.incomplete",
+                                }:
+                                    ws_memory_response_pending = False
                                 (
                                     usage_input_tokens,
                                     usage_output_tokens,
@@ -9348,12 +9525,26 @@ class OpenAIHandlerMixin:
                                     ws_cache_write_tokens_total += usage_cache_write_tokens
                                     ws_uncached_input_tokens_total += usage_uncached_tokens
 
+                                if event_type in {"response.failed", "response.incomplete"}:
+                                    for buffered_event in event_buffer:
+                                        await websocket.send_text(buffered_event)
+                                    _reset()
+                                    await websocket.send_text(msg_str)
+                                    continue
+
                                 memory_enabled = bool(
                                     self.memory_handler
-                                    and memory_user_id
+                                    and response_memory_user_id
+                                    and response_memory_request_ctx
+                                    and response_memory_generation == ws_memory_generation
+                                    and not ws_memory_overlap
+                                    and ws_turn_project_features_allowed
                                     and ws_memory_tools_allowed
                                 )
                                 if not memory_enabled:
+                                    for buffered_event in event_buffer:
+                                        await websocket.send_text(buffered_event)
+                                    _reset()
                                     if event_type == "response.completed":
                                         response_completed_seen = True
                                         await _record_ws_response_metrics()
@@ -9370,8 +9561,9 @@ class OpenAIHandlerMixin:
                                         ):
                                             pending_fcs.append(item)
 
-                                if not decided:
+                                if not decided or suppress_response:
                                     event_buffer.append(msg_str)
+                                if not decided:
                                     if event_type == "response.output_item.added":
                                         item = event.get("item", {})
                                         if (
@@ -9381,7 +9573,6 @@ class OpenAIHandlerMixin:
                                         ):
                                             suppress_response = True
                                             decided = True
-                                            event_buffer.clear()
                                             logger.info(
                                                 f"[{request_id}] WS Memory: Detected "
                                                 f"{item.get('name')} — suppressing response"
@@ -9437,12 +9628,15 @@ class OpenAIHandlerMixin:
                                         fc_args = {}
 
                                     await self.memory_handler._ensure_initialized()
+                                    if response_memory_generation != ws_memory_generation:
+                                        break
                                     if self.memory_handler._backend:
                                         result = await self.memory_handler._execute_memory_tool(
                                             fc_name,
                                             fc_args,
-                                            memory_user_id,
+                                            response_memory_user_id,
                                             "openai",
+                                            request_context=response_memory_request_ctx,
                                         )
                                     else:
                                         result = json.dumps({"error": "backend not ready"})
@@ -9456,12 +9650,16 @@ class OpenAIHandlerMixin:
                                     )
                                     logger.info(
                                         f"[{request_id}] WS Memory: Executed "
-                                        f"{fc_name} for user {memory_user_id}"
+                                        f"{fc_name} for user {response_memory_user_id}"
                                     )
 
-                                stateless_input = _responses_stateless_input_items(
-                                    current_response_input
-                                )
+                                if response_memory_generation != ws_memory_generation:
+                                    for buffered_event in event_buffer:
+                                        await websocket.send_text(buffered_event)
+                                    _reset()
+                                    continue
+
+                                stateless_input = _responses_stateless_input_items(response_input)
                                 stateless_output = _responses_stateless_output_items(
                                     response_output_items
                                 )
@@ -9471,7 +9669,7 @@ class OpenAIHandlerMixin:
                                     *tool_outputs,
                                 ]
                                 continuation_response = {
-                                    **current_response_template,
+                                    **response_template,
                                     "input": current_response_input,
                                 }
                                 continuation_response.pop("previous_response_id", None)
@@ -9480,6 +9678,7 @@ class OpenAIHandlerMixin:
                                     "response": continuation_response,
                                 }
                                 continuation_raw = _strip_codex_lite_metadata(json.dumps(cont))
+                                ws_memory_response_pending = True
                                 await upstream.send(
                                     _normalize_ws_response_create_for_upstream(continuation_raw)
                                 )
@@ -9851,6 +10050,7 @@ class OpenAIHandlerMixin:
                         conversation_key=ws_conversation_key,
                         conversation_tokens_saved=ws_conversation_tokens_saved,
                         client=client,
+                        project=ws_turn_project_key,
                         request_messages=ws_messages_for_log
                         if getattr(self.config, "log_full_messages", False)
                         else None,
