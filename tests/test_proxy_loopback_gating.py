@@ -134,6 +134,7 @@ CSRF_GUARDED = [
     "/stats/reset",
     "/cache/clear",
     "/v1/retrieve",
+    "/v1/retrieve/tool_call",
     "/v1/telemetry/import",
     "/admin/runtime-env",
 ]
