@@ -2174,6 +2174,11 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(compression_input),
                                         frozen_message_count=prefix_n,
+                                        # The compressed delta is replayed
+                                        # verbatim next turn, so the router
+                                        # keeps the newest user prompt intact
+                                        # here as on every other path (#1174).
+                                        prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         protect=protect,
