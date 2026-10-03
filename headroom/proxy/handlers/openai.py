@@ -77,6 +77,7 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.copilot import model_prefers_responses_api
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.proxy_targets import route_grok_to_xai
+from headroom.proxy import public_errors
 from headroom.proxy.auth_mode import (
     classify_auth_mode,
     classify_client,
@@ -93,15 +94,16 @@ from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.passthrough import CUSTOM_BASE_PROVIDER, is_opencode_zen_base
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
-from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
     set_current_project,
 )
+from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_from_usage
 from headroom.proxy.token_counting import gemini_output_tokens
 
@@ -1833,6 +1835,7 @@ class OpenAIHandlerMixin:
         return await count_tokens_offloaded(self, model, messages)
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
+    OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES = 8192
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
@@ -2175,12 +2178,22 @@ class OpenAIHandlerMixin:
             return payload, False, 0, [], {}, [], 0
 
         def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
-            # Only tool-output items are eligible for in-place compression.
-            # Message items (user/system/assistant) sit inside the request's
-            # cacheable prefix; mutating them busts prefix caching on every
-            # subsequent turn. Role-level guards in compression_units.py
-            # remain as defense-in-depth.
+            # Tool outputs and historical message text are eligible for
+            # in-place compression. The current user message is filtered below.
             type_tag = item.get("type")
+            if type_tag == "message":
+                content = item.get("content")
+                if isinstance(content, str):
+                    return [(content, ("content", None))]
+                if not isinstance(content, list):
+                    return []
+                return [
+                    (part["text"], ("content_text", index))
+                    for index, part in enumerate(content)
+                    if isinstance(part, dict)
+                    and part.get("type") in {"input_text", "output_text", "text"}
+                    and isinstance(part.get("text"), str)
+                ]
             if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 return []
             output = item.get("output")
@@ -2210,6 +2223,20 @@ class OpenAIHandlerMixin:
                 if isinstance(output, list) and 0 <= index < len(output):
                     part = output[index]
                     if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}:
+                        part["text"] = replacement
+                        return True
+            if kind == "content":
+                item["content"] = replacement
+                return True
+            if kind == "content_text" and isinstance(index, int):
+                content = item.get("content")
+                if isinstance(content, list) and 0 <= index < len(content):
+                    part = content[index]
+                    if isinstance(part, dict) and part.get("type") in {
+                        "input_text",
+                        "output_text",
+                        "text",
+                    }:
                         part["text"] = replacement
                         return True
             return False
@@ -2348,6 +2375,16 @@ class OpenAIHandlerMixin:
         # normal candidate compression — no ML, byte/data-lossless only.
         lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
         extraction_debug: list[dict[str, Any]] = []
+        last_user_item_idx = max(
+            (
+                idx
+                for idx, item in enumerate(items)
+                if isinstance(item, dict)
+                and item.get("type") == "message"
+                and item.get("role") == "user"
+            ),
+            default=-1,
+        )
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
                 if debug_enabled:
@@ -2490,6 +2527,48 @@ class OpenAIHandlerMixin:
                                 "item": item,
                             }
                         )
+            elif item_type == "message":
+                if item.get("role") == "user" and idx == last_user_item_idx:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "current_user_message_protected",
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "item": item,
+                            }
+                        )
+                    continue
+                slots = _slot_texts(item)
+                for text, slot_ref in slots:
+                    candidates.append((idx, slot_ref, text))
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": True,
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "slot": slot_ref,
+                                "text_chars": len(text),
+                                "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                "text_json_shape": _json_shape(text),
+                                "item": item,
+                                "text": text,
+                            }
+                        )
+                if not slots and debug_enabled:
+                    extraction_debug.append(
+                        {
+                            "index": idx,
+                            "eligible": False,
+                            "reason": "supported_type_without_text_slot",
+                            "item_type": item_type,
+                            "item": item,
+                        }
+                    )
             else:
                 if debug_enabled:
                     extraction_debug.append(
@@ -2554,6 +2633,16 @@ class OpenAIHandlerMixin:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
             role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+            metadata: dict[str, str] = {}
+            if role == "assistant":
+                metadata["compress_assistant"] = "true"
+            if role == "user" and item_idx != last_user_item_idx:
+                metadata["compress_user"] = "true"
+            min_bytes = (
+                self.OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES
+                if item_type == "message"
+                else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+            )
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -2562,7 +2651,8 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                min_bytes=min_bytes,
+                metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -3450,6 +3540,16 @@ class OpenAIHandlerMixin:
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
+        # Phase F PR-F3: resolve per-tenant TOIN key (header / hash /
+        # global) and populate the request-scoped ContextVar that
+        # SmartCrusher's deep-stack `record_compression` reads. See
+        # `headroom/proxy/tenant_key.py` for the threat model and the
+        # resolution rules.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
+
         # Check request body size
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
@@ -3642,7 +3742,12 @@ class OpenAIHandlerMixin:
             handler_path,
             custom_upstream_base_url or "",
         )
-        openai_chat_outcome_provider = custom_chat_provider or "openai"
+        # Fixed taxonomy from the shared helper (zen, zai, meta, openai); any
+        # other custom base is the shared "custom" bucket. Never derive the
+        # label from the request-controlled hostname — see the review on #3759.
+        openai_chat_outcome_provider = custom_chat_provider or (
+            CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai"
+        )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` for the
@@ -4349,6 +4454,19 @@ class OpenAIHandlerMixin:
                 openai_prefix_tracker.get_last_forwarded_messages(),
                 confirmed_frozen_count=_openai_confirmed_frozen,
             ).messages
+
+        # Both replays above forward earlier turns' messages byte-identical,
+        # including the cache_control each carried back then. Chat Completions
+        # clients mark the message dict and an assistant's tool_calls, which the
+        # block-level normalizer does not see, so without this the markers
+        # accumulate turn over turn and an Anthropic-backed gateway rejects the
+        # request (more than four breakpoints). Content is untouched: only the
+        # markers move.
+        from headroom.cache.prefix_tracker import mirror_client_message_cache_control
+
+        optimized_messages = mirror_client_message_cache_control(
+            optimized_messages, original_client_messages
+        )
 
         # Memory: inject context and tools for OpenAI requests.
         #
@@ -5113,13 +5231,11 @@ class OpenAIHandlerMixin:
                 logger.error(f"[{request_id}] Backend error: {e}")
                 return JSONResponse(
                     status_code=500,
-                    content={
-                        "error": {
-                            "message": str(e),
-                            "type": "api_error",
-                            "code": "backend_error",
-                        }
-                    },
+                    content=public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        request_id=str(request_id),
+                        error_type="api_error",
+                    ),
                 )
 
         # Direct OpenAI API (no backend configured). Reuse the upstream resolved
@@ -5792,6 +5908,16 @@ class OpenAIHandlerMixin:
         auth_mode = classify_auth_mode(request.headers)
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
+
+        # Phase F PR-F3: resolve per-tenant TOIN key (header / hash /
+        # global) and populate the request-scoped ContextVar that
+        # SmartCrusher's deep-stack `record_compression` reads. See
+        # `headroom/proxy/tenant_key.py` for the threat model and the
+        # resolution rules.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
 
         # Check request body size
         content_length = request.headers.get("content-length")
@@ -7472,8 +7598,16 @@ class OpenAIHandlerMixin:
                 from headroom.subscription.codex_rate_limits import (
                     maybe_schedule_usage_poll,
                 )
+                from headroom.subscription.credential_policy import (
+                    is_local_operator_connection,
+                )
 
-                maybe_schedule_usage_poll(ws_headers)
+                # The poll spends the caller's own bearer: local operator only
+                # (01-F16).
+                maybe_schedule_usage_poll(
+                    ws_headers,
+                    from_local_operator=is_local_operator_connection(websocket),
+                )
 
         try:
             # ChatGPT-auth sessions no longer need upstream x-codex-* headers on
@@ -10857,12 +10991,10 @@ class OpenAIHandlerMixin:
             await self.metrics.record_failed(provider="compress")
             return JSONResponse(
                 status_code=503,
-                content={
-                    "error": {
-                        "type": "compression_error",
-                        "message": str(e),
-                    }
-                },
+                content=public_errors.openai_error_body(
+                    public_errors.classify_or_internal(e),
+                    error_type="compression_error",
+                ),
             )
 
     async def handle_compress_usage(self, request: Request) -> JSONResponse:
@@ -11256,12 +11388,11 @@ class OpenAIHandlerMixin:
             tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
-                    {
-                        "error": {
-                            "type": "connection_error",
-                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
-                        }
-                    }
+                    public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        error_type="connection_error",
+                        hint=tls_hint,
+                    )
                 ),
                 status_code=502,
                 media_type="application/json",
@@ -11471,12 +11602,11 @@ class OpenAIHandlerMixin:
             tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
-                    {
-                        "error": {
-                            "type": "connection_error",
-                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
-                        }
-                    }
+                    public_errors.openai_error_body(
+                        public_errors.classify_or_internal(e),
+                        error_type="connection_error",
+                        hint=tls_hint,
+                    )
                 ),
                 status_code=502,
                 media_type="application/json",

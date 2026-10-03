@@ -1114,11 +1114,24 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     "memory" opts back into the in-process dict. Other values load
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
+
+    Stateless mode (``--stateless`` / ``HEADROOM_STATELESS``) never opens the
+    SQLite file: the entries it would hold are the verbatim tool outputs that
+    stateless deployments run stateless to keep off disk. The default and an
+    explicit ``sqlite`` both fall back to the in-process store (retrieval then
+    does not survive a restart or cross workers, which is the documented
+    stateless trade-off). A named entry-point backend is still honoured — the
+    operator chose it explicitly, and it is how a stateless multi-worker
+    deployment gets a non-file (e.g. redis) store.
     """
+    from ..paths import persistence_allowed
+
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None
     if not backend_type or backend_type == "sqlite":
+        if not persistence_allowed("CCR retrieval store (ccr_store.db)"):
+            return None
         try:
             from .backends.sqlite import SQLiteBackend
 
@@ -1195,6 +1208,22 @@ def get_compression_store(
                     backend=backend,
                 )
     return _compression_store
+
+
+def detach_compression_store() -> None:
+    """Drop the global compression store without clearing it.
+
+    The next :func:`get_compression_store` builds a fresh store from the
+    current settings. Unlike :func:`reset_compression_store`, the old store's
+    entries are left as they are: nothing is deleted from its backend, so a
+    SQLite file is neither written nor emptied. Used when the proxy switches to
+    stateless mode at runtime. The old backend is not closed, because code
+    that already holds the old store may still be using it.
+    """
+    global _compression_store
+
+    with _store_lock:
+        _compression_store = None
 
 
 def reset_compression_store() -> None:
