@@ -21,9 +21,15 @@ import logging
 import os
 import re
 import warnings
+from datetime import datetime
 from typing import Any, cast
 
 from headroom import paths as _paths
+from headroom.pricing.deepseek_tiers import (
+    LEGACY_MODEL_IDS,
+    OFF_PEAK_RATES_PER_1M,
+    off_peak_rates,
+)
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers.base import (
     TokenCountCache,
@@ -102,8 +108,12 @@ def sanitize_anthropic_model_metadata(value: Any) -> Any:
 # Anthropic model context limits
 # All Claude 3+ models have 200K context
 ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
-    # Claude Fable 5 - 1M context
+    # Claude Fable 5.1 / Fable 5 - 1M context
+    "claude-fable-5-1": 1000000,
     "claude-fable-5": 1000000,
+    # Claude Opus 5.5 / Opus 5 - 1M context
+    "claude-opus-5-5": 1000000,
+    "claude-opus-5": 1000000,
     # Claude Opus 4.8 - 1M context
     "claude-opus-4-8": 1000000,
     # Claude 4.7 (Opus 4.7) - 1M context
@@ -112,7 +122,8 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
     "claude-opus-4-6": 1000000,
     # Claude 4.5 (Opus 4.5)
     "claude-opus-4-5-20251101": 200000,
-    # Claude Sonnet 5 - 1M context
+    # Claude Sonnet 5.5 / Sonnet 5 - 1M context
+    "claude-sonnet-5-5": 1000000,
     "claude-sonnet-5": 1000000,
     # Claude Sonnet 4.6 - 1M context window
     "claude-sonnet-4-6": 1000000,
@@ -139,10 +150,20 @@ ANTHROPIC_CONTEXT_LIMITS: dict[str, int] = {
 
 # Fallback pricing - LiteLLM is preferred source
 # NOTE: These are ESTIMATES. Always verify against actual Anthropic billing.
-# Last updated: 2026-07-04
+# Last updated: 2026-09-29 (platform.claude.com/docs/en/about-claude/pricing)
+#
+# Newer ids come before their prefixes: `_get_pricing` falls back to substring
+# matching in insertion order, so a dated or suffixed "claude-sonnet-5-5-..."
+# must hit the Sonnet 5.5 row before it can hit "claude-sonnet-5".
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
+    # Claude Fable 5.1: $10 in / $50 out, cache read $0.25 (0.025x input).
+    "claude-fable-5-1": {"input": 10.00, "output": 50.00, "cached_input": 0.25},
     # Claude Fable 5 (anthropic.com/pricing): $10 in / $50 out, cache read $1.
     "claude-fable-5": {"input": 10.00, "output": 50.00, "cached_input": 1.00},
+    # Claude Opus 5.5: $4 in / $20 out, cache read $0.20 (0.05x input).
+    "claude-opus-5-5": {"input": 4.00, "output": 20.00, "cached_input": 0.20},
+    # Claude Opus 5: $5 in / $25 out, cache read $0.50.
+    "claude-opus-5": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude Opus 4.8 — current Opus tier: $5 in / $25 out, cache read $0.50.
     "claude-opus-4-8": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4.7 (current Opus tier)
@@ -151,8 +172,12 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
     # Claude 4.5 (current Opus tier — same rates as 4.6–4.8)
     "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00, "cached_input": 0.50},
-    # Claude Sonnet 5 / 4.6 / 4.5 (current Sonnet tier): $3 in / $15 out, cache read $0.30
-    "claude-sonnet-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
+    # Claude Sonnet 5.5 / 5: $2 in / $10 out, cache read $0.20. Sonnet 5's
+    # launch rate became its standard price; the scheduled 2026-09-01 rise to
+    # $3/$15 was cancelled.
+    "claude-sonnet-5-5": {"input": 2.00, "output": 10.00, "cached_input": 0.20},
+    "claude-sonnet-5": {"input": 2.00, "output": 10.00, "cached_input": 0.20},
+    # Claude Sonnet 4.6 / 4.5: $3 in / $15 out, cache read $0.30
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cached_input": 0.30},
     # Claude 4 (Sonnet/Haiku tier pricing)
@@ -222,10 +247,33 @@ _UNKNOWN_CLAUDE_DEFAULT = {
 }
 
 
-# DeepSeek fallback pricing for --anthropic-api-url deepseek routing
+def _deepseek_fallback_row(model_id: str) -> dict[str, float]:
+    """Off-peak fallback rates for ``model_id``, from the shared tier table.
+
+    This table has no request instant, so it carries the cheaper published tier;
+    per-request costing applies the peak window in
+    :func:`headroom.pricing.litellm_pricing.estimate_cost_from_tokens`.
+    """
+    rates = off_peak_rates(model_id)
+    if rates is None:  # pragma: no cover - the ids below are all in the tier table
+        raise ValueError(f"no DeepSeek tier for {model_id!r}")
+    return {
+        "input": rates.input_per_1m,
+        "output": rates.output_per_1m,
+        "cached_input": rates.cache_hit_per_1m,
+    }
+
+
+# DeepSeek fallback pricing for --anthropic-api-url deepseek routing.
+#
+# While the tier seam in ``headroom.pricing.litellm_pricing`` claims these four
+# ids first, ``estimate_cost`` never reaches this table on a live request: it is a
+# safety net for the flat-consumer invariant (anything without a request instant
+# carries the off-peak figure) and the only pricing left if that seam is ever
+# bypassed. ``_get_pricing`` therefore reaches it only when called directly.
 _DEEPSEEK_FALLBACK_PRICING: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"input": 0.14, "output": 0.28, "cached_input": 0.0028},
-    "deepseek-v4-pro": {"input": 0.435, "output": 0.87, "cached_input": 0.003625},
+    model_id: _deepseek_fallback_row(model_id)
+    for model_id in (*OFF_PEAK_RATES_PER_1M, *LEGACY_MODEL_IDS)
 }
 
 
@@ -775,6 +823,7 @@ class AnthropicProvider(Provider):
         output_tokens: int,
         model: str,
         cached_tokens: int = 0,
+        now: datetime | None = None,
     ) -> float | None:
         """Estimate cost for a request.
 
@@ -782,6 +831,9 @@ class AnthropicProvider(Provider):
         Both paths apply Anthropic's long-context premium: on the Sonnet 4 / 4.5
         family a prompt over 200K re-prices the whole request (see
         ``_LONG_CONTEXT_PREMIUM``).
+
+        ``now`` selects a DeepSeek peak/off-peak tier (see
+        :mod:`headroom.pricing.deepseek_tiers`); ``None`` reads the wall clock.
         """
         model = sanitize_anthropic_model_id(model)
         # LiteLLM knows per-model cache and long-context rates, so let it price
@@ -791,6 +843,7 @@ class AnthropicProvider(Provider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_tokens=cached_tokens,
+            now=now,
         )
         if cost is not None:
             return cost

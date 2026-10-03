@@ -50,6 +50,9 @@ def test_snapshot_accumulates_request_token_cache_cost_and_waste_metrics() -> No
         "cached": 1,
         "failed": 1,
         "rate_limited": 1,
+        # Lifetime carries the same splits the Prometheus labels do.
+        "failed_by_provider": {"anthropic": 1},
+        "rate_limited_by_source": {"headroom": 1},
         "by_provider": {"anthropic": 1},
         "by_stack": {"codex": 1},
     }
@@ -73,6 +76,13 @@ def test_snapshot_accumulates_request_token_cache_cost_and_waste_metrics() -> No
     assert snapshot["cost"] == {
         "input_usd": 0.4,
         "compression_savings_usd": 0.2,
+        # This call records no list ceiling, so the ceiling defaults to the
+        # cache-aware figure -- the truthful reading of "these are the same
+        # number" for a request with no cache mix to price against. The basis
+        # stays `unknown` because the caller named none: a fresh aggregate must
+        # not claim its untouched total was list-priced.
+        "compression_savings_list_usd": 0.2,
+        "savings_basis": "unknown",
         "cache_savings_usd": 0.1,
     }
     assert snapshot["waste_signals"] == {"repetition": 7}
@@ -198,3 +208,56 @@ def test_miss_reasons_still_fall_back_to_unknown_on_reload() -> None:
     snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
 
     assert snapshot["prefix_cache"]["misses_by_reason"] == {"ttl_expiry": 2, "unknown": 1}
+
+
+def test_rate_limited_is_split_by_source_and_failures_by_provider() -> None:
+    """Headroom's own limiter and an upstream 429 must stay distinguishable.
+
+    Both land in the same ``rate_limited`` total (unchanged), but an operator
+    acts on them differently: ours firing means raise the cap, the provider's
+    means back off. See issue #3696.
+    """
+    state = _new_state()
+
+    state.record_rate_limited(provider="anthropic", source="headroom")
+    state.record_rate_limited(provider="anthropic", source="upstream")
+    state.record_rate_limited(provider="openai", source="upstream")
+    state.record_failed(provider="anthropic")
+    state.record_failed(provider="openai")
+    state.record_failed(provider="openai")
+
+    requests = state.snapshot(persistence={"enabled": True, "healthy": True})["requests"]
+
+    assert requests["rate_limited"] == 3
+    assert requests["rate_limited_by_source"] == {"headroom": 1, "upstream": 2}
+    assert requests["failed"] == 3
+    assert requests["failed_by_provider"] == {"anthropic": 1, "openai": 2}
+
+
+def test_rate_limit_source_defaults_to_headroom_and_clamps_unknown_values() -> None:
+    state = _new_state()
+
+    state.record_rate_limited(provider="anthropic")
+    state.record_rate_limited(provider="anthropic", source="bogus")
+
+    requests = state.snapshot(persistence={"enabled": True, "healthy": True})["requests"]
+    assert requests["rate_limited_by_source"] == {"headroom": 2}
+
+
+def test_pre_3696_state_loads_without_backfilling_invented_history() -> None:
+    """A state file written before the split keeps its totals and starts the maps empty.
+
+    Back-filling the legacy ``rate_limited`` total into one bucket would claim we
+    observed a split we never recorded.
+    """
+    state = PersistentMetricsState(
+        {"requests": {"total": 10, "failed": 4, "rate_limited": 7}},
+        now=lambda: FIXED_NOW,
+    )
+
+    requests = state.snapshot(persistence={"enabled": True, "healthy": True})["requests"]
+
+    assert requests["rate_limited"] == 7
+    assert requests["failed"] == 4
+    assert requests["rate_limited_by_source"] == {}
+    assert requests["failed_by_provider"] == {}
