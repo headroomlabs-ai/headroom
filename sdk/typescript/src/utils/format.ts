@@ -71,6 +71,23 @@ export function detectFormat(messages: any[]): MessageFormat {
 // Anthropic → OpenAI
 // ============================================================
 
+// Anthropic image block `source` -> OpenAI image_url url string, or null if unconvertible.
+function anthropicImageUrl(source: any): string | null {
+  if (!source || typeof source !== "object") return null;
+  if (source.type === "base64" && source.media_type && source.data) {
+    return `data:${source.media_type};base64,${source.data}`;
+  }
+  if (source.type === "url" && typeof source.url === "string") return source.url;
+  return null;
+}
+
+// OpenAI image_url url -> Anthropic image block. data: URIs become a base64 source; other urls a url source.
+function openAIImageBlock(url: string): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+  return { type: "image", source: { type: "url", url } };
+}
+
 export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -81,14 +98,30 @@ export function anthropicToOpenAI(messages: any[]): OpenAIMessage[] {
         continue;
       }
       if (Array.isArray(msg.content)) {
-        const textBlocks = msg.content.filter((b: any) => b.type === "text");
         const toolResults = msg.content.filter((b: any) => b.type === "tool_result");
+        const hasImages = msg.content.some((b: any) => b.type === "image");
 
-        if (textBlocks.length > 0) {
-          result.push({
-            role: "user",
-            content: textBlocks.map((b: any) => b.text).join("\n"),
-          });
+        if (hasImages) {
+          const parts = msg.content
+            .filter((b: any) => b.type === "text" || b.type === "image")
+            .map((b: any) => {
+              if (b.type === "text") return { type: "text" as const, text: b.text };
+              const url = anthropicImageUrl(b.source);
+              return url ? { type: "image_url" as const, image_url: { url } } : null;
+            })
+            .filter((p: any): p is NonNullable<typeof p> => p !== null);
+
+          if (parts.length > 0) {
+            result.push({ role: "user", content: parts });
+          }
+        } else {
+          const textBlocks = msg.content.filter((b: any) => b.type === "text");
+          if (textBlocks.length > 0) {
+            result.push({
+              role: "user",
+              content: textBlocks.map((b: any) => b.text).join("\n"),
+            });
+          }
         }
         for (const tr of toolResults) {
           const content = typeof tr.content === "string"
@@ -155,9 +188,11 @@ export function openAIToAnthropic(messages: OpenAIMessage[]): any[] {
       } else if (Array.isArray(msg.content)) {
         result.push({
           role: "user",
-          content: msg.content.map((p) =>
-            p.type === "text" ? { type: "text", text: p.text } : { type: "text", text: "" },
-          ),
+          content: msg.content.map((p) => {
+            if (p.type === "text") return { type: "text", text: p.text };
+            if (p.type === "image_url") return openAIImageBlock(p.image_url.url);
+            return { type: "text", text: "" };
+          }),
         });
       }
       continue;
@@ -293,6 +328,8 @@ export function vercelToOpenAI(messages: any[]): OpenAIMessage[] {
 
 export function openAIToVercel(messages: OpenAIMessage[]): any[] {
   const result: any[] = [];
+  // tool_call id -> function name, so tool-result parts carry the name the AI SDK expects.
+  const toolNames = new Map<string, string>();
 
   for (const msg of messages) {
     if (msg.role === "system") {
@@ -319,6 +356,7 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
       if (msg.content) parts.push({ type: "text", text: msg.content });
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
+          toolNames.set(tc.id, tc.function.name);
           let input: any;
           try { input = JSON.parse(tc.function.arguments); } catch { input = tc.function.arguments ?? {}; }
           parts.push({
@@ -345,7 +383,7 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
         content: [{
           type: "tool-result",
           toolCallId: msg.tool_call_id,
-          toolName: "unknown",
+          toolName: toolNames.get(msg.tool_call_id) ?? "unknown",
           output,
         }],
       });
@@ -360,6 +398,44 @@ export function openAIToVercel(messages: OpenAIMessage[]): any[] {
 // Google Gemini → OpenAI
 // ============================================================
 
+// Gemini inlineData / fileData part -> OpenAI image_url object, or null if unconvertible.
+// inlineData travels as a data: URI (MIME type included). fileData keeps its MIME type on a
+// private `mime_type` key so the reverse conversion can rebuild the complete
+// { mimeType, fileUri } that @google/generative-ai requires; the proxy passes non-text
+// parts through unchanged, so the key survives /v1/compress.
+function geminiMediaImageUrl(part: any): { url: string; mime_type?: string } | null {
+  const blob = part.inlineData;
+  if (blob && typeof blob === "object" && blob.mimeType && blob.data) {
+    return { url: `data:${blob.mimeType};base64,${blob.data}` };
+  }
+  const file = part.fileData;
+  if (file && typeof file === "object" && typeof file.fileUri === "string") {
+    return typeof file.mimeType === "string"
+      ? { url: file.fileUri, mime_type: file.mimeType }
+      : { url: file.fileUri };
+  }
+  return null;
+}
+
+const MIME_BY_EXTENSION: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+};
+
+// OpenAI image_url -> Gemini part. data: URIs become inlineData. Other urls become fileData
+// with the carried MIME type, else one inferred from a common extension, else fileUri only.
+function geminiMediaPart(imageUrl: { url: string; mime_type?: string }): any {
+  const m = /^data:([^;,]+);base64,(.*)$/s.exec(imageUrl.url);
+  if (m) return { inlineData: { mimeType: m[1], data: m[2] } };
+  const ext = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(imageUrl.url)?.[1]?.toLowerCase();
+  const mimeType = imageUrl.mime_type ?? (ext ? MIME_BY_EXTENSION[ext] : undefined);
+  return { fileData: mimeType ? { mimeType, fileUri: imageUrl.url } : { fileUri: imageUrl.url } };
+}
+
 export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
@@ -370,10 +446,26 @@ export function geminiToOpenAI(messages: any[]): OpenAIMessage[] {
     if (role === "user") {
       // Check for functionResponse parts
       const funcResponses = parts.filter((p: any) => p.functionResponse);
-      const textParts = parts.filter((p: any) => p.text !== undefined);
+      const hasMedia = parts.some((p: any) => p.inlineData || p.fileData);
 
-      if (textParts.length > 0) {
-        result.push({ role: "user", content: textParts.map((p: any) => p.text).join("\n") });
+      if (hasMedia) {
+        const content = parts
+          .filter((p: any) => p.text !== undefined || p.inlineData || p.fileData)
+          .map((p: any) => {
+            if (p.text !== undefined) return { type: "text" as const, text: p.text };
+            const imageUrl = geminiMediaImageUrl(p);
+            return imageUrl ? { type: "image_url" as const, image_url: imageUrl } : null;
+          })
+          .filter((p: any): p is NonNullable<typeof p> => p !== null);
+
+        if (content.length > 0) {
+          result.push({ role: "user", content });
+        }
+      } else {
+        const textParts = parts.filter((p: any) => p.text !== undefined);
+        if (textParts.length > 0) {
+          result.push({ role: "user", content: textParts.map((p: any) => p.text).join("\n") });
+        }
       }
       for (const fr of funcResponses) {
         result.push({
@@ -421,6 +513,17 @@ export function openAIToGemini(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "user") {
+      if (Array.isArray(msg.content) && msg.content.some((p) => p.type === "image_url")) {
+        const geminiParts = msg.content
+          .map((p) => {
+            if (p.type === "text") return { text: p.text };
+            if (p.type === "image_url") return geminiMediaPart(p.image_url);
+            return null;
+          })
+          .filter((p) => p !== null);
+        result.push({ role: "user", parts: geminiParts });
+        continue;
+      }
       const text = typeof msg.content === "string"
         ? msg.content
         : (msg.content ?? []).filter((p) => p.type === "text").map((p) => (p as any).text).join("\n");

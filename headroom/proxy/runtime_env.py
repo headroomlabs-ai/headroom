@@ -62,8 +62,6 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
     Knob(
         "HEADROOM_VERBOSITY_LEVEL", "int", "Verbosity steering level 0-4 (unset = learned/default)."
     ),
-    Knob("HEADROOM_EFFORT_ROUTER", "bool", "Lower effort on mechanical tool-result continuations."),
-    Knob("HEADROOM_MECHANICAL_EFFORT", "str", "Effort value used on mechanical continuations."),
     Knob("HEADROOM_VERBOSITY_AUTOTUNE", "bool", "Use the AIMD verbosity controller state."),
     Knob(
         "HEADROOM_OUTPUT_HOLDOUT",

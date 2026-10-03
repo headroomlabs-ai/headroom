@@ -18,6 +18,7 @@ import os
 import signal
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import click
@@ -28,6 +29,8 @@ from headroom import paths as paths_mod
 from headroom import proxy_client_liveness
 from headroom.cli import wrap as wrap_mod
 from headroom.cli.main import main
+from headroom.memory.storage_router import ProjectResolver, RequestContext
+from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 
 # ---------------------------------------------------------------------------
 # _print_wrap_banner — centering math + box drawing.
@@ -378,7 +381,79 @@ class TestApplyProjectHeaderEnv:
         env: dict[str, str] = {}
         wrap_mod._apply_project_header_env(env)
 
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == "X-Headroom-Project: my-project"
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Headroom-Project: my-project",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
+
+    def test_wrap_project_header_resolves_ccr_workspace(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "my-project"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        env: dict[str, str] = {}
+        wrap_mod._apply_project_header_env(env)
+        headers = {
+            name.strip().lower(): value.strip()
+            for name, value in (
+                line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+            )
+        }
+
+        key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers), {}
+        )
+
+        assert key.startswith("my-project-")
+        assert label == "my-project"
+
+    def test_wrap_same_basename_projects_get_distinct_memory_and_ccr_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The wrapped headers keep same-named projects in separate stores."""
+        first = tmp_path / "one" / "api"
+        second = tmp_path / "two" / "api"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+
+        def wrapped_headers(project_dir: Path) -> dict[str, str]:
+            monkeypatch.chdir(project_dir)
+            env = {"ANTHROPIC_CUSTOM_HEADERS": "X-Headroom-Project: shared"}
+            wrap_mod._apply_project_header_env(env)
+            return {
+                name.strip().lower(): value.strip()
+                for name, value in (
+                    line.split(":", 1) for line in env["ANTHROPIC_CUSTOM_HEADERS"].splitlines()
+                )
+            }
+
+        headers_a = wrapped_headers(first)
+        headers_b = wrapped_headers(second)
+
+        assert headers_a["x-headroom-project"] == headers_b["x-headroom-project"] == "shared"
+        assert headers_a["x-headroom-cwd"] != headers_b["x-headroom-cwd"]
+
+        resolver = ProjectResolver()
+        memory_a = resolver.resolve(
+            RequestContext(headers=headers_a, system_prompt="", base_user_id="")
+        )
+        memory_b = resolver.resolve(
+            RequestContext(headers=headers_b, system_prompt="", base_user_id="")
+        )
+        assert memory_a is not None and memory_b is not None
+        assert memory_a[0] != memory_b[0]
+
+        ccr_a = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_a), {}
+        )
+        ccr_b = AnthropicHandlerMixin()._resolve_ccr_workspace(
+            SimpleNamespace(headers=headers_b), {}
+        )
+        assert ccr_a[0] == memory_a[0]
+        assert ccr_b[0] == memory_b[0]
+        assert ccr_a[0] != ccr_b[0]
 
     def test_appends_to_existing_custom_headers(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -391,9 +466,11 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # User header preserved verbatim, ours appended on a new line.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
-            "X-Custom-Trace: abc123\nX-Headroom-Project: proj"
-        )
+        assert env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+            "X-Custom-Trace: abc123",
+            "X-Headroom-Project: proj",
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}",
+        ]
 
     @pytest.mark.parametrize(
         "user_value",
@@ -417,8 +494,10 @@ class TestApplyProjectHeaderEnv:
         env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
         wrap_mod._apply_project_header_env(env)
 
-        # Untouched: no duplicate header, user override wins.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+        # The user label remains untouched; the missing routing identity is appended.
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     @pytest.mark.parametrize(
         "user_value",
@@ -441,7 +520,10 @@ class TestApplyProjectHeaderEnv:
         wrap_mod._apply_project_header_env(env)
 
         # Only an exact header-name match counts as a user override.
-        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (f"{user_value}\nX-Headroom-Project: proj")
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == (
+            f"{user_value}\nX-Headroom-Project: proj\n"
+            f"X-Headroom-Cwd: {wrap_mod._project_cwd_from_cwd()}"
+        )
 
     def test_empty_cwd_name_sets_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A degenerate cwd (e.g. filesystem root → empty basename) is a no-op."""
@@ -486,6 +568,34 @@ class TestApplyProjectHeaderEnv:
 
         assert urllib.parse.unquote(result) == "第二大脑共享"
 
+    def test_project_cwd_is_percent_encoded_and_round_trips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "project with space-中文"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        result = wrap_mod._project_cwd_from_cwd()
+        assert result is not None
+        result.encode("ascii")
+
+        import urllib.parse
+
+        assert urllib.parse.unquote(result) == str(project_dir.resolve())
+
+    def test_existing_cwd_header_wins_case_insensitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        project_dir = tmp_path / "proj"
+        project_dir.mkdir()
+        monkeypatch.chdir(project_dir)
+
+        user_value = "X-Headroom-Project: their-name\nx-headroom-cwd: /already/trusted"
+        env = {"ANTHROPIC_CUSTOM_HEADERS": user_value}
+        wrap_mod._apply_project_header_env(env)
+
+        assert env["ANTHROPIC_CUSTOM_HEADERS"] == user_value
+
     def test_non_ascii_cwd_header_is_ascii_safe(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -499,6 +609,7 @@ class TestApplyProjectHeaderEnv:
 
         header_value = env["ANTHROPIC_CUSTOM_HEADERS"]
         assert header_value.startswith("X-Headroom-Project: ")
+        assert "X-Headroom-Cwd: " in header_value
         header_value.encode("ascii")  # raises UnicodeEncodeError if non-ASCII
 
 
@@ -534,6 +645,62 @@ class _FakeProxyProc:
         self.killed = True
 
 
+def test_start_proxy_strips_ambient_worker_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HEADROOM_WORKERS", "4")
+    monkeypatch.setenv("HEADROOM_PROXY_CONFIG_JSON", '{"port": 9999}')
+    monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+    captured: dict[str, object] = {}
+    proc = _FakeProxyProc()
+
+    def fake_popen(command: list[str], **kwargs: object) -> _FakeProxyProc:
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return proc
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    assert wrap_mod._start_proxy(8787) is proc
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "HEADROOM_WORKERS" not in env
+    assert "HEADROOM_PROXY_CONFIG_JSON" not in env
+    assert env["HEADROOM_HTTP2"] == "false"
+    assert captured["command"][-2:] == ["--workers", "1"]
+
+
+def test_start_proxy_timeout_kills_failed_new_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc = _FakeProxyProc()
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(
+        wrap_mod,
+        "_get_proxy_stdio_log_path",
+        lambda port=None: tmp_path / "proxy-stdio.log",
+    )
+    monkeypatch.setattr(wrap_mod, "_resolve_wrap_proxy_timeout_seconds", lambda: 1)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="failed to start"):
+        wrap_mod._start_proxy(8787)
+
+    assert proc.killed is True
+
+
 class TestProxyClientRefCounting:
     """Proxy lifecycle is reference-counted via marker files, not pgrep."""
 
@@ -561,28 +728,28 @@ class TestProxyClientRefCounting:
         marker.write_text(json.dumps(rec))
         return marker
 
-    def test_cleanup_terminates_proxy_when_only_self_registered(self, clients_dir: Path) -> None:
-        """The owner alone → no other clients → proxy is terminated on exit."""
+    def test_cleanup_unregisters_marker_without_terminating_proxy(self, clients_dir: Path) -> None:
+        """Normal exit transfers final shutdown ownership to the watchdog."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
 
         cleanup()
 
-        assert proc.terminated is True
-        # Our own marker is removed before we count.
+        assert proc.terminated is False
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=False) == []
 
-    def test_cleanup_stops_detached_windows_serving_child(
+    def test_cleanup_leaves_detached_windows_serving_child_to_watchdog(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ctrl+C must stop the listener even when its launcher already exited."""
+        """Windows cleanup follows the same marker-only ownership transfer."""
         wrap_mod._register_proxy_client(self.PORT)
         proc = _FakeProxyProc()
         proc.poll = lambda: 0  # type: ignore[method-assign]
         stopped: list[int] = []
         monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 123})
         monkeypatch.setattr(
             wrap_mod,
             "_stop_local_proxy_for_unwrap",
@@ -592,7 +759,52 @@ class TestProxyClientRefCounting:
         wrap_mod._make_cleanup([proc], self.PORT)()
 
         assert not proc.terminated
-        assert stopped == [self.PORT]
+        assert stopped == []
+
+    def test_kill_proxy_uses_taskkill_tree_on_windows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows cleanup must terminate the native launcher's whole tree."""
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        checks = iter([True, False])
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: next(checks))
+        monkeypatch.setattr(
+            wrap_mod.subprocess,
+            "run",
+            lambda command, **kwargs: calls.append((command, kwargs)),
+        )
+
+        assert wrap_mod._kill_proxy_by_pid(456, self.PORT)
+        assert calls == [
+            (
+                ["taskkill", "/F", "/T", "/PID", "456"],
+                {"capture_output": True, "timeout": 10, "check": False},
+            )
+        ]
+
+    def test_cleanup_does_not_probe_or_kill_windows_serving_child(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The watchdog, not wrapper cleanup, owns normal listener shutdown."""
+        wrap_mod._register_proxy_client(self.PORT)
+        proc = _FakeProxyProc()
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: port == self.PORT)
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": 456})
+        monkeypatch.setattr(wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "unidentified")
+        monkeypatch.setattr(
+            wrap_mod,
+            "_kill_proxy_by_pid",
+            lambda pid, port: killed.append((pid, port)) or True,
+        )
+
+        wrap_mod._make_cleanup([proc], self.PORT)()
+
+        assert not proc.terminated
+        assert killed == []
 
     def test_cleanup_leaves_proxy_running_when_other_client_alive(self, clients_dir: Path) -> None:
         """A second live client (here: the test's parent) keeps the proxy up."""
@@ -619,6 +831,23 @@ class TestProxyClientRefCounting:
 
         assert dead_pid not in live
         assert not marker.exists()
+
+    def test_dead_client_marker_unlink_failure_is_tolerated(
+        self,
+        clients_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dead_pid = 358784
+        marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
+
+        def fail_unlink(*args: object, **kwargs: object) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
+        assert marker.exists()
 
     def test_reused_pid_with_mismatched_identity_is_pruned(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -677,6 +906,13 @@ class TestProxyClientRefCounting:
 
         assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == []
 
+    def test_non_dict_marker_is_tolerated(self, clients_dir: Path) -> None:
+        live_pid = os.getppid()
+        marker = self._write_marker(clients_dir, live_pid)
+        marker.write_text("[]", encoding="utf-8")
+
+        assert wrap_mod._live_proxy_clients(self.PORT, exclude_self=True) == [live_pid]
+
     def test_cleanup_does_not_shell_out_to_pgrep(
         self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -697,7 +933,7 @@ class TestProxyClientRefCounting:
         cleanup = wrap_mod._make_cleanup([proc], self.PORT)
         cleanup()  # must not raise
 
-        assert proc.terminated is True
+        assert proc.terminated is False
 
     def test_register_then_unregister_is_idempotent(self, clients_dir: Path) -> None:
         """Register adds exactly our marker; unregister removes it; re-call is safe."""
@@ -726,12 +962,16 @@ def test_ensure_proxy_already_running_prints_dashboard_url(
     wraps (the common case) never told the user where the dashboard lives.
     """
     port = 1234
+    # A compatible running proxy exposes its config; proxies without a config
+    # block are no longer reused (they cannot be compatibility-checked) and
+    # are covered by test_ensure_proxy_never_reuses_configless_proxy.
+    running_config = {"pid": 4321, "backend": "anthropic"}
     monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _p: True)
     monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _p: {})
     monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _h: False)
-    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: None)
-    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: None)
+    monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda _h: running_config)
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **kw: [])
 
     output = _run_in_click_context(lambda: wrap_mod._ensure_proxy(port, no_proxy=False))
 

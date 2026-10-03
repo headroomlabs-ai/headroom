@@ -171,6 +171,39 @@ describe("compressVercelMessages", () => {
     expect(result.messages[1].role).toBe("user");
     expect(result.messages[1].content[0].type).toBe("text");
   });
+
+  it("keeps tool names on tool-result parts after compression", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "getWeather", arguments: '{"city":"Paris"}' } },
+          ],
+        },
+        { role: "tool", content: '{"tempC":21}', tool_call_id: "call_1" },
+      ]),
+    );
+
+    const result = await compressVercelMessages(
+      [
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "call_1", toolName: "getWeather", input: { city: "Paris" } }],
+        },
+        {
+          role: "tool",
+          content: [
+            { type: "tool-result", toolCallId: "call_1", toolName: "getWeather", output: { type: "json", value: { tempC: 21 } } },
+          ],
+        },
+      ],
+      { model: "gpt-4o", baseUrl: "http://localhost:8787" },
+    );
+
+    expect(result.messages[1].content[0].toolName).toBe("getWeather");
+  });
 });
 
 describe("withHeadroom", () => {

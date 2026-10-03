@@ -6,6 +6,7 @@ import os
 import sys
 import types
 from contextlib import contextmanager
+from hashlib import sha1
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,8 @@ except ModuleNotFoundError:  # Python < 3.11
 import click
 import pytest
 from click.testing import CliRunner
+
+from headroom.install.paths import _PROFILE_RE as PROFILE_RE
 
 
 def _load_init_module(monkeypatch):
@@ -450,6 +453,46 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     assert session_entries[1] == {"hooks": "not-a-list"}
     assert session_entries[2]["hooks"][0]["command"] == "echo keep-me"
     assert session_entries[-1]["hooks"][0]["command"].endswith("--marker headroom-init-claude")
+
+
+def test_ensure_claude_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    """The external hook timeout must stay above the internal wait_ready(45s)
+    call _ensure_profile_running makes after a cold start (#3417), or the host
+    kills the hook before a first-ever proxy start can ever report ready."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
+
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        timeout = payload["hooks"][event][-1]["hooks"][0]["timeout"]
+        assert timeout > 45
+
+
+def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    config_path = tmp_path / "copilot.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_copilot_hooks(config_path, "init-user")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["timeout"] > 45
+
+
+def test_ensure_codex_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_codex_hooks(path, "init-user")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["hooks"][0]["timeout"] > 45
 
 
 def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -1554,3 +1597,50 @@ def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -
         f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
     )
     assert 'model = "gpt-4o"' in orphan_stripped
+
+
+@pytest.mark.parametrize(
+    "dir_name",
+    [
+        "Мастеринг в HW",
+        "项目",
+        "café-app",
+        "Ünicode Projekt",
+    ],
+)
+def test_local_profile_accepts_non_ascii_directory_names(monkeypatch, tmp_path, dir_name) -> None:
+    """A non-ASCII working directory must still yield a valid profile name.
+
+    ``str.isalnum`` is Unicode-aware, so Cyrillic/CJK/accented letters survived
+    into the slug and ``validate_profile_name`` then rejected it, making
+    ``headroom init`` unusable from such a directory.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / dir_name
+    root.mkdir()
+
+    profile = init_cli._local_profile(root)
+
+    assert PROFILE_RE.fullmatch(profile), profile
+    assert profile.startswith("init-")
+
+
+def test_local_profile_is_unchanged_for_ascii_directory_names(monkeypatch, tmp_path) -> None:
+    """The ASCII slug path keeps its existing output."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / "my-repo"
+    root.mkdir()
+
+    digest = sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:8]
+    assert init_cli._local_profile(root) == f"init-my-repo-{digest}"
+
+
+def test_local_profile_distinguishes_identical_non_ascii_names(monkeypatch, tmp_path) -> None:
+    """Two folders sharing a fully non-ASCII name must not collide."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = tmp_path / "a" / "项目"
+    second = tmp_path / "b" / "项目"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    assert init_cli._local_profile(first) != init_cli._local_profile(second)

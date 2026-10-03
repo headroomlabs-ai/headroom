@@ -38,6 +38,7 @@ pytest.importorskip("fastapi")
 
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS  # noqa: F401
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.proxy.tenant_key import get_current_tenant_key, set_request_tenant_key
 
 
 def _make_proxy(compression_max_workers: int | None = None):
@@ -81,6 +82,23 @@ def test_compression_executor_minimum_one_worker() -> None:
     """A non-positive override clamps to 1 (zero workers would deadlock)."""
     proxy = _make_proxy(compression_max_workers=0)
     assert proxy.compression_max_workers == 1
+
+
+def test_compression_executor_preserves_request_contextvars() -> None:
+    """Tenant context survives the thread-pool hop used by compression."""
+    proxy = _make_proxy(compression_max_workers=1)
+
+    async def _drive() -> str:
+        set_request_tenant_key("tenant_executor")
+        try:
+            return await proxy._run_compression_in_executor(
+                get_current_tenant_key,
+                timeout=10.0,
+            )
+        finally:
+            set_request_tenant_key(None)
+
+    assert asyncio.run(_drive()) == "tenant_executor"
 
 
 def test_in_flight_gauge_tracks_running_compressions() -> None:

@@ -72,12 +72,84 @@ def _make_handler():
     obj = object.__new__(OpenAIHandlerMixin)
     obj.OPENAI_API_URL = "https://api.openai.com"
     obj.http_client = None
+    # Deliberately odd values: a test that asserts the real defaults would pass
+    # even if the timeout stopped being read from config at all.
     obj.config = SimpleNamespace(
         retry_max_attempts=3,
         retry_base_delay_ms=0,
         retry_max_delay_ms=0,
+        connect_timeout_seconds=7,
+        write_timeout_seconds=33,
+        request_timeout_seconds=999,
     )
     return obj
+
+
+class TestWsHttpFallbackTimeout:
+    """The fallback POST must honor the configured timeouts.
+
+    It passed a bare ``timeout=120.0``, and httpx expands a float across all
+    four phases -- so connect and pool silently got 120s instead of the
+    configured value, and the send ignored ``write_timeout_seconds``. Only the
+    SSE read bound was ever meant to be 120s here.
+    """
+
+    def test_connect_and_pool_come_from_config(self):
+        handler = _make_handler()
+
+        timeout = handler._ws_http_fallback_timeout()
+
+        assert timeout.connect == 7
+        assert timeout.pool == 7
+
+    def test_write_comes_from_config(self):
+        handler = _make_handler()
+
+        timeout = handler._ws_http_fallback_timeout()
+
+        assert timeout.write == 33
+
+    def test_the_read_bound_is_not_smeared_across_the_other_phases(self):
+        """The regression itself: one float became all four phases."""
+        handler = _make_handler()
+
+        timeout = handler._ws_http_fallback_timeout()
+
+        assert timeout.read == 120.0
+        assert timeout.connect != timeout.read
+        assert timeout.write != timeout.read
+        assert timeout.pool != timeout.read
+
+    def test_read_stays_the_paths_own_sse_stall_bound(self):
+        """`read` is the gap between SSE events, so it is not the generic cap."""
+        handler = _make_handler()
+
+        timeout = handler._ws_http_fallback_timeout()
+
+        assert timeout.read == 120.0
+        assert timeout.read != handler.config.request_timeout_seconds
+
+    def test_the_fallback_request_actually_uses_it(self):
+        """Pin the wiring, not just the helper."""
+        handler = _make_handler()
+        ws = FakeWebSocket()
+        captured_kwargs = {}
+
+        class CapturingClient:
+            def stream(self, method, url, **kwargs):
+                captured_kwargs.update(kwargs)
+                return FakeStreamResponse(200, ["data: [DONE]\n\n"])
+
+        handler.http_client = CapturingClient()
+
+        body = {"model": "gpt-5.4", "input": "test"}
+        asyncio.run(handler._ws_http_fallback(ws, body, json.dumps(body), {}, "req_timeout"))
+
+        timeout = captured_kwargs["timeout"]
+        assert isinstance(timeout, httpx.Timeout)
+        assert timeout.connect == 7
+        assert timeout.write == 33
+        assert timeout.read == 120.0
 
 
 class TestWsHttpFallback:
