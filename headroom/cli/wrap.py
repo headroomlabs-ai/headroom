@@ -96,6 +96,7 @@ from headroom.providers.claude import (
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+    remote_control_gate_short_message,
     remote_control_sibling_gate_note,
     remove_vscode_claude_settings,
     resolve_1m_model,
@@ -4689,8 +4690,7 @@ def _ensure_proxy_unlocked(
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
                     if not missing:
-                        click.echo(f"  Proxy already running on port {port}")
-                        click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        click.echo(_proxy_status_line("Proxy already running", port))
                         return None, port
                 # Features mismatch or config unavailable — fall through to the
                 # non-persistent path which handles proxy restart. A routing
@@ -4963,8 +4963,7 @@ def _ensure_proxy_unlocked(
                         needs_restart = True
 
             if not needs_restart and reuse_running:
-                click.echo(f"  Proxy already running on port {port}")
-                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                click.echo(_proxy_status_line("Proxy already running", port))
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -5010,8 +5009,7 @@ def _ensure_proxy_unlocked(
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
                 ),
             )
-            click.echo(f"  Proxy ready on http://127.0.0.1:{actual_port}")
-            click.echo(f"  Dashboard:    http://127.0.0.1:{actual_port}/dashboard")
+            click.echo(_proxy_status_line("Proxy ready", actual_port))
             return proc, actual_port
         except RuntimeError as e:
             click.echo(f"  Error: {e}")
@@ -5069,6 +5067,11 @@ def _proxy_start_lock(port: int) -> Any:
 
 
 @wraps(_ensure_proxy_unlocked)
+def _proxy_status_line(status: str, port: int) -> str:
+    """One banner line for the proxy, naming its host:port once (#3426)."""
+    return f"  {status} — dashboard: http://127.0.0.1:{port}/dashboard"
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -5974,7 +5977,12 @@ def claude(
                 if remote_control_applies_to_auth(os.environ)
                 else None
             )
-            if remote_control_gate_active(proxy_url, os.environ, _cc_version):
+            _rc_gated = remote_control_gate_active(proxy_url, os.environ, _cc_version)
+            if _rc_gated and not verbose:
+                # Issue #3426: one actionable line by default; -v restores the
+                # full explanation (versions, sibling gates) below.
+                click.echo("  " + remote_control_gate_short_message(version=_cc_version))
+            elif _rc_gated:
                 click.echo(
                     "  "
                     + remote_control_gate_message(
@@ -6063,14 +6071,23 @@ def claude(
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
             # rather than repeat "kept on" (issue #1779 accuracy rule).
-            _tool_search_state = (
-                "on-demand tool loading kept on"
-                if _tool_search_mode_is_active(_tool_search_value)
-                else "on-demand tool loading DISABLED per your setting"
-            )
-            click.echo(
-                f"  {_TOOL_SEARCH_ENV}={_tool_search_value} ({_tool_search_state}; issue #746)"
-            )
+            _tool_search_active = _tool_search_mode_is_active(_tool_search_value)
+            if verbose:
+                _tool_search_state = (
+                    "on-demand tool loading kept on"
+                    if _tool_search_active
+                    else "on-demand tool loading DISABLED per your setting"
+                )
+                click.echo(
+                    f"  {_TOOL_SEARCH_ENV}={_tool_search_value} ({_tool_search_state}; issue #746)"
+                )
+            else:
+                # Issue #3426: state the outcome once; -v shows the env var and issue.
+                click.echo(
+                    "  On-demand tool loading: kept on (this session)"
+                    if _tool_search_active
+                    else "  On-demand tool loading: off (this session)"
+                )
         elif verbose:
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "

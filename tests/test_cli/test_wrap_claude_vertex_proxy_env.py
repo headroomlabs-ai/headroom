@@ -129,7 +129,8 @@ def _invoke_wrap_claude(
 def test_wrap_claude_plain_mode_warns_about_remote_control_gate(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # -v restores the full #1779 explanation (#3426 made it opt-in).
+    captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
 
     assert captured["child_cmd"] == ["/usr/bin/claude"]
     assert "Remote Control" in output
@@ -214,7 +215,7 @@ def test_wrap_claude_sibling_note_accurate_under_1m_and_tool_search_optouts(
         runner,
         monkeypatch,
         env={},
-        extra_args=("--1m", "--tool-search", "false"),
+        extra_args=("-v", "--1m", "--tool-search", "false"),
     )
     assert "already restored via --1m" in output
     assert "restore with `headroom wrap claude --1m`" not in output
@@ -267,8 +268,8 @@ def test_wrap_claude_tool_search_banner_line_still_accurate_when_active(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Default session: deferral is on, and both the #746 banner line and the
-    # RC sibling note say so.
-    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    # RC sibling note say so (full wording under -v, #3426).
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={}, extra_args=("-v",))
     assert "on-demand tool loading kept on" in output
     assert "keeps it on for this session" in output
     assert "DISABLED per your setting" not in output
@@ -289,7 +290,36 @@ def test_wrap_claude_foundry_persists_disabled_tool_search_for_workers(
 
     assert captured["child_env"]["ENABLE_TOOL_SEARCH"] == "false"
     assert captured["write_tool_search_value"] == "false"
-    assert "on-demand tool loading DISABLED" in output
+    # Foundry's default turns deferral off without a --tool-search flag, so the
+    # compact line must not blame the user's setting (#3426).
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
+
+
+def test_wrap_claude_default_banner_is_compact(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #3426: without -v the RC notice and the #746 line are one line each,
+    # and the long explanation / sibling note / env-var trailer are omitted.
+    _captured, output = _invoke_wrap_claude(runner, monkeypatch, env={})
+    assert (
+        "Remote Control (/rc) is disabled while routed through Headroom — run `claude` "
+        "directly (no wrap) for sessions that need it."
+    ) in output
+    assert "On-demand tool loading: kept on (this session)" in output
+    assert "Same base-URL gate" not in output
+    assert "ENABLE_TOOL_SEARCH=" not in output
+    assert "issue #746" not in output
+
+
+def test_wrap_claude_compact_tool_search_off_line(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _captured, output = _invoke_wrap_claude(
+        runner, monkeypatch, env={}, extra_args=("--tool-search", "false")
+    )
+    assert "On-demand tool loading: off (this session)" in output
+    assert "kept on" not in output
 
 
 def test_wrap_claude_vertex_passes_custom_base_url_to_proxy_before_child_redirect(
