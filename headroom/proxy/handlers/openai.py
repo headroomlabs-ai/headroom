@@ -7598,8 +7598,16 @@ class OpenAIHandlerMixin:
                 from headroom.subscription.codex_rate_limits import (
                     maybe_schedule_usage_poll,
                 )
+                from headroom.subscription.credential_policy import (
+                    is_local_operator_connection,
+                )
 
-                maybe_schedule_usage_poll(ws_headers)
+                # The poll spends the caller's own bearer: local operator only
+                # (01-F16).
+                maybe_schedule_usage_poll(
+                    ws_headers,
+                    from_local_operator=is_local_operator_connection(websocket),
+                )
 
         try:
             # ChatGPT-auth sessions no longer need upstream x-codex-* headers on
