@@ -65,6 +65,7 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
     installed = tmp_path / installer.CBM_BIN_NAME
     installed.write_text("bin")
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
+    monkeypatch.setattr(installer.platform, "system", lambda: "Linux")
     monkeypatch.setattr(installer.shutil, "which", lambda name: str(on_path))
     assert installer.get_cbm_path() == on_path
 
@@ -76,6 +77,9 @@ def test_get_cbm_path_prefers_path_then_install_dir(monkeypatch, tmp_path: Path)
 
 
 def test_download_cbm_success_and_verification_paths(monkeypatch, tmp_path: Path) -> None:
+    # v1.2.3 is not in the registry and the mock archive would not match a pin
+    # anyway; this test is about the install mechanics, not verification.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "1")
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
     monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
     monkeypatch.setattr(
@@ -109,6 +113,9 @@ def test_download_cbm_success_and_verification_paths(monkeypatch, tmp_path: Path
 def test_download_cbm_invalid_url_download_failure_and_extract_errors(
     monkeypatch, tmp_path: Path
 ) -> None:
+    # These failure modes are reached with an overridden (off-registry) release
+    # host, so verification would refuse them before the code under test runs.
+    monkeypatch.setenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", "1")
     monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
     monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
 
@@ -136,6 +143,27 @@ def test_download_cbm_invalid_url_download_failure_and_extract_errors(
     monkeypatch.setattr(installer, "urlopen", lambda url, timeout=60: FakeResponse(b"not a tar"))
     with pytest.raises(RuntimeError, match="Failed to extract archive"):
         installer.download_cbm()
+
+
+def test_download_cbm_refuses_an_off_registry_version(monkeypatch, tmp_path: Path) -> None:
+    """A version override points at a URL with no pin — refuse it (A-7).
+
+    The default CBM_VERSION is pinned for every platform in tools.json, so only
+    an override reaches this path.
+    """
+    from headroom import binaries
+
+    monkeypatch.delenv("HEADROOM_BINARIES_ALLOW_UNVERIFIED", raising=False)
+    monkeypatch.setattr(installer, "CBM_BIN_DIR", tmp_path)
+    monkeypatch.setattr(installer, "_detect_platform", lambda: "linux-amd64")
+    monkeypatch.setattr(
+        installer, "urlopen", lambda url, timeout=60: FakeResponse(_build_archive())
+    )
+
+    with pytest.raises(binaries.BinaryError) as exc:
+        installer.download_cbm(version="v9.9.9")
+    assert type(exc.value) is binaries.UnpinnedDownload
+    assert not (tmp_path / installer.CBM_BIN_NAME).exists()
 
 
 def test_ensure_cbm_uses_existing_or_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
