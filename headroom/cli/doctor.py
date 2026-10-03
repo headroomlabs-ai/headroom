@@ -1144,7 +1144,7 @@ def doctor(port: int, emit_json: bool, network: bool, network_urls: tuple[str, .
     live_elsewhere = None
     if livez is None:
         # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
-        # deployment manifests, the project's wrap marker), probed in parallel.
+        # deployment manifests, project wrap markers, and live client markers).
         live_elsewhere = find_live_proxy_elsewhere(
             port,
             manifests=manifests,

@@ -572,6 +572,33 @@ class TestDoctorAdditions:
         assert "port 9200" in proxy["summary"]
         assert "headroom doctor --port 9200" in proxy["hint"]
 
+    def test_doctor_names_live_proxy_from_client_marker(
+        self, home: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        marker = tmp_path / "workspace" / "clients" / "8788" / "4242.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(json.dumps({"pid": 4242, "started_at": 100.0}), encoding="utf-8")
+        monkeypatch.setattr(pd, "pid_alive", lambda pid: pid == 4242)
+
+        def fake_probe(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+            if url == "http://127.0.0.1:8788/livez":
+                return {"service": "headroom-proxy", "alive": True, "version": "1"}
+            return None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", fake_probe)
+        monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
+        monkeypatch.setattr(doctor_mod, "check_deployments", lambda manifests: None)
+        monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: home / "settings.json")
+        monkeypatch.setattr(doctor_mod, "savings_path", lambda: home / "savings.json")
+
+        result = CliRunner().invoke(main, ["doctor", "--json"])
+
+        payload = json.loads(result.output)
+        assert payload["port"] == 8787
+        proxy = next(c for c in payload["checks"] if c["name"] == "proxy")
+        assert "port 8788" in proxy["summary"]
+        assert "headroom doctor --port 8788" in proxy["hint"]
+
 
 # ---------------------------------------------------------------------------
 # wrap selfheal: warn (never repoint) when a live proxy exists elsewhere
