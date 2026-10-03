@@ -363,8 +363,10 @@ headroom perf --raw
 | `--hours` | `168.0` | Time window in hours |
 | `--raw` | off | Print raw PERF records instead of the summarized report |
 
-The command reads `${HEADROOM_WORKSPACE_DIR}/logs/proxy.log` (defaults
-to `~/.headroom/logs/proxy.log` — see the
+The command reads each per-port runtime log
+`${HEADROOM_WORKSPACE_DIR}/logs/proxy-<port>.log` (defaults to
+`~/.headroom/logs/`) plus PID-qualified files from multi-worker deployments,
+aggregating them while still reading a legacy `proxy.log` when present — see the
 [Filesystem Contract](filesystem-contract.md)).
 
 ## `headroom inspect`

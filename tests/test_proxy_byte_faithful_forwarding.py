@@ -711,7 +711,7 @@ def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
     """
     monkeypatch.delenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", raising=False)
     config = ProxyConfig(
-        optimize=False,
+        optimize=True,
         cache_enabled=False,
         rate_limit_enabled=False,
         cost_tracking_enabled=False,

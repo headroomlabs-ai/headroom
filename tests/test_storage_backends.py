@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import weakref
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+
+import pytest
 
 from headroom.config import RequestMetrics
 from headroom.storage import JSONLStorage, SQLiteStorage, Storage, create_storage
@@ -49,16 +54,34 @@ class DummyStorage(Storage):
     def get(self, request_id: str) -> RequestMetrics | None:
         return None
 
-    def query(self, **kwargs) -> list[RequestMetrics]:
+    def query(
+        self,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        model: str | None = None,
+        mode: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[RequestMetrics]:
         return []
 
-    def count(self, **kwargs) -> int:
+    def count(
+        self,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        model: str | None = None,
+        mode: str | None = None,
+    ) -> int:
         return 0
 
-    def iter_all(self):
+    def iter_all(self) -> Iterator[RequestMetrics]:
         return iter(())
 
-    def get_summary_stats(self, **kwargs) -> dict[str, int]:
+    def get_summary_stats(
+        self,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> dict[str, Any]:
         return {}
 
     def close(self) -> None:
@@ -81,7 +104,9 @@ def test_storage_base_context_manager_calls_close() -> None:
     assert Storage.close(storage) is None
 
 
-def test_create_storage_builtin_entrypoint_and_fallback(monkeypatch, tmp_path: Path) -> None:
+def test_create_storage_builtin_entrypoint_and_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     sqlite_storage = create_storage(f"sqlite://{tmp_path}\\metrics.db")
     jsonl_storage = create_storage(f"jsonl://{tmp_path}\\metrics.jsonl")
     assert isinstance(sqlite_storage, SQLiteStorage)
@@ -101,7 +126,7 @@ def test_create_storage_builtin_entrypoint_and_fallback(monkeypatch, tmp_path: P
     class FakeEntryPoint:
         name = "custom"
 
-        def load(self):
+        def load(self) -> Callable[[str], DummyStorage]:
             return lambda store_url: created
 
     monkeypatch.setattr(
@@ -160,7 +185,7 @@ def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> Non
     assert storage.get("missing") is None
 
     results = storage.query(start_time=now - timedelta(hours=1, minutes=30), offset=1, limit=1)
-    assert [item.request_id for item in results] == ["three"]
+    assert [item.request_id for item in results] == ["two"]
     assert storage.query(model="claude")[0].request_id == "two"
     assert storage.query(mode="optimize")[0].request_id == "two"
     assert storage.query(end_time=now - timedelta(hours=1, minutes=30))[0].request_id == "one"
@@ -181,6 +206,59 @@ def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> Non
     }
 
     storage.close()
+
+
+def test_jsonl_query_paging_matches_sqlite_newest_first(tmp_path: Path) -> None:
+    """JSONL query pages must be the newest-first window SQLite returns (issue #3822)."""
+    jsonl_storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite_storage = SQLiteStorage(str(tmp_path / "metrics.db"))
+    base = datetime(2026, 4, 23, 12, 0, 0)
+    rows = [
+        _metrics(
+            f"req-{i:03d}",
+            base + timedelta(seconds=i),
+            model="claude" if i % 2 == 0 else "gpt-4o",
+            mode="audit" if i % 3 == 0 else "optimize",
+        )
+        for i in range(250)
+    ]
+    for row in rows:
+        jsonl_storage.save(row)
+        sqlite_storage.save(row)
+
+    def ids(metrics: list[RequestMetrics]) -> list[str]:
+        return [item.request_id for item in metrics]
+
+    newest_first = [
+        row.request_id for row in sorted(rows, key=lambda item: item.timestamp, reverse=True)
+    ]
+
+    for kw in (
+        {"limit": 5, "offset": 0},
+        {"limit": 5, "offset": 5},
+        {"limit": 5, "offset": 10},
+        {"model": "claude", "limit": 5, "offset": 0},
+        {"model": "claude", "limit": 5, "offset": 5},
+        {"mode": "audit", "limit": 4, "offset": 2},
+        {"model": "claude", "mode": "audit", "limit": 3, "offset": 1},
+    ):
+        jsonl_page = jsonl_storage.query(**kw)
+        assert ids(jsonl_page) == ids(sqlite_storage.query(**kw)), kw
+        stamps = [item.timestamp for item in jsonl_page]
+        assert stamps == sorted(stamps, reverse=True), kw
+
+    assert ids(jsonl_storage.query(limit=5)) == newest_first[:5]
+    assert ids(jsonl_storage.query(limit=5))[0] == "req-249"
+
+    page1 = ids(jsonl_storage.query(limit=5, offset=0))
+    page2 = ids(jsonl_storage.query(limit=5, offset=5))
+    page3 = ids(jsonl_storage.query(limit=5, offset=10))
+    assert set(page1).isdisjoint(page2)
+    assert set(page2).isdisjoint(page3)
+    assert set(page1).isdisjoint(page3)
+
+    jsonl_storage.close()
+    sqlite_storage.close()
 
 
 def test_jsonl_storage_handles_missing_file_malformed_lines_and_defaults(tmp_path: Path) -> None:
@@ -278,7 +356,7 @@ def test_sqlite_storage_round_trip_filters_summary_and_defaults(tmp_path: Path) 
 
 
 def test_sqlite_storage_get_conn_reuses_connection_and_create_storage_entrypoint(
-    monkeypatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     storage = SQLiteStorage(str(tmp_path / "metrics.db"))
     first = storage._get_conn()
@@ -292,3 +370,140 @@ def test_sqlite_storage_get_conn_reuses_connection_and_create_storage_entrypoint
         lambda group: [SimpleNamespace(name="custom", load=lambda: lambda url: created)],
     )
     assert create_storage("custom://db") is created
+
+
+def test_query_pagination_contract_validates_and_returns_empty_pages(tmp_path: Path) -> None:
+    """Negative limit/offset raise ValueError; zero limit and past-end offsets page empty."""
+    jsonl_storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite_storage = SQLiteStorage(str(tmp_path / "metrics.db"))
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    rows = [
+        _metrics("one", now - timedelta(hours=2)),
+        _metrics("two", now - timedelta(hours=1)),
+        _metrics("three", now),
+    ]
+    for row in rows:
+        jsonl_storage.save(row)
+        sqlite_storage.save(row)
+
+    for storage in (jsonl_storage, sqlite_storage):
+        with pytest.raises(ValueError):
+            storage.query(limit=-1)
+        with pytest.raises(ValueError):
+            storage.query(offset=-1)
+        with pytest.raises(ValueError):
+            storage.query(limit=-5, offset=-5)
+
+        assert storage.query(limit=0) == []
+        assert storage.query(limit=0, offset=0) == []
+        assert storage.query(limit=0, offset=9) == []
+        assert storage.query(limit=5, offset=3) == []
+        assert storage.query(limit=5, offset=10) == []
+        assert [m.request_id for m in storage.query(limit=2, offset=0)] == ["three", "two"]
+        assert [m.request_id for m in storage.query(limit=2, offset=2)] == ["one"]
+
+    jsonl_storage.close()
+    sqlite_storage.close()
+
+
+def test_query_equal_timestamp_pages_match_across_backends(tmp_path: Path) -> None:
+    """Timestamp ties break on request_id DESC and pages agree page-for-page."""
+    jsonl_storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    sqlite_storage = SQLiteStorage(str(tmp_path / "metrics.db"))
+    base = datetime(2026, 4, 23, 12, 0, 0)
+
+    rows: list[RequestMetrics] = []
+    # Rows are appended in a shuffled order on purpose: the contract orders by
+    # timestamp DESC then request_id DESC, never by append order.
+    for group in (1, 2, 3):
+        for suffix in (3, 1, 5, 2, 4):
+            rows.append(
+                _metrics(
+                    f"g{group}-{suffix}",
+                    base + timedelta(minutes=group),
+                    model="claude" if suffix % 2 == 0 else "gpt-4o",
+                )
+            )
+    for row in rows:
+        jsonl_storage.save(row)
+        sqlite_storage.save(row)
+
+    expected = [f"g{group}-{suffix}" for group in (3, 2, 1) for suffix in (5, 4, 3, 2, 1)]
+
+    for offset in (0, 4, 8, 12):
+        page_expected = expected[offset : offset + 4]
+        jsonl_page = jsonl_storage.query(limit=4, offset=offset)
+        sqlite_page = sqlite_storage.query(limit=4, offset=offset)
+        assert [m.request_id for m in jsonl_page] == page_expected, offset
+        assert [m.request_id for m in sqlite_page] == page_expected, offset
+        stamps = [m.timestamp for m in jsonl_page]
+        assert stamps == sorted(stamps, reverse=True)
+        # The same window must be stable across repeated queries.
+        assert [m.request_id for m in jsonl_storage.query(limit=4, offset=offset)] == page_expected
+        assert [m.request_id for m in sqlite_storage.query(limit=4, offset=offset)] == page_expected
+
+    # Filtered ties must stay consistent too: a page size of 3 splits the g2
+    # pair across pages so the tie-breaker decides both sides of the boundary.
+    filtered_expected = [f"g{group}-{suffix}" for group in (3, 2, 1) for suffix in (4, 2)]
+    for offset in (0, 3):
+        page_expected = filtered_expected[offset : offset + 3]
+        assert [
+            m.request_id for m in jsonl_storage.query(model="claude", limit=3, offset=offset)
+        ] == page_expected
+        assert [
+            m.request_id for m in sqlite_storage.query(model="claude", limit=3, offset=offset)
+        ] == page_expected
+
+    jsonl_storage.close()
+    sqlite_storage.close()
+
+
+def test_jsonl_query_retains_at_most_requested_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """query() must select a bounded window instead of materializing every match."""
+    storage = JSONLStorage(str(tmp_path / "metrics.jsonl"))
+    base = datetime(2026, 4, 23, 12, 0, 0)
+    rows = [
+        _metrics(
+            f"req-{i:03d}",
+            base + timedelta(seconds=i),
+            model="claude" if i % 2 == 0 else "gpt-4o",
+        )
+        for i in range(60)
+    ]
+    for row in rows:
+        storage.save(row)
+
+    limit, offset = 5, 10
+    window = offset + limit
+    matches = [row for row in rows if row.model == "claude"]
+    assert len(matches) > window
+
+    original_iter_all = storage.iter_all
+    refs: list[weakref.ReferenceType[RequestMetrics]] = []
+    kept: list[bool] = []
+    retained: list[int] = []
+
+    def tracked_iter_all() -> Iterator[RequestMetrics]:
+        for metrics in original_iter_all():
+            matched = metrics.model == "claude"
+            # Count matching records yielded earlier that the query still
+            # holds; the record being handed over is not in refs yet.
+            retained.append(sum(1 for keep, ref in zip(kept, refs) if keep and ref() is not None))
+            kept.append(matched)
+            refs.append(weakref.ref(metrics))
+            yield metrics
+
+    monkeypatch.setattr(storage, "iter_all", tracked_iter_all)
+
+    page = storage.query(model="claude", limit=limit, offset=offset)
+
+    expected = sorted(matches, key=lambda m: (m.timestamp, m.request_id), reverse=True)
+    assert [m.request_id for m in page] == [m.request_id for m in expected[offset : offset + limit]]
+    assert len(refs) == len(rows)
+    # Selection may hold the requested window plus at most one matching record
+    # still in flight while the next record is pulled; it must never retain the
+    # whole match set.
+    assert max(retained) <= window + 1
+    assert max(retained) < len(matches)

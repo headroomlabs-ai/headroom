@@ -24,12 +24,21 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
 import click
+from click.core import ParameterSource
 
+from headroom.cli.port_discovery import (
+    DEFAULT_PROXY_PORT,
+    env_port,
+    reconcile_default_port,
+    warn_codex_provider_port_change,
+)
 from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, SupervisorKind
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
     unix_user_env_targets,
+    codex_hooks_path,
+    codex_project_config_path,
     validate_profile_name,
 )
 from headroom.install.planner import build_manifest
@@ -69,6 +78,12 @@ _SUPPORTED_TARGETS = ("claude", "copilot", "codex", "openclaw", "agy")
 _LOCAL_TARGETS = {"claude", "codex"}
 _GLOBAL_TARGETS = {"claude", "copilot", "codex", "openclaw", "agy"}
 _STARTUP_READY_TIMEOUT_SECONDS = 15
+# External kill timeout Claude/Copilot/Codex apply to the `headroom init hook
+# ensure` command itself. Must stay above the internal wait_ready(45s) call in
+# _ensure_profile_running for a cold start (measured 15.9-36.9s in #3417) --
+# otherwise the host kills the hook before a first-ever proxy start can ever
+# report ready, and every session is permanently cold.
+_HOOK_ENSURE_TIMEOUT_SECONDS = 60
 _TOML_TABLE_HEADER_RE = re.compile(r"^[ \t]*(?:\[\[[^\]\r\n]+\]\]|\[[^\]\r\n]+\])[ \t]*(?:#.*)?$")
 _TOML_FEATURES_NAME_RE = r"(?:features|\"features\"|'features')"
 _TOML_CODEX_HOOKS_NAME_RE = r"(?:codex_hooks|\"codex_hooks\"|'codex_hooks')"
@@ -120,9 +135,9 @@ def _enable_verbose_logging() -> None:
 
 def _local_profile(cwd: Path | None = None) -> str:
     root = (cwd or Path.cwd()).resolve()
-    slug = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in root.name.lower()).strip(
-        "-"
-    )
+    slug = "".join(
+        ch if (ch.isascii() and ch.isalnum()) or ch in "-._" else "-" for ch in root.name.lower()
+    ).strip("-")
     digest = sha1(str(root).encode("utf-8")).hexdigest()[:8]
     return validate_profile_name(f"init-{slug or 'repo'}-{digest}")
 
@@ -136,7 +151,11 @@ def _copilot_config_path() -> Path:
 
 
 def _codex_hooks_path(global_scope: bool) -> Path:
-    return (Path.home() if global_scope else Path.cwd()) / ".codex" / "hooks.json"
+    # User scope follows Codex's own home resolution (CODEX_HOME, else ~/.codex)
+    # so `init -g codex` writes the hooks file Codex will actually load.
+    if global_scope:
+        return codex_hooks_path()
+    return Path.cwd() / ".codex" / "hooks.json"
 
 
 def _agy_hooks_path() -> Path:
@@ -152,7 +171,7 @@ def _claude_scope_path(global_scope: bool) -> Path:
 def _codex_scope_path(global_scope: bool) -> Path:
     if global_scope:
         return codex_config_path()
-    return Path.cwd() / ".codex" / "config.toml"
+    return codex_project_config_path()
 
 
 def _json_file(path: Path) -> dict[str, Any]:
@@ -231,7 +250,7 @@ def _ensure_claude_hooks(path: Path, profile: str, port: int) -> None:
                     {
                         "type": "command",
                         "command": f"{command} --marker {_CLAUDE_HOOK_MARKER}",
-                        "timeout": 15,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
                     }
                 ],
             }
@@ -255,7 +274,14 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
                 isinstance(entry, dict) and _COPILOT_HOOK_MARKER in str(entry.get("command", ""))
             )
         ]
-        retained.append({"type": "command", "command": command, "cwd": ".", "timeout": 15})
+        retained.append(
+            {
+                "type": "command",
+                "command": command,
+                "cwd": ".",
+                "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+            }
+        )
         hooks[event] = retained
     payload["hooks"] = hooks
     _write_json(path, payload)
@@ -346,6 +372,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     import re
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
+    warn_codex_provider_port_change(path, port)
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
@@ -551,7 +578,13 @@ def _ensure_codex_hooks(path: Path, profile: str) -> None:
         retained.append(
             {
                 "matcher": matcher,
-                "hooks": [{"type": "command", "command": command, "timeout": 15}],
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                        "timeout": _HOOK_ENSURE_TIMEOUT_SECONDS,
+                    }
+                ],
             }
         )
         hooks[event] = retained
@@ -1019,14 +1052,33 @@ def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
             click.echo(line)
 
 
+def _resolve_init_port(ctx: click.Context, port: int) -> int:
+    """Honor ``--port``; otherwise ``HEADROOM_PORT``; otherwise reconcile with a live proxy.
+
+    Skipped for the internal ``init hook`` group: hooks run non-interactively
+    on every session start and must stay silent and fast.
+    """
+    if ctx.invoked_subcommand == "hook":
+        return port
+    if ctx.get_parameter_source("port") is not ParameterSource.DEFAULT:
+        return port
+    configured = env_port()
+    if configured is not None:
+        return configured
+    return reconcile_default_port(port)
+
+
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")
 @click.option(
     "--port",
-    default=8787,
+    default=DEFAULT_PROXY_PORT,
     type=click.IntRange(1, 65535),
     show_default=True,
-    help="Headroom proxy port.",
+    help=(
+        "Headroom proxy port. When omitted, HEADROOM_PORT is used if set; otherwise a "
+        "live Headroom proxy on another port is detected and offered."
+    ),
 )
 @click.option("--backend", default="anthropic", show_default=True, help="Proxy backend.")
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backends.")
@@ -1053,6 +1105,7 @@ def init(
     """Install durable Headroom integrations for supported agents."""
     if verbose:
         _enable_verbose_logging()
+    port = _resolve_init_port(ctx, port)
     logger.debug(
         "init: global_scope=%s port=%s backend=%s anyllm_provider=%s region=%s memory=%s "
         "invoked_subcommand=%s",
@@ -1212,7 +1265,6 @@ def init_hook() -> None:
 @click.option("--marker", default=None, hidden=True)
 def init_hook_ensure(profile: str | None, marker: str | None) -> None:
     """Best-effort ensure used by installed agent hooks."""
-    del marker
 
     def _has_manifest(name: str) -> bool:
         # Best-effort: a corrupt manifest must not crash the session-start hook.
@@ -1232,3 +1284,158 @@ def init_hook_ensure(profile: str | None, marker: str | None) -> None:
             profiles.append(_GLOBAL_PROFILE)
     for name in profiles:
         _ensure_profile_running(name)
+    _emit_alignment_warning(marker, profiles)
+
+
+_HOOK_AGENT_BY_MARKER = {_CLAUDE_HOOK_MARKER: "claude", _CODEX_HOOK_MARKER: "codex"}
+_HOOK_STDIN_WAIT_SECONDS = 0.5
+
+
+def _read_hook_event_name() -> str | None:
+    """``hook_event_name`` from the hook's stdin JSON, read with a hard time bound.
+
+    Claude Code and Codex pipe a JSON object into command hooks. A reader
+    thread keeps a host that never closes stdin from stalling the hook.
+    """
+    import threading
+
+    try:
+        stream = sys.stdin
+        if stream is None or stream.isatty():
+            return None
+    except (AttributeError, ValueError, OSError):
+        return None
+    box: dict[str, str] = {}
+
+    def _read() -> None:
+        try:
+            box["raw"] = stream.read(1 << 20)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(_HOOK_STDIN_WAIT_SECONDS)
+    raw = box.get("raw")
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None
+    event = payload.get("hook_event_name") if isinstance(payload, dict) else None
+    return event if isinstance(event, str) else None
+
+
+def _claude_configured_base_url(cwd: Path) -> str | None:
+    """Effective ``ANTHROPIC_BASE_URL`` from Claude settings (local > project > user)."""
+    for path in (
+        cwd / ".claude" / "settings.local.json",
+        cwd / ".claude" / "settings.json",
+        claude_settings_path(),
+    ):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        except (OSError, ValueError):
+            continue
+        env_block = payload.get("env") if isinstance(payload, dict) else None
+        if isinstance(env_block, dict) and env_block.get("ANTHROPIC_BASE_URL"):
+            return str(env_block["ANTHROPIC_BASE_URL"])
+    return os.environ.get("ANTHROPIC_BASE_URL") or None
+
+
+def _codex_configured_base_url(cwd: Path) -> str | None:
+    """Active Codex provider ``base_url`` (project ``.codex`` first, then ``$CODEX_HOME``)."""
+    from .doctor import codex_active_base_url
+
+    for path in (codex_project_config_path(cwd), codex_config_path()):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        except OSError:
+            continue
+        if not text:
+            continue
+        _provider, base_url = codex_active_base_url(text)
+        if base_url:
+            return base_url
+    return None
+
+
+def alignment_warning(
+    agent: str,
+    profile: str,
+    *,
+    cwd: Path | None = None,
+    probe: Any = None,
+) -> str | None:
+    """Message when ``agent``'s configured proxy port differs from ``profile``'s.
+
+    Returns None when aligned, unconfigured, or anything cannot be read.
+    """
+    from .port_discovery import loopback_port, probe_headroom_proxy
+
+    try:
+        manifest = load_manifest(profile)
+    except ManifestError:
+        return None
+    if manifest is None:
+        return None
+    root = cwd or Path.cwd()
+    if agent == "claude":
+        base_url = _claude_configured_base_url(root)
+    elif agent == "codex":
+        base_url = _codex_configured_base_url(root)
+    else:
+        return None
+    configured = loopback_port(base_url or "")
+    expected = int(manifest.port)
+    if configured is None or configured == expected:
+        return None
+    check = probe or probe_headroom_proxy
+    configured_live = bool(check(configured))
+    scope_flag = " -g" if profile == _GLOBAL_PROFILE else ""
+    label = "Claude Code" if agent == "claude" else "Codex"
+    if configured_live:
+        state = f"a Headroom proxy is running on {configured}, not the managed one"
+        fix_port = configured
+    else:
+        state = f"nothing Headroom answers on {configured}, so requests may fail"
+        fix_port = expected
+    return (
+        f"Headroom: {label} is configured for http://127.0.0.1:{configured} but the Headroom "
+        f"proxy managed by `headroom init` ({profile}) uses port {expected}; {state}. "
+        f"Fix: headroom init{scope_flag} --port {fix_port} {agent}"
+    )
+
+
+def _emit_alignment_warning(marker: str | None, profiles: list[str]) -> None:
+    """Surface a base_url/proxy port mismatch through the SessionStart hook channel.
+
+    Emitted only for Claude/Codex SessionStart hooks, as hook JSON
+    (``systemMessage`` for the user, ``additionalContext`` for the agent).
+    Must never raise or block: any failure silently emits nothing.
+    """
+    try:
+        agent = _HOOK_AGENT_BY_MARKER.get(marker or "")
+        if agent is None or not profiles:
+            return
+        if _read_hook_event_name() != "SessionStart":
+            return
+        message = alignment_warning(agent, profiles[0])
+        if not message:
+            return
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "systemMessage": message,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": message,
+                    },
+                }
+            )
+            + "\n"
+        )
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - a hook must never break the session
+        return
