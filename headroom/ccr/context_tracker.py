@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -232,6 +233,7 @@ class ContextTracker:
         current_turn: int | None = None,
         *,
         workspace_key: str,
+        present_hashes: Collection[str] | None = None,
     ) -> list[ExpansionRecommendation]:
         """Analyze a query to find relevant compressed contexts.
 
@@ -246,6 +248,13 @@ class ContextTracker:
                 a workspace before invoking; the empty string short-
                 circuits to an empty result set rather than matching
                 empty-keyed test contexts to avoid accidental crossover.
+            present_hashes: CCR hashes whose markers appear in the request
+                being answered. When given, only those contexts may expand.
+                One workspace can serve several live conversations at once
+                (a Claude Code lead and its teammates share a cwd), and a
+                compression the requesting conversation never received is
+                another conversation's tool output, not context it lost
+                (#1174). ``None`` skips this filter.
 
         Returns:
             List of expansion recommendations, sorted by relevance.
@@ -277,6 +286,8 @@ class ContextTracker:
             # entries that belong to a different project than the one
             # the current request resolved to.
             if context.workspace_key != workspace_key:
+                continue
+            if present_hashes is not None and hash_key not in present_hashes:
                 continue
 
             # Check age
