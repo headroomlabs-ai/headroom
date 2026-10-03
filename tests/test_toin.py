@@ -457,7 +457,8 @@ class TestTOINExportImport:
         assert len(export["patterns"]) == 1
         # PR-B5: keys are now serialized "auth|model|hash" tuples; default
         # auth/model produce the "unknown|unknown|<hash>" string.
-        assert f"unknown|unknown|{sig.structure_hash}" in export["patterns"]
+        # PR-F3: prepended with the tenant_key slot — default is "global".
+        assert f"global|unknown|unknown|{sig.structure_hash}" in export["patterns"]
 
     def test_import_patterns_new_pattern(self):
         """import_patterns adds new patterns."""

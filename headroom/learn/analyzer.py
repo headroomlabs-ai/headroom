@@ -60,6 +60,13 @@ _MIN_DIGEST_TOKENS = 10_000
 # --include-partial-messages adds incremental "stream_event" ticks during the
 # assistant's response; without it claude only emits ~3 events total (system
 # init, one assistant message, result) — too sparse to report live progress.
+# --tools "" and --strict-mcp-config leave the analysis session with zero tools:
+# the digest is the whole input and the answer is one JSON object, but a
+# headless `claude -p` is otherwise a full agent (Bash, Edit, Task, every MCP
+# server) under the user's own permissions. A model that goes off to read or
+# verify things keeps streaming, so the idle cap never fires and the run dies
+# at the hard cap with nothing written. Both flags are needed: --tools "" alone
+# leaves the MCP servers' tools.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     (
         "claude",
@@ -71,6 +78,9 @@ _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--tools",
+            "",
+            "--strict-mcp-config",
         ],
     ),
     ("gemini", "gemini-cli", ["gemini", "-p"]),

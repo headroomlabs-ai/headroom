@@ -209,7 +209,13 @@ SESSION_WINDOW_SECONDS = 7200  # 2 hours — events older than this are pruned
 
 
 def _append_shared_event(event: dict[str, Any]) -> None:
-    """Append an event to the shared stats file (cross-process, file-locked)."""
+    """Append an event to the shared stats file (cross-process, file-locked).
+
+    No-op in stateless mode (``HEADROOM_STATELESS``): the aggregate then covers
+    only this process, which is the documented stateless trade-off.
+    """
+    if not _paths.persistence_allowed("MCP session stats"):
+        return
     try:
         SHARED_STATS_DIR.mkdir(parents=True, exist_ok=True)
         event["pid"] = os.getpid()
@@ -249,8 +255,9 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     keep_lines.append(line + "\n")
             except json.JSONDecodeError:
                 continue
-        # Prune old entries (only if we dropped some)
-        if len(keep_lines) < len(lines):
+        # Prune old entries (only if we dropped some). Never rewrite the file in
+        # stateless mode — reading is fine, writing is not.
+        if len(keep_lines) < len(lines) and _paths.persistence_allowed("MCP session stats"):
             try:
                 with open(SHARED_STATS_FILE, "w") as f:
                     if _HAS_FCNTL:

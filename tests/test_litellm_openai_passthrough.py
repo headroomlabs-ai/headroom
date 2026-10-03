@@ -106,6 +106,40 @@ async def test_chat_template_kwargs_forwarded_streaming() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_chunks_report_requested_model_not_mapped_slug() -> None:
+    """Streamed chunks must carry the client's requested model, not the
+    LiteLLM-mapped provider slug (matches the non-streaming path)."""
+    import json
+
+    backend = make_backend()  # provider="openrouter"
+
+    # LiteLLM tags each chunk with the mapped model it was called with
+    # ("openrouter/qwen3"); the client asked for "qwen3".
+    stream = FakeAsyncStream(
+        [
+            SimpleNamespace(
+                model_dump=lambda **kwargs: {
+                    "id": "chunk1",
+                    "model": "openrouter/qwen3",
+                    "choices": [{"index": 0, "delta": {"content": "hi"}}],
+                }
+            ),
+        ]
+    )
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = stream
+
+        chunks = [
+            chunk async for chunk in backend.stream_openai_message(request_body(model="qwen3"), {})
+        ]
+
+    data_chunks = [c for c in chunks if c.startswith("data: ") and "[DONE]" not in c]
+    payload = json.loads(data_chunks[0][len("data: ") :])
+    assert payload["model"] == "qwen3"
+
+
+@pytest.mark.asyncio
 async def test_standard_only_body_has_no_extra_body() -> None:
     backend = make_backend()
 
