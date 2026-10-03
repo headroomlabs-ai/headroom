@@ -32,7 +32,7 @@ def test_finally_survives_early_proxy_start_failure(
         monkeypatch.delenv(key, raising=False)
 
     monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: "/usr/bin/claude")
-    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", lambda _port, session_token=None: None)
     monkeypatch.setattr(wrap_mod.signal, "signal", lambda *_a, **_k: None)
     monkeypatch.setattr(wrap_mod, "_push_runtime_env", lambda *_a, **_k: None)
     monkeypatch.setattr(wrap_mod, "_setup_coding_compressor", lambda *_a, **_k: None)

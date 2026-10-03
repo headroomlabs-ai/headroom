@@ -11,6 +11,7 @@ export interface HeadroomOpenCodePluginOptions {
   excludeHosts?: string[];
   backend?: string;
   debug?: boolean;
+  sessionToken?: string;
 }
 
 function normalizeProxyUrl(url: string): string {
@@ -26,6 +27,12 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
   );
 }
 
+// Read by workspace_registry.resolve_registered_cwd() on the proxy side --
+// mirrors wrap.py's _apply_session_token_header_env for claude.
+function resolveSessionToken(options?: HeadroomOpenCodePluginOptions): string | undefined {
+  return options?.sessionToken ?? process.env.HEADROOM_OPENCODE_SESSION_TOKEN;
+}
+
 export const HeadroomPlugin: Plugin = async (input, options = {}) => {
   const pluginOptions = options as HeadroomOpenCodePluginOptions;
   const proxyUrl = resolveProxyUrl(pluginOptions);
@@ -39,6 +46,7 @@ export const HeadroomPlugin: Plugin = async (input, options = {}) => {
     project,
     excludeHosts: pluginOptions.excludeHosts,
     debug: pluginOptions.debug,
+    sessionToken: resolveSessionToken(pluginOptions),
   });
 
   return {
