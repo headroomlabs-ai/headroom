@@ -72,13 +72,10 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
     fn = GeminiHandlerMixin.handle_gemini_stream_generate_content
     assert inspect.iscoroutinefunction(fn)
     src = inspect.getsource(fn)
-    assert "_count_texts_offloaded(" in src, "streaming Gemini text counting not offloaded"
-    assert "tokenizer = get_tokenizer(" not in src, "tokenizer resolved inline on the loop"
-    assert "count_text(" not in src, "streaming Gemini count_text still runs on the loop"
-    assert "_dict_parts(" in src, "streaming Gemini must reuse the shared _dict_parts coercion"
-    assert 'isinstance(part.get("text"), str)' in src, (
-        "streaming Gemini must skip non-str text so count_text can't 500"
-    )
+    assert "return await self.handle_gemini_generate_content(" in src
+    assert "upstream_base_url=upstream_base_url" in src
+    assert "_count_texts_offloaded(" not in src
+    assert "_dict_parts(" not in src
 
     for mixin, method in (
         (AnthropicHandlerMixin, "handle_anthropic_batch_create"),
