@@ -12,10 +12,10 @@ Kompressed marker-free; in CCR mode the same DROP tail can be dropped with a
 retrieval marker. Nothing here emits markers or calls a compressor.
 
 Segmentation is boundary-aware, not line-based: blank lines delimit records,
-indented continuation lines stay attached to their parent (so stack traces and
-pretty-printed blobs are scored as one unit), and dense blank-free streams
-(grep, tight logs) are packed into small fixed windows. The partition is
-lossless -- ``"".join(segment(content)) == content`` -- so KEEP runs
+indented continuation lines stay attached to their parent (so short stack
+traces and pretty-printed blobs are scored as one unit), and dense blank-free
+streams (grep, tight logs) are packed into small fixed windows. The partition
+is lossless -- ``"".join(segment(content)) == content`` -- so KEEP runs
 reconstruct the original bytes exactly.
 """
 
@@ -53,8 +53,12 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
 
     Lossless partition: ``"".join(segment(content)) == content``. Blank lines
     delimit records; oversized or dense blank-free blocks are packed into
-    windows of at most ``window`` lines / ``max_chars`` chars, with indented
-    continuation lines held to their window so multi-line units aren't cut.
+    windows of at most ``window`` lines and ``max_chars`` chars, with indented
+    continuation lines held past the line window (still inside ``max_chars``) so
+    multi-line units aren't cut mid-run. One budget covers the whole segment, so
+    a long indented run is windowed rather than collapsed into one record. A
+    single line longer than ``max_chars`` is emitted whole, since splitting it
+    would break the partition.
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 1:
@@ -76,15 +80,22 @@ def segment(content: str, *, window: int = 8, max_chars: int = 1200) -> list[str
     # their window so stack traces / pretty JSON aren't split mid-unit.
     segments: list[str] = []
     for block in blocks:
-        if len(block) <= window and sum(len(x) for x in block) <= max_chars:
-            segments.append("".join(block))
-            continue
         i = 0
         n = len(block)
         while i < n:
-            j = min(i + window, n)
-            while j < n and block[j][:1] in (" ", "\t"):
-                j += 1  # don't cut off an indented continuation run
+            # Always take at least one line (a single over-long line is atomic --
+            # splitting it would break the lossless partition), then grow while the
+            # line window or an indented continuation asks for it AND the char
+            # budget still fits. One budget covers the whole segment, so max_chars
+            # binds every multi-line record instead of only the continuation.
+            j, size = i + 1, len(block[i])
+            while (
+                j < n
+                and (j - i < window or block[j][:1] in (" ", "\t"))
+                and size + len(block[j]) <= max_chars
+            ):
+                size += len(block[j])
+                j += 1
             segments.append("".join(block[i:j]))
             i = j
     return segments
@@ -155,6 +166,12 @@ def plan_relevance_split(
     caller applies one disposition per run. Returns a single KEEP run -- i.e.
     no split -- when the query is empty, the content is a single record, or it
     segments into more than ``max_records`` records (a latency guard).
+
+    Note that bounding long runs makes uniformly-indented output (YAML,
+    container logs, indented JSON) segment into several records with no head
+    line, so a blob that previously stayed one whole KEEP record can now be
+    dropped in part or in full. Recoverability of a DROP run is the caller's
+    concern, not this module's.
     """
     if not query.strip():
         return [(True, content)]

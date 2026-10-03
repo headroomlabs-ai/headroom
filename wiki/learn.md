@@ -157,7 +157,7 @@ Options:
   --apply                      Write recommendations (default: dry-run)
   --target TEXT                Context file to write (default: CLAUDE.local.md for Claude Code)
   --main-only                  Write only to the main context file, skip MEMORY.md
-  --agent [auto|claude|codex|gemini]
+  --agent [auto|claude|codex|gemini|grok|opencode]
                                Which agent to analyze (default: auto-detect)
   --model TEXT                 LLM for analysis (default: auto from API keys or CLI)
   --workers / -j INTEGER       Parallel analysis workers (min 1, default: auto)
@@ -188,6 +188,8 @@ To keep the shaper on across proxy restarts, export both variables before starti
 | **Claude Code** | Reads `~/.claude/projects/*.jsonl` | ClaudeCodeWriter | CLAUDE.md, MEMORY.md |
 | **OpenAI Codex** | Reads `~/.codex/sessions/*.json` | CodexWriter | AGENTS.md, instructions.md |
 | **Gemini CLI** | Reads `~/.gemini/tmp/*/chats/session-*.json` | GeminiWriter | GEMINI.md |
+| **Grok CLI** | Reads `~/.grok/sessions/<workspace>/<session-id>/updates.jsonl` | GrokWriter | GROK.md |
+| **OpenCode** | Reads the OpenCode SQLite DB at `~/.local/share/opencode/opencode.db` (or `opencode-local.db`; override with `HEADROOM_OPENCODE_DB`) | CodexWriter (shared) | AGENTS.md, instructions.md |
 
 ## LLM Backend Selection
 

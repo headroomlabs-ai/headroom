@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
+from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
@@ -79,7 +80,9 @@ class ProxyProviderRuntime:
             return self.api_targets.gemini
         if headers.get("api-key"):
             azure_base = headers.get("x-headroom-base-url", "")
-            if azure_base:
+            # Same SSRF guard as `proxy_targets.select_passthrough_base_url`;
+            # both resolve a caller-named upstream (CVE-2026-77775).
+            if azure_base and is_safe_upstream_url(azure_base):
                 return azure_base.rstrip("/")
         return self.api_targets.openai
 
@@ -159,9 +162,27 @@ def resolve_extra_headers(
 
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     """Resolve normalized upstream provider targets from configured overrides."""
+    from headroom.copilot_auth import is_copilot_upstream_url
+
+    openai = _normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL)
+
+    # GitHub Copilot serves BOTH its OpenAI surface (``/chat/completions``,
+    # ``/responses``) and its Anthropic surface (``/v1/messages``, for Claude
+    # models) from the same host. When the OpenAI target is a Copilot host
+    # (``wrap copilot --subscription`` / ``wrap vscode`` both point it there so
+    # GPT models work) but no Anthropic target was set, Claude-model requests
+    # fell back to ``DEFAULT_ANTHROPIC_API_URL`` (api.anthropic.com) and 401'd
+    # with the Copilot bearer — "Invalid bearer token" (#3247). Default the
+    # Anthropic target to the same Copilot host so those requests reach the
+    # surface that actually serves them. An explicit ``ANTHROPIC_TARGET_API_URL``
+    # still wins (only a ``None`` override is filled in here).
+    anthropic_override = overrides.anthropic
+    if anthropic_override is None and is_copilot_upstream_url(openai):
+        anthropic_override = openai
+
     return ProviderApiTargets(
-        anthropic=_normalize_api_url(overrides.anthropic, default=DEFAULT_ANTHROPIC_API_URL),
-        openai=_normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL),
+        anthropic=_normalize_api_url(anthropic_override, default=DEFAULT_ANTHROPIC_API_URL),
+        openai=openai,
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
         vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),

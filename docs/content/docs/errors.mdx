@@ -45,7 +45,10 @@ HeadroomError (base class)
   +-- ProviderError          # Provider issues (unknown model, etc.)
   +-- StorageError           # Database/storage failures
   +-- CompressionError       # Compression failures (rare)
+  +-- TokenizationError      # Token counting failed
+  +-- CacheError             # Cache operations failed
   +-- ValidationError        # Setup validation failures
+  +-- TransformError         # Transform execution failed
 ```
 
 ```python
@@ -55,7 +58,10 @@ from headroom import (
     ProviderError,
     StorageError,
     CompressionError,
+    TokenizationError,
+    CacheError,
     ValidationError,
+    TransformError,
 )
 ```
 
@@ -119,7 +125,11 @@ except HeadroomError as e:
 
 ### ConfigurationError
 
-Raised when configuration is invalid.
+Raised when configuration is invalid. In the Python SDK (0.37.0),
+`ConfigurationError` is importable and exported from `headroom`, but
+`HeadroomClient` itself does not currently raise it: an invalid
+`default_mode` string is validated by the `HeadroomMode` enum and raises a
+plain **`ValueError`**, not `ConfigurationError`.
 
 <Tabs groupId="lang" items={['TypeScript', 'Python']}>
 <Tab value="TypeScript">
@@ -136,44 +146,62 @@ try:
     client = HeadroomClient(
         original_client=OpenAI(),
         provider=OpenAIProvider(),
-        default_mode="invalid_mode",  # Will raise ConfigurationError
+        default_mode="invalid_mode",
     )
-except ConfigurationError as e:
-    print(f"Config error: {e}")
-    print(f"Field: {e.details.get('field')}")
+except ValueError as e:
+    print(f"Invalid mode: {e}")
+    # 'invalid_mode' is not a valid HeadroomMode
 ```
 </Tab>
 </Tabs>
 
 ### ProviderError
 
-Raised for provider-specific issues (unknown model, API error, token counting failure).
+Reserved for provider-specific issues, but not currently raised anywhere in
+the SDK. In particular, an unknown model name does **not** raise
+`ProviderError`: `Provider.get_context_limit()` is documented to "never
+raise an exception -- uses sensible defaults for unknown models," and only
+logs a one-time `WARNING` naming the fallback it used.
 
 ```python
-try:
-    response = client.chat.completions.create(
-        model="unknown-model-xyz",
-        messages=[...],
-    )
-except ProviderError as e:
-    print(f"Provider error: {e}")
-    print(f"Provider: {e.details.get('provider')}")
+import logging
+logging.basicConfig(level=logging.WARNING)
+
+# Does NOT raise ProviderError -- falls back to a default context limit
+# and logs: WARNING:headroom.providers.openai:Unknown OpenAI model
+# 'unknown-model-xyz': using default limit (...). To configure explicitly,
+# set HEADROOM_MODEL_LIMITS env var or add to ~/.headroom/models.json
+response = client.chat.completions.create(
+    model="unknown-model-xyz",
+    messages=[...],
+)
 ```
 
 ### StorageError
 
-Raised when database operations fail. Storage errors do not affect core functionality -- the application can continue without historical metrics.
+Reserved for database/storage failures. `HeadroomClient.get_metrics()` and
+`get_summary()` currently delegate straight to the storage backend
+(`headroom/client.py`) without wrapping failures in `StorageError`, so a
+broken database today surfaces as the underlying driver's own exception
+(for example `sqlite3.OperationalError`) rather than `StorageError`. Catch
+the base `HeadroomError` -- or `Exception` around storage calls specifically
+-- until that wrapping lands.
 
 ```python
 try:
     metrics = client.get_metrics()
-except StorageError as e:
+except Exception as e:
     metrics = []  # Continue without historical metrics
 ```
 
 ### CompressionError
 
-Raised when compression fails (rare). In practice, compression errors are caught internally and the original content passes through unchanged. This exception is only raised in strict mode.
+Reserved for compression failures. As of 0.37.0 this class is exported but
+not raised anywhere in the codebase -- there is no "strict mode" that
+triggers it. Compression failures are instead caught internally by broad
+`except Exception` handlers throughout `headroom/transforms/`, which fail
+open and return the original, uncompressed content. This is what backs the
+safety guarantee below.
 
 ### HeadroomConnectionError (TypeScript)
 
@@ -202,6 +230,7 @@ The TypeScript SDK automatically maps proxy error responses to the correct error
 | 4xx/5xx | `provider_error` | `ProviderError` |
 | 4xx/5xx | `storage_error` | `StorageError` |
 | 4xx/5xx | `tokenization_error` | `TokenizationError` |
+| 4xx/5xx | `cache_error` | `CacheError` |
 | 4xx/5xx | `validation_error` | `ValidationError` |
 | 4xx/5xx | `transform_error` | `TransformError` |
 | 4xx/5xx | (other) | `HeadroomCompressError` |
@@ -265,12 +294,15 @@ response = client.chat.completions.create(
 ## Best Practices
 
 1. **Catch specific exceptions** rather than broad `Exception` to avoid hiding real bugs
-2. **Let StorageError pass** -- storage errors do not affect core compression functionality
+2. **Don't rely on storage failures raising** -- as of 0.37.0 they surface as the
+   underlying driver's own exception, not `StorageError` (see above)
 3. **Validate on startup** with `client.validate_setup()` to catch configuration issues early
-4. **Enable logging** at WARNING level to see when compression is skipped
+4. **Enable logging** at WARNING level to see when compression falls back safely
 
 ```python
 import logging
 logging.basicConfig(level=logging.WARNING)
-# WARNING:headroom.transforms.smart_crusher:Skipping compression: invalid JSON
+# WARNING:headroom.transforms.smart_crusher:SmartCrusher audit_safe: 1 protected
+# row(s) could not be preserved through compression (...). Failing closed:
+# returning original uncompressed.
 ```
