@@ -1007,6 +1007,26 @@ def main():
         except SyntaxError:
             pytest.fail("Compressed output has invalid Python syntax")
 
+    @pytest.mark.parametrize(
+        "language, code, missing",
+        [
+            ("python", "def f():\n    return 1", False),
+            ("python", "def f(:\n    return 1", True),
+            ("javascript", "function f() { return 1;", True),
+            ("go", "package p\nfunc f() { return", True),
+        ],
+    )
+    def test_native_syntax_flag_includes_missing_descendants(self, language, code, missing):
+        root = cc._get_parser(language).parse(code.encode()).root_node
+        nodes = [root]
+        has_missing = False
+        while nodes:
+            node = nodes.pop()
+            has_missing |= node.is_missing
+            nodes.extend(node.children)
+        assert has_missing is missing
+        assert cc._has_syntax_issues(root) is missing
+
     def test_python_future_import_stays_at_module_start(self):
         """Compressed Python keeps future imports before executable statements."""
         config = CodeCompressorConfig(
@@ -1282,6 +1302,46 @@ class TestSemanticSymbolImportance:
         assert "process_payment" in result.symbol_scores
         assert "validate_order" in result.symbol_scores
         assert "_dead_helper" in result.symbol_scores
+
+    def test_symbol_analysis_keeps_qualified_names_and_calls(self):
+        code = """
+class Worker:
+    def helper(self):
+        return 1
+
+    def caller(self):
+        return self.helper()
+"""
+        root = cc._get_parser("python").parse(code.encode()).root_node
+        analysis = self._make_compressor()._analyze_symbol_importance(
+            root, code, CodeLanguage.PYTHON
+        )
+
+        assert {"Worker", "Worker.helper", "Worker.caller"} <= set(analysis.bare_names)
+        assert analysis.calls["Worker.caller"] == {"helper"}
+
+    def test_symbol_analysis_indexes_first_qualified_call_entry_by_bare_name(self):
+        code = """
+class First:
+    def helper(self):
+        return 1
+
+    def target(self):
+        return self.helper()
+
+class Second:
+    def ignored(self):
+        return 1
+
+    def target(self):
+        return self.ignored()
+"""
+        root = cc._get_parser("python").parse(code.encode()).root_node
+        analysis = self._make_compressor()._analyze_symbol_importance(
+            root, code, CodeLanguage.PYTHON
+        )
+
+        assert analysis.qualified_calls_by_bare_name["target"] == {"helper"}
 
     def test_called_functions_score_higher_than_dead_code(self):
         """Functions called by others score higher than unused functions."""
@@ -1652,7 +1712,9 @@ class TestRealASTRuns:
         code = self._python_recovery_fixture()
         original_compress_function_ast = compressor._compress_function_ast
 
-        def _patched(node, code_text, language, lang_config, body_limits, analysis):
+        def _patched(
+            node, code_text, language, lang_config, body_limits, analysis, code_lines=None
+        ):
             name = cc._get_definition_name(node)
             if name == "expand_search_roots":
                 return "def expand_search_roots(user_root: str) -> list[Path]:\n    if True\n"
@@ -1670,6 +1732,7 @@ class TestRealASTRuns:
                 lang_config,
                 body_limits,
                 analysis,
+                code_lines,
             )
 
         with patch.object(compressor, "_compress_function_ast", side_effect=_patched):
@@ -1727,7 +1790,9 @@ class TestRealASTRuns:
         compressor = self._recovery_compressor()
         code = self._python_recovery_fixture()
 
-        def _patched(node, _code_text, _language, _lang_config, _body_limits, _analysis):
+        def _patched(
+            node, _code_text, _language, _lang_config, _body_limits, _analysis, _code_lines=None
+        ):
             name = cc._get_definition_name(node) or "broken"
             return f"def {name}(:\n    pass"
 
@@ -1750,6 +1815,69 @@ class TestRealASTRuns:
         functions = [node for node in root.children if node.type == "function_definition"]
 
         assert _get_node_text(functions[1], code) == "def second():\n    return 2"
+
+    def test_symbol_analysis_preserves_nested_decorated_and_duplicate_definitions(self):
+        code = textwrap.dedent("""\
+            def wrap(fn):
+                return fn
+            @wrap
+            class Box:
+                def run(self):
+                    return helper()
+                class Inner:
+                    def run(self):
+                        return Box()
+            def helper():
+                return 1
+            def helper():
+                return Box()
+            """)
+        compressor = CodeAwareCompressor(CodeCompressorConfig(enable_ccr=False))
+        root = cc._get_parser("python").parse(code.encode()).root_node
+
+        analysis = compressor._analyze_symbol_importance(root, code, CodeLanguage.PYTHON, "helper")
+
+        assert list(analysis.scores) == [
+            "wrap",
+            "Box",
+            "Box.run",
+            "Box.Inner",
+            "Box.Inner.run",
+            "helper",
+        ]
+        assert analysis.ref_counts == {
+            "wrap": 1,
+            "Box": 2,
+            "Box.run": 0,
+            "Box.Inner": 0,
+            "Box.Inner.run": 0,
+            "helper": 2,
+        }
+        assert analysis.calls["Box"] == {"Inner", "helper", "run"}
+        assert analysis.calls["helper"] == {"Box"}
+        assert analysis.qualified_calls_by_bare_name["run"] == {"helper"}
+        assert analysis.scores["helper"] == 1.0
+
+    def test_unicode_analysis_uses_node_text_without_source_slices(self):
+        code = "\n\n".join(
+            f'def function_{index}():\n    value = "🔥"\n    value += str(index)\n    return value'
+            for index in range(20)
+        )
+        compressor = CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+
+        with patch.object(cc, "_slice_code_bytes", wraps=cc._slice_code_bytes) as source_slice:
+            result = compressor.compress(code, language="python")
+
+        assert source_slice.call_count == 0
+        assert result.syntax_valid is True
+        assert "🔥" in result.compressed
+        compile(result.compressed, "<test>", "exec")
 
     def test_ast_compresses_python_after_non_ascii_source(self):
         """CJK/emoji before a later function must not corrupt downstream slices."""
@@ -2210,3 +2338,41 @@ class TestPhpSupport:
         code = "<?php\nclass Broken {\n    public function oops( {\n"
         result = self._compressor().compress(code, language="php")
         assert result.compressed == code
+
+
+def test_omitted_comment_direct_call_entry_skips_suffix_scan():
+    class NoSuffixScanCalls(dict):
+        def __iter__(self):
+            raise AssertionError("direct call entry must not scan suffixes")
+
+    analysis = cc._SymbolAnalysis(
+        calls=NoSuffixScanCalls({"target": set()}),
+        qualified_calls_by_bare_name={"target": {"ignored"}},
+    )
+
+    assert cc._make_omitted_comment("target", 2, "", "#", analysis) == "# [2 lines omitted]"
+
+
+def test_omitted_comment_uses_first_qualified_call_entry():
+    analysis = cc._SymbolAnalysis(
+        calls={"first.target": {"beta", "alpha"}, "second.target": {"ignored"}},
+    )
+
+    assert cc._make_omitted_comment("target", 2, "", "#", analysis) == (
+        "# [2 lines omitted; calls: alpha, beta]"
+    )
+
+
+def test_omitted_comment_uses_analysis_lookup_without_suffix_scan():
+    class NoSuffixScanCalls(dict):
+        def __iter__(self):
+            raise AssertionError("qualified call entry must not scan suffixes")
+
+    analysis = cc._SymbolAnalysis(
+        calls=NoSuffixScanCalls({"first.target": {"beta", "alpha"}}),
+        qualified_calls_by_bare_name={"target": {"beta", "alpha"}},
+    )
+
+    assert cc._make_omitted_comment("target", 2, "", "#", analysis) == (
+        "# [2 lines omitted; calls: alpha, beta]"
+    )
