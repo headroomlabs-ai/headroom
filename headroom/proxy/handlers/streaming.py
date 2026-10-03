@@ -661,6 +661,16 @@ class StreamingMixin:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
+            if not forwarded_messages and provider == "gemini":
+                # Gemini bodies carry contents[] rather than messages[] (Cloud
+                # Code Assist nests the payload under body["request"]).
+                # Convert with the same helper the Gemini handler used so the
+                # tracker walks the same message shape (#3394).
+                _gemini_payload = body["request"] if isinstance(body.get("request"), dict) else body
+                forwarded_messages, _ = self._gemini_contents_to_messages(
+                    _gemini_payload.get("contents", []),
+                    _gemini_payload.get("systemInstruction"),
+                )
             next_forwarded = _copy.deepcopy(forwarded_messages)
             next_original = _copy.deepcopy(original_messages or forwarded_messages)
 
@@ -697,9 +707,19 @@ class StreamingMixin:
                     )
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
+            tracker_cache_write = cache_write_tokens
+            if provider == "gemini" and tracker_cache_write == 0:
+                # Gemini's stream usage reports cache reads only
+                # (cachedContentTokenCount); implicit caching has no write
+                # counter, so the uncached input portion is the write proxy
+                # (same inference as the OpenAI buffered path). Kept as a
+                # tracker-local value: Gemini outcomes intentionally report no
+                # cache-write concept (#3394).
+                tracker_cache_write = max(effective_optimized_tokens - cache_read_tokens, 0)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
+                cache_write_tokens=tracker_cache_write,
                 messages=next_forwarded,
                 original_messages=next_original,
             )

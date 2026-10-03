@@ -180,6 +180,10 @@ class NativeGeminiHandler(DummyBatchHandler):
         self.memory_handler = None
         self.rate_limiter = None
         self.usage_reporter = None
+        # The mixin resolves a prefix tracker for the freeze floor (#3394).
+        from headroom.cache.prefix_tracker import SessionTrackerStore
+
+        self.session_tracker_store = SessionTrackerStore()
         self.responses = iter(responses)
         self.sent_bodies: list[dict] = []
         from headroom.ccr.response_handler import CCRResponseHandler
