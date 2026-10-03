@@ -773,6 +773,85 @@ def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
     assert outcome.cache_read_tokens == 2
 
 
+def _finalize_anthropic_stream(optimized_tokens, input_tokens):  # noqa: ANN001, ANN202
+    handler = object.__new__(HeadroomProxy)
+    handler.config = SimpleNamespace(log_full_messages=False)
+    outcomes = []
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = record
+
+    asyncio.run(
+        handler._finalize_stream_response(
+            body={"messages": [{"role": "user", "content": "hello"}]},
+            provider="anthropic",
+            model="claude-opus-4-1",
+            request_id="req_anthropic_stream_final",
+            original_tokens=optimized_tokens + 5,
+            optimized_tokens=optimized_tokens,
+            tokens_saved=5,
+            transforms_applied=[],
+            optimization_latency=1.0,
+            stream_state={
+                "input_tokens": input_tokens,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 360_949,
+                "cache_creation_input_tokens": 840,
+                "cache_creation_ephemeral_5m_input_tokens": 0,
+                "cache_creation_ephemeral_1h_input_tokens": 840,
+                "total_bytes": 100,
+                "sse_buffer": bytearray(),
+                "ttfb_ms": 4.0,
+            },
+            start_time=0.0,
+        )
+    )
+    (outcome,) = outcomes
+    return outcome
+
+
+@pytest.mark.parametrize(
+    "optimized_tokens",
+    [
+        # Local count 50k over the provider's (a production turn reported
+        # input_tokens=2 while the old derivation logged 50,663 uncached).
+        412_452,
+        # Local count under the provider's: the old derivation clamped to 0.
+        300_000,
+    ],
+)
+def test_stream_finalizer_takes_anthropic_uncached_input_from_usage(optimized_tokens) -> None:  # noqa: ANN001
+    outcome = _finalize_anthropic_stream(optimized_tokens, input_tokens=2)
+
+    assert outcome.uncached_input_tokens == 2
+    assert outcome.cache_read_tokens == 360_949
+    assert outcome.cache_write_tokens == 840
+
+
+def test_stream_finalizer_derives_anthropic_uncached_input_without_usage() -> None:
+    # No message_start usage (an error before the stream began): keep the
+    # tokenizer-based derivation.
+    outcome = _finalize_anthropic_stream(400_000, input_tokens=None)
+
+    assert outcome.uncached_input_tokens == 400_000 - 360_949 - 840
+
+
+def test_sse_parser_leaves_absent_anthropic_input_tokens_absent() -> None:
+    # A message_start usage without input_tokens must not read as a provider
+    # count of 0, or the finalizer books 0 uncached instead of deriving it.
+    proxy = object.__new__(HeadroomProxy)
+    event = {"type": "message_start", "message": {"usage": {"cache_read_input_tokens": 9}}}
+    state = {"sse_buffer": bytearray(f"data: {json.dumps(event)}\n\n".encode())}
+
+    usage = proxy._parse_sse_usage_from_buffer(state, "anthropic")
+
+    assert usage is not None
+    assert "input_tokens" not in usage
+    assert usage["cache_read_input_tokens"] == 9
+
+
 def test_vertex_gemini_non_text_generate_records_dashboard_outcome() -> None:
     handler = object.__new__(HeadroomProxy)
     handler.memory_handler = None
