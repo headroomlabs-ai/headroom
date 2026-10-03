@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -405,8 +406,124 @@ def _load_json_value(raw: Any) -> Any:
     return raw
 
 
+# headroom's own retrieval tool. Kept as a literal (rather than imported from
+# headroom.ccr.tool_injection) so this leaf module stays free of the ccr
+# package's import graph; mirrors CCR_TOOL_NAME there.
+_CCR_RETRIEVE_TOOL_NAME = "headroom_retrieve"
+
+# Orchestrator wrappers. OpenCode V2 Code Mode runs every MCP call inside its
+# built-in `execute` tool, and Codex code mode sends calls as `exec` /
+# `functions.exec` custom tool calls whose payload is JavaScript. On the wire
+# the name is the wrapper -- the inner tool name never reaches the proxy -- so
+# when the script invokes the retrieval tool the ccr_retrieve exemption misses
+# and the retrieved bytes are re-offloaded into a <<ccr:hash>> marker the agent
+# can never redeem (unresolvable retrieval loop, #3563).
+#
+# Only a call whose own payload invokes the retrieval tool resolves to it: the
+# wrapper is never exempted as a whole (an `execute` call running anything else
+# stays compressible), and the match keys on the model-authored call arguments
+# -- never on the result content (an `original_content` property is data the
+# model may echo, not recovery proof). Tradeoff, same family as the
+# mcp__<server>__ alias matching above: a wrapper payload that merely mentions
+# `headroom_retrieve(` inside a string (e.g. a shell command being exec'd)
+# over-protects that one output; losing compression is cheap, losing retrieved
+# bytes is not.
+#
+# Matching runs on decoded script text: the OpenAI wire hands the payload over
+# JSON-encoded, where a real newline between the callee and `(` arrives as the
+# two characters `\n` and a raw-text scan misses the call.
+_ORCHESTRATOR_WRAPPER_NAMES = frozenset({"execute", "exec", "functions.exec"})
+
+# JavaScript call expressions inside a wrapper payload: `headroom_retrieve(`,
+# `tools.headroom.headroom_retrieve(`, plus bracket access
+# `tools["headroom_retrieve"](` / `tools['mcp__headroom__headroom_retrieve'](`.
+# Optional chaining counts as an invocation too -- `headroom_retrieve?.()`,
+# `tools?.headroom.headroom_retrieve(...)`, `tools["headroom_retrieve"]?.()`
+# -- since the tool still runs when present and its bytes need the exemption.
+# Decoded script text carries unescaped quotes; the escaped form of a raw
+# payload is tolerated too.
+_JS_CALL_CHAIN_RE = re.compile(
+    r"(?<![\w$.])([A-Za-z_$][\w$]*(?:\??\.[A-Za-z_$][\w$]*)*)\s*(?:\?\.)?\s*\("
+)
+_JS_BRACKET_KEY_RE = re.compile(
+    r"""\[\s*\\?(?:"([^"\n\\]{1,200})\\?"|'([^'\n\\]{1,200})\\?')\s*\]"""
+    r"""\s*(?:\?\.)?\s*\("""
+)
+
+
+def _decoded_strings(value: Any) -> list[str]:
+    """Every string nested in a decoded payload (dicts and lists walk
+    through); scalars contribute nothing."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        items: Iterable[Any] = value.values()
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return []
+    strings: list[str] = []
+    for item in items:
+        strings.extend(_decoded_strings(item))
+    return strings
+
+
+def _orchestrator_invokes_retrieve(name: str, arguments: Any) -> bool:
+    """True when an orchestrator wrapper's payload invokes the retrieval tool.
+
+    See the comment above ``_ORCHESTRATOR_WRAPPER_NAMES``. ``arguments`` is the
+    model-authored call payload: JSON text on the OpenAI wire, a decoded dict on
+    the Anthropic wire, raw JavaScript for a custom_tool_call. JSON text is
+    decoded before matching so a script newline is seen as a real newline. Any
+    other value fails closed (the call keeps its wrapper name).
+    """
+    if name not in _ORCHESTRATOR_WRAPPER_NAMES:
+        return False
+    texts: list[str]
+    if isinstance(arguments, str):
+        decoded = _load_json_value(arguments)
+        if isinstance(decoded, dict):
+            texts = _decoded_strings(decoded)
+        elif decoded is None:
+            # Not JSON: a raw JavaScript custom_tool_call payload.
+            texts = [arguments]
+        else:
+            # A JSON scalar, string or array: no orchestrator payload shape.
+            return False
+    elif isinstance(arguments, dict):
+        texts = _decoded_strings(arguments)
+    else:
+        return False
+
+    def _names_retrieve(candidate: str) -> bool:
+        # A dotted chain resolves on its last segment
+        # (`tools.headroom.headroom_retrieve`); is_tool_excluded() then applies
+        # the usual mcp__<server>__ aliases to it.
+        return is_tool_excluded(candidate.rsplit(".", 1)[-1], (_CCR_RETRIEVE_TOOL_NAME,))
+
+    for text in texts:
+        if _CCR_RETRIEVE_TOOL_NAME not in text:
+            continue
+        for match in _JS_CALL_CHAIN_RE.finditer(text):
+            if _names_retrieve(match.group(1)):
+                return True
+        for match in _JS_BRACKET_KEY_RE.finditer(text):
+            key = next(group for group in match.groups() if group)
+            if _names_retrieve(key):
+                return True
+    return False
+
+
 def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
-    """Resolve a Hermes deferred ``tool_call`` wrapper to ``(real_name, real_arguments)``.
+    """Resolve a wrapper tool call to ``(effective_name, effective_arguments)``.
+
+    Two wrapper families resolve here beyond the pass-through: the Hermes
+    deferred ``tool_call`` bridge (see comment above), and an orchestrator
+    wrapper (``execute`` / ``exec`` / ``functions.exec``) whose payload invokes
+    the retrieval tool -- the latter reports the retrieval tool's own name so
+    its result keeps the ccr_retrieve exemption (#3563). A Hermes bridge over
+    an orchestrator call (``tool_call`` -> ``execute`` -> script) resolves
+    through that same orchestrator rule.
 
     Non-wrapper names pass through with their arguments unchanged. A batch
     resolves when every entry names the same tool (Hermes rejects multi-local
@@ -416,6 +533,8 @@ def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
     means).
     """
     if name != _HERMES_TOOL_CALL_WRAPPER:
+        if _orchestrator_invokes_retrieve(name, arguments):
+            return _CCR_RETRIEVE_TOOL_NAME, arguments
         return name, arguments
     payload = _load_json_value(arguments)
     if not isinstance(payload, dict):
@@ -444,6 +563,11 @@ def unwrap_tool_call(name: str, arguments: Any) -> tuple[str, Any]:
     # Per-call arguments are only meaningful for a single call; a batch keeps
     # the wrapper payload so nothing downstream reads one entry as the whole.
     real_arguments = entries[0].get("arguments") if len(entries) == 1 else arguments
+    if _orchestrator_invokes_retrieve(real_name, real_arguments):
+        # Hermes bridge over an orchestrator wrapper (`tool_call` -> `execute`
+        # -> script): the effective call is the orchestrator's, so its
+        # retrieval check decides the name; the bridge alone is never exempted.
+        return _CCR_RETRIEVE_TOOL_NAME, real_arguments
     return real_name, real_arguments
 
 
