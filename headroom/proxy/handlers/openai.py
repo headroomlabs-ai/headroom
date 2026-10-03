@@ -103,6 +103,7 @@ from headroom.proxy.project_context import (
     get_current_project,
     set_current_project,
 )
+from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_from_usage
 from headroom.proxy.token_counting import gemini_output_tokens
 
@@ -1834,6 +1835,7 @@ class OpenAIHandlerMixin:
         return await count_tokens_offloaded(self, model, messages)
 
     OPENAI_RESPONSES_ROUTER_MIN_BYTES = 512
+    OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES = 8192
     OPENAI_RESPONSES_OUTPUT_TYPES = _RESPONSES_OUTPUT_ITEM_TYPES
 
     def _openai_responses_unit_cache(self) -> tuple[Any, OrderedDict[str, Any]]:
@@ -2176,12 +2178,22 @@ class OpenAIHandlerMixin:
             return payload, False, 0, [], {}, [], 0
 
         def _slot_texts(item: dict[str, Any]) -> list[tuple[str, tuple[str, int | None]]]:
-            # Only tool-output items are eligible for in-place compression.
-            # Message items (user/system/assistant) sit inside the request's
-            # cacheable prefix; mutating them busts prefix caching on every
-            # subsequent turn. Role-level guards in compression_units.py
-            # remain as defense-in-depth.
+            # Tool outputs and historical message text are eligible for
+            # in-place compression. The current user message is filtered below.
             type_tag = item.get("type")
+            if type_tag == "message":
+                content = item.get("content")
+                if isinstance(content, str):
+                    return [(content, ("content", None))]
+                if not isinstance(content, list):
+                    return []
+                return [
+                    (part["text"], ("content_text", index))
+                    for index, part in enumerate(content)
+                    if isinstance(part, dict)
+                    and part.get("type") in {"input_text", "output_text", "text"}
+                    and isinstance(part.get("text"), str)
+                ]
             if type_tag not in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 return []
             output = item.get("output")
@@ -2211,6 +2223,20 @@ class OpenAIHandlerMixin:
                 if isinstance(output, list) and 0 <= index < len(output):
                     part = output[index]
                     if isinstance(part, dict) and part.get("type") in {"input_text", "output_text"}:
+                        part["text"] = replacement
+                        return True
+            if kind == "content":
+                item["content"] = replacement
+                return True
+            if kind == "content_text" and isinstance(index, int):
+                content = item.get("content")
+                if isinstance(content, list) and 0 <= index < len(content):
+                    part = content[index]
+                    if isinstance(part, dict) and part.get("type") in {
+                        "input_text",
+                        "output_text",
+                        "text",
+                    }:
                         part["text"] = replacement
                         return True
             return False
@@ -2349,6 +2375,16 @@ class OpenAIHandlerMixin:
         # normal candidate compression — no ML, byte/data-lossless only.
         lossless_excluded: list[tuple[int, tuple[str, int | None], str, str]] = []
         extraction_debug: list[dict[str, Any]] = []
+        last_user_item_idx = max(
+            (
+                idx
+                for idx, item in enumerate(items)
+                if isinstance(item, dict)
+                and item.get("type") == "message"
+                and item.get("role") == "user"
+            ),
+            default=-1,
+        )
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
                 if debug_enabled:
@@ -2491,6 +2527,48 @@ class OpenAIHandlerMixin:
                                 "item": item,
                             }
                         )
+            elif item_type == "message":
+                if item.get("role") == "user" and idx == last_user_item_idx:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "current_user_message_protected",
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "item": item,
+                            }
+                        )
+                    continue
+                slots = _slot_texts(item)
+                for text, slot_ref in slots:
+                    candidates.append((idx, slot_ref, text))
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": True,
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "slot": slot_ref,
+                                "text_chars": len(text),
+                                "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                "text_json_shape": _json_shape(text),
+                                "item": item,
+                                "text": text,
+                            }
+                        )
+                if not slots and debug_enabled:
+                    extraction_debug.append(
+                        {
+                            "index": idx,
+                            "eligible": False,
+                            "reason": "supported_type_without_text_slot",
+                            "item_type": item_type,
+                            "item": item,
+                        }
+                    )
             else:
                 if debug_enabled:
                     extraction_debug.append(
@@ -2555,6 +2633,16 @@ class OpenAIHandlerMixin:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
             role = str(item.get("role") or "tool") if isinstance(item, dict) else "tool"
+            metadata: dict[str, str] = {}
+            if role == "assistant":
+                metadata["compress_assistant"] = "true"
+            if role == "user" and item_idx != last_user_item_idx:
+                metadata["compress_user"] = "true"
+            min_bytes = (
+                self.OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES
+                if item_type == "message"
+                else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+            )
             unit = CompressionUnit(
                 text=original_text,
                 provider="openai",
@@ -2563,7 +2651,8 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                min_bytes=min_bytes,
+                metadata=metadata,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -3450,6 +3539,16 @@ class OpenAIHandlerMixin:
         auth_mode = classify_auth_mode(request.headers)
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
+
+        # Phase F PR-F3: resolve per-tenant TOIN key (header / hash /
+        # global) and populate the request-scoped ContextVar that
+        # SmartCrusher's deep-stack `record_compression` reads. See
+        # `headroom/proxy/tenant_key.py` for the threat model and the
+        # resolution rules.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
 
         # Check request body size
         content_length = request.headers.get("content-length")
@@ -5810,6 +5909,16 @@ class OpenAIHandlerMixin:
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
+        # Phase F PR-F3: resolve per-tenant TOIN key (header / hash /
+        # global) and populate the request-scoped ContextVar that
+        # SmartCrusher's deep-stack `record_compression` reads. See
+        # `headroom/proxy/tenant_key.py` for the threat model and the
+        # resolution rules.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
+
         # Check request body size
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
@@ -7489,8 +7598,16 @@ class OpenAIHandlerMixin:
                 from headroom.subscription.codex_rate_limits import (
                     maybe_schedule_usage_poll,
                 )
+                from headroom.subscription.credential_policy import (
+                    is_local_operator_connection,
+                )
 
-                maybe_schedule_usage_poll(ws_headers)
+                # The poll spends the caller's own bearer: local operator only
+                # (01-F16).
+                maybe_schedule_usage_poll(
+                    ws_headers,
+                    from_local_operator=is_local_operator_connection(websocket),
+                )
 
         try:
             # ChatGPT-auth sessions no longer need upstream x-codex-* headers on

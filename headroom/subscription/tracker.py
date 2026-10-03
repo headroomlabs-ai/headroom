@@ -179,11 +179,15 @@ class SubscriptionTracker(QuotaTracker):
     # Proxy integration hooks
     # ------------------------------------------------------------------
 
-    def notify_active(self, token: str) -> None:
+    def notify_active(self, token: str, *, from_local_operator: bool = False) -> None:
         """Called by the proxy handler when an OAuth request comes through.
 
-        Stores the token for polling and marks the tracker as recently active.
-        Only processes Bearer tokens that look like OAuth (not API keys).
+        Marks the tracker as recently active. The caller's bearer is remembered
+        for polling **only** when ``from_local_operator`` is true — the handler
+        passes :func:`headroom.subscription.credential_policy.is_local_operator_connection`.
+        A network caller on a shared proxy never becomes the polled account
+        (VAPT 01-F16). Only Bearer tokens that look like OAuth (not API keys)
+        are considered.
         """
         if not token or not token.startswith("Bearer "):
             return
@@ -192,8 +196,10 @@ class SubscriptionTracker(QuotaTracker):
         if raw.startswith("sk-ant-api"):
             return
         with self._lock:
-            self._current_token = raw
             self._state.last_active_at = _utc_now()
+            if not from_local_operator:
+                return
+            self._current_token = raw
             prefix = raw[:8]
             self._full_tokens[prefix] = self._full_tokens.get(prefix, 0) + 1
 
