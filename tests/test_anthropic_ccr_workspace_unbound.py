@@ -39,6 +39,7 @@ def _client() -> TestClient:
         # Tracker + proactive expansion enabled (defaults) reach the unbound use:
         ccr_context_tracking=True,
         ccr_proactive_expansion=True,
+        ccr_max_turn_distance=3,
         image_optimize=False,
     )
     return TestClient(create_app(config))
@@ -49,6 +50,7 @@ def test_proactive_expansion_does_not_raise_when_ccr_inject_disabled() -> None:
         proxy = client.app.state.proxy
         # Sanity: the tracker is wired up (necessary for the bug to trigger).
         assert proxy.ccr_context_tracker is not None
+        assert proxy.ccr_context_tracker.config.max_turn_distance == 3
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             return httpx.Response(
