@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 from urllib.parse import urlsplit
 
+from headroom.proxy.body_forwarding import OutboundBody
+
 if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
@@ -2484,6 +2486,7 @@ class HeadroomProxy(
         forwarder_name: str = "server",
         path_for_log: str | None = None,
         timeout: httpx.Timeout | float | None = None,
+        outbound: OutboundBody | None = None,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -2507,11 +2510,15 @@ class HeadroomProxy(
 
         last_error = None
         reasons = list(mutation_reasons or [])
-        outbound = select_outbound_body(
-            body=body,
-            original_body_bytes=original_body_bytes,
-            body_mutated=body_mutated,
-            mutation_reasons=reasons,
+        outbound = (
+            outbound
+            if outbound is not None
+            else select_outbound_body(
+                body=body,
+                original_body_bytes=original_body_bytes,
+                body_mutated=body_mutated,
+                mutation_reasons=reasons,
+            )
         )
         outbound_bytes, source = outbound.content, outbound.source
         outbound_headers = {**headers, "content-type": "application/json"}

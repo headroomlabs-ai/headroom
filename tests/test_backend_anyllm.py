@@ -715,3 +715,117 @@ async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)
     assert await backend.close() is None
     assert isinstance(StreamEvent(event_type="message_start", data={}), StreamEvent)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "system", ["synthetic system", [{"type": "text", "text": "synthetic list"}]]
+)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supplied", [False, True])
+async def test_prepared_handoff_compatibility_preserves_mode(monkeypatch, stream, system, supplied):
+    from copy import deepcopy
+
+    backend, instance = make_backend(monkeypatch)
+    body = {
+        "model": "sample",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": system,
+        "max_tokens": 32,
+        "temperature": 0.5,
+        "top_p": 0.8,
+        "stop_sequences": ["stop"],
+        "tools": [{"name": "sample", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "auto"},
+    }
+    prepared = backend.prepare_message(body, {}, stream=stream)
+    original = deepcopy(prepared)
+    assert instance.calls == []
+    assert bool(prepared["messages"][0]["role"] == "system") == (
+        not stream or isinstance(system, str)
+    )
+    if stream:
+        instance.response = FakeAsyncStream([])
+        assert [
+            event
+            async for event in backend.stream_message(
+                body, {}, **({"prepared": prepared} if supplied else {})
+            )
+        ]
+    else:
+        instance.response = make_response(
+            make_choice(), usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)
+        )
+        result = await backend.send_message(
+            body, {}, **({"prepared": prepared} if supplied else {})
+        )
+        assert result.body["model"] == "sample"
+    assert instance.calls == [original] and prepared == original
+    print(
+        f"AnyLLM prepared mode={'streaming' if stream else 'buffered'} system_list={isinstance(system, list)} sdk_kwargs_equal=True response_identity=sample"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.asyncio
+async def test_prepared_production_route_anyllm_guard(monkeypatch, stream, reject):
+    import copy
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from headroom.backends.anyllm import AnyLLMBackend
+    from headroom.proxy.server import create_app
+    from headroom.tokenizers import get_tokenizer
+    from tests.context_budget_behavior_probe import config
+
+    backend = AnyLLMBackend(provider="openai", api_key="synthetic")
+    body = {
+        "model": "gpt-4o",
+        "stream": stream,
+        "max_tokens": 32,
+        "system": [{"type": "text", "text": "synthetic system " * 100}],
+        "messages": [{"role": "user", "content": "synthetic payload " * 100}],
+    }
+    prepared = backend.prepare_message(body, {}, stream=stream)
+    count = get_tokenizer("gpt-4o").count_messages(prepared["messages"])
+    threshold = count - 1 if reject else count
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_MODE", "reject")
+    monkeypatch.setenv("HEADROOM_CONTEXT_LIMIT_SAFETY_MARGIN", "0")
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"context_limits": {"gpt-4o": threshold + 32}})
+    )
+    calls = []
+    preparations = []
+
+    async def sdk(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return (
+            FakeAsyncStream([])
+            if stream
+            else make_response(
+                make_choice(), usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1)
+            )
+        )
+
+    real_prepare = backend.prepare_message
+
+    def capture(*args, **kwargs):
+        item = real_prepare(*args, **kwargs)
+        preparations.append(copy.deepcopy(item))
+        return item
+
+    monkeypatch.setattr(backend.llm, "acompletion", sdk)
+    monkeypatch.setattr(backend, "prepare_message", capture)
+    app = create_app(config())
+    app.state.proxy.anthropic_backend = backend
+    with TestClient(app) as client:
+        result = client.post("/v1/messages", json=body, headers={"x-api-key": "synthetic"})
+    assert result.status_code == (400 if reject else 200) and len(preparations) == 1
+    assert len(calls) == (0 if reject else 1)
+    if calls:
+        assert calls[0] == preparations[0] == prepared
+    print(
+        f"AnyLLM prepared production mode={'streaming' if stream else 'buffered'} count={count} threshold={threshold} status={result.status_code} sdk_calls={len(calls)} prepare_calls=1 sdk_kwargs_equal=True"
+    )
