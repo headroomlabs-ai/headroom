@@ -74,17 +74,75 @@ class TestLaunch:
         monkeypatch.setenv("HEADROOM_MODE", "cache")
         assert self._invoke(monkeypatch)["mode"] == "cache"
 
-    def test_saved_gateway_url_aborts_before_launch(self, monkeypatch, tmp_path):
-        # bobshell re-resolves settings.gatewayUrl over BOB_GATEWAY_URL at startup,
-        # so launching would run Bob uncompressed behind a banner saying otherwise.
+
+class TestSavedGatewayGuard:
+    """bobshell re-resolves settings.gatewayUrl over BOB_GATEWAY_URL at startup,
+    so launching would run Bob uncompressed behind a banner saying otherwise.
+    The guard must judge the URL Bob actually receives, i.e. after _ensure_proxy
+    may have fallen back to another port."""
+
+    @pytest.fixture
+    def saved(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         settings = tmp_path / ".bob" / "settings" / "settings.json"
         settings.parent.mkdir(parents=True)
-        settings.write_text(json.dumps({"gatewayUrl": "https://api.eu-de.bob.ibm.com"}))
-        output = self._invoke(monkeypatch, expect_exit=1)
+
+        def _write(gateway_url: str) -> Path:
+            settings.write_text(json.dumps({"gatewayUrl": gateway_url}))
+            return settings
+
+        return _write
+
+    @staticmethod
+    def _launch(monkeypatch, tmp_path, *, actual_port: int):
+        """Run `wrap bob` for real up to the child spawn, with the proxy stubbed
+        to come up on ``actual_port`` (8787 requested)."""
+        import sys
+        from unittest.mock import patch
+
+        monkeypatch.setattr(wrap_mod.shutil, "which", lambda _name: sys.executable)
+        monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: "proj")
+        marker = tmp_path / "child.txt"
+        child = (
+            "import os; from pathlib import Path; "
+            f"Path({str(marker)!r}).write_text(os.environ['BOB_GATEWAY_URL'])"
+        )
+        with (
+            patch.object(wrap_mod, "_make_cleanup", return_value=lambda: None),
+            patch.object(wrap_mod.signal, "signal"),
+            patch.object(wrap_mod, "_register_proxy_client"),
+            patch.object(wrap_mod, "_unregister_proxy_client"),
+            patch.object(wrap_mod, "_push_runtime_env"),
+            patch.object(wrap_mod, "_ensure_proxy", return_value=(None, actual_port)),
+            patch.object(wrap_mod, "_configure_quiet_cli_env", return_value=[]),
+        ):
+            result = CliRunner().invoke(wrap, ["bob", "--port", "8787", "--", "-c", child])
+        return result, marker
+
+    def test_foreign_gateway_aborts(self, monkeypatch, tmp_path, saved):
+        settings = saved("https://api.eu-de.bob.ibm.com")
+        result, marker = self._launch(monkeypatch, tmp_path, actual_port=8787)
+        assert result.exit_code == 1
         # Exact ClickException text; a substring check on the URL reads to
         # CodeQL as URL sanitization.
         expected = bob_preflight({"BOB_GATEWAY_URL": "http://127.0.0.1:8787"}, settings)
-        assert output.strip() == f"Error: {expected}"
+        assert result.output.strip().endswith(f"Error: {expected}")
+        assert not marker.exists(), "Bob must not be spawned"
+
+    def test_saved_requested_port_aborts_after_fallback(self, monkeypatch, tmp_path, saved):
+        # Saved URL matches the requested port, but the proxy came up on 8899:
+        # Bob would ignore BOB_GATEWAY_URL and talk to a port with no proxy.
+        saved("http://127.0.0.1:8787/p/proj")
+        result, marker = self._launch(monkeypatch, tmp_path, actual_port=8899)
+        assert result.exit_code == 1 and "overrides BOB_GATEWAY_URL" in result.output
+        assert not marker.exists()
+
+    def test_saved_fallback_port_launches(self, monkeypatch, tmp_path, saved):
+        # The inverse: saved URL already names the port the proxy ended up on.
+        saved("http://127.0.0.1:8899/p/proj")
+        result, marker = self._launch(monkeypatch, tmp_path, actual_port=8899)
+        assert result.exit_code == 0, result.output
+        assert marker.read_text() == "http://127.0.0.1:8899/p/proj"
 
 
 class TestBobPreflight:

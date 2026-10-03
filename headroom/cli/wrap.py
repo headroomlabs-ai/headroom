@@ -8892,8 +8892,21 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             os.environ,
             project=_project_name_from_cwd() if target.project_prefix else None,
         )
-        if target.preflight is not None and (problem := target.preflight(env)):
-            raise click.ClickException(problem)
+
+        configure_launch = None
+        if target.preflight is not None:
+            preflight = target.preflight
+
+            def configure_launch(
+                actual_port: int, args: tuple, env: dict[str, str], display: list[str]
+            ) -> tuple[tuple, dict[str, str], list[str]]:
+                # Runs on the final env: _ensure_proxy may have moved to another
+                # port, and the saved-gateway comparison must use that URL.
+                # Raising here still tears the proxy down via _launch_tool's
+                # cleanup.
+                if problem := preflight(env):
+                    raise click.ClickException(problem)
+                return args, env, display
 
         _launch_tool(
             binary=tool_bin,
@@ -8911,6 +8924,7 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=target.openai_api_url,
+            configure_launch=configure_launch,
         )
 
     _run.__doc__ = target.help_text
