@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from headroom.install.models import DeploymentManifest
 from headroom.providers.codex.install import (
     _codex_login_status,
@@ -49,7 +54,15 @@ def test_keyring_chatgpt_auth_emits_provider_flag(monkeypatch, tmp_path: Path) -
 
     apply_provider_scope(_manifest(tmp_path))
 
-    assert "requires_openai_auth = true" in config.read_text(encoding="utf-8")
+    content = config.read_text(encoding="utf-8")
+    assert "requires_openai_auth = true" in content
+    assert 'base_url = "http://127.0.0.1:8787/v1"' in content
+    assert 'experimental_realtime_ws_base_url = "https://api.openai.com/v1"' in content
+    assert 'experimental_realtime_webrtc_call_base_url = "https://api.openai.com/v1"' in content
+    provider = tomllib.loads(content)["model_providers"]["headroom"]
+    assert provider["base_url"] == "http://127.0.0.1:8787/v1"
+    assert provider["experimental_realtime_ws_base_url"] == "https://api.openai.com/v1"
+    assert provider["experimental_realtime_webrtc_call_base_url"] == "https://api.openai.com/v1"
 
 
 def test_keyring_non_chatgpt_auth_keeps_provider_flag_off(monkeypatch, tmp_path: Path) -> None:

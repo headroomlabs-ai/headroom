@@ -16,9 +16,9 @@ def test_codex_provider_section_omits_requires_openai_auth_by_default() -> None:
 
     assert 'name = "OpenAI via Headroom proxy"' in section
     assert 'base_url = "http://127.0.0.1:8787/v1"' in section
-    assert "requires_openai_auth" not in section, (
-        f"requires_openai_auth must be absent by default; got:\n{section}"
-    )
+    assert (
+        "requires_openai_auth" not in section
+    ), f"requires_openai_auth must be absent by default; got:\n{section}"
     assert "supports_websockets = true" in section
     assert 'env_key = "OPENAI_API_KEY"' not in section
 
@@ -29,6 +29,13 @@ def test_codex_provider_section_emits_requires_openai_auth_when_flagged() -> Non
     )
 
     assert "requires_openai_auth = true" in section
+
+
+def test_codex_provider_section_bypasses_headroom_for_realtime_voice() -> None:
+    section = build_provider_section(port=8787, name="OpenAI via Headroom proxy")
+
+    assert 'experimental_realtime_ws_base_url = "https://api.openai.com/v1"' in section
+    assert 'experimental_realtime_webrtc_call_base_url = "https://api.openai.com/v1"' in section
 
 
 def test_codex_uses_chatgpt_auth_true_for_chatgpt_mode(tmp_path: Path) -> None:
