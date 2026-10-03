@@ -13,6 +13,7 @@ Or via headroom extras:
 
 from __future__ import annotations
 
+import heapq
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..models import Memory, ScopeLevel
+from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
 # hnswlib is optional - may not compile on all platforms
@@ -139,7 +140,9 @@ class IndexedMemoryMetadata:
             valid_until=(
                 datetime.fromisoformat(data["valid_until"]) if data.get("valid_until") else None
             ),
-            entity_refs=data.get("entity_refs", []),
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(data.get("entity_refs")),
             content=data["content"],
             created_at=datetime.fromisoformat(data["created_at"]),
             importance=data.get("importance", 0.5),
@@ -391,15 +394,19 @@ class HNSWVectorIndex:
         if not self._metadata:
             return 0
 
-        # Sort entries by importance (ascending), then by created_at (oldest first)
-        sorted_entries = sorted(
+        # Select the `count` lowest-importance (then oldest) entries. nsmallest
+        # is O(n log count); fully sorting all entries just to take the first
+        # `count` was O(n log n), and eviction runs on every insert once a
+        # bounded index is at capacity. The selection is identical.
+        lowest_entries = heapq.nsmallest(
+            count,
             self._metadata.items(),
             key=lambda x: (x[1].importance, x[1].created_at),
         )
 
         # Evict the lowest importance entries
         evicted = 0
-        for memory_id, _metadata in sorted_entries[:count]:
+        for memory_id, _metadata in lowest_entries:
             if memory_id not in self._memory_to_hnsw:
                 continue
 

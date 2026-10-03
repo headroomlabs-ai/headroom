@@ -17,6 +17,68 @@ from typing import Any, Protocol, runtime_checkable
 #: encode. Truncating keeps the estimate finite and the request alive.
 _MAX_COERCED_FIELD_CHARS = 200_000
 
+#: Admission policy for :class:`TokenCountCache`. These bound memory only — they
+#: never change a returned count, so they are not a behavioural threshold.
+#: Strings below the floor encode in microseconds, so caching them would only
+#: evict the large entries that the cache exists for.
+_COUNT_CACHE_MIN_CHARS = 256
+_COUNT_CACHE_MAX_ENTRIES = 4096
+_COUNT_CACHE_MAX_CHARS = 8_000_000
+
+
+class TokenCountCache:
+    """Exact memo for ``count_text``.
+
+    ``count_text`` is a pure function of its text, so replaying a stored count is
+    value-identical. That is the whole safety argument: the result is the same
+    integer, which is why this is safe even at the call sites whose count feeds a
+    routing decision (``context_pressure`` -> ``min_ratio``) rather than a log line.
+
+    Keyed on the text itself rather than a hash. A hash collision here would hand
+    back the wrong count for real content and silently change what gets
+    compressed; the counts are too load-bearing to trade correctness for a
+    smaller key. The price is holding the strings, so entries *and* total
+    characters are capped.
+
+    No lock: ``dict`` get/set/clear are atomic under the GIL, and the pipeline
+    runs on a thread pool. An LRU would need ``move_to_end``, which is not
+    atomic — hence clear-on-full rather than eviction. A cleared cache costs one
+    re-encode, never a wrong answer.
+    """
+
+    __slots__ = ("_chars", "_counts", "_max_chars", "_max_entries", "_min_chars")
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = _COUNT_CACHE_MIN_CHARS,
+        max_entries: int = _COUNT_CACHE_MAX_ENTRIES,
+        max_chars: int = _COUNT_CACHE_MAX_CHARS,
+    ) -> None:
+        self._counts: dict[str, int] = {}
+        self._chars = 0
+        self._min_chars = min_chars
+        self._max_entries = max_entries
+        self._max_chars = max_chars
+
+    def get(self, text: str) -> int | None:
+        """Return the stored count for *text*, or None."""
+        return self._counts.get(text)
+
+    def put(self, text: str, count: int) -> None:
+        """Store *count* for *text* if it is worth caching."""
+        if len(text) < self._min_chars:
+            return
+        if len(self._counts) >= self._max_entries or self._chars >= self._max_chars:
+            self._counts.clear()
+            self._chars = 0
+        self._counts[text] = count
+        self._chars += len(text)
+
+    def clear(self) -> None:
+        self._counts.clear()
+        self._chars = 0
+
 
 def coerce_countable_text(value: Any) -> str:
     """Return *value* as text safe to pass to ``count_text``.
@@ -266,6 +328,23 @@ class BaseTokenizer(ABC):
                         total += frames * 1000
                     else:
                         total += 3200
+                elif part_type == "thinking":
+                    # Anthropic extended thinking replayed by the client. The
+                    # ``signature`` is the encrypted full reasoning: on the
+                    # keep-all-turns models (Opus 4.5+, Sonnet 4.6+, the 5.x
+                    # line) the server decrypts it into the prompt and bills
+                    # it as input, and under ``display: "omitted"`` (the 5.x
+                    # default) the ``thinking`` text is empty, so text alone
+                    # is not the input. Nor is the base64: the JSON catch-all
+                    # below priced it as prose at ~3 chars/token, and on a
+                    # 369-message Claude Code session 99 signatures counted
+                    # 256K of 414K tokens against ~313K provider-reported.
+                    # Price the text plus the decoded signature bytes at
+                    # ~4 bytes/token (len * 3/4 / 4), which lands that session
+                    # near the provider figure and never prices an omitted
+                    # block at zero.
+                    total += self.count_text(part.get("thinking", "") or "")
+                    total += len(part.get("signature") or "") * 3 // 16
                 else:
                     # Unknown type - estimate from JSON
                     total += self._count_serialized(part)

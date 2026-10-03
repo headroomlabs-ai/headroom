@@ -20,6 +20,16 @@ def _no_retired_context_tool_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _mock_ensure_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wrap-opencode tests should not spawn a real proxy subprocess in CI."""
+
+    def fake_ensure_proxy(port: int, no_proxy: bool, **kwargs):  # noqa: ANN002, ANN003
+        return None, port
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", fake_ensure_proxy)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -283,6 +293,98 @@ def test_wrap_opencode_copilot_subscription_cleans_up_proxy_on_config_failure(
     assert proxy.wait_timeout == 5
 
 
+@pytest.mark.parametrize("failure", ["spawn", "interrupt"])
+def test_wrap_opencode_cleans_up_proxy_when_tool_launch_fails(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    class _FakeProxy:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    proxy = _FakeProxy()
+
+    def fail_before_spawn(**kwargs: object) -> None:
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        try:
+            raise OSError("spawn failed")
+        except OSError as error:
+            raise SystemExit(1) from error
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_ensure_proxy", return_value=(proxy, 9010)),
+        patch.object(wrap_mod, "_register_proxy_client"),
+        patch.object(wrap_mod, "_unregister_proxy_client"),
+        patch.object(wrap_mod, "_live_proxy_clients", return_value=[]),
+        patch.object(wrap_mod, "inject_opencode_provider_config"),
+        patch.object(wrap_mod, "_launch_tool", side_effect=fail_before_spawn),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--no-mcp", "--no-serena"],
+        )
+
+    assert result.exit_code == 1
+    assert proxy.terminated is True
+
+
+def test_wrap_opencode_leaves_started_proxy_to_watchdog_after_normal_exit(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+
+    class _FakeProxy:
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    proxy = _FakeProxy()
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_ensure_proxy", return_value=(proxy, 9010)),
+        patch.object(wrap_mod, "_register_proxy_client"),
+        patch.object(wrap_mod, "_unregister_proxy_client"),
+        patch.object(wrap_mod, "_live_proxy_clients", return_value=[]),
+        patch.object(wrap_mod, "inject_opencode_provider_config"),
+        patch.object(wrap_mod, "_launch_tool", side_effect=SystemExit(0)),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "opencode", "--no-mcp", "--no-serena"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert proxy.terminated is False
+
+
 def test_wrap_opencode_sets_config_content_env(
     runner: CliRunner,
     tmp_path: Path,
@@ -362,6 +464,35 @@ def test_wrap_opencode_missing_binary_errors_clearly(
 
     assert result.exit_code == 1
     assert "'opencode' not found in PATH" in result.output
+
+
+def test_wrap_opencode_missing_binary_does_not_mutate_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing opencode binary must not leave memory side-effects behind (#1614 class).
+
+    The MCP/Serena registrations are already gated on ``registrar.detect()``, but
+    the ``--memory`` injections (AGENTS.md, the .headroom dir, the memory MCP
+    config) are not -- they ran unconditionally before the binary check. Verify
+    the binary first, like claude/codex/goose/omp, so an absent tool cannot write
+    those and then error with nothing launched.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    agents_md = tmp_path / "AGENTS.md"
+    headroom_dir = tmp_path / ".headroom"
+
+    with patch.object(wrap_mod.shutil, "which", return_value=None):
+        result = runner.invoke(main, ["wrap", "opencode", "--memory"])
+
+    assert result.exit_code == 1
+    assert "'opencode' not found in PATH" in result.output
+    assert not agents_md.exists(), "AGENTS.md was created before the missing-binary check"
+    assert not headroom_dir.exists(), ".headroom dir was created before the missing-binary check"
 
 
 def test_wrap_opencode_prepare_only_injects_config(

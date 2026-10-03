@@ -63,6 +63,37 @@ class TestRoundTrip:
 
 
 class TestValidation:
+    def test_validate_accepts_env_aliases(self, workspace):
+        assert settings_store.validate({"HEADROOM_LOSSLESS": True, "HEADROOM_RPM": "30"}) == {
+            "lossless": True,
+            "rpm": 30,
+        }
+
+    def test_save_accepts_env_alias_and_persists_short_key(self, workspace):
+        settings_store.save({"HEADROOM_LOSSLESS": True})
+
+        assert settings_store.load() == {"lossless": True}
+
+    def test_env_alias_clear_removes_short_key(self, workspace):
+        settings_store.save({"lossless": True})
+
+        settings_store.save({"HEADROOM_LOSSLESS": None})
+
+        assert settings_store.load() == {}
+
+    def test_conflicting_env_alias_and_short_key_rejected(self, workspace):
+        with pytest.raises(settings_store.SettingsValidationError) as exc:
+            settings_store.validate({"HEADROOM_LOSSLESS": True, "lossless": False})
+
+        assert exc.value.unknown_keys == []
+        assert "lossless" in exc.value.field_errors
+        assert "HEADROOM_LOSSLESS" in exc.value.field_errors["lossless"]
+
+    def test_same_env_alias_and_short_key_value_is_accepted(self, workspace):
+        assert settings_store.validate({"HEADROOM_LOSSLESS": True, "lossless": True}) == {
+            "lossless": True
+        }
+
     def test_save_rejects_unknown_key(self, workspace):
         with pytest.raises(settings_store.SettingsValidationError) as exc:
             settings_store.save({"nope": 1})
@@ -144,6 +175,45 @@ class TestEffectiveValues:
         monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", "general")
         assert settings_store.effective_values()["savings_profile"] == "general"
 
+    def test_runtime_values_override_environment(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "0")
+
+        values = settings_store.effective_values(runtime_values={"lossless": True})
+
+        assert values["lossless"] is True
+
+    def test_schema_marks_runtime_difference_without_mislabeling_seeded_env(
+        self, workspace, monkeypatch
+    ):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_MODE", "cache")
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "0")
+
+        schema = settings_store.to_schema(
+            runtime_values={"mode": "token", "lossless": True},
+            env_override_exclusions={"HEADROOM_MODE", "HEADROOM_LOSSLESS"},
+        )
+        by_key = {field["key"]: field for field in schema["fields"]}
+
+        assert by_key["mode"]["value"] == "token"
+        assert by_key["mode"]["runtime_override"] is True
+        assert by_key["mode"]["env_override"] is False
+        assert by_key["lossless"]["value"] is True
+        assert by_key["lossless"]["runtime_override"] is True
+        assert by_key["lossless"]["env_override"] is False
+
+    def test_schema_keeps_explicit_environment_override(self, workspace, monkeypatch):
+        _clear_env(monkeypatch)
+        monkeypatch.setenv("HEADROOM_LOSSLESS", "1")
+
+        schema = settings_store.to_schema(runtime_values={"lossless": True})
+        lossless = next(field for field in schema["fields"] if field["key"] == "lossless")
+
+        assert lossless["value"] is True
+        assert lossless["runtime_override"] is False
+        assert lossless["env_override"] is True
+
 
 class TestSecretMasking:
     def test_schema_and_stored_mask_secret(self, workspace, monkeypatch):
@@ -156,6 +226,7 @@ class TestSecretMasking:
         )
         monkeypatch.setattr(settings_store, "SETTINGS", registry)
         monkeypatch.setattr(settings_store, "_BY_KEY", {f.key: f for f in registry})
+        monkeypatch.setattr(settings_store, "_BY_ENV", {f.env: f for f in registry})
         settings_store.save({"log_file": "/tmp/secret.log"})
 
         stored = settings_store.stored_values()
@@ -186,6 +257,15 @@ class TestSecretMasking:
         assert stored.get("anthropic_extra_headers") == '{"Api-Key": "secret123"}', (
             "Saving _MASK should retain the stored value, not overwrite it"
         )
+
+    def test_anthropic_extra_headers_retain_on_env_alias_mask(self, workspace, monkeypatch):
+        """Saving _MASK through the env alias retains the stored value."""
+        _clear_env(monkeypatch)
+        settings_store.save({"anthropic_extra_headers": '{"Api-Key": "secret123"}'})
+
+        settings_store.save({"ANTHROPIC_TARGET_API_HEADERS": settings_store._MASK})
+
+        assert settings_store.load().get("anthropic_extra_headers") == '{"Api-Key": "secret123"}'
 
     def test_anthropic_extra_headers_clear_on_none(self, workspace, monkeypatch):
         """Saving None for anthropic_extra_headers removes it."""

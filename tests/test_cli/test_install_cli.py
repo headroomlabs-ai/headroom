@@ -1,9 +1,123 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import click
+import pytest
 from click.testing import CliRunner
 
+from headroom.cli import install as inst
 from headroom.cli.main import main
+from headroom.install.planner import build_tool_envs
+
+
+def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
+    """On an init'd machine (one profile, e.g. init-user), a bare lifecycle
+    command whose --profile defaults to 'default' resolves to the single
+    installed deployment instead of dead-ending (#2811)."""
+    only = SimpleNamespace(profile="init-user")
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [only])
+
+    assert inst._require_manifest("default") is only
+
+
+def test_require_manifest_honors_env_profile(monkeypatch):
+    """An explicit HEADROOM_DEPLOYMENT_PROFILE (exported by the runtime) selects
+    the target even when the requested profile is not installed."""
+    target = SimpleNamespace(profile="init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(
+        inst, "load_manifest", lambda profile: target if profile == "init-user" else None
+    )
+    monkeypatch.setattr(inst, "list_manifests", lambda: [target])
+
+    assert inst._require_manifest("default") is target
+
+
+def test_require_manifest_lists_installed_profiles_when_ambiguous(monkeypatch):
+    """With several installed profiles and no signal, the error names them and
+    points at --profile instead of dead-ending on 'default'."""
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(
+        inst,
+        "list_manifests",
+        lambda: [SimpleNamespace(profile="init-user"), SimpleNamespace(profile="ci")],
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._require_manifest("default")
+    msg = str(exc.value)
+    assert "ci" in msg and "init-user" in msg and "--profile" in msg
+
+
+def _status_manifest(profile: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        profile=profile,
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="none",
+        scope="user",
+        port=8787,
+        health_url="http://127.0.0.1:8787/readyz",
+        backend="anthropic",
+    )
+
+
+def test_install_status_explicit_missing_profile_is_not_redirected_to_env(monkeypatch):
+    """An explicit --profile must be honored or rejected verbatim, never
+    redirected to HEADROOM_DEPLOYMENT_PROFILE or a lone installed deployment: a
+    typo must fail even when the env profile exists (#2832 review). Only a
+    CliRunner invocation exercises the default-vs-explicit distinction."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status", "--profile", "typo"])
+
+    assert res.exit_code != 0
+    assert "typo" in res.output
+    # The error names the installed profile, but the command never operated on it.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
+def test_install_status_stale_env_profile_is_not_redirected_to_lone_manifest(monkeypatch):
+    """A non-empty HEADROOM_DEPLOYMENT_PROFILE is an explicit selection: if it
+    names a missing/stale profile the command must fail naming that profile, never
+    silently redirect to a different lone installed deployment (#2832 review)."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "missing")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code != 0
+    assert "missing" in res.output
+    # Never operated on the lone init-user deployment.
+    assert "Preset:" not in res.output
+    assert "Status:" not in res.output
+
+
+def test_install_status_omitted_profile_resolves_env_deployment(monkeypatch):
+    """With --profile omitted (Click default), HEADROOM_DEPLOYMENT_PROFILE selects
+    the target so the documented bare command works on an init'd machine."""
+    init_user = _status_manifest("init-user")
+    monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "init-user")
+    monkeypatch.setattr(inst, "load_manifest", lambda p: init_user if p == "init-user" else None)
+    monkeypatch.setattr(inst, "list_manifests", lambda: [init_user])
+    monkeypatch.setattr(inst, "probe_json", lambda url: None)
+    monkeypatch.setattr(inst, "runtime_status", lambda m: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+
+    res = CliRunner().invoke(main, ["install", "status"])
+
+    assert res.exit_code == 0, res.output
+    assert "Profile:    init-user" in res.output
 
 
 def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
@@ -11,6 +125,9 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -59,11 +176,55 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     assert calls == ["save", "start_service", "apply", "save"]
 
 
+def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+        profile = "default"
+        preset = "persistent-task"
+        runtime_kind = "python"
+        supervisor_kind = "task"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations: list[object] = []
+        targets: list[str] = []
+        artifacts: list[object] = []
+
+    monkeypatch.setattr("headroom.cli.install._is_windows", lambda: True)
+    monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr(
+        "headroom.cli.install.start_detached_agent", lambda profile: calls.append("start_agent")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+    result = runner.invoke(main, ["install", "apply", "--preset", "persistent-service"])
+
+    assert result.exit_code == 0, result.output
+    assert "Falling back to persistent-task with Task Scheduler" in result.output
+    assert "sc.exe" not in result.output
+    assert calls == ["start_agent"]
+
+
 def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     runner = CliRunner()
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -99,6 +260,107 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     assert captured["no_http2"] is True
 
 
+def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
+    """Stub out the apply side effects and capture ``build_manifest`` kwargs."""
+
+    class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations: list = []
+        artifacts: list = []
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return Manifest()
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+    )
+
+
+def test_install_apply_honors_headroom_port_env(monkeypatch) -> None:
+    """An explicit HEADROOM_PORT must reach build_manifest, like `proxy --port` honors it.
+
+    Regression for #3072 bug 1: `install apply` ignored HEADROOM_PORT and always
+    configured 8787 because the --port option had no envvar binding.
+    """
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
+def test_install_apply_explicit_port_overrides_env(monkeypatch) -> None:
+    """An explicit --port still wins over HEADROOM_PORT (Click precedence)."""
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+
+
+def test_deploy_honors_headroom_port_env(monkeypatch) -> None:
+    """`headroom deploy` must honor HEADROOM_PORT the same way (#3072 bug 1)."""
+    captured: dict[str, object] = {}
+
+    plan = SimpleNamespace(
+        preset="persistent-service",
+        runtime="python",
+        reason="test",
+        supervisor_kind="service",
+        base_env={},
+    )
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        port=0,
+        health_url="http://127.0.0.1:8788/readyz",
+        targets=["claude"],
+    )
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr(
+        "headroom.cli.install._select_turnkey_plan", lambda prefer_docker=True: plan
+    )
+    monkeypatch.setattr("headroom.cli.install._build_deployment_manifest", fake_build)
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install._echo_installed", lambda m, prefix="": None)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["deploy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
 def test_install_apply_help_lists_no_http2() -> None:
     runner = CliRunner()
 
@@ -127,6 +389,9 @@ def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -184,6 +449,8 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -215,6 +482,8 @@ def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -241,6 +510,10 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -270,6 +543,7 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     )
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: calls.append("save"))
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.wait_stopped", lambda manifest: True)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
 
     result = runner.invoke(main, ["install", "restart"])
@@ -287,11 +561,95 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     ]
 
 
+def _restart_race_manifest():
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        health_url = "http://127.0.0.1:8787/readyz"
+        backend = "anthropic"
+        targets: list[str] = []
+        tool_envs: dict[str, dict[str, str]] = {}
+        mutations: list = []
+
+    return Manifest()
+
+
+def test_install_restart_waits_for_old_process_before_starting(monkeypatch) -> None:
+    """#3658: the old proxy still answers /readyz right after stop; restart must
+    wait for it to go away, otherwise start is skipped and the service stays down."""
+
+    runner = CliRunner()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop_runtime")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped",
+        lambda manifest, timeout_seconds=15: calls.append("wait_stopped") or True,
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds=45: True
+    )
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda manifest: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+
+    result = runner.invoke(main, ["install", "restart"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["stop_supervisor", "stop_runtime", "wait_stopped", "start_supervisor"]
+
+
+@pytest.mark.parametrize("command", ["stop", "restart"])
+def test_install_stop_and_restart_fail_when_old_process_never_stops(monkeypatch, command) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr("headroom.cli.install.stop_supervisor", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped", lambda manifest, timeout_seconds=15: False
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+
+    result = runner.invoke(main, ["install", command])
+
+    assert result.exit_code != 0
+    assert "still answering" in result.output
+    assert "deployment 'default'." not in result.output
+    assert calls == []
+
+
 def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -317,6 +675,10 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -340,6 +702,10 @@ def test_install_start_does_not_spawn_when_start_lock_is_contended(monkeypatch) 
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -374,6 +740,10 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -439,6 +809,9 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -490,6 +863,11 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+
         def __init__(self, profile: str, targets: list[str]) -> None:
             self.profile = profile
             self.preset = "persistent-service"
@@ -576,6 +954,10 @@ def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -596,6 +978,9 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -653,6 +1038,9 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -712,6 +1100,9 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -769,6 +1160,9 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -821,6 +1215,10 @@ def test_install_remove_continues_when_runtime_teardown_errors(monkeypatch) -> N
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -858,6 +1256,10 @@ def test_install_agent_ensure_reports_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -874,6 +1276,10 @@ def test_install_agent_run_exits_with_foreground_status(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -891,6 +1297,10 @@ def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> No
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -925,6 +1335,10 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -987,6 +1401,10 @@ def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1030,6 +1448,10 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1068,6 +1490,10 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1095,3 +1521,85 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
     assert "simulated start failure" in result.output
+
+
+def test_install_start_reconciles_a_healthy_deployment(monkeypatch) -> None:
+    """The regression this whole change exists for.
+
+    ``install start`` activated mutations only when the deployment had NONE
+    recorded. A normally-installed, working deployment always has some, so the
+    reconcile never ran on the one command the affected users actually type --
+    and the stale env var stayed stale forever.
+    """
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        # Pre-#746: base URL written, tool search never enabled.
+        tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]  # healthy AND already mutated: the skipped case
+        artifacts = []
+
+    manifest = Manifest()
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda m, timeout_seconds=None: True)
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert "ENABLE_TOOL_SEARCH" in manifest.tool_envs["claude"]
+    assert applied == ["apply"]  # re-applied so the new key reaches the config
+
+
+def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
+    """A deployment that is already current must not be perturbed."""
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs: dict = {}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]
+        artifacts = []
+
+    manifest = Manifest()
+    from headroom.cli.install import _reconcile_tool_envs
+
+    _reconcile_tool_envs(manifest)  # bring it fully up to date first
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda m, timeout_seconds=None: True)
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert applied == []
