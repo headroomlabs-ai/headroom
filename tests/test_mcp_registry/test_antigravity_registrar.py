@@ -101,14 +101,10 @@ def test_register_prefers_current_location_when_both_exist(tmp_path: Path) -> No
 def test_get_server_reads_current_location_when_both_exist(tmp_path: Path) -> None:
     current = _config_path(tmp_path)
     current.parent.mkdir(parents=True)
-    current.write_text(
-        json.dumps({"mcpServers": {"headroom": {"command": "/current/headroom"}}})
-    )
+    current.write_text(json.dumps({"mcpServers": {"headroom": {"command": "/current/headroom"}}}))
     legacy = _legacy_config_path(tmp_path)
     legacy.parent.mkdir(parents=True)
-    legacy.write_text(
-        json.dumps({"mcpServers": {"headroom": {"command": "/stale/headroom"}}})
-    )
+    legacy.write_text(json.dumps({"mcpServers": {"headroom": {"command": "/stale/headroom"}}}))
 
     server = _make_registrar(tmp_path).get_server("headroom")
 
@@ -127,9 +123,7 @@ def test_register_mismatch_without_force_leaves_file_alone(tmp_path: Path) -> No
     registrar = _make_registrar(tmp_path)
     registrar.register_server(_spec())
 
-    other = ServerSpec(
-        name="headroom", command="/other/headroom", args=("mcp", "serve")
-    )
+    other = ServerSpec(name="headroom", command="/other/headroom", args=("mcp", "serve"))
     result = registrar.register_server(other)
 
     assert result.status == RegisterStatus.MISMATCH
@@ -141,9 +135,7 @@ def test_register_force_overwrites_mismatch(tmp_path: Path) -> None:
     registrar = _make_registrar(tmp_path)
     registrar.register_server(_spec())
 
-    other = ServerSpec(
-        name="headroom", command="/other/headroom", args=("mcp", "serve")
-    )
+    other = ServerSpec(name="headroom", command="/other/headroom", args=("mcp", "serve"))
     result = registrar.register_server(other, force=True)
 
     assert result.status == RegisterStatus.REGISTERED

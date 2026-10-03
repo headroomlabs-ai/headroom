@@ -7587,9 +7587,7 @@ def cursor(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @proxy_port_option()
-@click.option(
-    "--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)"
-)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -7623,9 +7621,7 @@ def antigravity(
         return
 
     def _print_antigravity_setup(actual_port: int) -> None:
-        for line in _render_antigravity_setup_lines(
-            actual_port, project=_project_name_from_cwd()
-        ):
+        for line in _render_antigravity_setup_lines(actual_port, project=_project_name_from_cwd()):
             click.echo(line)
 
     _run_proxy_only_watcher(
