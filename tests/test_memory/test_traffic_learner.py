@@ -860,6 +860,8 @@ class TestPatternsToRecommendations:
         assert len(recs) == 1
         assert recs[0].target == RecommendationTarget.MEMORY_FILE
         assert "User prefers terse output" in recs[0].content
+        assert "<!-- headroom:pattern-id:" in recs[0].content
+        assert recs[0].preserve_prior_items is True
 
     def test_routes_environment_to_context_file(self):
         from headroom.learn.models import RecommendationTarget
@@ -898,6 +900,77 @@ class TestPatternsToRecommendations:
         assert lines[0] == "- B"
         assert lines[1] == "- A"
         assert recs[0].evidence_count == 7
+        assert recs[0].preserve_prior_items is False
+
+    def test_active_item_ids_span_every_live_pattern(self):
+        """The lifecycle signal covers the whole live set, not just rendered bullets."""
+        preference = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        environment = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="Use uv run python",
+            importance=0.7,
+            evidence_count=4,
+        )
+
+        recs = _patterns_to_recommendations([preference, environment])
+
+        assert len(recs) == 2
+        expected = frozenset({preference.content_hash, environment.content_hash})
+        for rec in recs:
+            # Each section renders one bullet but claims both ids as active, so
+            # a prior item this batch left out is not read as expired.
+            assert len(rec.content.splitlines()) == 1
+            assert rec.active_item_ids == expected
+
+    def test_error_recovery_carries_no_active_item_ids(self):
+        """error_recovery replaces its section, so it exposes no preservation signal."""
+        recs = _patterns_to_recommendations(
+            [
+                ExtractedPattern(
+                    category=PatternCategory.ERROR_RECOVERY,
+                    content="A",
+                    importance=0.5,
+                    evidence_count=2,
+                ),
+            ]
+        )
+
+        assert len(recs) == 1
+        assert recs[0].active_item_ids is None
+
+    def test_pattern_dropped_from_live_set_is_removed_from_the_file(self, tmp_path):
+        """End-to-end removal invariant: an expired pattern leaves the memory file."""
+        from headroom.learn.writer import _merge_into_file
+
+        keep = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers terse output",
+            importance=0.8,
+            evidence_count=3,
+        )
+        expired = ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content="User prefers the legacy migration script",
+            importance=0.8,
+            evidence_count=3,
+        )
+        memory_file = tmp_path / "MEMORY.md"
+        memory_file.write_text(
+            _merge_into_file(memory_file, _patterns_to_recommendations([keep, expired])),
+            encoding="utf-8",
+        )
+        assert "User prefers the legacy migration script" in memory_file.read_text()
+
+        # Next render: the learner no longer holds the expired pattern.
+        final = _merge_into_file(memory_file, _patterns_to_recommendations([keep]))
+
+        assert "User prefers terse output" in final
+        assert "User prefers the legacy migration script" not in final
 
 
 # =============================================================================
@@ -2604,3 +2677,97 @@ class TestExtractPreferencesSentenceBoundary:
         assert not out[0].content.endswith(".")
         assert not out[0].content.endswith("!")
         assert not out[0].content.endswith("?")
+
+
+# =============================================================================
+# Pending-state persistence across restarts
+# =============================================================================
+
+
+class TestPendingStatePersistence:
+    """Sub-threshold evidence must survive process restarts (sidecar JSON)."""
+
+    _PATTERN_KWARGS = {
+        "category": PatternCategory.ENVIRONMENT,
+        "content": "Use /usr/bin/python3 for system scripts.",
+        "importance": 0.6,
+    }
+
+    @pytest.mark.asyncio
+    async def test_pending_evidence_survives_restart(self, tmp_path):
+        """2 sightings before restart + 1 after = saved with evidence_count 3."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(2):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await first.stop()
+
+        sidecar = tmp_path / "pending_patterns.json"
+        assert sidecar.exists()
+        assert _read_traffic_rows(db) == []  # still below threshold
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 1
+        await second._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(second, 1, db)
+        await second.stop()
+
+        rows = _read_traffic_rows(db)
+        assert len(rows) == 1
+        assert rows[0][2]["evidence_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_corrupt_pending_file_is_ignored(self, tmp_path):
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        (tmp_path / "pending_patterns.json").write_text("{not json")
+
+        learner = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await learner.start()  # must not raise
+        assert learner.get_stats()["pending_patterns"] == 0
+        await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_already_saved_pattern_not_rehydrated_as_pending(self, tmp_path):
+        """A sidecar entry whose hash is already persisted is skipped on load."""
+        import json as _json
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+
+        first = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await first.start()
+        for _ in range(3):
+            await first._accumulate(ExtractedPattern(**self._PATTERN_KWARGS))
+        await _wait_for_saved(first, 1, db)
+        await first.stop()
+
+        # Handcraft a stale sidecar claiming the saved pattern is still pending.
+        h = ExtractedPattern(**self._PATTERN_KWARGS).content_hash
+        (tmp_path / "pending_patterns.json").write_text(
+            _json.dumps(
+                {
+                    "version": 1,
+                    "patterns": [
+                        {
+                            "category": "environment",
+                            "content": self._PATTERN_KWARGS["content"],
+                            "importance": 0.6,
+                            "count": 2,
+                            "entity_refs": [],
+                            "metadata": {},
+                            "content_hash": h,
+                        }
+                    ],
+                }
+            )
+        )
+
+        second = TrafficLearner(backend=_FakeBackend(db), min_evidence=3)
+        await second.start()
+        assert second.get_stats()["pending_patterns"] == 0
+        await second.stop()

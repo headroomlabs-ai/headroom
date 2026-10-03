@@ -301,11 +301,20 @@ def extract_tags(headers: Any) -> dict[str, str]:
 
     Header name match is case-insensitive; the returned key has the
     ``x-headroom-`` prefix stripped.
+
+    Credential-bearing headers are never tags. ``x-headroom-proxy-token`` is
+    the proxy's own bearer and gateways (Kong, Envoy, LiteLLM) send it on every
+    turn; before this filter it landed in ``RequestOutcome.tags`` and from
+    there in the request log, dashboard facets and every export that carries
+    tags. The rule lives in :mod:`internal_header_policy` so producers and
+    consumers of tags agree on it.
     """
+    from headroom.proxy.internal_header_policy import is_credential_header
+
     return {
         k.lower().replace("x-headroom-", ""): v
         for k, v in headers.items()
-        if k.lower().startswith("x-headroom-")
+        if k.lower().startswith("x-headroom-") and not is_credential_header(k)
     }
 
 
@@ -1943,7 +1952,19 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     is set, returns a shallow copy unchanged. That mode is for diagnostic
     shadow tracing only and is documented as a per-deploy choice.
     """
-    return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
+    mode = get_strip_internal_headers_mode()
+    if mode == "disabled":
+        # Always return a copy so callers can mutate without surprise.
+        return dict(headers)
+    from headroom.proxy.tenant_key import (
+        DEFAULT_TENANT_KEY_HEADER,
+        TENANT_KEY_HEADER_ENV_VAR,
+    )
+
+    tenant_header = os.environ.get(TENANT_KEY_HEADER_ENV_VAR, DEFAULT_TENANT_KEY_HEADER)
+    tenant_header_lower = tenant_header.lower()
+    stripped = strip_internal_headers(headers, mode=mode)
+    return {k: v for k, v in stripped.items() if k.lower() != tenant_header_lower}
 
 
 def merge_extra_headers(
