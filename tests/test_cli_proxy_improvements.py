@@ -407,6 +407,22 @@ class TestNewEnvVarWiring:
         assert mock_run_server["config"].retry_base_delay_ms == 125
         assert mock_run_server["config"].retry_max_delay_ms == 8000
 
+    def test_anthropic_auto_continue_from_env(
+        self, runner: CliRunner, mock_run_server: dict
+    ) -> None:
+        result = runner.invoke(
+            main,
+            ["proxy"],
+            env={
+                "HEADROOM_ANTHROPIC_AUTO_CONTINUE": "1",
+                "HEADROOM_ANTHROPIC_AUTO_CONTINUE_MAX_WAIT_SECONDS": "900",
+            },
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0, result.output
+        assert mock_run_server["config"].anthropic_auto_continue_enabled is True
+        assert mock_run_server["config"].anthropic_auto_continue_max_wait_seconds == 900
+
     def test_headroom_connect_timeout_from_env(
         self, runner: CliRunner, mock_run_server: dict
     ) -> None:
