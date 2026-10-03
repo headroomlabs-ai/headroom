@@ -116,7 +116,15 @@ def _build_section(recommendations: list[Recommendation]) -> str:
 
 # Matches the "*~N tokens/session saved*" annotation emitted by _build_section.
 _TOKENS_ANNOTATION_PATTERN = re.compile(r"\*~([\d,]+) tokens/session saved\*\n?")
-_PATTERN_ID_PATTERN = re.compile(r"<!--\s*headroom:pattern-id:([^\s>]+)\s*-->\s*$")
+# Matches the raw ``<!-- headroom:pattern-id:… -->`` form and the
+# sanitizer-escaped ``&lt;!-- … --&gt;`` form. _build_section runs
+# sanitize_block_text over recommendation content, which escapes our own
+# lifecycle comments along with transcript text; the read path has to
+# recognise both, or id-tagged bullets turn invisible to the item merge
+# and the carry-forward pruning.
+_PATTERN_ID_PATTERN = re.compile(
+    r"(?:<!--|&lt;!--)\s*headroom:pattern-id:([^\s>]+)\s*(?:-->|--&gt;)\s*$"
+)
 
 
 def _merge_markdown_items(

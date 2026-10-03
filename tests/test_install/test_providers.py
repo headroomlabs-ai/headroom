@@ -891,6 +891,67 @@ def test_planner_provider_scope_unsupported_error_excludes_opencode() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Planner-level antigravity smoke tests
+# ---------------------------------------------------------------------------
+
+
+def test_planner_resolves_antigravity_as_install_target() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("manual", ["antigravity"])
+    assert "antigravity" in targets
+
+
+def test_planner_antigravity_in_supported_targets_enum() -> None:
+    from headroom.install.models import ToolTarget
+    from headroom.install.planner import PROVIDER_SCOPE_TARGETS, SUPPORTED_TARGETS
+
+    assert ToolTarget.ANTIGRAVITY in SUPPORTED_TARGETS
+    assert ToolTarget.ANTIGRAVITY not in PROVIDER_SCOPE_TARGETS
+
+
+def test_planner_antigravity_rejected_in_provider_scope() -> None:
+    import click
+    import pytest
+
+    from headroom.install.planner import resolve_targets
+
+    with pytest.raises(click.ClickException, match="unsupported targets"):
+        resolve_targets("manual", ["antigravity"], scope="provider")
+
+
+def test_planner_build_tool_envs_includes_antigravity() -> None:
+    from headroom.install.planner import build_tool_envs
+
+    envs = build_tool_envs(port=8787, backend="anthropic", targets=["antigravity"])
+    assert "antigravity" in envs
+    assert envs["antigravity"]["OPENAI_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert envs["antigravity"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_planner_resolve_all_includes_antigravity() -> None:
+    from headroom.install.planner import resolve_targets
+
+    targets = resolve_targets("all", [])
+    assert "antigravity" in targets
+
+
+def test_planner_detect_targets_ignores_bare_gemini_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import Path as StdPath
+
+    from headroom.install.planner import detect_targets
+
+    # Gemini CLI keeps its own session data under ~/.gemini/, so the shared
+    # home directory alone must not count as an Antigravity install.
+    (tmp_path / ".gemini").mkdir()
+    monkeypatch.setattr(StdPath, "home", classmethod(lambda cls: tmp_path))
+
+    assert "antigravity" not in detect_targets()
+
+
+# ---------------------------------------------------------------------------
 # Opencode revert OSError fallback
 # ---------------------------------------------------------------------------
 

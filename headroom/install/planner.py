@@ -9,6 +9,7 @@ from collections.abc import Iterable
 import click
 
 from headroom import paths as _paths
+from headroom.mcp_registry.antigravity import AntigravityRegistrar
 from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
 from headroom.rollout import RolloutChannel
@@ -34,6 +35,7 @@ SUPPORTED_TARGETS = [
     ToolTarget.GROK,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
+    ToolTarget.ANTIGRAVITY,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
@@ -63,7 +65,24 @@ def detect_targets() -> list[str]:
             continue
         if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
             detected.append(target.value)
+        if target == ToolTarget.ANTIGRAVITY and _antigravity_detected():
+            detected.append(target.value)
     return detected
+
+
+def _antigravity_detected() -> bool:
+    """Detect an Antigravity IDE install via its own markers.
+
+    The bare ``~/.gemini`` home is not enough: Gemini CLI keeps its session
+    data there too, so a Gemini-CLI-only host must not count as Antigravity
+    (a false positive suppresses the auto-install defaults in
+    ``resolve_targets``). The MCP registrar owns the authoritative gate —
+    the ``~/.gemini/antigravity`` or ``~/.gemini/config`` directories, or an
+    existing MCP config file — so reuse it here instead of re-implementing
+    the check.
+    """
+
+    return AntigravityRegistrar().detect()
 
 
 def resolve_targets(
@@ -186,11 +205,15 @@ def build_manifest(
     # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
     # OpenAI-compatible tools share this proxy (those may need api.openai.com /
     # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
+    # Antigravity speaks the OpenAI protocol (custom OpenAI-compatible model
+    # provider), so it belongs in the exclusion set too: a Grok + Antigravity
+    # deployment must not send Antigravity's traffic to xAI.
     _openai_native = {
         ToolTarget.CODEX.value,
         ToolTarget.COPILOT.value,
         ToolTarget.AIDER.value,
         ToolTarget.OPENCODE.value,
+        ToolTarget.ANTIGRAVITY.value,
     }
     _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
     target_set = set(resolved_targets)

@@ -371,6 +371,49 @@ def test_build_manifest_extra_env_wins_over_grok_xai_default() -> None:
     assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"
 
 
+def test_build_manifest_grok_with_antigravity_does_not_force_xai() -> None:
+    """Do not route Antigravity's OpenAI-compatible traffic to xAI.
+
+    Antigravity uses the proxy as a custom OpenAI-compatible model provider,
+    so a Grok + Antigravity deployment must keep the shared OpenAI upstream
+    instead of switching it to xAI.
+    """
+    manifest = build_manifest(
+        **_base_manifest_kwargs(targets=["grok_build", "antigravity"], backend="openai")
+    )
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_detect_targets_ignores_shared_gemini_home(monkeypatch, tmp_path) -> None:
+    """A Gemini-CLI-only home must not detect Antigravity.
+
+    Gemini CLI keeps session data under ``~/.gemini/tmp/``; that shared home
+    directory alone must not register as an Antigravity install, or an
+    ``auto`` deployment would pick up Antigravity and skip the usual
+    Claude/Codex/Copilot defaults.
+    """
+    (tmp_path / ".gemini" / "tmp" / "chats").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None)
+
+    from headroom.install.planner import detect_targets
+
+    assert ToolTarget.ANTIGRAVITY.value not in detect_targets()
+
+
+def test_detect_targets_finds_antigravity_config_dir(monkeypatch, tmp_path) -> None:
+    """The Antigravity ``~/.gemini/config`` directory still counts as a hit."""
+    (tmp_path / ".gemini" / "config").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None)
+
+    from headroom.install.planner import detect_targets
+
+    assert ToolTarget.ANTIGRAVITY.value in detect_targets()
+
+
 def test_build_manifest_for_persistent_service_uses_safe_model_backends() -> None:
     manifest = build_manifest(**_base_manifest_kwargs())
 
