@@ -1264,10 +1264,20 @@ def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
         # No header: the plain OpenAI path keeps its own label (control).
         _chat(None)
 
+        # Grok CLI on the default OpenAI target is routed to api.x.ai without
+        # a base-url header (#2693); it is still xAI traffic, not OpenAI's.
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"authorization": "Bearer test-key", "user-agent": "grok-shell/0.2.117"},
+            json={"model": "grok-4", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 200
+
         by_provider = proxy.metrics.requests_by_provider
         assert by_provider["meta"] == 2
         assert by_provider["custom"] == 1
         assert by_provider["openai"] == 1
+        assert by_provider["xai"] == 1
 
 
 def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(

@@ -130,6 +130,13 @@ _CACHE_ECONOMICS = {
         "write_multiplier": 1.25,
         "label": "Same as Anthropic (Bedrock)",
     },
+    # The modal LiteLLM ratio across xai/grok-* (cache read 0.20 vs 1.25 $/M);
+    # xAI caches automatically with no write premium.
+    "xai": {
+        "read_multiplier": 0.16,
+        "write_multiplier": 1.0,
+        "label": "Automatic, no TTL control",
+    },
 }
 
 
@@ -285,6 +292,7 @@ def build_prefix_cache_stats(
                     (provider in ("anthropic", "vertex:anthropic") and "claude" in model_name)
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
+                    or (provider == "xai" and "grok" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
                 )
                 if is_match and tokens_sent > best_tokens:

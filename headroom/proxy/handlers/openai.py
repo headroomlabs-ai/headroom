@@ -3742,11 +3742,16 @@ class OpenAIHandlerMixin:
             handler_path,
             custom_upstream_base_url or "",
         )
-        # Fixed taxonomy from the shared helper (zen, zai, meta, openai); any
-        # other custom base is the shared "custom" bucket. Never derive the
+        # Fixed taxonomy from the shared helper (zen, zai, meta, openai, xai);
+        # any other custom base is the shared "custom" bucket. Never derive the
         # label from the request-controlled hostname — see the review on #3759.
+        # Grok CLI routed to xAI without a base-url header is still xai.
         openai_chat_outcome_provider = custom_chat_provider or (
-            CUSTOM_BASE_PROVIDER if custom_upstream_base_url else "openai"
+            CUSTOM_BASE_PROVIDER
+            if custom_upstream_base_url
+            else "xai"
+            if _is_xai_upstream(upstream_base_url)
+            else "openai"
         )
 
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
