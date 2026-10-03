@@ -301,14 +301,15 @@ class BedrockHandlerMixin:
             upstream = await self.http_client.send(upstream_request, stream=True)  # type: ignore[attr-defined]
         except (httpx.ConnectError, httpx.TimeoutException) as err:
             logger.warning("[%s] %s upstream connect failed: %s", request_id, LOG_TAG, err)
+            from headroom.proxy import public_errors
+
             return JSONResponse(
                 status_code=502,
-                content={
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to Bedrock upstream: {err}",
-                    }
-                },
+                content=public_errors.openai_error_body(
+                    public_errors.classify_or_internal(err),
+                    request_id=str(request_id),
+                    error_type="connection_error",
+                ),
             )
 
         # Forward raw (still-encoded) bytes, so strip hop-by-hop headers that
