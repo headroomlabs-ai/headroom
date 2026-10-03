@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.proxy import public_errors
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
@@ -658,6 +659,16 @@ class StreamingMixin:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
+            if not forwarded_messages and provider == "gemini":
+                # Gemini bodies carry contents[] rather than messages[] (Cloud
+                # Code Assist nests the payload under body["request"]).
+                # Convert with the same helper the Gemini handler used so the
+                # tracker walks the same message shape (#3394).
+                _gemini_payload = body["request"] if isinstance(body.get("request"), dict) else body
+                forwarded_messages, _ = self._gemini_contents_to_messages(
+                    _gemini_payload.get("contents", []),
+                    _gemini_payload.get("systemInstruction"),
+                )
             next_forwarded = _copy.deepcopy(forwarded_messages)
             next_original = _copy.deepcopy(original_messages or forwarded_messages)
 
@@ -694,9 +705,19 @@ class StreamingMixin:
                     )
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
+            tracker_cache_write = cache_write_tokens
+            if provider == "gemini" and tracker_cache_write == 0:
+                # Gemini's stream usage reports cache reads only
+                # (cachedContentTokenCount); implicit caching has no write
+                # counter, so the uncached input portion is the write proxy
+                # (same inference as the OpenAI buffered path). Kept as a
+                # tracker-local value: Gemini outcomes intentionally report no
+                # cache-write concept (#3394).
+                tracker_cache_write = max(effective_optimized_tokens - cache_read_tokens, 0)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
+                cache_write_tokens=tracker_cache_write,
                 messages=next_forwarded,
                 original_messages=next_original,
             )
@@ -1063,17 +1084,17 @@ class StreamingMixin:
             from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
 
             tls_hint = await describe_upstream_failure_async(e, url)
-            client_message = tls_hint or f"Failed to connect to upstream API: {error_msg}"
+            # The exception text itself stays in the log above: it names the
+            # resolved upstream host and address (public_errors module doc).
+            error_body = public_errors.anthropic_error_body(
+                public_errors.classify_or_internal(e),
+                request_id=request_id,
+                error_type="connection_error",
+                hint=tls_hint,
+            )
 
             async def _error_gen():
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": client_message,
-                    },
-                }
-                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode()
 
             self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(
@@ -1428,13 +1449,11 @@ class StreamingMixin:
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to upstream API: {e}",
-                    },
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="connection_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
@@ -1442,10 +1461,11 @@ class StreamingMixin:
                 yield e.response.content
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
                 pending_messages = self._cleanup_mid_turn_stream(
@@ -1673,10 +1693,11 @@ class StreamingMixin:
             except Exception as e:
                 error_message = format_exception_message(e)
                 logger.error(f"[{request_id}] Bedrock streaming error: {error_message}")
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             finally:
@@ -1868,13 +1889,11 @@ class StreamingMixin:
                     yield chunk_bytes
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
-                error_data = {
-                    "error": {
-                        "message": str(e),
-                        "type": "api_error",
-                        "code": "backend_error",
-                    }
-                }
+                error_data = public_errors.openai_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
