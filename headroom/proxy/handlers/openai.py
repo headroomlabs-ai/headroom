@@ -2166,6 +2166,9 @@ class OpenAIHandlerMixin:
         unit_target_ratio = profile_kwargs.get("target_ratio")
         if unit_target_ratio is not None:
             unit_target_ratio = float(unit_target_ratio)
+        # Earlier user turns follow the same compress_user_messages resolution
+        # as the message pipeline (profile default, or an explicit override).
+        compress_user_units = profile_kwargs.get("compress_user_messages") is not False
 
         try:
             tokenizer = self.openai_provider.get_token_counter(model)
@@ -2636,7 +2639,7 @@ class OpenAIHandlerMixin:
             metadata: dict[str, str] = {}
             if role == "assistant":
                 metadata["compress_assistant"] = "true"
-            if role == "user" and item_idx != last_user_item_idx:
+            if role == "user" and item_idx != last_user_item_idx and compress_user_units:
                 metadata["compress_user"] = "true"
             min_bytes = (
                 self.OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES

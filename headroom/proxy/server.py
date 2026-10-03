@@ -6083,6 +6083,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         read_maturation=rollout.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
@@ -6874,8 +6875,11 @@ if __name__ == "__main__":
         if protect_tool_results
         else frozenset(),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
-        compress_user_messages=args.compress_user_messages
-        or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        compress_user_messages=(
+            True
+            if args.compress_user_messages
+            else _get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES")
+        ),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
         # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.
