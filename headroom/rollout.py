@@ -119,6 +119,17 @@ FEATURES: dict[str, FeatureSpec] = {
         legacy_env=("HEADROOM_READ_MATURATION",),
         description="Hold-back Read maturation before provider cache entry.",
     ),
+    "bedrock_openai_prompt_caching": FeatureSpec(
+        name="bedrock_openai_prompt_caching",
+        available_in=RolloutChannel.STABLE,
+        # Deliberately NOT default-enabled. A cache breakpoint bills the system
+        # prompt at the cache-write rate (1.25x) until it is read back, so a
+        # one-shot caller who did not ask for it would pay more, not less.
+        description=(
+            "Place a system-prompt cache breakpoint on OpenAI-compatible requests "
+            "to Bedrock models that support prompt caching (opt-in)."
+        ),
+    ),
 }
 
 

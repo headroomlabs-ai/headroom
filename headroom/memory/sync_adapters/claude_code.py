@@ -193,7 +193,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
                     "source_agent": source_agent,
                 }
             )
-            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8")
+            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8", newline="\n")
             written += 1
 
             # Track for MEMORY.md index
@@ -236,7 +236,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
         else:
             content = "# Memory\n" + new_section
 
-        memory_md.write_text(content, encoding="utf-8")
+        memory_md.write_text(content, encoding="utf-8", newline="\n")
 
     def fingerprint(self) -> str:
         """Hash of all .md filenames + contents for change detection."""

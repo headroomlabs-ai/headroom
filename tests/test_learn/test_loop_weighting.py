@@ -25,7 +25,10 @@ from headroom.learn.fixtures import (
     refetch_loop_session,
 )
 from headroom.learn.loops import (
+    _IDENTITY_FIELDS,
     _canonical_signature,
+    _identity_input,
+    _signature_tokens,
     apply_loop_weighting,
     detect_loops,
 )
@@ -52,6 +55,46 @@ def _project() -> ProjectInfo:
 
 
 class TestDetectLoops:
+    @pytest.mark.parametrize(
+        ("name", "pattern"),
+        [("Grep", "TimeoutError"), ("Glob", "**/*.py")],
+    )
+    def test_search_signatures_include_path(self, name: str, pattern: str):
+        def call(path: str, index: int):
+            return ToolCall(
+                name=name,
+                tool_call_id=f"{name}-{index}",
+                input_data={"pattern": pattern, "path": path},
+                output="x" * 40000,
+                is_error=False,
+                output_bytes=40000,
+                msg_index=index,
+            )
+
+        distinct_paths = [
+            call("/srv/ingest", 0),
+            call("/srv/billing", 1),
+            call("/srv/web", 2),
+        ]
+        assert len({_canonical_signature(call) for call in distinct_paths}) == 3
+        assert detect_loops([SessionData(session_id=name, tool_calls=distinct_paths)]) == []
+
+        same_path = [call("/srv/ingest", index) for index in range(3)]
+        loop = detect_loops([SessionData(session_id=name, tool_calls=same_path)])[0]
+        assert loop.count == 3
+        assert loop.sample_input == f"{pattern} in /srv/ingest"
+
+    def test_unknown_tool_summary_still_uses_generic_input(self):
+        input_data = {"query": "TimeoutError", "path": "/srv/ingest"}
+        tool_call = ToolCall(
+            name="Search",
+            tool_call_id="search-1",
+            input_data=input_data,
+            output="",
+            is_error=False,
+        )
+        assert tool_call.input_summary == str(input_data)[:80]
+
     def test_refetch_loop_detected_despite_no_errors(self):
         loops = detect_loops([refetch_loop_session(repetitions=5)])
         assert len(loops) == 1
@@ -218,6 +261,342 @@ def _call(name: str, tool_call_id: str, input_data: dict, *, msg_index: int) -> 
         msg_index=msg_index,
         output_bytes=len(output),
     )
+
+
+class TestSignatureIsIdentityNotDisplay:
+    """The loop key must be a full identity, not the truncated display summary.
+
+    ``ToolCall.input_summary`` is documented as being "for display": it cuts Bash
+    commands at 100 chars and renders any non-builtin tool as
+    ``str(input_data)[:80]``. Grouping on it makes distinct calls that share a
+    long prefix compare equal, so unrelated work is reported as one loop.
+    """
+
+    def test_distinct_custom_tool_calls_are_not_one_loop(self):
+        # Five patches to five different files under one long shared prefix.
+        prefix = "/home/user/worktrees/feature-branch-alpha/services/api/internal/handlers"
+        calls = [
+            _call(
+                "apply_patch",
+                f"call_{i}",
+                {"input": f"*** Update File: {prefix}/handler_{i}.py\n@@\n-old\n+new\n"},
+                msg_index=i,
+            )
+            for i in range(5)
+        ]
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_distinct_long_bash_commands_are_not_one_loop(self):
+        # Commands diverge only after the 100-char display cutoff.
+        base = (
+            "rg --no-heading --line-number --color never "
+            "'TimeoutError|ValueError|KeyError' /srv/app/services/ingest/pipeline/"
+        )
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base}module_{i}/handlers.py"}, msg_index=i)
+            for i in range(4)
+        ]
+        assert len(calls[0].input_summary) < len(calls[0].input_data["command"])
+        assert len({_canonical_signature(c) for c in calls}) == 4
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_pagination_variants_of_one_long_command_still_collapse(self):
+        # The re-fetch collapse must survive the identity change: one command,
+        # growing output limits, past the 100-char display cutoff.
+        base = (
+            "rg --no-heading --line-number --color never "
+            "'TimeoutError|ValueError|KeyError' /srv/app/services/ingest/pipeline/handlers.py"
+        )
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base} | head -{50 * (i + 1)}"}, msg_index=i)
+            for i in range(4)
+        ]
+        assert len({_canonical_signature(c) for c in calls}) == 1
+        loops = detect_loops([SessionData(session_id="s", tool_calls=calls)])
+        assert len(loops) == 1
+        assert loops[0].count == 4
+
+
+class TestSignatureIsSizeIndependent:
+    """Detection quality must not degrade as a tool input gets larger.
+
+    The identity key is lossless, so it grows with the input. Everything derived
+    from it must stay size-independent, because the only consumer of
+    ``LoopPattern.signature`` — ``_signature_tokens`` in ``apply_loop_weighting``
+    — requires a *majority* of the signature's tokens to appear in a
+    recommendation. A signature that grows without bound pushes that threshold
+    out of reach, and a real loop silently loses its measured-waste boost.
+    """
+
+    BASE = "pytest tests/test_learn/test_loops.py -v --maxfail 1 --tb=short"
+    REC = (
+        "Avoid rerunning pytest on tests/test_learn/test_loops.py with"
+        " -v --maxfail 1 --tb=short; reuse the prior run."
+    )
+
+    def _command(self, extra_args: int) -> str:
+        tail = " ".join(f"--unrelated-opt-{i}=value-{i}" for i in range(extra_args))
+        return f"{self.BASE} {tail}".strip()
+
+    def _loop(self, extra_args: int):
+        calls = [
+            _call("Bash", f"call_b{i}", {"command": self._command(extra_args)}, msg_index=i)
+            for i in range(5)
+        ]
+        return detect_loops([SessionData(session_id="s", tool_calls=calls)])
+
+    @pytest.mark.parametrize("extra_args", [0, 20, 200, 2000])
+    def test_weighting_holds_however_long_the_input_is(self, extra_args):
+        loops = self._loop(extra_args)
+        rec = Recommendation(
+            target=RecommendationTarget.CONTEXT_FILE,
+            section="Tooling",
+            content=self.REC,
+            estimated_tokens_saved=100,
+        )
+
+        apply_loop_weighting([rec], loops)
+
+        assert rec.is_loop_guardrail is True
+        assert rec.estimated_tokens_saved == loops[0].wasted_tokens
+
+    def test_signature_size_does_not_track_input_size(self):
+        big = self._loop(500)[0].signature
+        ten_times_bigger = self._loop(5000)[0].signature
+
+        assert big == ten_times_bigger
+        assert len(big) < len(self._command(500)) // 10
+
+    def test_oversized_inputs_are_still_told_apart(self):
+        """Bounding the signature must not reintroduce the merge it was added to survive.
+
+        Identity is the *unbounded* key; only the stored signature is capped. Two
+        calls sharing a long prefix must therefore stay distinct even when their
+        bounded signatures are identical.
+        """
+        shared = "*** Update File: /repo/services/ingest/handler.py\n" + "-old\n+new\n" * 400
+        calls = [
+            _call("apply_patch", f"call_p{i}", {"input": f"{shared}# variant {i}"}, msg_index=i)
+            for i in range(5)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+
+class TestGroupingInvariants:
+    """Properties that must hold for any input, not just the pinned examples."""
+
+    def _mixed_calls(self) -> list[ToolCall]:
+        return [
+            _call("Read", "call_r0", {"file_path": "/repo/a.py"}, msg_index=0),
+            _call("Read", "call_r1", {"file_path": "/repo/a.py"}, msg_index=1),
+            _call("Read", "call_r2", {"file_path": "/repo/a.py"}, msg_index=2),
+            _call("Bash", "call_b0", {"command": "rg alpha /repo"}, msg_index=3),
+            _call("Bash", "call_b1", {"command": "rg alpha /repo"}, msg_index=4),
+            _call("Bash", "call_b2", {"command": "rg alpha /repo"}, msg_index=5),
+            _call("Grep", "call_g0", {"pattern": "beta"}, msg_index=6),
+        ]
+
+    def test_detection_does_not_depend_on_call_order(self):
+        calls = self._mixed_calls()
+        shuffled = list(reversed(calls))
+
+        def summarize(cs):
+            loops = detect_loops([SessionData(session_id="s", tool_calls=cs)])
+            return sorted((lp.tool, lp.count, lp.wasted_tokens) for lp in loops)
+
+        assert summarize(shuffled) == summarize(calls)
+
+    def test_whitespace_variants_share_one_signature(self):
+        """Whitespace normalization survives the split/join implementation.
+
+        The collapse is done with ``" ".join(str.split())`` rather than a regex
+        for speed; this pins that tabs, newlines and repeated spaces still fold
+        to the same signature.
+        """
+        variants = [
+            "rg --line-number 'def handler' /repo/app.py",
+            "rg  --line-number\t'def handler'   /repo/app.py",
+            "  rg --line-number\n'def handler' /repo/app.py  ",
+        ]
+        calls = [
+            _call("Bash", f"call_w{i}", {"command": cmd}, msg_index=i)
+            for i, cmd in enumerate(variants)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 1
+
+
+class TestIdentityFallsBackWhenTheSchemaIsUnknown:
+    """``_identity_input`` must render the input in full, as it documents.
+
+    ``_IDENTITY_FIELDS`` guesses which field identifies a call from the tool's
+    name. ``normalize_tool_name`` maps provider tools onto those same names
+    without normalizing their input schema, so the guess can miss every field —
+    at which point an empty identity collapses unrelated calls into one loop,
+    the exact failure this signature change exists to prevent.
+    """
+
+    def test_a_builtin_name_carrying_a_foreign_schema_stays_distinct(self):
+        # `codebase_search` / `search_text` normalize to Grep but carry `query`.
+        calls = [
+            _call("Grep", f"call_{i}", {"query": f"distinct query number {i}"}, msg_index=i)
+            for i in range(5)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 5
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_a_partially_matching_schema_still_uses_the_known_field(self):
+        # `file_path` is present, so identity comes from it and the rest is
+        # ignored — the pinned builtin behaviour is unchanged.
+        calls = [
+            _call("Read", f"call_{i}", {"file_path": "/repo/a.md", "offset": i}, msg_index=i)
+            for i in range(3)
+        ]
+
+        loops = detect_loops([SessionData(session_id="s", tool_calls=calls)])
+
+        assert [lp.count for lp in loops] == [3]
+
+    @pytest.mark.parametrize("payload", [None, [], "raw string", {1: "a", "b": 2}])
+    def test_an_unexpected_input_shape_does_not_raise(self, payload):
+        # Identity is derived during a scan of files the user did not write;
+        # a malformed input must not take down `headroom learn`.
+        call = _call("Bash", "call_0", payload, msg_index=0)
+
+        assert _canonical_signature(call).startswith("bash::")
+
+
+class TestSearchIdentityIncludesPath:
+    """The same pattern in different trees is three searches, not a loop.
+
+    Identity now comes from the input fields rather than ``input_summary``, so
+    every field that distinguishes a search has to be named here — a pattern
+    alone would merge a sweep across three service directories into one loop
+    worth 20,000 tokens of phantom waste. Pins the same behavior #3455 pins on
+    the display side, on the path identity actually reads.
+    """
+
+    def _search(self, name: str, pattern: str, path: str, index: int) -> ToolCall:
+        return _call(name, f"{name}-{index}", {"pattern": pattern, "path": path}, msg_index=index)
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_distinct_paths_are_distinct_signatures(self, name: str, pattern: str):
+        calls = [
+            self._search(name, pattern, path, i)
+            for i, path in enumerate(("/srv/ingest", "/srv/billing", "/srv/web"))
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 3
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_the_same_pattern_in_three_trees_is_not_a_loop(self, name: str, pattern: str):
+        calls = [
+            self._search(name, pattern, path, i)
+            for i, path in enumerate(("/srv/ingest", "/srv/billing", "/srv/web"))
+        ]
+
+        assert detect_loops([SessionData(session_id=name, tool_calls=calls)]) == []
+
+    @pytest.mark.parametrize(("name", "pattern"), [("Grep", "TimeoutError"), ("Glob", "**/*.py")])
+    def test_repeating_one_search_is_still_a_loop(self, name: str, pattern: str):
+        # Adding path to identity must not stop a real re-search loop counting.
+        calls = [self._search(name, pattern, "/srv/ingest", i) for i in range(3)]
+
+        assert detect_loops([SessionData(session_id=name, tool_calls=calls)])[0].count == 3
+
+    def test_a_search_without_a_path_still_has_identity(self, name: str = "Grep"):
+        # Claude Code omits path when searching the cwd; identity must not
+        # collapse to the empty fallback, nor split from a differing path.
+        rooted = _call(name, "g-1", {"pattern": "TimeoutError", "path": "/srv"}, msg_index=1)
+        bare = _call(name, "g-0", {"pattern": "TimeoutError"}, msg_index=0)
+
+        assert _canonical_signature(bare) != _canonical_signature(rooted)
+
+
+class TestIdentityPreservesFieldBoundaries:
+    """Two identity fields must not run together into one flat string.
+
+    ``pattern`` and ``path`` joined on a space lose the boundary between them:
+    ``("error in src", "logs")`` and ``("error", "in src logs")`` are different
+    searches that render the same text, and merged into one loop they report
+    20,000 tokens of waste nobody spent. Only tools with more than one identity
+    field need the structured form, so Bash keeps the bare command its
+    pagination normalization is written against.
+    """
+
+    def _search(self, pattern: str, path: str, index: int) -> ToolCall:
+        return _call("Grep", f"g-{index}", {"pattern": pattern, "path": path}, msg_index=index)
+
+    # Same characters in the same order, split between the fields three ways.
+    _AMBIGUOUS = (("error in src", "logs"), ("error in", "src logs"), ("error", "in src logs"))
+
+    def test_field_splits_of_one_string_are_distinct_signatures(self):
+        calls = [
+            self._search(pattern, path, i) for i, (pattern, path) in enumerate(self._AMBIGUOUS)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 3
+
+    def test_field_splits_of_one_string_are_not_a_loop(self):
+        calls = [
+            self._search(pattern, path, i) for i, (pattern, path) in enumerate(self._AMBIGUOUS)
+        ]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)]) == []
+
+    def test_a_path_containing_spaces_still_loops_when_repeated(self):
+        # Spaces are not themselves a reason to split a group.
+        calls = [self._search("error in src", "/srv/my logs", i) for i in range(3)]
+
+        assert detect_loops([SessionData(session_id="s", tool_calls=calls)])[0].count == 3
+
+    @pytest.mark.parametrize(
+        ("pattern", "path"),
+        [('a", "b', "c"), ("a", '", "b", "c'), ("a\\", '"b'), ('["a"]', "b")],
+    )
+    def test_a_pattern_that_mimics_the_encoding_stays_distinct(self, pattern: str, path: str):
+        # Whatever the encoding is, a search cannot forge another search's
+        # identity by embedding the separator in its own pattern.
+        mimic = self._search(pattern, path, 0)
+        plain = self._search("a", "b", 1)
+
+        assert _canonical_signature(mimic) != _canonical_signature(plain)
+
+    def test_pagination_variants_of_one_command_still_collapse(self):
+        # The structured form must not reach single-field tools: Bash identity
+        # stays the bare command, so _PAGINATION_RE keeps matching it.
+        base = 'rg --no-heading "TimeoutError" /srv/app/services/ingest/pipeline/handlers.py'
+        calls = [
+            _call("Bash", f"call_{i}", {"command": f"{base} | head -{50 * (i + 1)}"}, msg_index=i)
+            for i in range(4)
+        ]
+
+        assert len({_canonical_signature(c) for c in calls}) == 1
+
+    def test_a_non_ascii_pattern_does_not_leak_escape_tokens(self):
+        # apply_loop_weighting requires a *majority* of a signature's tokens to
+        # appear in a recommendation. An escape artifact is a token no
+        # recommendation can ever contain, so it only raises that bar and costs
+        # a real loop its measured-waste boost.
+        call = self._search("café latte", "/srv/menu", 0)
+
+        assert "u00e9" not in _signature_tokens(_canonical_signature(call))
+
+    @pytest.mark.parametrize(
+        ("name", "field"),
+        [(n, f[0]) for n, f in sorted(_IDENTITY_FIELDS.items()) if len(f) == 1],
+    )
+    def test_a_single_field_tool_keeps_its_bare_value(self, name: str, field: str):
+        # Guards the carve-out above: give one of these tools a second identity
+        # field and it silently moves to the structured form, where
+        # _PAGINATION_RE no longer matches the command it was written for.
+        call = _call(name, "c-0", {field: "a b c"}, msg_index=0)
+
+        assert _identity_input(call) == "a b c"
 
 
 def _mixed_calls() -> list[ToolCall]:

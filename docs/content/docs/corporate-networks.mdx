@@ -1,0 +1,97 @@
+---
+title: Corporate Networks (Zscaler, Netskope, TLS Inspection)
+description: Run Headroom behind Zscaler, Netskope, Palo Alto, Cisco Secure Access and other TLS-inspecting gateways, and what to ask IT for when something is still blocked.
+---
+
+Many companies route laptop traffic through a gateway that **inspects TLS**: it opens each HTTPS connection, checks it, and re-signs it with the company's own root certificate. IT installs that root in the operating system's certificate store, which is why browsers, `curl` and Claude Code keep working.
+
+Headroom verifies upstream certificates against the **same OS certificate store** (macOS Keychain, Windows certificate store, the system bundle on Linux), plus the public roots bundled with Python. On a managed machine this usually needs no configuration.
+
+## Quick check
+
+```bash
+headroom doctor --network
+```
+
+For each endpoint Headroom uses, this prints who signed the certificate the network presented (for example `Zscaler Intermediate Root CA`), whether Headroom trusts it, and whether a gateway block page was returned instead of the service. If anything fails, the last row is a short request you can send to IT as-is.
+
+Add `--network-url https://your-gateway.example.com/v1/models` to test a custom upstream too.
+
+## If a certificate is still not trusted
+
+The error Claude Code (or Codex) shows will read like:
+
+> Headroom could not verify the TLS certificate for api.anthropic.com (unable to get local issuer certificate). The certificate was issued by 'O=Zscaler Inc., CN=Zscaler Intermediate Root CA': Zscaler is inspecting this connection. ...
+
+Pick one fix:
+
+1. **Ask IT to deploy the root to the OS certificate store.** This is the normal setup for Zscaler Client Connector ("Install Zscaler SSL Certificate") and most MDM profiles. Nothing else to change.
+2. **Point Headroom at the root as a file.** Export it (your browser's certificate viewer, or IT) as PEM and set:
+
+   ```bash
+   export HEADROOM_CA_BUNDLE=/path/to/company-root.pem
+   ```
+
+   `HEADROOM_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS` are **added** to the trusted set. If you already set `NODE_EXTRA_CA_CERTS` for Claude Code, Headroom picks it up.
+3. **Ask IT to exempt the provider domains from TLS inspection** (see the list below).
+
+<Callout type="warn" title="Don't disable verification">
+Never turn certificate checking off to get past this. Headroom has no switch for that on purpose.
+</Callout>
+
+## Trust settings
+
+| Env var | Default | Effect |
+|---|---|---|
+| `HEADROOM_CERT_STORE` | `system,bundled` | Where trusted roots come from: `system` = OS certificate store, `bundled` = certifi's public roots. Set `bundled` to go back to the previous behavior (public roots only). Mirrors Claude Code's `CLAUDE_CODE_CERT_STORE`. |
+| `HEADROOM_CA_BUNDLE` | unset | Extra PEM roots, added to the above. |
+| `NODE_EXTRA_CA_CERTS` | unset | Same as `HEADROOM_CA_BUNDLE` (shared with Claude Code). |
+| `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` | unset | **Replace** every other source: only this bundle is trusted. Use only if the bundle is complete. |
+| `HEADROOM_TLS_STRICT` | strict | `0` relaxes OpenSSL's RFC 5280 strict checks on the bundled path. Not needed with the OS store; kept for `HEADROOM_CERT_STORE=bundled`. |
+
+The same policy covers the proxy's HTTP and WebSocket upstreams, GitHub Copilot sign-in, and model and tokenizer downloads made from Python. The Rust proxy binary (`headroom-proxy`, used in the Docker image) trusts Mozilla's roots plus the OS store for all upstreams, and adds `HEADROOM_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` for HTTP upstreams.
+
+One gap remains: the embedding model that the Rust core fetches for relevance scoring still trusts Mozilla's roots only. Behind inspection that download fails and Headroom falls back to BM25 scoring; use `HF_ENDPOINT` (below) or pre-populate the cache to keep embeddings.
+
+In a container there is usually no corporate root in the OS store: mount it and set `HEADROOM_CA_BUNDLE`.
+
+## HTTP proxies
+
+If your company uses an explicit proxy (`HTTPS_PROXY` set, or a PAC file), Headroom's upstream calls go through it. The agent's calls **to** Headroom must not: they target `127.0.0.1`, which the corporate proxy cannot reach. `headroom wrap` adds `127.0.0.1,localhost,::1` to `NO_PROXY` for the processes it launches; if you start the agent yourself, set:
+
+```bash
+export NO_PROXY="$NO_PROXY,127.0.0.1,localhost,::1"
+```
+
+PAC files are not evaluated by Python. Export the proxy the PAC file resolves to as `HTTPS_PROXY`.
+
+## What to ask IT for
+
+Headroom runs on the developer's machine and talks to the same services the AI tools already use, plus two download hosts:
+
+| Domain | Used for | Required |
+|---|---|---|
+| `api.anthropic.com` | Claude / Claude Code | yes, for Anthropic |
+| `api.openai.com`, `chatgpt.com` | OpenAI API, Codex | yes, for OpenAI / Codex |
+| `api.githubcopilot.com`, `api.github.com` | GitHub Copilot | for Copilot |
+| `huggingface.co` and the storage hosts it redirects to (`cdn-lfs.hf.co`, `cas-bridge.xethub.hf.co`) | Compression models (downloaded once) | recommended |
+| `openaipublic.blob.core.windows.net` | Tokenizer vocabulary (downloaded once) | recommended |
+
+Things that help:
+
+- **Deploy the inspection root to the OS store.** This is enough for Headroom; no per-app certificate work is needed.
+- **Do not route these domains to "Caution" or "Isolate".** An API client cannot click through an interstitial page; it sees HTML where it expected JSON.
+- **Streaming:** some gateways buffer server-sent events while inspecting them, so responses arrive in bursts or time out. If users see stalled streams, exempt the provider domains from inspection or DLP buffering.
+- **Please don't exempt `python` as a process** (for example Zscaler's process-based bypass). Headroom does not need it once the root is trusted, and it would exempt every Python program on the machine.
+
+If your company uses Anthropic **tenant restrictions**, those require inspection of `api.anthropic.com` to stay on. That works with Headroom as long as the root is trusted.
+
+## Model downloads when huggingface.co is blocked
+
+Headroom degrades instead of failing: without the compression model it falls back to rule-based compression, and without the tokenizer vocabulary it estimates token counts. To keep ML compression on a locked-down network, point Headroom at an internal Hugging Face mirror (Artifactory, Nexus):
+
+```bash
+export HF_ENDPOINT=https://artifactory.example.com/api/huggingface/huggingface
+```
+
+Or pre-populate `~/.cache/huggingface` from a machine that has access.
