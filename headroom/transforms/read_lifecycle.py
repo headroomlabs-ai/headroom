@@ -34,6 +34,7 @@ from ..config import (
     _READ_TOOL_NAMES,
     ReadLifecycleConfig,
 )
+from ..ignore import IgnorePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +108,16 @@ class ReadLifecycleManager:
         self,
         config: ReadLifecycleConfig,
         compression_store: Any | None = None,
+        ignore_policy: IgnorePolicy | None = None,
     ):
         self.config = config
         self.store = compression_store
+        # Central compress-ignore enforcement point (issue #1150): a Read's
+        # file_path is the one place in the compression pipeline where a
+        # real filesystem path is known, so this is where `.headroomignore`
+        # / `ignore.compress` rules are actually enforced — a path ignored
+        # for "compress" is never marked stale/superseded (never replaced).
+        self._ignore_policy = ignore_policy
 
     def apply(
         self,
@@ -323,10 +331,18 @@ class ReadLifecycleManager:
             if not reads:
                 continue
 
+            # A path ignored for "compress" is never replaced — treat it as
+            # always FRESH regardless of stale/superseded detection below.
+            compress_ignored = bool(
+                self._ignore_policy and self._ignore_policy.is_ignored(file_path, "compress")
+            )
+
             for read_op in reads:
                 # Check stale: any edit/write of this file AFTER this read?
-                is_stale = self.config.compress_stale and any(
-                    e.msg_index > read_op.msg_index for e in edits
+                is_stale = (
+                    not compress_ignored
+                    and self.config.compress_stale
+                    and any(e.msg_index > read_op.msg_index for e in edits)
                 )
 
                 # Check superseded: any later read that FULLY COVERS this read's range?
@@ -334,8 +350,13 @@ class ReadLifecycleManager:
                 # different partial read (offset=200, limit=50) — they cover
                 # different lines. Only supersede when the later read contains
                 # all the lines of this read.
-                is_superseded = self.config.compress_superseded and any(
-                    r.msg_index > read_op.msg_index and self._read_covers(r, read_op) for r in reads
+                is_superseded = (
+                    not compress_ignored
+                    and self.config.compress_superseded
+                    and any(
+                        r.msg_index > read_op.msg_index and self._read_covers(r, read_op)
+                        for r in reads
+                    )
                 )
 
                 if is_stale:
