@@ -30,7 +30,10 @@ import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
 from headroom.proxy import public_errors
-from headroom.proxy.memory_tool_stream import MemoryToolStreamFilter
+from headroom.proxy.memory_tool_stream import (
+    MemoryToolStreamFilter,
+    MemoryToolStreamOverflowError,
+)
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
@@ -1718,6 +1721,14 @@ class StreamingMixin:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
                 # Forward the upstream error response
                 yield e.response.content
+            except MemoryToolStreamOverflowError as e:
+                # The filter dropped what it withheld; end the stream rather
+                # than forward it.
+                logger.error(f"[{request_id}] Memory: {e}; ending the stream")
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.INTERNAL_ERROR, request_id=request_id
+                )
+                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
                 error_event = public_errors.anthropic_error_body(

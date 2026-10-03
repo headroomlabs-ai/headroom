@@ -18,6 +18,11 @@ Content block indices are rewritten so the blocks the client sees stay
 contiguous, including across continuation rounds whose blocks are appended
 to the same client message. Frames that need no rewrite are forwarded as the
 exact upstream bytes.
+
+Everything the filter holds back (a pending partial frame, withheld tool
+input, held tail frames) counts against ``max_retained_bytes``; past it the
+filter drops what it holds and raises ``MemoryToolStreamOverflowError``
+rather than forwarding withheld bytes.
 """
 
 from __future__ import annotations
@@ -37,6 +42,14 @@ logger = logging.getLogger(__name__)
 
 _BLOCK_EVENTS = ("content_block_start", "content_block_delta", "content_block_stop")
 _TAIL_EVENTS = ("message_delta", "message_stop")
+
+# Same budget as the proxy's SSE reconstruction buffer. Legitimate streams
+# retain a few KiB at most: one partial frame plus the memory calls' input.
+DEFAULT_MAX_RETAINED_BYTES = 10 * 1024 * 1024
+
+
+class MemoryToolStreamOverflowError(Exception):
+    """The filter would have to retain more than ``max_retained_bytes``."""
 
 
 def _parse_frame(frame: bytes) -> tuple[str | None, dict[str, Any] | None]:
@@ -74,6 +87,8 @@ class MemoryToolStreamFilter:
             for a continuation round.
         forward_message_start: False for continuation rounds, whose blocks
             extend the message the client already opened.
+        max_retained_bytes: Limit on the bytes held back at any time;
+            ``DEFAULT_MAX_RETAINED_BYTES`` when None.
     """
 
     def __init__(
@@ -82,8 +97,14 @@ class MemoryToolStreamFilter:
         *,
         index_offset: int = 0,
         forward_message_start: bool = True,
+        max_retained_bytes: int | None = None,
     ) -> None:
         self._tool_names = frozenset(tool_names)
+        self._max_retained_bytes = (
+            DEFAULT_MAX_RETAINED_BYTES if max_retained_bytes is None else max_retained_bytes
+        )
+        # Bytes held in _hidden fragments and _tail; _buffer is counted live.
+        self._retained = 0
         self._forward_message_start = forward_message_start
         self._buffer = bytearray()
         self._index_map: dict[int, int] = {}
@@ -140,7 +161,14 @@ class MemoryToolStreamFilter:
         return calls
 
     def feed(self, chunk: bytes) -> list[bytes]:
-        """Consume upstream bytes; return the frames to forward now."""
+        """Consume upstream bytes; return the frames to forward now.
+
+        Raises:
+            MemoryToolStreamOverflowError: The bytes held back exceed
+                ``max_retained_bytes``. The filter has dropped them; the
+                caller must end the stream instead of forwarding anything
+                further.
+        """
         self._buffer.extend(chunk)
         out: list[bytes] = []
         while (match := find_sse_event_terminator(self._buffer)) is not None:
@@ -150,6 +178,17 @@ class MemoryToolStreamFilter:
             forwarded = self._route(frame)
             if forwarded is not None:
                 out.append(forwarded)
+        retained = len(self._buffer) + self._retained
+        if retained > self._max_retained_bytes:
+            self._buffer.clear()
+            self._hidden.clear()
+            self._hidden_stopped.clear()
+            self._tail.clear()
+            self._retained = 0
+            raise MemoryToolStreamOverflowError(
+                f"memory tool stream filter would retain {retained} bytes "
+                f"(limit {self._max_retained_bytes})"
+            )
         return out
 
     def _route(self, frame: bytes) -> bytes | None:
@@ -166,6 +205,7 @@ class MemoryToolStreamFilter:
                 if isinstance(delta, dict) and delta.get("stop_reason"):
                     self.stop_reason = delta["stop_reason"]
             self._tail.append((event_name, payload, frame))
+            self._retained += len(frame)
             return None
 
         if event_name not in _BLOCK_EVENTS:
@@ -196,7 +236,9 @@ class MemoryToolStreamFilter:
                 and isinstance(delta, dict)
                 and delta.get("type") == "input_json_delta"
             ):
-                self._hidden[upstream_index][1].append(str(delta.get("partial_json", "")))
+                fragment = str(delta.get("partial_json", ""))
+                self._hidden[upstream_index][1].append(fragment)
+                self._retained += len(fragment)
             elif event_name == "content_block_stop":
                 self._hidden_stopped.add(upstream_index)
             return None
@@ -254,7 +296,11 @@ class MemoryToolStreamFilter:
                 rendered["usage"] = usage
             frames.append(_render_frame(event_name, rendered))
         if self._buffer:
-            # An unterminated trailing frame: pass it through untouched.
-            frames.append(bytes(self._buffer))
+            # The stream ended mid-frame. It may belong to a withheld block,
+            # so drop it rather than risk exposing it to the client.
+            logger.warning(
+                "Memory: dropping %d bytes of an unterminated SSE frame at end of stream",
+                len(self._buffer),
+            )
             self._buffer.clear()
         return frames

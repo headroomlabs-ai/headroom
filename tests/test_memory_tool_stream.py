@@ -15,7 +15,10 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from headroom.proxy.memory_tool_stream import MemoryToolStreamFilter
+from headroom.proxy.memory_tool_stream import (
+    MemoryToolStreamFilter,
+    MemoryToolStreamOverflowError,
+)
 from headroom.proxy.server import HeadroomProxy
 
 MEMORY_TOOLS = frozenset({"memory_save", "memory_search"})
@@ -483,12 +486,54 @@ class TestFrameParsingEdgeCases:
         flt.feed(_frame({"type": "message_delta", "delta": {}, "usage": {"output_tokens": 1}}))
         assert flt.stop_reason is None
 
-    def test_unterminated_trailing_frame_is_flushed_with_the_tail(self) -> None:
+    def test_unterminated_trailing_frame_is_dropped(self) -> None:
         flt = MemoryToolStreamFilter(MEMORY_TOOLS)
         flt.feed(_sse([TEXT], "end_turn"))
         flt.feed(b"event: ping\ndata: {")
-        assert flt.closing_frames()[-1] == b"event: ping\ndata: {"
-        assert flt.closing_frames()[-1] != b"event: ping\ndata: {"
+        assert b"ping" not in b"".join(flt.closing_frames())
+
+    def test_truncated_hidden_delta_never_reaches_the_client(self) -> None:
+        secret = "my private deploy key"
+        start = _frame({"type": "content_block_start", "index": 0, "content_block": SAVE})
+        delta = _frame(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": f'{{"content": "{secret}'},
+            }
+        )
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        emitted = flt.feed(start + delta[:-2])  # the stream ends before the terminator
+        emitted += flt.closing_frames()
+        assert secret.encode() not in b"".join(emitted)
+        assert flt.hidden_calls() == []
+
+
+class TestRetainedByteLimit:
+    def test_unterminated_event_stops_growing_at_the_limit(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=4096)
+        chunk = b"event: content_block_delta\ndata: " + b"x" * 1024
+        with pytest.raises(MemoryToolStreamOverflowError):
+            for _ in range(12):
+                flt.feed(chunk)
+        assert flt.closing_frames() == []
+
+    def test_oversized_hidden_input_is_dropped_not_run(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=4096)
+        flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": SAVE}))
+        fragment = {"type": "input_json_delta", "partial_json": "y" * 1024}
+        with pytest.raises(MemoryToolStreamOverflowError):
+            for _ in range(12):
+                flt.feed(_frame({"type": "content_block_delta", "index": 0, "delta": fragment}))
+        assert not flt.hid_tool_calls
+        assert flt.hidden_calls() == []
+        assert flt.closing_frames() == []
+
+    def test_frames_within_the_limit_pass(self) -> None:
+        raw = _sse([TEXT, SAVE], "tool_use")
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=len(raw))
+        flt.feed(raw)
+        assert flt.hidden_calls() == [SAVE]
 
 
 class TestUpstreamErrorFrame:
@@ -751,3 +796,40 @@ class TestHandlerPassesServerMemoryTools:
             )
 
         assert captured["server_memory_tool_names"] == MEMORY_TOOLS
+
+
+class TestStreamingRetainedByteLimit:
+    SECRET = "s3cr3t-" * 64
+
+    def _oversized_save(self) -> bytes:
+        save = {**SAVE, "input": {"content": self.SECRET}}
+        return _sse([TEXT, save], "tool_use")
+
+    @pytest.mark.asyncio
+    async def test_overflow_ends_the_stream_with_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.memory_tool_stream as mts
+
+        monkeypatch.setattr(mts, "DEFAULT_MAX_RETAINED_BYTES", 256)
+        proxy = _proxy([self._oversized_save()], SAVE_RESULT)
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        assert events[-1]["type"] == "error"
+        assert self.SECRET not in json.dumps(events)
+        proxy.memory_handler.handle_memory_tool_calls.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_continuation_overflow_ends_the_stream_with_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import headroom.proxy.memory_tool_stream as mts
+
+        monkeypatch.setattr(mts, "DEFAULT_MAX_RETAINED_BYTES", 512)
+        proxy = _proxy([_sse([TEXT, SAVE], "tool_use"), self._oversized_save()], SAVE_RESULT)
+        events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
+
+        assert proxy.http_client.send.await_count == 2
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
+        assert events[-1]["type"] == "error"
+        assert self.SECRET not in json.dumps(events)
