@@ -13,6 +13,16 @@ if TYPE_CHECKING:
 from .main import main
 
 
+def _projects_at(projects: list[Any], path: Path) -> list[Any]:
+    """Projects checked out at ``path``, including linked worktrees merged into one.
+
+    ``getattr``: external plugins may return duck-typed projects without the field.
+    """
+    return [
+        p for p in projects if p.project_path == path or path in getattr(p, "worktree_paths", ())
+    ]
+
+
 class _AgentChoice(click.ParamType):
     """Dynamic Click type that validates against the plugin registry."""
 
@@ -255,15 +265,15 @@ def learn(
             targets = all_projects
         elif project:
             resolved = project.resolve()
-            targets = [p for p in all_projects if p.project_path == resolved]
+            targets = _projects_at(all_projects, resolved)
             if not targets:
                 continue
         else:
             cwd = Path.cwd().resolve()
-            targets = [p for p in all_projects if p.project_path == cwd]
+            targets = _projects_at(all_projects, cwd)
             if not targets:
                 for parent in cwd.parents:
-                    targets = [p for p in all_projects if p.project_path == parent]
+                    targets = _projects_at(all_projects, parent)
                     if targets:
                         break
             if not targets and len(agent_configs) == 1:
@@ -494,13 +504,13 @@ def _run_verbosity(
         targets = all_projects
     elif project:
         resolved = project.resolve()
-        targets = [p for p in all_projects if p.project_path == resolved]
+        targets = _projects_at(all_projects, resolved)
     else:
         cwd = Path.cwd().resolve()
-        targets = [p for p in all_projects if p.project_path == cwd]
+        targets = _projects_at(all_projects, cwd)
         if not targets:
             for parent in cwd.parents:
-                targets = [p for p in all_projects if p.project_path == parent]
+                targets = _projects_at(all_projects, parent)
                 if targets:
                     break
     if not targets:
@@ -519,7 +529,9 @@ def _run_verbosity(
     analyzed_count = 0
 
     for proj in targets:
-        session_paths = sorted(proj.data_path.glob("*.jsonl"))
+        session_paths = sorted(
+            f for d in (proj.data_path, *proj.extra_data_paths) for f in d.glob("*.jsonl")
+        )
         if not session_paths:
             continue
         profile, baseline = analyze(session_paths, str(proj.project_path), llm_judge=judge)
