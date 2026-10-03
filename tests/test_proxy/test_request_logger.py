@@ -132,3 +132,66 @@ def test_get_recent_never_walks_message_payloads():
     again = logger.get_recent(10)[0]
     assert again["tags"] == {"agent": "codex", "meta": {"depth": 1}}
     assert again["savings_breakdown"] == [{"tokens": 60}]
+
+
+def test_payloads_survive_only_on_the_newest_message_window():
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    window = RequestLogger.MESSAGE_WINDOW
+    total = window + 50
+    for i in range(total):
+        logger.log(
+            _entry(
+                request_id=f"r{i}",
+                request_messages=[{"role": "user", "content": f"pre{i}"}],
+                compressed_messages=[{"role": "user", "content": f"post{i}"}],
+                response_content=f"resp{i}",
+            )
+        )
+
+    logs = list(logger._logs)
+    assert len(logs) == total
+    # Every entry is still there for /stats, in order, light fields intact.
+    assert [e.request_id for e in logs] == [f"r{i}" for i in range(total)]
+    assert all(e.tokens_saved == 60 for e in logs)
+    # Only the newest MESSAGE_WINDOW keep their payloads.
+    aged, kept = logs[:-window], logs[-window:]
+    assert all(
+        e.request_messages is None and e.compressed_messages is None and e.response_content is None
+        for e in aged
+    )
+    assert all(e.request_messages and e.compressed_messages and e.response_content for e in kept)
+    # The feed path is fully populated for its whole cap.
+    feed = logger.get_recent_with_messages(window)
+    assert len(feed) == window
+    assert all(item["request_messages"] for item in feed)
+
+
+def test_message_window_leaves_a_short_log_untouched():
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    for i in range(RequestLogger.MESSAGE_WINDOW):
+        logger.log(_entry(request_id=f"r{i}", request_messages=[{"role": "user", "content": "x"}]))
+    assert all(e.request_messages for e in logger._logs)
+
+
+def test_get_recent_with_messages_can_skip_payloads_without_walking_them():
+    """A feed poller that only reads the numbers passes include_messages=False;
+    the three body fields are absent and never traversed (asdict deep-copied
+    them). A leaf that refuses to be deep-copied proves the walk is gone."""
+
+    class _NoCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError("get_recent_with_messages walked a message payload")
+
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    logger.log(
+        _entry(
+            request_messages=[{"role": "user", "content": _NoCopy()}],
+            compressed_messages=[{"role": "user", "content": _NoCopy()}],
+            response_content="ok",
+        )
+    )
+
+    slim = logger.get_recent_with_messages(10, include_messages=False)
+    assert slim[0]["tokens_saved"] == 60
+    assert slim[0]["transforms_applied"] == ["kompress:user:0.4"]
+    assert not {"request_messages", "compressed_messages", "response_content"} & slim[0].keys()

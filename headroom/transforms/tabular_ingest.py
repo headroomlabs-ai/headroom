@@ -153,6 +153,11 @@ def parse_tabular(
     width = len(headers)
     if any(len(row) != width for row in rows):
         return None
+    # The detector finds fixed-width columns by single-space gutters, but the
+    # parser splits on 2+ spaces, so a table like GNU `ls -l` can come back as
+    # one cell per line. That is not a table; leave it verbatim.
+    if fmt == "fixed_width" and width < 2:
+        return None
     return headers, rows, fmt
 
 

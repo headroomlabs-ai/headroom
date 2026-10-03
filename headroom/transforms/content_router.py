@@ -56,11 +56,12 @@ from ..config import (
     DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
     DEFAULT_EXCLUDE_TOOLS,
     DEFAULT_VERBATIM_EXCLUDE_TOOLS,
+    MessageDecision,
     ReadLifecycleConfig,
     RelevanceScorerConfig,
     TransformResult,
     is_tool_excluded,
-    unwrap_tool_call_name,
+    unwrap_tool_call,
 )
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -91,7 +92,7 @@ from .lossless_provider import (
     get_lossless_verifier,
 )
 from .mixed_content import ContentSection, mixed_content_indicators
-from .relevance_split import build_relevance_query, plan_relevance_split
+from .relevance_split import build_relevance_query, plan_relevance_split, segment
 
 logger = logging.getLogger(__name__)
 
@@ -572,8 +573,36 @@ def _tool_call_command_text(raw: Any) -> str:
 
 _EXEC_COMMAND_CALL_RE = re.compile(r"\bexec_command\s*\(")
 
+# The `cmd` property of a JavaScript object literal, as Codex code-mode usually
+# writes it: `{cmd: "sed -n '1,80p' f.py", workdir: "/repo"}` or
+# `{cmd:"cat f","workdir":"/repo"}`. Matched from the opening brace; the key may
+# be bare or quoted and the value a "...", '...' or `...` string that is the
+# WHOLE property value (the next token ends it: `,` or `}`). Anything else -
+# `"c" + "at f"`, `"cat f".trim()`, a template literal with `${...}` - is an
+# expression whose value is not the literal and does not match.
+_JS_CMD_PROPERTY_RE = re.compile(
+    r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
+    r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+    r"""(?=\s*[,}])"""
+)
+_JS_STRING_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v"}
 
-def _custom_tool_call_commands(raw: Any) -> list[str]:
+
+def _js_string_value(body: str) -> str | None:
+    """Unescape the body of a JavaScript string literal.
+
+    Returns None for an escape it does not decode (``\\x61``, ``\\u0061``, octal),
+    since guessing would misread ``c\\x61t f`` as something other than ``cat f``.
+    """
+    escaped = re.findall(r"\\(.)", body, flags=re.S)
+    if any(c.isalnum() and c not in _JS_STRING_ESCAPES for c in escaped):
+        return None
+    return re.sub(
+        r"\\(.)", lambda m: _JS_STRING_ESCAPES.get(m.group(1), m.group(1)), body, flags=re.S
+    )
+
+
+def _custom_tool_call_commands(raw: Any) -> list[str | None]:
     """Extract shell commands from a Codex code-mode ``exec`` custom tool call.
 
     Codex sends shell commands as a Responses ``custom_tool_call`` named ``exec``
@@ -582,21 +611,34 @@ def _custom_tool_call_commands(raw: Any) -> list[str]:
         const r = await tools.exec_command({"cmd": "sed -n '1,80p' f.py", "workdir": "…"});
         text(r.output);
 
+    The argument is usually a JavaScript object literal rather than JSON
+    (``{cmd: "cat f.py"}``, unquoted key); when strict JSON decoding fails, the
+    ``cmd`` property is read from the literal instead.
+
     Returns every ``cmd`` passed to ``exec_command``, in order. Returns ``[]`` when
-    the input is not that shape; an argument object that is not strict JSON is
-    skipped, which leaves the output compressible exactly as before.
+    the input is not that shape. A call whose ``cmd`` is not statically known (a
+    variable, a concatenation, a template with substitution, an escape this does
+    not decode) yields ``None``: the command may be a read, and callers must treat
+    it as one rather than let an incomplete parse release the output.
     """
     if not isinstance(raw, str) or "exec_command" not in raw:
         return []
     decoder = json.JSONDecoder()
-    commands: list[str] = []
+    commands: list[str | None] = []
     for match in _EXEC_COMMAND_CALL_RE.finditer(raw):
         start = raw.find("{", match.end())
         if start < 0 or raw[match.end() : start].strip():
+            commands.append(None)  # argument is not an object literal: dynamic
             continue
         try:
             args, _end = decoder.raw_decode(raw, start)
         except ValueError:
+            literal = _JS_CMD_PROPERTY_RE.match(raw, start)
+            if literal is None:
+                commands.append(None)
+                continue
+            body = next(group for group in literal.groups() if group is not None)
+            commands.append(_js_string_value(body) or None)
             continue
         command = _tool_call_command_text(args)
         if command:
@@ -699,14 +741,54 @@ def _is_read_command(command: str) -> bool:
 
     Excludes writes: a redirect (``>``/``>>``), ``tee``, or heredoc (``<<``) means the
     command WRITES a file (e.g. ``cat > f <<EOF``), and a bare ``sed`` (without ``-n``)
-    is a stream edit — neither is a read.
+    is a stream edit — neither is a read. Redirects and ``tee`` are judged PER SEGMENT,
+    so a sibling write (``cat a.py && echo done > marker``) does not strip protection
+    from the read segment next to it.
+
+    CHAINED commands are scanned segment by segment: agents routinely batch a read
+    with other work (``wc -l a.py && sed -n '1,60p' a.py``, ``grep … ; head -80 b.py``),
+    and matching only the FIRST program left every such read unprotected — the file
+    content was lossy-compressed despite read protection being enabled.
     """
     if not command or not isinstance(command, str):
         return False
     # strip leading `cd <dir> && ` chains (agents prefix reads with a cd)
     c = _strip_cd_prefix(command)
-    # a write / append / tee / heredoc anywhere => not a pure read
-    if re.search(r"(^|\s)(>>?|tee\b|<<)", c):
+    # A heredoc is the one WHOLE-STRING bailout: its body can contain `;`/`&&`,
+    # which would split into bogus segments that look like reads. Redirects and
+    # `tee` are per-segment (see `_segment_is_read`) — a sibling write must not
+    # unprotect the read next to it.
+    if re.search(r"(^|\s)<<", c):
+        return False
+    return any(_segment_is_read(seg) for seg in _command_segments(c))
+
+
+# Separators that start a NEW command. A pipeline (`|`) deliberately does NOT:
+# downstream stages consume the previous stage's output, not a file, so
+# `grep -n x a.py | head -40` is derived search output (compressible), while
+# `cat a.py | head -40` is a file read (caught via the first stage).
+_CMD_SEPARATOR_RE = re.compile(r"\|\||&&|;")
+
+
+def _command_segments(command: str) -> list[str]:
+    """Split a shell string into the independently-executed commands in it.
+
+    Splits on ``;``, ``&&`` and ``||`` — never on a single ``|``. Pipelines are kept
+    whole so the segment's own writes (``cat a.py | tee b.py``) stay visible; the
+    reduction to the first stage happens in :func:`_segment_is_read`.
+    """
+    return [seg.strip() for seg in _CMD_SEPARATOR_RE.split(command) if seg.strip()]
+
+
+def _segment_is_read(c: str) -> bool:
+    """:func:`_is_read_command` for ONE command (no ``;``/``&&``/``||`` chaining)."""
+    # A redirect or `tee` in THIS segment means the segment writes a file rather than
+    # reading one (`cat a.py > copy.py`, `cat a.py | tee copy.py`). Checked on the whole
+    # segment — pipeline included — before reducing to the stage that touches the file.
+    if re.search(r"(^|\s)(>>?|tee\b)", c):
+        return False
+    c = c.split("|", 1)[0].strip()
+    if not c:
         return False
     # Parse the real program with the SAME structural parser the search-fold uses
     # (_bash_program peels sudo/env/timeout/rtk wrappers + env assignments), so
@@ -852,6 +934,73 @@ def _content_is_valid_json(content: str) -> bool:
         )
         return False
     return True
+
+
+def _protected_json_spans(content: str) -> list[tuple[int, int]]:
+    """JSON spans of ``content`` that a prose model must not be handed (#3673).
+
+    Kompress has no notion of JSON grammar, so JSON bytes in its input are at
+    risk of a destructive span around ``},{``. The scan is the deterministic
+    balanced-span walk embedded-JSON routing already uses, so prefixed tool
+    output and relevance fragments are seen too. Two shapes qualify:
+
+    * a span carrying an array of objects — deleting the ``},{`` between two
+      records leaves VALID JSON, so the loss is invisible to every parser, log
+      line and model downstream, which is what made #3673 invisible;
+    * a block that is one JSON document end to end, which covers welding two
+      keys of a lone object by the same argument.
+
+    A stream of SEPARATE top-level values (search hits as space-joined objects,
+    JSONL) is deliberately not protected. Welding two of those yields an
+    unparseable record rather than a silently shorter document, so the
+    invisible-loss argument does not apply — and protecting them costs a large,
+    legitimate savings class: it turns forced Kompress into a no-op on a
+    160-object search payload (see
+    ``test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress``).
+    """
+    from .recursive_json import carries_record_array, scan_json_documents
+
+    spans, complete = scan_json_documents(content)
+    if not complete:
+        # The scan stopped at its budget (input built to defeat the linear walk),
+        # so a record array past that point cannot be ruled out. Protect the
+        # whole block: declining a prose compression is recoverable, a silently
+        # deleted record is not.
+        return [(0, len(content))]
+    if not spans:
+        return []
+    if (
+        len(spans) == 1
+        and not content[: spans[0][0]].strip()
+        and not content[spans[0][1] :].strip()
+    ):
+        return spans
+    return [(a, b) for a, b in spans if carries_record_array(content[a:b])]
+
+
+def _contains_protected_json(content: str) -> bool:
+    """True when ``content`` is, or contains, a JSON span worth protecting."""
+    return bool(_protected_json_spans(content))
+
+
+def _json_straddles_segments(content: str) -> bool:
+    """True when a protected JSON span crosses a boundary ``segment()`` cuts at.
+
+    The relevance split windows by line with no JSON awareness, so a payload
+    misclassified as LOG/SEARCH can be cut mid-structure and the pieces handed
+    to Kompress as fragments no span check can recognise. Declining only for a
+    straddling span keeps the split working on line-contained JSON (JSONL
+    logs), which is the shape it exists for.
+    """
+    spans = _protected_json_spans(content)
+    if not spans:
+        return False
+    cuts: list[int] = []
+    offset = 0
+    for piece in segment(content)[:-1]:
+        offset += len(piece)
+        cuts.append(offset)
+    return any(a < cut < b for a, b in spans for cut in cuts)
 
 
 def _mixed_indicators(content: str) -> dict[str, bool]:
@@ -1116,6 +1265,41 @@ _RELEASABLE_READ_TYPES = frozenset(
 )
 
 
+def _codex_exec_envelope_outputs(text: str) -> list[str] | None:
+    """The file text inside a Codex ``exec`` result printed whole, else ``None``.
+
+    Codex code mode runs ``exec`` as JavaScript. A script that prints the whole
+    ``exec_command`` result, ``text(r)`` rather than ``text(r.output)``, sends
+    the JSON envelope ``{"chunk_id", "wall_time_seconds", "exit_code", ...,
+    "output": "<file>"}`` (or a list of them), possibly behind Codex's
+    ``Script completed / Wall time / Output:`` preamble. Judging the envelope
+    would judge a line of JSON-escaped code, whose verdict flips per file
+    between source and releasable JSON; the read is its ``output`` string(s).
+    Only a body that is nothing but envelope(s) is unwrapped.
+    """
+    if '"wall_time_seconds"' not in text:
+        return None
+    body = text.strip()
+    if not body.startswith(("{", "[")):
+        _, found, body = text.partition("\nOutput:\n")
+        body = body.strip()
+        if not found or not body.startswith(("{", "[")):
+            return None
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    envelopes = parsed if isinstance(parsed, list) else [parsed]
+    outputs = [
+        env["output"]
+        for env in envelopes
+        if isinstance(env, dict)
+        and "wall_time_seconds" in env
+        and isinstance(env.get("output"), str)
+    ]
+    return outputs if outputs and len(outputs) == len(envelopes) else None
+
+
 def _read_output_should_be_protected(text: Any) -> bool:
     """Finalize read-protection by CONTENT — protect by default, release only DATA.
 
@@ -1131,11 +1315,20 @@ def _read_output_should_be_protected(text: Any) -> bool:
     """
     if not isinstance(text, str) or not text:
         return False
+    outputs = _codex_exec_envelope_outputs(text)
+    if outputs is not None:
+        return any(_read_output_should_be_protected(output) for output in outputs)
     try:
-        return _detect_content(text).content_type not in _RELEASABLE_READ_TYPES
+        detection = _detect_content(text)
     except Exception:
         # Detection failure → protect (preserve the byte-exact default).
         return True
+    if detection.metadata.get("format") == "fixed_width":
+        # Space-aligned columns are also what hand-aligned files look like
+        # (/etc/fstab, a block of C #defines), so a READ of one stays
+        # byte-exact. Only delimited and markdown tables are released.
+        return True
+    return detection.content_type not in _RELEASABLE_READ_TYPES
 
 
 def _create_content_signature(
@@ -1866,6 +2059,13 @@ class _PerRequestRuntimeState:
     # a compression-policy misapplication.
     protect_read_tool_ids: set[str] = field(default_factory=set)
     protect_read_msg_indices: set[int] = field(default_factory=set)
+    # ``time.perf_counter()`` origin shared by every kompress call this
+    # request makes. ``HEADROOM_COMPRESSION_DEADLINE_MS`` is a deadline on
+    # kompress inference, but each ``compress()`` call started its own clock,
+    # so the budget bounded a BLOCK and a request with a dozen blocks could
+    # spend a dozen budgets. Set once per ``apply()``; see
+    # ``_try_ml_compressor``.
+    kompress_deadline_started_at: float | None = None
 
 
 # Monotonic counter so each ContentRouter instance gets a uniquely named
@@ -1911,14 +2111,14 @@ class ContentRouter(Transform):
 
     name: str = "content_router"
 
-    # Lossy summarizers that emit a CCR retrieve marker only when they store the
-    # original — a marker-less result from one of these is unrecoverable. Tool
-    # ground truth (role="tool") must not be replaced by such a result (#1307).
+    # Lossy transforms that discard source data need a CCR retrieval marker;
+    # without one, tool ground truth must remain unchanged (#1307).
     LOSSY_UNMARKED_STRATEGIES = frozenset(
         {
             CompressionStrategy.KOMPRESS,
             CompressionStrategy.TEXT,
             CompressionStrategy.CODE_AWARE,
+            CompressionStrategy.HTML,
         }
     )
 
@@ -2342,6 +2542,36 @@ class ContentRouter(Transform):
             "on",
         }
 
+    def _force_kompress_ready(self) -> bool:
+        """Return whether forced Kompress routing can actually run.
+
+        ``force_kompress`` is an opt-in routing preference, not a reason to
+        disable every other compressor. A cold or unavailable ML model used to
+        turn otherwise compressible logs/JSON into a silent passthrough because
+        the forced KOMPRESS strategy returned its input and the normal
+        structural fallback was never considered. Keep the background warmup,
+        but let the regular detector choose a safe structural compressor until
+        the model is ready.
+        """
+        if not self.config.enable_kompress:
+            return False
+        try:
+            compressor = self._get_kompress()
+        except Exception:
+            return False
+        if compressor is None:
+            return False
+        try:
+            ready = bool(compressor.is_ready())
+        except Exception:
+            return False
+        if not ready:
+            try:
+                compressor.ensure_background_load()
+            except Exception:
+                logger.debug("Kompress background warmup failed", exc_info=True)
+        return ready
+
     def _kompress_model_ready(self) -> bool:
         """Whether the ML compressor is ready (or deliberately disabled).
 
@@ -2532,6 +2762,11 @@ class ContentRouter(Transform):
             # force Kompress, skip the full router detection path so large
             # proxy payloads do not pay for an unused strategy decision.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
+            # Forced routing is only meaningful while the ML compressor is
+            # ready. On a cold cache, preserve the normal content detector so
+            # structured compressors can still make progress instead of the
+            # forced passthrough masking them.
+            force_kompress = force_kompress and self._force_kompress_ready()
             if force_kompress:
                 mixed = False
                 detection = DetectionResult(ContentType.PLAIN_TEXT, 1.0, {})
@@ -3259,6 +3494,12 @@ class ContentRouter(Transform):
                 type(out).__name__,
             )
             return None
+        # A passthrough (``compressed=False``) is the compressor declining this
+        # block, not a result; fall back so the built-in path still gets its
+        # turn instead of the block going out uncompressed.
+        if not out.compressed:
+            logger.debug("external compressor %r passed through; falling back to built-in", name)
+            return None
         compressed = out.content
         # Never blank out a non-empty block (an empty user/tool block makes
         # providers reject the request); fall back so the built-in path runs.
@@ -3467,22 +3708,20 @@ class ContentRouter(Transform):
         # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
         # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
         # stable, and a strict no-op when the block has no embedded JSON.
-        if _allow_embedded:
-            from headroom.transforms.recursive_json import route_embedded_json
-
-            def _dispatch_span(span: str) -> str | None:
-                strat = self._strategy_from_detection_type(_detect_content(span).content_type)
-                text, _t, _c = self._apply_strategy_to_content(
-                    span,
-                    strat,
-                    context,
-                    question=question,
-                    bias=bias,
-                    _allow_embedded=False,
-                )
-                return text if text != span else None
-
-            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+        #
+        # HTML blocks are the one exception (#3609): whole-document extraction
+        # routinely beats a local JSON minify by orders of magnitude (the report
+        # measured a 2% splice win pre-empting a 95% extraction), so the splice
+        # must not short-circuit the parent strategy. Defer it: run the HTML
+        # dispatch below first and compute the splice in the passthrough
+        # fallback only when extraction found nothing. Lossless mode never
+        # reaches that dispatch, so it keeps the immediate-return behavior
+        # (JSON minification is itself byte-lossless).
+        _defer_embedded_for_html = (
+            _allow_embedded and strategy is CompressionStrategy.HTML and not self.config.lossless
+        )
+        if _allow_embedded and not _defer_embedded_for_html:
+            routed = self._embedded_json_route(content, context, question, bias)
             if routed is not None:
                 return routed, _estimate_tokens(routed), ["embedded_json"]
 
@@ -3617,7 +3856,11 @@ class ContentRouter(Transform):
                         )
                         if output is not None and output.compressed:
                             compressed = output.content
-                            compressed_tokens = len(output.content.split())
+                            # Tokens, like ``original_tokens`` and every other
+                            # branch: a word count here (code runs ~2.2
+                            # tokens/word) made an unchanged block look like a
+                            # 55% compression and no fallback could beat it.
+                            compressed_tokens = _estimate_tokens(output.content)
                             decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress
@@ -3641,19 +3884,17 @@ class ContentRouter(Transform):
                     # lossless has no savings. Reads are protected upstream, so
                     # only NON-read code reaches here. Keep Kompress ONLY if it
                     # actually shrinks (never inflate).
-                    _k, _kt = self._try_ml_compressor(content, context, question)
-                    if (
-                        _k is not None
-                        and _kt is not None
-                        and _kt < original_tokens
-                        and len(_k) < len(content)
-                    ):
+                    # Recorded as tried even if it loses, so the no-savings
+                    # fallback below does not run the same inference again.
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                    _k, _ = self._try_ml_compressor(content, context, question)
+                    _kt = _estimate_tokens(_k)
+                    if _kt < original_tokens and len(_k) < len(content):
                         compressed, compressed_tokens = _k, _kt
                         strategy = CompressionStrategy.KOMPRESS
                         actual_strategy = strategy
                         compressor_name = "KompressCompressor"
                         decision_reason = "code_aware_no_shrink_fallback_kompress"
-                        strategy_chain.append(CompressionStrategy.KOMPRESS.value)
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
                 # SmartCrusher handles its own TOIN recording
@@ -3782,9 +4023,15 @@ class ContentRouter(Transform):
                         # ``result.extracted is None`` path (chain
                         # ``[html, passthrough]``). A real extraction is
                         # byte-identical to the historical ``result.extracted``.
+                        # An EMPTY extraction (trafilatura found no article text)
+                        # collapses to None too: a blank page is "nothing
+                        # extracts", and returning "" here would discard the
+                        # whole block instead of falling through (#3609).
                         output = self._registry_compress("html", strategy, content, context, bias)
                         compressed = (
-                            output.content if output is not None and output.compressed else None
+                            output.content
+                            if output is not None and output.compressed and output.content.strip()
+                            else None
                         )
                         # A page that is all <script>/<style> extracts to "".
                         # That is "nothing extracted" (fall through to the
@@ -3854,10 +4101,13 @@ class ContentRouter(Transform):
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
+            # TABULAR is deliberately absent: a table the tabular compressor
+            # declined (ragged rows, #1652) or could not shrink stays verbatim.
+            # Kompress drops words inside rows, so it would remove fields from
+            # some rows and not others with nothing marking which (#3652).
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
-                CompressionStrategy.TABULAR,
                 CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
@@ -3869,9 +4119,11 @@ class ContentRouter(Transform):
                 already_tried_kompress = CompressionStrategy.KOMPRESS.value in strategy_chain
                 if not already_tried_kompress:
                     strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                    fallback_compressed, fallback_tokens = self._try_ml_compressor(
-                        content, context, question
-                    )
+                    fallback_compressed, _ = self._try_ml_compressor(content, context, question)
+                    # Measure with the router's estimator, the unit of
+                    # ``compressed_tokens``. Kompress reports a passthrough in
+                    # WORDS, which would let an unchanged block "win".
+                    fallback_tokens = _estimate_tokens(fallback_compressed)
                 else:
                     fallback_compressed = compressed
                     fallback_tokens = compressed_tokens
@@ -3937,8 +4189,8 @@ class ContentRouter(Transform):
             # actually shorter — never inflating, never doing worse than the
             # strategy output. DIFF is excluded (Kompress corrupts ``git
             # apply``); TEXT/KOMPRESS already ran Kompress; CODE_AWARE has its
-            # own inline no-shrink fallback; SMART_CRUSHER/TABULAR use the
-            # zero-savings fallback above.
+            # own inline no-shrink fallback; SMART_CRUSHER uses the
+            # zero-savings fallback above; TABULAR never goes to Kompress.
             if (
                 self._lossless_then_lossy
                 and compressed is not None
@@ -4019,6 +4271,16 @@ class ContentRouter(Transform):
             )
             return compressed, compressed_tokens, strategy_chain
 
+        # #3609: deferred embedded-JSON splice. The HTML strategy ran above and
+        # extracted nothing (``compressed`` is still None), so the local JSON
+        # win — held back at the top to give whole-document extraction first
+        # refusal — is now the best available outcome.
+        if _defer_embedded_for_html:
+            routed = self._embedded_json_route(content, context, question, bias)
+            if routed is not None:
+                strategy_chain.append("embedded_json")
+                return routed, _estimate_tokens(routed), strategy_chain
+
         # Fallback: return unchanged
         if self.config.enable_dense_line_elision:
             dense = self._elide_dense(content, context)
@@ -4092,6 +4354,32 @@ class ContentRouter(Transform):
                 return None
         return elided, _estimate_tokens(elided)
 
+    def _embedded_json_route(
+        self, content: str, context: str, question: str | None, bias: float
+    ) -> str | None:
+        """Route embedded JSON spans inside ``content`` through the JSON compressors.
+
+        Extracted from the ``_apply_strategy_to_content`` pre-pass so the HTML
+        strategy can defer the splice (#3609) and retry it in the passthrough
+        fallback. Returns the spliced block, or ``None`` when nothing
+        safe/smaller applied.
+        """
+        from headroom.transforms.recursive_json import route_embedded_json
+
+        def _dispatch_span(span: str) -> str | None:
+            strat = self._strategy_from_detection_type(_detect_content(span).content_type)
+            text, _t, _c = self._apply_strategy_to_content(
+                span,
+                strat,
+                context,
+                question=question,
+                bias=bias,
+                _allow_embedded=False,
+            )
+            return text if text != span else None
+
+        return route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+
     def _try_ml_compressor(
         self,
         content: str,
@@ -4116,6 +4404,14 @@ class ContentRouter(Transform):
         Returns:
             Tuple of (compressed, token_count).
         """
+        # Kompress is a prose model: dropping a span around ``},{`` can remove
+        # an entire JSON record while leaving the remaining document valid
+        # (#3673). This boundary sees the final Kompress input, which may be a
+        # prefixed block or a fragment rather than a whole JSON document, so
+        # guard every parseable JSON span before the prose model runs.
+        if _contains_protected_json(content):
+            return content, _estimate_tokens(content)
+
         from .tag_protector import protect_tags, restore_tags
 
         # Protect custom tags before any ML compression
@@ -4232,6 +4528,18 @@ class ContentRouter(Transform):
                         # don't accept the kwarg are unaffected on the common path.
                         if protected:
                             compress_kwargs["ccr_original"] = content
+                        # One deadline for the whole request, not one per
+                        # block. Without this a request with N compressible
+                        # blocks gets N full deadlines and can run far past
+                        # the pipeline's own compression timeout; the worker
+                        # that overruns cannot be preempted, so it opens the
+                        # timeout-debt quarantine and every request behind it
+                        # forwards with no compression at all.
+                        deadline_origin = self._runtime_state_var.get().kompress_deadline_started_at
+                        if deadline_origin is not None and getattr(
+                            compressor, "shares_request_deadline", False
+                        ):
+                            compress_kwargs["_deadline_started_at"] = deadline_origin
                         result = compressor.compress(text_to_compress, **compress_kwargs)
                         compressed = result.compressed
                         compressed_tokens = result.compressed_tokens
@@ -4446,6 +4754,11 @@ class ContentRouter(Transform):
         normal path when the scorer is unavailable, the query is empty, nothing
         is dropped, or the split doesn't beat plain compaction. Never raises.
 
+        JSON the windows would cut is excluded from splitting. Without that
+        route guard, a payload misclassified as LOG/SEARCH is cut at arbitrary
+        offsets before the JSON guard sees it (#3673); line-contained JSON
+        (JSONL) still splits, which is the shape this exists for.
+
         Embedding cost is bounded two ways: the model is pre-warmed off the
         request thread (BM25 until it's ready, see _get_relevance_scorer) and
         outputs segmenting into more than ``relevance_max_records`` records skip
@@ -4453,6 +4766,8 @@ class ContentRouter(Transform):
         """
         scorer = self._get_relevance_scorer()
         if scorer is None or not query.strip():
+            return None
+        if _json_straddles_segments(content):
             return None
         from .lossless_compaction import compact_lossless
 
@@ -4925,16 +5240,17 @@ class ContentRouter(Transform):
                     tc_id = tc.get("id", "")
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
+                    call_args = fn.get("arguments")
                     if name:
                         # Hermes deferred tools arrive wrapped as `tool_call`
-                        # with the real name inside the arguments payload.
-                        name = unwrap_tool_call_name(name, fn.get("arguments"))
+                        # with the real name and arguments inside the payload.
+                        name, call_args = unwrap_tool_call(name, call_args)
                     if tc_id and name:
                         mapping[tc_id] = name
-                        args = _tool_call_args_text(fn.get("arguments"))
+                        args = _tool_call_args_text(call_args)
                         if args:
                             args_map[tc_id] = args
-                        command = _tool_call_command_text(fn.get("arguments"))
+                        command = _tool_call_command_text(call_args)
                         if command:
                             commands_map[tc_id] = command
 
@@ -4945,16 +5261,17 @@ class ContentRouter(Transform):
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tc_id = block.get("id", "")
                         name = block.get("name", "")
+                        call_input = block.get("input")
                         if name:
                             # Hermes deferred tools arrive wrapped as `tool_call`
-                            # with the real name inside the input payload.
-                            name = unwrap_tool_call_name(name, block.get("input"))
+                            # with the real name and arguments inside the input.
+                            name, call_input = unwrap_tool_call(name, call_input)
                         if tc_id and name:
                             mapping[tc_id] = name
-                            args = _tool_call_args_text(block.get("input"))
+                            args = _tool_call_args_text(call_input)
                             if args:
                                 args_map[tc_id] = args
-                            command = _tool_call_command_text(block.get("input"))
+                            command = _tool_call_command_text(call_input)
                             if command:
                                 commands_map[tc_id] = command
 
@@ -5141,7 +5458,12 @@ class ContentRouter(Transform):
         # call does. No `reset()` is needed: every `apply()` call installs
         # its own fresh object up front, so the next call on a reused worker
         # thread simply overwrites the ambient value before reading it.
-        self._runtime_state_var.set(_PerRequestRuntimeState())
+        # The kompress deadline origin is stamped HERE, with the rest of the
+        # per-request state, so every block this call compresses draws down one
+        # shared budget instead of restarting it.
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(kompress_deadline_started_at=time.perf_counter())
+        )
 
         # Pre-process: Read lifecycle management (stale/superseded detection)
         if self.config.read_lifecycle.enabled:
@@ -5184,7 +5506,7 @@ class ContentRouter(Transform):
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
         )
-        min_tokens = kwargs.get("min_tokens_to_compress", 50)
+        min_tokens = int(kwargs.get("min_tokens_to_compress", 50) or 50)
         # Cache-safety knobs for content-block (Anthropic-format) handling:
         compress_assistant_text_blocks = kwargs.get(
             "compress_assistant_text_blocks",
@@ -5234,6 +5556,15 @@ class ContentRouter(Transform):
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
+        # Per-message veto from a compression hook (``CompressionHooks.
+        # protect_messages``). Distinct from ``biases``, which is a soft
+        # multiplier on how aggressively a compressor prunes: several
+        # strategies clamp or ignore it, so a bias — however large — cannot
+        # express "leave this one alone". This can. Empty unless a hook is
+        # installed, so the default path is unchanged.
+        hook_protect: set[int] = {
+            int(i) for i in (kwargs.get("protect") or ()) if isinstance(i, (int, bool))
+        }
 
         # Build tool name map for exclusion checking
         tool_name_map = self._build_tool_name_map(messages)
@@ -5345,6 +5676,7 @@ class ContentRouter(Transform):
         runtime_read_protection_window = kwargs.get("read_protection_window")
         if (
             runtime_read_protection_window is not None
+            and int(runtime_read_protection_window) > 0
             and self.config.protect_recent_reads_fraction > 0
         ):
             # A profile-derived window may only narrow protection when the
@@ -5353,7 +5685,11 @@ class ContentRouter(Transform):
             # See #1374's documented contract: protected tool output must never
             # lossy-compress "regardless of conversation depth" -- a per-request
             # savings-profile kwarg must not silently weaken that.
-            read_protection_window = max(0, int(runtime_read_protection_window))
+            # A window of 0 is "no override", not "protect nothing": it comes
+            # from a profile's protect_recent=0 (coding, general), a positional
+            # guard for cache mode, and would otherwise strip file reads of all
+            # protection in token mode, down to the newest message.
+            read_protection_window = int(runtime_read_protection_window)
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
@@ -5422,6 +5758,10 @@ class ContentRouter(Transform):
             "content_blocks": 0,
         }
         compressed_details: list[str] = []  # e.g. ["code_aware:0.72", "kompress:0.65"]
+
+        # Per-message diagnostics (collected only when collect_diagnostics=True)
+        collect_diagnostics = bool(kwargs.get("collect_diagnostics", False))
+        _diag: dict[int, str] = {}  # slot_index → action string
 
         # Check for analysis intent in the most recent user message
         analysis_intent = False
@@ -5527,11 +5867,21 @@ class ContentRouter(Transform):
                 else:
                     # Frozen — byte-identical to preserve the prefix cache.
                     result_slots[i] = message
+                    if collect_diagnostics:
+                        _diag[i] = "passthrough:frozen"
                     continue
 
             role = message.get("role", "")
             content = message.get("content", "")
             bias = 1.0  # Default bias, may be overridden for tool messages
+
+            # Hook veto, checked before any routing decision so it covers both
+            # the content-block path and the string path below.
+            if i in hook_protect:
+                result_slots[i] = message
+                transforms_applied.append("router:protected:hook")
+                route_counts["hook_protected"] = route_counts.get("hook_protected", 0) + 1
+                continue
 
             messages_from_end = num_messages - i
             # The caller's own words stay verbatim on a replaying path even
@@ -5577,12 +5927,24 @@ class ContentRouter(Transform):
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
+                if collect_diagnostics:
+                    # _process_content_blocks returns the SAME message object
+                    # when it protected/passed through every block, and a NEW
+                    # dict only when at least one block was actually
+                    # compressed -- use that instead of assuming compression.
+                    _diag[i] = (
+                        "compressed:content_blocks"
+                        if transformed_message is not message
+                        else "protected:content_blocks_unchanged"
+                    )
                 continue
 
             # Skip non-string content (other types)
             if not isinstance(content, str):
                 result_slots[i] = message
                 route_counts["non_string"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:non_string"
                 continue
 
             # A headroom_retrieve result IS already-retrieved, original CCR content --
@@ -5602,6 +5964,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:excluded:ccr_retrieve")
                 route_counts["ccr_retrieve"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:ccr_retrieve"
                 continue
 
             # Skip OpenAI-style tool messages for excluded tools
@@ -5614,6 +5978,8 @@ class ContentRouter(Transform):
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
+                        if collect_diagnostics:
+                            _diag[i] = "protected:excluded_tool_verbatim"
                         continue
                     if messages_from_end <= read_protection_window:
                         # Protected from lossy compression — but grep/log/json
@@ -5633,11 +5999,15 @@ class ContentRouter(Transform):
                             route_counts["excluded_tool_lossless"] = (
                                 route_counts.get("excluded_tool_lossless", 0) + 1
                             )
+                            if collect_diagnostics:
+                                _diag[i] = f"compressed:lossless_{kind}"
                             continue
                         # Recent — protect as before
                         result_slots[i] = message
                         transforms_applied.append("router:excluded:tool")
                         route_counts["excluded_tool"] += 1
+                        if collect_diagnostics:
+                            _diag[i] = "protected:excluded_tool_recent"
                         continue
                     # Old excluded-tool output — fall through to compression
                     # (the LLM is unlikely to need exact content from this far back,
@@ -5656,6 +6026,8 @@ class ContentRouter(Transform):
                     route_counts["bash_lossless_search"] = (
                         route_counts.get("bash_lossless_search", 0) + 1
                     )
+                    if collect_diagnostics:
+                        _diag[i] = "compressed:bash_lossless_search"
                     continue
 
             # Read protection (ROLE / SHAPE-AGNOSTIC). An observation produced by
@@ -5683,11 +6055,15 @@ class ContentRouter(Transform):
                         route_counts["read_kompress_exp"] = (
                             route_counts.get("read_kompress_exp", 0) + 1
                         )
+                        if collect_diagnostics:
+                            _diag[i] = "compressed:read_kompress_exp"
                         continue
                     result_slots[i] = message
                     transforms_applied.append("router:read_protected")
                     route_counts.setdefault("read_protected", 0)
                     route_counts["read_protected"] += 1
+                    if collect_diagnostics:
+                        _diag[i] = "protected:read_output"
                     continue
 
             # Protection 1: Never compress user messages (unless overridden),
@@ -5696,6 +6072,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:user_message")
                 route_counts["user_msg"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:user_message"
                 continue
 
             # Protection 1b: Never compress system/developer messages unless
@@ -5705,12 +6083,16 @@ class ContentRouter(Transform):
                 transforms_applied.append(f"router:protected:{role}_message")
                 route_counts.setdefault("system_msg", 0)
                 route_counts["system_msg"] += 1
+                if collect_diagnostics:
+                    _diag[i] = f"protected:{role}_message"
                 continue
 
             if not content or tokenizer.count_text(content) < min_tokens:
                 # Skip small content
                 result_slots[i] = message
                 route_counts["small"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:small"
                 continue
 
             # Protection: failed tool calls / error outputs stay verbatim
@@ -5729,6 +6111,8 @@ class ContentRouter(Transform):
                 transforms_applied.append("router:protected:error_output")
                 route_counts.setdefault("error_protected", 0)
                 route_counts["error_protected"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:error_output"
                 continue
 
             # Detect content type for protection decisions. Even when the
@@ -5747,6 +6131,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:recent_code")
                 route_counts["recent_code"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:recent_code"
                 continue
 
             # Protection 3: Don't compress CODE when analysis intent detected
@@ -5754,6 +6140,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 transforms_applied.append("router:protected:analysis_context")
                 route_counts["analysis_ctx"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "protected:analysis_context"
                 continue
 
             # Compression pinning: if this message was already compressed
@@ -5764,6 +6152,8 @@ class ContentRouter(Transform):
                 result_slots[i] = message
                 route_counts.setdefault("already_compressed", 0)
                 route_counts["already_compressed"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:already_compressed"
                 continue
 
             # Route and compress based on content detection
@@ -5791,6 +6181,8 @@ class ContentRouter(Transform):
                 route_counts["ratio_too_high"] += 1
                 route_counts.setdefault("cache_hit", 0)
                 route_counts["cache_hit"] += 1
+                if collect_diagnostics:
+                    _diag[i] = "passthrough:cache_skip"
                 continue
 
             # Tier 2: result cache — reuse compressed output
@@ -5830,10 +6222,14 @@ class ContentRouter(Transform):
                         # Net-cost gate: mutation would cost more in cache
                         # invalidation than it saves — leave untouched.
                         result_slots[i] = message
+                        if collect_diagnostics:
+                            _diag[i] = "passthrough:netcost_blocked"
                     else:
                         result_slots[i] = {**message, "content": cached_compressed}
                         transforms_applied.append(f"router:{cached_strategy}:{cached_ratio:.2f}")
                         compressed_details.append(f"{cached_strategy}:{cached_ratio:.2f}")
+                        if collect_diagnostics:
+                            _diag[i] = f"compressed:{cached_strategy}:{cached_ratio:.2f}"
                         # Freeze the "compress" verdict so future turns skip the
                         # min_ratio re-check above and never downgrade it.
                         if freeze_decision:
@@ -5855,6 +6251,8 @@ class ContentRouter(Transform):
                     self._cache.move_to_skip(content_key)
                     result_slots[i] = message
                     route_counts["ratio_too_high"] += 1
+                    if collect_diagnostics:
+                        _diag[i] = "passthrough:ratio_too_high"
                 route_counts.setdefault("cache_hit", 0)
                 route_counts["cache_hit"] += 1
                 continue
@@ -6016,8 +6414,8 @@ class ContentRouter(Transform):
                 else:
                     accept_ratio = result.compression_ratio
                 if accept_ratio < min_ratio:
-                    # tool ground truth must stay reversible — a lossy summarizer
-                    # (kompress/text/code) that emitted no CCR retrieve marker is
+                    # tool ground truth must stay reversible — a lossy transform
+                    # (kompress/text/code/html) that emitted no CCR retrieve marker is
                     # unrecoverable, so the agent would act on a fabricated summary
                     # (#1307). Keep the original verbatim instead.
                     if (
@@ -6031,6 +6429,8 @@ class ContentRouter(Transform):
                         route_counts["lossy_unrecoverable_skipped"] = (
                             route_counts.get("lossy_unrecoverable_skipped", 0) + 1
                         )
+                        if collect_diagnostics:
+                            _diag[slot_idx] = "passthrough:lossy_unrecoverable"
                         continue
                     # Compressed — store in result cache. The cache is still
                     # warmed when the net-cost gate blocks the slot: the
@@ -6058,12 +6458,18 @@ class ContentRouter(Transform):
                         write_multiplier=netcost_write_multiplier,
                     ):
                         result_slots[slot_idx] = message
+                        if collect_diagnostics:
+                            _diag[slot_idx] = "passthrough:netcost_blocked"
                         continue
                     result_slots[slot_idx] = {**message, "content": result.compressed}
                     transforms_applied.append(
                         f"router:{result.strategy_used.value}:{accept_ratio:.2f}"
                     )
                     compressed_details.append(f"{result.strategy_used.value}:{accept_ratio:.2f}")
+                    if collect_diagnostics:
+                        _diag[slot_idx] = (
+                            f"compressed:{result.strategy_used.value}:{accept_ratio:.2f}"
+                        )
                     if slot_idx in frozen_unlock_slots:
                         transforms_applied.append("router:netcost_frozen_unlock")
                         route_counts.setdefault("netcost_frozen_unlocked", 0)
@@ -6073,6 +6479,8 @@ class ContentRouter(Transform):
                     self._cache.mark_skip(content_key)
                     result_slots[slot_idx] = message
                     route_counts["ratio_too_high"] += 1
+                    if collect_diagnostics:
+                        _diag[slot_idx] = "passthrough:ratio_too_high"
                     # Caveat (1): only freeze a "skip" verdict when the ML model
                     # is actually ready. A passthrough caused purely by a still-
                     # loading ModernBERT must stay re-evaluable on later turns,
@@ -6185,6 +6593,34 @@ class ContentRouter(Transform):
             except Exception as e:  # pragma: no cover - defensive
                 logger.debug("Router observer raised (non-fatal): %s", e)
 
+        # Build per-message diagnostics when collect_diagnostics=True
+        message_decisions: list[MessageDecision] = []
+        if collect_diagnostics:
+            for idx, orig_msg in enumerate(messages):
+                slot = result_slots[idx] if idx < len(result_slots) else None
+                if slot is None:
+                    continue
+                # Delegates to the canonical block-aware counter (also used for
+                # net-cost estimation) so list/block content (Anthropic-style
+                # tool_result/text blocks) gets a real count instead of the 0
+                # a str-only check would give it.
+                tok_before = _netcost_message_tokens(orig_msg, tokenizer)
+                tok_after = _netcost_message_tokens(slot, tokenizer)
+                # "uninstrumented" (never "compressed:...") for any route that
+                # didn't tag `_diag`: claiming a compression that may not have
+                # happened is worse than admitting the diagnostic is incomplete
+                # for that path.
+                action = _diag.get(idx, "uninstrumented")
+                message_decisions.append(
+                    MessageDecision(
+                        message_index=idx,
+                        role=orig_msg.get("role", ""),
+                        tokens_before=tok_before,
+                        tokens_after=tok_after,
+                        action=action,
+                    )
+                )
+
         all_transforms = lifecycle_transforms + transforms_applied
         return TransformResult(
             messages=transformed_messages,
@@ -6194,6 +6630,7 @@ class ContentRouter(Transform):
             markers_inserted=lifecycle_ccr_hashes,
             warnings=warnings,
             timing=compressor_timing,
+            message_decisions=message_decisions,
         )
 
     def _lossless_compact_excluded(self, content: Any) -> tuple[str, str] | None:
@@ -7049,8 +7486,8 @@ class ContentRouter(Transform):
                 self._record_frozen_verdict(content_key, True)
             return result.compressed, True
         if result.compression_ratio < min_ratio:
-            # Tool ground truth must stay reversible: a lossy summarizer
-            # (kompress/text/code) that emitted no CCR retrieve marker is
+            # Tool ground truth must stay reversible: a lossy transform
+            # (kompress/text/code/html) that emitted no CCR retrieve marker is
             # unrecoverable, so the agent would act on a fabricated summary
             # (#1307). The string/`role=="tool"` path guards this; mirror it
             # here for tool_result blocks (never cached, so the Tier-2 path
