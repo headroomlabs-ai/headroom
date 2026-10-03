@@ -160,6 +160,8 @@ class TestBobPreflight:
             {"gatewayUrl": ""},
             {"gatewayUrl": None},
             {"gatewayUrl": "http://127.0.0.1:8787/p/myproj/"},  # already the proxy
+            {"gatewayUrl": "http://127.0.0.1:8787/p/another-project"},  # attribution only
+            {"gatewayUrl": "http://localhost:8787"},  # same proxy, spelled differently
             "not json",
         ],
     )
@@ -168,6 +170,10 @@ class TestBobPreflight:
 
     def test_passes_when_no_settings_file(self, tmp_path):
         assert bob_preflight(self.ENV, tmp_path / "missing.json") is None
+
+    def test_fails_on_same_host_other_port(self, tmp_path):
+        path = self._settings(tmp_path, {"gatewayUrl": "http://127.0.0.1:9999"})
+        assert bob_preflight(self.ENV, path) is not None
 
     def test_fails_on_foreign_gateway(self, tmp_path):
         path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})
@@ -202,6 +208,20 @@ class TestOriginPassthrough:
         assert (
             resolve_origin_passthrough_url(BASE, path) == f"https://api.us-east.bob.ibm.com{path}"
         )
+
+    def test_other_ibm_regions_get_the_same_rules(self):
+        # IBM runs one gateway per region; --openai-api-url selects it.
+        base = "https://api.eu-de.bob.ibm.com/inference"
+        assert (
+            resolve_origin_passthrough_url(base, "/admin/v1/profile")
+            == "https://api.eu-de.bob.ibm.com/admin/v1/profile"
+        )
+        body = b'{"instances":[{"teams":[{"id":"t","region_domain":"eu-de.bob.ibm.com"}]}]}'
+        assert json.loads(
+            strip_origin_passthrough_response_keys(base, "/admin/v1/profile", body)
+        ) == {"instances": [{"teams": [{"id": "t"}]}]}
+        # The web-login host is not a gateway.
+        assert resolve_origin_passthrough_url("https://bob.ibm.com", "/admin/v1/profile") is None
 
     @pytest.mark.parametrize(
         ("base", "path"),
@@ -354,4 +374,57 @@ class TestModeWarningOnEveryReusePath:
         monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
 
         assert wrap_mod._ensure_proxy_unlocked(8787, False) == (None, 8787)
+        assert any("'token' mode" in line for line in cache_mode_proxy)
+
+    def test_stale_version_left_running_for_attached_clients_warns(
+        self, monkeypatch, cache_mode_proxy
+    ):
+        # Shared proxy on an older Headroom with other wrappers attached is
+        # deliberately left running; Bob still ends up on its cache mode.
+        monkeypatch.setattr(
+            wrap_mod,
+            "_query_proxy_health",
+            lambda _p: {"version": "0.0.1", "config": {"mode": "cache"}},
+        )
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *_a, **_k: ["other-wrapper"])
+        monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+
+        assert wrap_mod._ensure_proxy_unlocked(8787, False) == (None, 8787)
+        assert any("'token' mode" in line for line in cache_mode_proxy)
+
+    def test_persistent_restart_warns_with_the_restarted_config(
+        self, monkeypatch, cache_mode_proxy
+    ):
+        from types import SimpleNamespace
+
+        import headroom.install.health as install_health
+
+        # Dormant persistent deployment: recovery brings it up without
+        # --memory, so wrap restarts it from the manifest, in the manifest's
+        # (cache) mode.
+        manifest = SimpleNamespace(profile="p", health_url="http://127.0.0.1:8787/readyz")
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: manifest)
+        monkeypatch.setattr(install_health, "probe_ready", lambda _url: False)
+        monkeypatch.setattr(wrap_mod, "_recover_persistent_proxy", lambda _p: True)
+        monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
+        restarted: list[int] = []
+        monkeypatch.setattr(
+            wrap_mod, "_restart_persistent_proxy", lambda _m, p: restarted.append(p) or True
+        )
+        monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _p: {"mode": "cache"})
+
+        assert wrap_mod._ensure_proxy_unlocked(8787, False, memory=True) == (None, 8787)
+        assert restarted == [8787]
+        assert any("'token' mode" in line for line in cache_mode_proxy)
+
+    def test_feature_gap_without_pid_reused_as_is_warns(self, monkeypatch, cache_mode_proxy):
+        # Proxy lacks --memory and exposes no PID, so wrap reuses it unchanged.
+        monkeypatch.setattr(wrap_mod, "_proxy_needs_version_restart", lambda _p: False)
+        monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *_a, **_k: [])
+        monkeypatch.setattr(wrap_mod, "_proxy_routing_mismatches", lambda *_a, **_k: [])
+        monkeypatch.setattr(wrap_mod, "_find_persistent_manifest", lambda _p: None)
+
+        assert wrap_mod._ensure_proxy_unlocked(8787, False, memory=True) == (None, 8787)
+        assert any("Cannot restart automatically" in line for line in cache_mode_proxy)
         assert any("'token' mode" in line for line in cache_mode_proxy)

@@ -79,7 +79,13 @@ class WrapTarget:
     # them onto ``openai_api_url``'s path doubles or misroots them.
     origin_passthrough_prefixes: tuple[str, ...] = ()
     # (path, key) pairs removed from JSON responses on origin passthrough.
+    # The key is removed at every nesting depth: Bob reads region_domain from
+    # /admin/v1/profile under instances[].teams[], not at the top level.
     origin_passthrough_strip_json_keys: tuple[tuple[str, str], ...] = ()
+    # Apply the passthrough rules to every host under this DNS suffix (leading
+    # dot), not only the host in ``openai_api_url``: IBM runs one gateway per
+    # region (api.<region>.bob.ibm.com) and --openai-api-url can select it.
+    origin_host_suffix: str | None = None
     # Proxy mode exported as HEADROOM_MODE when the user has not set one.
     # Only affects a proxy this wrap starts; wrap warns when a reused proxy
     # runs a different mode.
@@ -108,6 +114,12 @@ def build_launch_env(
     return env, display
 
 
+def _origin_key(url: str) -> tuple[str, str, int | None]:
+    parts = urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    return parts.scheme, "127.0.0.1" if host == "localhost" else host, parts.port
+
+
 def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> str | None:
     """Refuse to launch Bob when its saved gatewayUrl would bypass the proxy.
 
@@ -124,8 +136,10 @@ def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> 
         return None
     if not isinstance(saved, str) or not saved.strip():
         return None
-    proxy_url = env.get("BOB_GATEWAY_URL", "")
-    if saved.strip().rstrip("/") == proxy_url.rstrip("/"):
+    # Same proxy if scheme, host and port agree; a different /p/<project>
+    # prefix only changes attribution, and the error below tells users to
+    # point gatewayUrl at the proxy, so that must not then be rejected.
+    if _origin_key(saved) == _origin_key(env.get("BOB_GATEWAY_URL", "")):
         return None
     return (
         f"Bob's saved gatewayUrl ({saved.strip()}) overrides BOB_GATEWAY_URL, so Bob "
@@ -212,6 +226,7 @@ WRAP_TARGETS: dict[str, WrapTarget] = {
             # Bob builds every gateway path itself: inference + model info,
             # profile/budget, IBM docs search (/rag/v1/search), telemetry.
             origin_passthrough_prefixes=("/inference/", "/admin/", "/rag/", "/metrics-forwarder/"),
+            origin_host_suffix=".bob.ibm.com",
             # Bob 2.0.1–2.0.5 rewrites its gateway host from region_domain in the
             # /admin/v1/profile response while keeping the proxied port, so
             # every later request targets api.<region>:<proxy-port>. With the
@@ -279,24 +294,31 @@ class _OriginRules:
     strip_keys: tuple[tuple[str, str], ...]
 
 
-# (scheme, netloc) of a target's upstream -> its passthrough rules.
-_ORIGIN_RULES: dict[tuple[str, str], _OriginRules] = {
-    (url.scheme, url.netloc): _OriginRules(
-        target.origin_passthrough_prefixes, target.origin_passthrough_strip_json_keys
+# (scheme, host or ".suffix") of a target's upstream -> its passthrough rules.
+_ORIGIN_RULES: tuple[tuple[str, str, _OriginRules], ...] = tuple(
+    (
+        url.scheme,
+        target.origin_host_suffix or url.netloc,
+        _OriginRules(target.origin_passthrough_prefixes, target.origin_passthrough_strip_json_keys),
     )
     for target in WRAP_TARGETS.values()
     if target.openai_api_url
     and (target.origin_passthrough_prefixes or target.origin_passthrough_strip_json_keys)
     for url in (urlsplit(target.openai_api_url),)
-}
+)
 
 
 def _origin_rules(base_url: str | None) -> tuple[str, _OriginRules] | None:
     if not base_url:
         return None
     base = urlsplit(base_url)
-    rules = _ORIGIN_RULES.get((base.scheme, base.netloc))
-    return (f"{base.scheme}://{base.netloc}", rules) if rules else None
+    host = (base.hostname or "").lower()
+    for scheme, pattern, rules in _ORIGIN_RULES:
+        if base.scheme != scheme:
+            continue
+        if base.netloc == pattern or (pattern.startswith(".") and host.endswith(pattern)):
+            return f"{base.scheme}://{base.netloc}", rules
+    return None
 
 
 def resolve_origin_passthrough_url(base_url: str | None, path: str) -> str | None:

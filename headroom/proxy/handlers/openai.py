@@ -425,6 +425,26 @@ def _sanitize_forwarded_response_headers(
     return sanitize_forwarded_response_headers(headers, *extra_names)
 
 
+def _replaced_json_body(response: httpx.Response, body: bytes) -> tuple[bytes, dict[str, str]]:
+    """Headers for replaying ``response`` with ``body`` in place of its content.
+
+    The upstream's validators and digests describe the original bytes;
+    forwarding them would let a cache or integrity check pair them with the
+    rewritten body.
+    """
+    headers = _sanitize_forwarded_response_headers(
+        response.headers,
+        "etag",
+        "last-modified",
+        "cache-control",
+        "content-digest",
+        "digest",
+        "content-type",
+    )
+    headers["content-type"] = "application/json"
+    return body, headers
+
+
 def _resolve_openai_handler_path(
     request_headers: dict[str, str],
     *,
@@ -11442,20 +11462,7 @@ class OpenAIHandlerMixin:
             # routing through the configured gateway URL.
             filtered = strip_origin_passthrough_response_keys(base_url, path, response_content)
             if filtered is not None:
-                response_content = filtered
-                # The upstream's validators and digests describe the
-                # unfiltered bytes; forwarding them would let a cache or
-                # integrity check pair them with this different body.
-                response_headers = _sanitize_forwarded_response_headers(
-                    response.headers,
-                    "etag",
-                    "last-modified",
-                    "cache-control",
-                    "content-digest",
-                    "digest",
-                    "content-type",
-                )
-                response_headers["content-type"] = "application/json"
+                response_content, response_headers = _replaced_json_body(response, filtered)
 
         if provider == "anthropic" and endpoint_name == "models":
             from headroom.providers.anthropic import sanitize_anthropic_model_metadata
@@ -11466,18 +11473,12 @@ class OpenAIHandlerMixin:
             except (TypeError, ValueError):
                 sanitized_payload = None
             if sanitized_payload is not None and sanitized_payload != payload:
-                response_content = json.dumps(
-                    sanitized_payload,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                response_headers = _sanitize_forwarded_response_headers(
-                    response.headers,
-                    "etag",
-                    "last-modified",
-                    "cache-control",
+                response_content, response_headers = _replaced_json_body(
+                    response,
+                    json.dumps(sanitized_payload, separators=(",", ":"), ensure_ascii=False).encode(
+                        "utf-8"
+                    ),
                 )
-                response_headers["content-type"] = "application/json"
 
         # Passthrough request: forwarded upstream with no transforms.
         # Still recorded so dashboards see traffic on the passthrough

@@ -4689,8 +4689,11 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                     if helpers._restart_persistent_proxy(manifest, port):
+                        # Restarted from the manifest, whose mode need not be ours.
+                        _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                         return None, port
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4762,6 +4765,8 @@ def _ensure_proxy_unlocked(
                                 f"is missing: {flags_str}; restarting..."
                             )
                             if helpers._restart_persistent_proxy(manifest, port):
+                                # Restarted from the manifest, whose mode need not be ours.
+                                _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                                 return None, port
                             raise click.ClickException(
                                 f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4861,6 +4866,7 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
 
                 else:
@@ -4939,6 +4945,7 @@ def _ensure_proxy_unlocked(
                                 f"  Please stop the proxy on port {port} manually "
                                 f"and rerun with {flags_str}."
                             )
+                            _warn_proxy_mode_mismatch(running_config)
                             return None, port
 
                 # Routing-level config (backend, upstream URLs) must match in
