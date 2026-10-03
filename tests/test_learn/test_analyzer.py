@@ -1062,6 +1062,50 @@ class TestCallCliLlm:
             _call_cli_llm("test digest", "codex-cli")
         assert long_stderr not in str(exc_info.value)
 
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_codex_failure_drops_prompt_echo_and_keeps_reason(self, mock_run: MagicMock):
+        # `codex exec` echoes the whole stdin prompt to stderr ahead of its own
+        # error, so a head-of-stderr excerpt is the banner plus our system prompt
+        # and never the reason. Shape captured from codex-cli 0.156.1.
+        def _codex(cmd, *, input, **kwargs):
+            stderr = (
+                "Reading prompt from stdin...\nOpenAI Codex v0.156.1\n--------\n"
+                "model: gpt-5\n--------\nuser\n" + input + "\n\n"
+            )
+            stderr += "ERROR: Reconnecting... 1/5\n" * 100
+            stderr += "ERROR: unexpected status 401 Unauthorized: Missing bearer\n"
+            return MagicMock(returncode=1, stdout="", stderr=stderr)
+
+        mock_run.side_effect = _codex
+        with pytest.raises(RuntimeError) as exc_info:
+            _call_cli_llm("SECRET-SESSION-DIGEST", "codex-cli")
+        message = str(exc_info.value)
+        assert message.endswith("ERROR: unexpected status 401 Unauthorized: Missing bearer")
+        assert "[prompt omitted]" in message
+        assert "SECRET-SESSION-DIGEST" not in message
+        assert "OpenAI Codex v0.156.1" in message
+        # Whole lines only, still inside the snippet cap.
+        assert "\nERROR: Reconnecting... 1/5\n" in message
+        assert len(message) < 2200
+
+    @patch("headroom.learn.analyzer.subprocess.run")
+    def test_codex_failure_keeps_reason_behind_a_long_banner(self, mock_run: MagicMock):
+        # Diagnostics ahead of the echo longer than the whole snippet cap must
+        # not push the CLI's final error out of the message.
+        def _codex(cmd, *, input, **kwargs):
+            stderr = "WARN startup diagnostic line\n" * 100 + input + "\n"
+            stderr += "ERROR: unknown model gpt-x\n"
+            return MagicMock(returncode=1, stdout="", stderr=stderr)
+
+        mock_run.side_effect = _codex
+        with pytest.raises(RuntimeError) as exc_info:
+            _call_cli_llm("SECRET-SESSION-DIGEST", "codex-cli")
+        message = str(exc_info.value)
+        assert message.endswith("[prompt omitted]\nERROR: unknown model gpt-x")
+        assert message.startswith("`codex exec")
+        assert "SECRET-SESSION-DIGEST" not in message
+        assert len(message) < 2200
+
     def test_unknown_cli_model_raises(self):
         with pytest.raises(ValueError, match="Unknown CLI model"):
             _call_cli_llm("test digest", "unknown-cli")

@@ -635,7 +635,11 @@ def _output_snippet(text: str, limit: int = _MAX_SNIPPET_LEN) -> str:
 
 
 def _failure_detail(
-    stderr: str | None, stdout: str | None, *, result_text: str | None = None
+    stderr: str | None,
+    stdout: str | None,
+    *,
+    result_text: str | None = None,
+    prompt: str | None = None,
 ) -> str:
     """Build the operator-facing reason for a non-zero CLI exit.
 
@@ -649,17 +653,39 @@ def _failure_detail(
     than headed because CLI backends emit the error last (a streaming backend's
     whole event log precedes it).
 
+    A CLI that echoes its stdin prompt to stderr (``codex exec`` prints the whole
+    prompt ahead of its own error) would otherwise fill the head-of-stderr cut
+    with our system prompt and never reach the reason. The echo is replaced with
+    a marker and only the end of what follows it is kept, which also keeps the
+    session digest out of the message.
+
     Args:
         stderr: Captured stderr, if any.
         stdout: Captured stdout, if any.
         result_text: Pre-extracted reason (claude-cli's final ``result`` field),
             used in place of the raw stdout tail when available.
+        prompt: The prompt sent on stdin, dropped from stderr when echoed there.
 
     Returns:
         A non-empty snippet, or ``"(no output captured)"`` when both streams were
         empty, so the message is never a dangling colon.
     """
     parts: list[str] = []
+    # Text-mode pipes read the echo back with universal newlines.
+    echo = prompt.replace("\r\n", "\n").replace("\r", "\n").strip() if prompt else ""
+    if stderr and echo and echo in stderr:
+        head, _, after = stderr.strip().partition(echo)
+        marker = "[prompt omitted]\n"
+        after = after.strip()
+        # At least half the cap goes to what follows the echo, so a long
+        # banner ahead of it cannot push the CLI's verdict out.
+        room = max(_MAX_SNIPPET_LEN - len(head) - len(marker), _MAX_SNIPPET_LEN // 2)
+        head = head[: _MAX_SNIPPET_LEN - room - len(marker)] + marker
+        if len(after) > room:
+            # Keep whole lines where possible: the CLI's verdict is the last one.
+            cut = after[len(after) - room :]
+            after = cut.partition("\n")[2] or cut
+        stderr = head + after
     if stderr and stderr.strip():
         parts.append(stderr.strip()[:_MAX_SNIPPET_LEN])
     tail = result_text if result_text and result_text.strip() else stdout
@@ -747,7 +773,7 @@ def _call_cli_llm(
         ) from None
 
     if result.returncode != 0:
-        detail = _failure_detail(result.stderr, result.stdout)
+        detail = _failure_detail(result.stderr, result.stdout, prompt=prompt)
         raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {result.returncode}):\n{detail}")
 
     # Log stderr warnings even on success (auth refreshes, deprecation notices).
@@ -917,7 +943,7 @@ def _call_claude_cli_streaming(
         # the human-readable reason ("API Error: ...", "Not logged in", usage
         # limits).
         detail = _failure_detail(
-            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result
+            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result, prompt=prompt
         )
         raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
 
