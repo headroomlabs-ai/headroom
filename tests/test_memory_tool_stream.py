@@ -536,13 +536,40 @@ class TestRetainedByteLimit:
             flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": block}))
         assert not flt.hid_tool_calls
 
-    def test_hidden_input_is_counted_in_utf8_bytes(self) -> None:
-        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=4096)
-        flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": SAVE}))
-        # 2,000 characters but 6,000 UTF-8 bytes.
-        fragment = {"type": "input_json_delta", "partial_json": "\u20ac" * 2000}
+    def test_limit_is_in_bytes_at_the_boundary(self) -> None:
+        start = _frame({"type": "content_block_start", "index": 0, "content_block": SAVE})
+        snowmen = {"type": "input_json_delta", "partial_json": "\u2603" * 24}
+        payload = {"type": "content_block_delta", "index": 0, "delta": snowmen}
+        # Raw UTF-8 on the wire: 24 characters, 72 bytes.
+        delta = f"event: {payload['type']}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        frames = start + delta.encode()
+
+        MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=len(frames)).feed(frames)
         with pytest.raises(MemoryToolStreamOverflowError):
-            flt.feed(_frame({"type": "content_block_delta", "index": 0, "delta": fragment}))
+            MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=len(frames) - 1).feed(frames)
+
+    def test_lone_surrogate_in_hidden_input_is_counted(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS)
+        flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": SAVE}))
+        fragment = {"type": "input_json_delta", "partial_json": '{"content": "\ud800"}'}
+        frame = _frame({"type": "content_block_delta", "index": 0, "delta": fragment})
+        assert flt.feed(frame) == []
+        assert flt.feed(_frame({"type": "content_block_stop", "index": 0})) == []
+        assert flt.hidden_tool_names == ["memory_save"]
+
+    def test_repeated_hidden_start_replaces_its_charge(self) -> None:
+        first = {**SAVE, "input": {"content": "a" * 300}}
+        second = {**SAVE, "input": {"content": "b" * 300}}
+        start_one = _frame({"type": "content_block_start", "index": 0, "content_block": first})
+        start_two = _frame({"type": "content_block_start", "index": 0, "content_block": second})
+        stop = _frame({"type": "content_block_stop", "index": 0})
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=len(start_two) + 1)
+        flt.feed(start_one)
+        flt.feed(stop)
+        flt.feed(start_two)
+        assert flt.hidden_calls() == []  # the replacement has not stopped yet
+        flt.feed(stop)
+        assert flt.hidden_calls() == [second]
 
     def test_frames_within_the_limit_pass(self) -> None:
         raw = _sse([TEXT, SAVE], "tool_use")
@@ -814,7 +841,7 @@ class TestHandlerPassesServerMemoryTools:
 
 
 class TestStreamingRetainedByteLimit:
-    SECRET = "s3cr3t-" * 64
+    SECRET = "s3cr3t-" * 256
 
     def _oversized_save(self) -> bytes:
         save = {**SAVE, "input": {"content": self.SECRET}}
@@ -840,7 +867,7 @@ class TestStreamingRetainedByteLimit:
     ) -> None:
         import headroom.proxy.memory_tool_stream as mts
 
-        monkeypatch.setattr(mts, "DEFAULT_MAX_RETAINED_BYTES", 512)
+        monkeypatch.setattr(mts, "DEFAULT_MAX_RETAINED_BYTES", 1024)
         proxy = _proxy([_sse([TEXT, SAVE], "tool_use"), self._oversized_save()], SAVE_RESULT)
         events = await _client_view(proxy, server_memory_tool_names=MEMORY_TOOLS)
 

@@ -20,9 +20,10 @@ to the same client message. Frames that need no rewrite are forwarded as the
 exact upstream bytes.
 
 Everything the filter holds back (a pending partial frame, withheld tool
-input, held tail frames) counts against ``max_retained_bytes``; past it the
-filter drops what it holds and raises ``MemoryToolStreamOverflowError``
-rather than forwarding withheld bytes.
+blocks and their input, held tail frames) is charged its size on the wire
+against ``max_retained_bytes``; past it the filter drops what it holds and
+raises ``MemoryToolStreamOverflowError`` rather than forwarding withheld
+bytes.
 """
 
 from __future__ import annotations
@@ -103,9 +104,10 @@ class MemoryToolStreamFilter:
         self._max_retained_bytes = (
             DEFAULT_MAX_RETAINED_BYTES if max_retained_bytes is None else max_retained_bytes
         )
-        # UTF-8 bytes held in _hidden (start frames and input fragments) and
+        # Wire bytes of the frames behind _hidden (per upstream index) and
         # _tail; _buffer is counted live.
-        self._retained = 0
+        self._hidden_bytes: dict[int, int] = {}
+        self._tail_bytes = 0
         self._forward_message_start = forward_message_start
         self._buffer = bytearray()
         self._index_map: dict[int, int] = {}
@@ -179,13 +181,14 @@ class MemoryToolStreamFilter:
             forwarded = self._route(frame)
             if forwarded is not None:
                 out.append(forwarded)
-        retained = len(self._buffer) + self._retained
+        retained = len(self._buffer) + self._tail_bytes + sum(self._hidden_bytes.values())
         if retained > self._max_retained_bytes:
             self._buffer.clear()
             self._hidden.clear()
+            self._hidden_bytes.clear()
             self._hidden_stopped.clear()
             self._tail.clear()
-            self._retained = 0
+            self._tail_bytes = 0
             raise MemoryToolStreamOverflowError(
                 f"memory tool stream filter would retain {retained} bytes "
                 f"(limit {self._max_retained_bytes})"
@@ -206,7 +209,7 @@ class MemoryToolStreamFilter:
                 if isinstance(delta, dict) and delta.get("stop_reason"):
                     self.stop_reason = delta["stop_reason"]
             self._tail.append((event_name, payload, frame))
-            self._retained += len(frame)
+            self._tail_bytes += len(frame)
             return None
 
         if event_name not in _BLOCK_EVENTS:
@@ -223,9 +226,12 @@ class MemoryToolStreamFilter:
                 and block.get("type") == "tool_use"
                 and block.get("name") in self._tool_names
             ):
+                # A repeated start for the same index replaces the block,
+                # its charge and any earlier stop. The frame may carry the
+                # whole input inline, so it is charged in full.
                 self._hidden[upstream_index] = (block, [])
-                # The block may carry its whole input inline.
-                self._retained += len(frame)
+                self._hidden_bytes[upstream_index] = len(frame)
+                self._hidden_stopped.discard(upstream_index)
                 return None
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 self.visible_tool_use = True
@@ -239,9 +245,10 @@ class MemoryToolStreamFilter:
                 and isinstance(delta, dict)
                 and delta.get("type") == "input_json_delta"
             ):
-                fragment = str(delta.get("partial_json", ""))
-                self._hidden[upstream_index][1].append(fragment)
-                self._retained += len(fragment.encode("utf-8"))
+                self._hidden[upstream_index][1].append(str(delta.get("partial_json", "")))
+                # The frame's size bounds the fragment's, and needs no
+                # re-encoding (a lone surrogate cannot be encoded).
+                self._hidden_bytes[upstream_index] += len(frame)
             elif event_name == "content_block_stop":
                 self._hidden_stopped.add(upstream_index)
             return None
