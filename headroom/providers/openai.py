@@ -17,7 +17,11 @@ from typing import Any, cast
 
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
-from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
+from headroom.tokenizers.base import (
+    TokenCountCache,
+    coerce_countable_text,
+    count_content_blocks,
+)
 
 from .base import Provider, TokenCounter
 
@@ -81,8 +85,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
     # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
-    # get_context_limit; these are the manual fallback for installs without it
-    # (the litellm dep is gated python_version < '3.14').
+    # get_context_limit; these are the manual fallback for installs without it.
     "gpt-4.1": 1_047_576,
     "gpt-4.1-mini": 1_047_576,
     "gpt-4.1-nano": 1_047_576,
@@ -110,9 +113,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o3-mini": 200000,
     "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
-    # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
-    # aliases). LiteLLM lookup is still attempted first in get_context_limit;
-    # these are the manual fallback when LiteLLM doesn't know the model.
+    # against api-docs.deepseek.com (V4.1-Flash / V4-Pro-0813) and LiteLLM
+    # model_cost (deprecated aliases). LiteLLM lookup is still attempted first in
+    # get_context_limit; these are the manual fallback when LiteLLM doesn't know
+    # the model.
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v3.2": 128_000,
@@ -200,6 +205,11 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
@@ -209,7 +219,10 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -223,6 +236,9 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
+
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
 
             openai_config = loaded.get("openai", {})
             if "context_limits" in openai_config:
@@ -239,7 +255,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -354,11 +370,26 @@ class OpenAITokenCounter:
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
         self._encoding = _get_encoding(encoding_name)
+        # count_text is a pure function of its text, and this counter is a
+        # per-model singleton reused across requests (OpenAIProvider caches it),
+        # so a stable prefix/system prompt or a repeated tool result is otherwise
+        # re-encoded on every turn. Cache the count like AnthropicTokenCounter
+        # already does (the cache only admits large strings, so tiny/rare ones
+        # pay nothing).
+        self._count_cache = TokenCountCache()
 
     def count_text(self, text: str) -> int:
         """Count tokens in text."""
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self._encoding.encode(text))
         except ValueError:
@@ -694,8 +725,7 @@ class OpenAIProvider(Provider):
 
         The table used to be authoritative, which is how it went ~18 months stale
         and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
-        a fallback means that drift only reaches installs with no LiteLLM — the
-        dependency is gated ``python_version < '3.14'``.
+        a fallback means that drift only reaches installs with no LiteLLM.
         """
         # 1. Explicit configuration wins.
         override = self._pricing_overrides.get(model)

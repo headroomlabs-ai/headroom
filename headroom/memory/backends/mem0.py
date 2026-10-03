@@ -12,6 +12,7 @@ Supports both local mode (embedded services) and cloud mode (Mem0 API).
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -57,7 +58,7 @@ class Mem0Config:
     # Local mode settings - Neo4j and Qdrant config
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
     # Qdrant settings (defaults resolve from HEADROOM_QDRANT_* env vars)
     qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
     qdrant_host: str = field(default_factory=qdrant_env.qdrant_env_host)

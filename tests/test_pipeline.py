@@ -51,7 +51,11 @@ def test_discover_pipeline_extensions_handles_load_and_init_failures(
         ),
     )
 
-    discovered = discover_pipeline_extensions()
+    # Discovery is opt-in since the contract gained ``body`` (it can now
+    # rewrite max_tokens/effort on live traffic), so name the extensions
+    # explicitly. What this test covers is unchanged: a bad load and a bad
+    # __init__ are isolated, and the healthy two still come through.
+    discovered = discover_pipeline_extensions(["*"])
     assert len(discovered) == 2
     assert all(callable(getattr(ext, "on_pipeline_event", None)) for ext in discovered)
 

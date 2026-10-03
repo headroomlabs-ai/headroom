@@ -108,13 +108,30 @@ def _headers() -> dict[str, str]:
 
 
 @pytest.mark.parametrize(
-    ("with_thinking", "expect_plain_streaming"),
-    [(True, True), (False, False)],
+    ("with_thinking", "relaxation_enabled", "expect_plain_streaming"),
+    [
+        # Locked (kill switch engaged): the flip cannot reach upstream, so
+        # buffering would ask for a stream and then parse it as JSON, stranding
+        # the client with an unreadable 200. This is #2952 exactly.
+        (True, False, True),
+        # Relaxed (default): no transform touched the thinking block, so the
+        # flip DOES land and buffered retrieval becomes the coherent choice --
+        # the outcome #2952 wanted before the blanket lock made it unreachable.
+        (True, True, False),
+        # No thinking block: unaffected in either regime.
+        (False, True, False),
+        (False, False, False),
+    ],
 )
 def test_signed_thinking_history_skips_the_buffered_ccr_path(
-    with_thinking: bool, expect_plain_streaming: bool, ccr_marker: str
+    with_thinking: bool,
+    relaxation_enabled: bool,
+    expect_plain_streaming: bool,
+    ccr_marker: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The buffered path is only chosen when the stream:false flip can land."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1" if relaxation_enabled else "0")
     calls: dict[str, object] = {}
 
     async def fake_stream_response(url, headers, body, *args, **kwargs):  # noqa: ANN001
@@ -297,6 +314,7 @@ def test_cache_hit_never_replays_a_foreign_content_type() -> None:
         key = proxy.cache._compute_key(
             body["messages"],
             body["model"],
+            upstream_base_url=None,
             system=None,
             tools=None,
             tool_choice=None,

@@ -38,6 +38,13 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
+
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the reserved override used by the end-to-end isolation test."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "override.example")
+
+
 # ---------------------------------------------------------------------------
 # Pure helper unit tests
 # ---------------------------------------------------------------------------
@@ -169,6 +176,35 @@ def test_strip_preserves_value_semantics() -> None:
     )
     assert out["Authorization"] == "Bearer sk-ant-..."
     assert out["anthropic-version"] == "2023-06-01"
+
+
+def test_strip_default_tenant_header_removed() -> None:
+    """Tenant header is ingress-only and must not reach providers."""
+    out = _strip_internal_headers(
+        {
+            "Authorization": "Bearer sk-ant-...",
+            "X-Headroom-Tenant-ID": "tenant_a",
+        }
+    )
+
+    assert "X-Headroom-Tenant-ID" not in out
+    assert out["Authorization"] == "Bearer sk-ant-..."
+
+
+def test_strip_custom_tenant_header_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured tenant header is also stripped, even outside x-headroom-*."""
+    monkeypatch.setenv("HEADROOM_TENANT_KEY_HEADER", "X-Tenant-ID")
+
+    out = _strip_internal_headers(
+        {
+            "Authorization": "Bearer sk-ant-...",
+            "X-Tenant-ID": "tenant_a",
+            "x-request-id": "rid-1",
+        }
+    )
+
+    assert "X-Tenant-ID" not in out
+    assert out["x-request-id"] == "rid-1"
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +661,9 @@ def test_anthropic_no_extra_headers_configured_is_unchanged() -> None:
 def test_merge_extra_headers_overrides_case_insensitively() -> None:
     """A configured extra header wins even when the client used different casing."""
     out = merge_extra_headers(
-        {"Authorization": "client", "keep": "v"}, {"authorization": "gateway"}
+        {"Authorization": "client", "keep": "v"},
+        {"authorization": "gateway"},
+        upstream_url=None,
     )
     assert out == {"authorization": "gateway", "keep": "v"}
     # Exactly one authorization header survives (no duplicate casings upstream).
@@ -635,4 +673,4 @@ def test_merge_extra_headers_overrides_case_insensitively() -> None:
 def test_merge_extra_headers_none_returns_same_object() -> None:
     """No configured extras -> caller's dict is returned unchanged (no copy)."""
     headers = {"a": "b"}
-    assert merge_extra_headers(headers, None) is headers
+    assert merge_extra_headers(headers, None, upstream_url=None) is headers

@@ -76,7 +76,7 @@ class TestAllSeenInstancesUnboundedGrowth:
         # Simulate adding users via record_compression
         # (the cap is enforced there, not when directly adding to set)
         pattern = ToolPattern(tool_signature_hash=sig.structure_hash)
-        toin._patterns[("unknown", "unknown", sig.structure_hash)] = pattern
+        toin._patterns[("global", "unknown", "unknown", sig.structure_hash)] = pattern
 
         # Direct manipulation should still work for testing
         for i in range(200):
@@ -101,7 +101,7 @@ class TestAllSeenInstancesUnboundedGrowth:
         # Record compressions from 150 "users" (simulated)
         # by directly manipulating the pattern
         pattern = ToolPattern(tool_signature_hash=sig.structure_hash)
-        toin._patterns[("unknown", "unknown", sig.structure_hash)] = pattern
+        toin._patterns[("global", "unknown", "unknown", sig.structure_hash)] = pattern
 
         # Track 150 unique users
         for i in range(150):
@@ -183,7 +183,7 @@ class TestAllSeenInstancesSerialization:
             )
 
             # Manually add more users to simulate multi-user scenario
-            pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+            pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
             for i in range(50):
                 instance_hash = hashlib.sha256(f"extra_user_{i}".encode()).hexdigest()[:8]
                 if instance_hash not in pattern._all_seen_instances:
@@ -202,7 +202,7 @@ class TestAllSeenInstancesSerialization:
             toin2 = ToolIntelligenceNetwork(config)
 
             # Verify user count is preserved
-            pattern2 = toin2._patterns.get(("unknown", "unknown", sig.structure_hash))
+            pattern2 = toin2._patterns.get(("global", "unknown", "unknown", sig.structure_hash))
             assert pattern2 is not None
             assert pattern2.user_count == original_user_count
 
@@ -252,7 +252,7 @@ class TestUserCountMergeLogic:
         imported.sample_size = 5
 
         # Merge
-        toin._patterns[("unknown", "unknown", "test_hash")] = existing
+        toin._patterns[("global", "unknown", "unknown", "test_hash")] = existing
         toin._merge_patterns(existing, imported)
 
         # After merge: 5 existing + 2 new = 7 unique users
@@ -287,7 +287,7 @@ class TestUserCountMergeLogic:
         imported.sample_size = 20
 
         # Merge
-        toin._patterns[("unknown", "unknown", "test_hash")] = existing
+        toin._patterns[("global", "unknown", "unknown", "test_hash")] = existing
         toin._merge_patterns(existing, imported)
 
         # After merge: 120 existing + 10 new = 130 unique users
@@ -728,7 +728,7 @@ class TestTOINHighPriorityFixes:
                 query_fields=[f"unique_field_{i}"],
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert len(pattern.field_retrieval_frequency) <= 100
 
     def test_commonly_retrieved_fields_bounded(self):
@@ -757,7 +757,7 @@ class TestTOINHighPriorityFixes:
                     query_fields=[f"common_field_{i}"],
                 )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert len(pattern.commonly_retrieved_fields) <= 20
 
     def test_strategy_success_rate_updates(self):
@@ -778,7 +778,7 @@ class TestTOINHighPriorityFixes:
             strategy="TEST_STRATEGY",
         )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         initial_rate = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert initial_rate == 1.0  # Starts at 1.0
 
@@ -790,7 +790,7 @@ class TestTOINHighPriorityFixes:
             strategy="TEST_STRATEGY",
         )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         after_retrieval = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert after_retrieval < initial_rate  # Should decrease
 
@@ -805,7 +805,7 @@ class TestTOINHighPriorityFixes:
                 strategy="TEST_STRATEGY",
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         after_compressions = pattern.strategy_success_rates["TEST_STRATEGY"]
         assert after_compressions > after_retrieval  # Should increase
 
