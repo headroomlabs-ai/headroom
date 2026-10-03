@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
+import time
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -1415,3 +1417,111 @@ def test_openai_responses_adapter_compresses_historical_messages_not_current_use
     assert new_payload["input"][2]["content"][0]["text"] == current_text
     assert units_by_category == {"applied": 2}
     assert any(t.startswith("router:openai:responses:message:") for t in transforms)
+
+
+class _RecordingKompress:
+    """Stands in for KompressCompressor, recording the deadline origin it gets."""
+
+    shares_request_deadline = True
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.deadlines: list[float | None] = []
+
+    def is_ready(self) -> bool:
+        return True
+
+    def compress(self, content: str, **kwargs):
+        self.deadlines.append(kwargs.get("_deadline_started_at"))
+        time.sleep(self.delay)
+        compressed = " ".join(content.split()[:20])
+        return SimpleNamespace(compressed=compressed, compressed_tokens=20)
+
+
+def _kompress_payload(units: int) -> dict:
+    return {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"call_{i}",
+                "output": "\n".join(
+                    " ".join(f"unit{i}line{line}word{j}" for j in range(10)) for line in range(70)
+                ),
+            }
+            for i in range(units)
+        ],
+    }
+
+
+def _compress_through_executor(router: ContentRouter, payload: dict) -> tuple:
+    handler = _handler_with_router(router)
+
+    async def _run_compression(fn, *, timeout):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_in_executor = _run_compression
+    return asyncio.run(
+        handler._compress_openai_responses_payload_in_executor(
+            payload, model="gpt-5", request_id="req_deadline"
+        )
+    )
+
+
+def test_openai_responses_units_share_one_kompress_deadline(monkeypatch):
+    """The fan-out must draw down ONE request deadline (#3693), pool threads too.
+
+    Each unit is its own ContentRouter.compress call, and Kompress started a
+    fresh HEADROOM_COMPRESSION_DEADLINE_MS clock in every one, so a request
+    that blew its timeout kept running inference for minutes afterwards.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
+    router = ContentRouter()
+    kompress = _RecordingKompress()
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+
+    _compress_through_executor(router, _kompress_payload(6))
+
+    assert len(kompress.deadlines) >= 6, kompress.deadlines
+    assert None not in kompress.deadlines, kompress.deadlines
+    assert len(set(kompress.deadlines)) == 1, kompress.deadlines
+
+
+def test_openai_responses_units_after_the_deadline_pass_through_unchanged(monkeypatch):
+    """Finished units are kept; units not started by the deadline are not started."""
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "1")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "200")
+    router = ContentRouter()
+    kompress = _RecordingKompress(delay=0.3)
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+    payload = _kompress_payload(4)
+    original = json.loads(json.dumps(payload))
+
+    result = _compress_through_executor(router, payload)
+
+    assert len(kompress.deadlines) == 1
+    outputs = [item["output"] for item in result[0]["input"]]
+    assert outputs[0] != original["input"][0]["output"]
+    assert outputs[1:] == [item["output"] for item in original["input"][1:]]
+    assert result[2] > 0
+
+
+@pytest.mark.parametrize(
+    ("deadline_ms", "timeout", "budget"),
+    [("20000", 30.0, 20.0), ("20000", 5.0, 3.75), ("0", 30.0, None)],
+    ids=["deadline-binds", "timeout-binds", "disabled"],
+)
+def test_openai_responses_deadline_budget_stays_inside_the_timeout(
+    monkeypatch, deadline_ms, timeout, budget
+):
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", deadline_ms)
+    before = time.perf_counter()
+    origin = openai_handler._openai_responses_deadline_started_at(timeout)
+    after = time.perf_counter()
+
+    if budget is None:
+        assert origin is None
+        return
+    expires_at = origin + int(deadline_ms) / 1000
+    assert before + budget <= expires_at <= after + budget

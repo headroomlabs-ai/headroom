@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
 import hmac
@@ -642,6 +643,31 @@ def _openai_responses_unit_parallelism() -> int:
         )
         return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
     return max(1, min(_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX, requested))
+
+
+def _openai_responses_deadline_started_at(timeout: float) -> float | None:
+    """Deadline origin shared by every compress call of one Responses request.
+
+    A Responses request fans out over many ``ContentRouter.compress`` calls,
+    and Kompress starts a fresh ``HEADROOM_COMPRESSION_DEADLINE_MS`` clock in
+    each one unless it is handed an origin. Without one, a request past its
+    ``timeout`` keeps running inference long after the awaiter gave up, and
+    that timeout debt quarantines compression for every request behind it.
+    Stamped before the job is queued, because ``timeout`` counts queue wait
+    too. ``None`` when the deadline is disabled (``0``).
+
+    The budget is also capped at 75% of ``timeout``: the deadline only stops
+    the NEXT Kompress chunk, so the chunk already running when it expires, the
+    splice and the output serialization need the rest. Kompress checks
+    ``now - origin > deadline``, so a shorter budget is a backdated origin.
+    """
+    from headroom.transforms.content_router import _compression_deadline_seconds
+
+    deadline_s = _compression_deadline_seconds()
+    if deadline_s <= 0:
+        return None
+    budget_s = min(deadline_s, 0.75 * timeout)
+    return time.perf_counter() - (deadline_s - budget_s)
 
 
 def _openai_responses_unit_executor() -> ThreadPoolExecutor:
@@ -2110,6 +2136,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
+        deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2700,6 +2727,7 @@ class OpenAIHandlerMixin:
                 router=router,
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
+                deadline_started_at=deadline_started_at,
             )
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
@@ -2769,12 +2797,18 @@ class OpenAIHandlerMixin:
                     0.0,
                 )
 
+        # Each pool task runs in its own copy of this Context: the router binds
+        # the request's deadline per task (see share_request_deadline), and
+        # pool threads would otherwise keep that binding between requests.
         parallelism = _openai_responses_unit_parallelism()
         if len(cache_misses) > 1 and parallelism > 1:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(cache_misses), parallelism):
                 batch = cache_misses[start : start + parallelism]
-                futures = [executor.submit(_compress_and_store, *item) for item in batch]
+                futures = [
+                    executor.submit(contextvars.copy_context().run, _compress_and_store, *item)
+                    for item in batch
+                ]
                 for future in as_completed(futures):
                     unit_idx, cache_key, routed_result = future.result()
                     _record_routed_result(unit_idx, cache_key, routed_result)
@@ -2799,6 +2833,7 @@ class OpenAIHandlerMixin:
                 router=router,
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
+                deadline_started_at=deadline_started_at,
             )
             return results, (time.perf_counter() - batch_started) * 1000.0
 
@@ -2812,7 +2847,10 @@ class OpenAIHandlerMixin:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(small_batches), parallelism):
                 batch_group = small_batches[start : start + parallelism]
-                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
+                futures = [
+                    executor.submit(contextvars.copy_context().run, _compress_batch, batch)
+                    for batch in batch_group
+                ]
                 for future in as_completed(futures):
                     _record_batch_result(future.result())
         else:
@@ -3000,6 +3038,7 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
+        deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3267,6 +3306,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             pass_id=pass_id,
             timing=timing_sink,
+            deadline_started_at=deadline_started_at,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3414,6 +3454,8 @@ class OpenAIHandlerMixin:
                 exc_info=True,
             )
 
+        deadline_started_at = _openai_responses_deadline_started_at(timeout)
+
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
             # compression so the turn classifier sees the client's input as
@@ -3433,6 +3475,7 @@ class OpenAIHandlerMixin:
                 "request_id": request_id,
                 "timing": timing,
                 "client": client,
+                "deadline_started_at": deadline_started_at,
             }
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
@@ -3447,7 +3490,12 @@ class OpenAIHandlerMixin:
                     unsupported_kwarg = next(
                         (
                             name
-                            for name in ("savings_tags", "client", "timing")
+                            for name in (
+                                "savings_tags",
+                                "client",
+                                "timing",
+                                "deadline_started_at",
+                            )
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
                         ),
