@@ -81,7 +81,10 @@ class TestLaunch:
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"gatewayUrl": "https://api.eu-de.bob.ibm.com"}))
         output = self._invoke(monkeypatch, expect_exit=1)
-        assert "api.eu-de.bob.ibm.com" in output and str(settings) in output
+        # Exact ClickException text; a substring check on the URL reads to
+        # CodeQL as URL sanitization.
+        expected = bob_preflight({"BOB_GATEWAY_URL": "http://127.0.0.1:8787"}, settings)
+        assert output.strip() == f"Error: {expected}"
 
 
 class TestBobPreflight:
@@ -111,7 +114,13 @@ class TestBobPreflight:
     def test_fails_on_foreign_gateway(self, tmp_path):
         path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})
         message = bob_preflight(self.ENV, path)
-        assert message and "https://api.eu-de.bob.ibm.com" in message and str(path) in message
+        assert message == (
+            "Bob's saved gatewayUrl (https://api.eu-de.bob.ibm.com) overrides "
+            "BOB_GATEWAY_URL, so Bob would bypass the Headroom proxy. Remove the "
+            f"gatewayUrl entry from {path} (or set it to the proxy URL shown by this "
+            "wrap) and retry. If your organisation enforces a GatewayUrl policy, Bob "
+            "cannot be wrapped."
+        )
 
 
 class TestOriginPassthrough:
