@@ -2,6 +2,7 @@
 
 Usage:
     headroom wrap claude                    # Start proxy + claude
+    headroom wrap pi                        # Start proxy + Pi coding agent
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap vscode                    # Transparently proxy VS Code Copilot
     headroom wrap vscode-claude             # Transparently proxy VS Code Claude Code
@@ -31,6 +32,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, MutableMapping
@@ -193,6 +195,15 @@ from headroom.providers.opencode.config import (
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
+from headroom.providers.pi import (
+    gemini_proxy_base_url as _pi_gemini_proxy_base_url,
+)
+from headroom.providers.pi import (
+    vertex_proxy_base_url as _pi_vertex_proxy_base_url,
+)
+from headroom.providers.pi import (
+    write_proxy_extension as _write_pi_proxy_extension,
+)
 from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
 from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
 from headroom.providers.zcode import (
@@ -312,7 +323,15 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+    "opencode",
+    "pi",
+}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -328,7 +347,7 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
+_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "pi"}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -5542,6 +5561,7 @@ def wrap(ctx: click.Context) -> None:
     \b
     Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
+        headroom wrap pi                  # Pi coding agent
         headroom wrap codex               # OpenAI Codex CLI
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap vscode             # VS Code Copilot (preserves model picker)
@@ -6266,6 +6286,118 @@ def unwrap_claude(
             "  Claude local wrap settings were removed, but effective routing residue remains."
         )
     click.echo()
+
+
+# =============================================================================
+# Pi coding agent
+# =============================================================================
+
+
+@wrap.command("pi", context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
+def pi(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    pi_args: tuple,
+) -> None:
+    """Launch Pi through Headroom proxy.
+
+    \b
+    Pi does not read ANTHROPIC_BASE_URL or OPENAI_BASE_URL directly. This
+    wrapper creates a temporary Pi extension and launches Pi with ``-e`` so
+    the extension can register provider overrides for Pi's built-in Anthropic,
+    Google Gemini/Vertex, OpenAI, and OpenAI Codex providers. The user's normal
+    Pi auth and model selection keep working; only the provider base URLs are
+    pointed at the local Headroom proxy for the wrapped process.
+
+    \b
+    Examples:
+        headroom wrap pi                         # Start proxy + Pi
+        headroom wrap pi -- -p "explain this"    # Pass args to pi
+    """
+    if prepare_only:
+        return
+
+    pi_bin = shutil.which("pi")
+    if not pi_bin:
+        click.echo("Error: 'pi' not found in PATH.")
+        click.echo("Install Pi: npm install -g --ignore-scripts @earendil-works/pi-coding-agent")
+        raise SystemExit(1)
+
+    env = os.environ.copy()
+    with tempfile.TemporaryDirectory(prefix="headroom-pi-") as extension_dir:
+        extension_path = _write_pi_proxy_extension(
+            Path(extension_dir),
+            port,
+            project=_project_name_from_cwd(),
+            project_header=_PROJECT_HEADER_NAME,
+        )
+        launch_args = ("-e", str(extension_path), *pi_args)
+        env_vars_display = [
+            f"Pi extension={extension_path}",
+            f"Anthropic base URL={_claude_proxy_base_url(port)}",
+            f"Google/Gemini base URL={_pi_gemini_proxy_base_url(port)}",
+            f"Google Vertex base URL={_pi_vertex_proxy_base_url(port)}",
+            f"OpenAI/OpenAI Codex base URL=http://127.0.0.1:{port}/v1",
+        ]
+
+        def configure_pi_launch(
+            actual_port: int,
+            _args: tuple,
+            launch_env: dict[str, str],
+            _display: list[str],
+        ) -> tuple[tuple, dict[str, str], list[str]]:
+            actual_extension = _write_pi_proxy_extension(
+                Path(extension_dir),
+                actual_port,
+                project=_project_name_from_cwd(),
+                project_header=_PROJECT_HEADER_NAME,
+            )
+            actual_args = ("-e", str(actual_extension), *pi_args)
+            actual_display = [
+                f"Pi extension={actual_extension}",
+                f"Anthropic base URL={_claude_proxy_base_url(actual_port)}",
+                f"Google/Gemini base URL={_pi_gemini_proxy_base_url(actual_port)}",
+                f"Google Vertex base URL={_pi_vertex_proxy_base_url(actual_port)}",
+                f"OpenAI/OpenAI Codex base URL=http://127.0.0.1:{actual_port}/v1",
+            ]
+            return actual_args, launch_env, actual_display
+
+        _launch_tool(
+            binary=pi_bin,
+            args=launch_args,
+            env=env,
+            port=port,
+            no_proxy=no_proxy,
+            tool_label="PI",
+            env_vars_display=env_vars_display,
+            learn=learn,
+            memory=memory,
+            agent_type="pi",
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            configure_launch=configure_pi_launch,
+        )
 
 
 # =============================================================================
