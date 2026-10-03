@@ -1,6 +1,6 @@
 """Async HTTP client for Anthropic's OAuth usage API.
 
-Endpoint: GET https://api.anthropic.com/api/oauth/usage
+Endpoint: provider-owned Anthropic OAuth usage endpoint
 Required header: anthropic-beta: oauth-2025-04-20
 Auth: Authorization: Bearer <oauth_access_token>
 
@@ -21,12 +21,16 @@ from typing import Any
 
 import httpx
 
+from headroom.providers.anthropic_subscription import (
+    ANTHROPIC_OAUTH_USAGE_BETA_HEADER,
+    ANTHROPIC_OAUTH_USAGE_URL,
+)
 from headroom.subscription.models import SubscriptionSnapshot
 
 logger = logging.getLogger(__name__)
 
-_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-_BETA_HEADER = "oauth-2025-04-20"
+_USAGE_URL = ANTHROPIC_OAUTH_USAGE_URL
+_BETA_HEADER = ANTHROPIC_OAUTH_USAGE_BETA_HEADER
 _TOKEN_EXPIRY_BUFFER_S = 60
 
 

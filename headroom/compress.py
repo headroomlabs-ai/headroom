@@ -46,9 +46,10 @@ Examples:
     # With any HTTP client
     import httpx
     from headroom import compress
+    from headroom.providers.anthropic_subscription import ANTHROPIC_MESSAGES_URL
 
     compressed = compress(messages, model="claude-sonnet-4-5-20250929")
-    httpx.post("https://api.anthropic.com/v1/messages", json={
+    httpx.post(ANTHROPIC_MESSAGES_URL, json={
         "model": "claude-sonnet-4-5-20250929",
         "messages": compressed.messages,
     })

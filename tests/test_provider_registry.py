@@ -9,6 +9,7 @@ from headroom.providers.registry import (
     build_proxy_provider_runtime,
     create_proxy_backend,
     format_backend_status,
+    format_backend_usage_section,
     resolve_api_overrides,
     resolve_api_targets,
     resolve_extra_headers,
@@ -36,6 +37,20 @@ def test_resolve_api_overrides_prefers_explicit_values_over_environment(monkeypa
         cloudcode=None,
         vertex="https://cli-vertex-aiplatform.example/v1",
     )
+
+
+def test_resolve_api_overrides_respects_explicit_empty_environment(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://ambient.example/v1")
+
+    overrides = resolve_api_overrides(
+        anthropic_api_url=None,
+        openai_api_url=None,
+        gemini_api_url=None,
+        cloudcode_api_url=None,
+        environ={},
+    )
+
+    assert overrides.openai is None
 
 
 def test_resolve_api_targets_normalizes_trailing_v1() -> None:
@@ -143,6 +158,15 @@ def test_format_backend_status_for_anthropic_direct() -> None:
         )
         == "ANTHROPIC (direct API)"
     )
+
+
+def test_format_backend_usage_section_for_direct_and_anyllm() -> None:
+    assert format_backend_usage_section(backend="anthropic", host="127.0.0.1", port=8787) == ""
+
+    anyllm = format_backend_usage_section(backend="anyllm", host="127.0.0.1", port=8787)
+
+    assert "Set credentials for your provider" in anyllm
+    assert "any-llm/providers" in anyllm
 
 
 def test_proxy_provider_runtime_routes_model_metadata_and_passthrough() -> None:
@@ -476,6 +500,12 @@ def test_resolve_extra_headers_cli_wins_over_env(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_TARGET_API_HEADERS", '{"Env-Header": "env-value"}')
     result = resolve_extra_headers('{"Cli-Header": "cli-value"}', "ANTHROPIC_TARGET_API_HEADERS")
     assert result == {"Cli-Header": "cli-value"}
+
+
+def test_resolve_extra_headers_respects_explicit_empty_environment(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_TARGET_API_HEADERS", '{"Ambient": "value"}')
+
+    assert resolve_extra_headers(None, "ANTHROPIC_TARGET_API_HEADERS", environ={}) is None
 
 
 def test_resolve_extra_headers_falls_back_to_env(monkeypatch) -> None:
