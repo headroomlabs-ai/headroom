@@ -29,11 +29,18 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
+from headroom.cache.prefix_tracker import PrefixCacheTracker, PrefixFreezeConfig
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
+from headroom.proxy.anthropic_threads import (
+    is_thread_continue,
+    restore_thread_pinned,
+    snapshot_thread_pinned,
+    thread_scope,
+)
 from headroom.proxy.anthropic_wire import (
     build_anthropic_upstream_url,
     is_safeguard_capable_request,
@@ -68,6 +75,12 @@ from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
+from headroom.tool_name_registry import (
+    lookup_thread_pinned,
+    record_thread_pinned,
+    thread_pinned_of,
+)
+from headroom.tool_name_registry import record_from_json as _record_tool_names_json
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
@@ -947,6 +960,10 @@ class AnthropicHandlerMixin:
         request.state.tenant_key = tenant_key
         request.state.tenant_key_source = tenant_key_source
         set_request_tenant_key(tenant_key)
+        # Thread pins and tool names are partitioned by tenant + credential + upstream.
+        _tool_scope = thread_scope(
+            request.headers, tenant_key, upstream_base_url or self.ANTHROPIC_API_URL
+        )
 
         # Unit 2: per-stage timings for the pre-upstream phase. The
         # finalizer emits one structured log line + Prometheus
@@ -1089,6 +1106,24 @@ class AnthropicHandlerMixin:
                         },
                     },
                 )
+            # Thread continue turns: system/tools are stored upstream and any
+            # change 400s. Remember them as received; restored before the send.
+            _thread_pinned = snapshot_thread_pinned(body)
+            # The stored thread holds system/tools exactly as the proxy forwarded them
+            # on the previous turn (shaped, sorted, schema-compacted), not as the
+            # client resends them. When that turn went through this proxy, pin THAT
+            # for each key the client carries (a key the client omits stays omitted).
+            _thread_recorded = None
+            if _thread_pinned is not None:
+                _thread_recorded = lookup_thread_pinned(
+                    _tool_scope, body["thread"].get("previous_message_id")
+                )
+                if _thread_recorded is not None:
+                    for _k in list(_thread_pinned):
+                        if _k in _thread_recorded:
+                            _thread_pinned[_k] = _thread_recorded[_k]
+                        else:
+                            del _thread_pinned[_k]
             # This is a boolean capability classification only.  The
             # safeguards value itself is never copied into logs, metrics, or
             # any Headroom-owned state.
@@ -1388,6 +1423,9 @@ class AnthropicHandlerMixin:
                 "stop": body.get("stop_sequences"),
                 "thinking": body.get("thinking"),
                 "output_config": body.get("output_config"),
+                # Thread continue bodies are tiny deltas; without the thread
+                # two conversations sending the same delta would share a key.
+                "thread": body.get("thread"),
             }
             # Snapshot the lookup messages too. `messages` is the primary cache
             # key component, but it is reassigned below by the security scan, the
@@ -1612,12 +1650,19 @@ class AnthropicHandlerMixin:
             # fallback id — on one shared tracker their interleaved histories
             # thrash the frozen-prefix state and the provider prompt cache is
             # re-written on nearly every call.
-            prefix_tracker = self.session_tracker_store.resolve_tracker(
-                session_id,
-                "anthropic",
-                messages=session_messages,
-                cache_affinity=cache_affinity,
-            )
+            if is_thread_continue(body):
+                # A continue delta can never prefix-match a real lineage, and
+                # recording it would poison the content-keyed store (another
+                # conversation's small request matched it and froze fresh
+                # tokens). Use a throwaway tracker that is never stored.
+                prefix_tracker = PrefixCacheTracker("anthropic", PrefixFreezeConfig())
+            else:
+                prefix_tracker = self.session_tracker_store.resolve_tracker(
+                    session_id,
+                    "anthropic",
+                    messages=session_messages,
+                    cache_affinity=cache_affinity,
+                )
             # Snapshot lineage state once.  Reusing the same pair for delta
             # extraction, byte-stable replay, and breakpoint placement keeps
             # all three decisions tied to one previous request (and avoids
@@ -1641,6 +1686,10 @@ class AnthropicHandlerMixin:
                     original_client_messages,
                     frozen_message_count,
                 )
+            if is_thread_continue(body):
+                # The delta is never resent, so nothing in it is a client-visible
+                # cache prefix; freezing it would block compressing fresh output.
+                frozen_message_count = 0
             # Cold-prefix cache-miss hook (HEADROOM_COLD_RECOMPACT). Claude's thinking is
             # an encrypted handle we can't shrink, so when the prompt cache has lapsed
             # (idle past TTL → dead, nothing to bust) we instead recompact the whole
@@ -1893,6 +1942,8 @@ class AnthropicHandlerMixin:
                                     model_limit=context_limit,
                                     context=extract_user_query(working_messages),
                                     frozen_message_count=frozen_message_count,
+                                    thread_continue=is_thread_continue(body),
+                                    tool_scope=_tool_scope,
                                     prefix_replay_guaranteed=True,
                                     idle_seconds=idle_seconds,
                                     biases=biases,
@@ -1940,6 +1991,8 @@ class AnthropicHandlerMixin:
                                             model_limit=context_limit,
                                             context=extract_user_query(working_messages),
                                             frozen_message_count=frozen_message_count,
+                                            thread_continue=is_thread_continue(body),
+                                            tool_scope=_tool_scope,
                                             prefix_replay_guaranteed=True,
                                             idle_seconds=idle_seconds,
                                             biases=biases,
@@ -1993,6 +2046,8 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(working_messages),
                                         frozen_message_count=frozen_message_count,
+                                        thread_continue=is_thread_continue(body),
+                                        tool_scope=_tool_scope,
                                         prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
@@ -2038,6 +2093,8 @@ class AnthropicHandlerMixin:
                                     model_limit=context_limit,
                                     context=extract_user_query(messages),
                                     frozen_message_count=frozen_message_count,
+                                    thread_continue=is_thread_continue(body),
+                                    tool_scope=_tool_scope,
                                     prefix_replay_guaranteed=True,
                                     biases=biases,
                                     protect=protect,
@@ -2101,6 +2158,8 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(messages),
                                         frozen_message_count=frozen_message_count,
+                                        thread_continue=is_thread_continue(body),
+                                        tool_scope=_tool_scope,
                                         prefix_replay_guaranteed=True,
                                         biases=biases,
                                         protect=protect,
@@ -2174,6 +2233,8 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(compression_input),
                                         frozen_message_count=prefix_n,
+                                        thread_continue=is_thread_continue(body),
+                                        tool_scope=_tool_scope,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         protect=protect,
@@ -2508,17 +2569,29 @@ class AnthropicHandlerMixin:
             # ``ccr_inject_system_instructions=False``, or when ``_bypass`` is
             # set. The downstream uses already treat falsy as "unresolved".
             ccr_workspace_key, ccr_workspace_label = None, None
+            # A Thread continue turn without tools must forward no tools: the API
+            # 400s on any change to the stored thread's tools, so skip all injection.
+            _thread_continue_turn = is_thread_continue(body)
+            _thread_no_tools = _thread_continue_turn and not body.get("tools")
+            # No recorded forwarded tools for the previous turn (e.g. proxy restart): the
+            # client's tools are restored and the sticky retrieve tool is kept only if
+            # the history already references it. The API's exact rule for a continue
+            # turn that resends tools is unmeasured.
+            _thread_keep_tools: list[dict[str, Any]] | None = None
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
                 inject_system_instructions = self.config.ccr_inject_system_instructions
-                if inject_system_instructions and frozen_message_count > 0:
+                if inject_system_instructions and _thread_continue_turn:
+                    # The API 400s on any change to the stored thread's system.
+                    inject_system_instructions = False
+                elif inject_system_instructions and frozen_message_count > 0:
                     logger.info(
                         f"[{request_id}] CCR: skipping system instruction injection "
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_system_instructions = False
-                configured_inject_tool = self.config.ccr_inject_tool
+                configured_inject_tool = self.config.ccr_inject_tool and not _thread_no_tools
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -2587,6 +2660,19 @@ class AnthropicHandlerMixin:
                         # would leave an unredeemable tool in the array.
                         allow_eager=not preserve_tool_order,
                     )
+                    if (
+                        ccr_tool_injected
+                        and _thread_continue_turn
+                        and _thread_recorded is None
+                        and history_references_ccr_tool(optimized_messages)
+                    ):
+                        from headroom.ccr.tool_injection import CCR_TOOL_NAME
+
+                        _thread_keep_tools = [
+                            t
+                            for t in (tools or [])
+                            if isinstance(t, dict) and t.get("name") == CCR_TOOL_NAME
+                        ]
                     if ccr_tool_injected:
                         logger.debug(
                             f"[{request_id}] CCR: tool registered (session={session_id}, "
@@ -2830,15 +2916,17 @@ class AnthropicHandlerMixin:
                     if self.memory_handler.config.inject_tools
                     else []
                 )
-                tools, mem_tools_injected = apply_session_sticky_memory_tools(
-                    provider="anthropic",
-                    session_id=session_id,
-                    request_id=request_id,
-                    existing_tools=tools,
-                    memory_tools_to_inject=memory_tool_defs,
-                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
-                    client_declared_tools=bool(_original_tools),
-                )
+                mem_tools_injected = False
+                if not _thread_no_tools:
+                    tools, mem_tools_injected = apply_session_sticky_memory_tools(
+                        provider="anthropic",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        memory_tools_to_inject=memory_tool_defs,
+                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                        client_declared_tools=bool(_original_tools),
+                    )
                 if mem_tools_injected:
                     memory_tools_injected = True
                     tool_names = [
@@ -3293,11 +3381,33 @@ class AnthropicHandlerMixin:
                 strip_unsupported_tool_search_references,
             )
 
+            # On a Thread continue turn the stored thread's tools are what upstream
+            # validates against, so put the snapshot back BEFORE the history repair
+            # reads body["tools"] (earlier schema compaction / deferral may have
+            # rewritten it). The discarded tool compaction must not be counted as
+            # savings either: drop its token fold and tags before the recount below.
+            if restore_thread_pinned(body, _thread_pinned, _thread_keep_tools):
+                tools = body.get("tools")
+                _tool_tokens_before = _tool_tokens_after = 0
+                if "anthropic:system_prompt_compaction" in transforms_applied:
+                    transforms_applied.remove("anthropic:system_prompt_compaction")
+                from headroom.proxy.tool_schema_savings_policy import TOOL_SCHEMA_SAVINGS_TAGS
+
+                for _savings_tag in TOOL_SCHEMA_SAVINGS_TAGS:
+                    tags.pop(_savings_tag, None)
+                logger.debug(
+                    "[%s] thread continue: restored system/tools rewritten by a transform",
+                    request_id,
+                )
+
             # The tools array is repaired first: it shrinks what a history
             # tool_reference can resolve against, so the block repair below has to
             # validate against the final view (same reason as the ORDERING note).
-            _ts_tools, _ts_refs_dropped = strip_unsupported_tool_search_references(
-                body.get("tools")
+            # Never on a continue turn: its tools are the stored, pinned ones.
+            _ts_tools, _ts_refs_dropped = (
+                (body.get("tools"), 0)
+                if _thread_continue_turn
+                else strip_unsupported_tool_search_references(body.get("tools"))
             )
             if _ts_refs_dropped:
                 body["tools"] = tools = _ts_tools
@@ -3310,8 +3420,13 @@ class AnthropicHandlerMixin:
                     _ts_refs_dropped,
                 )
 
-            _ts_repaired, _ts_stripped = strip_unsupported_tool_search_blocks(
-                body.get("messages"), body.get("tools")
+            # A tools-less Thread continue (_thread_no_tools) validates against the
+            # stored thread's tools, not this body: skip both history repairs there or
+            # valid tool_reference/retrieve blocks get stripped.
+            _ts_repaired, _ts_stripped = (
+                (body.get("messages"), 0)
+                if _thread_no_tools
+                else strip_unsupported_tool_search_blocks(body.get("messages"), body.get("tools"))
             )
             if _ts_stripped:
                 body["messages"] = _ts_repaired
@@ -3333,8 +3448,10 @@ class AnthropicHandlerMixin:
             # tool_use/tool_result references that Anthropic would reject.
             from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks
 
-            _ccr_repaired, _ccr_neutralized = strip_unsupported_ccr_retrieve_blocks(
-                body.get("messages"), body.get("tools")
+            _ccr_repaired, _ccr_neutralized = (
+                (body.get("messages"), 0)
+                if _thread_no_tools
+                else strip_unsupported_ccr_retrieve_blocks(body.get("messages"), body.get("tools"))
             )
             if _ccr_neutralized:
                 body["messages"] = _ccr_repaired
@@ -3513,6 +3630,12 @@ class AnthropicHandlerMixin:
                     "top-level system parameter (Anthropic wire-contract guard, issue #765)",
                     request_id,
                 )
+
+            # Thread continue: the last word on system/tools, after every mutation
+            # site and before the backend fork so Bedrock/translated sends are
+            # covered too. (Savings were already corrected at the earlier restore.)
+            if restore_thread_pinned(body, _thread_pinned, _thread_keep_tools):
+                tools = body.get("tools")
 
             # Byte-faithful forwarder support (PR-A3, fixes P0-2). At this
             # point body has been through every transform (image, compression,
@@ -3934,12 +4057,16 @@ class AnthropicHandlerMixin:
                     request_id=request_id,
                 )
                 if _ttl_stats["violation"]:
-                    if body.get("system") is not None:
-                        body["system"] = _ttl_system
+                    # On a Thread continue turn system/tools/cache_control are
+                    # stored upstream and must go out byte-identical: only the
+                    # delta messages may be repaired.
+                    if not is_thread_continue(body):
+                        if body.get("system") is not None:
+                            body["system"] = _ttl_system
+                        if body.get("tools") is not None:
+                            body["tools"] = _ttl_tools
+                        tools = _ttl_tools
                     body["messages"] = _ttl_messages
-                    if body.get("tools") is not None:
-                        body["tools"] = _ttl_tools
-                    tools = _ttl_tools
                     body_mutation_tracker.mark_mutated("cache_control_ttl_order")
 
                 # Signed thinking locks the request to the client's original
@@ -4060,6 +4187,7 @@ class AnthropicHandlerMixin:
                         memory_request_ctx=memory_request_ctx,
                         outcome_provider=provider_name,
                         session_key=session_key,
+                        thread_scope=_tool_scope,
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
@@ -4315,8 +4443,12 @@ class AnthropicHandlerMixin:
 
                         # Parse response for CCR handling
                         resp_json = None
+                        # system/tools of the LAST upstream call whose reply the client
+                        # receives (CCR/memory/hook continuations update this).
+                        _final_pinned = thread_pinned_of(body)
                         try:
                             resp_json = response.json()
+                            _record_tool_names_json(_tool_scope, resp_json)
                             if buffered_stream_ccr and response.status_code == 200 and resp_json:
                                 # Remember the upstream's own answer before any
                                 # post-processing touches it. Everything from here
@@ -4366,8 +4498,10 @@ class AnthropicHandlerMixin:
                                     **body,
                                     "messages": msgs,
                                 }
-                                if tls is not None:
+                                # A Thread continue turn must keep its pinned tools.
+                                if tls is not None and not is_thread_continue(body):
                                     continuation_body["tools"] = tls
+                                nonlocal _final_pinned
 
                                 # Use clean headers for continuation
                                 continuation_headers = {
@@ -4441,6 +4575,10 @@ class AnthropicHandlerMixin:
                                         )
                                     result: dict[str, Any] = cont_response.json()
                                     logger.info("CCR: Parsed JSON successfully")
+                                    # Only a continuation that succeeded and parsed
+                                    # produces the reply the client receives; a failed
+                                    # one leaves the original id and its own values.
+                                    _final_pinned = thread_pinned_of(continuation_body)
                                     return result
                                 except Exception as e:
                                     resp_headers: str | dict[str, str] = "N/A"
@@ -4587,7 +4725,8 @@ class AnthropicHandlerMixin:
 
                                     # Make continuation API call
                                     continuation_body = {**body, "messages": continuation_messages}
-                                    if tools:
+                                    # A Thread continue turn must keep its pinned tools.
+                                    if tools and not is_thread_continue(body):
                                         continuation_body["tools"] = tools
 
                                     cont_response = await self._retry_request(
@@ -4601,6 +4740,7 @@ class AnthropicHandlerMixin:
                                     # Update response with continuation
                                     resp_json = cont_response.json()
                                     response = cont_response
+                                    _final_pinned = thread_pinned_of(continuation_body)
                                     logger.info(
                                         f"[{request_id}] Memory: Tool calls handled, continuation complete"
                                     )
@@ -4651,6 +4791,16 @@ class AnthropicHandlerMixin:
                                         if key.lower() not in ("content-encoding", "content-length")
                                     },
                                 )
+
+                        # Record by the id the client actually receives, with the
+                        # system/tools of the call that produced it.
+                        if (
+                            _final_pinned is not None
+                            and resp_json
+                            and response.status_code == 200
+                            and isinstance(resp_json.get("id"), str)
+                        ):
+                            record_thread_pinned(_tool_scope, resp_json["id"], _final_pinned)
 
                         total_latency = (time.time() - start_time) * 1000
 

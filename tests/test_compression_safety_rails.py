@@ -103,6 +103,11 @@ class TestErrorOutputProtection:
     def test_tool_result_block_with_is_error_flag_protected(self, tokenizer: Tokenizer) -> None:
         router = ContentRouter()
         messages = _filler_messages() + [
+            # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
@@ -123,6 +128,11 @@ class TestErrorOutputProtection:
     def test_tool_result_block_with_error_indicators_protected(self, tokenizer: Tokenizer) -> None:
         router = ContentRouter()
         messages = _filler_messages() + [
+            # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
@@ -152,6 +162,11 @@ class TestErrorOutputProtection:
         """`"errors": []` JSON without `is_error` must not skip compression."""
         router = ContentRouter()
         messages = _filler_messages() + [
+            # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
@@ -172,6 +187,11 @@ class TestErrorOutputProtection:
         """The explicit `is_error` flag needs no indicator corroboration."""
         router = ContentRouter()
         messages = _filler_messages() + [
+            # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_4", "name": "Bash", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
@@ -203,6 +223,11 @@ class TestErrorOutputProtection:
         router = ContentRouter(config=config)
         messages = _filler_messages() + [
             {"role": "tool", "tool_call_id": "call_1", "content": _TRACEBACK},
+            # Naming tool_use: an unnamed tool_result is treated as an excluded tool.
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}],
+            },
             {
                 "role": "user",
                 "content": [
