@@ -529,6 +529,21 @@ class TestRetainedByteLimit:
         assert flt.hidden_calls() == []
         assert flt.closing_frames() == []
 
+    def test_inline_hidden_input_counts_against_the_limit(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=4096)
+        block = {**SAVE, "input": {"content": "z" * 20000}}
+        with pytest.raises(MemoryToolStreamOverflowError):
+            flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": block}))
+        assert not flt.hid_tool_calls
+
+    def test_hidden_input_is_counted_in_utf8_bytes(self) -> None:
+        flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=4096)
+        flt.feed(_frame({"type": "content_block_start", "index": 0, "content_block": SAVE}))
+        # 2,000 characters but 6,000 UTF-8 bytes.
+        fragment = {"type": "input_json_delta", "partial_json": "\u20ac" * 2000}
+        with pytest.raises(MemoryToolStreamOverflowError):
+            flt.feed(_frame({"type": "content_block_delta", "index": 0, "delta": fragment}))
+
     def test_frames_within_the_limit_pass(self) -> None:
         raw = _sse([TEXT, SAVE], "tool_use")
         flt = MemoryToolStreamFilter(MEMORY_TOOLS, max_retained_bytes=len(raw))

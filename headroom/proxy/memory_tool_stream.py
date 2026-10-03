@@ -103,7 +103,8 @@ class MemoryToolStreamFilter:
         self._max_retained_bytes = (
             DEFAULT_MAX_RETAINED_BYTES if max_retained_bytes is None else max_retained_bytes
         )
-        # Bytes held in _hidden fragments and _tail; _buffer is counted live.
+        # UTF-8 bytes held in _hidden (start frames and input fragments) and
+        # _tail; _buffer is counted live.
         self._retained = 0
         self._forward_message_start = forward_message_start
         self._buffer = bytearray()
@@ -223,6 +224,8 @@ class MemoryToolStreamFilter:
                 and block.get("name") in self._tool_names
             ):
                 self._hidden[upstream_index] = (block, [])
+                # The block may carry its whole input inline.
+                self._retained += len(frame)
                 return None
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 self.visible_tool_use = True
@@ -238,7 +241,7 @@ class MemoryToolStreamFilter:
             ):
                 fragment = str(delta.get("partial_json", ""))
                 self._hidden[upstream_index][1].append(fragment)
-                self._retained += len(fragment)
+                self._retained += len(fragment.encode("utf-8"))
             elif event_name == "content_block_stop":
                 self._hidden_stopped.add(upstream_index)
             return None
