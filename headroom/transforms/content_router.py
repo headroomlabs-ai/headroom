@@ -7035,6 +7035,8 @@ class ContentRouter(Transform):
             # guarantee that we never bust an explicit cache key.
             if "cache_control" in block and not (fresh_turn and block.get("type") == "tool_result"):
                 new_blocks.append(block)
+                if "router:protected:cache_control" not in transforms_applied:
+                    transforms_applied.append("router:protected:cache_control")
                 if route_counts is not None:
                     route_counts.setdefault("cache_control_protected", 0)
                     route_counts["cache_control_protected"] += 1
