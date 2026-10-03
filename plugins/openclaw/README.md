@@ -205,7 +205,8 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
 | `autoStart` | `false` | Opt-in auto-start for a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies). Keep `false` when systemd owns the proxy. |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
-| `requestTimeoutMs` | `30000` | Maximum milliseconds to wait for a single `compress()` call. If the proxy hangs or is slow, the call is cancelled after this deadline and the original uncompressed messages are used as a fallback. |
+| `requestTimeoutMs` | `2000` | Maximum milliseconds to wait for a single `compress()` call. The SDK aborts the request at this deadline and the original messages are used as a fallback. |
+| `minContextChars` | `800` | Skip proxy compression below this approximate 200-token context floor. Large single tool results still qualify; set to `0` to disable the gate. |
 | `circuitBreakerThreshold` | `3` | Number of consecutive `assemble()` errors before the circuit breaker opens and all requests bypass the proxy. Prevents cascading failures when the proxy is unhealthy. |
 | `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next request re-probes the proxy via `/health`. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
