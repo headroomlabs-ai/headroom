@@ -5,9 +5,11 @@ This module provides backend adapters for the memory system:
 - Mem0Backend: Graph + vector memory via Mem0 (Neo4j + Qdrant)
 - Mem0SystemAdapter: Adapter to use Mem0Backend with MemorySystem tools
 - DirectMem0Adapter: Optimized adapter that bypasses Mem0's LLM extraction
+- CogneeBackend: Knowledge-graph memory via cognee
 
-LocalBackend is always available. Mem0-based backends require optional
-dependencies and imports are deferred until the backend is actually used.
+LocalBackend is always available. Mem0-based and cognee backends require
+optional dependencies and imports are deferred until the backend is actually
+used.
 
 Performance comparison:
     Mem0SystemAdapter:   3-4 LLM calls per memory_save (Mem0 extracts internally)
@@ -24,11 +26,14 @@ _Mem0Config = None
 _Mem0SystemAdapter = None
 _DirectMem0Adapter = None
 _DirectMem0Config = None
+_CogneeBackend = None
+_CogneeConfig = None
 
 
 def __getattr__(name: str) -> type:
     """Lazy import for optional backends."""
     global _Mem0Backend, _Mem0Config, _Mem0SystemAdapter, _DirectMem0Adapter, _DirectMem0Config
+    global _CogneeBackend, _CogneeConfig
 
     if name == "Mem0Backend":
         if _Mem0Backend is None:
@@ -65,6 +70,20 @@ def __getattr__(name: str) -> type:
             _DirectMem0Config = DirectMem0Config
         return _DirectMem0Config
 
+    if name == "CogneeBackend":
+        if _CogneeBackend is None:
+            from headroom.memory.backends.cognee import CogneeBackend
+
+            _CogneeBackend = CogneeBackend
+        return _CogneeBackend
+
+    if name == "CogneeConfig":
+        if _CogneeConfig is None:
+            from headroom.memory.backends.cognee import CogneeConfig
+
+            _CogneeConfig = CogneeConfig
+        return _CogneeConfig
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -79,4 +98,7 @@ __all__ = [
     # Direct Mem0 adapter (optimized, bypasses LLM extraction)
     "DirectMem0Adapter",
     "DirectMem0Config",
+    # Cognee backend (optional dependency: pip install "headroom-ai[cognee]")
+    "CogneeBackend",
+    "CogneeConfig",
 ]
