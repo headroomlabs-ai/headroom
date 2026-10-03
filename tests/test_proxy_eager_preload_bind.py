@@ -141,8 +141,8 @@ async def test_startup_reports_deferred_kompress(caplog):
     proxy.openai_pipeline = _FakePipeline([])
 
     try:
-        # Proxy setup disables propagation on the ``headroom`` logger, so
-        # attach caplog's handler directly to the logger that emits this line.
+        # Attach caplog directly so unrelated propagation mutations cannot
+        # affect this assertion.
         server_mod.logger.addHandler(caplog.handler)
         try:
             with caplog.at_level(logging.INFO, logger=server_mod.logger.name):

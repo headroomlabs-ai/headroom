@@ -65,6 +65,10 @@ dependencies = [
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
     "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
+    # Verify upstream TLS through the OS trust store (macOS Keychain, Windows
+    # cert store), where IT installs corporate TLS-inspection roots (Zscaler,
+    # Netskope). Pure Python, no deps; the same library pip uses by default.
+    "truststore>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -231,10 +235,10 @@ agno = [
 strands = [
     "strands-agents>=0.1.0",
 ]
-# CrewAI agent framework integration
-crewai = [
-    "crewai>=1.15.21",
-]
+# CrewAI: no extra on purpose. The integration only wraps CrewAI tools, so it
+# uses whatever CrewAI the user already has (`pip install headroom-ai crewai`).
+# An extra here would put CrewAI's own dependency tree (including chromadb,
+# which has unpatched server-side CVEs) into our lockfile and security alerts.
 # AutoGen agent framework integration
 autogen = [
     "autogen-agentchat>=0.7",
@@ -528,6 +532,7 @@ markers = [
     "real_llm: tests that hit real LLM APIs; skipped unless explicitly enabled",
     "live: opt-in multi-turn tests that hit real upstream APIs; require provider keys",
     "proxy_dependency_gate: exercises ensure_proxy_dependencies() without mocking",
+    "windows_newline: newline-contract tests (#3698); also run on windows-latest in CI",
 ]
 
 [tool.coverage.run]
