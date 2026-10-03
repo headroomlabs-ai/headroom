@@ -338,7 +338,7 @@ with a privileged job.
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
 | `HEADROOM_LICENSE` | unset | Licence token, read by core and every licensed extension. `HEADROOM_LICENSE_KEY` is a deprecated alias for one release and logs a warning. A licence on its own sends nothing to Headroom. |

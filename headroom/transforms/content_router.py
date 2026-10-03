@@ -3494,6 +3494,12 @@ class ContentRouter(Transform):
                 type(out).__name__,
             )
             return None
+        # A passthrough (``compressed=False``) is the compressor declining this
+        # block, not a result; fall back so the built-in path still gets its
+        # turn instead of the block going out uncompressed.
+        if not out.compressed:
+            logger.debug("external compressor %r passed through; falling back to built-in", name)
+            return None
         compressed = out.content
         # Never blank out a non-empty block (an empty user/tool block makes
         # providers reject the request); fall back so the built-in path runs.
@@ -5500,7 +5506,7 @@ class ContentRouter(Transform):
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
         )
-        min_tokens = kwargs.get("min_tokens_to_compress", 50)
+        min_tokens = int(kwargs.get("min_tokens_to_compress", 50) or 50)
         # Cache-safety knobs for content-block (Anthropic-format) handling:
         compress_assistant_text_blocks = kwargs.get(
             "compress_assistant_text_blocks",
