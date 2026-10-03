@@ -795,6 +795,8 @@ class TestCallCliLlm:
             "--tools",
             "",
             "--strict-mcp-config",
+            "--settings",
+            '{"disableAllHooks":true}',
         ]
 
     def test_claude_cli_progress_callback_is_throttled(self):

@@ -67,6 +67,11 @@ _MIN_DIGEST_TOKENS = 10_000
 # verify things keeps streaming, so the idle cap never fires and the run dies
 # at the hard cap with nothing written. Both flags are needed: --tools "" alone
 # leaves the MCP servers' tools.
+# --settings '{"disableAllHooks":true}' turns off hooks from settings and
+# plugins alike. A blocking Stop hook otherwise forces a second turn whose reply
+# replaces the analysis as the final result, so learn finds no rules and reports
+# "No actionable patterns found" with no error. The user's own settings still
+# load (env routing, auth), which --bare would not do: it skips OAuth.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     (
         "claude",
@@ -81,6 +86,8 @@ _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
             "--tools",
             "",
             "--strict-mcp-config",
+            "--settings",
+            '{"disableAllHooks":true}',
         ],
     ),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
