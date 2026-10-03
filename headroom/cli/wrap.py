@@ -8892,6 +8892,8 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             os.environ,
             project=_project_name_from_cwd() if target.project_prefix else None,
         )
+        if target.preflight is not None and (problem := target.preflight(env)):
+            raise click.ClickException(problem)
 
         _launch_tool(
             binary=tool_bin,

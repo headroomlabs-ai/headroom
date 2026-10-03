@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -13,6 +14,7 @@ from headroom.cli.wrap import _warn_proxy_mode_mismatch, wrap
 from headroom.providers.route_specs import OPENAI_HANDLER_ROUTES
 from headroom.providers.wrap_registry import (
     WRAP_TARGETS,
+    bob_preflight,
     build_launch_env,
     resolve_origin_passthrough_url,
     strip_origin_passthrough_response_keys,
@@ -35,8 +37,13 @@ def test_inference_chat_route_reaches_openai_handler():
 
 
 class TestLaunch:
+    @pytest.fixture(autouse=True)
+    def _isolated_bob_home(self, monkeypatch, tmp_path):
+        # The preflight reads ~/.bob/settings/settings.json; never the developer's.
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
     @staticmethod
-    def _invoke(monkeypatch) -> dict:
+    def _invoke(monkeypatch, expect_exit: int = 0):
         monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
         captured: dict = {}
 
@@ -45,8 +52,8 @@ class TestLaunch:
 
         monkeypatch.setattr(wrap_mod, "_launch_tool", fake_launch_tool)
         result = CliRunner().invoke(wrap, ["bob", "--", "run", "fix it"])
-        assert result.exit_code == 0, result.output
-        return captured
+        assert result.exit_code == expect_exit, result.output
+        return captured if expect_exit == 0 else result.output
 
     def test_hands_proxy_the_inference_upstream(self, monkeypatch):
         monkeypatch.delenv("HEADROOM_MODE", raising=False)
@@ -67,6 +74,45 @@ class TestLaunch:
         monkeypatch.setenv("HEADROOM_MODE", "cache")
         assert self._invoke(monkeypatch)["mode"] == "cache"
 
+    def test_saved_gateway_url_aborts_before_launch(self, monkeypatch, tmp_path):
+        # bobshell re-resolves settings.gatewayUrl over BOB_GATEWAY_URL at startup,
+        # so launching would run Bob uncompressed behind a banner saying otherwise.
+        settings = tmp_path / ".bob" / "settings" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"gatewayUrl": "https://api.eu-de.bob.ibm.com"}))
+        output = self._invoke(monkeypatch, expect_exit=1)
+        assert "api.eu-de.bob.ibm.com" in output and str(settings) in output
+
+
+class TestBobPreflight:
+    def _settings(self, tmp_path, payload) -> Path:
+        path = tmp_path / "settings.json"
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return path
+
+    ENV = {"BOB_GATEWAY_URL": "http://127.0.0.1:8787/p/myproj"}
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {},
+            {"gatewayUrl": ""},
+            {"gatewayUrl": None},
+            {"gatewayUrl": "http://127.0.0.1:8787/p/myproj/"},  # already the proxy
+            "not json",
+        ],
+    )
+    def test_passes(self, tmp_path, payload):
+        assert bob_preflight(self.ENV, self._settings(tmp_path, payload)) is None
+
+    def test_passes_when_no_settings_file(self, tmp_path):
+        assert bob_preflight(self.ENV, tmp_path / "missing.json") is None
+
+    def test_fails_on_foreign_gateway(self, tmp_path):
+        path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})
+        message = bob_preflight(self.ENV, path)
+        assert message and "https://api.eu-de.bob.ibm.com" in message and str(path) in message
+
 
 class TestOriginPassthrough:
     """Bob builds full gateway paths itself; the catch-all must not re-prefix
@@ -74,7 +120,17 @@ class TestOriginPassthrough:
     /inference/v1/model/info doubled the prefix, and /admin/v1/profile was
     misrooted under /inference."""
 
-    @pytest.mark.parametrize("path", ["/inference/v1/model/info", "/admin/v1/profile"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/inference/v1/model/info",
+            "/inference/v1/embeddings",
+            "/admin/v1/profile",
+            "/admin/v1/teams/t1/users/u1",
+            "/rag/v1/search",  # IBM docs tools (search_ibm_docs)
+            "/metrics-forwarder/v1/codeagent/core/metrics",
+        ],
+    )
     def test_declared_paths_are_origin_rooted(self, path):
         assert (
             resolve_origin_passthrough_url(BASE, path) == f"https://api.us-east.bob.ibm.com{path}"

@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -83,6 +84,9 @@ class WrapTarget:
     # Only affects a proxy this wrap starts; wrap warns when a reused proxy
     # runs a different mode.
     default_mode: str | None = None
+    # Launch-time check on the built env; a returned message aborts the wrap.
+    # For tools whose own saved config can override the env var we set.
+    preflight: Callable[[Mapping[str, str]], str | None] | None = None
 
 
 def build_launch_env(
@@ -102,6 +106,33 @@ def build_launch_env(
         if var.display:
             display.append(f"{var.key}={url}")
     return env, display
+
+
+def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> str | None:
+    """Refuse to launch Bob when its saved gatewayUrl would bypass the proxy.
+
+    bobshell (verified 2.0.5) re-resolves its gateway at startup as
+    ``settings.gatewayUrl ?? policy.GatewayUrl ?? <env/flag>``, so a saved
+    gatewayUrl silently overrides BOB_GATEWAY_URL and Bob runs uncompressed
+    while the wrap banner claims otherwise. A policy-enforced URL cannot be
+    read locally; the message names it so the user knows where else to look.
+    """
+    path = settings_path or Path.home() / ".bob" / "settings" / "settings.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8")).get("gatewayUrl")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(saved, str) or not saved.strip():
+        return None
+    proxy_url = env.get("BOB_GATEWAY_URL", "")
+    if saved.strip().rstrip("/") == proxy_url.rstrip("/"):
+        return None
+    return (
+        f"Bob's saved gatewayUrl ({saved.strip()}) overrides BOB_GATEWAY_URL, so Bob "
+        f"would bypass the Headroom proxy. Remove the gatewayUrl entry from {path} "
+        "(or set it to the proxy URL shown by this wrap) and retry. If your "
+        "organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
+    )
 
 
 WRAP_TARGETS: dict[str, WrapTarget] = {
@@ -165,18 +196,23 @@ WRAP_TARGETS: dict[str, WrapTarget] = {
             binary="bob",
             install_hint="Install IBM Bob CLI: npm install -g bobshell",
             env_vars=(
-                # Bob resolves its gateway as config.gatewayUrl ?? BOB_GATEWAY_URL
+                # Bob resolves its gateway as --gateway-url ?? BOB_GATEWAY_URL
                 # ?? default, so this reroutes inference without touching
-                # ~/.bob/settings. Bob appends /inference/v1/... itself.
+                # ~/.bob/settings. Bob appends /inference/v1/... itself. A saved
+                # settings.json gatewayUrl (or GatewayUrl policy) still wins over
+                # all of these at startup — see bob_preflight.
                 EnvVar("BOB_GATEWAY_URL", "bare_origin"),
             ),
+            preflight=bob_preflight,
             # Carries /inference/v1 so the proxy's _normalize_api_url (strips
             # /v1) and handle_openai_chat (re-appends /v1/chat/completions)
             # compose back into the path IBM serves.
             openai_api_url="https://api.us-east.bob.ibm.com/inference/v1",
             extra_chat_routes=("/inference/v1/chat/completions",),
-            origin_passthrough_prefixes=("/inference/", "/admin/"),
-            # Bob 2.0.1 rewrites its gateway host from region_domain in the
+            # Bob builds every gateway path itself: inference + model info,
+            # profile/budget, IBM docs search (/rag/v1/search), telemetry.
+            origin_passthrough_prefixes=("/inference/", "/admin/", "/rag/", "/metrics-forwarder/"),
+            # Bob 2.0.1–2.0.5 rewrites its gateway host from region_domain in the
             # /admin/v1/profile response while keeping the proxied port, so
             # every later request targets api.<region>:<proxy-port>. With the
             # key absent it keeps its configured gateway URL (the proxy).
