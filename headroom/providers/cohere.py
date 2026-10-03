@@ -21,6 +21,7 @@ import warnings
 from datetime import date
 from typing import Any
 
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
 from headroom.tokenizers import EstimatingTokenCounter
 
 from .base import Provider, TokenCounter
@@ -229,6 +230,11 @@ class CohereProvider(Provider):
                     If provided, uses tokenize API for accurate counts.
         """
         self._client = client
+        # Cache counters per model so their internal TokenCountCache persists
+        # across requests, like the Anthropic and OpenAI providers. A fresh
+        # counter per call threw the cache away every request, re-tokenizing a
+        # stable prefix (system prompt + tools) on every turn.
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -255,7 +261,9 @@ class CohereProvider(Provider):
                 f"Model '{model}' is not recognized as a Cohere model. "
                 f"Supported models: {list(_CONTEXT_LIMITS.keys())}"
             )
-        return CohereTokenCounter(model, client=self._client)
+        if model not in self._token_counters:
+            self._token_counters[model] = CohereTokenCounter(model, client=self._client)
+        return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
         """Get context limit for a Cohere model.
@@ -326,18 +334,13 @@ class CohereProvider(Provider):
         # Try LiteLLM first
         if LITELLM_AVAILABLE:
             for model_variant in [f"cohere/{model}", model]:
-                try:
-                    cost = litellm.completion_cost(
-                        model=model_variant,
-                        prompt="",
-                        completion="",
-                        prompt_tokens=input_tokens,
-                        completion_tokens=output_tokens,
-                    )
-                    if cost is not None:
-                        return float(cost)
-                except Exception:
-                    pass
+                cost = estimate_cost_from_tokens(
+                    model_variant,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                if cost is not None:
+                    return float(cost)
 
         # Fallback to built-in pricing
         model_lower = model.lower()

@@ -67,7 +67,10 @@ def test_wrap_vscode_no_configure_prints_transparent_settings(tmp_path: Path) ->
     assert not path.exists()
     assert "overrideProxyUrl" in result.output
     assert "overrideCapiUrl" in result.output
-    assert "overrideAuthType" in result.output
+    # No `overrideAuthType`: the setting does not exist in the modern Copilot
+    # Chat extension, so printing it told users to add a key VS Code flags as
+    # unknown and which does nothing (#3076).
+    assert "overrideAuthType" not in result.output
 
 
 def test_unwrap_vscode_removes_only_managed_settings(tmp_path: Path) -> None:
