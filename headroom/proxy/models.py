@@ -466,8 +466,11 @@ class ProxyConfig:
     memory_bridge_auto_import: bool = False
     memory_bridge_export_path: str = ""
 
-    # License / Usage Reporting
+    # Licence / usage reporting. ``license_key`` holds the HEADROOM_LICENSE
+    # token. The cloud usage reporter runs only when ``usage_reporting`` is
+    # also true (HEADROOM_USAGE_REPORTING=1); a licence alone sends nothing.
     license_key: str | None = None
+    usage_reporting: bool = False
     license_cloud_url: str = "https://app.headroomlabs.ai"
     license_report_interval: int = 300
 

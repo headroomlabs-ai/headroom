@@ -227,7 +227,7 @@ These rows *explain* the headline total — they are never added to it.
 
 4. **A 5xx erases its own savings.** Requests that fail upstream are dropped from every savings and token counter. During a provider incident, savings rates look artificially clean while throughput falls.
 
-5. **`/metrics` needs auth if you set a proxy token.** With `HEADROOM_PROXY_TOKEN` set, any non-loopback scraper must send `Authorization: Bearer <token>`. Loopback is always exempt.
+5. **`/metrics` needs auth if you set a proxy token.** With `HEADROOM_PROXY_TOKEN` set, any non-loopback scraper must send `Authorization: Bearer <token>` (or `X-Headroom-Proxy-Token: <token>`). Loopback is always exempt. The proxy removes the token from every request before forwarding it, so it never reaches a model provider.
 
 ---
 
