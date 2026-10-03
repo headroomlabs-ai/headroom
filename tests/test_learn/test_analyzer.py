@@ -792,6 +792,9 @@ class TestCallCliLlm:
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--tools",
+            "",
+            "--strict-mcp-config",
         ]
 
     def test_claude_cli_progress_callback_is_throttled(self):

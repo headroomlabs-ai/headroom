@@ -439,7 +439,10 @@ _TOOL_SEARCH_FALSY = {"false", "0", "no", "off"}
 # Opt out entirely with HEADROOM_WRAP_QUIET=0 (or false/no/off).
 _QUIET_CLI_ENV = "HEADROOM_WRAP_QUIET"
 _QUIET_CLI_FALSY = {"0", "false", "no", "off"}
-# name -> value, injected only when the user has not already set it.
+# name -> value, injected only when the user has not already set it. Every entry
+# here suppresses ONLY zero-signal chatter — telemetry pings, version nags,
+# funding/first-run banners, progress bars, pager framing — never diffs, errors,
+# summaries, or search results.
 _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "GIT_PAGER": "cat",  # never page (keeps full content, drops pager framing)
     "PIP_QUIET": "1",  # drop "Requirement already satisfied"/download chatter
@@ -447,6 +450,20 @@ _QUIET_CLI_DEFAULTS: dict[str, str] = {
     "npm_config_fund": "false",  # drop the funding banner
     "npm_config_audit": "false",  # drop the audit summary (not a security scan here)
     "npm_config_progress": "false",  # drop the install progress bar
+    "npm_config_update_notifier": "false",  # drop the boxed "update available" notice
+    # Cross-tool telemetry opt-out standard (consoledonottrack.com), honored by
+    # turbo, netlify, gatsby, and many others to drop telemetry pings/banners.
+    "DO_NOT_TRACK": "1",
+    # .NET SDK: telemetry ping + the "Welcome to .NET" logo/copyright banner.
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1",
+    # JS framework telemetry banners printed on build/dev.
+    "NEXT_TELEMETRY_DISABLED": "1",
+    "GATSBY_TELEMETRY_DISABLED": "1",
+    "ASTRO_TELEMETRY_DISABLED": "1",
+    "NG_CLI_ANALYTICS": "false",  # Angular CLI analytics ping + first-run prompt
+    # Homebrew's "==> ... hints" chatter (not warnings/errors).
+    "HOMEBREW_NO_ENV_HINTS": "1",
 }
 
 
@@ -5625,6 +5642,42 @@ def wrap_selfheal(marker: str | None) -> None:
 # Claude Code
 # =============================================================================
 
+# Hostnames that mean "this machine" — used to avoid feeding the proxy its own
+# URL back as the upstream when the user already had ANTHROPIC_BASE_URL pointed
+# at a previous Headroom instance.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _detect_inbound_anthropic_upstream(port: int) -> str | None:
+    """Return a pre-set ANTHROPIC_BASE_URL that is NOT this proxy, else None.
+
+    Issue #1353: users who already route Claude Code at a LiteLLM (or any
+    custom Anthropic-compatible) gateway via ``ANTHROPIC_BASE_URL`` lose that
+    routing when they run ``headroom wrap claude`` — wrap overwrites
+    ANTHROPIC_BASE_URL with the local proxy URL and silently forwards to
+    api.anthropic.com instead of the LiteLLM URL the user configured. Treat
+    the pre-existing value as the proxy's upstream so compression layers on
+    top of the user's gateway instead of replacing it. URLs pointing at this
+    proxy instance are ignored to avoid a self-referential forwarding loop.
+    """
+
+    base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip()
+    if not base_url:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _LOCAL_HOSTNAMES:
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            return None
+        if parsed_port == port:
+            return None
+    return base_url
+
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
@@ -5851,6 +5904,20 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
+        # Issue #1353: when none of the explicit override channels (Foundry,
+        # Vertex, ANTHROPIC_TARGET_API_URL) apply, inherit a pre-existing
+        # ANTHROPIC_BASE_URL as the upstream so wrap doesn't silently revert
+        # the user's LiteLLM/custom-gateway routing back to api.anthropic.com.
+        custom_upstream: str | None = None
+        if (
+            not foundry_upstream
+            and not use_vertex
+            and not os.environ.get("ANTHROPIC_TARGET_API_URL")
+        ):
+            custom_upstream = _detect_inbound_anthropic_upstream(port)
+
+        upstream_for_proxy = foundry_upstream or custom_upstream
+
         _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
@@ -5861,7 +5928,7 @@ def claude(
             code_graph=code_graph,
             backend=backend,
             region=region,
-            anthropic_api_url=foundry_upstream,
+            anthropic_api_url=upstream_for_proxy,
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
         )
@@ -5907,6 +5974,8 @@ def claude(
             click.echo(
                 f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={_foundry_proxy_url(proxy_url)} → upstream {foundry_upstream}"
             )
+        elif custom_upstream:
+            click.echo(f"  ANTHROPIC_BASE_URL={proxy_url} → upstream {custom_upstream}")
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
             # Issue #1779: Claude Code 2.1.196+ deterministically disables

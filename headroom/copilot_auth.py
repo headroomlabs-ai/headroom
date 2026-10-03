@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -591,9 +591,19 @@ def _parse_expiry(value: Any) -> float | None:
             pass
         try:
             normalized = raw.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).timestamp()
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
             return None
+        # A timezone-naive ISO string (no `Z`, no offset) must be read as UTC,
+        # not the host's local zone. `datetime.timestamp()` assumes local time
+        # for naive datetimes, so on a non-UTC box the same expiry resolves to a
+        # different epoch — hours early or late — silently expiring a live token
+        # or trusting a dead one. Every other ISO parser in the codebase treats
+        # naive as UTC (see telemetry/traffic_learner, proxy/memory_rank_policy);
+        # match that here.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
 
     return None
 
