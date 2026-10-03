@@ -36,9 +36,9 @@ from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, Sup
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
-    unix_user_env_targets,
     codex_hooks_path,
     codex_project_config_path,
+    unix_user_env_targets,
     validate_profile_name,
 )
 from headroom.install.planner import build_manifest
