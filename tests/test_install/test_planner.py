@@ -423,12 +423,8 @@ def test_detect_targets_ignores_shared_gemini_home(monkeypatch, tmp_path) -> Non
     Claude/Codex/Copilot defaults.
     """
     (tmp_path / ".gemini" / "tmp" / "chats").mkdir(parents=True)
-    monkeypatch.setattr(
-        "pathlib.Path.home", classmethod(lambda cls: tmp_path)
-    )
-    monkeypatch.setattr(
-        "headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None)
 
     from headroom.install.planner import detect_targets
 
@@ -438,12 +434,8 @@ def test_detect_targets_ignores_shared_gemini_home(monkeypatch, tmp_path) -> Non
 def test_detect_targets_finds_antigravity_config_dir(monkeypatch, tmp_path) -> None:
     """The Antigravity ``~/.gemini/config`` directory still counts as a hit."""
     (tmp_path / ".gemini" / "config").mkdir(parents=True)
-    monkeypatch.setattr(
-        "pathlib.Path.home", classmethod(lambda cls: tmp_path)
-    )
-    monkeypatch.setattr(
-        "headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None
-    )
+    monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("headroom.install.planner.shutil.which", lambda *_args, **_kwargs: None)
 
     from headroom.install.planner import detect_targets
 

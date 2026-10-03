@@ -17,9 +17,7 @@ class AntigravityProxyTargets:
     anthropic_base_url: str
 
 
-def build_proxy_targets(
-    port: int, project: str | None = None
-) -> AntigravityProxyTargets:
+def build_proxy_targets(port: int, project: str | None = None) -> AntigravityProxyTargets:
     """Build the local proxy URLs shown to Antigravity users.
 
     ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
