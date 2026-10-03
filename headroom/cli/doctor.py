@@ -316,7 +316,7 @@ def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckRe
 
 
 def _claude_base_url_in(path: Path) -> tuple[str, CheckResult | None]:
-    """Read ``env.ANTHROPIC_BASE_URL`` from one Claude settings file.
+    """Read the active Claude routing URL from one settings file.
 
     Returns ``(base_url, error)``. A parse problem comes back as a WARN so the
     caller surfaces it verbatim instead of skipping the file and reporting the
@@ -340,7 +340,10 @@ def _claude_base_url_in(path: Path) -> tuple[str, CheckResult | None]:
         )
     env_block = payload.get("env")
     if isinstance(env_block, dict):
-        return str(env_block.get("ANTHROPIC_BASE_URL", "") or ""), None
+        base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
+        if not base_url and str(env_block.get("CLAUDE_CODE_USE_FOUNDRY", "") or ""):
+            base_url = str(env_block.get("ANTHROPIC_FOUNDRY_BASE_URL", "") or "")
+        return base_url, None
     return "", None
 
 

@@ -338,9 +338,11 @@ with a privileged job.
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a bearer token (`X-Headroom-Proxy-Token`) from non-loopback callers. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
+| `HEADROOM_LICENSE` | unset | Licence token, read by core and every licensed extension. `HEADROOM_LICENSE_KEY` is a deprecated alias for one release and logs a warning. A licence on its own sends nothing to Headroom. |
+| `HEADROOM_USAGE_REPORTING` | `false` | Set `1` to let the proxy validate the licence and post aggregate usage counts (no content) to the Headroom cloud. Off unless set; `HEADROOM_OFFLINE` still overrides it. |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
 | `HEADROOM_STRIP_INTERNAL_HEADERS` | `enabled` | Strip internal `x-headroom-*` headers before forwarding upstream. |
 | `HEADROOM_TLS_STRICT` | strict | Set `0` to relax CA-constraint checks behind a corporate TLS-inspection proxy. |
@@ -802,6 +804,22 @@ headroom wrap cursor
 # Grok Build (updates ~/.grok/config.toml and starts the proxy)
 headroom wrap grok-build
 ```
+
+`headroom wrap codex` keeps routing scoped to the Codex process it launches: it
+passes the proxy URL as a `--config` override and never writes it to
+`~/.codex/config.toml`. Codex runs any session started with command-line
+overrides in embedded mode, so a wrapped session does not use Codex's shared
+background server and Codex prints "Running without the shared background
+server". If you want the shared server, write the proxy routing to Codex's own
+config instead, then start `codex` directly:
+
+```bash
+headroom init codex     # this project's .codex/config.toml (trusted projects)
+headroom init -g codex  # ~/.codex/config.toml, for every project
+```
+
+That routing is persistent: it applies to every Codex session in that scope
+until you remove it.
 
 Cursor reads model endpoints from its settings UI, so `headroom wrap cursor`
 does not rewrite Cursor configuration or launch the app. After it starts the
