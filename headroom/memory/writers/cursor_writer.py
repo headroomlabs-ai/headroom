@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
+from headroom.managed_block import sanitize_block_text
 from headroom.memory.writers.base import (
     MARKER_END,
     MARKER_PATTERN,
@@ -93,8 +94,8 @@ class CursorMemoryWriter(AgentWriter):
         if not budgeted:
             return result
 
-        # Build full .mdc file content
-        body = self.format_memories(budgeted)
+        # Build full .mdc file content; sanitised for the same reason as base.py.
+        body = sanitize_block_text(self.format_memories(budgeted))
 
         target = output_path or self.default_path()
 

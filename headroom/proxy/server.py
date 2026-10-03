@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import hmac
 import ipaddress
 import json
@@ -643,13 +644,30 @@ def _check_rust_core() -> tuple[str, str | None]:
             return ("disabled", reason)
         # Fail loud. Print to stderr in addition to logging so operators
         # see it even if the logging handler is mis-configured.
+        #
+        # On Windows the usual cause is not a missing build but a present
+        # binary the OS refuses to load: `_core.pyd` ships unsigned, so
+        # Smart App Control / WDAC / antivirus can block it (issue #2918).
+        # "rebuild the wheel" is useless advice there, so name the real
+        # cause and point at the degraded mode instead.
+        windows_hint = ""
+        if sys.platform == "win32":
+            windows_hint = (
+                "    windows: a 'DLL load failed' or 'blocked by application control policy'\n"
+                "             error usually means Smart App Control, WDAC, or antivirus\n"
+                "             blocked the (unsigned) _core.pyd rather than the wheel being\n"
+                "             broken. Check Event Viewer > Applications and Services Logs >\n"
+                "             Microsoft > Windows > CodeIntegrity/Operational for event 3033.\n"
+            )
         msg = (
             f"FATAL: Rust extension `headroom._core` not loadable.\n"
             f"    error: {reason}\n"
+            f"{windows_hint}"
             f"    fix:   `make build-wheel && pip install --force-reinstall "
             f"target/wheels/headroom_*.whl`\n"
             f"    opt-out: set {_RUST_CORE_REQUIRED_ENV}=false to start in "
-            f"degraded Python-only mode\n"
+            f"degraded Python-only mode (proxy stays up and forwards traffic "
+            f"unoptimized)\n"
         )
         logger.error("event=rust_core_missing reason=%r action=exit_78", reason)
         print(msg, file=sys.stderr, flush=True)
@@ -698,7 +716,10 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     files are written to the workspace.
 
     Covers TOIN (the always-on serving writer): it keeps learning patterns
-    in-memory but never reads or writes ``toin.json``. An empty ``storage_path``
+    in-memory but never reads or writes ``toin.json``. Also detaches the CCR
+    retrieval store so it is rebuilt in-memory (see below). Every other
+    workspace writer consults ``paths.persistence_allowed()`` at its write
+    site, so it needs no special handling here. An empty ``storage_path``
     makes the backend ``None``, which no-ops load/save/auto-save. The savings
     subsystem is handled separately via ``PrometheusMetrics(stateless=...)``.
 
@@ -718,12 +739,21 @@ def _apply_stateless_persistence(config: ProxyConfig) -> None:
     """
     if not getattr(config, "stateless", False):
         return
+    from headroom.cache.compression_store import detach_compression_store
     from headroom.telemetry.toin import TOINConfig, get_toin, reset_toin
 
     # Reset first so this wins regardless of whether the singleton was already
     # created with a filesystem backend earlier in the process.
     reset_toin()
     get_toin(TOINConfig(storage_path=""))
+    # Same for the CCR retrieval store: drop any singleton built before the
+    # stateless flag was recorded so the next get_compression_store() goes
+    # through _create_default_ccr_backend(), which refuses the SQLite file in
+    # stateless mode. The store holds verbatim tool output — the one thing a
+    # stateless deployment most needs kept off disk. Detach, not reset: reset
+    # clears the old store, which deletes every row from an existing SQLite
+    # file — a destructive write on the way into stateless mode.
+    detach_compression_store()
 
 
 def _provider_httpx_client_options(
@@ -1425,11 +1455,13 @@ class HeadroomProxy(
                     "hint=bridge_syncs_only_the_legacy_DB_today_per-project_bridge_follow-up_planned"
                 )
 
-        # Usage Reporter (license validation + phone-home for managed/enterprise).
+        # Usage Reporter (licence validation + phone-home for managed deployments).
+        # Explicit opt-in only: a licence being present must not start outbound
+        # reporting on its own (HEADROOM_USAGE_REPORTING=1 is required).
         # Suppressed entirely in offline mode — the air-gap switch must stop all
-        # egress, including license phone-home, even when a key is configured.
+        # egress, including licence phone-home, even when opted in.
         self.usage_reporter: UsageReporter | None = None
-        if config.license_key and not (config.offline or is_offline()):
+        if config.license_key and config.usage_reporting and not (config.offline or is_offline()):
             from headroom.telemetry.reporter import UsageReporter
 
             self.usage_reporter = UsageReporter(
@@ -1564,6 +1596,7 @@ class HeadroomProxy(
 
         loop = asyncio.get_running_loop()
         queued_at = time.monotonic()
+        request_context = contextvars.copy_context()
         state = {
             "queued": True,
             "started": False,
@@ -1631,7 +1664,7 @@ class HeadroomProxy(
             if quarantine_activated:
                 _announce_quarantine()
             try:
-                return fn()
+                return request_context.run(fn)
             finally:
                 elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
@@ -2835,6 +2868,60 @@ def read_proxy_token(headers: Mapping[str, str]) -> str | None:
     return None
 
 
+_PROXY_TOKEN_HEADER = b"x-headroom-proxy-token"
+
+
+def _is_proxy_token_bearer(value: bytes, token_bytes: bytes) -> bool:
+    """Whether a raw ``Authorization`` value is ``Bearer <proxy token>``.
+
+    Parses exactly as :func:`read_proxy_token` does (case-insensitive scheme,
+    stripped credential) and compares the way the gates do, so a value the gate
+    accepted as the proxy credential is always recognised here.
+    """
+    auth = value.decode("latin-1")
+    if not auth.lower().startswith("bearer "):
+        return False
+    credential = auth[7:].strip()
+    return bool(credential) and hmac.compare_digest(
+        credential.encode("utf-8", "replace"), token_bytes
+    )
+
+
+def scrub_proxy_token_headers(scope: Any, token_bytes: bytes) -> None:
+    """Remove the proxy credential from an ASGI scope before any handler reads it.
+
+    The proxy token authenticates the caller to Headroom and nothing else, but
+    the handlers build their upstream headers from the inbound request and only
+    drop ``x-headroom-*`` names. A token sent as ``Authorization: Bearer <token>``
+    (the documented scraper form, and what the TypeScript SDK sends when it has
+    no provider credential) was therefore forwarded to Anthropic/OpenAI. Doing
+    this once, on the scope, covers every handler and transport at once instead
+    of relying on each upstream call site to remember.
+
+    ``x-headroom-proxy-token`` is dropped unconditionally, so it cannot reach an
+    upstream even with ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``. An
+    ``Authorization`` header is dropped only when it carries the configured
+    token; any other value is a provider credential and is left alone.
+    """
+    headers = scope.get("headers")
+    if not headers:
+        return
+    kept = [
+        (name, value)
+        for name, value in headers
+        if not (
+            name.lower() == _PROXY_TOKEN_HEADER
+            or (
+                token_bytes
+                and name.lower() == b"authorization"
+                and _is_proxy_token_bearer(value, token_bytes)
+            )
+        )
+    ]
+    if len(kept) != len(headers):
+        scope["headers"] = kept
+
+
 class WebSocketAuthMiddleware:
     """Enforce ``HEADROOM_PROXY_TOKEN`` on WebSocket handshakes.
 
@@ -2867,13 +2954,18 @@ class WebSocketAuthMiddleware:
         self.token_bytes = proxy_token.encode("utf-8") if proxy_token else b""
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "websocket" or not self.proxy_token:
+        if scope["type"] != "websocket":
+            await self.app(scope, receive, send)
+            return
+        if not self.proxy_token:
+            scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
 
         client = scope.get("client")
         client_host = client[0] if client else None
         if is_loopback_host(client_host):
+            scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
 
@@ -2888,6 +2980,7 @@ class WebSocketAuthMiddleware:
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):
+            scrub_proxy_token_headers(scope, self.token_bytes)
             await self.app(scope, receive, send)
             return
 
@@ -3093,6 +3186,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         _rust_core_status, _rust_core_error = _check_rust_core()
         app.state.rust_core_status = _rust_core_status
         app.state.rust_core_error = _rust_core_error
+
+        # Degraded mode has to mean something. Every compressor reaches
+        # `headroom._core` eventually, so leaving `optimize` on while the
+        # extension is unloadable turns each request into an ImportError
+        # instead of a proxied response. Drop to the same passthrough path
+        # `--no-optimize` uses: no savings, but the client keeps working
+        # rather than getting a connection refused (issue #2918).
+        #
+        # Safe to mutate here: `HeadroomProxy` holds this exact config
+        # object, its compressors are built lazily on first use, and
+        # `proxy.startup()` has not run yet.
+        if _rust_core_status == "disabled" and config.optimize:
+            config.optimize = False
+            logger.warning(
+                "event=proxy_optimization_disabled reason=rust_core_unavailable "
+                "detail=%r mode=passthrough; traffic is forwarded unmodified, "
+                "restore `headroom._core` to re-enable compression",
+                _rust_core_error,
+            )
 
         configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
         configure_langfuse_tracing(
@@ -3807,12 +3919,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             logger.debug("record_inbound_response failed", exc_info=True)
         logger.info(
-            "event=proxy_inbound_response id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            "event=proxy_inbound_response id=%s method=%s path=%s status=%s "
+            "duration_ms=%.2f response_content_length=%s",
             inbound_id,
             method,
             path,
             response.status_code,
             (time.perf_counter() - started) * 1000.0,
+            response.headers.get("content-length", ""),
         )
         return response
 
@@ -3921,6 +4035,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     _apply_security_headers(rejection)
                     return rejection
 
+        # The credential has done its job; take it off the request so no handler
+        # can forward it upstream. Runs on the exempt paths too, since a loopback
+        # caller's token is no more the provider's business than a remote one's.
+        scrub_proxy_token_headers(request.scope, _proxy_token_bytes)
         response = await call_next(request)
         _apply_security_headers(response)
 
@@ -4983,6 +5101,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             },
             "toin": get_toin().get_stats(),
+            # Auto-learning progress. `pending_patterns` counts sub-threshold
+            # evidence so dashboards can show the learner is alive before the
+            # first pattern crosses `min_evidence` (users otherwise read the
+            # silence as "learning is broken").
+            "traffic_learner": (
+                proxy.traffic_learner.get_stats() if proxy.traffic_learner else None
+            ),
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
