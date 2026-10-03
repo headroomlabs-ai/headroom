@@ -162,7 +162,20 @@ class CCSwitchReconciler:
                 self._atomic_write(data)
                 logger.info("cc-switch reconciler: official -> route via Headroom")
                 return True
-            return False  # leave official direct (default, safe for OAuth)
+            # Leaving official direct (default, safe for OAuth) still has to
+            # drop a previously captured third-party upstream. The upstream is
+            # process-wide (``HeadroomProxy.ANTHROPIC_API_URL`` is a class
+            # attr), so a stale DeepSeek/Kimi endpoint would keep receiving
+            # this proxy's Anthropic traffic from every client still routed
+            # through it -- with Anthropic credentials attached.
+            if self.current_upstream not in (None, self.default_upstream):
+                logger.info(
+                    "cc-switch reconciler: official -> upstream reset to %s",
+                    self.default_upstream,
+                )
+                self.current_upstream = self.default_upstream
+                self._set_upstream(self.default_upstream)
+            return False
 
         # Already pointing at us: nothing to do (loop guard).
         if url.rstrip("/") == self.proxy_url:

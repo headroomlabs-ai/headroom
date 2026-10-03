@@ -43,6 +43,7 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.proxy.public_errors import tool_result_error
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -784,9 +785,10 @@ class MemoryHandler:
         # PROJECT mode and `unresolved_project_fallback="empty"` (the
         # default after the 2026-05-26 incident). The sentinel signal is
         # `mode=PROJECT` + `project_key=None`: project mode was requested
-        # but no x-headroom-project-id / x-headroom-cwd / system-prompt
-        # cwd: was available, so we have no idea which project this
-        # request belongs to. Returning None here skips injection
+        # but no x-headroom-project-id / x-headroom-cwd /
+        # system-prompt cwd: was available, so we
+        # have no idea which project this request belongs to. Returning
+        # None here skips injection
         # entirely — better than pooling into GLOBAL and surfacing
         # memories from unrelated past sessions (the TAM-550 imperative-
         # misread bug).
@@ -1231,7 +1233,7 @@ your responses, not to drive new actions."""
 
         except Exception as e:
             logger.error(f"Memory: Tool {tool_name} failed: {e}")
-            return json.dumps({"status": "error", "error": str(e)})
+            return json.dumps(tool_result_error(e))
 
     async def _execute_save(
         self,
@@ -1520,7 +1522,7 @@ your responses, not to drive new actions."""
                 results = await list_fn(user_id=effective_user_id, limit=limit)
             except Exception as e:
                 logger.warning(f"Memory: list_memories failed for user {effective_user_id}: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
         else:
             try:
                 results = await backend.search_memories(
@@ -1530,7 +1532,7 @@ your responses, not to drive new actions."""
                 )
             except Exception as e:
                 logger.warning(f"Memory: list fallback search failed: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
 
         entries: list[dict[str, Any]] = []
         for r in results:

@@ -97,7 +97,19 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
-        let client = reqwest::Client::builder()
+        // Two rustls crypto providers are linked into this binary (ring via
+        // reqwest, aws-lc-rs via the AWS SDK), so anything that reaches for
+        // the process default — reqwest below, tokio-tungstenite, any future
+        // dependency — would panic without one. Pin it before the first TLS
+        // client is built. Idempotent; see `crate::tls`.
+        crate::tls::install_process_crypto_provider();
+        let mut builder = reqwest::Client::builder();
+        // Corporate roots handed over as PEM files, added on top of the
+        // bundled + OS roots (see `crate::tls`).
+        for cert in crate::tls::extra_root_certificates() {
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .connect_timeout(config.upstream_connect_timeout)
             .timeout(config.upstream_timeout)
             // Don't auto-follow redirects: pass them through verbatim.
@@ -373,30 +385,21 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
-    Ok(join_upstream_path(base, uri.path(), uri.query()))
+    join_upstream_path(base, uri.path(), uri.query())
 }
 
 /// Shared path-join helper used by HTTP and WebSocket handlers.
-/// Appends `path` to `base`, preserving any base path prefix, then sets `query`.
-pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str>) -> url::Url {
-    let mut joined = base.clone();
-    // Strip trailing slash from base path so "http://x:1/api" + "/v1/foo"
-    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
-    let base_path = joined.path().trim_end_matches('/').to_string();
-    let combined = if path.is_empty() || path == "/" {
-        if base_path.is_empty() {
-            "/".to_string()
-        } else {
-            base_path
-        }
-    } else if base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_path}{path}")
-    };
-    joined.set_path(&combined);
-    joined.set_query(query);
-    joined
+/// Appends `path` to `base`, preserving any base path prefix, then sets
+/// `query`. Rejects (400) any path the URL parser would rewrite — dot
+/// segments, backslashes — so the upstream always receives exactly the path
+/// the client sent, under exactly the configured prefix. See
+/// [`crate::upstream_path`].
+pub(crate) fn join_upstream_path(
+    base: &url::Url,
+    path: &str,
+    query: Option<&str>,
+) -> Result<url::Url, ProxyError> {
+    Ok(crate::upstream_path::join_request_path(base, path, query)?)
 }
 
 /// Forward an HTTP request to the upstream and stream the response back.
@@ -1692,5 +1695,15 @@ mod tests {
         let uri: Uri = "/".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/");
+    }
+
+    #[test]
+    fn url_build_refuses_to_escape_base_path() {
+        // `url::Url::set_path` would resolve this to `/tenant-b/v1/messages`.
+        let base: url::Url = "http://gw/tenant-a".parse().unwrap();
+        let uri: Uri = "/../tenant-b/v1/messages".parse().unwrap();
+        let err = build_upstream_url(&base, &uri).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPath(_)), "{err:?}");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }

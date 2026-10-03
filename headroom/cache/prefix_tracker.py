@@ -870,6 +870,77 @@ def normalize_message_cache_control(
     return out if changed else messages
 
 
+def mirror_client_message_cache_control(
+    messages: list[dict[str, Any]],
+    client_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+
+    OpenAI-compatible clients that talk to Anthropic models through a gateway
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
+    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
+    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
+    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
+    ``normalize_message_cache_control`` only sees block markers
+    (``_client_marker_positions`` reads list content), so after
+    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
+    forwarded messages, these markers ride along untouched. A client that marks
+    three places per request (system, the newest tool call, the newest tool
+    result) ends up forwarding four, then five and more, and the gateway's
+    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
+    blocks with cache_control may be provided. Found 6``).
+
+    The client's current request is the authority for these markers, the same
+    rule the block-level normalizer applies: on each message and on each of its
+    ``tool_calls``, drop the marker unless the client put one there in this
+    request, in which case copy the client's own value. Content — and any
+    block-level marker in it — is left alone, so the replayed bytes the provider
+    cached stay byte-identical.
+
+    Index alignment is the invariant (the pipeline preserves message count and
+    each message's tool calls); where it does not hold, that message or list is
+    returned unchanged rather than guessing, and the breakpoint budget guard
+    still bounds the total.
+    """
+    if not isinstance(client_messages, list) or len(client_messages) != len(messages):
+        return messages
+    changed = False
+    out: list[dict[str, Any]] = []
+    for msg, client in zip(messages, client_messages):
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        new_msg, msg_changed = _mirror_marker(msg, client)
+        calls = new_msg.get("tool_calls")
+        client_calls = client.get("tool_calls") if isinstance(client, dict) else None
+        if (
+            isinstance(calls, list)
+            and isinstance(client_calls, list)
+            and len(calls) == len(client_calls)
+        ):
+            mirrored = [_mirror_marker(c, cc) for c, cc in zip(calls, client_calls)]
+            if any(c for _, c in mirrored):
+                new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
+                msg_changed = True
+        out.append(new_msg)
+        changed = changed or msg_changed
+    return out if changed else messages
+
+
+def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
+    """Give ``holder`` the client's own ``cache_control`` (or none); report change."""
+    if not isinstance(holder, dict):
+        return holder, False
+    client_marker = client_holder.get("cache_control") if isinstance(client_holder, dict) else None
+    if isinstance(client_marker, dict):
+        if holder.get("cache_control") == client_marker:
+            return holder, False
+        return {**holder, "cache_control": dict(client_marker)}, True
+    if "cache_control" in holder:
+        return {k: v for k, v in holder.items() if k != "cache_control"}, True
+    return holder, False
+
+
 class PrefixCacheTracker:
     """Tracks provider prefix cache state across turns in a session.
 

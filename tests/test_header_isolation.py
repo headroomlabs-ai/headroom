@@ -178,6 +178,35 @@ def test_strip_preserves_value_semantics() -> None:
     assert out["anthropic-version"] == "2023-06-01"
 
 
+def test_strip_default_tenant_header_removed() -> None:
+    """Tenant header is ingress-only and must not reach providers."""
+    out = _strip_internal_headers(
+        {
+            "Authorization": "Bearer sk-ant-...",
+            "X-Headroom-Tenant-ID": "tenant_a",
+        }
+    )
+
+    assert "X-Headroom-Tenant-ID" not in out
+    assert out["Authorization"] == "Bearer sk-ant-..."
+
+
+def test_strip_custom_tenant_header_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured tenant header is also stripped, even outside x-headroom-*."""
+    monkeypatch.setenv("HEADROOM_TENANT_KEY_HEADER", "X-Tenant-ID")
+
+    out = _strip_internal_headers(
+        {
+            "Authorization": "Bearer sk-ant-...",
+            "X-Tenant-ID": "tenant_a",
+            "x-request-id": "rid-1",
+        }
+    )
+
+    assert "X-Tenant-ID" not in out
+    assert out["x-request-id"] == "rid-1"
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: x-headroom-* never reaches the upstream
 # ---------------------------------------------------------------------------
