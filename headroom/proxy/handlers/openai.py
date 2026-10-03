@@ -37,6 +37,7 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
+from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
@@ -3858,9 +3859,20 @@ class OpenAIHandlerMixin:
         # captured — keep this snapshot after image compression, or a reorder
         # silently reintroduces the drift.
         cache_lookup_messages = messages
+        # Response-cache partition: a cached response is only ever replayed to a
+        # caller presenting the same provider credentials and principal (01-F15).
+        # Snapshotted with the key fields so lookup and store agree. None means
+        # the principal could not be established: skip the cache entirely.
+        # Only resolved when the cache can be used, so streaming and
+        # cache-disabled requests never pay for identity resolution.
+        cache_partition = (
+            compute_request_cache_partition(request) if self.cache and not stream else None
+        )
         # Check cache
-        if self.cache and not stream:
-            cached = await self.cache.get(messages, model, **cache_key_fields)
+        if self.cache and not stream and cache_partition is not None:
+            cached = await self.cache.get(
+                messages, model, partition=cache_partition, **cache_key_fields
+            )
             if cached:
                 self.pipeline_extensions.emit(
                     PipelineStage.INPUT_CACHED,
@@ -5745,13 +5757,19 @@ class OpenAIHandlerMixin:
                 # site, which let a response built for a stream:true request
                 # answer a later non-streaming caller (#3019). Stating the
                 # invariant keeps that from being reintroduced silently.
-                if self.cache and not stream and response.status_code == 200:
+                if (
+                    self.cache
+                    and not stream
+                    and cache_partition is not None
+                    and response.status_code == 200
+                ):
                     await self.cache.set(
                         cache_lookup_messages,
                         model,
                         response.content,
                         dict(response.headers),
                         tokens_saved,
+                        partition=cache_partition,
                         **cache_key_fields,
                     )
 
