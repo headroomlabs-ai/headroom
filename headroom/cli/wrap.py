@@ -3608,7 +3608,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
 
 
 def _restore_codex_provider_config() -> tuple[str, Path]:
-    """Undo ``_inject_codex_provider_config`` for the active Codex config file.
+    """Undo ``_inject_codex_provider_config`` (and ``headroom init codex``
+    routing) for the active Codex config file.
 
     Returns a tuple of ``(status, config_file)`` where status is one of:
 
@@ -3617,7 +3618,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     * ``"cleaned"``  — no backup existed, but the Headroom-managed block was
       found and stripped out (preserving surrounding user content).
     * ``"removed"``  — the config file only contained Headroom-managed
-      content (created by wrap) and has been deleted.
+      content (created by wrap or init) and has been deleted.
     * ``"noop"``     — nothing to undo; no Headroom marker and no backup.
     """
     config_file, backup_file = _codex_config_paths()
@@ -3630,8 +3631,11 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
+        from headroom.cli.init import _CODEX_PROVIDER_MARKER_START, _strip_codex_init_block
+
         original = _read_text(config_file)
-        if _codex_config_has_headroom_markers(original):
+        has_init_block = _CODEX_PROVIDER_MARKER_START in original
+        if has_init_block or _codex_config_has_headroom_markers(original):
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
             remove_named_mcp = any(
@@ -3643,8 +3647,11 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                     _CODEX_MCP_END,
                 )
             )
+            # `headroom init codex` writes its own routing block, and nothing else
+            # removes it (#3749). Strip it first so its markers go with its keys.
+            content = _strip_codex_init_block(original) if has_init_block else original
             cleaned = _strip_codex_headroom_blocks(
-                original,
+                content,
                 remove_mcp=True,
                 remove_named_mcp=remove_named_mcp,
             )
@@ -8549,7 +8556,7 @@ def unwrap_grok_build(port: int, no_stop_proxy: bool) -> None:
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
-    """Undo ``headroom wrap codex`` edits to the active Codex config file.
+    """Undo ``headroom wrap codex`` and ``headroom init codex`` routing in the Codex config.
 
     Behaviour:
 

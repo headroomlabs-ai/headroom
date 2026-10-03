@@ -907,6 +907,12 @@ def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
         )
+        click.echo(
+            "Nothing starts the Headroom proxy for Codex on Windows, so Codex cannot connect "
+            "while it is down. Use `headroom install apply` for a supervised proxy. To remove "
+            "this routing, run `headroom unwrap codex` (user scope) or delete the Headroom init "
+            "provider block from the project's .codex/config.toml."
+        )
     click.echo("Restart Codex to activate Headroom configuration.")
 
 

@@ -2137,6 +2137,50 @@ def test_unwrap_codex_preserves_unrelated_sections(
     assert restored == original
 
 
+def test_unwrap_codex_removes_init_provider_routing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`headroom init -g codex` routing must be removable with `unwrap codex` (#3749).
+
+    Without this, unwrap reported "no longer routed" while Codex stayed pinned
+    to a local proxy that nothing restarts on Windows.
+    """
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model = "gpt-5"\n\n[mcp_servers.local_thing]\ncommand = "thing"\n'
+    config_file.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config_file, 8787)
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text(encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to undo" not in result.output
+    cleaned = config_file.read_text(encoding="utf-8")
+    assert "Headroom init provider" not in cleaned
+    assert "openai_base_url" not in cleaned
+    assert "model_providers.headroom" not in cleaned
+    assert tomllib.loads(cleaned) == tomllib.loads(original)
+
+
+def test_unwrap_codex_removes_init_only_config_file(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    init_cli._ensure_codex_provider(config_file, 8787)
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists()
+
+
 # ---------------------------------------------------------------------------
 # Per-project savings: env_http_headers in the injected provider block
 # ---------------------------------------------------------------------------

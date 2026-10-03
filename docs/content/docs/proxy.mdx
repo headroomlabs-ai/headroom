@@ -819,7 +819,11 @@ headroom init -g codex  # ~/.codex/config.toml, for every project
 ```
 
 That routing is persistent: it applies to every Codex session in that scope
-until you remove it.
+until you remove it. `headroom unwrap codex` removes the `-g` routing; for a
+project, delete the `# --- Headroom init provider ---` block from
+`.codex/config.toml`. On Windows, nothing starts the proxy for this routing, so
+Codex cannot connect while the proxy is down; use `headroom install apply` if
+you need a supervised proxy.
 
 Cursor reads model endpoints from its settings UI, so `headroom wrap cursor`
 does not rewrite Cursor configuration or launch the app. After it starts the
