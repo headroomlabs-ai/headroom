@@ -175,7 +175,8 @@ def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPat
 def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     html = get_dashboard_html()
 
-    assert "fetch('/stats?cached=1')" in html
+    assert "this.fetchJson('/stats?cached=1')" in html
+    assert "cache: 'no-store'" in html
     assert "statsPollMs: 5000" in html
     assert "viewRefreshers:" in html
     assert "this.refreshActiveView(force)" in html

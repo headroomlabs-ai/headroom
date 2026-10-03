@@ -9,6 +9,7 @@ Provides persistent storage for Memory objects with full support for:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sqlite3
@@ -20,6 +21,8 @@ from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import MemoryFilter
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
 
 # Regex pattern for safe metadata keys: alphanumeric, underscores, hyphens only
@@ -73,15 +76,20 @@ class SQLiteMemoryStore:
         self.db_path = Path(db_path)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
