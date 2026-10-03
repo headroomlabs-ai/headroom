@@ -1832,6 +1832,31 @@ def test_exchange_token_sync_returns_payload_on_success(monkeypatch: pytest.Monk
     assert result == payload
 
 
+def test_parse_expiry_reads_naive_iso_as_utc() -> None:
+    assert copilot_auth._parse_expiry("2026-01-01T00:00:00") == 1767225600.0
+
+
+def test_parse_expiry_reads_zulu_suffix_as_utc() -> None:
+    assert copilot_auth._parse_expiry("2026-01-01T00:00:00Z") == 1767225600.0
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is POSIX-only")
+def test_parse_expiry_naive_iso_is_independent_of_host_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_tz = os.environ.get("TZ")
+    try:
+        monkeypatch.setenv("TZ", "Asia/Kolkata")
+        time.tzset()
+        assert copilot_auth._parse_expiry("2026-01-01T00:00:00") == 1767225600.0
+    finally:
+        if previous_tz is None:
+            monkeypatch.delenv("TZ", raising=False)
+        else:
+            monkeypatch.setenv("TZ", previous_tz)
+        time.tzset()
+
+
 def test_exchange_token_sync_uses_configured_corporate_tls_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

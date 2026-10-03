@@ -132,7 +132,9 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
 
 
 def _save_sync_state(state_path: Path, state: dict[str, Any]) -> None:
-    """Save sync state to disk."""
+    """Save sync state to disk (skipped in stateless mode)."""
+    if not _paths.persistence_allowed("memory sync state"):
+        return
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8", newline="\n")
 

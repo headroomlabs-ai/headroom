@@ -1365,3 +1365,53 @@ def test_openai_responses_cache_mode_never_batches_old_small_outputs():
     assert calls == []
     assert modified is False
     assert second["input"][:4] == first["input"]
+
+
+def test_openai_responses_adapter_compresses_historical_messages_not_current_user():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_history"
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][1]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text
+    assert units_by_category == {"applied": 2}
+    assert any(t.startswith("router:openai:responses:message:") for t in transforms)

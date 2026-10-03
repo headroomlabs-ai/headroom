@@ -33,6 +33,7 @@ from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
     build_anthropic_upstream_url,
     is_safeguard_capable_request,
@@ -65,6 +66,7 @@ from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
 
@@ -932,6 +934,20 @@ class AnthropicHandlerMixin:
         request.state.auth_mode = auth_mode
         logger.debug(f"[{request_id}] auth_mode_classified mode={auth_mode.value}")
 
+        # Phase F PR-F3: resolve the per-tenant key for TOIN learning
+        # isolation. `set_request_tenant_key` populates the ContextVar
+        # the deep-stack `record_compression` / `record_retrieval` calls
+        # in SmartCrusher / ContentRouter read from. Pre-F3 every
+        # request's patterns aggregated into one global pool — F3
+        # partitions by header / hash / global namespace so two
+        # tenants can't cross-pollinate compression patterns. The
+        # resolver itself emits the structured `tenant_key_resolved`
+        # log on every call.
+        tenant_key, tenant_key_source = resolve_tenant_key(request)
+        request.state.tenant_key = tenant_key
+        request.state.tenant_key_source = tenant_key_source
+        set_request_tenant_key(tenant_key)
+
         # Unit 2: per-stage timings for the pre-upstream phase. The
         # finalizer emits one structured log line + Prometheus
         # observations even if the handler raises.
@@ -1248,7 +1264,16 @@ class AnthropicHandlerMixin:
 
                 _sub_tracker = _get_sub_tracker()
                 if _sub_tracker is not None:
-                    _sub_tracker.notify_active(_auth_header)
+                    from headroom.subscription.credential_policy import (
+                        is_local_operator_connection,
+                    )
+
+                    # Only the local operator's bearer may become the polled
+                    # account; a network caller only marks activity (01-F16).
+                    _sub_tracker.notify_active(
+                        _auth_header,
+                        from_local_operator=is_local_operator_connection(request),
+                    )
 
             # Rate limiting
             if self.rate_limiter:
@@ -2628,19 +2653,11 @@ class AnthropicHandlerMixin:
                 and self.config.ccr_proactive_expansion
                 and ccr_workspace_key
             ):
-                # Extract user query from messages
-                user_query = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            user_query = content
-                        elif isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    user_query = block.get("text", "")
-                                    break
-                        break
+                # Relevance query for this turn. Same helper the compression
+                # pipeline scores with, so both read the query the same way;
+                # `latest_user_turn_only` keeps the previous behaviour of not
+                # reaching back past the newest user turn.
+                user_query = extract_user_query(messages, latest_user_turn_only=True)
 
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(
@@ -3790,10 +3807,11 @@ class AnthropicHandlerMixin:
                     await _finalize_pre_upstream()
                     return JSONResponse(
                         status_code=500,
-                        content={
-                            "type": "error",
-                            "error": {"type": "api_error", "message": error_message},
-                        },
+                        content=public_errors.anthropic_error_body(
+                            public_errors.classify_or_internal(e),
+                            request_id=str(request_id),
+                            error_type="api_error",
+                        ),
                     )
 
             # Direct Anthropic API, or a provider-compatible Anthropic
