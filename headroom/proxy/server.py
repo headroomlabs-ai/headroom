@@ -1276,11 +1276,19 @@ class HeadroomProxy(
         # timeout. Stuck-thread leak indicator.
         self._compression_leaked_threads: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
-        # asyncio waiter times out, so accepting more compression while that
-        # worker is still running can multiply one slow call into a saturated
-        # executor. New work raises immediately until every known post-timeout
-        # worker has genuinely exited, then follows the caller's existing
-        # compression-failure policy.
+        # asyncio waiter times out, so accepting more compression while those
+        # workers are still running can multiply slow calls into a saturated
+        # executor. Once half the pool is held by post-timeout workers, new work
+        # raises immediately until the debt drops below that again, and callers
+        # follow their existing compression-failure policy. One straggler on a
+        # mostly idle pool does not saturate it, so it does not refuse work;
+        # pools of 1-3 workers still quarantine on the first timeout.
+        # HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD=1 restores that everywhere.
+        self._compression_quarantine_threshold: int = _get_env_int(
+            "HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD",
+            max(1, _compression_max // 2),
+            min_value=1,
+        )
         self._compression_timed_out_in_flight: int = 0
         self._compression_timed_out_in_flight_max: int = 0
         self._compression_quarantine_activations: int = 0
@@ -1531,10 +1539,11 @@ class HeadroomProxy(
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
-        block after it eventually finishes. While any such worker remains,
-        new calls raise :class:`CompressionQuarantinedError` immediately so
-        callers apply the existing compression-failure policy instead of
-        filling the rest of the pool with the same timeout debt. Jobs that are
+        block after it eventually finishes. While such workers hold half the
+        pool (``_compression_quarantine_threshold``), new calls raise
+        :class:`CompressionQuarantinedError` immediately so callers apply the
+        existing compression-failure policy instead of filling the rest of the
+        pool with the same timeout debt. Jobs that are
         successfully cancelled before a worker starts are removed from the
         queued gauge and do not activate the quarantine. If cancellation races
         with worker startup, the now-running job is tracked as timeout debt and
@@ -1556,20 +1565,19 @@ class HeadroomProxy(
             ``asyncio.TimeoutError`` if the callable doesn't return within
             ``timeout``. Any exception raised by ``fn`` propagates
             unchanged. :class:`CompressionQuarantinedError` (an
-            ``asyncio.TimeoutError`` subclass) if a prior timed-out worker is
-            still running.
+            ``asyncio.TimeoutError`` subclass) if prior timed-out workers still
+            hold half the pool.
         """
         now = time.monotonic()
         with self._compression_metrics_lock:
             timed_out_in_flight = self._compression_timed_out_in_flight
-            quarantined = timed_out_in_flight > 0 and now < self._compression_quarantine_deadline
+            saturating = timed_out_in_flight >= self._compression_quarantine_threshold
+            quarantined = saturating and now < self._compression_quarantine_deadline
             # Debt outlived the cap: presume the worker leaked/hung and stop
             # blocking on it. Count the release once per lapse (while debt stands
             # and the deadline has passed) so operators can see it happened.
             released = (
-                timed_out_in_flight > 0
-                and not quarantined
-                and self._compression_quarantine_deadline > 0.0
+                saturating and not quarantined and self._compression_quarantine_deadline > 0.0
             )
             if quarantined:
                 self._compression_quarantine_skips += 1
@@ -1613,7 +1621,7 @@ class HeadroomProxy(
             """Record a still-running post-timeout worker; lock must be held.
 
             Returns ``True`` only when this worker transitions the executor
-            from clear to quarantined.
+            from clear (or released by the time cap) to quarantined.
             """
             if (
                 not state["timed_out"]
@@ -1622,7 +1630,12 @@ class HeadroomProxy(
                 or state["timeout_debt_recorded"]
             ):
                 return False
-            was_clear = self._compression_timed_out_in_flight == 0
+            now = time.monotonic()
+            threshold = self._compression_quarantine_threshold
+            was_quarantined = (
+                self._compression_timed_out_in_flight >= threshold
+                and now < self._compression_quarantine_deadline
+            )
             self._compression_timed_out_in_flight += 1
             self._compression_timed_out_in_flight_max = max(
                 self._compression_timed_out_in_flight_max,
@@ -1631,19 +1644,19 @@ class HeadroomProxy(
             # (Re)arm the quarantine time cap on every fresh timeout, so ongoing
             # slowness keeps quarantining while a single leaked worker cannot
             # hold it past the cap (#2360).
-            self._compression_quarantine_deadline = (
-                time.monotonic() + self._compression_quarantine_max_seconds
-            )
+            self._compression_quarantine_deadline = now + self._compression_quarantine_max_seconds
             state["timeout_debt_recorded"] = True
-            if was_clear:
+            activated = not was_quarantined and self._compression_timed_out_in_flight >= threshold
+            if activated:
                 self._compression_quarantine_activations += 1
-            return was_clear
+            return activated
 
         def _announce_quarantine() -> None:
             self.metrics.record_compression_quarantine("activated")
             logger.warning(
                 "Compression worker exceeded its request deadline and is still running; "
-                "new compression is quarantined until timed-out workers exit"
+                "new compression is quarantined until fewer than %d timed-out workers remain",
+                self._compression_quarantine_threshold,
             )
 
         def _wrapped():  # noqa: ANN202
@@ -1678,11 +1691,15 @@ class HeadroomProxy(
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
                         state["timeout_debt_recorded"] = False
-                        quarantine_cleared = self._compression_timed_out_in_flight == 0
+                        remaining = self._compression_timed_out_in_flight
+                        quarantine_cleared = remaining == self._compression_quarantine_threshold - 1
                     else:
                         quarantine_cleared = False
                 if quarantine_cleared:
-                    logger.info("Compression quarantine cleared after all timed-out workers exited")
+                    logger.info(
+                        "Compression quarantine cleared; %d timed-out worker(s) still running",
+                        remaining,
+                    )
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
@@ -3542,6 +3559,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
             _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
+            _comp_quarantine_active = (
+                _comp_timed_out_in_flight >= proxy._compression_quarantine_threshold
+                and time.monotonic() < proxy._compression_quarantine_deadline
+            )
             _comp_timed_out_in_flight_max = proxy._compression_timed_out_in_flight_max
             _comp_quarantine_activations = proxy._compression_quarantine_activations
             _comp_quarantine_skips = proxy._compression_quarantine_skips
@@ -3572,7 +3593,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
-                "quarantine_active": _comp_timed_out_in_flight > 0,
+                "quarantine_active": _comp_quarantine_active,
                 "timed_out_workers": _comp_timed_out_in_flight,
                 "timed_out_workers_max": _comp_timed_out_in_flight_max,
                 "quarantine_activations_total": _comp_quarantine_activations,
