@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
+from datetime import datetime, timedelta
 
 import pytest
 from click.testing import CliRunner
@@ -17,6 +19,7 @@ from headroom.perf.analyzer import (
     TransformRecord,
     build_overhead_summary,
     build_perf_summary,
+    build_savings_audit,
     perf_records_as_dicts,
 )
 
@@ -95,6 +98,8 @@ def test_build_perf_summary_totals_and_pct():
     assert summary["cache_write_tokens"] == 200
     assert summary["cache_hit_pct"] == 83.3
     assert summary["window_hours"] == 24.0
+    assert summary["savings_audit"]["prompt_reduction_tokens"] == 1000
+    assert summary["savings_audit"]["accounting_delta_tokens"] == 0
 
 
 def test_build_perf_summary_by_model_and_transform():
@@ -160,6 +165,40 @@ def test_build_overhead_summary_attributes_slow_stages():
     assert overhead["stage_breakdown"][0]["total_ms"] == 650.0
     assert overhead["top_slow_requests"][0]["request_id"] == "slow"
     assert overhead["top_slow_requests"][0]["slowest_stage"] == "kompress"
+
+
+def test_build_savings_audit_surfaces_accounting_deltas():
+    report = PerfReport(
+        perf_records=[
+            PerfRecord(
+                timestamp="2026-06-05 10:00:00,000",
+                request_id="hr_bad",
+                model="gpt-5",
+                tokens_before=100,
+                tokens_after=90,
+                tokens_saved=250,
+            ),
+            PerfRecord(
+                timestamp="2026-06-05 10:01:00,000",
+                request_id="hr_growth",
+                model="gpt-5",
+                tokens_before=100,
+                tokens_after=120,
+                tokens_saved=1,
+            ),
+        ]
+    )
+
+    audit = build_savings_audit(report)
+
+    assert audit["logged_tokens_saved"] == 251
+    assert audit["prompt_reduction_tokens"] == 10
+    assert audit["accounting_delta_tokens"] == 241
+    assert audit["record_counts"]["with_accounting_delta"] == 2
+    assert audit["record_counts"]["logged_saved_gt_tokens_before"] == 1
+    assert audit["record_counts"]["prompt_grew_but_logged_savings_positive"] == 1
+    assert audit["suspicious_records"][0]["request_id"] == "hr_bad"
+    assert "logged_saved_gt_tokens_before" in audit["suspicious_records"][0]["reasons"]
 
 
 def test_perf_records_as_dicts_roundtrips_fields():
@@ -230,6 +269,70 @@ def test_parse_perf_line_preserves_client_field(monkeypatch, tmp_path):
     assert report.perf_records[0].client == "codex"
 
 
+def _perf_line(ts: datetime, client: str) -> str:
+    return (
+        f"{ts.strftime('%Y-%m-%d %H:%M:%S')},000 - headroom.proxy - INFO - "
+        f"[hr_x] PERF model=gpt-5 msgs=3 tok_before=1000 "
+        f"tok_after=90 tok_saved=910 cache_read=0 cache_write=0 "
+        f"cache_hit_pct=0 opt_ms=12 transforms=content_router client={client}\n"
+    )
+
+
+def _write_log(path, text: str, mtime: datetime) -> None:
+    path.write_text(text)
+    stamp = mtime.timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+def test_windowed_parse_skips_rotated_logs_older_than_the_cutoff(monkeypatch, tmp_path):
+    """A windowed query must cost O(window), not O(total log history).
+
+    `/stats` recomputes throughput over the last hour on a 10s cache TTL, so
+    reading every rotated log each time made the endpoint slower the longer
+    the proxy had been running.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    now = datetime.now()
+    _write_log(
+        log_dir / "proxy.log.1",
+        _perf_line(now - timedelta(days=3), "stale"),
+        now - timedelta(days=3),
+    )
+    _write_log(log_dir / "proxy.log", _perf_line(now - timedelta(minutes=5), "live"), now)
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=1.0)
+
+    assert [r.client for r in report.perf_records] == ["live"]
+    # The stale file was never opened, so its lines were never even counted.
+    # Asserted before the counters below because a read-then-filter
+    # implementation also yields the right records -- only the work differs.
+    assert report.total_lines_parsed == 1
+    assert report.log_files_read == 1
+    assert report.log_files_skipped == 1
+
+
+def test_unwindowed_parse_still_reads_every_rotated_log(monkeypatch, tmp_path):
+    """`--hours 0` means "all data" and must not prune anything."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    now = datetime.now()
+    _write_log(
+        log_dir / "proxy.log.1",
+        _perf_line(now - timedelta(days=3), "stale"),
+        now - timedelta(days=3),
+    )
+    _write_log(log_dir / "proxy.log", _perf_line(now - timedelta(minutes=5), "live"), now)
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert {r.client for r in report.perf_records} == {"stale", "live"}
+    assert report.log_files_skipped == 0
+    assert report.log_files_read == 2
+
+
 def test_perf_csv_by_model(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "csv"])
@@ -238,6 +341,8 @@ def test_perf_csv_by_model(runner, monkeypatch):
     assert {r["model"] for r in rows} == {"claude-sonnet-4.5", "claude-opus-4-8"}
     sonnet = next(r for r in rows if r["model"] == "claude-sonnet-4.5")
     assert sonnet["tokens_saved"] == "600"
+    assert sonnet["prompt_reduction_tokens"] == "600"
+    assert sonnet["accounting_delta_tokens"] == "0"
 
 
 def test_perf_csv_raw_per_record(runner, monkeypatch):
@@ -358,3 +463,85 @@ def test_throughput_empty_and_percentiles():
     # _calculate_throughput_stats with empty records
     stats = _calculate_throughput_stats([], 10.0)
     assert stats["input_wall_clock"] == 0.0
+
+
+# ---- savings attributed to named sources -----------------------------------
+# The PERF line carried `savings=` and the parser decoded it from the start, but
+# nothing rendered it, so a paid extension's contribution was invisible in the
+# report operators actually read.
+
+
+def _savings_perf_line(encoded: str, req: int = 1) -> str:
+    return (
+        f"2026-08-31 16:00:0{req},000 - headroom.proxy - INFO - [hr_1_00000{req}] PERF "
+        "model=claude-haiku-4-5 msgs=12 tok_before=59343 tok_after=30613 "
+        "tok_saved=28730 tok_inflated=0 tool_saved=0 total_saved=28730 cache_read=0 "
+        "cache_write=0 cache_hit_pct=0 opt_ms=12 total_ms=900 tok_out=100 "
+        f"ttfb_ms=800 savings={encoded} transforms=turn_hook"
+    )
+
+
+def _report_for(lines: list[str], tmp_path, monkeypatch) -> str:
+    """Render a report over `lines`, using this file's established LOG_DIR seam.
+
+    Deliberately NOT `HEADROOM_WORKSPACE_DIR`: that env var flips which branch
+    resolves the log directory, which changes behaviour for the rotated-log
+    tests above.
+    """
+    from headroom.perf import analyzer
+
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "proxy.log").write_text("\n".join(lines) + "\n")
+    monkeypatch.setattr(analyzer, "LOG_DIR", logs)
+    return analyzer.format_report(analyzer.parse_log_files(last_n_hours=0))
+
+
+def test_dollar_only_source_is_reported_with_zero_tokens(tmp_path, monkeypatch):
+    """A router saves DOLLARS and exactly zero tokens; both must be legible.
+
+    routemegood sends the same tokens to a cheaper model, so every token-savings
+    channel records nothing for it. Rendering the $ beside a 0-token row is the
+    only honest option — folding them together would invent a saving.
+    """
+    from headroom.proxy.savings_attribution import encode
+
+    out = _report_for(
+        [
+            _savings_perf_line(
+                encode([{"source": "routemegood", "tokens": 0, "usd": 0.1257, "realized": True}])
+            )
+        ],
+        tmp_path,
+        monkeypatch,
+    )
+    assert "Savings by Source" in out
+    assert "routemegood" in out
+    assert "0 tokens" in out
+    assert "$0.13" in out
+
+
+def test_token_source_and_dollar_source_coexist(tmp_path, monkeypatch):
+    from headroom.proxy.savings_attribution import encode
+
+    out = _report_for(
+        [
+            _savings_perf_line(
+                encode(
+                    [
+                        {"source": "routemegood", "tokens": 0, "usd": 0.0431, "realized": True},
+                        {"source": "lossless_guard", "tokens": 2233, "usd": 0.0, "realized": True},
+                    ]
+                )
+            )
+        ],
+        tmp_path,
+        monkeypatch,
+    )
+    assert "routemegood" in out and "lossless_guard" in out
+    assert "2,233 tokens" in out
+
+
+def test_no_section_when_nothing_attributed(tmp_path, monkeypatch):
+    out = _report_for([_savings_perf_line("none")], tmp_path, monkeypatch)
+    assert "Savings by Source" not in out

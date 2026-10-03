@@ -69,6 +69,8 @@ use crate::observability::{
     observe_bedrock_invoke_latency, record_bedrock_eventstream_message, record_bedrock_invoke,
 };
 use crate::proxy::AppState;
+use crate::upstream_path::append_segments;
+use crate::ProxyError;
 // Phase F PR-F1 + PR-D3: pre-classified by `classify_and_attach_auth_mode`
 // middleware on the bedrock router; we read it back via the
 // `Extension<AuthMode>` extractor.
@@ -187,7 +189,20 @@ pub async fn handle_invoke_streaming(
 
     let upstream_url = match build_bedrock_streaming_upstream(&state, &model_id, &uri, action) {
         Ok(u) => u,
-        Err(msg) => {
+        // Client-caused: a model id the proxy would have to rewrite. 400,
+        // and nothing is signed or forwarded.
+        Err(ProxyError::InvalidPath(msg)) => {
+            tracing::warn!(
+                event = "bedrock_path_rejected",
+                request_id = %request_id,
+                model_id = %model_id,
+                error = %msg,
+                "bedrock invoke-streaming: refusing to forward a model id that would rewrite the upstream path"
+            );
+            return error_response(StatusCode::BAD_REQUEST, "bedrock_path_rejected", &msg);
+        }
+        Err(e) => {
+            let msg = e.to_string();
             tracing::error!(
                 event = "bedrock_endpoint_invalid",
                 request_id = %request_id,
@@ -905,28 +920,27 @@ fn run_anthropic_compression(
     }
 }
 
+/// Streaming twin of `invoke::build_bedrock_upstream`: same base
+/// resolution, same segment-safe path construction (see
+/// `crate::upstream_path`), so an ARN model id stays one `%2F` segment
+/// and a traversal attempt is rejected with `ProxyError::InvalidPath`.
 fn build_bedrock_streaming_upstream(
     state: &AppState,
     model_id: &str,
     uri: &Uri,
     action: &str,
-) -> Result<Url, String> {
+) -> Result<Url, ProxyError> {
     let base = match state.config.bedrock_endpoint.as_ref() {
         Some(u) => u.clone(),
         None => {
             let host =
                 BEDROCK_RUNTIME_HOST_TEMPLATE.replace("{region}", &state.config.bedrock_region);
-            Url::parse(&format!("https://{host}/"))
-                .map_err(|e| format!("bedrock derived base URL parse error: {e}"))?
+            Url::parse(&format!("https://{host}/")).map_err(|e| {
+                ProxyError::InvalidUpstream(format!("bedrock derived base URL parse error: {e}"))
+            })?
         }
     };
-    let path = format!(
-        "/model/{model_id}/{action}",
-        model_id = model_id,
-        action = action,
-    );
-    let mut joined = base;
-    joined.set_path(&path);
+    let mut joined = append_segments(&base, ["model", model_id, action])?;
     if let Some(q) = uri.query() {
         joined.set_query(Some(q));
     }
@@ -1014,6 +1028,7 @@ mod tests {
             // PR-E6: drift detector is unused by this URL-builder
             // unit test; small capacity to satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             // PR-D4: unit tests for the Bedrock URL builder don't
             // touch the Vertex route, but `AppState` is one struct
             // — supply a dummy token source so the test compiles.
@@ -1056,6 +1071,7 @@ mod tests {
             client: reqwest::Client::new(),
             bedrock_credentials: None,
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            beta_sticky: crate::cache_stabilization::beta_sticky::BetaStickyState::new(8),
             vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
                 "test".to_string(),
             )),

@@ -56,6 +56,32 @@ def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def _container_runtime_is_podman() -> bool:
+    """Best-effort: is the ``docker`` command actually Podman?
+
+    Rootless Podman maps the host user to container UID 0, so the
+    ``--user <host-uid>:<host-gid>`` flag that is correct for Docker instead
+    selects a subordinate UID that owns none of the bind-mounted host
+    directories, and every write into ``~/.headroom`` fails (#2804). Detect the
+    common ``docker -> podman`` shim (e.g. NixOS
+    ``/run/current-system/sw/bin/docker -> podman``) by resolving the binary and
+    checking its real name. ``HEADROOM_CONTAINER_RUNTIME`` (``podman`` / ``docker``)
+    is an explicit override for setups the symlink heuristic cannot see, such as a
+    wrapper script. No subprocess is spawned.
+    """
+    override = os.environ.get("HEADROOM_CONTAINER_RUNTIME", "").strip().lower()
+    if override:
+        return override == "podman"
+    resolved = shutil.which("docker")
+    if not resolved:
+        return False
+    try:
+        real = os.path.realpath(resolved)
+    except OSError:
+        real = resolved
+    return "podman" in os.path.basename(real).lower()
+
+
 def _deployment_env(manifest: DeploymentManifest) -> dict[str, str]:
     return {
         "HEADROOM_DEPLOYMENT_PROFILE": manifest.profile,
@@ -136,10 +162,21 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
     if docker_gpus:
         command.extend(["--gpus", docker_gpus])
     if not _is_windows():
-        getuid = getattr(os, "getuid", None)
-        getgid = getattr(os, "getgid", None)
-        if callable(getuid) and callable(getgid):
-            command.extend(["--user", f"{getuid()}:{getgid()}"])
+        podman = _container_runtime_is_podman()
+        if podman:
+            # keep-id maps the host UID/GID to the same IDs in the container;
+            # --user alone would select subordinate host IDs (#2804). Also set
+            # the process user below: Podman versions such as 5.4.2 otherwise
+            # honor USER root from the image, creating files as a subordinate
+            # host UID even with keep-id (#3569). Docker already maps IDs 1:1.
+            command.append("--userns=keep-id")
+        # macOS Podman runs remotely in a VM whose user IDs may differ from
+        # the client's; retain its existing keep-id-only behavior.
+        if not podman or sys.platform.startswith("linux"):
+            getuid = getattr(os, "getuid", None)
+            getgid = getattr(os, "getgid", None)
+            if callable(getuid) and callable(getgid):
+                command.extend(["--user", f"{getuid()}:{getgid()}"])
     runtime_env = {**manifest.base_env, **_deployment_env(manifest)}
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
@@ -356,6 +393,17 @@ def wait_ready(manifest: DeploymentManifest, timeout_seconds: int = 30) -> bool:
             return True
         time.sleep(1)
     return False
+
+
+def wait_stopped(manifest: DeploymentManifest, timeout_seconds: int = 15) -> bool:
+    """Wait for the deployment's health endpoint to stop answering."""
+
+    deadline = time.monotonic() + timeout_seconds
+    while probe_ready(manifest.health_url):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+    return True
 
 
 def runtime_status(manifest: DeploymentManifest) -> str:
