@@ -8,6 +8,7 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections import OrderedDict
 from datetime import datetime
@@ -20,6 +21,31 @@ from headroom.proxy.models import CacheEntry
 from headroom.proxy.semantic_cache_key_policy import compute_semantic_cache_key, strip_cache_control
 
 _strip_cache_control = strip_cache_control
+
+
+def _is_cacheable_reply(response_body: bytes) -> bool:
+    """Whether a 200 body is a reply the cache may replay.
+
+    The status code alone does not say so: an Anthropic- or OpenAI-compatible
+    gateway can answer 200 with an error object, or with nothing. Stored, that
+    body is replayed to every matching request for the full TTL and the
+    upstream is never asked again. Refuse an empty body, and JSON that is not a
+    non-empty object or that carries an error (Anthropic ``"type": "error"``,
+    OpenAI ``"error": {...}``). Bytes that are not JSON pass: the cache is
+    format-agnostic, and both handlers only store a reply they have decoded.
+    """
+    if not response_body:
+        return False
+    try:
+        reply = json.loads(response_body)
+    except ValueError:
+        return True
+    return (
+        isinstance(reply, dict)
+        and bool(reply)
+        and reply.get("type") != "error"
+        and reply.get("error") is None
+    )
 
 
 class SemanticCache:
@@ -83,6 +109,9 @@ class SemanticCache:
     ):
         """Cache a response."""
         key = self._compute_key(messages, model, **key_fields)
+
+        if not _is_cacheable_reply(response_body):
+            return
 
         async with self._lock:
             # If key already exists, remove it first to update position
