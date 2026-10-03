@@ -4034,6 +4034,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
                     _apply_security_headers(rejection)
                     return rejection
+                # The caller proved it holds the proxy token. The rate limiter
+                # keys authenticated callers per credential and everyone else
+                # per peer (headroom/proxy/rate_limit_identity.py).
+                request.state.proxy_authenticated = True
 
         # The credential has done its job; take it off the request so no handler
         # can forward it upstream. Runs on the exempt paths too, since a loopback
