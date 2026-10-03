@@ -3580,7 +3580,16 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        original_client_messages = copy.deepcopy(messages)
+        # O1 (2026-09-27 perf audit): the snapshot of the original
+        # conversation aliases the live list unless hooks or pipeline
+        # extensions are configured; those can mutate `messages` in place
+        # (pre_compress receives the live list), so then it is an
+        # independently owned copy (see snapshot_original_messages).
+        from headroom.proxy.helpers import snapshot_original_messages
+
+        original_client_messages = snapshot_original_messages(
+            messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+        )
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = self._resolve_openai_upstream(request)
         handler_path_suffix = _resolve_openai_chat_handler_path(
@@ -3604,7 +3613,9 @@ class OpenAIHandlerMixin:
         )
         if input_event.messages is not None:
             messages = input_event.messages
-            original_client_messages = copy.deepcopy(messages)
+            original_client_messages = snapshot_original_messages(
+                messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+            )
         if input_event.tools is not None:
             body["tools"] = input_event.tools
 

@@ -1113,12 +1113,25 @@ class AnthropicHandlerMixin:
             # aborting multi-turn sessions. Canonicalizing here (in place, so body,
             # original, forwarded, and the recorded/replayed prefix are all identical)
             # keeps it cache-safe: overlay_cached_prefix replays the same stripped bytes.
+            # (Also applied in read_request_json_with_bytes for every parsed request;
+            # the re-run here is idempotent and covers paths that bypass that helper.)
             _strip_streaming_only_content_fields(messages)
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
             pipeline_stream = bool(body.get("stream", False) or force_stream)
+            # O1 (2026-09-27 perf audit): the snapshot of the original
+            # conversation aliases the live list unless hooks or pipeline
+            # extensions are configured - those can mutate `messages` in place
+            # (pre_compress receives the live list), so then the snapshot is an
+            # independently owned copy (snapshot_original_messages). The
+            # deep_copy stage is always measured so the timing summary keeps
+            # its key.
+            from headroom.proxy.helpers import snapshot_original_messages
+
             with stage_timer.measure("deep_copy"):
-                original_client_messages = copy.deepcopy(messages)
+                original_client_messages = snapshot_original_messages(
+                    messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+                )
             input_event = self.pipeline_extensions.emit(
                 PipelineStage.INPUT_RECEIVED,
                 operation="proxy.request",
@@ -1132,7 +1145,9 @@ class AnthropicHandlerMixin:
             if input_event.messages is not None:
                 messages = input_event.messages
                 with stage_timer.measure("deep_copy"):
-                    original_client_messages = copy.deepcopy(messages)
+                    original_client_messages = snapshot_original_messages(
+                        messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+                    )
             if input_event.tools is not None:
                 body["tools"] = input_event.tools
 
@@ -5375,6 +5390,9 @@ class AnthropicHandlerMixin:
         compressed_requests = []
         pipeline_timing: dict[str, float] = {}
 
+        # O1 (2026-09-27 perf audit): the per-request snapshot aliases unless
+        # hooks or extensions are configured (see the main handler).
+        from headroom.proxy.helpers import snapshot_original_messages
         from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
 
         # Apply compression to each request in the batch
@@ -5384,7 +5402,9 @@ class AnthropicHandlerMixin:
             canonical_params = dict(params)
             original_tools = canonical_params.get("tools")
             messages = params.get("messages", [])
-            original_messages = copy.deepcopy(messages)
+            original_messages = snapshot_original_messages(
+                messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+            )
             model = params.get("model", "unknown")
             cache_ttl_seconds = anthropic_cache_ttl_seconds(
                 model, original_messages, params.get("system")
