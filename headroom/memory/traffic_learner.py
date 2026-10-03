@@ -1511,7 +1511,9 @@ class TrafficLearner:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         def _bump() -> bool:
-            conn = sqlite3.connect(str(db_path))
+            from ..fileperms import connect_private_sqlite
+
+            conn = connect_private_sqlite(db_path, what="memory store")
             try:
                 cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
