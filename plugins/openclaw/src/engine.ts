@@ -9,7 +9,7 @@
 
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
-import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import { agentToOpenAIIndexed, normalizeAgentMessages, restoreAgentMessages } from "./convert.js";
 import { DurableAdvancementKeyStore, defaultCommitLogPath } from "./advancement-key-store.js";
 import {
   delegateCompactionToRuntime,
@@ -104,7 +104,9 @@ export class HeadroomContextEngine {
   /**
    * Assemble context for the model — THE CORE HOOK.
    *
-   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]
+   * Converts AgentMessage[] → OpenAI format → compress() → AgentMessage[]. Only messages the proxy
+   * actually changed are rebuilt; the rest are returned exactly as OpenClaw passed them, so the
+   * provider prompt cache survives up to the first compressed message (see restoreAgentMessages).
    */
   async assemble(params: {
     sessionId: string;
@@ -128,14 +130,15 @@ export class HeadroomContextEngine {
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
 
-    const openaiMessages = agentToOpenAI(params.messages);
-    const minContextChars = this.config.minContextChars ?? 800;
-    if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
-      this.logger.debug("[headroom] Context below compression threshold — using original messages");
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
-    }
-
     try {
+      // Convert AgentMessage → OpenAI format
+      const openaiMessages = agentToOpenAIIndexed(params.messages);
+      const minContextChars = this.config.minContextChars ?? 800;
+      if (minContextChars > 0 && countContextChars(openaiMessages) < minContextChars) {
+        this.logger.debug("[headroom] Context below compression threshold — using original messages");
+        return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      }
+
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
       const result = await compress(openaiMessages, {
         model: params.model ?? "claude-sonnet-4-5",
@@ -156,7 +159,7 @@ export class HeadroomContextEngine {
       }
 
       // Convert back to AgentMessage format
-      const compressedAgentMessages = openAIToAgent(result.messages);
+      const compressedAgentMessages = restoreAgentMessages(params.messages, openaiMessages, result.messages);
       this.resetCircuit();
 
       // Track stats
@@ -347,7 +350,7 @@ export class HeadroomContextEngine {
   }
 }
 
-function countContextChars(messages: ReturnType<typeof agentToOpenAI>): number {
+function countContextChars(messages: ReturnType<typeof agentToOpenAIIndexed>): number {
   let total = 0;
   for (const message of messages) {
     total += message.content?.length ?? 0;

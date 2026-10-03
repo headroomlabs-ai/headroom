@@ -32,6 +32,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from headroom.proxy.public_errors import tool_result_error
+
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
 
@@ -1145,7 +1147,7 @@ To SAVE: create /memories/<topic>.txt "content"
                 return json.dumps({"error": f"Unknown tool: {tool_name}"})
         except Exception as e:
             logger.error(f"MemoryToolAdapter: Tool {tool_name} failed: {e}")
-            return json.dumps({"status": "error", "error": str(e)})
+            return json.dumps(tool_result_error(e))
 
     async def _execute_save(self, input_data: dict[str, Any], user_id: str) -> str:
         """Execute memory_save tool."""
