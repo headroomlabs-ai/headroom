@@ -78,8 +78,14 @@ def test_vertex_target_for_location_uses_rep_hostname_for_multi_region() -> None
     assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "eu") == (
         "https://aiplatform.eu.rep.googleapis.com"
     )
+
+
+def test_vertex_target_for_location_falls_back_for_unsupported_bare_word_locations() -> None:
     assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "asia") == (
-        "https://aiplatform.asia.rep.googleapis.com"
+        "https://asia-aiplatform.googleapis.com"
+    )
+    assert vertex_target_for_location(DEFAULT_VERTEX_API_URL, "foo") == (
+        "https://foo-aiplatform.googleapis.com"
     )
 
 

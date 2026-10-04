@@ -18,6 +18,10 @@ _VERTEX_GLOBAL_API_URL = "https://aiplatform.googleapis.com"
 # port, path, or URL-fragment delimiter into the interpolated hostname.
 _VERTEX_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+# The only documented Vertex multi-region ids; an explicit allowlist since a
+# future bare-word location need not be one.
+_VERTEX_MULTI_REGION_LOCATIONS = frozenset({"us", "eu"})
+
 VERTEX_GOOGLE_PUBLISHER = "google"
 VERTEX_ANTHROPIC_PUBLISHER = "anthropic"
 VERTEX_GOOGLE_PROVIDER_NAME = "vertex:google"
@@ -82,7 +86,6 @@ def vertex_target_for_location(configured_target: str, location: str) -> str:
         return configured_target
     if not location or location == "global" or not _VERTEX_REGION_RE.match(location):
         return _VERTEX_GLOBAL_API_URL
-    if "-" not in location:
-        # multi-region ("us", "eu"): bare word, unlike hyphenated regions
+    if location in _VERTEX_MULTI_REGION_LOCATIONS:
         return f"https://aiplatform.{location}.rep.googleapis.com"
     return f"https://{location}-aiplatform.googleapis.com"
