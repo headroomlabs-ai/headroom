@@ -74,7 +74,10 @@ export class HeadroomContextEngine {
     compactions: 0,
   };
   private circuit = { errors: 0, openUntilMs: 0 };
-  private hasAnnouncedCompression = false;
+  // Sessions shown the compression notice. Bounded via insertion-order
+  // eviction — no session lifecycle callback exists here to bound it otherwise.
+  private announcedSessions = new Set<string>();
+  private static readonly MAX_ANNOUNCED_SESSIONS = 1000;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -162,10 +165,10 @@ export class HeadroomContextEngine {
       );
 
       const shouldAnnounceCompression =
-        (this.hasAnnouncedCompression || result.tokensSaved > 100) &&
+        (this.hasAnnouncedCompression(params.sessionId) || result.tokensSaved > 100) &&
         this.config.announceCompression !== false;
       if (shouldAnnounceCompression) {
-        this.hasAnnouncedCompression = true;
+        this.markCompressionAnnounced(params.sessionId);
       }
 
       if (!result.compressed || result.tokensSaved === 0) {
@@ -304,6 +307,19 @@ export class HeadroomContextEngine {
 
   private resetCircuit(): void {
     this.circuit = { errors: 0, openUntilMs: 0 };
+  }
+
+  private hasAnnouncedCompression(sessionId: string): boolean {
+    return this.announcedSessions.has(sessionId);
+  }
+
+  private markCompressionAnnounced(sessionId: string): void {
+    if (this.announcedSessions.has(sessionId)) return;
+    if (this.announcedSessions.size >= HeadroomContextEngine.MAX_ANNOUNCED_SESSIONS) {
+      const oldest = this.announcedSessions.values().next().value;
+      if (oldest !== undefined) this.announcedSessions.delete(oldest);
+    }
+    this.announcedSessions.add(sessionId);
   }
 
   ensureProxyStarted(): void {

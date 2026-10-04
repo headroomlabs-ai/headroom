@@ -508,4 +508,50 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
 
     expect(result.systemPromptAddition).toBeUndefined();
   });
+
+  it("does not leak a session's announcement to a different session on the same engine", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    const sessionA = await engine.assemble({ sessionId: "a", messages });
+    const sessionB = await engine.assemble({ sessionId: "b", messages });
+
+    expect(sessionA.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(sessionB.systemPromptAddition).toBeUndefined();
+  });
+
+  it("keeps announcing for the session that earned the notice even after another session is seen", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    await engine.assemble({ sessionId: "a", messages });
+    await engine.assemble({ sessionId: "b", messages });
+    const sessionAAgain = await engine.assemble({ sessionId: "a", messages });
+
+    expect(sessionAAgain.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("evicts the oldest tracked session once the announced-session bound is exceeded", async () => {
+    vi.mocked(compress).mockResolvedValue(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    for (let i = 0; i < 1000; i++) {
+      await engine.assemble({ sessionId: `session-${i}`, messages });
+    }
+    const overflow = await engine.assemble({ sessionId: "session-overflow", messages });
+
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+    const oldest = await engine.assemble({ sessionId: "session-0", messages });
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+    const newest = await engine.assemble({ sessionId: "session-overflow", messages });
+
+    expect(overflow.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(oldest.systemPromptAddition).toBeUndefined();
+    expect(newest.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
 });
