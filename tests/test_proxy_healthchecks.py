@@ -88,6 +88,8 @@ def test_health_preserves_backwards_compatible_config_payload(client):
     assert config["max_items_after_crush"] == 50
     assert config["smart_crusher_with_compaction"] is None
     assert isinstance(config["pid"], int)
+    # `headroom wrap` reads this on proxy reuse to warn on a mode mismatch.
+    assert config["mode"] in ("token", "cache")
 
 
 def test_health_reports_agent_savings_config():
