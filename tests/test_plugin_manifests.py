@@ -81,6 +81,10 @@ def test_plugin_hooks_share_anchored_launcher_and_rootless_tail() -> None:
         "exec headroom init hook ensure'"
     )
     assert commands == [expected, expected]
+    powershell = [
+        entry["hooks"][0]["powershell"] for entries in hooks["hooks"].values() for entry in entries
+    ]
+    assert powershell == ["headroom init hook ensure", "headroom init hook ensure"]
     assert hooks["hooks"]["SessionStart"][0]["matcher"] == "startup|resume"
     assert hooks["hooks"]["PreToolUse"][0]["matcher"] == "Bash|PowerShell"
     launcher = REPO_ROOT / "plugins/headroom-agent-hooks/bin/headroom-hook.sh"
