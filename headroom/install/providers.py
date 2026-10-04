@@ -68,17 +68,28 @@ def _apply_unix_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]
     try:
         for path in targets:
             path.parent.mkdir(parents=True, exist_ok=True)
-            previous.append((path, fsutil.read_text(path) if path.exists() else None))
+            original = fsutil.read_text(path) if path.exists() else None
             merged = _merge_marker_block(path, block, _ENV_PATTERN, _ENV_MARKER_START)
             fsutil.write_text(path, merged)
+            # write_text is atomic, so only completed writes need restoring.
+            previous.append((path, original))
             mutations.append(ManagedMutation(target="env", kind="shell-block", path=str(path)))
-    except Exception:
+    except Exception as exc:
         # Restore prior contents so a reapply keeps the existing routing.
+        rollback_errors: list[str] = []
         for path, content in reversed(previous):
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                fsutil.write_text(path, content)
+            try:
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    fsutil.write_text(path, content)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{path}: {rollback_exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"shell environment update failed: {exc}; "
+                f"rollback failed: {'; '.join(rollback_errors)}"
+            ) from exc
         raise
     return mutations
 

@@ -1041,3 +1041,31 @@ def test_unix_env_failure_restores_previous_shell_contents(monkeypatch, tmp_path
         providers._apply_unix_env_scope(manifest)
     assert bashrc.read_text(encoding="utf-8") == previous
     assert not zshrc.exists()
+
+
+def test_unix_env_failure_restores_earlier_targets_when_existing_target_rejects_writes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    bashrc.write_text("# bash\n", encoding="utf-8")
+    zshrc.write_text("# zsh\n", encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("read-only")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="read-only"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == "# bash\n"
+    assert zshrc.read_text(encoding="utf-8") == "# zsh\n"
