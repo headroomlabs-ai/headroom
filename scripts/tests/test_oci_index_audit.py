@@ -181,6 +181,42 @@ def test_non_linux_and_unknown_descriptors_are_not_runnable() -> None:
     assert audit_oci_index(observed).ignored_attestations == 1
 
 
+@pytest.mark.parametrize(
+    "media_type",
+    [
+        "application/vnd.oci.artifact.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+        None,
+    ],
+)
+def test_platform_descriptors_that_are_not_image_manifests_are_not_runnable(
+    media_type: str | None,
+) -> None:
+    artifacts = [
+        descriptor("linux", "amd64", "amd64-artifact"),
+        descriptor("linux", "arm64", "arm64-artifact"),
+    ]
+    for entry in artifacts:
+        if media_type is None:
+            del entry["mediaType"]
+        else:
+            entry["mediaType"] = media_type
+
+    with pytest.raises(OCIIndexAuditError, match="linux/amd64=0, linux/arm64=0"):
+        audit_oci_index(index(*artifacts))
+
+
+def test_docker_v2_image_manifests_are_runnable() -> None:
+    images = [
+        descriptor("linux", "amd64", "amd64-image"),
+        descriptor("linux", "arm64", "arm64-image"),
+    ]
+    for entry in images:
+        entry["mediaType"] = "application/vnd.docker.distribution.manifest.v2+json"
+
+    assert audit_oci_index(index(*images)).counts == {"linux/amd64": 1, "linux/arm64": 1}
+
+
 def test_malformed_index_fails() -> None:
     with pytest.raises(OCIIndexAuditError, match="manifests array"):
         audit_oci_index({})

@@ -19,6 +19,15 @@ EXPECTED_PLATFORMS = ("linux/amd64", "linux/arm64")
 ATTESTATION_REFERENCE_TYPE_ANNOTATION = "vnd.docker.reference.type"
 ATTESTATION_REFERENCE_TYPE = "attestation-manifest"
 
+# A platform-matched descriptor counts as runnable only if it points at an image
+# manifest; an artifact or nested index on that platform is not a pullable image.
+IMAGE_MANIFEST_MEDIA_TYPES = frozenset(
+    {
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+    }
+)
+
 
 class OCIIndexAuditError(ValueError):
     """Raised when an OCI index does not have one runnable descriptor per platform."""
@@ -75,7 +84,10 @@ def _runnable_descriptors_by_platform(
         if _is_annotated_attestation(descriptor):
             continue
         platform = _platform_name(descriptor)
-        if platform in expected_platforms:
+        if (
+            platform in expected_platforms
+            and descriptor.get("mediaType") in IMAGE_MANIFEST_MEDIA_TYPES
+        ):
             grouped[platform].append(descriptor)
     return {platform: grouped.get(platform, []) for platform in expected_platforms}
 
