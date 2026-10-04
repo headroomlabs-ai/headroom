@@ -53,7 +53,9 @@ Garden before they serve.
 
 When Vertex rejects a request, Headroom appends a `[headroom] hint: ...` note to
 `error.message` (also emitted as an `x-headroom-hint` header and a proxy WARNING)
-naming the likely fix.
+naming the likely fix. Hints are fixed text and never echo the request path,
+project, credentials or exception detail; raw provider errors stay in the proxy
+log.
 
 ## Gemini On Vertex
 

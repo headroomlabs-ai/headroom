@@ -61,9 +61,38 @@ class TestVertexErrorHint:
         kwargs = {"location": "global", "publisher": "google", "model": "m"}
         assert vertex_error_hint(403, **kwargs) == vertex_error_hint(404, **kwargs)
 
-    def test_hint_names_the_failing_triple(self):
-        hint = vertex_error_hint(404, location="europe-west2", publisher="google", model="gem")
-        assert "google/gem @ europe-west2" in hint
+    @pytest.mark.parametrize(
+        "hostile",
+        ["c\r\nX-Injected: 1", "caf\u00e9", "secret-proj-123", "<script>alert(1)</script>"],
+    )
+    @pytest.mark.parametrize("status", [401, 403, 404, 429])
+    def test_hint_never_echoes_client_path_params(self, hostile, status):
+        """Path params are client-supplied; the hint is fixed text by construction."""
+        hint = vertex_error_hint(status, location=hostile, publisher="google", model=hostile)
+        assert hostile not in hint
+        assert hint.isascii()
+        assert "\r" not in hint and "\n" not in hint
+
+
+class TestAnnotateVertexErrorHostileParams:
+    def test_crlf_model_cannot_reach_header_or_body(self):
+        body = json.dumps({"error": {"code": 404, "message": "not found"}}).encode()
+        evil = "m\r\nX-Injected: 1"
+        resp = annotate_vertex_error(
+            _FakeResponse(404, body), location=evil, publisher="google", model=evil
+        )
+        header = resp.headers[HINT_HEADER]
+        assert "X-Injected" not in header
+        assert header.isascii() and "\r" not in header and "\n" not in header
+        assert "X-Injected" not in json.loads(resp.body)["error"]["message"]
+
+    def test_hint_header_is_latin1_encodable(self):
+        """h11 rejects non-latin-1 / control bytes at send time, after we return."""
+        for status in (401, 403, 404, 429):
+            for publisher in ("google", "anthropic", ""):
+                hint = vertex_error_hint(status, publisher=publisher)
+                hint.encode("latin-1")
+                assert all(ch >= " " for ch in hint)
 
 
 class TestAnnotateVertexError:

@@ -956,6 +956,12 @@ response header, and logs a warning. The hint names the likely cause — expired
 ADC, a partner model not yet enabled in Model Garden, or a model that is not
 served in the requested location. Successful responses are never modified.
 
+Hints are fixed text: they never echo your request path, project, credentials or
+the underlying exception. With `--backend vertex`, a backend that cannot serve
+(missing Vertex SDK, no ADC) returns the standard sanitized proxy error plus the
+same kind of fixed hint; the raw provider detail is only in the proxy log, under
+the response's `request_id`.
+
 ### Bedrock via a local gateway
 
 `--backend bedrock` accepts **Anthropic** input (`/v1/messages`) and re-signs to AWS. Some setups are the other way around: the client already speaks **Bedrock** (e.g. Claude Code with `CLAUDE_CODE_USE_BEDROCK=1`, or any AWS SDK pointed at a custom endpoint), sending `POST /model/{id}/invoke` to a local gateway that re-signs and forwards to AWS (LiteLLM, LocalStack, a corporate Bedrock proxy).

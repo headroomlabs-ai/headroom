@@ -152,28 +152,30 @@ def vertex_error_hint(
     """Return an actionable hint for a Vertex failure, or None if we have none.
 
     Pure and side-effect free so it can be unit tested without a live upstream.
+    The returned text is always one of the fixed constants above: ``publisher``
+    only *selects* a remedy and nothing from the path is interpolated, because
+    the hint reaches a client header and error body (public_errors contract:
+    client-facing error text is fixed by construction). ``location`` and
+    ``model`` are accepted for logging by the caller, never echoed here.
     """
     if status_code not in _EXPLAINABLE:
         return None
 
-    where = f"{publisher or 'unknown'}/{model or 'unknown'} @ {location or 'unknown'}"
-    partner = _is_anthropic(publisher)
-
     if status_code == 401:
-        return f"{where}: {_ADC_REFRESH}"
+        return _ADC_REFRESH
 
     if status_code == 429:
-        return f"{where}: {_QUOTA}"
+        return _QUOTA
 
     # 403 and 404 are the same user-facing problem wearing two hats: the project
     # cannot serve this model here. Which remedy applies depends on publisher.
     parts = [_ENABLE_API]
-    if partner:
+    if _is_anthropic(publisher):
         parts.append(_ENABLE_PARTNER)
         parts.append(_LOCATION_CLAUDE)
     else:
         parts.append(_LOCATION_GEMINI)
-    return f"{where}: " + " ".join(parts)
+    return " ".join(parts)
 
 
 def annotate_vertex_error(
@@ -205,7 +207,11 @@ def annotate_vertex_error(
     except Exception:  # pragma: no cover - exotic Response implementations
         pass
 
-    logger.warning("vertex upstream %s -- %s", status, hint)
+    # Path params are client-supplied: %r keeps CR/LF and other control bytes
+    # from forging log lines. They go to the server log only.
+    logger.warning(
+        "vertex upstream %s for %r/%r @ %r -- %s", status, publisher, model, location, hint
+    )
 
     try:
         response.headers[HINT_HEADER] = hint
