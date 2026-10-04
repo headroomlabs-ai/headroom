@@ -367,6 +367,81 @@ def _classify_history_canonical(
     )
 
 
+_TRANSIENT_SYSTEM_LINEAGE_ENV = "HEADROOM_TRANSIENT_SYSTEM_LINEAGE"
+
+
+def _transient_system_lineage_enabled() -> bool:
+    return os.environ.get(_TRANSIENT_SYSTEM_LINEAGE_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _extends_past_system_tail(current_messages: list[Any], previous_messages: list[Any]) -> bool:
+    """Whether ``current`` continues ``previous`` once its trailing system turn is set aside.
+
+    Claude Code ends some requests with a ``role:"system"`` reminder and
+    replaces it on the next turn, so the recorded history is never a prefix of
+    the new one.  Only that last message is excluded: everything before it
+    must survive unchanged and include real user/assistant history, so a
+    changed leading or historical system instruction still diverges, and the
+    new history must be longer, so a sibling that only swaps the final
+    instruction is not a continuation.
+    """
+    if len(previous_messages) < 2 or len(current_messages) <= len(previous_messages):
+        return False
+    tail = previous_messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "system":
+        return False
+    stable = previous_messages[:-1]
+    return current_messages[: len(stable)] == stable and any(
+        isinstance(message, dict) and message.get("role") in ("user", "assistant")
+        for message in stable
+    )
+
+
+def _replaced_system_tail_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Cache-stable split for a request that replaced the previous trailing system turn.
+
+    The handlers record the model's reply after the request it answered, so the
+    replaced reminder is the last recorded message or sits right before that
+    reply.  It is left out of the replayed prefix (it is not in this request);
+    every other recorded message must match ``current`` position for position.
+    """
+    if not _transient_system_lineage_enabled() or len(previous_forwarded_messages) != len(
+        previous_original_messages
+    ):
+        return None
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_original_messages))
+    if len(current) != len(current_messages) or len(previous) != len(previous_original_messages):
+        # The projection dropped a directive-only message; raw indices would shift.
+        return None
+    for request_len in (len(previous), len(previous) - 1):
+        reply = previous[request_len:]
+        if reply and not (isinstance(reply[0], dict) and reply[0].get("role") == "assistant"):
+            continue
+        reminder = request_len - 1
+        if (
+            _extends_past_system_tail(current, previous[:request_len])
+            and current[reminder : reminder + len(reply)] == reply
+        ):
+            return (
+                copy.deepcopy(
+                    previous_forwarded_messages[:reminder]
+                    + previous_forwarded_messages[request_len:]
+                ),
+                copy.deepcopy(current_messages[reminder + len(reply) :]),
+            )
+    return None
+
+
 def classify_history_relation(
     current_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
@@ -427,10 +502,18 @@ def extract_cache_stable_delta(
     This is a COMPARISON + slice only: the returned prefix is the previously-forwarded
     bytes verbatim and the delta is the raw appended messages — never a rebuild from the
     canonical projection — so the projection dropping non-semantic fields is safe.
+
+    A previous request that ended in a ``role:"system"`` reminder the client has since
+    replaced also qualifies: its forwarded bytes are replayed without that reminder
+    (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
     relation = classify_history_relation(current_messages, previous_original_messages)
+    if relation.kind == RELATION_DIVERGED:
+        return _replaced_system_tail_delta(
+            current_messages, previous_original_messages, previous_forwarded_messages
+        )
     if relation.kind not in (RELATION_EXACT, RELATION_MESSAGE_APPEND):
         # A same-message block append needs a block-level splice in
         # ``overlay_cached_prefix``; slicing only whole messages would silently
@@ -1433,7 +1516,10 @@ class SessionTrackerStore:
         where a large leading run and two-block identity suffix survive while
         the middle tail is regenerated; all other rewrites start a fresh
         lineage. This keeps #2671's stable cache boundary attached without
-        merging unrelated parallel sub-calls.
+        merging unrelated parallel sub-calls. When nothing else matches, an
+        Anthropic chain whose trailing ``role:"system"`` reminder the client
+        replaced is matched on the history before that reminder
+        (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
         Byte-identical histories (templated fan-outs before they diverge)
         intentionally share a tracker: their provider cache line is identical
         too, so sharing is harmless.
@@ -1527,6 +1613,28 @@ class SessionTrackerStore:
                 len(rewrite_candidates) == 1 or rewrite_candidates[0][0] != rewrite_candidates[1][0]
             ):
                 best_key = rewrite_candidates[0][1]
+            elif (
+                not rewrite_candidates
+                and provider == "anthropic"
+                and _transient_system_lineage_enabled()
+            ):
+                # Nothing matched as recorded.  A chain whose only change is
+                # its replaced trailing system reminder is still this
+                # conversation; without it every such turn starts a cold
+                # tracker, the confirmed prefix is not replayed, and any
+                # recompressed history re-writes the provider cache.  Only a
+                # unique longest chain qualifies, so equal-length siblings
+                # that differ in their reminder stay separate.
+                tail_candidates = [
+                    (len(chain), key)
+                    for key, chain in by_length
+                    if self._lineage_affinities.get(key) == cache_affinity
+                    and _extends_past_system_tail(snap, chain)
+                ]
+                if tail_candidates and (
+                    len(tail_candidates) == 1 or tail_candidates[0][0] != tail_candidates[1][0]
+                ):
+                    best_key = tail_candidates[0][1]
 
         if best_key is None:
             cap = self._default_config.max_lineages_per_session
