@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -240,14 +241,17 @@ describe("withHeadroom", () => {
       provider: "test-provider",
       modelId: "test-model",
       supportedUrls: {},
-      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
-      // maps over `content`, so the fixture must carry it.
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
         content: [{ type: "text", text: "response" }],
-        finishReason: "stop",
-        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 5, text: 5, reasoning: undefined },
+        },
         warnings: [],
-      }),
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 
@@ -279,14 +283,17 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
-      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
-      // maps over `content`, so the fixture must carry it.
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
         content: [{ type: "text", text: "ok" }],
-        finishReason: "stop",
-        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 5, noCache: 5, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 3, text: 3, reasoning: undefined },
+        },
         warnings: [],
-      }),
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 
@@ -315,14 +322,17 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
-      // A LanguageModelV3 result: `ai` >= 7.0.119 wraps v3 models in a v4 adapter that
-      // maps over `content`, so the fixture must carry it.
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
         content: [{ type: "text", text: "ok" }],
-        finishReason: "stop",
-        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 5, noCache: 5, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 3, text: 3, reasoning: undefined },
+        },
         warnings: [],
-      }),
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 
