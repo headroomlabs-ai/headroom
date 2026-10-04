@@ -112,6 +112,38 @@ def test_learn_exits_cleanly_when_model_detection_fails(
     assert "Error: no model" in result.output
 
 
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [
+        (["learn"], {"HEADROOM_LEARN_CLI": "agy"}),
+        (["learn", "--model", "agy-cli"], {}),
+    ],
+)
+def test_learn_agy_without_unsafe_opt_in_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, args: list[str], env: dict[str, str]
+) -> None:
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "HEADROOM_LEARN_CLI",
+        "HEADROOM_LEARN_ALLOW_UNSAFE_AGY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    monkeypatch.setattr(
+        "headroom.learn.registry.auto_detect_plugins",
+        lambda: pytest.fail("sessions must not be scanned without the agy opt-in"),
+    )
+
+    result = runner.invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1" in result.output
+
+
 def test_learn_auto_agent_reports_no_detected_plugins(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner
 ) -> None:
