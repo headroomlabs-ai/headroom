@@ -33,6 +33,7 @@ from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
+from headroom.providers.vertex import backend_error_hint
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
     build_anthropic_upstream_url,
@@ -50,7 +51,6 @@ from headroom.proxy.buffered_ccr_response import (
     DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
     buffered_ccr_asgi_call,
 )
-from headroom.providers.vertex import annotate_backend_error_body, backend_error_hint
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
@@ -3679,12 +3679,7 @@ class AnthropicHandlerMixin:
                         if backend_response.error:
                             return JSONResponse(
                                 status_code=backend_response.status_code,
-                                content=annotate_backend_error_body(
-                                    backend_response.body,
-                                    backend_response.status_code,
-                                    logger=logger,
-                                    request_id=request_id,
-                                ),
+                                content=backend_response.body,
                             )
 
                         # Track metrics
@@ -3836,12 +3831,7 @@ class AnthropicHandlerMixin:
 
                         return JSONResponse(
                             status_code=backend_response.status_code,
-                            content=annotate_backend_error_body(
-                                backend_response.body,
-                                backend_response.status_code,
-                                logger=logger,
-                                request_id=request_id,
-                            ),
+                            content=backend_response.body,
                         )
                 except Exception as e:
                     error_message = format_exception_message(e)

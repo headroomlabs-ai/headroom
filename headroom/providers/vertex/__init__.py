@@ -2,10 +2,10 @@
 
 from .diagnostics import (
     HINT_HEADER,
-    annotate_backend_error_body,
     annotate_vertex_error,
     backend_error_hint,
     ensure_vertex_sdk_available,
+    public_backend_error_message,
     vertex_error_hint,
     vertex_sdk_available,
     with_vertex_diagnostics,
@@ -36,7 +36,7 @@ __all__ = [
     "VERTEX_STREAM_GENERATE_CONTENT",
     "VERTEX_STREAM_RAW_PREDICT",
     "VertexPublisherAction",
-    "annotate_backend_error_body",
+    "public_backend_error_message",
     "annotate_vertex_error",
     "backend_error_hint",
     "ensure_vertex_sdk_available",

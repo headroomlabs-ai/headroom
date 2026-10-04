@@ -123,37 +123,23 @@ def backend_error_hint(message: str) -> str | None:
     return None
 
 
-def annotate_backend_error_body(
-    body: Any,
-    status_code: int,
-    *,
-    logger: logging.Logger | None = None,
-    request_id: str = "",
-) -> Any:
-    """Append a setup hint to a failing backend response body, if we recognize it.
+def public_backend_error_message(exc: BaseException, raw_text: str) -> str:
+    """The client-facing message for a backend exception, plus a setup hint.
 
-    Backends report setup failures as an ordinary non-2xx *response* rather than
-    an exception, so the raw provider string reaches the user untouched. Find
-    the message wherever the provider put it and attach the fix.
+    Follows the ``public_errors`` contract: ``client_message`` decides what of
+    the exception may be shown (provider HTTP error text, or a fixed code
+    sentence). The hint is *matched* against ``raw_text`` server-side but is
+    itself one of the fixed constants above, so no exception text, project,
+    path or credential value can reach the client through it.
     """
-    if status_code < 400 or not isinstance(body, dict):
-        return body
+    from headroom.proxy.public_errors import client_message
 
-    error = body.get("error")
-    holder = error if isinstance(error, dict) else body
-    message = holder.get("message")
-    if not isinstance(message, str):
-        return body
-
-    hint = backend_error_hint(message)
+    message = client_message(exc, raw_text)
+    hint = backend_error_hint(raw_text)
     if not hint or "[headroom] hint:" in message:
-        return body
-
-    if logger is not None:
-        prefix = f"[{request_id}] " if request_id else ""
-        logger.error("%sbackend setup hint: %s", prefix, hint)
-    holder["message"] = f"{message}\n[headroom] hint: {hint}"
-    return body
+        return message
+    logger.error("backend setup hint: %s", hint)
+    return f"{message}\n[headroom] hint: {hint}"
 
 
 def vertex_error_hint(

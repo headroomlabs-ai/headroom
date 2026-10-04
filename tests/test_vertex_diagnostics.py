@@ -12,13 +12,14 @@ import pytest
 from headroom.providers.registry import BackendUnavailableError, create_proxy_backend
 from headroom.providers.vertex import (
     HINT_HEADER,
-    annotate_backend_error_body,
     annotate_vertex_error,
     backend_error_hint,
     ensure_vertex_sdk_available,
+    public_backend_error_message,
     vertex_error_hint,
     vertex_sdk_available,
 )
+from headroom.proxy.public_errors import INTERNAL_ERROR, public_message
 
 
 class _FakeResponse:
@@ -130,31 +131,88 @@ class TestBackendErrorHint:
         assert backend_error_hint("upstream timed out after 30s") is None
 
 
-class TestAnnotateBackendErrorBody:
-    def test_success_body_untouched(self):
-        body = {"content": [{"text": "hi"}]}
-        assert annotate_backend_error_body(body, 200) == body
+_SECRET_RAW = (
+    "Your default credentials were not found. project=secret-proj-123 "
+    "GOOGLE_APPLICATION_CREDENTIALS=/etc/keys/sa.json host=10.1.2.3"
+)
 
-    def test_hint_appended_to_nested_message(self):
-        body = {
-            "type": "error",
-            "error": {"type": "api_error", "message": "No module named 'vertexai'"},
-        }
-        out = annotate_backend_error_body(body, 500)
-        assert "[headroom] hint:" in out["error"]["message"]
 
-    def test_idempotent(self):
-        body = {"error": {"message": "No module named 'vertexai'"}}
-        first = annotate_backend_error_body(body, 500)["error"]["message"]
-        second = annotate_backend_error_body(body, 500)["error"]["message"]
-        assert first == second
+class TestPublicBackendErrorMessage:
+    """Hints must live inside the sanitized public_errors contract."""
 
-    def test_unrecognized_error_untouched(self):
-        body = {"error": {"message": "upstream timed out"}}
-        assert annotate_backend_error_body(body, 500) == body
+    def test_internal_error_gets_fixed_sentence_plus_hint(self):
+        out = public_backend_error_message(RuntimeError(_SECRET_RAW), _SECRET_RAW)
+        assert out.startswith(public_message(INTERNAL_ERROR))
+        assert "[headroom] hint:" in out
+        assert "application-default" in out
 
-    def test_non_dict_body_survives(self):
-        assert annotate_backend_error_body("plain text", 500) == "plain text"
+    @pytest.mark.parametrize("leak", ["secret-proj-123", "/etc/keys/sa.json", "10.1.2.3"])
+    def test_raw_exception_text_never_reaches_client(self, leak):
+        out = public_backend_error_message(RuntimeError(_SECRET_RAW), _SECRET_RAW)
+        assert leak not in out
+
+    def test_missing_sdk_hint_without_exception_text(self):
+        raw = "No module named 'vertexai' at /opt/venv/lib/site-packages"
+        out = public_backend_error_message(ImportError(raw), raw)
+        assert "google-cloud-aiplatform" in out
+        assert "/opt/venv" not in out
+
+    def test_unrecognized_error_is_plain_public_message(self):
+        raw = "upstream timed out talking to 10.9.9.9"
+        assert public_backend_error_message(RuntimeError(raw), raw) == public_message(
+            INTERNAL_ERROR
+        )
+
+    def test_hints_are_fixed_constants(self):
+        """Every possible hint is static text: nothing interpolated from input."""
+        for raw in (_SECRET_RAW, "No module named 'vertexai' xyz-123"):
+            hint = backend_error_hint(raw)
+            assert hint is not None
+            assert "secret-proj-123" not in hint and "xyz-123" not in hint
+
+
+class TestLiteLLMVertexBackendErrors:
+    """End to end through the real backend: raw text stays in the log."""
+
+    @pytest.mark.asyncio
+    async def test_vertex_backend_error_is_sanitized_with_hint(self, monkeypatch, caplog):
+        litellm_mod = pytest.importorskip("headroom.backends.litellm")
+        if not litellm_mod.LITELLM_AVAILABLE:
+            pytest.skip("litellm not installed")
+
+        async def boom(**_kw):
+            raise RuntimeError(_SECRET_RAW)
+
+        monkeypatch.setattr(litellm_mod, "acompletion", boom)
+        backend = litellm_mod.LiteLLMBackend(provider="vertex_ai")
+        with caplog.at_level(logging.ERROR):
+            resp = await backend.send_message(
+                {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+                {},
+            )
+        message = resp.body["error"]["message"]
+        assert "[headroom] hint:" in message
+        assert "secret-proj-123" not in message
+        assert "/etc/keys/sa.json" not in message
+        # Operators still get the full detail server-side.
+        assert "secret-proj-123" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_non_vertex_backend_gets_no_vertex_hint(self, monkeypatch):
+        litellm_mod = pytest.importorskip("headroom.backends.litellm")
+        if not litellm_mod.LITELLM_AVAILABLE:
+            pytest.skip("litellm not installed")
+
+        async def boom(**_kw):
+            raise RuntimeError(_SECRET_RAW)
+
+        monkeypatch.setattr(litellm_mod, "acompletion", boom)
+        backend = litellm_mod.LiteLLMBackend(provider="bedrock")
+        resp = await backend.send_message(
+            {"model": "claude-sonnet-4-6", "messages": [{"role": "user", "content": "hi"}]},
+            {},
+        )
+        assert "[headroom] hint:" not in resp.body["error"]["message"]
 
 
 class TestVertexSdkPreflight:
