@@ -5,7 +5,8 @@ Proves that standard Vertex native configurations route properly through the pro
 
 What this script does
 ---------------------
-1. Spawns the Headroom proxy as a subprocess (backend=vertex).
+1. Spawns the Headroom proxy as a subprocess. No ``--backend vertex``: the native
+   Vertex routes are a passthrough and need neither that flag nor ``[vertex]``.
 2. Waits for /readyz.
 3. Configures standard google-genai SDK with vertexai=True hitting the proxy.
 4. Sends an inference probe to validate native proxy connectivity.
@@ -69,23 +70,12 @@ DEFAULT_MODEL = "gemini-flash-latest"
 # ----------------------------------------------------------------------------
 
 
-def start_proxy(port: int, region: str) -> subprocess.Popen[bytes]:
-    """Spawn `headroom proxy --backend vertex` as a subprocess."""
+def start_proxy(port: int) -> subprocess.Popen[bytes]:
+    """Spawn `headroom proxy` as a subprocess."""
     env = os.environ.copy()
     env.setdefault("HEADROOM_LOG", "INFO")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "headroom.cli",
-        "proxy",
-        "--backend",
-        "vertex",
-        "--region",
-        region,
-        "--port",
-        str(port),
-    ]
+    cmd = [sys.executable, "-m", "headroom.cli", "proxy", "--port", str(port)]
     print(f"  $ {' '.join(cmd)}", file=sys.stderr)
     log_path = Path("/tmp") / f"vertex_genai_sdk_demo_{port}.log"
     log_file = log_path.open("wb")
@@ -133,45 +123,6 @@ def stop_proxy(proc: subprocess.Popen[bytes]) -> None:
 # ----------------------------------------------------------------------------
 
 
-def explain_failure(exc: Exception, region: str, model_id: str) -> str:
-    """Turn a raw Vertex exception into something the reader can act on."""
-    msg = str(exc)
-    hints: list[str] = []
-    if "404" in msg or "NOT_FOUND" in msg:
-        hints.append(
-            f"'{model_id}' is not available to this project at location '{region}'. "
-            "Evergreen '-latest' aliases and Gemini 3.x are global-only today; "
-            "Gemini 3.x has no US regional endpoint (try --region global, or "
-            "europe-west2 / asia-northeast1 for gemini-3.5-flash)."
-        )
-    if "401" in msg or "UNAUTHENTICATED" in msg:
-        hints.append(
-            "Credentials are missing or stale (tokens expire hourly). Run: "
-            "gcloud auth application-default login"
-        )
-    if "403" in msg or "PERMISSION_DENIED" in msg:
-        hints.append(
-            "The project cannot serve this model: enable aiplatform.googleapis.com, "
-            "grant roles/aiplatform.user, and (for partner models) enable the model "
-            "in Model Garden for this project."
-        )
-    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-        hints.append("Quota exhausted for this model/location -- retry or pick another region.")
-    if "publishers/anthropic" in msg or model_id.startswith("claude"):
-        hints.append(
-            "The google-genai SDK only builds publishers/google paths, so Claude "
-            "cannot be reached through it. Use the rawPredict path directly "
-            "(see tests/test_proxy_vertex_native_integration.py)."
-        )
-    if not hints:
-        hints.append(
-            "Not a known provisioning condition -- suspect the proxy (path rewrite, "
-            "body mangling, dropped auth header) and reproduce with curl straight "
-            "against Vertex to confirm."
-        )
-    return msg + "\n    hint: " + "\n    hint: ".join(hints)
-
-
 def run_demo(port: int, region: str, model_id: str) -> int:
     print("=" * 76)
     print(" Headroom E2E: google-genai SDK -> Headroom proxy -> Vertex")
@@ -180,7 +131,7 @@ def run_demo(port: int, region: str, model_id: str) -> int:
     print()
 
     print("[1/3] Spawning Headroom proxy ...")
-    proxy = start_proxy(port=port, region=region)
+    proxy = start_proxy(port=port)
     try:
         try:
             wait_for_proxy_ready(port=port, timeout_s=45.0)
@@ -220,7 +171,8 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             print("  ✓ Standard response received successfully!")
             print(f"  > {response.text.strip()}")
         except Exception as e:
-            print(f"  ! Standard inference failed: {explain_failure(e, region, model_id)}")
+            # Vertex 401/403/404/429 errors carry a `[headroom] hint:` from the proxy.
+            print(f"  ! Standard inference failed: {e}")
             return 1
 
         print("\n  b. Inference with Thinking Config:")
@@ -238,7 +190,7 @@ def run_demo(port: int, region: str, model_id: str) -> int:
             print("  ✓ Thinking response received successfully!")
             print(f"  > {response.text.strip()}")
         except Exception as e:
-            print(f"  ! Thinking inference failed: {explain_failure(e, region, model_id)}")
+            print(f"  ! Thinking inference failed: {e}")
             return 1
 
         return 0

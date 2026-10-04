@@ -1,6 +1,4 @@
-# Vertex AI (Gemini Enterprise Agent Platform)
-
-*(Note: Vertex AI is now branded as Gemini Enterprise Agent Platform, though underlying APIs remain unchanged.)*
+# Vertex AI
 
 Headroom supports Google Cloud Vertex AI publisher endpoints through the proxy
 passthrough surface. Configure the proxy with a regional Vertex base URL, then
@@ -82,35 +80,10 @@ curl -sS \
 
 ## Google Gen AI SDK (Proxy)
 
-You can use the official `google-genai` Python SDK pointed directly at Headroom, allowing you to use native extensions, tools, thinking levels, and multi-media components:
-
-```python
-import os
-from google import genai
-from google.genai import types
-
-LOCATION = os.environ.get("LOCATION", "global")
-MODEL = os.environ.get("MODEL", "gemini-flash-latest")
-
-client = genai.Client(
-    vertexai=True,
-    project=os.environ.get("GCP_PROJECT_ID", "your-project"),
-    location=LOCATION,
-    http_options={"base_url": "http://127.0.0.1:8787"},
-)
-
-response = client.models.generate_content(
-    model=MODEL,
-    contents="Think deeply. Which is heavier: a kg of feathers or a kg of steel?",
-    config=types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_budget=128),
-    ),
-)
-print(response.text)
-```
-
-A runnable version of exactly this flow -- it starts the proxy, probes it, and
-tears it down -- lives at `examples/vertex_genai_sdk_demo.py`.
+Point the `google-genai` SDK at Headroom with
+`genai.Client(vertexai=True, project=..., location="global", http_options={"base_url": "http://127.0.0.1:8787"})`.
+`examples/vertex_genai_sdk_demo.py` runs this end to end: it starts the proxy,
+probes it (including a thinking config) and tears it down.
 
 Note the `google-genai` SDK only builds `publishers/google/...` paths, so it
 cannot reach Claude on Vertex; use the `publishers/anthropic/...:rawPredict`

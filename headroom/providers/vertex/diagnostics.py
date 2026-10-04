@@ -6,11 +6,12 @@ requested location -- and its own error text says nothing about how to fix any
 of them. Users hit these while onboarding, see a bare 404 through whatever SDK
 they are using, and have no way to tell a proxy bug from a project-config gap.
 
-So annotate the failure at the proxy, where we know the location, publisher and
-model that produced it, and surface the hint three ways: a WARNING in the proxy
-log, an ``x-headroom-hint`` response header, and (because most SDKs only ever
-show the message string) an appended note on ``error.message`` itself.
+So annotate the failure at the proxy and surface a hint three ways: a WARNING in
+the proxy log, an ``x-headroom-hint`` response header, and (because most SDKs
+only ever show the message string) an appended note on ``error.message``.
 
+Every hint is one of the fixed constants below: request data and exception text
+select a hint but are never interpolated into it (public_errors contract).
 Only already-failing responses are touched; success bodies are never modified.
 """
 
@@ -24,14 +25,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from headroom.providers.registry import BackendUnavailableError
+from headroom.proxy.public_errors import client_message
+
+from .runtime import is_vertex_anthropic_publisher
 
 logger = logging.getLogger(__name__)
 
 HINT_HEADER = "x-headroom-hint"
-
-# Statuses worth explaining. Everything else is either fine or genuinely
-# unexpected, and inventing a hint for it would just be misleading.
-_EXPLAINABLE = frozenset({401, 403, 404, 429})
 
 _ADC_REFRESH = (
     "Credentials are missing or expired (Vertex access tokens last ~1h). "
@@ -68,7 +68,6 @@ _QUOTA = (
     "quota increase, or send the request to another supported region."
 )
 
-
 _MISSING_VERTEX_SDK = (
     "`--backend vertex` routes Anthropic Messages traffic through LiteLLM's vertex_ai "
     'provider, which needs the Vertex SDK: `pip install "headroom-ai[proxy,vertex]"` '
@@ -96,27 +95,18 @@ def ensure_vertex_sdk_available() -> None:
     *every* request with an opaque provider string. Failing here instead turns a
     per-request mystery into one startup error at the moment of misconfiguration.
     """
-    if vertex_sdk_available():
-        return
-    raise BackendUnavailableError(
-        f"Vertex backend selected but the Vertex SDK is missing. {_MISSING_VERTEX_SDK}"
-    )
-
-
-def _is_anthropic(publisher: str) -> bool:
-    return publisher == "anthropic"
+    if not vertex_sdk_available():
+        raise BackendUnavailableError(
+            f"Vertex backend selected but the Vertex SDK is missing. {_MISSING_VERTEX_SDK}"
+        )
 
 
 def backend_error_hint(message: str) -> str | None:
-    """Explain a backend-initialization failure, or None if it is not a known one.
-
-    These surface as opaque 500s carrying a raw LiteLLM string; the user has no
-    way to know the fix is a missing optional dependency or absent ADC.
-    """
+    """Fixed setup hint for a raw LiteLLM Vertex error, or None if unrecognized."""
     lowered = message.lower()
-    if "vertexai" in lowered and ("no module named" in lowered or "import failed" in lowered):
-        return _MISSING_VERTEX_SDK
-    if "google-cloud-aiplatform" in lowered:
+    if "google-cloud-aiplatform" in lowered or (
+        "vertexai" in lowered and ("no module named" in lowered or "import failed" in lowered)
+    ):
         return _MISSING_VERTEX_SDK
     if "default credentials" in lowered or "could not automatically determine" in lowered:
         return _MISSING_ADC
@@ -124,58 +114,28 @@ def backend_error_hint(message: str) -> str | None:
 
 
 def public_backend_error_message(exc: BaseException, raw_text: str) -> str:
-    """The client-facing message for a backend exception, plus a setup hint.
+    """``client_message`` plus a fixed setup hint selected by ``raw_text``.
 
-    Follows the ``public_errors`` contract: ``client_message`` decides what of
-    the exception may be shown (provider HTTP error text, or a fixed code
-    sentence). The hint is *matched* against ``raw_text`` server-side but is
-    itself one of the fixed constants above, so no exception text, project,
-    path or credential value can reach the client through it.
+    ``raw_text`` itself never reaches the client; the caller logs it.
     """
-    from headroom.proxy.public_errors import client_message
-
     message = client_message(exc, raw_text)
     hint = backend_error_hint(raw_text)
-    if not hint or "[headroom] hint:" in message:
-        return message
-    logger.error("backend setup hint: %s", hint)
-    return f"{message}\n[headroom] hint: {hint}"
+    return f"{message}\n[headroom] hint: {hint}" if hint else message
 
 
-def vertex_error_hint(
-    status_code: int,
-    *,
-    location: str = "",
-    publisher: str = "",
-    model: str = "",
-) -> str | None:
-    """Return an actionable hint for a Vertex failure, or None if we have none.
-
-    Pure and side-effect free so it can be unit tested without a live upstream.
-    The returned text is always one of the fixed constants above: ``publisher``
-    only *selects* a remedy and nothing from the path is interpolated, because
-    the hint reaches a client header and error body (public_errors contract:
-    client-facing error text is fixed by construction). ``location`` and
-    ``model`` are accepted for logging by the caller, never echoed here.
-    """
-    if status_code not in _EXPLAINABLE:
-        return None
-
+def vertex_error_hint(status_code: int, *, publisher: str = "") -> str | None:
+    """Fixed hint for a failing Vertex status, or None if we have none."""
     if status_code == 401:
         return _ADC_REFRESH
-
     if status_code == 429:
         return _QUOTA
-
-    # 403 and 404 are the same user-facing problem wearing two hats: the project
-    # cannot serve this model here. Which remedy applies depends on publisher.
-    parts = [_ENABLE_API]
-    if _is_anthropic(publisher):
-        parts.append(_ENABLE_PARTNER)
-        parts.append(_LOCATION_CLAUDE)
-    else:
-        parts.append(_LOCATION_GEMINI)
-    return " ".join(parts)
+    if status_code not in (403, 404):
+        return None
+    # 403 and 404 are the same problem for the user: the project cannot serve
+    # this model here. Which remedy applies depends on the publisher.
+    if is_vertex_anthropic_publisher(publisher):
+        return f"{_ENABLE_API} {_ENABLE_PARTNER} {_LOCATION_CLAUDE}"
+    return f"{_ENABLE_API} {_LOCATION_GEMINI}"
 
 
 def annotate_vertex_error(
@@ -187,66 +147,40 @@ def annotate_vertex_error(
 ) -> Any:
     """Attach a Headroom hint to a failing Vertex response, in place.
 
-    Returns the same response object so callers can `return annotate(...)`.
-    Any problem while annotating is swallowed: a diagnostic must never be able
-    to turn a clean upstream error into a proxy 500.
+    Returns the same response. Any problem while annotating is swallowed: a
+    diagnostic must never turn a clean upstream error into a proxy 500.
     """
     status = getattr(response, "status_code", None)
-    if not isinstance(status, int):
-        return response
-
-    hint = vertex_error_hint(status, location=location, publisher=publisher, model=model)
+    hint = vertex_error_hint(status, publisher=publisher) if isinstance(status, int) else None
     if hint is None:
         return response
-
-    # Idempotent: nested route helpers can legitimately annotate the same
-    # response twice, and a doubled hint reads like a bug.
     try:
+        # Idempotent: nested route helpers can annotate the same response twice.
         if HINT_HEADER in response.headers:
             return response
-    except Exception:  # pragma: no cover - exotic Response implementations
-        pass
-
-    # Path params are client-supplied: %r keeps CR/LF and other control bytes
-    # from forging log lines. They go to the server log only.
-    logger.warning(
-        "vertex upstream %s for %r/%r @ %r -- %s", status, publisher, model, location, hint
-    )
-
-    try:
+        # %r: path params are client-supplied; keep CR/LF from forging log lines.
+        logger.warning(
+            "vertex upstream %s for %r/%r @ %r -- %s", status, publisher, model, location, hint
+        )
         response.headers[HINT_HEADER] = hint
-    except Exception:  # pragma: no cover - exotic Response implementations
-        pass
 
-    # Streaming responses have no materialized body to rewrite; the header and
-    # the log line are the whole story for those.
-    body = getattr(response, "body", None)
-    if not isinstance(body, (bytes, bytearray)):
-        return response
-
-    try:
+        # Streaming responses have no materialized body; header + log suffice.
+        body = getattr(response, "body", None)
+        if not isinstance(body, (bytes, bytearray)):
+            return response
         payload = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
-        return response
-
-    if not isinstance(payload, dict):
-        return response
-
-    error = payload.get("error")
-    if isinstance(error, dict) and isinstance(error.get("message"), str):
-        # Most SDKs only ever show `error.message`, so the hint has to live
-        # there to be seen at all. Keep it clearly attributed to Headroom.
-        error["message"] = f"{error['message']}\n[headroom] hint: {hint}"
-    else:
-        payload["headroom_hint"] = hint
-
-    try:
-        new_body = json.dumps(payload).encode("utf-8")
-        response.body = new_body
-        response.headers["content-length"] = str(len(new_body))
-    except Exception:  # pragma: no cover - defensive
-        return response
-
+        if not isinstance(payload, dict):
+            return response
+        error = payload.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            # Most SDKs only show `error.message`, so the hint must live there.
+            error["message"] = f"{error['message']}\n[headroom] hint: {hint}"
+        else:
+            payload["headroom_hint"] = hint
+        response.body = json.dumps(payload).encode("utf-8")
+        response.headers["content-length"] = str(len(response.body))
+    except Exception:  # noqa: BLE001 - see docstring
+        pass
     return response
 
 
@@ -255,8 +189,7 @@ def with_vertex_diagnostics(
 ) -> Callable[..., Awaitable[Any]]:
     """Decorate a Vertex route so its failures carry an actionable hint.
 
-    Reads `location`/`publisher`/`model` from the path params FastAPI already
-    injects, so a route opts in with one line and no other change.
+    Reads `location`/`publisher`/`model` from the path params FastAPI injects.
     """
 
     @functools.wraps(handler)

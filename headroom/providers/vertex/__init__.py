@@ -3,11 +3,9 @@
 from .diagnostics import (
     HINT_HEADER,
     annotate_vertex_error,
-    backend_error_hint,
     ensure_vertex_sdk_available,
     public_backend_error_message,
     vertex_error_hint,
-    vertex_sdk_available,
     with_vertex_diagnostics,
 )
 from .runtime import (
@@ -36,16 +34,14 @@ __all__ = [
     "VERTEX_STREAM_GENERATE_CONTENT",
     "VERTEX_STREAM_RAW_PREDICT",
     "VertexPublisherAction",
-    "public_backend_error_message",
     "annotate_vertex_error",
-    "backend_error_hint",
     "ensure_vertex_sdk_available",
     "is_vertex_anthropic_publisher",
     "is_vertex_google_publisher",
+    "public_backend_error_message",
     "vertex_anthropic_target",
     "vertex_error_hint",
     "vertex_publisher_provider_name",
-    "vertex_sdk_available",
     "vertex_target_for_location",
     "with_vertex_diagnostics",
 ]
