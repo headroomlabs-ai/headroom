@@ -158,6 +158,7 @@ class TestNativeRoutesWiring:
             "m%0d%0aX-Injected:%201:generateContent"
         )
         assert resp.status_code == 404
+        assert "no US regional endpoint" in resp.headers[HINT_HEADER]
         assert "x-injected" not in resp.headers
         assert "X-Injected" not in resp.text
 
@@ -240,7 +241,7 @@ class TestLiteLLMVertexBackendErrors:
 
     @pytest.mark.asyncio
     async def test_non_vertex_backend_gets_no_vertex_hint(self, litellm_mod):
-        backend = litellm_mod.LiteLLMBackend(provider="bedrock")
+        backend = litellm_mod.LiteLLMBackend(provider="openrouter")
         resp = await backend.send_message(dict(self._BODY), {})
         assert "[headroom] hint:" not in resp.body["error"]["message"]
 

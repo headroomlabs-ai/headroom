@@ -49,7 +49,7 @@ region when you need Provisioned Throughput or data residency. Partner models
 (Claude, Llama, Mistral) also need a one-time per-project enable in Model
 Garden before they serve.
 
-When Vertex rejects a request, Headroom appends a `[headroom] hint: ...` note to
+When Vertex rejects a request with `401`, `403`, `404` or `429`, Headroom appends a `[headroom] hint: ...` note to
 `error.message` (also emitted as an `x-headroom-hint` header and a proxy WARNING)
 naming the likely fix. Hints are fixed text and never echo the request path,
 project, credentials or exception detail; raw provider errors stay in the proxy
@@ -126,7 +126,7 @@ request:
 Cannot start proxy: Vertex backend selected but the Vertex SDK is missing. ...
 ```
 
-Do not combine the two. With `--backend vertex` set, native publisher requests
+Do not combine the two. With `--backend vertex` set, Claude (`publishers/anthropic`) requests
 are re-routed through LiteLLM, which takes the project, region and model from
 its own configuration (`VERTEXAI_PROJECT` / `VERTEXAI_LOCATION`) and ignores the
 ones in your URL — so a request that works without the flag can come back `404`
