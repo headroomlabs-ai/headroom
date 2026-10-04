@@ -171,9 +171,19 @@ class TestBobPreflight:
     def test_passes_when_no_settings_file(self, tmp_path):
         assert bob_preflight(self.ENV, tmp_path / "missing.json") is None
 
-    def test_fails_on_same_host_other_port(self, tmp_path):
-        path = self._settings(tmp_path, {"gatewayUrl": "http://127.0.0.1:9999"})
-        assert bob_preflight(self.ENV, path) is not None
+    @pytest.mark.parametrize(
+        "gateway_url",
+        [
+            "http://127.0.0.1:9999",  # same host, other port
+            "http://127.0.0.1:8787/p/myproj/v1",  # extra segment the proxy would not strip
+            "http://127.0.0.1:8787/inference",  # path without the /p/ prefix
+            "http://127.0.0.1:not-a-port",  # urlsplit(...).port raises ValueError
+        ],
+    )
+    def test_fails_on_non_proxy_shapes(self, tmp_path, gateway_url):
+        path = self._settings(tmp_path, {"gatewayUrl": gateway_url})
+        message = bob_preflight(self.ENV, path)
+        assert message is not None and str(path) in message
 
     def test_fails_on_foreign_gateway(self, tmp_path):
         path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})

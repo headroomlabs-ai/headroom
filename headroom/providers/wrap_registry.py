@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
 from headroom.proxy.project_context import with_project_prefix
+from headroom.proxy.project_policy import split_project_path
 
 # How an EnvVar's URL is shaped: ``openai_v1`` ends in ``/v1`` (OpenAI-style
 # clients append ``/chat/completions``); ``anthropic`` is a bare origin
@@ -114,10 +115,24 @@ def build_launch_env(
     return env, display
 
 
-def _origin_key(url: str) -> tuple[str, str, int | None]:
-    parts = urlsplit(url.strip())
+def _proxy_identity(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) when ``url`` could be a Headroom proxy base, else None.
+
+    None for unparsable URLs (e.g. a non-numeric port, which makes
+    ``urlsplit(...).port`` raise) and for any path the proxy router would not
+    strip — only a bare origin or one valid ``/p/<project>`` prefix qualifies;
+    anything else would leave Bob's gateway paths under a prefix the router
+    never sees.
+    """
+    try:
+        parts = urlsplit(url.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if split_project_path(parts.path)[1] not in ("", "/"):
+        return None
     host = (parts.hostname or "").lower()
-    return parts.scheme, "127.0.0.1" if host == "localhost" else host, parts.port
+    return parts.scheme, "127.0.0.1" if host == "localhost" else host, port
 
 
 def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> str | None:
@@ -139,7 +154,11 @@ def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> 
     # Same proxy if scheme, host and port agree; a different /p/<project>
     # prefix only changes attribution, and the error below tells users to
     # point gatewayUrl at the proxy, so that must not then be rejected.
-    if _origin_key(saved) == _origin_key(env.get("BOB_GATEWAY_URL", "")):
+    # Anything else (foreign host, other port, extra path, unparsable) aborts.
+    saved_identity = _proxy_identity(saved)
+    if saved_identity is not None and saved_identity == _proxy_identity(
+        env.get("BOB_GATEWAY_URL", "")
+    ):
         return None
     return (
         f"Bob's saved gatewayUrl ({saved.strip()}) overrides BOB_GATEWAY_URL, so Bob "
