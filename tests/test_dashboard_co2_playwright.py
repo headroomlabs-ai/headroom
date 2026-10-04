@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-from tests.test_dashboard_cache_lifetime_playwright import _open_dashboard
+from tests.test_dashboard_cache_net_playwright import _open_dashboard
 from tests.test_dashboard_cache_ttl_playwright import _sample_stats
 
 playwright = pytest.importorskip("playwright.sync_api")
