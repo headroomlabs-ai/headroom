@@ -231,7 +231,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
-| `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | profile | Compress text inside user-role messages. The `coding` profile turns this on; set `0` to keep user text verbatim under it. Anthropic `tool_result` blocks compress either way. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |

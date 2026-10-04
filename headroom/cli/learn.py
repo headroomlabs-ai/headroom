@@ -161,7 +161,7 @@ def learn(
     """
     import os
 
-    from ..learn.analyzer import SessionAnalyzer, _detect_default_model
+    from ..learn.analyzer import SessionAnalyzer, _detect_default_model, _require_agy_opt_in
     from ..learn.registry import auto_detect_plugins, get_plugin
 
     # Flag-combination validation — reject contradictory/no-op combinations up
@@ -202,7 +202,9 @@ def learn(
     # Resolve model early to fail fast with a clear message
     try:
         resolved_model = model or _detect_default_model()
-    except RuntimeError as e:
+        if resolved_model == "agy-cli":
+            _require_agy_opt_in()
+    except (RuntimeError, ValueError) as e:
         click.echo(f"Error: {e}")
         raise SystemExit(1) from None
 
