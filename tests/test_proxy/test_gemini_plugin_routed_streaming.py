@@ -479,3 +479,99 @@ def test_gemini_count_tokens_without_the_header_stays_on_the_default_upstream() 
     call = proxy.handle_gemini_count_tokens.await_args
     assert call is not None
     assert call.kwargs == {}
+
+
+THINKING_PART = {
+    "text": "internal reasoning",
+    "thought": True,
+    "thoughtSignature": "signed-reasoning-token",
+}
+
+
+@pytest.mark.parametrize(
+    ("path", "headers"),
+    [
+        ("/v1beta/models/gemini-2.5-flash:streamGenerateContent", {}),
+        (
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            {"x-headroom-base-url": PLUGIN_BASE_URL},
+        ),
+        ("/v1beta/models/gemini-2.5-flash:generateContent", {}),
+        (
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            {"x-headroom-base-url": PLUGIN_BASE_URL},
+        ),
+    ],
+    ids=["stream-direct", "stream-plugin", "generate-direct", "generate-plugin"],
+)
+def test_thinking_parts_survive_compression_elsewhere(path: str, headers: dict[str, str]) -> None:
+    body = {
+        "contents": [
+            {"role": "user", "parts": [{"text": "compress me " * 200}]},
+            {"role": "model", "parts": [dict(THINKING_PART), {"text": "visible answer"}]},
+        ]
+    }
+    captured: dict[str, object] = {}
+
+    def fake_apply(**kwargs: object) -> CompressResult:
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        return CompressResult(
+            messages=[{"role": "user", "content": "compressed"}, *messages[1:]],
+            tokens_before=1000,
+            tokens_after=10,
+            tokens_saved=990,
+            compression_ratio=0.99,
+            transforms_applied=["smart_crusher"],
+        )
+
+    async def fake_stream_response(*args: object, **__: object) -> StreamingResponse:
+        captured["body"] = args[2]
+        return StreamingResponse(iter([b"data: {}\n\n"]), media_type="text/event-stream")
+
+    async def fake_retry(
+        method: str, url: str, headers: dict[str, str], request_body: dict, **_: object
+    ) -> httpx.Response:
+        captured["body"] = request_body
+        return httpx.Response(200, json={"candidates": []})
+
+    app = create_app(_streaming_optimize_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.openai_pipeline.apply = fake_apply
+        proxy._stream_response = fake_stream_response
+        proxy._retry_request = fake_retry
+        response = client.post(path, headers=headers, json=body)
+
+    assert response.status_code == 200, response.text
+    outbound = captured["body"]
+    assert isinstance(outbound, dict)
+    assert outbound["contents"] == [
+        {"role": "user", "parts": [{"text": "compressed"}]},
+        {"role": "model", "parts": [THINKING_PART, {"text": "visible answer"}]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"contents": None},
+        {"contents": [{"role": "user", "parts": [{"text": 42}]}]},
+    ],
+    ids=["null-contents", "numeric-text"],
+)
+def test_malformed_stream_body_is_forwarded(body: dict) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_stream_response(*args: object, **__: object) -> StreamingResponse:
+        captured["body"] = args[2]
+        return StreamingResponse(iter([b"data: {}\n\n"]), media_type="text/event-stream")
+
+    app = create_app(_streaming_optimize_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy._stream_response = fake_stream_response
+        response = client.post("/v1beta/models/gemini-2.5-flash:streamGenerateContent", json=body)
+
+    assert response.status_code == 200, response.text
+    assert captured["body"] == body

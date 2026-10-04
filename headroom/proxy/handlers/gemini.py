@@ -152,6 +152,8 @@ class GeminiHandlerMixin:
         - functionResponse: Responses to function calls
         - executableCode / codeExecutionResult: Gemini code-execution parts,
           echoed back in contents[] on later turns
+        - thought / thoughtSignature: thinking parts, which must round-trip intact
+        - non-string text, which the text round trip cannot rebuild
 
         Args:
             content: A single Gemini content entry with 'parts' list.
@@ -160,7 +162,7 @@ class GeminiHandlerMixin:
             True if any part contains non-text data.
         """
         for part in self._dict_parts(content):
-            if any(
+            if not isinstance(part.get("text", ""), str) or any(
                 key in part
                 for key in (
                     "inlineData",
@@ -169,6 +171,8 @@ class GeminiHandlerMixin:
                     "functionResponse",
                     "executableCode",
                     "codeExecutionResult",
+                    "thought",
+                    "thoughtSignature",
                 )
             ):
                 return True
@@ -195,7 +199,7 @@ class GeminiHandlerMixin:
         opt_iter = iter(optimized_contents)
         result: list[dict] = []
         for idx, content in enumerate(original_contents):
-            had_text = any("text" in p for p in self._dict_parts(content))
+            had_text = any(isinstance(p.get("text"), str) for p in self._dict_parts(content))
             if idx in preserved_indices:
                 result.append(preserved_contents[idx])
                 if had_text:
@@ -241,7 +245,7 @@ class GeminiHandlerMixin:
         # Add system instruction as system message
         if system_instruction:
             sys_parts = self._dict_parts(system_instruction)
-            text_parts = [p.get("text", "") for p in sys_parts if "text" in p]
+            text_parts = [p["text"] for p in sys_parts if isinstance(p.get("text"), str)]
             if text_parts:
                 messages.append({"role": "system", "content": "\n".join(text_parts)})
 
@@ -257,7 +261,7 @@ class GeminiHandlerMixin:
                 role = "assistant"
 
             parts = self._dict_parts(content)
-            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            text_parts = [p["text"] for p in parts if isinstance(p.get("text"), str)]
 
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
@@ -369,6 +373,9 @@ class GeminiHandlerMixin:
             )
 
         contents = body.get("contents", [])
+        if not isinstance(contents, list):
+            # Malformed contents: nothing to compress, so forward the body as-is
+            contents = []
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
