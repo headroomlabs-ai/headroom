@@ -775,12 +775,11 @@ async def test_prepared_production_route_anyllm_guard(monkeypatch, stream, rejec
 
     from fastapi.testclient import TestClient
 
-    from headroom.backends.anyllm import AnyLLMBackend
     from headroom.proxy.server import create_app
     from headroom.tokenizers import get_tokenizer
     from tests.context_budget_behavior_probe import config
 
-    backend = AnyLLMBackend(provider="openai", api_key="synthetic")
+    backend, _instance = make_backend(monkeypatch, "openai")
     body = {
         "model": "gpt-4o",
         "stream": stream,

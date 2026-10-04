@@ -870,6 +870,7 @@ def test_destination_identity_unchanged_counting_failure(
         handler._run_compression_in_executor = None
     elif failure == "quarantine":
         handler._compression_timed_out_in_flight = 1
+        handler._compression_quarantine_threshold = 1
         handler._compression_quarantine_deadline = time.monotonic() + 60
         handler._compression_quarantine_skips = 0
         handler.metrics.record_compression_quarantine = MagicMock()
