@@ -996,3 +996,48 @@ def test_revert_opencode_provider_scope_fallback_on_oserror(monkeypatch, tmp_pat
 
     assert backup_path.exists()  # backup preserved when copy fails
     assert not config_path.exists() or "headroom" not in config_path.read_text()
+
+
+def test_apply_mutations_records_each_provider_mutation_once(monkeypatch, tmp_path: Path) -> None:
+    import headroom.providers.install_registry as registry
+    from headroom.install.providers import apply_mutations
+
+    manifest = _manifest(tmp_path)
+    manifest.targets = ["first"]
+    first = ManagedMutation(target="first", kind="first")
+    monkeypatch.setattr(
+        registry,
+        "_PROVIDER_SCOPE_HANDLERS",
+        {"first": (lambda current: first, lambda mutation, current: None)},
+    )
+
+    assert apply_mutations(manifest) == [first]
+    assert manifest.mutations == [first]
+
+
+def test_unix_env_failure_restores_previous_shell_contents(monkeypatch, tmp_path: Path) -> None:
+    from headroom import fsutil
+    from headroom.install import providers
+
+    manifest = _manifest(tmp_path)
+    manifest.scope = "user"
+    bashrc = tmp_path / ".bashrc"
+    zshrc = tmp_path / ".zshrc"
+    previous = (
+        '# >>> headroom persistent env >>>\nexport OLD="1"\n# <<< headroom persistent env <<<\n'
+    )
+    bashrc.write_text(previous, encoding="utf-8")
+    monkeypatch.setattr(providers, "unix_user_env_targets", lambda: [bashrc, zshrc])
+    real_write = fsutil.write_text
+
+    def write_text(path, content):
+        if Path(path) == zshrc:
+            raise OSError("disk full")
+        real_write(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", write_text)
+
+    with pytest.raises(OSError, match="disk full"):
+        providers._apply_unix_env_scope(manifest)
+    assert bashrc.read_text(encoding="utf-8") == previous
+    assert not zshrc.exists()

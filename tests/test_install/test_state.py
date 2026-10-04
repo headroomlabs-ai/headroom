@@ -184,3 +184,22 @@ def test_delete_manifest_propagates_removal_failure(monkeypatch, tmp_path: Path)
 
     with pytest.raises(OSError, match="busy"):
         delete_manifest("default")
+
+
+@pytest.mark.windows_newline
+def test_manifest_writes_pin_lf(monkeypatch, tmp_path: Path) -> None:
+    import headroom.install.state as state
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls: list[dict] = []
+    real_fdopen = state.os.fdopen
+
+    def fdopen(fd, *args, **kwargs):
+        calls.append(kwargs)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "fdopen", fdopen)
+    save_manifest(_manifest())
+    save_recovery_manifest(_manifest())
+
+    assert [call.get("newline") for call in calls] == ["\n", "\n"]

@@ -563,6 +563,9 @@ def stop_runtime(manifest: DeploymentManifest) -> None:
                 f"Cannot stop deployment '{manifest.profile}': runner.pid is invalid"
             )
         return
+    if not pid_alive(pid):
+        _clear_pid(manifest.profile, expected_pid=pid)
+        return
     identity = _process_identity(pid, manifest)
     if identity is None:
         raise RuntimeError(f"Cannot stop deployment '{manifest.profile}': runtime identity unknown")

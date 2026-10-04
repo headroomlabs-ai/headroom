@@ -64,14 +64,21 @@ def _apply_unix_env_scope(manifest: DeploymentManifest) -> list[ManagedMutation]
     else:
         targets = unix_system_env_targets()
     mutations: list[ManagedMutation] = []
+    previous: list[tuple[Path, str | None]] = []
     try:
         for path in targets:
             path.parent.mkdir(parents=True, exist_ok=True)
+            previous.append((path, fsutil.read_text(path) if path.exists() else None))
             merged = _merge_marker_block(path, block, _ENV_PATTERN, _ENV_MARKER_START)
             fsutil.write_text(path, merged)
             mutations.append(ManagedMutation(target="env", kind="shell-block", path=str(path)))
     except Exception:
-        _remove_unix_env_scope(mutations)
+        # Restore prior contents so a reapply keeps the existing routing.
+        for path, content in reversed(previous):
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                fsutil.write_text(path, content)
         raise
     return mutations
 
@@ -166,7 +173,10 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
                 mutations.extend(_apply_windows_env_scope(manifest))
             else:
                 mutations.extend(_apply_unix_env_scope(manifest))
-        mutations.extend(apply_provider_scope_mutations(manifest))
+        # The registry already appends its records to manifest.mutations (this list).
+        for mutation in apply_provider_scope_mutations(manifest):
+            if not any(existing is mutation for existing in mutations):
+                mutations.append(mutation)
         return mutations
     except Exception as exc:
         if mutations:

@@ -868,7 +868,7 @@ def test_windows_runtime_status_and_stop_use_wmi_identity(monkeypatch, tmp_path:
     monkeypatch.setitem(sys.modules, "psutil", None)
     manifest = _python_service_manifest()
     _write_pid("default", 4321)
-    pid_states = iter([True, False, False])
+    pid_states = iter([True, True, False, False])
     monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
 
     class Result:
@@ -1111,7 +1111,8 @@ def test_start_stop_wait_and_runtime_status_branches(monkeypatch, tmp_path: Path
         "headroom.install.runtime.os.kill", lambda pid, sig: killed.append((pid, sig))
     )
     monkeypatch.setattr("headroom.install.runtime._process_identity", lambda pid, manifest: True)
-    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
+    pid_states = iter([True, False, False, True, False, False])
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: next(pid_states))
     stop_runtime(python_manifest)
     assert killed == [(123, signal.SIGTERM)]
     assert _read_pid("default") is None
@@ -1485,3 +1486,17 @@ class TestRestartCurrentDeployment:
         assert result["restarted"] is True
         assert result["mode"] == "service"
         assert recorded["command"][-4:] == ["install", "restart", "--profile", "default"]
+
+
+def test_stop_runtime_clears_pid_of_dead_process(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    manifest = _python_service_manifest()
+    _write_pid("default", 4321)
+    monkeypatch.setattr("headroom.install.runtime.pid_alive", lambda pid: False)
+    monkeypatch.setattr(
+        "headroom.install.runtime._process_identity",
+        lambda pid, current: pytest.fail("a dead PID has no identity to check"),
+    )
+
+    stop_runtime(manifest)
+    assert _read_pid("default") is None
