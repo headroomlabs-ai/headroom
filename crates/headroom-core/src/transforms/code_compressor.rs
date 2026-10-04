@@ -525,15 +525,12 @@ fn compress_ruby_source_edits(
                 .named_children(&mut body.walk())
                 .filter(|child| {
                     !matches!(child.kind(), "comment" | "heredoc_body")
-                        && !lang.is_source_edit_node(child.kind())
+                        && !contains_method(*child, lang)
                         && !contains_opaque_call(*child, lang)
                         && !contains_heredoc(*child)
                         && !contains_control_clause(*child)
                 })
                 .collect();
-            if statements.len() <= max_body_lines {
-                return;
-            }
             let mut kept_lines = 0;
             let mut omitted = Vec::new();
             for statement in statements {
@@ -2585,6 +2582,40 @@ def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n   
         assert!(result.syntax_valid);
         assert!(result.compressed.contains("def inner"));
         assert!(result.compressed.contains("inner_value = 1"));
+    }
+
+    #[test]
+    fn ruby_conditionally_nested_method_definition_is_preserved() {
+        let source = "def outer\n  keep = 1\n  if keep\n    def nested\n      first = 1\n      second = 2\n      third = 3\n    end\n  end\n  finish = 2\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 1,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("def nested"));
+        assert!(result.compressed.contains("third = 3"));
+    }
+
+    #[test]
+    fn ruby_line_budget_counts_multiline_statements() {
+        let source = "def run(value)\n  if value\n    first = 1\n    second = 2\n  end\n  if value\n    third = 3\n    fourth = 4\n  end\nend\n";
+        let compressor = CodeAwareCompressor::new(CodeCompressorConfig {
+            min_tokens_for_compression: 1,
+            max_body_lines: 5,
+            fallback_to_kompress: false,
+            enable_ccr: false,
+            ..CodeCompressorConfig::default()
+        });
+        let result = compressor.compress_with(source, Some("ruby"), "");
+
+        assert!(result.syntax_valid);
+        assert!(result.compressed.contains("first = 1"));
+        assert!(!result.compressed.contains("third = 3"));
     }
 
     #[test]

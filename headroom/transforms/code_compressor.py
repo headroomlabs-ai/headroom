@@ -1801,13 +1801,11 @@ class CodeAwareCompressor(Transform):
                     for child in body.named_children
                     if child.type not in {"comment", "heredoc_body"}
                     and child.is_named
-                    and child.type not in source_edit_node_types
+                    and not contains_method(child)
                     and not contains_opaque_call(child)
                     and not contains_heredoc(child)
                     and not contains_control_clause(child)
                 ]
-                if len(statements) <= self.config.max_body_lines:
-                    return
                 kept = 0
                 omitted: list[Any] = []
                 for statement in statements:

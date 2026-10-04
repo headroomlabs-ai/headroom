@@ -465,6 +465,55 @@ end
 
 
 @pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_conditionally_nested_method_definition_is_preserved():
+    code = """def outer
+  keep = 1
+  if keep
+    def nested
+      first = 1
+      second = 2
+      third = 3
+    end
+  end
+  finish = 2
+end
+"""
+
+    result = ruby_compressor().compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert "def nested" in result.compressed
+    assert "third = 3" in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+def test_ruby_line_budget_counts_multiline_statements():
+    code = """def run(value)
+  if value
+    first = 1
+    second = 2
+  end
+  if value
+    third = 3
+    fourth = 4
+  end
+end
+"""
+    config = CodeCompressorConfig(
+        min_tokens_for_compression=1,
+        max_body_lines=5,
+        enable_ccr=False,
+        fallback_to_kompress=False,
+    )
+
+    result = ruby_compressor(config).compress(code, language="ruby")
+
+    assert result.syntax_valid is True
+    assert "first = 1" in result.compressed
+    assert "third = 3" not in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
 def test_ruby_same_line_marker_preserves_crlf_line_endings():
     code = (
         "class X\r\n"
