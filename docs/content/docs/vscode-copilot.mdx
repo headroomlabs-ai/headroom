@@ -159,6 +159,9 @@ both `copilot-auth login` and `wrap vscode`.
   does not add or rename models.
 - If connection is refused, keep the wrapper running and check loopback/remote
   port reachability.
+- If Headroom records no requests while Copilot keeps working, the window is
+  probably using a VS Code profile with its own settings. `wrap vscode` warns
+  about each such profile and prints the `--settings-file` path to configure it.
 - Use `--port 8788` when the default port is occupied; settings update safely.
 - If Headroom refuses settings, repair the reported JSONC/marker conflict or use
   `--no-configure` and apply the printed settings manually.

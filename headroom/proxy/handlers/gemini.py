@@ -24,6 +24,7 @@ from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
+from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.token_counting import gemini_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
@@ -441,9 +442,10 @@ class GeminiHandlerMixin:
         )
         memory_decision.apply_to_tags(tags)
 
-        # Rate limiting (use Gemini API key)
+        # Rate limiting: one identity rule for every provider
+        # (headroom/proxy/rate_limit_identity.py).
         if self.rate_limiter:
-            rate_key = headers.get("x-goog-api-key", "default")[:20]
+            rate_key = rate_limit_identity(request, headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(provider=provider_name, source="headroom")
