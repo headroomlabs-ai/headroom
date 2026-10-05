@@ -557,6 +557,44 @@ def get_provider_config(provider: str) -> ProviderConfig:
     )
 
 
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+}
+
+_OPENAI_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "invalid_api_key",
+    403: "permission_error",
+    404: "model_not_found",
+    413: "invalid_request_error",
+    422: "invalid_request_error",
+    429: "rate_limit_exceeded",
+}
+
+
+def _upstream_client_error(exc: Exception, error_types: dict[int, str]) -> tuple[int, str] | None:
+    """Map a LiteLLM exception's own 4xx ``status_code`` to ``(status, error type)``.
+
+    A 4xx status outside ``error_types`` keeps its status with the generic
+    ``invalid_request_error`` type. Returns None when the exception carries no
+    4xx status, so the caller falls back to matching on the message.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    if status in error_types:
+        return status, error_types[status]
+    if 400 <= status <= 499:
+        return status, "invalid_request_error"
+    return None
+
+
 def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
     """Map LiteLLM usage to Anthropic-shape usage, surfacing cache tokens.
 
@@ -1291,7 +1329,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _ANTHROPIC_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "authentication_error"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
@@ -1925,7 +1966,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _OPENAI_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "invalid_api_key"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
