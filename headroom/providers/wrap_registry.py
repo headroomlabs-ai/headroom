@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
@@ -114,28 +114,39 @@ def build_launch_env(
     return env, display
 
 
-def _proxy_identity(url: str) -> tuple[str, str, int | None] | None:
-    """(scheme, host, port) when ``url`` could be a Headroom proxy base, else None.
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) of ``url``; None when it cannot be an HTTP origin.
 
-    None for unparsable URLs (e.g. a non-numeric port, which makes
-    ``urlsplit(...).port`` raise), for a missing scheme or host, for a query
-    or fragment (Bob appends its paths after them), and for any path the proxy
-    router would not strip — only a bare origin or one valid ``/p/<project>``
-    prefix qualifies; anything else would leave Bob's gateway paths under a
-    prefix the router never sees. A trailing slash is fine: bobshell's URL
-    join collapses repeated slashes and strips a trailing one.
+    None for an unparsable URL (a non-numeric port makes ``urlsplit(...).port``
+    raise) or a missing scheme or host.
     """
     try:
-        parts = urlsplit(url.strip())
+        parts = urlsplit(url)
         port = parts.port
     except ValueError:
         return None
-    if not parts.scheme or not parts.hostname or parts.query or parts.fragment:
+    if not parts.scheme or not parts.hostname:
         return None
-    if split_project_path(parts.path)[1] not in ("", "/"):
-        return None
-    host = (parts.hostname or "").lower()
+    host = parts.hostname  # urlsplit lowercases it
     return parts.scheme, "127.0.0.1" if host == "localhost" else host, port
+
+
+def _routable_proxy_path(url: str) -> bool:
+    """True when Bob's gateway paths appended to ``url`` reach the proxy router.
+
+    Only a bare origin or one ``/p/<project>`` prefix qualifies; anything else
+    leaves Bob's paths under a prefix the router never sees. A ``?`` or ``#``
+    anywhere fails, even bare: Bob appends to the string, so the paths would
+    land in the query or fragment. The path is checked decoded, as the ASGI
+    server hands it to the router, so an encoded slash in the project segment
+    is the extra segment it becomes, while the ``%20`` that
+    ``with_project_prefix`` itself emits is fine. A trailing slash is fine too:
+    bobshell's ``AJ()`` (verified in 2.0.5) collapses repeated slashes and
+    strips a trailing one before appending.
+    """
+    if "?" in url or "#" in url:
+        return False
+    return split_project_path(unquote(urlsplit(url).path))[1] in ("", "/")
 
 
 def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> str | None:
@@ -154,22 +165,25 @@ def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> 
         return None
     if not isinstance(saved, str) or not saved.strip():
         return None
-    # Same proxy if scheme, host and port agree; a different /p/<project>
-    # prefix only changes attribution, and the error below tells users to
-    # point gatewayUrl at the proxy, so that must not then be rejected.
-    # Anything else (foreign host, other port, extra path, unparsable) aborts.
-    saved_identity = _proxy_identity(saved)
-    proxy_identity = _proxy_identity(env.get("BOB_GATEWAY_URL", ""))
-    if saved_identity is not None and saved_identity == proxy_identity:
-        return None
-    reason = (
-        "is not a URL the proxy can route (use the bare proxy origin, optionally "
-        "with one /p/<project> prefix)"
-        if saved_identity is None
-        else "overrides BOB_GATEWAY_URL, so Bob would bypass the Headroom proxy"
-    )
+    saved = saved.strip()
+    saved_origin = _origin(saved)
+    proxy_origin = _origin(env.get("BOB_GATEWAY_URL", ""))
+    if saved_origin is None:
+        reason = "could not be parsed as an HTTP origin"
+    elif proxy_origin is not None and saved_origin == proxy_origin:
+        # Same proxy. A different /p/<project> prefix only changes attribution,
+        # and the message below tells users to point gatewayUrl at the proxy,
+        # so that must not then be rejected; an extra path segment must be.
+        if _routable_proxy_path(saved):
+            return None
+        reason = (
+            "is not a URL the proxy can route (use the bare proxy origin, optionally "
+            "with one /p/<project> prefix, and no query or fragment)"
+        )
+    else:
+        reason = "overrides BOB_GATEWAY_URL, so Bob would bypass the Headroom proxy"
     return (
-        f"Bob's saved gatewayUrl ({saved.strip()}) {reason}. Remove the gatewayUrl "
+        f"Bob's saved gatewayUrl ({saved}) {reason}. Remove the gatewayUrl "
         f"entry from {path} (or set it to the proxy URL shown by this wrap) and retry. "
         "If your organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
     )
