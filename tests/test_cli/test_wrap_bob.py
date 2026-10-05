@@ -177,13 +177,25 @@ class TestBobPreflight:
             "http://127.0.0.1:9999",  # same host, other port
             "http://127.0.0.1:8787/p/myproj/v1",  # extra segment the proxy would not strip
             "http://127.0.0.1:8787/inference",  # path without the /p/ prefix
+            "http://127.0.0.1:8787/p/myproj?team=a",  # Bob appends paths after the query
+            "http://127.0.0.1:8787#frag",
             "http://127.0.0.1:not-a-port",  # urlsplit(...).port raises ValueError
+            "/",  # no scheme or host
         ],
     )
     def test_fails_on_non_proxy_shapes(self, tmp_path, gateway_url):
         path = self._settings(tmp_path, {"gatewayUrl": gateway_url})
         message = bob_preflight(self.ENV, path)
         assert message is not None and str(path) in message
+        if gateway_url.startswith("http://127.0.0.1:8787"):
+            # Points at the proxy, so "bypass" would be the wrong diagnosis.
+            assert "not a URL the proxy can route" in message and "bypass" not in message
+
+    def test_unparsable_env_url_never_matches(self, tmp_path):
+        # Two None identities must not compare equal.
+        path = self._settings(tmp_path, {"gatewayUrl": "/"})
+        assert bob_preflight({"BOB_GATEWAY_URL": "http://127.0.0.1:bad"}, path) is not None
+        assert bob_preflight({}, path) is not None
 
     def test_fails_on_foreign_gateway(self, tmp_path):
         path = self._settings(tmp_path, {"gatewayUrl": "https://api.eu-de.bob.ibm.com"})

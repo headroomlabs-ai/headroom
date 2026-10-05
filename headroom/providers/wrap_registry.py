@@ -24,8 +24,7 @@ from urllib.parse import urlsplit
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
-from headroom.proxy.project_context import with_project_prefix
-from headroom.proxy.project_policy import split_project_path
+from headroom.proxy.project_context import split_project_path, with_project_prefix
 
 # How an EnvVar's URL is shaped: ``openai_v1`` ends in ``/v1`` (OpenAI-style
 # clients append ``/chat/completions``); ``anthropic`` is a bare origin
@@ -119,15 +118,19 @@ def _proxy_identity(url: str) -> tuple[str, str, int | None] | None:
     """(scheme, host, port) when ``url`` could be a Headroom proxy base, else None.
 
     None for unparsable URLs (e.g. a non-numeric port, which makes
-    ``urlsplit(...).port`` raise) and for any path the proxy router would not
-    strip — only a bare origin or one valid ``/p/<project>`` prefix qualifies;
-    anything else would leave Bob's gateway paths under a prefix the router
-    never sees.
+    ``urlsplit(...).port`` raise), for a missing scheme or host, for a query
+    or fragment (Bob appends its paths after them), and for any path the proxy
+    router would not strip — only a bare origin or one valid ``/p/<project>``
+    prefix qualifies; anything else would leave Bob's gateway paths under a
+    prefix the router never sees. A trailing slash is fine: bobshell's URL
+    join collapses repeated slashes and strips a trailing one.
     """
     try:
         parts = urlsplit(url.strip())
         port = parts.port
     except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname or parts.query or parts.fragment:
         return None
     if split_project_path(parts.path)[1] not in ("", "/"):
         return None
@@ -156,15 +159,19 @@ def bob_preflight(env: Mapping[str, str], settings_path: Path | None = None) -> 
     # point gatewayUrl at the proxy, so that must not then be rejected.
     # Anything else (foreign host, other port, extra path, unparsable) aborts.
     saved_identity = _proxy_identity(saved)
-    if saved_identity is not None and saved_identity == _proxy_identity(
-        env.get("BOB_GATEWAY_URL", "")
-    ):
+    proxy_identity = _proxy_identity(env.get("BOB_GATEWAY_URL", ""))
+    if saved_identity is not None and saved_identity == proxy_identity:
         return None
+    reason = (
+        "is not a URL the proxy can route (use the bare proxy origin, optionally "
+        "with one /p/<project> prefix)"
+        if saved_identity is None
+        else "overrides BOB_GATEWAY_URL, so Bob would bypass the Headroom proxy"
+    )
     return (
-        f"Bob's saved gatewayUrl ({saved.strip()}) overrides BOB_GATEWAY_URL, so Bob "
-        f"would bypass the Headroom proxy. Remove the gatewayUrl entry from {path} "
-        "(or set it to the proxy URL shown by this wrap) and retry. If your "
-        "organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
+        f"Bob's saved gatewayUrl ({saved.strip()}) {reason}. Remove the gatewayUrl "
+        f"entry from {path} (or set it to the proxy URL shown by this wrap) and retry. "
+        "If your organisation enforces a GatewayUrl policy, Bob cannot be wrapped."
     )
 
 
