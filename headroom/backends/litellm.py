@@ -544,6 +544,25 @@ def _caller_key_travels_to(model: str, key: str) -> bool:
     return provider not in _REJECTS_ANTHROPIC_KEY
 
 
+def _caller_key_from_headers(headers: dict[str, str]) -> str:
+    """Extract the caller's API key from inbound request headers.
+
+    The ``Authorization`` auth-scheme token is case-insensitive per RFC 7235
+    §2.1, so ``Authorization: bearer <key>`` must be read the same as
+    ``Bearer <key>``. A case-sensitive ``startswith("Bearer ")`` dropped the
+    credential for a lowercase (or otherwise differently-cased) scheme, and the
+    request then fell back to the target provider's env key — which may not
+    exist, yielding a spurious upstream 401. Only the scheme is case-folded; the
+    credential itself is returned verbatim. Falls back to ``x-api-key`` when the
+    header carries no bearer credential (matching the prior behavior).
+    """
+    auth_header = headers.get("authorization", headers.get("Authorization", ""))
+    scheme, sep, credentials = auth_header.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        return credentials
+    return headers.get("x-api-key", "")
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -1302,12 +1321,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1428,12 +1442,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1839,12 +1848,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -2054,12 +2058,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key

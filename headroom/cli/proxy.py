@@ -224,6 +224,18 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
@@ -1642,21 +1654,33 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
-    # Security posture line: inbound auth token + air-gap mode, and a loud
-    # flag for the open-bind case (non-loopback host with no token).
-    from headroom.proxy.loopback_guard import is_loopback_host
+    # Security posture line: inbound auth token + air-gap mode. An open bind
+    # (non-loopback host, no token) is refused here, before the banner, unless
+    # the operator acknowledged it explicitly; see headroom/proxy/bind_policy.py.
+    from headroom.proxy.bind_policy import OPEN_BIND_ACK_ENV, evaluate_bind_policy
 
-    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        raise click.ClickException(_bind.message())
+    _auth_on = _bind.token_configured
+    _open_bind_note = (
+        f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
+        if _bind.open_bind
+        else ""
+    )
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
-            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        # Offline masks nothing: an acknowledged open bind is still an open bind.
+        _security_status = (
+            "OFFLINE (all egress disabled)"
+            + (" · inbound token REQUIRED (non-loopback)" if _auth_on else "")
+            + _open_bind_note
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
-    elif not is_loopback_host(config.host):
+    elif _bind.open_bind:
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
-            "(set HEADROOM_PROXY_TOKEN)"
+            f"(acknowledged via {OPEN_BIND_ACK_ENV}=1; set HEADROOM_PROXY_TOKEN instead)"
         )
     else:
         _security_status = "loopback-only (no inbound token)"
