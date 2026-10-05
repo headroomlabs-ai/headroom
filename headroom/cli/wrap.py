@@ -4708,8 +4708,11 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                     if helpers._restart_persistent_proxy(manifest, port):
+                        # Restarted from the manifest, whose mode need not be ours.
+                        _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                         return None, port
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4727,6 +4730,7 @@ def _ensure_proxy_unlocked(
                     if not missing:
                         click.echo(f"  Proxy already running on port {port}")
                         click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to the
                 # non-persistent path which handles proxy restart. A routing
@@ -4772,6 +4776,7 @@ def _ensure_proxy_unlocked(
                                 missing.append("code-graph")
 
                             if not missing:
+                                _warn_proxy_mode_mismatch(running_config)
                                 return None, port
                             flags_str = ", ".join(f"--{f}" for f in missing)
                             click.echo(
@@ -4779,6 +4784,8 @@ def _ensure_proxy_unlocked(
                                 f"is missing: {flags_str}; restarting..."
                             )
                             if helpers._restart_persistent_proxy(manifest, port):
+                                # Restarted from the manifest, whose mode need not be ours.
+                                _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                                 return None, port
                             raise click.ClickException(
                                 f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4878,6 +4885,7 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
 
                 else:
@@ -4956,6 +4964,7 @@ def _ensure_proxy_unlocked(
                                 f"  Please stop the proxy on port {port} manually "
                                 f"and rerun with {flags_str}."
                             )
+                            _warn_proxy_mode_mismatch(running_config)
                             return None, port
 
                 # Routing-level config (backend, upstream URLs) must match in
@@ -5001,6 +5010,7 @@ def _ensure_proxy_unlocked(
             if not needs_restart and reuse_running:
                 click.echo(f"  Proxy already running on port {port}")
                 click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                _warn_proxy_mode_mismatch(running_config)
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -5055,23 +5065,25 @@ def _ensure_proxy_unlocked(
     else:
         if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url:
+        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
-            running_vertex_url = (
-                _normalize_proxy_api_url(running_config.get("vertex_api_url"))
-                if running_config is not None
-                else None
-            )
-            requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-            if running_vertex_url != requested_vertex_url:
-                click.echo(
-                    "  Warning: --no-proxy is set, but the running proxy does not "
-                    "advertise the requested Vertex target. Requests may still go "
-                    "to the proxy's existing Vertex upstream."
+            if vertex_api_url or clear_vertex_api_url:
+                running_vertex_url = (
+                    _normalize_proxy_api_url(running_config.get("vertex_api_url"))
+                    if running_config is not None
+                    else None
                 )
+                requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                if running_vertex_url != requested_vertex_url:
+                    click.echo(
+                        "  Warning: --no-proxy is set, but the running proxy does not "
+                        "advertise the requested Vertex target. Requests may still go "
+                        "to the proxy's existing Vertex upstream."
+                    )
+            _warn_proxy_mode_mismatch(running_config)
         return None, port
 
 
@@ -8875,6 +8887,28 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
+def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy runs a different mode than this session asked for.
+
+    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
+    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
+    other clients may be attached to the running proxy.
+    """
+    requested = os.environ.get("HEADROOM_MODE")
+    running = (running_config or {}).get("mode")
+    if not requested or not isinstance(running, str):
+        return
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
+
+    decision = normalize_proxy_mode_decision(requested, default=running)
+    if not decision.unknown and decision.normalized != running:
+        click.echo(
+            f"  Warning: this session requested {decision.normalized!r} mode but the "
+            f"running proxy is in {running!r} mode (mode is fixed at proxy startup). "
+            "Restart the proxy, or use --port for a separate one."
+        )
+
+
 # =============================================================================
 # Registry-generated wrap commands
 # =============================================================================
@@ -8905,12 +8939,32 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             click.echo(target.install_hint)
             raise SystemExit(1)
 
+        # Exported before proxy startup so _start_proxy forwards it as --mode;
+        # an explicit HEADROOM_MODE always wins.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
+
         env, env_vars_display = _build_registry_launch_env(
             target,
             port,
             os.environ,
             project=_project_name_from_cwd() if target.project_prefix else None,
         )
+
+        configure_launch = None
+        if target.preflight is not None:
+            preflight = target.preflight
+
+            def configure_launch(
+                actual_port: int, args: tuple, env: dict[str, str], display: list[str]
+            ) -> tuple[tuple, dict[str, str], list[str]]:
+                # Runs on the final env: _ensure_proxy may have moved to another
+                # port, and the saved-gateway comparison must use that URL.
+                # Raising here still tears the proxy down via _launch_tool's
+                # cleanup.
+                if problem := preflight(env):
+                    raise click.ClickException(problem)
+                return args, env, display
 
         _launch_tool(
             binary=tool_bin,
@@ -8927,6 +8981,8 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
+            openai_api_url=target.openai_api_url,
+            configure_launch=configure_launch,
         )
 
     _run.__doc__ = target.help_text

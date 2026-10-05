@@ -1242,7 +1242,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
         # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-14",
+        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (
