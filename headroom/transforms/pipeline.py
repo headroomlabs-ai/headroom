@@ -368,6 +368,9 @@ class TransformPipeline:
                     try:
                         result = transform.apply(current_messages, tokenizer, **kwargs)
                     except Exception:
+                        logger.exception(
+                            "Transform %s failed; aborting compression pipeline", transform.name
+                        )
                         self._breaker_record_failure()
                         raise
                     duration_ms = (time.perf_counter() - t0) * 1000

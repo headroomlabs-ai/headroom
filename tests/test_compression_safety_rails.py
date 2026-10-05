@@ -18,6 +18,7 @@ Three rails, each of which only ever makes compression LESS aggressive:
 from __future__ import annotations
 
 import importlib
+import logging
 import time
 from typing import Any
 
@@ -339,3 +340,27 @@ class TestLibraryInflationGuard:
         assert result.transforms_applied == ["inflation_guard:reverted"]
         assert result.tokens_saved == 0
         assert result.compression_ratio == 0.0
+
+
+def test_transform_failure_logs_name_and_traceback(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Tokenizer:
+        def count_messages(self, messages: list[dict[str, Any]]) -> int:
+            return len(messages)
+
+    pipeline = TransformPipeline(HeadroomConfig(), transforms=[_FailingTransform()])
+    monkeypatch.setattr(pipeline, "_get_tokenizer", lambda model: _Tokenizer())
+    caplog.set_level(logging.ERROR, logger="headroom.transforms.pipeline")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.apply(_MESSAGES, model="gpt-4o", model_limit=1024)
+
+    failure_records = [
+        record
+        for record in caplog.records
+        if record.name == "headroom.transforms.pipeline" and "always_fails" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].exc_info is not None
+    assert failure_records[0].exc_info[0] is RuntimeError
