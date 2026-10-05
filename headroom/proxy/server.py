@@ -148,7 +148,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
-from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 from headroom.proxy.malloc_trim import trim_periodically
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -1276,11 +1276,19 @@ class HeadroomProxy(
         # timeout. Stuck-thread leak indicator.
         self._compression_leaked_threads: int = 0
         # Timeout-debt quarantine. Python cannot preempt a worker after its
-        # asyncio waiter times out, so accepting more compression while that
-        # worker is still running can multiply one slow call into a saturated
-        # executor. New work raises immediately until every known post-timeout
-        # worker has genuinely exited, then follows the caller's existing
-        # compression-failure policy.
+        # asyncio waiter times out, so accepting more compression while those
+        # workers are still running can multiply slow calls into a saturated
+        # executor. Once half the pool is held by post-timeout workers, new work
+        # raises immediately until the debt drops below that again, and callers
+        # follow their existing compression-failure policy. One straggler on a
+        # mostly idle pool does not saturate it, so it does not refuse work;
+        # pools of 1-3 workers still quarantine on the first timeout.
+        # HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD=1 restores that everywhere.
+        self._compression_quarantine_threshold: int = _get_env_int(
+            "HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD",
+            max(1, _compression_max // 2),
+            min_value=1,
+        )
         self._compression_timed_out_in_flight: int = 0
         self._compression_timed_out_in_flight_max: int = 0
         self._compression_quarantine_activations: int = 0
@@ -1531,10 +1539,11 @@ class HeadroomProxy(
         worker keeps running to completion, ignored. We detect this by
         marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
-        block after it eventually finishes. While any such worker remains,
-        new calls raise :class:`CompressionQuarantinedError` immediately so
-        callers apply the existing compression-failure policy instead of
-        filling the rest of the pool with the same timeout debt. Jobs that are
+        block after it eventually finishes. While such workers hold half the
+        pool (``_compression_quarantine_threshold``), new calls raise
+        :class:`CompressionQuarantinedError` immediately so callers apply the
+        existing compression-failure policy instead of filling the rest of the
+        pool with the same timeout debt. Jobs that are
         successfully cancelled before a worker starts are removed from the
         queued gauge and do not activate the quarantine. If cancellation races
         with worker startup, the now-running job is tracked as timeout debt and
@@ -1556,20 +1565,19 @@ class HeadroomProxy(
             ``asyncio.TimeoutError`` if the callable doesn't return within
             ``timeout``. Any exception raised by ``fn`` propagates
             unchanged. :class:`CompressionQuarantinedError` (an
-            ``asyncio.TimeoutError`` subclass) if a prior timed-out worker is
-            still running.
+            ``asyncio.TimeoutError`` subclass) if prior timed-out workers still
+            hold half the pool.
         """
         now = time.monotonic()
         with self._compression_metrics_lock:
             timed_out_in_flight = self._compression_timed_out_in_flight
-            quarantined = timed_out_in_flight > 0 and now < self._compression_quarantine_deadline
+            saturating = timed_out_in_flight >= self._compression_quarantine_threshold
+            quarantined = saturating and now < self._compression_quarantine_deadline
             # Debt outlived the cap: presume the worker leaked/hung and stop
             # blocking on it. Count the release once per lapse (while debt stands
             # and the deadline has passed) so operators can see it happened.
             released = (
-                timed_out_in_flight > 0
-                and not quarantined
-                and self._compression_quarantine_deadline > 0.0
+                saturating and not quarantined and self._compression_quarantine_deadline > 0.0
             )
             if quarantined:
                 self._compression_quarantine_skips += 1
@@ -1613,7 +1621,7 @@ class HeadroomProxy(
             """Record a still-running post-timeout worker; lock must be held.
 
             Returns ``True`` only when this worker transitions the executor
-            from clear to quarantined.
+            from clear (or released by the time cap) to quarantined.
             """
             if (
                 not state["timed_out"]
@@ -1622,7 +1630,12 @@ class HeadroomProxy(
                 or state["timeout_debt_recorded"]
             ):
                 return False
-            was_clear = self._compression_timed_out_in_flight == 0
+            now = time.monotonic()
+            threshold = self._compression_quarantine_threshold
+            was_quarantined = (
+                self._compression_timed_out_in_flight >= threshold
+                and now < self._compression_quarantine_deadline
+            )
             self._compression_timed_out_in_flight += 1
             self._compression_timed_out_in_flight_max = max(
                 self._compression_timed_out_in_flight_max,
@@ -1631,19 +1644,19 @@ class HeadroomProxy(
             # (Re)arm the quarantine time cap on every fresh timeout, so ongoing
             # slowness keeps quarantining while a single leaked worker cannot
             # hold it past the cap (#2360).
-            self._compression_quarantine_deadline = (
-                time.monotonic() + self._compression_quarantine_max_seconds
-            )
+            self._compression_quarantine_deadline = now + self._compression_quarantine_max_seconds
             state["timeout_debt_recorded"] = True
-            if was_clear:
+            activated = not was_quarantined and self._compression_timed_out_in_flight >= threshold
+            if activated:
                 self._compression_quarantine_activations += 1
-            return was_clear
+            return activated
 
         def _announce_quarantine() -> None:
             self.metrics.record_compression_quarantine("activated")
             logger.warning(
                 "Compression worker exceeded its request deadline and is still running; "
-                "new compression is quarantined until timed-out workers exit"
+                "new compression is quarantined until fewer than %d timed-out workers remain",
+                self._compression_quarantine_threshold,
             )
 
         def _wrapped():  # noqa: ANN202
@@ -1678,11 +1691,15 @@ class HeadroomProxy(
                     if state["timeout_debt_recorded"]:
                         self._compression_timed_out_in_flight -= 1
                         state["timeout_debt_recorded"] = False
-                        quarantine_cleared = self._compression_timed_out_in_flight == 0
+                        remaining = self._compression_timed_out_in_flight
+                        quarantine_cleared = remaining == self._compression_quarantine_threshold - 1
                     else:
                         quarantine_cleared = False
                 if quarantine_cleared:
-                    logger.info("Compression quarantine cleared after all timed-out workers exited")
+                    logger.info(
+                        "Compression quarantine cleared; %d timed-out worker(s) still running",
+                        remaining,
+                    )
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
@@ -2962,13 +2979,6 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        client = scope.get("client")
-        client_host = client[0] if client else None
-        if is_loopback_host(client_host):
-            scrub_proxy_token_headers(scope, self.token_bytes)
-            await self.app(scope, receive, send)
-            return
-
         # Starlette's own Headers rather than a hand-built dict: on a repeated
         # header it returns the FIRST occurrence, which is what the HTTP gate
         # sees. Building a dict here instead took the LAST one, so the two
@@ -2976,7 +2986,22 @@ class WebSocketAuthMiddleware:
         # drift the shared reader below exists to prevent.
         from starlette.datastructures import Headers
 
-        provided = read_proxy_token(Headers(scope=scope))
+        headers = Headers(scope=scope)
+        client = scope.get("client")
+        client_host = client[0] if client else None
+        # Loopback exemption needs both gates the HTTP admin guards apply: a
+        # loopback peer *and* a loopback ``Host:`` header. The Host check is
+        # the DNS-rebinding defence — a browser on this machine coerced into
+        # opening a socket to 127.0.0.1 still sends ``Host: attacker.com``. A
+        # missing peer address (UDS, adapters) is not loopback (fails closed).
+        if is_loopback_host(client_host) and is_loopback_host_header(headers.get("host")):
+            # Exempt from the token, not from the scrub: a loopback client that
+            # sends the token anyway must not have it forwarded upstream.
+            scrub_proxy_token_headers(scope, self.token_bytes)
+            await self.app(scope, receive, send)
+            return
+
+        provided = read_proxy_token(headers)
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):
@@ -3542,6 +3567,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
             _comp_timed_out_in_flight = proxy._compression_timed_out_in_flight
+            _comp_quarantine_active = (
+                _comp_timed_out_in_flight >= proxy._compression_quarantine_threshold
+                and time.monotonic() < proxy._compression_quarantine_deadline
+            )
             _comp_timed_out_in_flight_max = proxy._compression_timed_out_in_flight_max
             _comp_quarantine_activations = proxy._compression_quarantine_activations
             _comp_quarantine_skips = proxy._compression_quarantine_skips
@@ -3572,7 +3601,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "run_seconds_total": _comp_run_total,
                 "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
-                "quarantine_active": _comp_timed_out_in_flight > 0,
+                "quarantine_active": _comp_quarantine_active,
                 "timed_out_workers": _comp_timed_out_in_flight,
                 "timed_out_workers_max": _comp_timed_out_in_flight_max,
                 "quarantine_activations_total": _comp_quarantine_activations,
@@ -3666,6 +3695,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # reports the proxy's policy, not the calling shell's.
                 "tls": describe_trust_policy(),
                 "backend": config.backend,
+                # Boot-time proxy mode; `headroom wrap` compares it to the
+                # session's requested mode when reusing this proxy.
+                "mode": config.mode,
                 "optimize": config.optimize,
                 "cache": config.cache_enabled,
                 "rate_limit": config.rate_limit_enabled,
@@ -3957,19 +3989,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _proxy_token_bytes = _proxy_token.encode("utf-8") if _proxy_token else b""
     # Health/readiness probes must stay reachable without a token so
     # orchestrators can check a container that binds non-loopback.
-    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/livez", "/readyz"})
+    #
+    # The exemption covers only GET, and only paths with a GET handler below.
+    # Anything else on these paths falls through to the catch-all passthrough
+    # relay (FastAPI's @app.get does not register HEAD), so exempting it would
+    # let an unauthenticated caller relay arbitrary requests upstream.
+    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/livez", "/readyz"})
 
-    # Loud warning when a non-loopback bind has no token configured: that is the
-    # exact shape (e.g. the Docker 0.0.0.0 image) that exposes unauthenticated
-    # /v1/* routes to the surrounding network.
-    if not _proxy_token and not is_loopback_host(getattr(config, "host", None)):
-        logger.warning(
-            "event=proxy_open_bind host=%s — proxy is bound to a non-loopback "
-            "interface with no HEADROOM_PROXY_TOKEN set; the /v1/* data-plane "
-            "routes are reachable WITHOUT authentication. Set HEADROOM_PROXY_TOKEN "
-            "to require a bearer token from non-loopback callers.",
-            getattr(config, "host", None),
-        )
+    # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
+    # from any launcher) that exposes the unauthenticated /v1/* relay to the
+    # surrounding network. It used to be a warning; it is now refused unless
+    # the operator acknowledges it explicitly (see bind_policy.py). Enforced
+    # here, not only in run_server, so programmatic embeddings and the
+    # multi-worker factory get the same guarantee.
+    from headroom.proxy.bind_policy import enforce_bind_policy
+
+    _bind_decision = enforce_bind_policy(getattr(config, "host", None), _proxy_token)
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
@@ -4020,7 +4055,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             path = request.url.path
             client = getattr(request, "client", None)
             client_host = getattr(client, "host", None) if client is not None else None
-            if path not in _AUTH_EXEMPT_PATHS and not is_loopback_host(client_host):
+            exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
+            if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
@@ -4034,6 +4070,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
                     _apply_security_headers(rejection)
                     return rejection
+                # The caller proved it holds the proxy token. The rate limiter
+                # keys authenticated callers per credential and everyone else
+                # per peer (headroom/proxy/rate_limit_identity.py).
+                request.state.proxy_authenticated = True
 
         # The credential has done its job; take it off the request so no handler
         # can forward it upstream. Runs on the exempt paths too, since a loopback
@@ -4101,6 +4141,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import (
+        is_container_host_gateway,
+    )
+    from headroom.proxy.loopback_guard import (
         require_loopback as _require_loopback,
     )
     from headroom.proxy.loopback_guard import (
@@ -4119,6 +4162,86 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
             raise HTTPException(status_code=404)
+
+    def _authenticated_at_gate(request: Request) -> bool:
+        """True when the security gate verified this request's proxy token.
+
+        The gate exempts loopback peers without checking the ``Host`` header,
+        so only a *non-loopback* request that reached a handler while a token
+        is configured has proven it holds the token. A loopback peer must
+        still pass the loopback (peer + Host) check: the DNS-rebinding defence.
+        """
+        client = getattr(request, "client", None)
+        return bool(_proxy_token) and not is_loopback_host(getattr(client, "host", None))
+
+    def _is_host_of_loopback_published_container(request: Request) -> bool:
+        """True for the host's own dashboard reaching a loopback-published container.
+
+        Docker relays a ``127.0.0.1:<port>`` publication into the container from
+        the bridge gateway, so the host browser's TCP peer is that gateway, not
+        127.0.0.1. The shipped launchers acknowledge their token-less 0.0.0.0
+        bind only together with that loopback publication, so under the
+        acknowledgement the gateway peer can only be a process on the host.
+        Matches the exact TCP peer (never a forwarded header, never another
+        container on the bridge) and keeps the loopback Host check.
+        """
+        if not (_bind_decision.open_bind and _bind_decision.acknowledged):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        return is_container_host_gateway(peer) and is_loopback_host_header(
+            request.headers.get("host")
+        )
+
+    def _require_operator_read_client(request: Request) -> None:
+        """Gate the read-only operator routes (history, quota, subscription window).
+
+        A token-authenticated operator on a public bind is entitled to them, as
+        is the host of a loopback-published container. Everyone else falls back
+        to the /settings* trust chain: loopback, or a trusted dashboard client
+        behind a gateway. Settings *writes* deliberately do not get either
+        short-cut.
+        """
+        if _authenticated_at_gate(request) or _is_host_of_loopback_published_container(request):
+            return
+        _require_loopback_or_trusted_dashboard_client(request)
+
+    def _require_metrics_scrape_client(request: Request) -> None:
+        """Gate ``/metrics`` for scrapers without demanding a dashboard's browser shape.
+
+        ``/metrics`` is a Prometheus target, so unlike the dashboard routes it
+        cannot require an IP-literal ``Host`` header. Allowed callers:
+
+        * a non-loopback caller that authenticated at the security gate;
+        * loopback (peer *and* Host header, the usual two gates);
+        * a connecting peer inside ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS``
+          (whatever it forwards), or a resolved client inside the
+          dashboard-client CIDRs, provided any browser provenance it carries
+          is same-origin (a scraper sends neither Origin nor Referer).
+
+        Everyone else gets the same 404 the other operator routes return.
+        """
+        if _authenticated_at_gate(request):
+            return
+        if _request_is_loopback(request):
+            return
+        from headroom.proxy.forwarded_headers import (
+            load_trusted_gateway_cidrs,
+            peer_is_trusted_gateway,
+            resolve_client_ip,
+        )
+
+        # Gateway CIDRs describe the TCP peer itself, never a forwarded address;
+        # only the dashboard-client CIDRs apply to the resolved client.
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        if peer_is_trusted_gateway(peer, load_trusted_gateway_cidrs()) or peer_is_trusted_gateway(
+            resolve_client_ip(request), trusted_dashboard_client_cidrs
+        ):
+            host_header = request.headers.get("host")
+            if host_header and _request_has_same_origin_or_no_provenance(request, host_header):
+                return
+        raise HTTPException(status_code=404)
 
     def _require_same_origin_or_trusted_dashboard_client(request: Request) -> None:
         """Same-origin CSRF guard for settings writes, trusted-dashboard aware.
@@ -4298,6 +4421,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         StaticFiles(directory=STATIC_DIR, check_dir=False),
         name="dashboard-static",
     )
+
+    # The read-only telemetry routes below carry operator data (model/project/
+    # session labels, spend history, subscription utilisation, provider quota)
+    # and were served to any network caller. They now answer token-authenticated
+    # operators, loopback, or a trusted dashboard client behind a gateway; other
+    # network callers get 404. The dashboard shell itself is a static template
+    # (like its /dashboard/static assets) and stays reachable, so a container
+    # published on host loopback, whose peer is the bridge gateway, still loads.
+    _dashboard_gate = [Depends(_require_operator_read_client)]
 
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
@@ -4712,6 +4844,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Build unified savings summary (all layers)
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
+        # Cache-aware dollar value of tool-schema deferral, the same figure the
+        # cost card uses. Exposed beside the token count because tokens alone
+        # mislead: deferred schemas would mostly have been cache reads, an order
+        # of magnitude cheaper than list input, so a big token number is a small
+        # dollar number. The token count without it invited "we removed 90% of
+        # the tokens, so we saved 90% of the cost".
+        _cost_tracker_stats = proxy.cost_tracker.stats() if proxy.cost_tracker else {}
+        tool_schema_usd = float(_cost_tracker_stats.get("tool_savings_usd", 0.0) or 0.0)
         total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
@@ -4840,13 +4980,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "tokens_saved": tool_schema_tokens,
                         "requests": tool_schema_requests,
                         "window": len(recent_request_logs),
+                        # Priced at what those tokens would actually have been
+                        # billed at (provider cache-read rate for the warm turns,
+                        # cache-write for the cold one), not at list input.
+                        "lifetime_usd": round(tool_schema_usd, 4),
                         "description": (
                             "Tool-definition tokens kept out of the model's context "
                             "by deferring heavy tool schemas until they're searched "
                             "for. Counted only when Headroom performed the deferral — "
                             "not when the client (e.g. Claude Code / Codex) already "
-                            "had tool search enabled. Aggregated over the recent "
-                            "request window."
+                            "had tool search enabled. Token and request counts use "
+                            "the recent request window; lifetime_usd covers the "
+                            "full process lifetime."
                         ),
                     },
                 },
@@ -4947,6 +5092,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     if total_tokens_before > 0
                     else 0,
                     2,
+                ),
+                # The same saving expressed in money rather than tokens, so a
+                # reader is never left to assume the two match. They don't, and
+                # not by a little: most tokens Headroom removes would have been
+                # prefix-cache reads, billed at roughly a tenth of list input
+                # (and less on some providers), so a large token share is a much
+                # smaller cost share. Mirrors summary.cost.savings_pct, which
+                # prices every layer at the rate its tokens would really have
+                # cost.
+                "cost_weighted_savings_percent": float(
+                    (summary.get("cost") or {}).get("savings_pct", 0.0) or 0.0
                 ),
             },
             "latency": {
@@ -5240,7 +5396,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = 0.0
         return JSONResponse(status_code=200, content={"status": "reset"})
 
-    @app.get("/stats-history")
+    @app.get("/stats-history", dependencies=_dashboard_gate)
     async def stats_history(
         format: Literal["json", "csv"] = "json",
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
@@ -5317,7 +5473,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return {"transformations": transformations, "log_full_messages": log_full_messages}
 
-    @app.get("/subscription-window")
+    @app.get("/subscription-window", dependencies=_dashboard_gate)
     async def subscription_window():
         """Current Anthropic subscription window utilisation and Headroom contribution.
 
@@ -5342,14 +5498,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await tracker.maybe_poll_on_demand()
         return JSONResponse(content=tracker.render_state())
 
-    @app.get("/quota")
+    @app.get("/quota", dependencies=_dashboard_gate)
     async def quota():
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[Depends(_require_metrics_scrape_client)])
     async def metrics():
-        """Prometheus metrics endpoint."""
+        """Prometheus metrics endpoint (loopback, trusted CIDR, or token-authenticated)."""
         return PlainTextResponse(
             await proxy.metrics.export(),
             media_type="text/plain; version=0.0.4",
@@ -5778,7 +5934,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
-    @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/v1/retrieve/tool_call",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def ccr_handle_tool_call(request: Request):
         """Handle a CCR tool call from an LLM response.
 
@@ -6083,6 +6242,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         # posture (compress_user, protect_recent, min_tokens). HEADROOM_SAVINGS_PROFILE
         # overrides.
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         read_maturation=rollout.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=_get_env_int("HEADROOM_READ_MATURATION_QUIESCE_TURNS", 5),
         read_maturation_max_hold_turns=_get_env_int("HEADROOM_READ_MATURATION_MAX_HOLD_TURNS", 25),
@@ -6180,6 +6340,16 @@ def run_server(
     config.profile_seeded_env_keys = frozenset(
         set(config.profile_seeded_env_keys) | set(seeded_env_keys)
     )
+
+    # Refuse an unacknowledged open bind here, before uvicorn forks, so the
+    # operator gets one error and an exit code instead of N workers crashing
+    # in create_app. create_app enforces the same policy for embedders.
+    from headroom.proxy.bind_policy import evaluate_bind_policy
+
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        print(f"ERROR: {_bind.message()}", file=sys.stderr)
+        sys.exit(2)
     if workers < 1:
         raise ValueError("workers must be >= 1")
     config.worker_processes = workers
@@ -6874,8 +7044,11 @@ if __name__ == "__main__":
         if protect_tool_results
         else frozenset(),
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_CACHE)),
-        compress_user_messages=args.compress_user_messages
-        or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        compress_user_messages=(
+            True
+            if args.compress_user_messages
+            else _get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES")
+        ),
         savings_profile=os.environ.get("HEADROOM_SAVINGS_PROFILE") or "coding",
         # Default 0.4 keep-ratio so the Kompress text (prose/code) path compresses
         # meaningfully out of the box; HEADROOM_TARGET_RATIO overrides.

@@ -7,14 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import secrets
 import ssl
 import threading
 import time
@@ -37,6 +36,7 @@ from headroom.proxy.helpers import (
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.modes import is_cache_mode
+from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
@@ -128,30 +128,6 @@ _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
 )
 _BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
-_OPENAI_RATE_KEY_SECRET = secrets.token_bytes(32)
-
-
-def _openai_rate_limit_key(headers: dict[str, str]) -> str:
-    """Return the credential identity used by the OpenAI rate limiter.
-
-    OpenAI-compatible gateways may authenticate with either a bearer token or
-    an ``api-key`` header. Deriving an identity from the complete value keeps common
-    prefixes distinct without retaining recoverable credential material in
-    bucket keys. The secret is process-local, like the limiter state.
-    Requests without either retain the existing shared fallback bucket.
-    """
-    authorization = headers.get("authorization")
-    api_key = headers.get("api-key")
-    if authorization:
-        kind, credential = "authorization", authorization
-    elif api_key:
-        kind, credential = "api-key", api_key
-    else:
-        return "default"
-    # API credentials are identifiers, not passwords to verify. A process-keyed
-    # HMAC keeps bucket keys opaque without a password KDF on the request path.
-    digest = hmac.digest(_OPENAI_RATE_KEY_SECRET, f"{kind}:{credential}".encode(), "sha256").hex()
-    return f"{kind}:{digest}"
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -425,6 +401,26 @@ def _sanitize_forwarded_response_headers(
     return sanitize_forwarded_response_headers(headers, *extra_names)
 
 
+def _replaced_json_body(response: httpx.Response, body: bytes) -> tuple[bytes, dict[str, str]]:
+    """Headers for replaying ``response`` with ``body`` in place of its content.
+
+    The upstream's validators and digests describe the original bytes;
+    forwarding them would let a cache or integrity check pair them with the
+    rewritten body.
+    """
+    headers = _sanitize_forwarded_response_headers(
+        response.headers,
+        "etag",
+        "last-modified",
+        "cache-control",
+        "content-digest",
+        "digest",
+        "content-type",
+    )
+    headers["content-type"] = "application/json"
+    return body, headers
+
+
 def _resolve_openai_handler_path(
     request_headers: dict[str, str],
     *,
@@ -642,6 +638,31 @@ def _openai_responses_unit_parallelism() -> int:
         )
         return _OPENAI_RESPONSES_UNIT_PARALLELISM_DEFAULT
     return max(1, min(_OPENAI_RESPONSES_UNIT_PARALLELISM_MAX, requested))
+
+
+def _openai_responses_deadline_started_at(timeout: float) -> float | None:
+    """Deadline origin shared by every compress call of one Responses request.
+
+    A Responses request fans out over many ``ContentRouter.compress`` calls,
+    and Kompress starts a fresh ``HEADROOM_COMPRESSION_DEADLINE_MS`` clock in
+    each one unless it is handed an origin. Without one, a request past its
+    ``timeout`` keeps running inference long after the awaiter gave up, and
+    that timeout debt quarantines compression for every request behind it.
+    Stamped before the job is queued, because ``timeout`` counts queue wait
+    too. ``None`` when the deadline is disabled (``0``).
+
+    The budget is also capped at 75% of ``timeout``: the deadline only stops
+    the NEXT Kompress chunk, so the chunk already running when it expires, the
+    splice and the output serialization need the rest. Kompress checks
+    ``now - origin > deadline``, so a shorter budget is a backdated origin.
+    """
+    from headroom.transforms.content_router import _compression_deadline_seconds
+
+    deadline_s = _compression_deadline_seconds()
+    if deadline_s <= 0:
+        return None
+    budget_s = min(deadline_s, 0.75 * timeout)
+    return time.perf_counter() - (deadline_s - budget_s)
 
 
 def _openai_responses_unit_executor() -> ThreadPoolExecutor:
@@ -2110,6 +2131,7 @@ class OpenAIHandlerMixin:
         request_id: str,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
+        deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -2166,6 +2188,9 @@ class OpenAIHandlerMixin:
         unit_target_ratio = profile_kwargs.get("target_ratio")
         if unit_target_ratio is not None:
             unit_target_ratio = float(unit_target_ratio)
+        # Earlier user turns follow the same compress_user_messages resolution
+        # as the message pipeline (profile default, or an explicit override).
+        compress_user_units = profile_kwargs.get("compress_user_messages") is not False
 
         try:
             tokenizer = self.openai_provider.get_token_counter(model)
@@ -2636,7 +2661,7 @@ class OpenAIHandlerMixin:
             metadata: dict[str, str] = {}
             if role == "assistant":
                 metadata["compress_assistant"] = "true"
-            if role == "user" and item_idx != last_user_item_idx:
+            if role == "user" and item_idx != last_user_item_idx and compress_user_units:
                 metadata["compress_user"] = "true"
             min_bytes = (
                 self.OPENAI_RESPONSES_MESSAGE_ROUTER_MIN_BYTES
@@ -2700,6 +2725,7 @@ class OpenAIHandlerMixin:
                 router=router,
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
+                deadline_started_at=deadline_started_at,
             )
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
@@ -2769,12 +2795,18 @@ class OpenAIHandlerMixin:
                     0.0,
                 )
 
+        # Each pool task runs in its own copy of this Context: the router binds
+        # the request's deadline per task (see share_request_deadline), and
+        # pool threads would otherwise keep that binding between requests.
         parallelism = _openai_responses_unit_parallelism()
         if len(cache_misses) > 1 and parallelism > 1:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(cache_misses), parallelism):
                 batch = cache_misses[start : start + parallelism]
-                futures = [executor.submit(_compress_and_store, *item) for item in batch]
+                futures = [
+                    executor.submit(contextvars.copy_context().run, _compress_and_store, *item)
+                    for item in batch
+                ]
                 for future in as_completed(futures):
                     unit_idx, cache_key, routed_result = future.result()
                     _record_routed_result(unit_idx, cache_key, routed_result)
@@ -2799,6 +2831,7 @@ class OpenAIHandlerMixin:
                 router=router,
                 tokenizer=tokenizer,
                 target_ratio=unit_target_ratio,
+                deadline_started_at=deadline_started_at,
             )
             return results, (time.perf_counter() - batch_started) * 1000.0
 
@@ -2812,7 +2845,10 @@ class OpenAIHandlerMixin:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(small_batches), parallelism):
                 batch_group = small_batches[start : start + parallelism]
-                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
+                futures = [
+                    executor.submit(contextvars.copy_context().run, _compress_batch, batch)
+                    for batch in batch_group
+                ]
                 for future in as_completed(futures):
                     _record_batch_result(future.result())
         else:
@@ -3000,6 +3036,7 @@ class OpenAIHandlerMixin:
         timing: dict[str, float] | None = None,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
+        deadline_started_at: float | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -3267,6 +3304,7 @@ class OpenAIHandlerMixin:
             request_id=request_id,
             pass_id=pass_id,
             timing=timing_sink,
+            deadline_started_at=deadline_started_at,
         )
         _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
@@ -3414,6 +3452,8 @@ class OpenAIHandlerMixin:
                 exc_info=True,
             )
 
+        deadline_started_at = _openai_responses_deadline_started_at(timeout)
+
         def _compress():  # noqa: ANN202
             # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER) runs before
             # compression so the turn classifier sees the client's input as
@@ -3433,6 +3473,7 @@ class OpenAIHandlerMixin:
                 "request_id": request_id,
                 "timing": timing,
                 "client": client,
+                "deadline_started_at": deadline_started_at,
             }
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
@@ -3447,7 +3488,12 @@ class OpenAIHandlerMixin:
                     unsupported_kwarg = next(
                         (
                             name
-                            for name in ("savings_tags", "client", "timing")
+                            for name in (
+                                "savings_tags",
+                                "client",
+                                "timing",
+                                "deadline_started_at",
+                            )
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
                         ),
@@ -3580,7 +3626,16 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
-        original_client_messages = copy.deepcopy(messages)
+        # O1 (2026-09-27 perf audit): the snapshot of the original
+        # conversation aliases the live list unless hooks or pipeline
+        # extensions are configured; those can mutate `messages` in place
+        # (pre_compress receives the live list), so then it is an
+        # independently owned copy (see snapshot_original_messages).
+        from headroom.proxy.helpers import snapshot_original_messages
+
+        original_client_messages = snapshot_original_messages(
+            messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+        )
         custom_upstream_base_url = _resolve_openai_upstream_base(request.headers)
         upstream_base_url = self._resolve_openai_upstream(request)
         handler_path_suffix = _resolve_openai_chat_handler_path(
@@ -3604,7 +3659,9 @@ class OpenAIHandlerMixin:
         )
         if input_event.messages is not None:
             messages = input_event.messages
-            original_client_messages = copy.deepcopy(messages)
+            original_client_messages = snapshot_original_messages(
+                messages, hooks=self.config.hooks, extensions=self.pipeline_extensions
+            )
         if input_event.tools is not None:
             body["tools"] = input_event.tools
 
@@ -3792,7 +3849,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = _openai_rate_limit_key(headers)
+            rate_key = rate_limit_identity(request, headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(
@@ -6137,7 +6194,7 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = _openai_rate_limit_key(headers)
+            rate_key = rate_limit_identity(request, headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
                 await self.metrics.record_rate_limited(provider="openai", source="headroom")
@@ -11277,7 +11334,14 @@ class OpenAIHandlerMixin:
             clean_model_id = sanitize_anthropic_model_id(unquote(raw_model_id))
             if clean_model_id != unquote(raw_model_id):
                 path = "/v1/models/" + quote(clean_model_id, safe="")
-        url = build_copilot_upstream_url(base_url, path)
+        from headroom.providers.wrap_registry import resolve_origin_passthrough_url
+
+        # Wrap targets that build full gateway paths themselves (e.g. IBM Bob's
+        # /inference/v1/model/info, /admin/v1/profile) declare origin
+        # passthrough prefixes; joining those paths onto the base URL's own
+        # path would double or misroot the upstream URL.
+        origin_passthrough_url = resolve_origin_passthrough_url(base_url, path)
+        url = origin_passthrough_url or build_copilot_upstream_url(base_url, path)
 
         # Preserve query string parameters
         if request.url.query:
@@ -11426,6 +11490,17 @@ class OpenAIHandlerMixin:
         response_headers = _sanitize_forwarded_response_headers(response.headers)
         response_content = response.content
 
+        if origin_passthrough_url is not None and response.status_code == 200:
+            from headroom.providers.wrap_registry import strip_origin_passthrough_response_keys
+
+            # E.g. Bob's /admin/v1/profile carries region_domain, which bob
+            # 2.0.1 uses to rewrite its gateway host away from the proxy while
+            # keeping the proxied port — strip declared keys so the tool keeps
+            # routing through the configured gateway URL.
+            filtered = strip_origin_passthrough_response_keys(base_url, path, response_content)
+            if filtered is not None:
+                response_content, response_headers = _replaced_json_body(response, filtered)
+
         if provider == "anthropic" and endpoint_name == "models":
             from headroom.providers.anthropic import sanitize_anthropic_model_metadata
 
@@ -11435,18 +11510,12 @@ class OpenAIHandlerMixin:
             except (TypeError, ValueError):
                 sanitized_payload = None
             if sanitized_payload is not None and sanitized_payload != payload:
-                response_content = json.dumps(
-                    sanitized_payload,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                response_headers = _sanitize_forwarded_response_headers(
-                    response.headers,
-                    "etag",
-                    "last-modified",
-                    "cache-control",
+                response_content, response_headers = _replaced_json_body(
+                    response,
+                    json.dumps(sanitized_payload, separators=(",", ":"), ensure_ascii=False).encode(
+                        "utf-8"
+                    ),
                 )
-                response_headers["content-type"] = "application/json"
 
         # Passthrough request: forwarded upstream with no transforms.
         # Still recorded so dashboards see traffic on the passthrough

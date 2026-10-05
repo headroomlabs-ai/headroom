@@ -1729,12 +1729,17 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
     if not candidates:
         return None
 
+    # A path inside a worktree folded into a project belongs to that project.
     # Longest root first — most specific wins
-    roots_sorted = sorted(roots, key=lambda p: len(str(p.project_path)), reverse=True)
+    roots_sorted = sorted(
+        ((path, root) for root in roots for path in (root.project_path, *root.worktree_paths)),
+        key=lambda item: len(str(item[0])),
+        reverse=True,
+    )
 
     for cand in candidates:
-        for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/\\")
+        for path, root in roots_sorted:
+            root_str = str(path).rstrip("/\\")
             if not root_str:
                 continue
             if (

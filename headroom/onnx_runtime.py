@@ -71,6 +71,10 @@ def onnx_thread_spinning_enabled() -> bool:
 _PINNED_REVISIONS: dict[str, str] = {
     # chopratejas/kompress-v2-base @ 2026-06-10
     "chopratejas/kompress-v2-base": "b1563631b35bfdcee37587ad530147497d820d4c",
+    # Kompress tokenizer + torch-path encoder base. The ONNX artifacts were
+    # exported against this snapshot; a silently updated tokenizer would shift
+    # token ids under the shipped weights.
+    "answerdotai/ModernBERT-base": "8949b909ec900327062f0ebf497f51aef5e6f0c8",
     "chopratejas/technique-router-onnx": "27b0b4bfa510a1cff66d888072c0b807082721a8",
     "chopratejas/siglip-image-encoder-onnx": "d0a9fbd66d4bd8c761bff592d44831f7c2ae184e",
     # Third-party repo — pinning matters most here.

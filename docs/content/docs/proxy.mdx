@@ -231,7 +231,7 @@ Fine-grained control over what gets compressed and how hard. Most users pick a [
 | `--mode` / `HEADROOM_MODE` | `cache` | `cache` compresses only the newest delta (prefix-cache safe); `token` maximizes removal. |
 | `--target-ratio` / `HEADROOM_TARGET_RATIO` | unset | Keep-ratio for ML text compression; lower = more aggressive (e.g. `0.10`). |
 | `HEADROOM_MIN_TOKENS` | `500` | Minimum block size before a tool output is compressed. |
-| `HEADROOM_COMPRESS_USER_MESSAGES` | `false` | Compress content inside user-role messages (tool results live there). The `coding` profile turns this on. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
+| `HEADROOM_COMPRESS_USER_MESSAGES` | profile | Compress text inside user-role messages. The `coding` profile turns this on; set `0` to keep user text verbatim under it. Anthropic `tool_result` blocks compress either way. No `--compress-user-messages` flag on `headroom proxy`; the direct module entry point (`python -m headroom.proxy.server`) does accept one. |
 | `HEADROOM_COMPRESS_SYSTEM_MESSAGES` | unset | Compress system prompts. Off by default to keep the hottest cache prefix stable. |
 | `HEADROOM_PROTECT_RECENT` | profile | Never compress the N most recent turns. |
 | `--protect-tool-results` / `HEADROOM_PROTECT_TOOL_RESULTS` | empty | Comma-separated tool names whose output is never lossy-compressed. |
@@ -338,7 +338,8 @@ with a privileged job.
 
 | Flag / env | Default | Effect |
 |---|---|---|
-| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. |
+| `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. Also gates the read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`), which otherwise answer loopback and trusted-CIDR callers only. |
+| `HEADROOM_ALLOW_UNAUTHENTICATED_BIND` | `false` | Acknowledge a non-loopback bind (`--host 0.0.0.0`, `::`, a LAN address) with **no** `HEADROOM_PROXY_TOKEN`. Without a token or this flag the proxy refuses to start, because `/v1/*` would relay upstream with the operator's credentials for every peer that can reach the port. Only set it when the runtime already restricts reachability (a container published on `127.0.0.1`). |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
 | `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: hard-disable **all** egress (telemetry, update checks, license reporting, model downloads). |
 | `HEADROOM_LICENSE` | unset | Licence token, read by core and every licensed extension. `HEADROOM_LICENSE_KEY` is a deprecated alias for one release and logs a warning. A licence on its own sends nothing to Headroom. |
