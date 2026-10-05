@@ -245,6 +245,9 @@
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed" x-show="(stats.tokens?.new_input_tokens || 0) > 0">
                             <span x-text="'Of new input: ' + (stats.tokens?.new_input_savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of the tokens that newly entered context (uncached + cache write), which is what compression can touch. The headline above recounts the session's cached history on every turn, so it reads low on a long session even when compression is working."></span>
                         </div>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                            <span x-text="'Cost-weighted: ' + (stats.tokens?.cost_weighted_savings_percent || 0).toFixed(1) + '%'" title="The same saving in money. Lower than the token share because most removed tokens would have been cheap prefix-cache reads."></span>
+                        </div>
                         <div class="mt-2 h-8">
                             <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
                                  :aria-label="'Savings trend sparkline, ' + (stats.savings_history || []).length + ' recent samples; latest ' + (stats.tokens?.savings_percent || 0).toFixed(1) + ' percent'">
