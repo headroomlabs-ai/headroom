@@ -13,6 +13,7 @@ import click
 from headroom import paths as _paths
 from headroom.providers.registry import (
     BackendUnavailableError,
+    preflight_backend,
     resolve_api_overrides,
     resolve_api_targets,
     resolve_extra_headers,
@@ -1738,6 +1739,13 @@ Press Ctrl+C to stop.
     # Option E: start embedding server sidecar if requested
     # -----------------------------------------------------------------------
     _embed_watchdog = None
+    try:
+        # Here, not only in create_app: with --workers >1 each worker builds its
+        # own app and uvicorn would keep restarting them instead of exiting.
+        preflight_backend(backend)
+    except BackendUnavailableError as exc:
+        click.echo(f"\nCannot start proxy: {exc}", err=True)
+        raise SystemExit(2) from None
     if embedding_server:
         _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
         # Pass socket path to all worker processes via environment variable

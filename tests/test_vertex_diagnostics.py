@@ -62,8 +62,10 @@ class TestVertexErrorHint:
     def test_partner_vs_gemini_remedies(self, status):
         claude = vertex_error_hint(status, publisher="anthropic")
         gemini = vertex_error_hint(status, publisher="google")
+        mistral = vertex_error_hint(status, publisher="mistralai")
         assert "Model Garden" in claude and "Claude 4.7+" in claude
         assert "no US regional endpoint" in gemini and "Model Garden" not in gemini
+        assert "Model Garden" in mistral and "Gemini" not in mistral and "Claude 4" not in mistral
 
     @pytest.mark.parametrize("status", [401, 403, 404, 429])
     @pytest.mark.parametrize("publisher", ["google", "anthropic", "", _HOSTILE])
@@ -184,6 +186,18 @@ class TestPublicBackendErrorMessage:
             INTERNAL_ERROR
         )
 
+    def test_chained_proxy_hint_is_not_repeated(self):
+        """A provider HTTP error passes its text through; it may already hold our hint."""
+        httpx = pytest.importorskip("httpx")
+        openai = pytest.importorskip("openai")
+        raw = (
+            "vertexai import failed: No module named 'vertexai'\n"
+            "[headroom] hint: install headroom-ai[proxy,vertex]"
+        )
+        resp = httpx.Response(500, request=httpx.Request("POST", "http://x"))
+        exc = openai.InternalServerError(raw, response=resp, body=None)
+        assert public_backend_error_message(exc, raw).count("[headroom] hint:") == 1
+
 
 class TestLiteLLMVertexBackendErrors:
     """Through the real backend: raw text stays in the log, hint reaches client."""
@@ -300,3 +314,16 @@ class TestVertexSdkPreflight:
         assert result.exit_code == 2
         assert "Cannot start proxy: Vertex SDK is missing. remedy-text" in result.output
         assert "Traceback" not in result.output
+
+    def test_cli_multi_worker_fails_in_parent_before_serving(self, no_sdk):
+        """--workers >1 builds the app inside each worker, past the CLI's handler."""
+        click_testing = pytest.importorskip("click.testing")
+        from headroom.cli.main import main
+
+        with patch("headroom.proxy.server.run_server") as run_server:
+            result = click_testing.CliRunner().invoke(
+                main, ["proxy", "--backend", "vertex", "--workers", "2"]
+            )
+        assert result.exit_code == 2
+        assert "headroom-ai[proxy,vertex]" in result.output
+        run_server.assert_not_called()

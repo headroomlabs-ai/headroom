@@ -120,7 +120,10 @@ def public_backend_error_message(exc: BaseException, raw_text: str) -> str:
     """
     message = client_message(exc, raw_text)
     hint = backend_error_hint(raw_text)
-    return f"{message}\n[headroom] hint: {hint}" if hint else message
+    # A chained Headroom upstream may already have added one.
+    if not hint or "[headroom] hint:" in message:
+        return message
+    return f"{message}\n[headroom] hint: {hint}"
 
 
 def vertex_error_hint(status_code: int, *, publisher: str = "") -> str | None:
@@ -135,6 +138,8 @@ def vertex_error_hint(status_code: int, *, publisher: str = "") -> str | None:
     # this model here. Which remedy applies depends on the publisher.
     if is_vertex_anthropic_publisher(publisher):
         return f"{_ENABLE_API} {_ENABLE_PARTNER} {_LOCATION_CLAUDE}"
+    if publisher != "google":
+        return f"{_ENABLE_API} {_ENABLE_PARTNER}"
     return f"{_ENABLE_API} {_LOCATION_GEMINI}"
 
 
