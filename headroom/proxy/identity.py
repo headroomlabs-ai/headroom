@@ -5,6 +5,12 @@ the OSS proxy it is honored only for loopback callers (the single-user local
 model). For other callers the identity is bound to the proxy token (or the
 server's OS user) so a network client cannot select another user's memory.
 
+A caller on a Unix domain socket (``headroom proxy --uds``) has no peer
+address, so it is never honoured for the header and always resolves to the
+default partition. The socket is ``0600``, so that caller is the proxy's own
+user, whose partition the default already is; widening header trust to
+"missing peer metadata" would let any unusual transport opt in as well.
+
 Multi-tenant deployments (e.g. headroom-managed) replace the default with an
 authenticated resolver via :func:`set_identity_resolver`, typically from a
 ``headroom.proxy_extension`` install hook. This keeps real per-tenant identity —

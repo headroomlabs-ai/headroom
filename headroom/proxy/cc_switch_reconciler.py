@@ -70,6 +70,21 @@ def reconciler_enabled() -> bool:
     )
 
 
+def refuse_unix_socket_listener(uds: str | None) -> None:
+    """Raise :class:`ValueError` when the reconciler is enabled for a proxy serving on *uds*.
+
+    The reconciler points Claude Code at ``http://127.0.0.1:<port>``, which a
+    proxy listening on a Unix socket does not serve, so every rewritten
+    ``settings.json`` would send Claude Code to a dead or unrelated port.
+    """
+    if uds is not None and reconciler_enabled():
+        raise ValueError(
+            "HEADROOM_CC_SWITCH_RECONCILE points Claude Code at http://127.0.0.1:<port>, "
+            "which a proxy serving on a Unix socket (--uds) does not listen on. "
+            "Unset it or drop --uds."
+        )
+
+
 def _route_official() -> bool:
     return os.environ.get("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", "").strip().lower() in (
         "1",

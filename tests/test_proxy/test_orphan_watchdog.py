@@ -30,7 +30,7 @@ def _write_marker(clients_dir: Path, pid: int, **extra: object) -> Path:
 
 class _Proxy:
     def __init__(self, *, port: int = 8787, active_sessions: int = 0) -> None:
-        self.config = SimpleNamespace(port=port)
+        self.config = SimpleNamespace(port=port, instance_key=port)
         self.ws_sessions = SimpleNamespace(active_count=lambda: active_sessions)
         self._active_requests = 0
         self._activity_generation = 0

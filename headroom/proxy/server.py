@@ -3085,9 +3085,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy log. Multi-worker processes add their PID so
-    # same-port workers never share a RotatingFileHandler target.
+    # workers of one instance never share a RotatingFileHandler target.
     _setup_file_logging(
-        config.port,
+        config.instance_key,
         process_id=os.getpid() if config.worker_processes > 1 else None,
     )
 
@@ -3124,8 +3124,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     from headroom.proxy.cc_switch_reconciler import (
         CCSwitchReconciler,
         reconciler_enabled,
+        refuse_unix_socket_listener,
     )
 
+    refuse_unix_socket_listener(config.uds)
     _cc_reconciler: CCSwitchReconciler | None = None
     if reconciler_enabled():
         _cc_proxy_port = config.port if hasattr(config, "port") else 8787
@@ -3149,7 +3151,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # once across all workers instead of N times.
     from headroom import paths as _hr_paths
 
-    _beacon_lock_path = _hr_paths.beacon_lock_path(config.port)
+    _beacon_lock_path = _hr_paths.beacon_lock_path(config.instance_key)
     _beacon_lock_fd: list = [None]  # mutable holder for the lock file descriptor
     _beacon_is_owner: list = [False]
 
@@ -6180,6 +6182,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         rollout=rollout,
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
         port=_get_env_int("HEADROOM_PORT", 8787),
+        uds=os.environ.get("HEADROOM_UDS") or None,
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
         anthropic_api_url=os.environ.get("ANTHROPIC_TARGET_API_URL"),
         anthropic_buffered_request_timeout_seconds=_get_env_int(
@@ -6359,13 +6362,29 @@ def run_server(
     # Resolve upstream API targets for display in the banner (#583).
     api_targets = resolve_api_targets(config.provider_api_overrides)
 
+    # Validate the socket path before the banner, so a bad path is a one-line
+    # error rather than a traceback under a banner announcing a listener.
+    uds_path: Path | None = None
+    if config.uds:
+        from headroom.proxy.uds import prepare_uds_path
+
+        uds_path = prepare_uds_path(config.uds)
+        # No per-agent recipe on a socket bind; see uds.socket_usage_lines().
+        listen_display = f"unix:{uds_path}"
+        usage_label = "Client:     "
+        usage_display = "must support HTTP over a Unix socket natively"
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_label = "Claude Code:"
+        usage_display = f"ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude"
+
     if print_banner:
         print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                      HEADROOM PROXY SERVER                           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  Version: 1.0.0                                                      ║
-║  Listening: http://{config.host}:{config.port:<5}                                      ║
+║  Listening: {listen_display:<57}║
 ║  Workers: {workers:<3}  Concurrency Limit: {limit_concurrency:<5}                          ║
 ║  Backend: {backend_status:<59}║
 ╠══════════════════════════════════════════════════════════════════════╣
@@ -6387,7 +6406,7 @@ def run_server(
 ║    Conn Pool:       {pool_info:<52}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  USAGE:                                                              ║
-║    Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude     ║
+║    {usage_label}   {usage_display:<51}║
 ║    Cursor:        Set base URL in settings                           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                          ║
@@ -6466,18 +6485,54 @@ def run_server(
     # and no CLI flag to change it. Overridable now; the default is unchanged.
     uvicorn_log_level = _resolve_uvicorn_log_level()
 
+    if uds_path is not None:
+        from headroom.proxy.uds import serving_uds
+
+        # Headroom binds the socket and hands uvicorn the descriptor, so the
+        # socket is 0600 before uvicorn listens and is removed on SIGTERM too;
+        # see bind_uds_listener() and serving_uds().
+        with serving_uds(uds_path) as listener:
+            _run_uvicorn(
+                app_target,
+                {"fd": listener.sock.fileno()},
+                workers,
+                limit_concurrency,
+                uvicorn_log_level,
+                uvicorn_kwargs,
+            )
+    else:
+        _run_uvicorn(
+            app_target,
+            {"host": config.host, "port": config.port},
+            workers,
+            limit_concurrency,
+            uvicorn_log_level,
+            uvicorn_kwargs,
+        )
+
+
+def _run_uvicorn(
+    app_target: Any,
+    bind_kwargs: dict[str, Any],
+    workers: int,
+    limit_concurrency: int,
+    log_level: str,
+    uvicorn_kwargs: dict[str, Any],
+) -> None:
+    """Hand off to uvicorn. Split out so the bind target stays testable."""
     uvicorn.run(
         app_target,
-        host=config.host,
-        port=config.port,
-        log_level=uvicorn_log_level,
+        **bind_kwargs,
+        log_level=log_level,
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
         # Defense-in-depth: the loopback guard for /debug/* endpoints trusts
         # request.client.host. uvicorn's ProxyHeadersMiddleware rewrites that
         # from X-Forwarded-For when FORWARDED_ALLOW_IPS is broader than the
         # default. Disabling proxy_headers here guarantees the guard sees the
-        # real peer address regardless of env.
+        # real peer address regardless of env. Over a Unix socket uvicorn reports
+        # no peer address, so request.client is None, which the guard treats as
+        # local: the socket's 0600 mode limits peers to the proxy's own user.
         proxy_headers=False,
         timeout_graceful_shutdown=10,
         **uvicorn_kwargs,
@@ -6637,8 +6692,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Headroom Proxy Server")
 
     # Server
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8787)
+    # No argparse defaults for the TCP address, so an explicit value can be told
+    # apart from the default and refused alongside --uds; ProxyConfig owns them.
+    parser.add_argument("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=None, help="Port to bind to (default: 8787)")
+    parser.add_argument(
+        "--uds",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Serve on a Unix domain socket at PATH instead of a TCP host and port. "
+            "POSIX only. Cannot be combined with --host/--port or HEADROOM_HOST/HEADROOM_PORT."
+        ),
+    )
     parser.add_argument(
         "--openai-api-url", help=f"Custom OpenAI API URL (default: {DEFAULT_OPENAI_API_URL})"
     )
@@ -6956,10 +7022,23 @@ if __name__ == "__main__":
     from headroom.rollout import resolve_rollout
 
     rollout = resolve_rollout()
+    tcp_address_sources = [
+        source
+        for source, given in (
+            ("--host", args.host is not None),
+            ("--port", args.port is not None),
+            ("HEADROOM_HOST", "HEADROOM_HOST" in os.environ),
+            ("HEADROOM_PORT", "HEADROOM_PORT" in os.environ),
+        )
+        if given
+    ]
+    if args.uds is not None and tcp_address_sources:
+        parser.error(f"--uds cannot be combined with {', '.join(tcp_address_sources)}")
     config = ProxyConfig(
         rollout=rollout,
-        host=_get_env_str("HEADROOM_HOST", args.host),
-        port=_get_env_int("HEADROOM_PORT", args.port),
+        uds=args.uds,
+        host=_get_env_str("HEADROOM_HOST", ProxyConfig.host if args.host is None else args.host),
+        port=_get_env_int("HEADROOM_PORT", ProxyConfig.port if args.port is None else args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
         anthropic_api_url=_get_env_str("ANTHROPIC_TARGET_API_URL", args.anthropic_api_url),
         anthropic_buffered_request_timeout_seconds=_get_env_int(
@@ -7070,4 +7149,9 @@ if __name__ == "__main__":
     workers = _get_env_int("HEADROOM_WORKERS", args.workers)
     limit_concurrency = _get_env_int("HEADROOM_LIMIT_CONCURRENCY", args.limit_concurrency)
 
-    run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    from headroom.proxy.uds import UdsError
+
+    try:
+        run_server(config, workers=workers, limit_concurrency=limit_concurrency)
+    except UdsError as exc:
+        parser.exit(1, f"error: {exc}\n")

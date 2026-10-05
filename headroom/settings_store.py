@@ -274,6 +274,20 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Bind port. Managed by the install manifest on docker/service installs.",
         tier="advanced",
     ),
+    SettingField(
+        "HEADROOM_UDS",
+        "uds",
+        "Unix socket path",
+        "Networking",
+        "str",
+        default=None,
+        help=(
+            "Serve on a Unix domain socket at this path instead of host/port. "
+            "POSIX only; leave empty to bind host/port. Cannot be combined with "
+            "HEADROOM_HOST or HEADROOM_PORT."
+        ),
+        tier="advanced",
+    ),
     # --- Logging ---
     SettingField(
         "HEADROOM_LOG_MESSAGES",

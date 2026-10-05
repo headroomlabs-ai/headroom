@@ -764,6 +764,9 @@ def _start_proxy(
     # watchdog can observe all activity before deciding to self-terminate.
     proxy_env.pop("HEADROOM_WORKERS", None)
     proxy_env.pop("HEADROOM_PROXY_CONFIG_JSON", None)
+    # wrap launches the proxy on --port and polls it over TCP, so an inherited
+    # socket path (from the shell or settings.json) must not reach the child.
+    proxy_env.pop("HEADROOM_UDS", None)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
     # `wrap` from a directory that contains a `headroom/` folder (most commonly a

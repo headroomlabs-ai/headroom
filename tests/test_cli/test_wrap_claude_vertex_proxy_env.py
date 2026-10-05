@@ -629,3 +629,25 @@ def test_ensure_proxy_restarts_idle_proxy_to_clear_vertex_api_url(
     assert calls[1][0] == "start"
     assert calls[1][2]["vertex_api_url"] is None
     assert calls[1][2]["clear_vertex_api_url"] is True
+
+
+def test_start_proxy_does_not_pass_headroom_uds_to_its_tcp_proxy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """wrap launches the proxy with --port and polls TCP; an inherited HEADROOM_UDS would conflict."""
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setenv("HEADROOM_UDS", str(tmp_path / "proxy.sock"))
+    monkeypatch.setattr(wrap_mod, "_get_log_path", lambda port=None: tmp_path / "proxy.log")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProxyProcess:
+        captured["kwargs"] = kwargs
+        return _FakeProxyProcess()
+
+    monkeypatch.setattr(wrap_mod.subprocess, "Popen", fake_popen)
+
+    wrap_mod._start_proxy(8787, agent_type="claude")
+
+    assert "HEADROOM_UDS" not in captured["kwargs"]["env"]

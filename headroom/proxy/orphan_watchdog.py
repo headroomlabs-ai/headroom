@@ -168,8 +168,8 @@ async def orphan_watchdog_loop(
     even with no live markers. The idle clock runs only while every supported
     activity signal is positively observable and idle.
     """
-    port = proxy.config.port
-    clients_dir = proxy_clients_dir(port)
+    instance_key = proxy.config.instance_key
+    clients_dir = proxy_clients_dir(instance_key)
     idle_since: float | None = None
     last_activity_generation = _activity_generation(proxy)
     while True:
@@ -200,9 +200,9 @@ async def orphan_watchdog_loop(
         ):
             if idle_since is not None:
                 logger.info(
-                    "event=orphan_watchdog_reset port=%d live_clients=%s "
+                    "event=orphan_watchdog_reset instance=%s live_clients=%s "
                     "active_sessions=%s active_requests=%s",
-                    port,
+                    instance_key,
                     clients,
                     active_sessions,
                     active_requests,
@@ -215,8 +215,8 @@ async def orphan_watchdog_loop(
             continue
         if now - idle_since >= grace_seconds:
             logger.info(
-                "event=orphan_watchdog_exit port=%d idle_seconds=%.0f reason=no_live_wrap_clients",
-                port,
+                "event=orphan_watchdog_exit instance=%s idle_seconds=%.0f reason=no_live_wrap_clients",
+                instance_key,
                 now - idle_since,
             )
             stop()

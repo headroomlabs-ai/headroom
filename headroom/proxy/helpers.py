@@ -1814,19 +1814,21 @@ def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
 
 
 def _setup_file_logging(
-    port: int | None = None,
+    instance_key: int | str | None = None,
     *,
     process_id: int | None = None,
 ) -> None:
     """Add a RotatingFileHandler to the headroom root logger.
 
-    Writes to a per-port log, with a PID suffix in multi-worker mode:
+    Writes to a per-instance log, with a PID suffix in multi-worker mode:
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
 
-    The file is keyed by *port* so concurrent instances rotate separate logs.
-    Multi-worker callers also pass *process_id* so same-port workers cannot
-    race during rollover. When *port* is omitted the legacy shared name is used.
+    The file is keyed by *instance_key* (``ProxyConfig.instance_key``: the port,
+    or ``uds-<hash>`` for a Unix socket proxy) so concurrent instances rotate
+    separate logs. Multi-worker callers also pass *process_id* so workers of
+    one instance cannot race during rollover. When *instance_key* is omitted
+    the legacy shared name is used.
 
     The log is **always** created owner-only, and so are its rotated backups —
     not only when ``HEADROOM_LOG_PAYLOAD_PREVIEW`` is on. Payload previews are
@@ -1841,7 +1843,7 @@ def _setup_file_logging(
     try:
         log_dir = _headroom_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = _paths.proxy_log_path(port, process_id=process_id)
+        log_path = _paths.proxy_log_path(instance_key, process_id=process_id)
         if log_path.is_symlink():
             # Fail closed. A symlink at the log path redirects both the write
             # and the mode we set on it, so whoever planted it chooses where
