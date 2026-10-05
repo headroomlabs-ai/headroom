@@ -2394,6 +2394,27 @@ class ContentRouter(Transform):
             self._runtime_state_var.set(state)
         return state
 
+    def share_request_deadline(self, started_at: float) -> bool:
+        """Join a request whose kompress deadline started at ``started_at``.
+
+        ``apply()`` stamps its own origin. A caller that fans ONE request out
+        over many ``compress()`` calls (the OpenAI Responses unit adapter) calls
+        this before each one instead, so every call draws down the same
+        ``HEADROOM_COMPRESSION_DEADLINE_MS`` budget rather than restarting it.
+        Binds a fresh ``_PerRequestRuntimeState`` in the CURRENT Context, so a
+        worker-pool task must run in its own ``contextvars.copy_context()``.
+
+        Returns ``False``, binding nothing, once the deadline has passed: the
+        caller should leave the content unchanged rather than start new work.
+        """
+        deadline_s = _compression_deadline_seconds()
+        if deadline_s and time.perf_counter() - started_at > deadline_s:
+            return False
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(kompress_deadline_started_at=started_at)
+        )
+        return True
+
     @property
     def _runtime_compression_policy(self) -> Any:
         return self._runtime_state_var.get().compression_policy

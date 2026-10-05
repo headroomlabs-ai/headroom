@@ -423,7 +423,12 @@ def _build_usage_headers(request_headers: dict[str, str]) -> dict[str, str] | No
     """
     lower = {str(k).lower(): v for k, v in request_headers.items()}
     auth = str(lower.get("authorization", ""))
-    if not auth.startswith("Bearer ") or not auth[len("Bearer ") :].strip():
+    # The auth-scheme token is case-insensitive per RFC 7235 2.1, so a client
+    # sending "authorization: bearer <token>" must be recognized the same as
+    # "Bearer <token>". A case-sensitive check skipped the usage poll for such
+    # requests, so the Codex rate-limit window was never refreshed for them.
+    scheme, sep, credentials = auth.partition(" ")
+    if not sep or scheme.lower() != "bearer" or not credentials.strip():
         return None
     account_id = lower.get("chatgpt-account-id")
     if not account_id:
