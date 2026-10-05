@@ -500,6 +500,17 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
     assert kwargs["min_tokens_to_compress"] == 300
 
 
+def test_proxy_explicit_compress_user_messages_off_overrides_coding_profile() -> None:
+    # coding turns user-message compression on; an explicit off
+    # (HEADROOM_COMPRESS_USER_MESSAGES=0) must win like every other override,
+    # and leaving it unset must keep the profile default.
+    explicit_off = ProxyConfig(savings_profile="coding", compress_user_messages=False)
+    unset = ProxyConfig(savings_profile="coding")
+
+    assert proxy_pipeline_kwargs(explicit_off)["compress_user_messages"] is False
+    assert proxy_pipeline_kwargs(unset)["compress_user_messages"] is True
+
+
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:
     router = ContentRouter(
         ContentRouterConfig(
