@@ -62,16 +62,23 @@ headroom memory list
 For `proxy`, the maintained wrapper always publishes the selected host port on
 loopback. It passes `--host 0.0.0.0` inside the container so that the loopback
 publication can reach the container, and it has no public-publication override.
-For local-only use, no token is required:
+For local-only use no token is needed, but the proxy refuses to start on a
+non-loopback bind without one unless you acknowledge that the runtime already
+restricts who can reach the port (here: the `127.0.0.1` publication):
 
 ```bash
 docker run --rm -it \
   -p 127.0.0.1:8787:8787 \
+  -e HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 \
   -v "$PWD:/workspace" \
   -w /workspace \
   ghcr.io/headroomlabs-ai/headroom:latest \
   --host 0.0.0.0 --port 8787
 ```
+
+The maintained wrappers (`headroom install`, the `install.sh` / `install.ps1`
+native wrappers, and `docker/docker-compose.native.yml`) set that acknowledgement
+themselves, and only together with the `127.0.0.1` publication it depends on.
 
 For deliberate public access, publish on an explicit public address and set
 `HEADROOM_PROXY_TOKEN`:
