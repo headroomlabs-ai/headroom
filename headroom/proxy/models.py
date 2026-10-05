@@ -6,7 +6,9 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import sys
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -571,6 +573,9 @@ class ProxyConfig:
     # the worker receiving the admin request would observe the update.
     worker_processes: int = 1
 
+    # Unix domain socket path to listen on instead of ``host``/``port``. When set, no TCP socket is bound and ``host``/``port`` are not used; see headroom.proxy.unix_socket for the socket's mode, stale-file handling and the caller's duty to provide a private parent directory.
+    uds: str | None = None
+
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
@@ -581,6 +586,8 @@ class ProxyConfig:
         # break explicit non-CLI configuration.
         if self.worker_processes < 1:
             raise ValueError("worker_processes must be >= 1")
+        if self.uds == "":
+            raise ValueError("uds must be a socket path, not an empty string")
         if self.retry_enabled and self.retry_max_attempts < 1:
             raise ValueError("retry_max_attempts must be >= 1 when retry_enabled=True")
         # A 0 (or negative) requests-per-minute limit divides by zero in the
@@ -592,6 +599,17 @@ class ProxyConfig:
             raise ValueError(
                 "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
             )
+
+    @property
+    def instance_key(self) -> int | str:
+        """Key for per-instance workspace state (runtime log, beacon lock, wrap-client markers).
+
+        The TCP port for a TCP listener. For a unix socket listener, ``uds-`` followed by the SHA-256 of the socket's absolute path, so two socket instances never share a log or lock with each other or with a TCP instance on the default port.
+        """
+        if self.uds is None:
+            return self.port
+        digest = hashlib.sha256(os.path.abspath(self.uds).encode("utf-8")).hexdigest()
+        return f"uds-{digest}"
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:

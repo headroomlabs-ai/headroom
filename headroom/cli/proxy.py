@@ -194,6 +194,22 @@ def _get_env_float_optional(name: str) -> float | None:
         raise click.ClickException(f"{name} must be a number, got {val!r}") from None
 
 
+def _refuse_tcp_listen_options_with_uds(ctx: click.Context) -> None:
+    """Reject ``--host``/``--port`` (from the command line or environment) alongside ``--uds``.
+
+    A unix socket listener binds no TCP address, so either value would be silently ignored.
+    """
+    explicit = {click.core.ParameterSource.COMMANDLINE, click.core.ParameterSource.ENVIRONMENT}
+    conflicting = [
+        f"--{name}" for name in ("host", "port") if ctx.get_parameter_source(name) in explicit
+    ]
+    if conflicting:
+        raise click.UsageError(
+            f"--uds cannot be combined with {', '.join(conflicting)} "
+            "(set on the command line or via HEADROOM_HOST/HEADROOM_PORT)"
+        )
+
+
 @main.command()
 @click.option(
     "--port",
@@ -234,6 +250,18 @@ def dashboard(port: int, no_open: bool) -> None:
     type=click.IntRange(1, 65535),
     envvar="HEADROOM_PORT",
     help="Port to bind to (default: 8787, env: HEADROOM_PORT)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    type=click.Path(dir_okay=False, resolve_path=False),
+    help=(
+        "Listen on this unix domain socket path instead of a TCP host and port. "
+        "Cannot be combined with --host/--port or HEADROOM_HOST/HEADROOM_PORT. "
+        "The parent directory must already exist and be private (mode 0700); "
+        "the socket is created with mode 0600, a stale socket at the path is "
+        "replaced, and the socket is removed on shutdown."
+    ),
 )
 @click.option(
     "--workers",
@@ -1013,7 +1041,7 @@ def dashboard(port: int, no_open: bool) -> None:
     "--embedding-server-socket",
     default=None,
     help="Unix socket path for the embedding server sidecar. "
-    "Default: /tmp/headroom-embed-{port}.sock. "
+    "Default: /tmp/headroom-embed-{port}.sock (a uds- key in place of the port with --uds). "
     "(env: HEADROOM_EMBEDDING_SERVER_SOCKET)",
 )
 @click.option(
@@ -1039,6 +1067,7 @@ def proxy(
     target_ratio: float | None,
     host: str,
     port: int,
+    uds: str | None,
     workers: int,
     limit_concurrency: int,
     max_connections: int,
@@ -1141,6 +1170,19 @@ def proxy(
     Usage with OpenAI-compatible clients:
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
+    if uds is not None:
+        # Before anything else: the malloc-tuning re-exec and dependency checks are wasted work when --uds cannot work.
+        from headroom.proxy.unix_socket import (
+            UnixSocketUnusableError,
+            checked_unix_socket_path,
+            require_unix_sockets,
+        )
+
+        try:
+            require_unix_sockets()
+        except UnixSocketUnusableError as exc:
+            raise click.ClickException(str(exc)) from None
+
     _reexec_with_malloc_tuning()
     ensure_proxy_dependencies()
 
@@ -1329,9 +1371,17 @@ def proxy(
     if memory_qdrant_api_key is not None:
         qdrant_overrides["memory_qdrant_api_key"] = memory_qdrant_api_key
 
+    if uds is not None:
+        _refuse_tcp_listen_options_with_uds(ctx)
+        try:
+            uds = checked_unix_socket_path(uds)
+        except UnixSocketUnusableError as exc:
+            raise click.ClickException(str(exc)) from None
+
     config = ProxyConfig(
         host=host,
         port=port,
+        uds=uds,
         rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
@@ -1525,6 +1575,19 @@ def proxy(
             reporting = "ON"
         license_status = f"LICENSED (usage reporting {reporting})"
 
+    if config.uds is not None:
+        # HTTP clients reach a unix socket listener with any Host; the URL is only the request target.
+        listen_url = "http://localhost"
+        listen_display = f"unix:{config.uds}"
+        usage_lines = f"  curl:          curl --unix-socket {config.uds} {listen_url}/health"
+    else:
+        listen_url = f"http://{config.host}:{config.port}"
+        listen_display = listen_url
+        usage_lines = (
+            f"  Claude Code:   ANTHROPIC_BASE_URL={listen_url} claude\n"
+            f"  Codex / OpenAI: OPENAI_BASE_URL={listen_url}/v1 your-app"
+        )
+
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
     openai_url = provider_api_targets.openai
@@ -1554,7 +1617,7 @@ IMPORTANT for {provider_config.display_name} users:
   1. Set credentials: {env_vars_str}
   2. Set a dummy Anthropic key: ANTHROPIC_API_KEY="sk-ant-dummy"
      (Headroom ignores this - it uses your {provider_config.display_name} credentials)
-  3. Set base URL: ANTHROPIC_BASE_URL=http://{config.host}:{config.port}"""
+  3. Set base URL: ANTHROPIC_BASE_URL={listen_url}"""
         if provider_config.model_format_hint:
             backend_section += f"\n  4. Use model names: {provider_config.model_format_hint}"
         backend_section += "\n"
@@ -1651,6 +1714,8 @@ Memory (Multi-Provider):
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
+    elif config.uds is not None:
+        _security_status = "unix socket (peers limited by filesystem permissions)"
     elif not is_loopback_host(config.host):
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
@@ -1669,7 +1734,8 @@ Memory (Multi-Provider):
 
     # Performance tuning section — only shown when at least one tuning var is active.
     _embed_socket = os.environ.get("HEADROOM_EMBEDDING_SERVER_SOCKET") or (
-        embedding_server and (embedding_server_socket or f"/tmp/headroom-embed-{port}.sock")
+        embedding_server
+        and (embedding_server_socket or f"/tmp/headroom-embed-{config.instance_key}.sock")
     )
     _tuning_lines: list[str] = []
     if _embed_socket:
@@ -1687,7 +1753,7 @@ Memory (Multi-Provider):
 
 Starting proxy server...
 
-  URL:          http://{config.host}:{config.port}
+  URL:          {listen_display}
   Mode:         {config.mode}
   Optimization: {"ENABLED" if config.optimize else "DISABLED"}
   Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
@@ -1708,8 +1774,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}
 
 Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+{usage_lines}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness
@@ -1738,7 +1803,7 @@ Press Ctrl+C to stop.
     # -----------------------------------------------------------------------
     _embed_watchdog = None
     if embedding_server:
-        _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.port}.sock"
+        _embed_socket = embedding_server_socket or f"/tmp/headroom-embed-{config.instance_key}.sock"
         # Pass socket path to all worker processes via environment variable
         os.environ["HEADROOM_EMBEDDING_SERVER_SOCKET"] = _embed_socket
         click.echo(f"  Embedding server: starting sidecar on {_embed_socket}...")
@@ -1775,6 +1840,8 @@ Press Ctrl+C to stop.
             )
             os.environ.pop("HEADROOM_EMBEDDING_SERVER_SOCKET", None)
 
+    from headroom.proxy.unix_socket import UnixSocketInUseError
+
     try:
         run_kwargs: dict[str, Any] = {}
         if workers != 1:
@@ -1786,6 +1853,8 @@ Press Ctrl+C to stop.
         # the legacy banner via run_server's default.
         run_kwargs["print_banner"] = False
         run_server(config, **run_kwargs)
+    except UnixSocketInUseError as exc:
+        raise click.ClickException(str(exc)) from None
     except KeyboardInterrupt:
         click.echo("\nShutting down...")
         raise SystemExit(130) from None

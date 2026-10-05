@@ -28,12 +28,14 @@ LOG_DIR = _paths.log_dir()
 DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 
 # Runtime-log filenames that carry PERF records: the legacy shared
-# ``proxy.log``, per-port ``proxy-<port>.log``, and worker-specific
-# ``proxy-<port>-<pid>.log`` (port and PID are digits), each with optional
-# rotation suffix ``.1``..``.5``. A positive match (not a
-# ``proxy-stdio`` blacklist) so unrelated files like ``proxy-stdio-8787.log``
-# or a hypothetical ``proxy-errors.log`` are never ingested as PERF input.
-_PERF_LOG_FILE_RE = re.compile(r"proxy(?:-\d+){0,2}\.log(?:\.\d+)?$")
+# ``proxy.log``, per-instance ``proxy-<key>.log``, and worker-specific
+# ``proxy-<key>-<pid>.log``, each with optional rotation suffix ``.1``..``.5``.
+# ``<key>`` is ``ProxyConfig.instance_key``: the port (digits) for a TCP proxy,
+# ``uds-<sha256 hex>`` for a Unix socket proxy; the PID is digits. A positive
+# match (not a ``proxy-stdio`` blacklist) so unrelated files like
+# ``proxy-stdio-8787.log`` or a hypothetical ``proxy-errors.log`` are never
+# ingested as PERF input.
+_PERF_LOG_FILE_RE = re.compile(r"proxy(?:-(?:\d+|uds-[0-9a-f]+)(?:-\d+)?)?\.log(?:\.\d+)?$")
 
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
@@ -323,8 +325,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
             report.newest_kept_ts = ts_str
 
     # Collect log files across every proxy instance:
-    #   - per-worker runtime logs: proxy-<port>-<pid>.log, rotations
-    #   - standard per-port runtime logs: proxy-<port>.log, rotations
+    #   - per-worker runtime logs: proxy-<key>-<pid>.log, rotations
+    #   - standard per-instance runtime logs: proxy-<key>.log, rotations
     #   - legacy shared log (backward compat): proxy.log, proxy.log.1, ...
     # Selected by a positive filename match (``_PERF_LOG_FILE_RE``), so the
     # proxy-stdio-*.log captures (stdout/stderr, not PERF records) and any other

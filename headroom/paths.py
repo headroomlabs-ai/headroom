@@ -343,8 +343,10 @@ def log_dir() -> Path:
     return workspace_dir() / _LOGS_DIR
 
 
-def proxy_log_path(port: int | None = None, *, process_id: int | None = None) -> Path:
+def proxy_log_path(port: int | str | None = None, *, process_id: int | None = None) -> Path:
     """Return the path for the proxy runtime log file.
+
+    *port* is the instance key (``ProxyConfig.instance_key``): the TCP port, or a ``uds-`` key for a unix socket listener.
 
     Multi-worker processes pass both values and write
     ``proxy-<port>-<pid>.log``. Omitting *process_id* returns the standard
@@ -390,8 +392,8 @@ def bin_dir() -> Path:
     return workspace_dir() / _BIN_DIR
 
 
-def proxy_clients_dir(port: int) -> Path:
-    """Per-port dir of live wrap-client markers (one file per client PID)."""
+def proxy_clients_dir(port: int | str) -> Path:
+    """Per-instance dir of live wrap-client markers (one file per client PID), keyed by ``ProxyConfig.instance_key``."""
 
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
@@ -402,10 +404,10 @@ def deploy_root() -> Path:
     return workspace_dir() / _DEPLOY_DIR
 
 
-def beacon_lock_path(port: int) -> Path:
-    """Return the per-port proxy beacon lock file path."""
+def beacon_lock_path(port: int | str) -> Path:
+    """Return the per-instance proxy beacon lock file path, keyed by ``ProxyConfig.instance_key``."""
 
-    return workspace_dir() / f".beacon_lock_{int(port)}"
+    return workspace_dir() / f".beacon_lock_{port}"
 
 
 def proxy_start_lock_path(port: int) -> Path:

@@ -1814,7 +1814,7 @@ def _warn_once_if_owner_only_unsupported(log_path: Path) -> None:
 
 
 def _setup_file_logging(
-    port: int | None = None,
+    port: int | str | None = None,
     *,
     process_id: int | None = None,
 ) -> None:
@@ -1824,7 +1824,7 @@ def _setup_file_logging(
     - Rotates at 10 MB
     - Keeps 5 backups (~50 MB max)
 
-    The file is keyed by *port* so concurrent instances rotate separate logs.
+    The file is keyed by *port*, the instance key (``ProxyConfig.instance_key``: the TCP port, or a ``uds-`` key for a unix socket listener), so concurrent instances rotate separate logs.
     Multi-worker callers also pass *process_id* so same-port workers cannot
     race during rollover. When *port* is omitted the legacy shared name is used.
 

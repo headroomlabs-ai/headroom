@@ -38,6 +38,27 @@ The install id is a random UUID generated on first run and stored in your config
 
 Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--offline` (which also disables update checks and license reporting).
 
+### Listening on a unix socket
+
+`headroom proxy --uds /path/to/dir/proxy.sock` serves HTTP on a unix domain socket and binds no TCP port. A local process cannot reach the proxy just by grabbing a free loopback port; only processes allowed by the filesystem can connect. The same flag exists on `python -m headroom.proxy.server`, and programmatic callers set `ProxyConfig(uds=...)`.
+
+- The parent directory must already exist, be owned by the user running the proxy, and not be writable by group or others (`mkdir -m 700` is the recommended setup). Whoever can write a directory can delete the socket in it and bind their own at the same path, so a directory that fails this check is refused with a one-line error before the banner. A sticky bit (as on `/tmp`) does not substitute: it stops other users removing your entries but not planting one at the path first. Only the parent is inspected, not the directories above it, and Headroom never creates or chmods it.
+- The socket is created with mode `0600`.
+- A relative path is resolved against the current directory and `~` is expanded before anything else, and the banner and the `curl --unix-socket` example show the resolved path. The resolved path must fit the platform's `sockaddr_un` limit (`sun_path` is 104 bytes on macOS and the BSDs and 108 on Linux; the usable length is measured at startup); a longer one is refused with an error naming its length and the limit.
+- `--uds` is refused on a platform without unix domain sockets, such as Windows.
+- A socket left at the path by a process that has exited is replaced. A socket another process is still listening on, or any path that is not a socket, is refused and the proxy exits.
+- The socket file is removed on shutdown (Ctrl+C or SIGTERM), unless something else has replaced it in the meantime.
+- `--uds` cannot be combined with `--host`, `--port`, `HEADROOM_HOST` or `HEADROOM_PORT`.
+- Peers on the socket count as local for the loopback-only `/debug/*` and dashboard routes and are exempt from `HEADROOM_PROXY_TOKEN`, exactly like loopback TCP callers. The `x-headroom-user-id` header is the exception: uvicorn reports no peer address on a unix socket, and identity selection only trusts a peer it can see is loopback, so the header from a socket caller is ignored.
+- Per-instance state that is normally keyed by port (the runtime log, which `headroom perf` reads, the beacon lock, the embedding sidecar's default socket and the wrap-client markers the orphan watchdog reads) is keyed by a hash of the socket path instead.
+- `HEADROOM_CC_SWITCH_RECONCILE` is refused, since it points Claude Code at a TCP URL.
+
+```bash
+mkdir -m 700 ~/.headroom-run
+headroom proxy --uds ~/.headroom-run/proxy.sock
+curl --unix-socket ~/.headroom-run/proxy.sock http://localhost/health
+```
+
 ## CLI options
 
 ### Core
@@ -46,6 +67,7 @@ Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--of
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
+| `--uds` | None | Listen on this unix domain socket path instead of `--host`/`--port` (see [Listening on a unix socket](#listening-on-a-unix-socket)) |
 | `--workers` | `1` | Number of Uvicorn worker processes |
 | `--limit-concurrency` | `1000` | Maximum concurrent connections before Uvicorn returns 503 |
 | `--max-connections` | `500` | Maximum upstream HTTP connections |
