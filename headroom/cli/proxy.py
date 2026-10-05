@@ -1148,6 +1148,7 @@ def proxy(
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,
+        _get_env_optional_bool,
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
@@ -1347,7 +1348,8 @@ def proxy(
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        # Same parse as the server entry points: empty means unset (profile).
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         periodic_malloc_trim_enabled=_get_env_bool(
             "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
