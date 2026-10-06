@@ -14,6 +14,7 @@ from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
     CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
@@ -37,6 +38,9 @@ from headroom.providers.openai_responses import (
 )
 from headroom.providers.proxy_targets import (
     api_target as _api_target,
+)
+from headroom.providers.proxy_targets import (
+    openai_compatible_base_url as _openai_compatible_base_url,
 )
 from headroom.providers.proxy_targets import (
     select_passthrough_base_url as _select_passthrough_base_url,
@@ -67,7 +71,7 @@ from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
 from headroom.proxy.request_scope import normalize_request_path
-from headroom.proxy.upstream_guard import is_safe_upstream_url
+from headroom.proxy.upstream_guard import is_safe_upstream_url_async
 
 logger = logging.getLogger("headroom.proxy.routes")
 
@@ -130,14 +134,21 @@ def _register_provider_handler_route(app: FastAPI, proxy: Any, spec: ProviderHan
         model: str = "",
     ):
         handler = getattr(proxy, spec.handler_name)
+        handler_kwargs: dict[str, str] = {}
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and spec.supports_custom_base_url:
+            if not await is_safe_upstream_url_async(custom_base):
+                logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+                raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
+            handler_kwargs["upstream_base_url"] = custom_base.rstrip("/")
         if spec.path_param is None:
-            return await handler(request)
+            return await handler(request, **handler_kwargs)
         path_args = {
             "batch_id": batch_id,
             "batch_name": batch_name,
             "model": model,
         }
-        return await handler(request, path_args[spec.path_param])
+        return await handler(request, path_args[spec.path_param], **handler_kwargs)
 
     provider_handler.__name__ = (
         spec.handler_name.replace("handle_", "")
@@ -213,6 +224,25 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
 def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
     for path in CODEX_LIVE_ROUTE_PATHS:
 
+        async def codex_live_http(request: Request, route_path: str = path):
+            response = await handle_codex_live_http(
+                request,
+                proxy.http_client,
+                _api_target(proxy, "openai"),
+                route_path,
+            )
+            if response is not None:
+                return response
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "openai"),
+                route_path,
+                "openai",
+            )
+
+        codex_live_http.__name__ = path.strip("/").replace("/", "_") + "_live_http"
+        app.post(path)(codex_live_http)
+
         def register_websocket_route(route_path: str) -> None:
             async def codex_live_websocket(websocket: WebSocket):
                 await handle_codex_live_websocket(
@@ -267,7 +297,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         # OpenAI-compatible and generic passthrough routes.
         custom_base = request.headers.get("x-headroom-base-url", "").strip()
         if custom_base:
-            if not is_safe_upstream_url(custom_base):
+            if not await is_safe_upstream_url_async(custom_base):
                 logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             return await proxy.handle_anthropic_messages(
@@ -470,23 +500,35 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
-        provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
+        headers = dict(request.headers)
+        provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+        base_url = (
+            _openai_compatible_base_url(proxy, headers)
+            if provider_name == "openai"
+            else _api_target(proxy, provider_name)
+        )
         return await handle_model_metadata_endpoint(
             proxy,
             request,
             endpoint=model_metadata_get_endpoint(model_id),
-            provider_api_base_url=_api_target(proxy, provider_name),
+            provider_api_base_url=base_url,
             provider_name=provider_name,
         )
 
@@ -495,6 +537,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         chatgpt_response = await _handle_chatgpt_codex_alpha_search(request, proxy)
         if chatgpt_response is not None:
             return chatgpt_response
+        # This route resolves a caller-named upstream like the catch-all does,
+        # so it needs the same rejection. Without it a client could point the
+        # proxy at loopback/RFC1918/cloud-metadata and read the response back
+        # (CVE-2026-77775).
+        custom_base = request.headers.get("x-headroom-base-url", "").strip()
+        if custom_base and not await is_safe_upstream_url_async(custom_base):
+            logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
+            raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
         return await proxy.handle_passthrough(
             request,
             _select_passthrough_base_url(proxy, dict(request.headers)),
@@ -510,7 +560,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def passthrough(request: Request, path: str):
         custom_base = request.headers.get("x-headroom-base-url")
         if custom_base:
-            if not is_safe_upstream_url(custom_base):
+            if not await is_safe_upstream_url_async(custom_base):
                 logger.warning("rejecting unsafe x-headroom-base-url: %r", custom_base)
                 raise HTTPException(status_code=400, detail="Rejected unsafe upstream base URL")
             base_url = custom_base.rstrip("/")

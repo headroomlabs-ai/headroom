@@ -4,7 +4,9 @@
 //! Used as a baseline; future stages can compare against this to catch
 //! regressions when we change tokenizer backends or add caching layers.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use headroom_core::tokenizer::{TiktokenCounter, Tokenizer};
 
 fn bench_count_text(c: &mut Criterion) {

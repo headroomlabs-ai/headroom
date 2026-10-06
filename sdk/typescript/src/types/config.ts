@@ -7,6 +7,30 @@
 
 export type HeadroomMode = "audit" | "optimize" | "simulate";
 
+/** Pipeline mode accepted by POST /v1/compress. Unset = default marker-free
+ *  pipeline. Any other value is rejected (400) by the proxy. */
+export type CompressMode = "ccr" | "lossy_inline" | "lossless_then_lossy";
+
+/** Config accepted by the POST /v1/compress endpoint. camelCase keys are
+ *  snake_cased on the wire (e.g. targetRatio -> target_ratio). Every field is
+ *  optional; only these keys are honored by the endpoint. */
+export interface CompressRequestConfig {
+  /** Compression pipeline mode (unset = default marker-free pipeline). */
+  mode?: CompressMode;
+  /** Target keep-ratio (0–1) for lossy compression. -> target_ratio */
+  targetRatio?: number;
+  /** Also compress user-role messages (default false). -> compress_user_messages */
+  compressUserMessages?: boolean;
+  /** Number of most-recent messages to protect from compression. -> protect_recent */
+  protectRecent?: number;
+  /** Protect analysis/reasoning context from compression. -> protect_analysis_context */
+  protectAnalysisContext?: boolean;
+  /** Freeze the first N messages (prefix) from compression. -> frozen_message_count */
+  frozenMessageCount?: number;
+  /** Session id for session-aware compression. -> session_id */
+  sessionId?: string;
+}
+
 export type RelevanceTier = "bm25" | "embedding" | "hybrid";
 
 export type ContentType =

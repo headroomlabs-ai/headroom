@@ -131,7 +131,7 @@ jobs:
           components: rustfmt, clippy
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Provide ONNX Runtime dylib
@@ -271,7 +271,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             maturin-target: x86_64
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             maturin-target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -281,7 +281,7 @@ jobs:
         # Apple Silicon bundles ORT via `ort-download-binaries-rustls-tls`.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: "Build wheel (single-wheel architecture builds headroom-ai)"
