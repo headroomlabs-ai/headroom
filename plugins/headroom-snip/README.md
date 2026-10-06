@@ -39,8 +39,12 @@ they aren't animated or added to the totals. Nothing leaves your machine.
 It finds the proxy in this order:
 
 1. `HEADROOM_PROXY_URL`
-2. `ANTHROPIC_BASE_URL`, when it points at localhost (as `headroom wrap claude` sets it)
+2. `ANTHROPIC_BASE_URL` (as `headroom wrap claude` sets it)
 3. `http://127.0.0.1:8787`
+
+Only loopback URLs are used: `http` or `https` on exactly `localhost`, `127.0.0.1`
+or `[::1]`, with no user or password. A value that isn't one (a remote proxy, or a
+host like `localhost.example.com`) is skipped, so the mod never polls a remote host.
 
 ## Install
 

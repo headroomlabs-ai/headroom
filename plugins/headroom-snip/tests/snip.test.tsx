@@ -19,6 +19,50 @@ test('proxy url follows the wrapped base url only when it is local', async () =>
   expect(proxyUrl('http://localhost:1234', 'http://127.0.0.1:9999')).toBe('http://localhost:1234')
 })
 
+test('valid loopback urls keep their origin', async () => {
+  expect(proxyUrl(undefined, 'http://localhost:8787')).toBe('http://localhost:8787')
+  expect(proxyUrl(undefined, 'HTTP://LOCALHOST:8787/v1')).toBe('http://localhost:8787')
+  expect(proxyUrl(undefined, 'https://127.0.0.1:8443/p/my-project')).toBe('https://127.0.0.1:8443')
+  expect(proxyUrl(undefined, 'http://[::1]:8787/v1')).toBe('http://[::1]:8787')
+  expect(proxyUrl('http://[::1]:9000', undefined)).toBe('http://[::1]:9000')
+})
+
+test('hosts that only look local are never polled', async () => {
+  const remote = [
+    'https://localhost.attacker.example/v1',
+    'http://127.0.0.1.attacker.example/v1',
+    'http://localhost@attacker.example/v1',
+    'http://127.0.0.1:8787@attacker.example',
+    'http://attacker.example/?localhost',
+    'http://attacker.example#127.0.0.1',
+    'http://[::1].attacker.example',
+    'http://localhost:8787.attacker.example',
+  ]
+  for (const url of remote) {
+    expect(proxyUrl(undefined, url)).toBe('http://127.0.0.1:8787')
+    expect(proxyUrl(url, undefined)).toBe('http://127.0.0.1:8787')
+  }
+})
+
+test('userinfo, other schemes and junk are refused even on loopback', async () => {
+  for (const url of [
+    'http://user:pass@127.0.0.1:8787',
+    'http://user@localhost:8787',
+    'ftp://127.0.0.1:8787',
+    'file:///tmp/sock',
+    'javascript:alert(1)',
+    '127.0.0.1:8787',
+    'not a url',
+    '',
+  ]) {
+    expect(proxyUrl(url, undefined)).toBe('http://127.0.0.1:8787')
+  }
+})
+
+test('a remote override falls back to the local base url, not the remote host', async () => {
+  expect(proxyUrl('https://headroom.example.com', 'http://127.0.0.1:9999/v1')).toBe('http://127.0.0.1:9999')
+})
+
 test('transforms read as plain words', async () => {
   const { cuts, kept } = explain(['smart:array', 'smart:dict', 'router:protected:user_message', 'inserted_2_cache_breakpoints'])
   expect(cuts).toEqual(['JSON crush ×2', 'cache align'])

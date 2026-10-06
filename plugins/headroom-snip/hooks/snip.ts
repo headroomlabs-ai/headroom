@@ -5,13 +5,32 @@ export const FRAME_MS = 45
 export const TOKENS_PER_PAGE = 600
 export const MILESTONES = [10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 5_000_000]
 
-const LOOPBACK = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?/i
+const DEFAULT_PROXY = 'http://127.0.0.1:8787'
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
-/** Where the Headroom proxy listens: explicit override, the wrapped base URL, or the default port. */
+/** The origin of `raw` when it is an http(s) URL on a loopback host with no userinfo, else undefined. */
+export function loopbackOrigin(raw?: string): string | undefined {
+  if (!raw) return undefined
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return undefined
+  }
+  const isHttp = url.protocol === 'http:' || url.protocol === 'https:'
+  if (!isHttp || url.username || url.password || !LOOPBACK_HOSTS.has(url.hostname.toLowerCase())) {
+    return undefined
+  }
+
+  return url.origin
+}
+
+/**
+ * Where the Headroom proxy listens: the override, then the wrapped base URL, then the default port.
+ * Each candidate must be a loopback URL; one that is not is skipped, so the mod never polls a remote host.
+ */
 export function proxyUrl(override?: string, baseUrl?: string): string {
-  const pick = override || (baseUrl && LOOPBACK.test(baseUrl) ? baseUrl : '') || 'http://127.0.0.1:8787'
-  const match = pick.match(/^https?:\/\/[^/]+/i)
-  return match ? match[0] : 'http://127.0.0.1:8787'
+  return loopbackOrigin(override) ?? loopbackOrigin(baseUrl) ?? DEFAULT_PROXY
 }
 
 type RawRequest = {
