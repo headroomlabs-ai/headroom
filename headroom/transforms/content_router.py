@@ -1832,6 +1832,14 @@ class RouterCompressionResult:
             )
 
 
+def _mcp_result_min_chars() -> int:
+    """Below this many characters an MCP tool result is never compressed."""
+    try:
+        return max(0, int(os.environ.get("HEADROOM_MCP_RESULT_MIN_CHARS", "4000")))
+    except ValueError:
+        return 4000
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -7374,6 +7382,26 @@ class ContentRouter(Transform):
                     if _tr_list_form
                     else tool_content
                 )
+
+                # Small MCP results stay verbatim. A Jira ticket or a Slack thread is
+                # a few hundred tokens of high-value fields; compressing it saves
+                # tens of tokens, and when the model misses a field it re-calls the
+                # tool or headroom_retrieve — a whole extra turn that re-reads the
+                # entire cached conversation (measured: +2 turns, +15% cost on
+                # benchmarks/tool_search_vs_native). HEADROOM_MCP_RESULT_MIN_CHARS=0
+                # restores the old behaviour.
+                if (
+                    isinstance(tool_text, str)
+                    and str(tool_name).lower().startswith("mcp_")
+                    and len(tool_text) < _mcp_result_min_chars()
+                ):
+                    new_blocks.append(block)
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    if route_counts is not None:
+                        route_counts["mcp_small_result"] = (
+                            route_counts.get("mcp_small_result", 0) + 1
+                        )
+                    continue
 
                 # Bash-search lossless pre-empt (twin of the string-form path):
                 # fold read-only search output (grep/rg/git grep) byte-losslessly
