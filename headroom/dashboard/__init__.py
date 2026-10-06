@@ -1,7 +1,6 @@
 """Headroom Dashboard - Real-time proxy monitoring UI."""
 
 import mimetypes
-import os
 import re
 from pathlib import Path
 
@@ -54,15 +53,22 @@ def register_static_mime_types() -> None:
 _TEAMS_PERK = re.compile(r"[ \t]*<!-- teams-perk:start.*?<!-- teams-perk:end -->\n?", re.DOTALL)
 
 
-def get_dashboard_html() -> str:
+def get_dashboard_html(*, licensed: bool | None = None) -> str:
     """Load the dashboard HTML template.
 
-    The Headroom for Teams offer is stripped when ``HEADROOM_LICENSE`` is set:
-    a licensed install is already a customer.
+    The Headroom for Teams offer is stripped on a licensed install: it is
+    already a customer. ``licensed`` is the running proxy's effective licence
+    state (``create_app`` passes it, covering ``ProxyConfig.license_key``).
+    When omitted it is resolved from the environment the same way the CLI
+    does: ``HEADROOM_LICENSE``, or the deprecated ``HEADROOM_LICENSE_KEY``.
     """
     template_path = TEMPLATES_DIR / "dashboard.html"
     html = template_path.read_text(encoding="utf-8")
-    if os.environ.get("HEADROOM_LICENSE"):
+    if licensed is None:
+        from headroom.license_env import resolve_license_token
+
+        licensed = bool(resolve_license_token())
+    if licensed:
         html = _TEAMS_PERK.sub("", html)
     return html
 

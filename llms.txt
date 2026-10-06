@@ -64,11 +64,11 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 ## Headroom for Teams
 
-For teams and companies that want Headroom across every developer rather than one laptop: Headroom Enterprise adds more savings (tool search, harness tuning, extra compressors), model routing, prompt-injection and risky-tool-call removal, SSO, managed or VPC deployment, an org-wide savings dashboard, and support. Companies that sign a 12-month Enterprise plan get the first 3 months free.
+For teams and companies that want Headroom across every developer rather than one laptop: Headroom Enterprise adds more savings (tool search for every model, harness tuning, extra compressors), automatic model routing (open source has opt-in, rule-based routing), prompt-injection and risky-tool-call removal, SSO, managed or VPC deployment, an org-wide savings dashboard, and support. Companies that sign a 12-month Enterprise plan get the first 3 months free.
 
 - [Headroom for Teams](https://docs.headroomlabs.ai/docs/teams): Open source vs Enterprise, and the 3-months-free offer.
 - [Claim 3 months free](https://headroom-perks.vercel.app/?source=github&utm_source=llms-txt): Perk sign-up form. One perk per company.
 
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. An anonymous usage beacon is **on by default**: it reports compression ratios, counters, provider and model IDs, OS and architecture, and never prompts, completions, code or file paths. Turn it off with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `--offline`. See [Telemetry](https://github.com/headroomlabs-ai/headroom#telemetry).
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. An anonymous usage beacon is **on by default**: it reports compression ratios, counters, provider and model IDs, OS and architecture, and never prompts, completions, code or file paths. Turn it off with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE=1`. See [Telemetry](https://github.com/headroomlabs-ai/headroom#telemetry).

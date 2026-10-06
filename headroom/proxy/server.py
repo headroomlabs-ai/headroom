@@ -4531,11 +4531,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # published on host loopback, whose peer is the bridge gateway, still loads.
     _dashboard_gate = [Depends(_require_operator_read_client)]
 
+    # Effective licence state of THIS proxy, resolved once: an explicit
+    # ProxyConfig.license_key, else HEADROOM_LICENSE or its deprecated alias.
+    from headroom.license_env import resolve_license_token
+
+    _dashboard_licensed = bool(config.license_key) or bool(resolve_license_token())
+
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
-        return get_dashboard_html()
+        return get_dashboard_html(licensed=_dashboard_licensed)
 
     # --- Dashboard settings API (loopback-gated, registry-validated) ---------
     # Read/write the curated HEADROOM_* knobs the settings GUI manages. Writes
