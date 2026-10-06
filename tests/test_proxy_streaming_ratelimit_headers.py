@@ -821,6 +821,47 @@ class TestStreamingRatelimitHeaderForwarding:
         assert snap.primary.used_percent == 99.5
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hint_headers", "expected_sends"),
+        [
+            ({"retry-after": "3600"}, 1),
+            ({"x-should-retry": "false"}, 1),
+            ({}, 3),
+        ],
+    )
+    async def test_streaming_429_skips_futile_retries(self, hint_headers, expected_sends):
+        """A 429 whose reset lies beyond the backoff cap is forwarded at once."""
+        proxy = self._create_mock_proxy()
+        mock_response = self._create_mock_upstream_response()
+        mock_response.status_code = 429
+        mock_response.headers = httpx.Headers({"content-type": "application/json", **hint_headers})
+        mock_response.aread = AsyncMock(
+            return_value=b'{"type":"error","error":{"type":"rate_limit_error"}}'
+        )
+        mock_response.aclose = AsyncMock()
+
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-ant-test"},
+            body={"model": "claude-sonnet-4-6", "stream": True, "messages": []},
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            request_id="test-futile-429",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.status_code == 429
+        assert proxy.http_client.send.await_count == expected_sends
+
+    @pytest.mark.asyncio
     async def test_anthropic_stream_leaves_codex_state_untouched(self):
         """The now-unconditional capture must be a no-op for non-Codex streams."""
         from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state

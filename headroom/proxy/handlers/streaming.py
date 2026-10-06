@@ -18,6 +18,7 @@ from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
 from headroom.proxy.helpers import (
     RETRYABLE_OVERLOAD_STATUSES,
     jitter_delay_ms,
+    overload_retry_is_futile,
     retry_after_ms,
 )
 from headroom.proxy.token_counting import gemini_output_tokens
@@ -1248,6 +1249,9 @@ class StreamingMixin:
                         upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
                         and self.config.retry_enabled
                         and attempt < retry_attempts - 1
+                        and not overload_retry_is_futile(
+                            upstream_response, self.config.retry_max_delay_ms
+                        )
                     ):
                         delay_with_jitter = retry_after_ms(
                             upstream_response, self.config.retry_max_delay_ms

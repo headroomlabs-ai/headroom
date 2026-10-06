@@ -150,6 +150,7 @@ from headroom.proxy.helpers import (
     _setup_file_logging,  # noqa: F401
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    overload_retry_is_futile,
     resolve_display_provider,
     retry_after_ms,
 )
@@ -2658,6 +2659,7 @@ class HeadroomProxy(
                         if (
                             not self.config.retry_enabled
                             or attempt >= self.config.retry_max_attempts - 1
+                            or overload_retry_is_futile(response, self.config.retry_max_delay_ms)
                         ):
                             return response
                         delay_ms = retry_after_ms(

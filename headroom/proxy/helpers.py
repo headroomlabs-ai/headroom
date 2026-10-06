@@ -1621,6 +1621,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
     exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
     covers other upstreams. Fails open on any parse error.
     """
+    seconds = _retry_after_seconds(response)
+    if seconds is None:
+        return None
+    return min(seconds * 1000.0, float(max_ms))
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Uncapped, non-negative ``Retry-After`` in seconds, or ``None`` if absent/unparseable."""
     value = response.headers.get("retry-after")
     if not value:
         return None
@@ -1635,7 +1643,22 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
             seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+    return max(seconds, 0.0)
+
+
+def overload_retry_is_futile(response: httpx.Response, max_ms: int) -> bool:
+    """True when retrying a 429/529 cannot succeed within the proxy's backoff.
+
+    Upstream says so explicitly with ``x-should-retry: false``, or implicitly with a
+    ``Retry-After`` longer than ``max_ms``: sleeping the capped delay re-sends before
+    the reset, so the retry only delays the same error (an exhausted subscription
+    window answers with a reset hours away). Forwarding it at once lets the client,
+    or a credential-rotating proxy in front, act on it.
+    """
+    if response.headers.get("x-should-retry", "").strip().lower() == "false":
+        return True
+    seconds = _retry_after_seconds(response)
+    return seconds is not None and seconds * 1000.0 > max_ms
 
 
 # Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
