@@ -618,7 +618,7 @@ regresses a compression ratio across real workloads rather than only our own tes
 corpus.
 
 Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
-`--offline`. The full field list is in
+`HEADROOM_OFFLINE=1`. The full field list is in
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams
@@ -628,8 +628,8 @@ for the whole team.
 
 | | Open source | Enterprise |
 |---|---|---|
-| Savings | Core compression | More: tool search, harness tuning, extra compressors |
-| Model routing | — | Cheaper model when quality allows |
+| Savings | Compression, plus tool search on Anthropic requests (on by default) | Also: tool search for every model, harness tuning, extra compressors |
+| Model routing | Rule-based and opt-in: you write the rules (`HEADROOM_MODEL_ROUTES`) | Automatic: a cheaper model per request when quality allows, with a shadow mode that shows the savings before you turn it on |
 | Security | — | Detect and strip prompt injection and risky tool calls |
 | Rollout | Per laptop | Managed or in your VPC, SSO, central config, org-wide savings |
 | Support | GitHub, Discord | Dedicated engineers, onboarding, priority response |
