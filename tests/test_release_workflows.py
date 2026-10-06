@@ -277,7 +277,8 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
-    assert manifest["if"] == "${{ always() }}"
+    # Publishing requires every architecture's digest, including after cancellation.
+    assert manifest["if"] == "${{ success() }}"
     step_names = [step["name"] for step in manifest["steps"]]
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
@@ -1275,7 +1276,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
         # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-14",
+        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (

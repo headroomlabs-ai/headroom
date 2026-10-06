@@ -347,10 +347,37 @@ def _render_block(spec: ServerSpec) -> str:
     return "\n".join(lines)
 
 
+# TOML basic strings forbid literal control characters other than tab, so a
+# value carrying a newline/carriage-return (e.g. a multi-line PEM key in an
+# env var) must be escaped or the rendered block is unparseable TOML. Only
+# ``\`` and ``"`` were escaped before, so such a value produced invalid TOML
+# and the write guard rejected the whole registration with a misleading
+# "file does not parse" error.
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _toml_str(s: str) -> str:
     """Render a Python string as a TOML basic string literal."""
-    escaped = s.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    out: list[str] = []
+    for ch in s:
+        escape = _TOML_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif ch < "\x20" or ch == "\x7f":
+            # Remaining C0 controls (and DEL) have no short escape; TOML requires
+            # the \uXXXX form.
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def _entry_to_spec(name: str, entry: dict[str, Any]) -> ServerSpec:

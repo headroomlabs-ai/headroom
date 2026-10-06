@@ -6,7 +6,10 @@ import copy
 
 import pytest
 
-from tests.test_dashboard_cache_lifetime_playwright import _open_dashboard
+from tests.test_dashboard_cache_lifetime_playwright import (
+    _lifetime_cache_payload,
+    _open_dashboard,
+)
 from tests.test_dashboard_cache_ttl_playwright import _sample_stats
 
 playwright = pytest.importorskip("playwright.sync_api")
@@ -25,7 +28,7 @@ def test_co2_card_renders_estimated_savings() -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
-        _open_dashboard(page, stats)
+        _open_dashboard(page, stats, _lifetime_cache_payload())
 
         expect(page.get_by_text("CO2 Saved", exact=True)).to_be_visible()
         expect(page.get_by_text("120.00 g", exact=True)).to_be_visible()

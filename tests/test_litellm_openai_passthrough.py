@@ -259,3 +259,24 @@ async def test_reasoning_params_forwarded_top_level_streaming() -> None:
     kwargs = mock_acomp.await_args.kwargs
     assert kwargs["reasoning_effort"] == "high"
     assert "reasoning_effort" not in kwargs.get("extra_body", {})
+
+
+@pytest.mark.asyncio
+async def test_lowercase_bearer_caller_key_is_forwarded() -> None:
+    """A lowercase `authorization: bearer <key>` must still forward the key.
+
+    RFC 7235 §2.1 makes the auth-scheme token case-insensitive. A case-sensitive
+    `startswith("Bearer ")` dropped the caller credential for a lowercase scheme,
+    so litellm fell back to a (possibly absent) env key and the upstream 401'd.
+    """
+    backend = make_backend()  # provider=openrouter, not env-auth
+
+    with patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp:
+        mock_acomp.return_value = make_response()
+
+        await backend.send_openai_message(
+            request_body(),
+            {"authorization": "bearer sk-caller-123"},
+        )
+
+    assert mock_acomp.await_args.kwargs.get("api_key") == "sk-caller-123"

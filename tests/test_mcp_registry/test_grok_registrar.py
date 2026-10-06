@@ -93,3 +93,29 @@ def test_refuses_span_rewrite_that_would_change_other_entries(
     moved = ServerSpec(name="headroom", command="/opt/python", args=_spec().args)
     assert reg.register_server(moved, force=True).status == RegisterStatus.FAILED
     assert cfg.read_text() == before
+
+
+def test_register_escapes_control_chars_in_env_value(tmp_path: Path) -> None:
+    """Grok shares the codex TOML escaper: a newline env value must round-trip."""
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:  # pragma: no cover
+        import tomli as tomllib
+
+    reg = _make_registrar(tmp_path)
+    pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----"
+    spec = ServerSpec(
+        name="headroom",
+        command="/usr/bin/python",
+        args=("-m", "headroom.cli", "mcp", "serve"),
+        env={"PEM": pem},
+    )
+
+    result = reg.register_server(spec, force=True)
+
+    assert result.status == RegisterStatus.REGISTERED
+    parsed = tomllib.loads(reg._config_file.read_text())
+    assert parsed["mcp_servers"]["headroom"]["env"]["PEM"] == pem
+    assert reg.get_server("headroom").env["PEM"] == pem

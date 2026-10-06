@@ -72,13 +72,10 @@ def test_handlers_offload_token_counting_and_batch_apply() -> None:
     fn = GeminiHandlerMixin.handle_gemini_stream_generate_content
     assert inspect.iscoroutinefunction(fn)
     src = inspect.getsource(fn)
-    assert "_count_texts_offloaded(" in src, "streaming Gemini text counting not offloaded"
-    assert "tokenizer = get_tokenizer(" not in src, "tokenizer resolved inline on the loop"
-    assert "count_text(" not in src, "streaming Gemini count_text still runs on the loop"
-    assert "_dict_parts(" in src, "streaming Gemini must reuse the shared _dict_parts coercion"
-    assert 'isinstance(part.get("text"), str)' in src, (
-        "streaming Gemini must skip non-str text so count_text can't 500"
-    )
+    assert "return await self.handle_gemini_generate_content(" in src
+    assert "upstream_base_url=upstream_base_url" in src
+    assert "_count_texts_offloaded(" not in src
+    assert "_dict_parts(" not in src
 
     for mixin, method in (
         (AnthropicHandlerMixin, "handle_anthropic_batch_create"),
@@ -179,8 +176,9 @@ async def test_count_tokens_offloaded_fails_open_on_executor_quarantine() -> Non
     # quarantines the next call — no mock of the helper itself. Since the
     # quarantine became time-capped (#2412), standing debt alone no longer
     # quarantines: the deadline armed by the fresh timeout must still be in
-    # the future, so arm it the way a real timeout would.
-    proxy._compression_timed_out_in_flight = 1
+    # the future, so arm it the way a real timeout would. The debt must reach
+    # the quarantine threshold (half the auto-sized pool).
+    proxy._compression_timed_out_in_flight = proxy._compression_quarantine_threshold
     proxy._compression_quarantine_deadline = time.monotonic() + 60.0
 
     tokenizer, tokens = await proxy._count_tokens_offloaded(
@@ -198,8 +196,8 @@ async def test_count_tokens_offloaded_returns_count_text_capable_tokenizer() -> 
     proxy = _make_proxy()
     # Quarantine forces the fail-open branch (an EstimatingTokenCounter).
     # Post-#2412 the quarantine is time-capped, so the deadline must be armed
-    # alongside the standing debt.
-    proxy._compression_timed_out_in_flight = 1
+    # alongside the standing debt, which must reach the quarantine threshold.
+    proxy._compression_timed_out_in_flight = proxy._compression_quarantine_threshold
     proxy._compression_quarantine_deadline = time.monotonic() + 60.0
 
     # The empty-messages count is intentionally discarded by that handler

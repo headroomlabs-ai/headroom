@@ -33,7 +33,7 @@ vi.mock("../src/proxy-manager.js", () => ({
   defaultLogger: mocked.logger,
 }));
 
-import { HeadroomContextEngine } from "../src/engine.js";
+import { HeadroomContextEngine, type HeadroomEngineConfig } from "../src/engine.js";
 import { compress } from "headroom-ai";
 
 afterEach(() => {
@@ -463,5 +463,225 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
     const raw = await fs.readFile(commitLogPath, "utf8");
     const entries = JSON.parse(raw) as Record<string, { messages: unknown }>;
     expect(entries["turn-1"].messages).toEqual(messages);
+  });
+});
+
+describe("HeadroomContextEngine assemble() compression notice", () => {
+  const HEADROOM_COMPRESSION_NOTICE =
+    "[Headroom is compressing tool outputs in this session. Use headroom_retrieve if you need the original, uncompressed content.]";
+  const messages = [{ role: "user", content: "hello" }];
+
+  function mockCompressResult(overrides: Partial<{
+    compressed: boolean;
+    tokensSaved: number;
+    tokensBefore: number;
+    tokensAfter: number;
+  }>) {
+    const tokensSaved = overrides.tokensSaved ?? 0;
+    return {
+      compressed: overrides.compressed ?? tokensSaved > 0,
+      messages: [{ role: "user", content: "hello" }],
+      tokensBefore: overrides.tokensBefore ?? 1000,
+      tokensAfter: overrides.tokensAfter ?? 1000 - tokensSaved,
+      tokensSaved,
+    };
+  }
+
+  function readyEngine(config?: HeadroomEngineConfig) {
+    const engine = new HeadroomContextEngine({ minContextChars: 0, ...config });
+    (engine as unknown as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    return engine;
+  }
+
+  it("returns the static notice, with no interpolated count, once tokensSaved crosses the threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("returns byte-identical notices across turns with different tokensSaved amounts", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 9000 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(first.systemPromptAddition);
+  });
+
+  it("keeps the notice present on a later turn that has nothing to compress", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("keeps an earned notice on a later context below the compression threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+    const engine = readyEngine({ minContextChars: 800 });
+    const first = await engine.assemble({
+      sessionId: "s1", messages: [{ role: "user", content: "x".repeat(1000) }],
+    });
+    const second = await engine.assemble({ sessionId: "s1", messages });
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(second.systemPromptAddition).toBe(first.systemPromptAddition);
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("never returns a notice when announceCompression is false", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 500 }));
+
+    const engine = readyEngine({ announceCompression: false });
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBeUndefined();
+  });
+
+  it("does not announce for compression below the noise threshold", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 50 }));
+
+    const engine = readyEngine();
+    const result = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(result.systemPromptAddition).toBeUndefined();
+  });
+
+  it("does not leak a session's announcement to a different session on the same engine", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    const sessionA = await engine.assemble({ sessionId: "a", messages });
+    const sessionB = await engine.assemble({ sessionId: "b", messages });
+
+    expect(sessionA.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(sessionB.systemPromptAddition).toBeUndefined();
+  });
+
+  it("keeps announcing for the session that earned the notice even after another session is seen", async () => {
+    vi.mocked(compress)
+      .mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }))
+      .mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+
+    const engine = readyEngine();
+    await engine.assemble({ sessionId: "a", messages });
+    await engine.assemble({ sessionId: "b", messages });
+    const sessionAAgain = await engine.assemble({ sessionId: "a", messages });
+
+    expect(sessionAAgain.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("evicts the oldest tracked session once the announced-session bound is exceeded", async () => {
+    vi.mocked(compress).mockResolvedValue(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    for (let i = 0; i < 1000; i++) {
+      await engine.assemble({ sessionId: `session-${i}`, messages });
+    }
+    const overflow = await engine.assemble({ sessionId: "session-overflow", messages });
+
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+    const oldest = await engine.assemble({ sessionId: "session-0", messages });
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+    const newest = await engine.assemble({ sessionId: "session-overflow", messages });
+
+    expect(overflow.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    expect(oldest.systemPromptAddition).toBeUndefined();
+    expect(newest.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("keeps the earned notice byte-identical through a timeout, a circuit-open turn, and recovery", async () => {
+    vi.useFakeTimers();
+    try {
+      const requestTimeoutMs = 5_000;
+      const circuitBreakerCooldownMs = 10_000;
+      const engine = readyEngine({
+        requestTimeoutMs,
+        circuitBreakerThreshold: 1,
+        circuitBreakerCooldownMs,
+      });
+
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+      const turn1 = await engine.assemble({ sessionId: "s1", messages });
+      const firstNotice = turn1.systemPromptAddition;
+      expect(firstNotice).toBe(HEADROOM_COMPRESSION_NOTICE);
+
+      vi.mocked(compress).mockImplementationOnce(() => new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("SDK request timed out")), requestTimeoutMs);
+      }));
+      const turn2Promise = engine.assemble({ sessionId: "s1", messages });
+      await vi.advanceTimersByTimeAsync(requestTimeoutMs);
+      const turn2 = await turn2Promise;
+      expect(turn2.systemPromptAddition).toBe(firstNotice);
+
+      const turn3 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn3.systemPromptAddition).toBe(firstNotice);
+      expect(compress).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(circuitBreakerCooldownMs);
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+      const turn4 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn4.systemPromptAddition).toBe(firstNotice);
+      expect(turn4.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an earned notice when the proxy becomes unavailable", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+
+    (engine as unknown as { proxyUrl: string | null }).proxyUrl = null;
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(second.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("never surfaces a notice in any fallback path when announceCompression is false", async () => {
+    vi.useFakeTimers();
+    try {
+      const requestTimeoutMs = 5_000;
+      const engine = readyEngine({
+        announceCompression: false,
+        requestTimeoutMs,
+        circuitBreakerThreshold: 1,
+        circuitBreakerCooldownMs: 10_000,
+      });
+
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+      const turn1 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn1.systemPromptAddition).toBeUndefined();
+
+      vi.mocked(compress).mockImplementationOnce(() => new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("SDK request timed out")), requestTimeoutMs);
+      }));
+      const turn2Promise = engine.assemble({ sessionId: "s1", messages });
+      await vi.advanceTimersByTimeAsync(requestTimeoutMs);
+      const turn2 = await turn2Promise;
+      expect(turn2.systemPromptAddition).toBeUndefined();
+
+      const turn3 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn3.systemPromptAddition).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
