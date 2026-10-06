@@ -417,6 +417,43 @@ def test_generated_wrappers_explicitly_override_image_host_for_container_access(
     assert "dockerArgs.Add('0.0.0.0')" in powershell_source
 
 
+def test_wrappers_acknowledge_open_bind_only_with_loopback_publication() -> None:
+    """Every container launch that binds 0.0.0.0 inside the container must
+    publish on host loopback *and* acknowledge the token-less open bind, and
+    the acknowledgement must never appear without that publication.
+
+    The proxy refuses a token-less non-loopback bind unless
+    HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 is set; the wrappers make that
+    statement only through one helper that also adds ``-p 127.0.0.1:...``.
+    """
+    ack = "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1"
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    # Bash: the publish flag and the acknowledgement live only in the helper.
+    helper = bash_source.split("append_loopback_publish_args() {", 1)[1].split("\n}\n", 1)[0]
+    assert '-p "127.0.0.1:${port}:${port}"' in helper and ack in helper
+    outside = bash_source.replace(helper, "")
+    assert '-p "127.0.0.1:' not in outside
+    assert outside.count(ack) == 0
+    # Three launch sites, three helper calls.
+    assert bash_source.count("--host 0.0.0.0") == 3
+    assert bash_source.count("append_loopback_publish_args ") == 3
+
+    # PowerShell: same shape.
+    ps_helper = powershell_source.split("function Get-LoopbackPublishArgs {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "127.0.0.1`:$Port`:$Port" in ps_helper and ack in ps_helper
+    # Without the unary comma PowerShell unrolls the array to object[], and
+    # List[string].AddRange rejects it at runtime.
+    assert "return ,[string[]]@(" in ps_helper
+    ps_outside = powershell_source.replace(ps_helper, "")
+    assert "'-p'," not in ps_outside.replace("Get-LoopbackPublishArgs", "")
+    assert ps_outside.count(ack) == 0
+    assert powershell_source.count("Get-LoopbackPublishArgs -Port") == 3
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
     reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",

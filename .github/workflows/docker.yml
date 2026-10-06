@@ -247,7 +247,7 @@ jobs:
   # tags, and that manifest is what users pull by `:tag`.
   docker-manifest:
     needs: docker-build
-    if: ${{ always() }}
+    if: ${{ success() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:

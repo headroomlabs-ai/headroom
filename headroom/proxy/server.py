@@ -97,7 +97,13 @@ from headroom.observability import (
     shutdown_headroom_tracing,
     shutdown_otel_metrics,
 )
-from headroom.offline import apply_offline_env, is_offline
+from headroom.offline import (
+    OFFLINE_ENV,
+    OfflineEgressBlocked,
+    apply_offline_env,
+    guard_egress,
+    is_offline,
+)
 from headroom.pipeline import PipelineExtensionManager, PipelineStage
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
@@ -148,7 +154,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
-from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 from headroom.proxy.malloc_trim import trim_periodically
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -696,6 +702,89 @@ def _check_rust_core() -> tuple[str, str | None]:
 
     logger.info("event=rust_core_loaded marker=%r", marker)
     return ("loaded", None)
+
+
+def _refuse_offline_egress(blocked: OfflineEgressBlocked, feature: str, fix: str) -> None:
+    """Turn a startup-time air-gap refusal into a clean exit, never a traceback.
+
+    ``OfflineEgressBlocked`` derives from ``BaseException``, so nothing in the
+    lifespan's own ``except Exception`` will catch it and it would otherwise
+    escape uvicorn as an unhandled error — killing a proxy that had been
+    serving traffic, with a stack trace instead of an explanation, and before
+    ``app.state.startup_error`` exists to record why. ``_check_rust_core``
+    above already settled the shape for a startup refusal: say what is wrong,
+    say how to fix it, exit 78 (``EX_CONFIG``).
+    """
+    msg = (
+        f"FATAL: {feature} needs outbound network access, but "
+        f"{OFFLINE_ENV}=1 forbids it.\n"
+        f"    refused: {blocked}\n"
+        f"    fix:     {fix}\n"
+    )
+    logger.error(
+        "event=offline_egress_refused feature=%r reason=%r action=exit_78",
+        feature,
+        str(blocked),
+    )
+    print(msg, file=sys.stderr, flush=True)
+    sys.exit(_EXIT_CONFIG)
+
+
+def _configure_observability_or_refuse() -> None:
+    """Install the metric/trace exporters, refusing cleanly under an air-gap.
+
+    Both exporters call ``guard_egress`` before they build a client, so under
+    ``HEADROOM_OFFLINE`` they raise rather than dial. Catching that here is what
+    keeps the refusal a refusal: these two calls sit OUTSIDE ``lifespan``'s own
+    ``try``/``except Exception``, and ``OfflineEgressBlocked`` is a
+    ``BaseException``, so an uncaught one escapes uvicorn as an unhandled error
+    — a proxy that had been serving traffic dies on a traceback with
+    ``app.state.startup_error`` never set.
+    """
+    _preflight_offline_egress()
+    try:
+        configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
+    except OfflineEgressBlocked as blocked:
+        _refuse_offline_egress(
+            blocked,
+            "OTLP metric export (HEADROOM_OTEL_METRICS_ENABLED)",
+            "set HEADROOM_OTEL_METRICS_EXPORTER=console or scrape /metrics "
+            "(both stay on-box), or unset HEADROOM_OTEL_METRICS_ENABLED",
+        )
+    try:
+        configure_langfuse_tracing(
+            LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
+        )
+    except OfflineEgressBlocked as blocked:
+        _refuse_offline_egress(
+            blocked,
+            "Langfuse OTLP trace export (HEADROOM_LANGFUSE_ENABLED)",
+            "unset HEADROOM_LANGFUSE_ENABLED; Langfuse ingestion has no on-box mode",
+        )
+
+
+def _preflight_offline_egress() -> None:
+    """Refuse, at startup, any configuration that asks for egress while offline.
+
+    Runs before the observability exporters are configured and before the
+    compressors are preloaded. Without it the same contradiction surfaces later
+    and worse: the OTLP exporter raised out of ``lifespan`` with a raw
+    traceback, and the remote Kompress endpoint was not noticed until a request
+    reached for the compressor.
+    """
+    if not is_offline():
+        return
+    endpoint = os.environ.get("HEADROOM_KOMPRESS_ENDPOINT", "").strip()
+    if endpoint:
+        try:
+            guard_egress("remote Kompress inference", endpoint)
+        except OfflineEgressBlocked as blocked:
+            _refuse_offline_egress(
+                blocked,
+                "remote Kompress compression (HEADROOM_KOMPRESS_ENDPOINT)",
+                "unset HEADROOM_KOMPRESS_ENDPOINT to use the local Kompress "
+                "model, or unset " + OFFLINE_ENV + " if this box is not air-gapped",
+            )
 
 
 # Compression pipeline timeout in seconds
@@ -2979,13 +3068,6 @@ class WebSocketAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        client = scope.get("client")
-        client_host = client[0] if client else None
-        if is_loopback_host(client_host):
-            scrub_proxy_token_headers(scope, self.token_bytes)
-            await self.app(scope, receive, send)
-            return
-
         # Starlette's own Headers rather than a hand-built dict: on a repeated
         # header it returns the FIRST occurrence, which is what the HTTP gate
         # sees. Building a dict here instead took the LAST one, so the two
@@ -2993,7 +3075,22 @@ class WebSocketAuthMiddleware:
         # drift the shared reader below exists to prevent.
         from starlette.datastructures import Headers
 
-        provided = read_proxy_token(Headers(scope=scope))
+        headers = Headers(scope=scope)
+        client = scope.get("client")
+        client_host = client[0] if client else None
+        # Loopback exemption needs both gates the HTTP admin guards apply: a
+        # loopback peer *and* a loopback ``Host:`` header. The Host check is
+        # the DNS-rebinding defence — a browser on this machine coerced into
+        # opening a socket to 127.0.0.1 still sends ``Host: attacker.com``. A
+        # missing peer address (UDS, adapters) is not loopback (fails closed).
+        if is_loopback_host(client_host) and is_loopback_host_header(headers.get("host")):
+            # Exempt from the token, not from the scrub: a loopback client that
+            # sends the token anyway must not have it forwarded upstream.
+            scrub_proxy_token_headers(scope, self.token_bytes)
+            await self.app(scope, receive, send)
+            return
+
+        provided = read_proxy_token(headers)
         if provided is not None and hmac.compare_digest(
             provided.encode("utf-8", "replace"), self.token_bytes
         ):
@@ -3096,15 +3193,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
-    # it, force HF/transformers offline before any model code loads, and
-    # announce that every outbound path is disabled.
+    # it, force HF/transformers offline before any model code loads, and say
+    # what is covered.
+    #
+    # The banner names the exception rather than claiming a whole-process kill
+    # switch, and the exception is permanent rather than a to-do: a proxy that
+    # refused to forward the caller's request to the caller's own upstream
+    # would not be a proxy. Every connection Headroom itself initiates IS
+    # refused; tests/test_offline_egress_chokepoint.py fails the build if a new
+    # egress path appears that is neither guarded nor one of the four written
+    # exceptions. TestDocsMatchTheGuarantee scans this file for the absolute
+    # phrasings and fails while any remain.
     if config.offline:
         os.environ.setdefault("HEADROOM_OFFLINE", "1")
     if is_offline():
         apply_offline_env()
         logger.warning(
-            "event=proxy_offline_mode air-gap active — all outbound egress disabled "
-            "(telemetry, update check, license reporter, HuggingFace downloads)"
+            "event=proxy_offline_mode air-gap active — every connection Headroom "
+            "initiates is refused (telemetry, update check, license reporter, "
+            "model/tokenizer/binary/dataset downloads, remote Kompress, "
+            "OTLP/Langfuse export, Copilot auth, subscription polling, OpenAI "
+            "embedders, Headroom Cloud compression). Still allowed on purpose: "
+            "forwarding your requests to the upstream you configured, "
+            "operator-configured local endpoints, loopback health probes."
         )
 
     proxy = HeadroomProxy(config)
@@ -3223,10 +3334,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 _rust_core_error,
             )
 
-        configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
-        configure_langfuse_tracing(
-            LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
-        )
+        _configure_observability_or_refuse()
 
         app.state.started_at = time.time()
         app.state.ready = False
@@ -3981,19 +4089,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _proxy_token_bytes = _proxy_token.encode("utf-8") if _proxy_token else b""
     # Health/readiness probes must stay reachable without a token so
     # orchestrators can check a container that binds non-loopback.
-    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/livez", "/readyz"})
+    #
+    # The exemption covers only GET, and only paths with a GET handler below.
+    # Anything else on these paths falls through to the catch-all passthrough
+    # relay (FastAPI's @app.get does not register HEAD), so exempting it would
+    # let an unauthenticated caller relay arbitrary requests upstream.
+    _AUTH_EXEMPT_PATHS = frozenset({"/health", "/livez", "/readyz"})
 
-    # Loud warning when a non-loopback bind has no token configured: that is the
-    # exact shape (e.g. the Docker 0.0.0.0 image) that exposes unauthenticated
-    # /v1/* routes to the surrounding network.
-    if not _proxy_token and not is_loopback_host(getattr(config, "host", None)):
-        logger.warning(
-            "event=proxy_open_bind host=%s — proxy is bound to a non-loopback "
-            "interface with no HEADROOM_PROXY_TOKEN set; the /v1/* data-plane "
-            "routes are reachable WITHOUT authentication. Set HEADROOM_PROXY_TOKEN "
-            "to require a bearer token from non-loopback callers.",
-            getattr(config, "host", None),
-        )
+    # A non-loopback bind with no token is the exact shape (``--host 0.0.0.0``
+    # from any launcher) that exposes the unauthenticated /v1/* relay to the
+    # surrounding network. It used to be a warning; it is now refused unless
+    # the operator acknowledges it explicitly (see bind_policy.py). Enforced
+    # here, not only in run_server, so programmatic embeddings and the
+    # multi-worker factory get the same guarantee.
+    from headroom.proxy.bind_policy import enforce_bind_policy
+
+    _bind_decision = enforce_bind_policy(getattr(config, "host", None), _proxy_token)
 
     def _apply_security_headers(response) -> None:
         # setdefault: never clobber a header an upstream/handler already set.
@@ -4044,7 +4155,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             path = request.url.path
             client = getattr(request, "client", None)
             client_host = getattr(client, "host", None) if client is not None else None
-            if path not in _AUTH_EXEMPT_PATHS and not is_loopback_host(client_host):
+            exempt = request.method == "GET" and path in _AUTH_EXEMPT_PATHS
+            if not exempt and not is_loopback_host(client_host):
                 provided = _extract_proxy_token(request.headers)
                 if provided is None or not hmac.compare_digest(
                     provided.encode("utf-8", "replace"), _proxy_token_bytes
@@ -4058,6 +4170,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     rejection = JSONResponse(status_code=401, content={"error": "unauthorized"})
                     _apply_security_headers(rejection)
                     return rejection
+                # The caller proved it holds the proxy token. The rate limiter
+                # keys authenticated callers per credential and everyone else
+                # per peer (headroom/proxy/rate_limit_identity.py).
+                request.state.proxy_authenticated = True
 
         # The credential has done its job; take it off the request so no handler
         # can forward it upstream. Runs on the exempt paths too, since a loopback
@@ -4125,6 +4241,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import (
+        is_container_host_gateway,
+    )
+    from headroom.proxy.loopback_guard import (
         require_loopback as _require_loopback,
     )
     from headroom.proxy.loopback_guard import (
@@ -4143,6 +4262,86 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """
         if not _request_can_view_dashboard_metadata(request, trusted_dashboard_client_cidrs):
             raise HTTPException(status_code=404)
+
+    def _authenticated_at_gate(request: Request) -> bool:
+        """True when the security gate verified this request's proxy token.
+
+        The gate exempts loopback peers without checking the ``Host`` header,
+        so only a *non-loopback* request that reached a handler while a token
+        is configured has proven it holds the token. A loopback peer must
+        still pass the loopback (peer + Host) check: the DNS-rebinding defence.
+        """
+        client = getattr(request, "client", None)
+        return bool(_proxy_token) and not is_loopback_host(getattr(client, "host", None))
+
+    def _is_host_of_loopback_published_container(request: Request) -> bool:
+        """True for the host's own dashboard reaching a loopback-published container.
+
+        Docker relays a ``127.0.0.1:<port>`` publication into the container from
+        the bridge gateway, so the host browser's TCP peer is that gateway, not
+        127.0.0.1. The shipped launchers acknowledge their token-less 0.0.0.0
+        bind only together with that loopback publication, so under the
+        acknowledgement the gateway peer can only be a process on the host.
+        Matches the exact TCP peer (never a forwarded header, never another
+        container on the bridge) and keeps the loopback Host check.
+        """
+        if not (_bind_decision.open_bind and _bind_decision.acknowledged):
+            return False
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        return is_container_host_gateway(peer) and is_loopback_host_header(
+            request.headers.get("host")
+        )
+
+    def _require_operator_read_client(request: Request) -> None:
+        """Gate the read-only operator routes (history, quota, subscription window).
+
+        A token-authenticated operator on a public bind is entitled to them, as
+        is the host of a loopback-published container. Everyone else falls back
+        to the /settings* trust chain: loopback, or a trusted dashboard client
+        behind a gateway. Settings *writes* deliberately do not get either
+        short-cut.
+        """
+        if _authenticated_at_gate(request) or _is_host_of_loopback_published_container(request):
+            return
+        _require_loopback_or_trusted_dashboard_client(request)
+
+    def _require_metrics_scrape_client(request: Request) -> None:
+        """Gate ``/metrics`` for scrapers without demanding a dashboard's browser shape.
+
+        ``/metrics`` is a Prometheus target, so unlike the dashboard routes it
+        cannot require an IP-literal ``Host`` header. Allowed callers:
+
+        * a non-loopback caller that authenticated at the security gate;
+        * loopback (peer *and* Host header, the usual two gates);
+        * a connecting peer inside ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS``
+          (whatever it forwards), or a resolved client inside the
+          dashboard-client CIDRs, provided any browser provenance it carries
+          is same-origin (a scraper sends neither Origin nor Referer).
+
+        Everyone else gets the same 404 the other operator routes return.
+        """
+        if _authenticated_at_gate(request):
+            return
+        if _request_is_loopback(request):
+            return
+        from headroom.proxy.forwarded_headers import (
+            load_trusted_gateway_cidrs,
+            peer_is_trusted_gateway,
+            resolve_client_ip,
+        )
+
+        # Gateway CIDRs describe the TCP peer itself, never a forwarded address;
+        # only the dashboard-client CIDRs apply to the resolved client.
+        client = getattr(request, "client", None)
+        peer = getattr(client, "host", None) if client is not None else None
+        if peer_is_trusted_gateway(peer, load_trusted_gateway_cidrs()) or peer_is_trusted_gateway(
+            resolve_client_ip(request), trusted_dashboard_client_cidrs
+        ):
+            host_header = request.headers.get("host")
+            if host_header and _request_has_same_origin_or_no_provenance(request, host_header):
+                return
+        raise HTTPException(status_code=404)
 
     def _require_same_origin_or_trusted_dashboard_client(request: Request) -> None:
         """Same-origin CSRF guard for settings writes, trusted-dashboard aware.
@@ -4322,6 +4521,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         StaticFiles(directory=STATIC_DIR, check_dir=False),
         name="dashboard-static",
     )
+
+    # The read-only telemetry routes below carry operator data (model/project/
+    # session labels, spend history, subscription utilisation, provider quota)
+    # and were served to any network caller. They now answer token-authenticated
+    # operators, loopback, or a trusted dashboard client behind a gateway; other
+    # network callers get 404. The dashboard shell itself is a static template
+    # (like its /dashboard/static assets) and stays reachable, so a container
+    # published on host loopback, whose peer is the bridge gateway, still loads.
+    _dashboard_gate = [Depends(_require_operator_read_client)]
 
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
@@ -5288,7 +5496,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _stats_snapshot["expires_at"] = 0.0
         return JSONResponse(status_code=200, content={"status": "reset"})
 
-    @app.get("/stats-history")
+    @app.get("/stats-history", dependencies=_dashboard_gate)
     async def stats_history(
         format: Literal["json", "csv"] = "json",
         series: Literal["history", "hourly", "daily", "weekly", "monthly"] = "history",
@@ -5365,7 +5573,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return {"transformations": transformations, "log_full_messages": log_full_messages}
 
-    @app.get("/subscription-window")
+    @app.get("/subscription-window", dependencies=_dashboard_gate)
     async def subscription_window():
         """Current Anthropic subscription window utilisation and Headroom contribution.
 
@@ -5390,14 +5598,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await tracker.maybe_poll_on_demand()
         return JSONResponse(content=tracker.render_state())
 
-    @app.get("/quota")
+    @app.get("/quota", dependencies=_dashboard_gate)
     async def quota():
         """Unified quota/rate-limit stats for all registered providers (Anthropic, Codex, Copilot)."""
         return JSONResponse(content=get_quota_registry().get_all_stats())
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[Depends(_require_metrics_scrape_client)])
     async def metrics():
-        """Prometheus metrics endpoint."""
+        """Prometheus metrics endpoint (loopback, trusted CIDR, or token-authenticated)."""
         return PlainTextResponse(
             await proxy.metrics.export(),
             media_type="text/plain; version=0.0.4",
@@ -5826,7 +6034,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
-    @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
+    @app.post(
+        "/v1/retrieve/tool_call",
+        dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
+    )
     async def ccr_handle_tool_call(request: Request):
         """Handle a CCR tool call from an LLM response.
 
@@ -6229,6 +6440,16 @@ def run_server(
     config.profile_seeded_env_keys = frozenset(
         set(config.profile_seeded_env_keys) | set(seeded_env_keys)
     )
+
+    # Refuse an unacknowledged open bind here, before uvicorn forks, so the
+    # operator gets one error and an exit code instead of N workers crashing
+    # in create_app. create_app enforces the same policy for embedders.
+    from headroom.proxy.bind_policy import evaluate_bind_policy
+
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        print(f"ERROR: {_bind.message()}", file=sys.stderr)
+        sys.exit(2)
     if workers < 1:
         raise ValueError("workers must be >= 1")
     config.worker_processes = workers
@@ -6247,13 +6468,23 @@ def run_server(
     # Resolve upstream API targets for display in the banner (#583).
     api_targets = resolve_api_targets(config.provider_api_overrides)
 
+    if config.uds:
+        # No per-agent recipe on a socket bind; see uds.socket_usage_lines().
+        listen_display = f"unix:{config.uds}"
+        usage_label = "Client:     "
+        usage_display = "must support HTTP over a Unix socket natively"
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_label = "Claude Code:"
+        usage_display = f"ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude"
+
     if print_banner:
         print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                      HEADROOM PROXY SERVER                           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  Version: 1.0.0                                                      ║
-║  Listening: http://{config.host}:{config.port:<5}                                      ║
+║  Listening: {listen_display:<57}║
 ║  Workers: {workers:<3}  Concurrency Limit: {limit_concurrency:<5}                          ║
 ║  Backend: {backend_status:<59}║
 ╠══════════════════════════════════════════════════════════════════════╣
@@ -6275,7 +6506,7 @@ def run_server(
 ║    Conn Pool:       {pool_info:<52}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  USAGE:                                                              ║
-║    Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude     ║
+║    {usage_label}   {usage_display:<51}║
 ║    Cursor:        Set base URL in settings                           ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  ENDPOINTS:                                                          ║
@@ -6354,11 +6585,48 @@ def run_server(
     # and no CLI flag to change it. Overridable now; the default is unchanged.
     uvicorn_log_level = _resolve_uvicorn_log_level()
 
+    # Bind target: a Unix socket when one is configured, otherwise host:port.
+    # uvicorn treats `uds` and `host`/`port` as alternatives, so they are built
+    # here rather than passed together.
+    bind_kwargs: dict[str, Any]
+    uds_path: Path | None = None
+    if config.uds:
+        from headroom.proxy.uds import prepare_uds_path
+
+        uds_path = prepare_uds_path(config.uds)
+        bind_kwargs = {"uds": str(uds_path)}
+    else:
+        bind_kwargs = {"host": config.host, "port": config.port}
+
+    try:
+        _run_uvicorn(
+            app_target,
+            bind_kwargs,
+            workers,
+            limit_concurrency,
+            uvicorn_log_level,
+            uvicorn_kwargs,
+        )
+    finally:
+        if uds_path is not None:
+            from headroom.proxy.uds import remove_uds_path
+
+            remove_uds_path(uds_path)
+
+
+def _run_uvicorn(
+    app_target: Any,
+    bind_kwargs: dict[str, Any],
+    workers: int,
+    limit_concurrency: int,
+    log_level: str,
+    uvicorn_kwargs: dict[str, Any],
+) -> None:
+    """Hand off to uvicorn. Split out so the bind target stays testable."""
     uvicorn.run(
         app_target,
-        host=config.host,
-        port=config.port,
-        log_level=uvicorn_log_level,
+        **bind_kwargs,
+        log_level=log_level,
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
         # Defense-in-depth: the loopback guard for /debug/* endpoints trusts

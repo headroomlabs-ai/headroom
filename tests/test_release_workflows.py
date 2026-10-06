@@ -277,7 +277,8 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
-    assert manifest["if"] == "${{ always() }}"
+    # Publishing requires every architecture's digest, including after cancellation.
+    assert manifest["if"] == "${{ success() }}"
     step_names = [step["name"] for step in manifest["steps"]]
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
