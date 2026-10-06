@@ -44,6 +44,11 @@ _OPENCODE_SUBCOMMANDS = frozenset(
 )
 _OPENCODE_STANDALONE_SUBCOMMANDS = frozenset({"run", "mini"})
 
+# Root OpenCode 2.x options that consume the following argument. Their values
+# must not be mistaken for the command position when they happen to match a
+# subcommand name (e.g. `--session models`).
+_OPENCODE_ROOT_VALUE_FLAGS = frozenset({"--session", "-s", "--prompt"})
+
 
 def opencode_major_version(binary: str) -> int | None:
     """Return the major version of the ``opencode`` binary, or ``None``.
@@ -91,11 +96,23 @@ def with_opencode_standalone(args: Sequence[str], major_version: int | None) -> 
         return args
     if any(arg in ("--standalone", "--server") or arg.startswith("--server=") for arg in args):
         return args
+    skip_next = False
     for index, arg in enumerate(args):
-        if arg in _OPENCODE_SUBCOMMANDS:
-            if arg not in _OPENCODE_STANDALONE_SUBCOMMANDS:
-                return args
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in _OPENCODE_ROOT_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        # First positional token: the subcommand, or the root TUI's directory
+        # argument. Only this position decides whether to add the flag.
+        if arg in _OPENCODE_STANDALONE_SUBCOMMANDS:
             return (*args[: index + 1], "--standalone", *args[index + 1 :])
+        if arg in _OPENCODE_SUBCOMMANDS:
+            return args
+        break
     return ("--standalone", *args)
 
 

@@ -609,6 +609,10 @@ def test_opencode_major_version_missing_binary_is_unknown(tmp_path: Path) -> Non
         (("--print-logs", "mini"), ("--print-logs", "mini", "--standalone")),
         (("models",), ("models",)),
         (("auth", "list"), ("auth", "list")),
+        (("--session", "models"), ("--standalone", "--session", "models")),
+        (("--prompt", "models", "extra"), ("--standalone", "--prompt", "models", "extra")),
+        (("-s", "stats"), ("--standalone", "-s", "stats")),
+        (("run", "--agent", "models"), ("run", "--standalone", "--agent", "models")),
         (("--standalone",), ("--standalone",)),
         (
             ("run", "--server", "http://127.0.0.1:4096", "x"),
