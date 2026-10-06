@@ -17,10 +17,11 @@ from headroom.providers.wrap_registry import WRAP_TARGETS, build_launch_env
 
 def test_goose_banner_hides_openai_api_base_alias():
     _, display = build_launch_env(WRAP_TARGETS["goose"], 8787, environ={}, project="p")
-    # Legacy goose never encoded the project prefix and showed two vars only.
+    # Goose has no project prefix; its endpoint override is visible in the banner.
     assert display == [
         "OPENAI_BASE_URL=http://127.0.0.1:8787/v1",
         "ANTHROPIC_BASE_URL=http://127.0.0.1:8787",
+        "ANTHROPIC_HOST=http://127.0.0.1:8787",
     ]
 
 

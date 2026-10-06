@@ -11,6 +11,10 @@ from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
+# Share of the call's timeout spent starting new OCR. One OCR already running
+# when it runs out still finishes, so the rest of the budget is its margin.
+_OCR_BUDGET_FRACTION = 2 / 3
+
 logger = logging.getLogger("headroom.proxy")
 
 _IMAGE_POOL_LOCK = threading.Lock()
@@ -40,9 +44,10 @@ def _get_worker_compressor() -> Any:
 def _compress_messages_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     compressor = _get_worker_compressor()
-    compressed = compressor.compress(messages, provider=provider)
+    compressed = compressor.compress(messages, provider=provider, deadline=deadline)
     if compressor.last_result is None:
         return compressed, None
     return compressed, {
@@ -57,6 +62,7 @@ def _compress_messages_worker(
 def _success_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     compressed = [dict(message) for message in messages]
     compressed[-1] = {**compressed[-1], "content": f"compressed:{provider}"}
@@ -72,6 +78,7 @@ def _success_worker(
 def _raise_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     raise RuntimeError(f"boom:{provider}")
 
@@ -79,6 +86,7 @@ def _raise_worker(
 def _sleep_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     time.sleep(0.2)
     return messages, None
@@ -87,6 +95,7 @@ def _sleep_worker(
 def _hang_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     time.sleep(60)
     return messages, None
@@ -95,12 +104,13 @@ def _hang_worker(
 def _abort_worker(
     messages: list[dict[str, Any]],
     provider: str,
+    deadline: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     os.abort()
 
 
 _IMAGE_WORKER: Callable[
-    [list[dict[str, Any]], str],
+    [list[dict[str, Any]], str, float | None],
     tuple[list[dict[str, Any]], dict[str, Any] | None],
 ] = _compress_messages_worker
 
@@ -149,8 +159,9 @@ async def run_image_compression_isolated(
     loop = asyncio.get_running_loop()
     pool: ProcessPoolExecutor | None = None
     try:
+        deadline = time.time() + timeout * _OCR_BUDGET_FRACTION
         pool = _image_pool()
-        future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider)
+        future = loop.run_in_executor(pool, _IMAGE_WORKER, messages, provider, deadline)
         return await asyncio.wait_for(future, timeout=timeout)
     except BrokenProcessPool:
         logger.warning("Image compression worker crashed; forwarding original image payload")

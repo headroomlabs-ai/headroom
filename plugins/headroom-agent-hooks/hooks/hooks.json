@@ -7,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "headroom init hook ensure",
+            "command": "sh -c '[ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && launcher=\"${CLAUDE_PLUGIN_ROOT}/bin/headroom-hook.sh\" && [ -r \"$launcher\" ] && exec sh \"$launcher\"; exec headroom init hook ensure'",
+            "powershell": "headroom init hook ensure",
             "timeout": 60
           }
         ]
@@ -19,7 +20,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "headroom init hook ensure",
+            "command": "sh -c '[ -n \"${CLAUDE_PLUGIN_ROOT:-}\" ] && launcher=\"${CLAUDE_PLUGIN_ROOT}/bin/headroom-hook.sh\" && [ -r \"$launcher\" ] && exec sh \"$launcher\"; exec headroom init hook ensure'",
+            "powershell": "headroom init hook ensure",
             "timeout": 60
           }
         ]

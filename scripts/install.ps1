@@ -159,6 +159,18 @@ function Get-PassthroughEnvArgs {
     return ,$args.ToArray()
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This is the only place that statement is made,
+# and it is always made together with the 127.0.0.1 publication it relies on.
+function Get-LoopbackPublishArgs {
+    param([int]$Port)
+    # Leading comma: return the array as one object so AddRange receives a
+    # string[] rather than an unrolled object[] (same as Get-SharedDockerArgs).
+    return ,[string[]]@('-p',"127.0.0.1`:$Port`:$Port",'--env','HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1')
+}
+
 function Get-SharedDockerArgs {
     Ensure-HostDirs
     $args = New-Object System.Collections.Generic.List[string]
@@ -253,7 +265,8 @@ function Start-ProxyContainer {
 
     $containerName = "headroom-proxy-$Port-$PID"
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-SharedDockerArgs))
     $dockerArgs.Add($HeadroomImage)
     $dockerArgs.Add('--host')
@@ -548,7 +561,8 @@ function Start-PersistentDockerInstall {
     docker rm -f $containerName | Out-Null 2>$null
 
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
     Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(
@@ -1739,7 +1753,7 @@ switch ($args[0]) {
         $dockerArgs = New-Object System.Collections.Generic.List[string]
         $dockerArgs.AddRange([string[]]@('run','--rm'))
         Add-TtyArgs -ArgsList $dockerArgs
-        $dockerArgs.AddRange([string[]]@('-p',"127.0.0.1`:$port`:$port"))
+        $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $port))
         $dockerArgs.AddRange((Get-SharedDockerArgs))
         $dockerArgs.Add('--entrypoint')
         $dockerArgs.Add('headroom')

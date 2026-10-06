@@ -98,6 +98,10 @@ class HeadroomServer:
 
         # The loopback guard on /v1/compress is decided when the app is built.
         os.environ["HEADROOM_COMPRESS_ALLOW_REMOTE"] = "1"
+        # This harness deliberately binds 0.0.0.0 with no inbound token so the
+        # Kong container can reach it; acknowledge the open bind explicitly
+        # (create_app refuses it otherwise).
+        os.environ["HEADROOM_ALLOW_UNAUTHENTICATED_BIND"] = "1"
         self.app = create_app(
             ProxyConfig(
                 host="0.0.0.0",
