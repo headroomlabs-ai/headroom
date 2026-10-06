@@ -141,12 +141,20 @@ export class HeadroomContextEngine {
     if (!this.proxyUrl || this.config.enabled === false) {
       this.ensureProxyStarted();
       // Fallback: return messages unchanged
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     if (this.isCircuitOpen()) {
       this.logger.warn("[headroom] Circuit open — using uncompressed messages");
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
 
     try {
@@ -176,7 +184,7 @@ export class HeadroomContextEngine {
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: result.tokensBefore,
-          systemPromptAddition: shouldAnnounceCompression ? HEADROOM_COMPRESSION_NOTICE : undefined,
+          systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
         };
       }
 
@@ -196,13 +204,17 @@ export class HeadroomContextEngine {
       return {
         messages: compressedAgentMessages,
         estimatedTokens: result.tokensAfter,
-        systemPromptAddition: shouldAnnounceCompression ? HEADROOM_COMPRESSION_NOTICE : undefined,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
       };
     } catch (error) {
       this.logger.error(`Assemble failed: ${error}`);
       this.tripCircuit(error);
       // Graceful fallback: return original messages
-      return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
+      return {
+        messages: normalizeAgentMessages(params.messages),
+        estimatedTokens: 0,
+        systemPromptAddition: this.sessionCompressionNotice(params.sessionId),
+      };
     }
   }
 
@@ -320,6 +332,13 @@ export class HeadroomContextEngine {
       if (oldest !== undefined) this.announcedSessions.delete(oldest);
     }
     this.announcedSessions.add(sessionId);
+  }
+
+  /** The sticky notice if this session already earned it and announcements aren't opted out. */
+  private sessionCompressionNotice(sessionId: string): string | undefined {
+    return this.hasAnnouncedCompression(sessionId) && this.config.announceCompression !== false
+      ? HEADROOM_COMPRESSION_NOTICE
+      : undefined;
   }
 
   ensureProxyStarted(): void {

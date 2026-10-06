@@ -33,7 +33,7 @@ vi.mock("../src/proxy-manager.js", () => ({
   defaultLogger: mocked.logger,
 }));
 
-import { HeadroomContextEngine } from "../src/engine.js";
+import { HeadroomContextEngine, type HeadroomEngineConfig } from "../src/engine.js";
 import { compress } from "headroom-ai";
 
 afterEach(() => {
@@ -450,7 +450,7 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
     };
   }
 
-  function readyEngine(config?: { announceCompression?: boolean }) {
+  function readyEngine(config?: HeadroomEngineConfig) {
     const engine = new HeadroomContextEngine(config);
     (engine as unknown as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     return engine;
@@ -553,5 +553,82 @@ describe("HeadroomContextEngine assemble() compression notice", () => {
     expect(overflow.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
     expect(oldest.systemPromptAddition).toBeUndefined();
     expect(newest.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("keeps the earned notice byte-identical through a timeout, a circuit-open turn, and recovery", async () => {
+    vi.useFakeTimers();
+    try {
+      const requestTimeoutMs = 5_000;
+      const circuitBreakerCooldownMs = 10_000;
+      const engine = readyEngine({
+        requestTimeoutMs,
+        circuitBreakerThreshold: 1,
+        circuitBreakerCooldownMs,
+      });
+
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+      const turn1 = await engine.assemble({ sessionId: "s1", messages });
+      const firstNotice = turn1.systemPromptAddition;
+      expect(firstNotice).toBe(HEADROOM_COMPRESSION_NOTICE);
+
+      vi.mocked(compress).mockImplementationOnce(() => new Promise(() => {}));
+      const turn2Promise = engine.assemble({ sessionId: "s1", messages });
+      await vi.advanceTimersByTimeAsync(requestTimeoutMs);
+      const turn2 = await turn2Promise;
+      expect(turn2.systemPromptAddition).toBe(firstNotice);
+
+      const turn3 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn3.systemPromptAddition).toBe(firstNotice);
+      expect(compress).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(circuitBreakerCooldownMs);
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ compressed: false, tokensSaved: 0 }));
+      const turn4 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn4.systemPromptAddition).toBe(firstNotice);
+      expect(turn4.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves an earned notice when the proxy becomes unavailable", async () => {
+    vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+
+    const engine = readyEngine();
+    const first = await engine.assemble({ sessionId: "s1", messages });
+    expect(first.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+
+    (engine as unknown as { proxyUrl: string | null }).proxyUrl = null;
+    const second = await engine.assemble({ sessionId: "s1", messages });
+
+    expect(second.systemPromptAddition).toBe(HEADROOM_COMPRESSION_NOTICE);
+  });
+
+  it("never surfaces a notice in any fallback path when announceCompression is false", async () => {
+    vi.useFakeTimers();
+    try {
+      const requestTimeoutMs = 5_000;
+      const engine = readyEngine({
+        announceCompression: false,
+        requestTimeoutMs,
+        circuitBreakerThreshold: 1,
+        circuitBreakerCooldownMs: 10_000,
+      });
+
+      vi.mocked(compress).mockResolvedValueOnce(mockCompressResult({ tokensSaved: 150 }));
+      const turn1 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn1.systemPromptAddition).toBeUndefined();
+
+      vi.mocked(compress).mockImplementationOnce(() => new Promise(() => {}));
+      const turn2Promise = engine.assemble({ sessionId: "s1", messages });
+      await vi.advanceTimersByTimeAsync(requestTimeoutMs);
+      const turn2 = await turn2Promise;
+      expect(turn2.systemPromptAddition).toBeUndefined();
+
+      const turn3 = await engine.assemble({ sessionId: "s1", messages });
+      expect(turn3.systemPromptAddition).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
