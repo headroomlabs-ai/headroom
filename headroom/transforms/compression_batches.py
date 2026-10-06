@@ -230,8 +230,15 @@ def compress_batch_with_router(
     router: ContentRouter,
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
+    deadline_started_at: float | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
-    """Compress one tagged batch and split only structurally valid output."""
+    """Compress one tagged batch and split only structurally valid output.
+
+    ``deadline_started_at`` works as in ``compress_unit_with_router``.
+    """
+
+    if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
+        return _passthrough_batch_results(batch, tokenizer=tokenizer, reason="deadline_exceeded")
 
     nonce = _batch_nonce(batch)
     batch_texts, marker_blocks = _protect_ccr_markers(batch, nonce)
