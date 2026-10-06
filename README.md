@@ -629,7 +629,7 @@ for the whole team.
 | | Open source | Enterprise |
 |---|---|---|
 | Savings | Compression, plus tool search on Anthropic requests (on by default) | Also: tool search for every model, harness tuning, extra compressors |
-| Model routing | Rule-based and opt-in: you write the rules (`HEADROOM_MODEL_ROUTES`) | Automatic: a cheaper model per request when quality allows, with a shadow mode that shows the savings before you turn it on |
+| Model routing | Rule-based and opt-in: turn it on with `HEADROOM_MODEL_ROUTER_ENABLED=1` and write the rules in `HEADROOM_MODEL_ROUTES` | Automatic: a cheaper model per request when quality allows, with a shadow mode that shows the savings before you turn it on |
 | Security | — | Detect and strip prompt injection and risky tool calls |
 | Rollout | Per laptop | Managed or in your VPC, SSO, central config, org-wide savings |
 | Support | GitHub, Discord | Dedicated engineers, onboarding, priority response |
