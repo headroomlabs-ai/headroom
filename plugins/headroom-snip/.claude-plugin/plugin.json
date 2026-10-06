@@ -1,6 +1,6 @@
 {
   "name": "headroom-snip",
-  "version": "0.39.1",
+  "version": "0.40.0",
   "description": "Watch Headroom snip tokens off every Claude Code request: an animated band, a /headroom log and a running total.",
   "author": {
     "name": "Headroom Contributors",

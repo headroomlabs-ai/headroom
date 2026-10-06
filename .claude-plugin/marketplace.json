@@ -30,7 +30,7 @@
       "name": "headroom-snip",
       "source": "./plugins/headroom-snip",
       "description": "Claude Code mod: watch Headroom snip tokens off every request, with an animated band, a /headroom log and a running total.",
-      "version": "0.39.1",
+      "version": "0.40.0",
       "author": {
         "name": "Headroom Contributors",
         "url": "https://github.com/headroomlabs-ai/headroom"
