@@ -60,7 +60,7 @@ def test_env_override_wins_then_falls_back(monkeypatch):
 
 @pytest.mark.parametrize(
     ("client", "supported"),
-    [(None, True), ("codex", False), (" CODEX ", False), ("opencode", True), ("claude", True)],
+    [(None, True), ("codex", False), (" CODEX ", False), ("opencode", False), ("claude", True)],
 )
 def test_client_supported(client, supported):
     assert openai_tool_search_client_supported(client) is supported
@@ -76,7 +76,7 @@ def test_codex_client_does_not_inject():
     assert all("defer_loading" not in tool for tool in out)
 
 
-@pytest.mark.parametrize("client", [None, "opencode"])
+@pytest.mark.parametrize("client", [None, "claude-code"])
 def test_supported_clients_still_inject(client):
     tools = _tools()
 
@@ -121,6 +121,20 @@ def test_terminal_helper_remains_deferrable():
 
     helper = next(t for t in out if t.get("name") == "terminal_helper")
     assert helper.get("defer_loading") is True
+
+
+def test_prefixed_core_and_terminal_names_stay_resident():
+    resident = ["_bash", "_read", "_write", "_edit", "_glob", "_grep", "_terminal"]
+    noncore = ["_hub", "_todo", "_eval", "mcp__server__read", "terminal_helper"]
+    tools = [_fn(name) for name in resident + noncore]
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.6-terra")
+
+    by_name = {tool["name"]: tool for tool in out if tool.get("type") == "function"}
+    for name in resident:
+        assert by_name[name].get("defer_loading") is None, name
+    for name in noncore:
+        assert by_name[name].get("defer_loading") is True, name
 
 
 def test_defers_mcp_server():
@@ -187,3 +201,34 @@ def test_resident_names_match_case_insensitively():
     for name in ("Bash", "Read", "Edit", "Terminal", "ToolSearch"):
         assert by_name[name].get("defer_loading") is None, name
     assert by_name["slack_0"].get("defer_loading") is True
+
+
+# --- client-harness exclusion (GH #2660) -------------------------------------
+
+
+def test_noop_for_a_client_that_cannot_execute_the_search_tool():
+    # GH #2660 reports opencode resolving tool calls against its own registry
+    # and rejecting the injected tool as unavailable, so its tools stay resident
+    # and untouched.
+    tools = _tools()
+    snapshot = copy.deepcopy(tools)
+
+    out = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="opencode")
+
+    assert out is tools
+    assert tools == snapshot
+    assert not any(t.get("type") == "tool_search" for t in out)
+    assert not any(t.get("defer_loading") for t in out)
+
+
+def test_supported_clients_keep_the_existing_deferral():
+    # The exclusion is per-client, not a global default flip: anything that can
+    # search still gets the same payload it got before.
+    tools = _tools()
+
+    explicit = inject_tool_search_deferral_openai(tools, "gpt-5.5", client="claude-code")
+    implicit = inject_tool_search_deferral_openai(tools, "gpt-5.5")
+
+    assert explicit == implicit
+    assert implicit[0] == {"type": "tool_search"}
+    assert any(t.get("defer_loading") for t in implicit)

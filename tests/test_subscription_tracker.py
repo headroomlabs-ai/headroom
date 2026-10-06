@@ -57,7 +57,7 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     tracker.notify_active("Bearer sk-ant-api-key")
     assert tracker._current_token is None
 
-    tracker.notify_active("Bearer oauth-token-123")
+    tracker.notify_active("Bearer oauth-token-123", from_local_operator=True)
     assert tracker._current_token == "oauth-token-123"
     assert tracker._full_tokens["oauth-to"] == 1
     assert tracker.is_active() is True
@@ -175,12 +175,115 @@ async def test_maybe_poll_handles_inactive_and_none_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_maybe_poll_prefers_refreshed_credentials_token_over_stale_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (#3913): the credentials file is where Claude Code writes the
+    *refreshed* OAuth token. Polling the remembered Authorization-header token
+    first pinned every poll to an expired credential, so `/stats` reported
+    permanent `poll_errors` and a `polled_at` that never advanced."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    # Token captured from a proxied local-operator request, before Claude Code rotated it.
+    tracker.notify_active("Bearer stale-header-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "refreshed-file-token"
+    )
+
+    snapshot = _make_snapshot()
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        # The stale header token is what Anthropic rejects with 401 -> None.
+        if token == "stale-header-token":
+            return None
+        return snapshot
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["refreshed-file-token"]
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.poll_errors == 0
+    assert tracker._state.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_falls_back_to_header_token_when_file_token_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remembered header token is still the only credential when no
+    credentials file exists, so a rejection of the file token must fall back to
+    it rather than mark the tracker errored."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer header-only-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "revoked-file-token"
+    )
+
+    snapshot = _make_snapshot()
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        if token == "revoked-file-token":
+            return None
+        return snapshot
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["revoked-file-token", "header-only-token"]
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.poll_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_single_request_when_file_token_matches_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical tokens must not be spent twice — the common case for a proxy
+    session whose credentials file holds the same token as the header."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer shared-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "shared-token"
+    )
+
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        return _make_snapshot()
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["shared-token"]
+
+
+@pytest.mark.asyncio
 async def test_maybe_poll_success_updates_state_and_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    # Pin the credentials-file/env source so this exercises the adopted
+    # local-operator header path, not whatever token the host happens to hold.
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
     discrepancies = [WindowDiscrepancy(kind="cache_miss", description="miss", severity="warning")]
@@ -226,7 +329,8 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
     multi-second ~/.claude/projects scan wedges the proxy every poll interval."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
 

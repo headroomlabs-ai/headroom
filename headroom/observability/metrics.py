@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Literal
@@ -12,6 +13,7 @@ from opentelemetry import metrics
 from opentelemetry.metrics import CallbackOptions, Observation
 
 from headroom._version import get_version
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,67 @@ _metrics_lock = Lock()
 _global_metrics: HeadroomOtelMetrics | None = None
 _owned_meter_provider: Any | None = None
 _owned_metrics_config: OTelMetricsConfig | None = None
+
+MetricAttributeProvider = Callable[[], Mapping[str, Any]]
+_metric_attribute_providers: list[MetricAttributeProvider] = []
+_metric_attribute_providers_lock = Lock()
+_MAX_DYNAMIC_ATTRIBUTES = 16
+_MAX_DYNAMIC_ATTRIBUTE_LENGTH = 256
+
+
+def register_otel_metric_attribute_provider(
+    provider: MetricAttributeProvider,
+) -> MetricAttributeProvider:
+    """Add request-scoped attributes to every Headroom OTEL datapoint.
+
+    Extensions use this narrow seam for dimensions such as tenant, team, or
+    user identity without coupling the OSS metrics layer to an auth package.
+    Providers run in the request context and must return content-free scalar
+    labels. A failing provider is ignored so observability cannot break traffic.
+    """
+
+    with _metric_attribute_providers_lock:
+        if provider not in _metric_attribute_providers:
+            _metric_attribute_providers.append(provider)
+    return provider
+
+
+def unregister_otel_metric_attribute_provider(provider: MetricAttributeProvider) -> None:
+    """Remove a previously registered request-attribute provider."""
+
+    with _metric_attribute_providers_lock:
+        try:
+            _metric_attribute_providers.remove(provider)
+        except ValueError:
+            pass
+
+
+def _dynamic_metric_attributes() -> dict[str, Any]:
+    with _metric_attribute_providers_lock:
+        providers = tuple(_metric_attribute_providers)
+
+    resolved: dict[str, Any] = {}
+    for provider in providers:
+        try:
+            attributes = provider()
+        except Exception:
+            logger.debug("OTEL metric attribute provider failed", exc_info=True)
+            continue
+        if not isinstance(attributes, Mapping):
+            continue
+        for raw_key, raw_value in attributes.items():
+            if len(resolved) >= _MAX_DYNAMIC_ATTRIBUTES:
+                return resolved
+            key = str(raw_key).strip()
+            if not key or raw_value is None or raw_value == "":
+                continue
+            if not isinstance(raw_value, (str, bool, int, float)):
+                continue
+            value = raw_value
+            if isinstance(value, str):
+                value = value[:_MAX_DYNAMIC_ATTRIBUTE_LENGTH]
+            resolved[key[:_MAX_DYNAMIC_ATTRIBUTE_LENGTH]] = value
+    return resolved
 
 
 def _headroom_version() -> str:
@@ -145,12 +208,15 @@ class HeadroomOtelMetrics:
         )
         self._proxy_failed_requests = self._meter.create_counter(
             "headroom.proxy.requests.failed",
-            description="Proxy requests that failed.",
+            description="Proxy requests that failed upstream (4xx and 5xx, excluding 429).",
             unit="1",
         )
         self._proxy_rate_limited_requests = self._meter.create_counter(
             "headroom.proxy.requests.rate_limited",
-            description="Proxy requests rejected by rate limiting.",
+            description=(
+                "Proxy requests rejected with 429, by source "
+                "(headroom=our own limiter, upstream=the provider)."
+            ),
             unit="1",
         )
         self._proxy_input_tokens = self._meter.create_counter(
@@ -163,9 +229,31 @@ class HeadroomOtelMetrics:
             description="Output tokens returned by upstream providers.",
             unit="1",
         )
+        self._proxy_attempted_input_tokens = self._meter.create_counter(
+            "headroom.proxy.tokens.attempted_input",
+            description=("Input tokens Headroom attempted to optimize before compression."),
+            unit="1",
+        )
+        self._proxy_output_saved_tokens = self._meter.create_counter(
+            "headroom.proxy.tokens.output_saved",
+            description="Estimated output tokens avoided by Headroom optimization.",
+            unit="1",
+        )
+        self._proxy_savings_usd = self._meter.create_counter(
+            "headroom.proxy.savings.usd",
+            description=("Estimated savings in USD by distinct Headroom or provider-cache layer."),
+            unit="USD",
+        )
         self._proxy_saved_tokens = self._meter.create_counter(
             "headroom.proxy.tokens.saved",
-            description="Input tokens saved by Headroom compression.",
+            description=(
+                "Input tokens saved across Headroom compression and tool-schema deferral."
+            ),
+            unit="1",
+        )
+        self._proxy_tool_schema_saved_tokens = self._meter.create_counter(
+            "headroom.proxy.tokens.tool_schema_saved",
+            description="Input tokens saved by deferring tool schemas.",
             unit="1",
         )
         self._proxy_cache_read_tokens = self._meter.create_counter(
@@ -258,6 +346,21 @@ class HeadroomOtelMetrics:
             description="Waste tokens detected in compressed inputs.",
             unit="1",
         )
+        self._savings_attribution_events = self._meter.create_counter(
+            "headroom.savings.attribution.events",
+            description="Per-request savings attribution events.",
+            unit="1",
+        )
+        self._savings_attributed_tokens = self._meter.create_counter(
+            "headroom.savings.attributed.tokens",
+            description="Tokens attributed to a named savings source.",
+            unit="1",
+        )
+        self._savings_attributed_usd = self._meter.create_up_down_counter(
+            "headroom.savings.attributed.usd",
+            description="Attributed cost delta; negative values represent added cost.",
+            unit="USD",
+        )
 
         # Backing values updated by record_subscription_window()
         self._sub_5h_util_val: float = 0.0
@@ -330,7 +433,9 @@ class HeadroomOtelMetrics:
 
     @staticmethod
     def _attrs(**attrs: Any) -> dict[str, Any]:
-        filtered: dict[str, Any] = {}
+        # Dynamic request dimensions are deliberately lower precedence than
+        # canonical instrument dimensions (provider/model/source/etc.).
+        filtered = _dynamic_metric_attributes()
         for key, value in attrs.items():
             if value is None or value == "":
                 continue
@@ -346,6 +451,7 @@ class HeadroomOtelMetrics:
         output_tokens: int,
         tokens_saved: int,
         latency_ms: float,
+        tool_search_saved: int = 0,
         cached: bool = False,
         overhead_ms: float = 0.0,
         ttfb_ms: float = 0.0,
@@ -354,8 +460,23 @@ class HeadroomOtelMetrics:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        attempted_input_tokens: int = 0,
+        output_tokens_saved: int = 0,
+        # Mixed value types: per-layer dollars plus a string `basis` label.
+        # The loop below skips anything non-numeric rather than coercing it.
+        savings_usd: Mapping[str, Any] | None = None,
+        project: str | None = None,
+        client: str | None = None,
     ) -> None:
-        attrs = self._attrs(provider=provider, model=model, cached=cached)
+        attrs = self._attrs(
+            provider=provider,
+            model=model,
+            cached=cached,
+            **{
+                "headroom.project": project,
+                "headroom.client": client,
+            },
+        )
 
         self._proxy_requests.add(1, attrs)
         if cached:
@@ -363,7 +484,47 @@ class HeadroomOtelMetrics:
 
         self._proxy_input_tokens.add(max(input_tokens, 0), attrs)
         self._proxy_output_tokens.add(max(output_tokens, 0), attrs)
-        self._proxy_saved_tokens.add(max(tokens_saved, 0), attrs)
+        if attempted_input_tokens > 0:
+            self._proxy_attempted_input_tokens.add(attempted_input_tokens, attrs)
+        if output_tokens_saved > 0:
+            self._proxy_output_saved_tokens.add(output_tokens_saved, attrs)
+        # ``savings_usd`` is the breakdown from
+        # ``savings_tracker.estimate_request_savings_usd``: per-layer dollars,
+        # plus two companions that must NOT become their own counter series.
+        #
+        #   * ``basis`` — a string saying how soundly the layers were priced.
+        #     It is a DIMENSION, not a measure, so it rides on the attributes
+        #     where a consumer can group by it.
+        #   * ``*_list`` — the same layers at flat list price (the upper bound).
+        #     Exporting them as sources would make a dashboard summing `source`
+        #     report roughly double the real saving, since each layer would
+        #     appear twice.
+        #
+        # Anything non-numeric is skipped rather than coerced: this loop used to
+        # call `float()` on every value and would raise on a string, taking the
+        # whole request-metrics path down with it.
+        savings_basis = str((savings_usd or {}).get("basis") or "")[:32]
+        for source, value in (savings_usd or {}).items():
+            if source == "basis" or str(source).endswith("_list"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            amount = max(float(value), 0.0)
+            if amount:
+                self._proxy_savings_usd.add(
+                    amount,
+                    {
+                        **attrs,
+                        "source": str(source)[:64],
+                        "estimated": True,
+                        "basis": savings_basis,
+                    },
+                )
+        compression_saved = max(tokens_saved, 0)
+        tool_schema_saved = max(tool_search_saved, 0)
+        self._proxy_saved_tokens.add(compression_saved + tool_schema_saved, attrs)
+        if tool_schema_saved > 0:
+            self._proxy_tool_schema_saved_tokens.add(tool_schema_saved, attrs)
         self._proxy_latency.record(max(latency_ms, 0.0) / _MILLISECONDS_TO_SECONDS, attrs)
 
         if overhead_ms > 0:
@@ -390,13 +551,35 @@ class HeadroomOtelMetrics:
     def record_proxy_failed(self, *, provider: str | None = None, model: str | None = None) -> None:
         self._proxy_failed_requests.add(1, self._attrs(provider=provider, model=model))
 
+    def record_savings_attribution(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            attrs = self._attrs(
+                source=str(item.get("source") or "other")[:64],
+                realized=bool(item.get("realized", True)),
+                estimated=bool(item.get("estimated", False)),
+            )
+            self._savings_attribution_events.add(1, attrs)
+            saved = max(0, int(item.get("tokens", 0) or 0))
+            if saved:
+                self._savings_attributed_tokens.add(saved, attrs)
+            cost = float(item.get("usd", 0.0) or 0.0)
+            if cost:
+                self._savings_attributed_usd.add(cost, attrs)
+
     def record_proxy_rate_limited(
         self,
         *,
         provider: str | None = None,
         model: str | None = None,
+        source: str = "headroom",
     ) -> None:
-        self._proxy_rate_limited_requests.add(1, self._attrs(provider=provider, model=model))
+        # ``source`` mirrors the headroom_requests_rate_limited_total{source}
+        # Prometheus label: "headroom" = our own limiter refused the request,
+        # "upstream" = the provider did. Same split in both backends so an
+        # operator's query means the same thing whichever one they scrape.
+        self._proxy_rate_limited_requests.add(
+            1, self._attrs(provider=provider, model=model, source=source)
+        )
 
     def record_proxy_cache_bust(self, *, tokens_lost: int) -> None:
         self._proxy_cache_busts.add(1)
@@ -535,6 +718,22 @@ def configure_otel_metrics(config: OTelMetricsConfig | None = None) -> HeadroomO
     if resolved.exporter == "console":
         exporter = ConsoleMetricExporter()
     else:
+        # Air-gap chokepoint. OTLP/HTTP export dials a collector and then keeps
+        # POSTing on a background timer (PeriodicExportingMetricReader), so it
+        # is exactly the kind of long-lived, easy-to-forget egress
+        # HEADROOM_OFFLINE is supposed to cover — and it was not covered.
+        #
+        # The guard runs before OTLPMetricExporter is constructed, because the
+        # exporter opens its session eagerly. No exemption for a collector that
+        # looks local: the endpoint may be unset here (the OTEL SDK then falls
+        # back to OTEL_EXPORTER_OTLP_ENDPOINT or the 4318 default) and a
+        # sidecar address is not distinguishable from an internet one. An
+        # operator who wants in-cluster metrics under an air-gap should use the
+        # "console" exporter or scrape /metrics, both of which stay on-box.
+        guard_egress(
+            "OTLP metric export",
+            resolved.endpoint or "the OTEL SDK's default OTLP endpoint",
+        )
         exporter_kwargs: dict[str, Any] = {}
         if resolved.endpoint is not None:
             exporter_kwargs["endpoint"] = resolved.endpoint
