@@ -12426,13 +12426,22 @@ function tool(input) {
 }
 tool.schema = external_exports;
 
+// src/strings.ts
+function stripTrailingSlashes(value) {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+}
+
 // src/retrieve.ts
 var _proxyUrlCache = null;
 function getDefaultProxyUrl() {
   return _proxyUrlCache ?? process.env.HEADROOM_BASE_URL ?? "http://localhost:8787";
 }
 function createHeadroomRetrieveTool(config2) {
-  const origin = config2.proxyBaseUrl.replace(/\/+$/, "");
+  const origin = stripTrailingSlashes(config2.proxyBaseUrl);
   return {
     name: "headroom_retrieve",
     description: "Retrieve original uncompressed content from Headroom's compression store. Use when compressed context mentions a hash and you need the full details. Pass the hash from the compression marker (24 hex characters). Retrieval is by hash and always returns the full original content.",
@@ -12907,7 +12916,7 @@ function uninstallHeadroomTransport() {
 // src/plugin.ts
 var HEADROOM_PLUGIN_ID = "headroom";
 function normalizeProxyUrl2(url2) {
-  return url2.replace(/\/+$/, "");
+  return stripTrailingSlashes(url2);
 }
 function resolveProxyUrl(options) {
   return normalizeProxyUrl2(
@@ -12948,7 +12957,7 @@ function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts) {
       draft.headers = {
         ...draft.headers,
         [BASE_URL_HEADER]: upstream.origin,
-        [ORIGINAL_PATH_HEADER]: `${upstream.pathname.replace(/\/+$/, "")}${suffix}`,
+        [ORIGINAL_PATH_HEADER]: `${stripTrailingSlashes(upstream.pathname)}${suffix}`,
         [PROJECT_HEADER]: project
       };
     });

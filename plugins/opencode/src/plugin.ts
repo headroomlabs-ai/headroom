@@ -4,6 +4,7 @@ import type { Plugin as PluginV2 } from "@opencode/plugin";
 import { z } from "zod";
 
 import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
+import { stripTrailingSlashes } from "./strings.js";
 import {
   BASE_URL_HEADER,
   EXCLUDE_HOSTS_ENV,
@@ -25,7 +26,7 @@ export interface HeadroomOpenCodePluginOptions {
 export const HEADROOM_PLUGIN_ID = "headroom";
 
 function normalizeProxyUrl(url: string): string {
-  return url.replace(/\/+$/, "");
+  return stripTrailingSlashes(url);
 }
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
@@ -98,7 +99,7 @@ function routeModelsThroughProxy(
       draft.headers = {
         ...draft.headers,
         [BASE_URL_HEADER]: upstream.origin,
-        [ORIGINAL_PATH_HEADER]: `${upstream.pathname.replace(/\/+$/, "")}${suffix}`,
+        [ORIGINAL_PATH_HEADER]: `${stripTrailingSlashes(upstream.pathname)}${suffix}`,
         [PROJECT_HEADER]: project,
       };
     });

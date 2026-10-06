@@ -358,6 +358,52 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     }
   });
 
+  it("handles adversarial slash runs in model base URLs in bounded time", async () => {
+    const trailing = "/".repeat(20000);
+    const models: FakeModel[] = [
+      {
+        id: "non-slash-tail",
+        providerID: "gateway",
+        settings: { baseURL: `https://gateway.example/api/v1${trailing}x` },
+      },
+      {
+        id: "slash-tail",
+        providerID: "gateway",
+        settings: { baseURL: `https://gateway.example/api/v1${trailing}` },
+      },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787" },
+      {
+        providers: [
+          {
+            id: "gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+          },
+        ],
+        models,
+      },
+    );
+
+    const cleanup = await headroomSetup(context);
+    await cleanup?.();
+
+    expect(models[0]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://gateway.example",
+        "x-headroom-original-path": `/api/v1${trailing}x/chat/completions`,
+      },
+    });
+    expect(models[1]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: {
+        "x-headroom-base-url": "https://gateway.example",
+        "x-headroom-original-path": "/api/v1/chat/completions",
+      },
+    });
+  });
+
   it("leaves local, already-proxied, non-OpenAI-wire and URL-less models alone", async () => {
     const models: FakeModel[] = [
       { id: "llama", providerID: "ollama" },
