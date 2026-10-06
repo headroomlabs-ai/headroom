@@ -12,6 +12,8 @@ import zipfile
 from pathlib import Path
 from urllib.request import urlopen
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 CBM_VERSION = "v0.8.1"
@@ -98,6 +100,7 @@ def download_cbm(version: str | None = None) -> Path:
     plat = _detect_platform()
     filename = _asset_filename(plat)
     url = f"{GITHUB_RELEASE_URL}/{version}/{filename}"
+    guard_egress("codebase-memory-mcp binary download", url)
 
     CBM_BIN_DIR.mkdir(parents=True, exist_ok=True)
     target_path = CBM_BIN_DIR / _installed_name(plat)
