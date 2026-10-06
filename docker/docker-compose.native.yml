@@ -30,6 +30,11 @@ services:
       HOME: /tmp/headroom-home
       HEADROOM_HOST: 0.0.0.0
       HEADROOM_PROXY_TOKEN: ${HEADROOM_PROXY_TOKEN:-}
+      # The container binds 0.0.0.0 so the loopback publication below can reach
+      # it; the proxy refuses that bind without a token unless the operator
+      # acknowledges it. This file always publishes on 127.0.0.1, so it does.
+      # Irrelevant (and harmless) once HEADROOM_PROXY_TOKEN is set.
+      HEADROOM_ALLOW_UNAUTHENTICATED_BIND: "1"
       # Canonical Headroom filesystem contract (issue #175). See `cli` service
       # above for rationale.
       HEADROOM_WORKSPACE_DIR: /tmp/headroom-home/.headroom

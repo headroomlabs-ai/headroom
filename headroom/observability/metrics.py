@@ -13,6 +13,7 @@ from opentelemetry import metrics
 from opentelemetry.metrics import CallbackOptions, Observation
 
 from headroom._version import get_version
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -717,6 +718,22 @@ def configure_otel_metrics(config: OTelMetricsConfig | None = None) -> HeadroomO
     if resolved.exporter == "console":
         exporter = ConsoleMetricExporter()
     else:
+        # Air-gap chokepoint. OTLP/HTTP export dials a collector and then keeps
+        # POSTing on a background timer (PeriodicExportingMetricReader), so it
+        # is exactly the kind of long-lived, easy-to-forget egress
+        # HEADROOM_OFFLINE is supposed to cover — and it was not covered.
+        #
+        # The guard runs before OTLPMetricExporter is constructed, because the
+        # exporter opens its session eagerly. No exemption for a collector that
+        # looks local: the endpoint may be unset here (the OTEL SDK then falls
+        # back to OTEL_EXPORTER_OTLP_ENDPOINT or the 4318 default) and a
+        # sidecar address is not distinguishable from an internet one. An
+        # operator who wants in-cluster metrics under an air-gap should use the
+        # "console" exporter or scrape /metrics, both of which stay on-box.
+        guard_egress(
+            "OTLP metric export",
+            resolved.endpoint or "the OTEL SDK's default OTLP endpoint",
+        )
         exporter_kwargs: dict[str, Any] = {}
         if resolved.endpoint is not None:
             exporter_kwargs["endpoint"] = resolved.endpoint
