@@ -62,7 +62,14 @@ def opencode_major_version(binary: str) -> int | None:
     output = f"{getattr(proc, 'stdout', '') or ''} {getattr(proc, 'stderr', '') or ''}"
     # Not `\b`: in "v2.0.12" the "v" and "2" are both word characters.
     match = re.search(r"(?<!\d)(\d+)\.\d+\.\d+", output)
-    return int(match.group(1)) if match else None
+    major = int(match.group(1)) if match else None
+    if major == 0:
+        # Dev builds report `0.0.0-v2-<stamp>`; the channel marker carries the
+        # real major. Take the highest `vN` token, skipping the "v0" prefix.
+        channels = re.findall(r"(?<![A-Za-z0-9])v(\d+)(?![0-9])", output)
+        if channels:
+            major = max(int(channel) for channel in channels)
+    return major
 
 
 def with_opencode_standalone(args: Sequence[str], major_version: int | None) -> tuple[str, ...]:

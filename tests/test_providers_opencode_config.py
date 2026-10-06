@@ -574,6 +574,8 @@ def test_inject_provider_config_strips_existing_markers(
     [
         ("opencode v2.0.12\n", 0, 2),
         ("1.18.32\n", 0, 1),
+        ("opencode v0.0.0-v2-202610061051\n", 0, 2),
+        ("0.0.0-dev-202610060234\n", 0, 0),
         ("garbage\n", 0, None),
         ("opencode v2.0.12\n", 1, None),
     ],
