@@ -958,3 +958,91 @@ class TestWorkspaceScoping:
         # read, not purging on write — workspace A could come back and use
         # them again within the age window).
         assert len(tracker.get_tracked_hashes()) == 5
+
+
+# ============================================================================
+# Conversation scoping (#1174).
+#
+# One workspace (cwd) can carry several live conversations at once: a Claude
+# Code lead and its agent-team teammates all run in the same directory. The
+# workspace gate alone let the lead's compressed tool output keyword-match a
+# teammate's incoming message and get appended to it. `present_hashes` limits
+# expansion to compressions whose markers the requesting conversation holds.
+# ============================================================================
+
+
+class TestConversationScoping:
+    """Same-workspace conversations must not receive each other's content."""
+
+    _QUERY = "please review the auth middleware session code"
+
+    @pytest.fixture(autouse=True)
+    def reset_trackers(self):
+        reset_context_tracker()
+        reset_compression_store()
+        yield
+        reset_context_tracker()
+        reset_compression_store()
+
+    @staticmethod
+    def _track(tracker: ContextTracker, hash_key: str, sample: str) -> None:
+        tracker.track_compression(
+            hash_key=hash_key,
+            turn_number=1,
+            tool_name="Bash",
+            original_count=100,
+            compressed_count=10,
+            workspace_key="ws-team",
+            query_context="list the auth code",
+            sample_content=sample,
+        )
+
+    def test_hash_absent_from_request_is_not_expanded(self):
+        tracker = ContextTracker(ContextTrackerConfig(relevance_threshold=0.1))
+        self._track(tracker, "lead_hash", "auth middleware login session token")
+
+        recommendations = tracker.analyze_query(
+            query=self._QUERY, current_turn=2, workspace_key="ws-team", present_hashes=[]
+        )
+
+        assert recommendations == []
+
+    def test_hash_present_in_request_still_expands(self):
+        tracker = ContextTracker(ContextTrackerConfig(relevance_threshold=0.1))
+        self._track(tracker, "own_hash", "auth middleware login session token")
+
+        recommendations = tracker.analyze_query(
+            query=self._QUERY,
+            current_turn=2,
+            workspace_key="ws-team",
+            present_hashes=["own_hash"],
+        )
+
+        assert [r.hash_key for r in recommendations] == ["own_hash"]
+
+    def test_foreign_hash_does_not_take_an_expansion_slot(self):
+        config = ContextTrackerConfig(relevance_threshold=0.1, max_proactive_expansions=1)
+        tracker = ContextTracker(config)
+        # The foreign context is the stronger match; with a single slot it
+        # would win if it were scored at all.
+        self._track(tracker, "lead_hash", "auth middleware login session token review code")
+        self._track(tracker, "own_hash", "auth notes")
+
+        recommendations = tracker.analyze_query(
+            query=self._QUERY,
+            current_turn=2,
+            workspace_key="ws-team",
+            present_hashes=["own_hash"],
+        )
+
+        assert [r.hash_key for r in recommendations] == ["own_hash"]
+
+    def test_none_keeps_workspace_only_behaviour(self):
+        tracker = ContextTracker(ContextTrackerConfig(relevance_threshold=0.1))
+        self._track(tracker, "any_hash", "auth middleware login session token")
+
+        recommendations = tracker.analyze_query(
+            query=self._QUERY, current_turn=2, workspace_key="ws-team"
+        )
+
+        assert [r.hash_key for r in recommendations] == ["any_hash"]

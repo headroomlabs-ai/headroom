@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import click
 import pytest
 
@@ -50,6 +52,35 @@ def test_build_manifest_for_persistent_docker_sets_expected_defaults() -> None:
     # exist inside the container and would keep /readyz at 503 (#2803). The proxy
     # resolves the DB under its own cwd, which is the bind-mounted ~/.headroom.
     assert "--memory-db-path" not in manifest.proxy_args
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
+
+
+def test_build_manifest_docker_runtime_never_installs_native_supervisor() -> None:
+    manifest = build_manifest(
+        profile="default",
+        preset=InstallPreset.PERSISTENT_SERVICE.value,
+        runtime_kind="docker",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        backend="anthropic",
+        anyllm_provider=None,
+        region=None,
+        proxy_mode="token",
+        memory_enabled=False,
+        telemetry_enabled=False,
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+    )
+
+    assert manifest.supervisor_kind == "none"
+    expected_preset = (
+        InstallPreset.PERSISTENT_TASK.value
+        if sys.platform.startswith("win")
+        else InstallPreset.PERSISTENT_SERVICE.value
+    )
+    assert manifest.preset == expected_preset
 
 
 def test_build_manifest_python_runtime_keeps_explicit_memory_db_path() -> None:
@@ -97,6 +128,8 @@ def test_build_manifest_falls_back_from_windows_service_to_task(monkeypatch) -> 
 
     assert manifest.preset == InstallPreset.PERSISTENT_TASK.value
     assert manifest.supervisor_kind == "task"
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env
 
 
 def test_build_manifest_uses_provider_slice_env_builders_for_all_supported_targets() -> None:
@@ -330,3 +363,66 @@ def test_build_manifest_extra_env_overrides_derived_defaults() -> None:
     # telemetry_enabled=False in _base_manifest_kwargs would normally set "off";
     # an explicit --env must win.
     assert manifest.base_env["HEADROOM_TELEMETRY"] == "on"
+
+
+def test_build_manifest_grok_build_only_sets_xai_upstream() -> None:
+    """Persistent install for Grok Build alone must route proxy upstream to xAI."""
+    from headroom.providers.grok import DEFAULT_API_URL
+
+    manifest = build_manifest(**_base_manifest_kwargs(targets=["grok_build"], backend="openai"))
+
+    assert manifest.base_env.get("OPENAI_TARGET_API_URL") == DEFAULT_API_URL
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == DEFAULT_API_URL
+
+
+def test_build_manifest_grok_with_codex_does_not_force_xai() -> None:
+    """Do not override OpenAI upstream when OpenAI-native tools share the proxy."""
+    manifest = build_manifest(
+        **_base_manifest_kwargs(targets=["grok_build", "codex"], backend="openai")
+    )
+
+    assert "OPENAI_TARGET_API_URL" not in manifest.base_env
+    assert "--openai-api-url" not in manifest.proxy_args
+
+
+def test_build_manifest_extra_env_wins_over_grok_xai_default() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            targets=["grok_build"],
+            backend="openai",
+            extra_env={"OPENAI_TARGET_API_URL": "https://gateway.example/v1"},
+        )
+    )
+
+    assert manifest.base_env["OPENAI_TARGET_API_URL"] == "https://gateway.example/v1"
+    idx = manifest.proxy_args.index("--openai-api-url")
+    assert manifest.proxy_args[idx + 1] == "https://gateway.example/v1"
+
+
+def test_build_manifest_for_persistent_service_uses_safe_model_backends() -> None:
+    manifest = build_manifest(**_base_manifest_kwargs())
+
+    assert manifest.base_env["HEADROOM_EMBEDDER_RUNTIME"] == "cpu"
+    assert manifest.base_env["HEADROOM_KOMPRESS_BACKEND"] == "onnx"
+
+
+def test_persistent_service_explicit_model_backends_override_safe_defaults() -> None:
+    manifest = build_manifest(
+        **_base_manifest_kwargs(
+            extra_env={
+                "HEADROOM_EMBEDDER_RUNTIME": "pytorch_mps",
+                "HEADROOM_KOMPRESS_BACKEND": "pytorch_mps",
+            }
+        )
+    )
+
+    assert manifest.base_env["HEADROOM_EMBEDDER_RUNTIME"] == "pytorch_mps"
+    assert manifest.base_env["HEADROOM_KOMPRESS_BACKEND"] == "pytorch_mps"
+
+
+def test_persistent_task_does_not_inherit_service_backend_defaults() -> None:
+    manifest = build_manifest(**_base_manifest_kwargs(preset=InstallPreset.PERSISTENT_TASK.value))
+
+    assert "HEADROOM_EMBEDDER_RUNTIME" not in manifest.base_env
+    assert "HEADROOM_KOMPRESS_BACKEND" not in manifest.base_env

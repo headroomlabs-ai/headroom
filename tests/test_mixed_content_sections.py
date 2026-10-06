@@ -49,6 +49,43 @@ def test_split_into_sections_preserves_typed_boundaries():
     assert sections[3].start_line == 5
 
 
+def test_split_carves_grep_context_lines_into_search_sections():
+    """Regression (#3580): prose + ``grep -A`` output keeps code out of text.
+
+    Context lines (``path-NN-content``) must join the SEARCH_RESULTS section
+    instead of stranding source code in a PLAIN_TEXT section, where the
+    word-dropping prose compressor would corrupt it. ``--`` group separators
+    ride along as ordinary text lines.
+    """
+    content = "\n".join(
+        [
+            "Some intro prose explaining the search.",
+            "src/main.py-40-    context before",
+            "src/main.py:42:def process_data(items):",
+            "src/main.py-43-    context after",
+            "--",
+            "src/other.py:12:    return True",
+            "Trailing prose after the results.",
+        ]
+    )
+
+    sections = split_into_sections(content)
+
+    # The ``--`` group separator breaks the run, so the two grep groups keep
+    # their own SEARCH_RESULTS sections instead of merging through it.
+    assert [section.content_type for section in sections] == [
+        ContentType.PLAIN_TEXT,
+        ContentType.SEARCH_RESULTS,
+        ContentType.PLAIN_TEXT,
+        ContentType.SEARCH_RESULTS,
+        ContentType.PLAIN_TEXT,
+    ]
+    assert "src/main.py-40-    context before" in sections[1].content
+    assert "src/main.py:42:def process_data(items):" in sections[1].content
+    assert "src/main.py-43-    context after" in sections[1].content
+    assert "src/other.py:12:    return True" in sections[3].content
+
+
 def test_extract_json_block_ignores_delimiters_inside_strings():
     lines = [
         "[",

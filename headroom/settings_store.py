@@ -64,6 +64,20 @@ class SettingField:
 SETTINGS: tuple[SettingField, ...] = (
     # --- Compression ---
     SettingField(
+        "HEADROOM_MODE",
+        "mode",
+        "Proxy mode",
+        "Compression",
+        "enum",
+        default="cache",
+        choices=("token", "cache"),
+        help=(
+            "Optimization posture: token rewrites history for maximum compression; "
+            "cache preserves prior turns for prefix-cache stability."
+        ),
+        tier="basic",
+    ),
+    SettingField(
         "HEADROOM_SAVINGS_PROFILE",
         "savings_profile",
         "Savings profile",
@@ -258,6 +272,21 @@ SETTINGS: tuple[SettingField, ...] = (
         maximum=65535,
         manifest_managed=True,
         help="Bind port. Managed by the install manifest on docker/service installs.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_UDS",
+        "uds",
+        "Unix socket path",
+        "Networking",
+        "str",
+        default=None,
+        manifest_managed=True,
+        help=(
+            "Serve on a Unix domain socket at this path instead of host/port. "
+            "POSIX only; leave empty to bind host/port. Managed by the install "
+            "manifest on docker/service installs."
+        ),
         tier="advanced",
     ),
     # --- Logging ---
@@ -559,6 +588,38 @@ SETTINGS: tuple[SettingField, ...] = (
         minimum=1,
         maximum=300,
         help="Upstream connection timeout in seconds. Default: 10.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_WRITE_TIMEOUT_SECONDS",
+        "write_timeout_seconds",
+        "Write timeout (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=1,
+        help=(
+            "Seconds the upstream send may take before it is abandoned. Default: 150. "
+            "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+            "large bodies over a slow link. Lower it to fail over a dead pooled "
+            "connection faster; the connect timeout only guards a fresh connect."
+        ),
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+        "upstream_tcp_keepalive_seconds",
+        "Upstream TCP keepalive (s)",
+        "Timeouts",
+        "int",
+        default=None,
+        minimum=0,
+        help=(
+            "Seconds an upstream connection may sit silent before TCP keepalive "
+            "probes it. Default: 30, 0 disables. A link that dies without a reset "
+            "then fails over after about this + 60s instead of waiting out the "
+            "read timeout."
+        ),
         tier="advanced",
     ),
     SettingField(
@@ -947,8 +1008,25 @@ def apply_to_environ(values: dict[str, Any]) -> None:
         os.environ.setdefault(field.env, _serialize(field, value))
 
 
-def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
-    """The value actually active now for each knob: default ← file ← environ."""
+def _coerce_runtime_values(runtime_values: dict[str, Any] | None) -> dict[str, Any]:
+    """Coerce known live-config values without exposing invalid internal state."""
+    result: dict[str, Any] = {}
+    for key, value in (runtime_values or {}).items():
+        field = _BY_KEY.get(key)
+        if field is None:
+            continue
+        try:
+            result[key] = _coerce(field, value)
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def effective_values(
+    stored: dict[str, Any] | None = None,
+    runtime_values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The active value for each knob: default ← file ← environ ← runtime."""
     if stored is None:
         stored = load()
     result: dict[str, Any] = {}
@@ -961,6 +1039,7 @@ def effective_values(stored: dict[str, Any] | None = None) -> dict[str, Any]:
             except (ValueError, TypeError):
                 pass  # unparseable env: keep the file/default value
         result[field.key] = value
+    result.update(_coerce_runtime_values(runtime_values))
     return result
 
 
@@ -978,14 +1057,26 @@ def stored_values(mask_secrets: bool = True) -> dict[str, Any]:
     return {key: _mask(_BY_KEY[key], value) for key, value in values.items()}
 
 
-def to_schema() -> dict[str, Any]:
+def to_schema(
+    *,
+    runtime_values: dict[str, Any] | None = None,
+    env_override_exclusions: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Registry + grouped fields + effective values for the UI. Secrets masked.
 
     All curated knobs are startup-captured, so every key is restart-required;
     ``needs_restart_keys`` lists them for the UI's "restart to apply" banner.
+
+    ``runtime_values`` is the live ``ProxyConfig`` tier. It wins over values
+    re-read from ``os.environ``, which can contain profile defaults that were
+    seeded only after CLI options had already been resolved. Those generated
+    defaults belong in ``env_override_exclusions`` so they are not presented as
+    explicit operator exports.
     """
     stored = load()
-    effective = effective_values(stored)
+    environment_effective = effective_values(stored)
+    runtime = _coerce_runtime_values(runtime_values)
+    effective = {**environment_effective, **runtime}
     fields: list[dict[str, Any]] = []
     for field in SETTINGS:
         fields.append(
@@ -1003,7 +1094,10 @@ def to_schema() -> dict[str, Any]:
                 "minimum": field.minimum,
                 "maximum": field.maximum,
                 "tier": field.tier,
-                "env_override": bool(os.environ.get(field.env)),
+                "env_override": bool(os.environ.get(field.env))
+                and field.env not in env_override_exclusions,
+                "runtime_override": field.key in runtime
+                and runtime[field.key] != environment_effective[field.key],
                 "value": _mask(field, effective.get(field.key)),
                 "stored": _mask(field, stored.get(field.key)),
             }

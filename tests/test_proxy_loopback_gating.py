@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from headroom.cache.backends import InMemoryBackend
+from headroom.cache.compression_feedback import CompressionHints
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.loopback_guard import is_ip_literal_host_header
 from headroom.proxy.server import ProxyConfig, create_app
@@ -30,6 +31,11 @@ GATED = [
     ("get", "/v1/toin/stats"),
     ("get", "/v1/toin/patterns"),
     ("get", "/v1/toin/pattern/example"),
+    # #2927 guarded the eight telemetry/TOIN routes the issue enumerated but
+    # left these two siblings open, and their payload carries the same raw
+    # agent query text (``common_queries``, built from ``event.query``).
+    ("get", "/v1/feedback"),
+    ("get", "/v1/feedback/example"),
 ]
 
 
@@ -117,6 +123,136 @@ def test_toin_pattern_detail_whitelists_learned_payload(monkeypatch: pytest.Monk
         "skip_recommended": False,
         "optimal_max_items": 20,
     }
+
+
+# Mutating routes reachable from loopback. `require_loopback` cannot stop a
+# remote page from POSTing to a known 127.0.0.1 URL: a "simple" cross-origin
+# request (Content-Type: text/plain carrying JSON) skips preflight, and the
+# browser still sends the real loopback Host header. Only `Origin` betrays the
+# attacker, and only `require_same_origin` inspects it.
+CSRF_GUARDED = [
+    "/stats/reset",
+    "/cache/clear",
+    "/v1/retrieve",
+    "/v1/retrieve/tool_call",
+    "/v1/telemetry/import",
+    "/admin/runtime-env",
+]
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_cross_origin_post_rejected(path: str) -> None:
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "https://attacker.example", "Content-Type": "text/plain"},
+        content="{}",
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_sandboxed_null_origin_post_rejected(path: str) -> None:
+    # A sandboxed iframe or file:// page sends the opaque literal "null".
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "null", "Content-Type": "text/plain"},
+        content="{}",
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_loopback_origin_post_allowed(path: str) -> None:
+    # The local dashboard is same-origin on loopback and must keep working.
+    resp = _loopback_client().post(
+        path,
+        headers={"Origin": "http://127.0.0.1"},
+        json={},
+    )
+    assert resp.status_code != 403, resp.text
+
+
+@pytest.mark.parametrize("path", CSRF_GUARDED)
+def test_originless_post_allowed(path: str) -> None:
+    # CLI tools and the TypeScript SDK send no Origin header at all; the guard
+    # must pass them through or it breaks every non-browser client.
+    resp = _loopback_client().post(path, json={})
+    assert resp.status_code != 403, resp.text
+
+
+def _feedback_with_query_text():
+    """A feedback singleton whose patterns carry raw agent query text."""
+
+    class FakePattern:
+        total_compressions = 8
+        total_retrievals = 2
+        retrieval_rate = 0.25
+        full_retrieval_rate = 0.1
+        search_rate = 0.5
+        common_queries = {"find the customer api key rotation runbook": 3}
+        queried_fields = {"internal_field_name": 2}
+
+    class FakeFeedback:
+        def get_stats(self):
+            return {
+                "total_compressions": 8,
+                "total_retrievals": 2,
+                "global_retrieval_rate": 0.25,
+                "tools_tracked": 1,
+                "tool_patterns": {
+                    "Grep": {
+                        "compressions": 8,
+                        "retrievals": 2,
+                        "retrieval_rate": 0.25,
+                        "full_rate": 0.1,
+                        "search_rate": 0.5,
+                        "common_queries": ["find the customer api key rotation runbook"],
+                        "queried_fields": ["internal_field_name"],
+                    }
+                },
+            }
+
+        def get_compression_hints(self, tool_name):
+            # The real implementation is annotated ``-> CompressionHints`` and
+            # always returns one, so the double must too.
+            return CompressionHints()
+
+        def get_all_patterns(self):
+            return {"Grep": FakePattern()}
+
+    return FakeFeedback()
+
+
+def test_feedback_stats_exclude_agent_query_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "headroom.proxy.server.get_compression_feedback",
+        _feedback_with_query_text,
+    )
+    response = _loopback_client().get("/v1/feedback")
+
+    assert response.status_code == 200
+    pattern = response.json()["feedback"]["tool_patterns"]["Grep"]
+    assert "common_queries" not in pattern
+    assert "queried_fields" not in pattern
+    # The aggregate counters the endpoint exists to expose still survive.
+    assert pattern["retrieval_rate"] == 0.25
+    assert "customer api key rotation" not in response.text
+
+
+def test_feedback_tool_detail_excludes_agent_query_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "headroom.proxy.server.get_compression_feedback",
+        _feedback_with_query_text,
+    )
+    response = _loopback_client().get("/v1/feedback/Grep")
+
+    assert response.status_code == 200
+    pattern = response.json()["pattern"]
+    assert "common_queries" not in pattern
+    assert "queried_fields" not in pattern
+    assert pattern["retrieval_rate"] == 0.25
+    assert "customer api key rotation" not in response.text
+    assert "internal_field_name" not in response.text
 
 
 # CCR data endpoints — cached session content, gated to 404 off-loopback (#1227).
@@ -610,3 +746,256 @@ def test_dashboard_client_cidr_does_not_expand_other_management_endpoints(
     assert client.get("/admin/upstream").status_code == 404
     assert client.get("/debug/tasks").status_code == 404
     assert client.post("/stats/reset").status_code == 404
+
+
+# ─────────────────────── read-only telemetry routes ─────────────────────────
+# These carried operator data (model/project/session labels, spend history,
+# subscription utilisation, provider quota) to any network caller. They now
+# share the /settings* trust chain: loopback or a trusted dashboard client
+# behind a gateway; everyone else sees 404. The dashboard shell is a static
+# template and stays reachable.
+
+DASHBOARD_GATED = [
+    ("get", "/stats-history"),
+    ("get", "/stats-history?format=csv"),
+    ("get", "/quota"),
+    ("get", "/subscription-window"),
+]
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_non_loopback_gets_404(method: str, path: str) -> None:
+    resp = TestClient(_make_app()).request(method, path)
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_loopback_caller_allowed(method: str, path: str) -> None:
+    resp = _loopback_client().request(method, path)
+    # /subscription-window answers 503 when tracking is off; the point here is
+    # that the *guard* let the caller through.
+    assert resp.status_code != 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_trusted_gateway_dashboard_client_allowed(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+    resp = client.request(method, path)
+    assert resp.status_code != 404, resp.text
+
+
+@pytest.mark.parametrize("method,path", DASHBOARD_GATED)
+def test_dashboard_routes_token_authenticated_operator_allowed(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str
+) -> None:
+    """With a token configured the security gate is the control: 401 without,
+    through with. Mirrors the docker-bind e2e contract (correct token → 200)."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    app = _make_app()
+    network = TestClient(app, base_url="http://headroom.svc.internal:8787", client=("10.10.0.7", 1))
+    assert network.request(method, path).status_code == 401
+    wrong = network.request(method, path, headers={"Authorization": "Bearer wrong"})
+    assert wrong.status_code == 401
+    ok = network.request(method, path, headers={"Authorization": "Bearer s3cr3t-token"})
+    assert ok.status_code not in (401, 404), ok.text
+
+
+@pytest.mark.parametrize("path", ["/stats-history", "/quota", "/metrics"])
+def test_token_does_not_exempt_a_loopback_peer_from_the_host_check(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The gate waves loopback peers through without a token, so a configured
+    token must not short-cut the DNS-rebinding defence for them."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    app = _make_app()
+    local = TestClient(app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 1))
+    assert local.get(path).status_code != 404
+    rebound = TestClient(app, base_url="http://attacker.example", client=("127.0.0.1", 1))
+    assert rebound.get(path).status_code == 404
+
+
+def test_dashboard_shell_is_not_gated() -> None:
+    """Static template, no operator data: a container published on host loopback
+    (peer = bridge gateway, Host = localhost) must still load it."""
+    client = TestClient(_make_app(), base_url="http://localhost:8787", client=("172.17.0.1", 1))
+    assert client.get("/dashboard").status_code == 200
+    assert client.get("/stats-history").status_code == 404
+
+
+def _acknowledged_container_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """A token-less 0.0.0.0 bind acknowledged as published on host loopback,
+    running in a container whose bridge gateway is 172.17.0.1."""
+    monkeypatch.setenv("HEADROOM_ALLOW_UNAUTHENTICATED_BIND", "1")
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    return create_app(
+        ProxyConfig(
+            host="0.0.0.0",
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+    )
+
+
+@pytest.mark.parametrize("path", ["/stats-history", "/quota", "/subscription-window"])
+def test_loopback_published_container_serves_dashboard_data_to_its_host(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Host browser -> 127.0.0.1 publication -> container sees the bridge gateway."""
+    app = _acknowledged_container_app(monkeypatch)
+    host = TestClient(app, base_url="http://localhost:8787", client=("172.17.0.1", 1))
+    assert host.get(path).status_code != 404
+
+
+@pytest.mark.parametrize(
+    "client,base_url,headers",
+    [
+        # Another container on the same bridge is not the host.
+        (("172.17.0.5", 1), "http://127.0.0.1:8787", {}),
+        # The trust is the TCP peer; a forwarded header naming the gateway is ignored.
+        (("172.17.0.5", 1), "http://127.0.0.1:8787", {"X-Forwarded-For": "172.17.0.1"}),
+        # The DNS-rebinding defence still applies to the gateway peer.
+        (("172.17.0.1", 1), "http://attacker.example:8787", {}),
+    ],
+)
+def test_loopback_published_container_trust_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    client: tuple[str, int],
+    base_url: str,
+    headers: dict[str, str],
+) -> None:
+    app = _acknowledged_container_app(monkeypatch)
+    resp = TestClient(app, base_url=base_url, client=client).get("/stats-history", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_container_gateway_needs_the_open_bind_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the launcher's acknowledgement nothing vouches for the publication."""
+    monkeypatch.setenv("HEADROOM_CONTAINER_HOST_GATEWAY", "172.17.0.1")
+    client = TestClient(_make_app(), base_url="http://localhost:8787", client=("172.17.0.1", 1))
+    assert client.get("/stats-history").status_code == 404
+
+
+def test_stats_history_csv_export_not_served_to_network_callers() -> None:
+    """The CSV export is the whole spend/model/session history in one GET."""
+    resp = TestClient(_make_app()).get("/stats-history", params={"format": "csv"})
+    assert resp.status_code == 404
+    assert "text/csv" not in resp.headers.get("content-type", "")
+
+
+# ─────────────────────────────── /metrics ───────────────────────────────────
+# A Prometheus target: it cannot demand the dashboard's IP-literal Host header,
+# but it must not be a free read for every network peer either.
+
+
+def test_metrics_non_loopback_gets_404_without_token_or_cidr() -> None:
+    resp = TestClient(_make_app()).get("/metrics")
+    assert resp.status_code == 404, resp.text
+
+
+def test_metrics_loopback_allowed() -> None:
+    resp = _loopback_client().get("/metrics")
+    assert resp.status_code == 200, resp.text
+    assert "text/plain" in resp.headers["content-type"]
+
+
+def test_metrics_trusted_gateway_cidr_scraper_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scraper inside HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS with a hostname Host."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_trusted_dashboard_cidr_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS", "100.90.0.5/32")
+    client = TestClient(
+        _make_app(),
+        base_url="http://100.82.0.2:8787",
+        client=("100.90.0.5", 12345),
+    )
+    assert client.get("/metrics").status_code == 200
+
+
+def test_metrics_trusted_cidr_peer_outside_range_still_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.10.0.7", 40000),
+    )
+    assert client.get("/metrics").status_code == 404
+
+
+def test_metrics_trusted_gateway_forwarding_an_outside_scraper_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway CIDRs vouch for the connecting peer, not the forwarded scraper."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"X-Forwarded-For": "192.0.2.8"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_metrics_forwarded_gateway_address_from_untrusted_peer_404s(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming a gateway-CIDR address in X-Forwarded-For grants nothing."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.10.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"X-Forwarded-For": "10.9.0.7"})
+    assert resp.status_code == 404
+
+
+def test_metrics_trusted_cidr_cross_origin_browser_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser provenance from another origin is refused even from a trusted peer."""
+    monkeypatch.setenv("HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS", "10.9.0.0/24")
+    client = TestClient(
+        _make_app(),
+        base_url="http://headroom.svc.internal:8787",
+        client=("10.9.0.7", 40000),
+    )
+    resp = client.get("/metrics", headers={"Origin": "http://attacker.example"})
+    assert resp.status_code == 404
+
+
+def test_metrics_token_authenticated_network_caller_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a token configured the security gate is the control; /metrics defers to it."""
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "s3cr3t-token")
+    app = _make_app()
+    network = TestClient(app, base_url="http://headroom.svc.internal:8787", client=("10.10.0.7", 1))
+    assert network.get("/metrics").status_code == 401
+    ok = network.get("/metrics", headers={"Authorization": "Bearer s3cr3t-token"})
+    assert ok.status_code == 200, ok.text

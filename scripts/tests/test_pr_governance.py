@@ -19,11 +19,21 @@ def _load_module():
     return module
 
 
-def _event(body: str, *, draft: bool = False, login: str = "octocat") -> dict[str, object]:
+def _event(
+    body: str,
+    *,
+    draft: bool = False,
+    login: str = "octocat",
+    title: str = "feat(governance): add a required PR-governance gate",
+) -> dict[str, object]:
+    # A real `pull_request` payload always carries a title, and squash-merge
+    # turns it into the commit subject on main, so the default here is a valid
+    # Conventional Commit. Tests that exercise the title rule pass their own.
     return {
         "pull_request": {
             "number": 42,
             "draft": draft,
+            "title": title,
             "body": body,
             "user": {"login": login},
         }
@@ -233,3 +243,71 @@ def test_validate_pull_request_skips_bot_authored_prs() -> None:
     assert report.is_bot_pr is True
     assert report.needs_author_action is False
     assert report.labels_to_add == []
+
+
+def test_validate_pull_request_rejects_non_conventional_title() -> None:
+    """The exact title that stalled release-please on v0.35.0 must be caught.
+
+    `Unify savings attribution ...` squash-merged to main as commit 31452426.
+    release-please could not parse it (`unexpected token ' ' at 1:6`), so the
+    change never reached a changelog. commitlint passed the PR because it lints
+    the commits inside it, not the title that replaces them on squash-merge.
+    """
+    module = _load_module()
+    report = module.validate_pull_request(
+        _event(
+            VALID_BODY, title="Unify savings attribution across stats, perf, metrics, and dashboard"
+        )
+    )
+
+    assert report.valid is False
+    assert any("Conventional Commit" in problem for problem in report.problems)
+
+
+def test_validate_pull_request_accepts_conventional_titles() -> None:
+    module = _load_module()
+    for title in (
+        "fix(proxy): keep prefixed core tools resident",
+        "deps: bump sha2 from 0.10.9 to 0.11.0",
+        "chore: release main",
+        "feat!: drop python 3.10",
+        "fix(proxy/anthropic): stop replaying the recorded prefix",
+    ):
+        report = module.validate_pull_request(_event(VALID_BODY, title=title))
+        assert report.valid is True, (title, report.problems)
+
+
+def test_validate_pull_request_rejects_empty_and_typeless_titles() -> None:
+    module = _load_module()
+    for title in ("", "   ", "WIP", "fix:", "Fix(proxy): capitalised type", "update stuff"):
+        report = module.validate_pull_request(_event(VALID_BODY, title=title))
+        assert report.valid is False, title
+        assert any("Conventional Commit" in problem for problem in report.problems), title
+
+
+def test_bot_authored_prs_skip_title_enforcement() -> None:
+    """Dependabot/release-please titles are already conventional; don't gate them."""
+    module = _load_module()
+    report = module.validate_pull_request(
+        _event("", login="dependabot[bot]", title="Bump sha2 from 0.10.9 to 0.11.0")
+    )
+
+    assert report.is_bot_pr is True
+    assert report.valid is True
+
+
+def test_commit_types_match_commitlint_config() -> None:
+    """The gate and commitlint must accept the same type vocabulary.
+
+    They enforce the same rule at two points in the lifecycle -- commitlint on
+    the PR's commits, this on the title that squash-merge substitutes for them.
+    Divergence would let a title through that the commit hook rejects, or vice
+    versa.
+    """
+    module = _load_module()
+    config = json.loads(
+        (Path(__file__).parent.parent.parent / ".commitlintrc.json").read_text(encoding="utf-8")
+    )
+    _level, _applicable, allowed = config["rules"]["type-enum"]
+
+    assert sorted(module.COMMIT_TYPES) == sorted(allowed)

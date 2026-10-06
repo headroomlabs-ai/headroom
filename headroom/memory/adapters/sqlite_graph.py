@@ -13,7 +13,9 @@ This is a drop-in replacement for InMemoryGraphStore that:
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import sqlite3
 from collections import deque
 from datetime import datetime
@@ -21,10 +23,15 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from .graph_models import Entity, Relationship, RelationshipDirection, Subgraph
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from ..tracker import ComponentStats
+
+logger = logging.getLogger(__name__)
 
 
 class SQLiteGraphStore:
@@ -81,18 +88,18 @@ class SQLiteGraphStore:
         if initialize:
             self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
         """Get a new database connection (thread-safe pattern).
 
-        Returns:
-            A new SQLite connection with row factory configured.
+        Commits on clean exit, rolls back on exception, and always closes
+        the connection -- callers use ``with self._get_conn() as conn:``.
         """
-        target = (
-            f"{self.db_path.expanduser().resolve().as_uri()}?mode=ro"
-            if self._read_only
-            else str(self.db_path)
-        )
-        conn = sqlite3.connect(target, uri=self._read_only)
+        if self._read_only:
+            target = f"{self.db_path.expanduser().resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(target, uri=True)
+        else:
+            conn = connect_private_sqlite(self.db_path, what="memory graph store")
         conn.row_factory = sqlite3.Row
 
         # Configure page cache size (negative = KB, positive = pages)
@@ -102,7 +109,11 @@ class SQLiteGraphStore:
         # Enable foreign keys
         conn.execute("PRAGMA foreign_keys = ON")
 
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize the database schema with indexes."""
@@ -180,19 +191,31 @@ class SQLiteGraphStore:
             "metadata": json.dumps(entity.metadata),
         }
 
-    def _row_to_entity(self, row: sqlite3.Row) -> Entity:
-        """Convert database row to Entity object."""
-        return Entity(
-            id=row["id"],
-            user_id=row["user_id"],
-            name=row["name"],
-            entity_type=row["entity_type"],
-            description=row["description"],
-            properties=json.loads(row["properties"]),
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-            metadata=json.loads(row["metadata"]),
-        )
+    def _row_to_entity(self, row: sqlite3.Row) -> Entity | None:
+        """Convert a database row to an Entity, or None if the row is corrupt.
+
+        ``properties``/``metadata`` (JSON) and ``created_at``/``updated_at``
+        (ISO timestamps) are parsed from stored text. A single unparseable row —
+        from a partial write, a manual edit, or a bad migration — must not abort
+        an entire multi-row scan (``query_subgraph``, neighbour expansion): one
+        corrupt edge would otherwise make an unrelated part of the graph
+        unqueryable. Skip the bad row instead.
+        """
+        try:
+            return Entity(
+                id=row["id"],
+                user_id=row["user_id"],
+                name=row["name"],
+                entity_type=row["entity_type"],
+                description=row["description"],
+                properties=json.loads(row["properties"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                metadata=json.loads(row["metadata"]),
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("skipping corrupt entity row %r: %s", row["id"], exc)
+            return None
 
     def _relationship_to_row(self, relationship: Relationship) -> dict[str, Any]:
         """Convert Relationship object to row dict for insertion."""
@@ -208,19 +231,29 @@ class SQLiteGraphStore:
             "metadata": json.dumps(relationship.metadata),
         }
 
-    def _row_to_relationship(self, row: sqlite3.Row) -> Relationship:
-        """Convert database row to Relationship object."""
-        return Relationship(
-            id=row["id"],
-            user_id=row["user_id"],
-            source_id=row["source_id"],
-            target_id=row["target_id"],
-            relation_type=row["relation_type"],
-            weight=row["weight"],
-            properties=json.loads(row["properties"]),
-            created_at=datetime.fromisoformat(row["created_at"]),
-            metadata=json.loads(row["metadata"]),
-        )
+    def _row_to_relationship(self, row: sqlite3.Row) -> Relationship | None:
+        """Convert a database row to a Relationship, or None if the row is corrupt.
+
+        Same contract as :meth:`_row_to_entity`: a single unparseable relationship
+        row (bad ``properties``/``metadata`` JSON or ``created_at`` timestamp) must
+        not abort a whole ``get_relationships`` / ``query_subgraph`` scan and take
+        unrelated edges down with it. Skip the bad row instead.
+        """
+        try:
+            return Relationship(
+                id=row["id"],
+                user_id=row["user_id"],
+                source_id=row["source_id"],
+                target_id=row["target_id"],
+                relation_type=row["relation_type"],
+                weight=row["weight"],
+                properties=json.loads(row["properties"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                metadata=json.loads(row["metadata"]),
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            logger.warning("skipping corrupt relationship row %r: %s", row["id"], exc)
+            return None
 
     # =========================================================================
     # Entity Operations
@@ -388,7 +421,9 @@ class SQLiteGraphStore:
                     params,
                 )
 
-                return [self._row_to_relationship(row) for row in cursor]
+                return [
+                    rel for row in cursor if (rel := self._row_to_relationship(row)) is not None
+                ]
 
     async def delete_relationship(self, relationship_id: str) -> bool:
         """Delete a single relationship.
@@ -451,9 +486,12 @@ class SQLiteGraphStore:
                     )
                     row = cursor.fetchone()
                     if row is not None:
+                        entity = self._row_to_entity(row)
+                        if entity is None:
+                            continue
                         queue.append((entity_id, 0))
                         visited.add(entity_id)
-                        collected_entities[entity_id] = self._row_to_entity(row)
+                        collected_entities[entity_id] = entity
 
                 # BFS traversal
                 while queue:
@@ -470,8 +508,14 @@ class SQLiteGraphStore:
                         rel_query = "SELECT * FROM relationships WHERE target_id = ?"
                         rel_params = [current_id]
                     else:  # BOTH
+                        # The OR must be parenthesized: a later ``AND relation_type
+                        # IN (...)`` binds tighter than ``OR`` in SQL, so without
+                        # the parens the type filter would apply only to the
+                        # ``target_id`` (incoming) side, letting outgoing edges of
+                        # every type leak into the subgraph. (``get_relationships``
+                        # already groups this correctly.)
                         rel_query = (
-                            "SELECT * FROM relationships WHERE source_id = ? OR target_id = ?"
+                            "SELECT * FROM relationships WHERE (source_id = ? OR target_id = ?)"
                         )
                         rel_params = [current_id, current_id]
 
@@ -485,6 +529,8 @@ class SQLiteGraphStore:
 
                     for rel_row in cursor:
                         rel = self._row_to_relationship(rel_row)
+                        if rel is None:
+                            continue
 
                         # Add relationship
                         collected_relationships[rel.id] = rel
@@ -511,8 +557,11 @@ class SQLiteGraphStore:
                             )
                             neighbor_row = neighbor_cursor.fetchone()
                             if neighbor_row is not None:
+                                neighbor = self._row_to_entity(neighbor_row)
+                                if neighbor is None:
+                                    continue
                                 visited.add(neighbor_id)
-                                collected_entities[neighbor_id] = self._row_to_entity(neighbor_row)
+                                collected_entities[neighbor_id] = neighbor
                                 queue.append((neighbor_id, depth + 1))
 
                 return Subgraph(
@@ -666,7 +715,9 @@ class SQLiteGraphStore:
                     "SELECT * FROM entities WHERE user_id = ?",
                     (user_id,),
                 )
-                return [self._row_to_entity(row) for row in cursor]
+                return [
+                    entity for row in cursor if (entity := self._row_to_entity(row)) is not None
+                ]
 
     async def get_relationships_for_user(self, user_id: str) -> list[Relationship]:
         """Get all relationships for a user.
