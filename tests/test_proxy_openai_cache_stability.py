@@ -20,7 +20,6 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from headroom.backends.base import BackendResponse
 from headroom.observability import HeadroomOtelMetrics, reset_otel_metrics, set_otel_metrics
-from headroom.proxy.handlers.openai import _openai_rate_limit_key
 from headroom.proxy.server import ProxyConfig, create_app
 from tests.test_observability_metrics import _collect_metrics
 
@@ -1287,6 +1286,12 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
     # The flood hosts are unresolvable on purpose; without this stub the SSRF
     # guard would drop the override and relabel the flood as "openai".
     monkeypatch.setattr("headroom.proxy.handlers.openai.is_safe_upstream_url", lambda url: True)
+    # Bucket by the raw credential so the stub limiter below can refuse just
+    # ``limited_auth``; the identity rule itself is covered by its own tests.
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai.rate_limit_identity",
+        lambda request, headers: headers.get("authorization", ""),
+    )
     # Isolated sinks: a fresh lifetime store and workspace, so the exact
     # counts below are this test's traffic and nothing reaches ~/.headroom.
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
@@ -1298,7 +1303,7 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
         """Headroom's own limiter, refusing only ``limited_auth``."""
 
         async def check_request(self, key: str = "default") -> tuple[bool, float]:
-            return key != _openai_rate_limit_key({"authorization": limited_auth}), 1.0
+            return key != limited_auth, 1.0
 
         async def check_tokens(self, key: str, tokens: int) -> tuple[bool, float]:
             return True, 0.0
@@ -1374,7 +1379,11 @@ def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(
             assert lifetime["rate_limited_by_source"] == {"headroom": 250, "upstream": 250}
 
             # Prometheus export: every provider series is from the fixed set.
-            export = client.get("/metrics").text
+            # /metrics is an operator route: read it as the local operator does.
+            operator = TestClient(
+                client.app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+            )
+            export = operator.get("/metrics").text
             assert set(re.findall(r'provider="([^"]+)"', export)) <= fixed_providers | {"unknown"}
             assert 'headroom_requests_by_provider{provider="zai"} 10' in export
             assert 'headroom_requests_by_provider{provider="custom"} 250' in export

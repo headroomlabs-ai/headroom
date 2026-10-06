@@ -133,6 +133,7 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_rate_limit: bool = False,
     no_http2: bool = False,
     code_aware: bool | None = None,
     intercept_tool_results: bool = False,
@@ -154,7 +155,11 @@ def build_manifest(
     if sys.platform.startswith("win") and preset == InstallPreset.PERSISTENT_SERVICE.value:
         effective_preset = InstallPreset.PERSISTENT_TASK.value
 
-    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+    if runtime_kind == RuntimeKind.DOCKER.value:
+        # Docker owns its container lifecycle; never install a native service
+        # or task alongside it when callers combine runtime and preset flags.
+        supervisor_kind = SupervisorKind.NONE.value
+    elif effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
         supervisor_kind = SupervisorKind.SERVICE.value
     elif effective_preset == InstallPreset.PERSISTENT_TASK.value:
         supervisor_kind = SupervisorKind.TASK.value
@@ -225,12 +230,21 @@ def build_manifest(
         "127.0.0.1",
         "--port",
         str(port),
+        "--headroom-deployment-profile",
+        normalized_profile,
+        "--headroom-deployment-runtime",
+        runtime_kind,
         "--mode",
         proxy_mode,
         "--backend",
         backend,
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
+    # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
+    # Persist the flag so reinstalls don't silently reintroduce throttling.
+    # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)
+    if no_rate_limit:
+        proxy_args.append("--no-rate-limit")
     if memory_enabled:
         proxy_args.append("--memory")
         # `_paths.memory_db_path()` resolves against the HOST home. A container
