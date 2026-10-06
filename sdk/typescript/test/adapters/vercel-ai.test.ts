@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { LanguageModelV3 } from "@ai-sdk/provider";
 import {
   headroomMiddleware,
   compressVercelMessages,
@@ -171,6 +172,39 @@ describe("compressVercelMessages", () => {
     expect(result.messages[1].role).toBe("user");
     expect(result.messages[1].content[0].type).toBe("text");
   });
+
+  it("keeps tool names on tool-result parts after compression", async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockCompressResponse([
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_1", type: "function", function: { name: "getWeather", arguments: '{"city":"Paris"}' } },
+          ],
+        },
+        { role: "tool", content: '{"tempC":21}', tool_call_id: "call_1" },
+      ]),
+    );
+
+    const result = await compressVercelMessages(
+      [
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "call_1", toolName: "getWeather", input: { city: "Paris" } }],
+        },
+        {
+          role: "tool",
+          content: [
+            { type: "tool-result", toolCallId: "call_1", toolName: "getWeather", output: { type: "json", value: { tempC: 21 } } },
+          ],
+        },
+      ],
+      { model: "gpt-4o", baseUrl: "http://localhost:8787" },
+    );
+
+    expect(result.messages[1].content[0].toolName).toBe("getWeather");
+  });
 });
 
 describe("withHeadroom", () => {
@@ -178,7 +212,7 @@ describe("withHeadroom", () => {
     mockFetch.mockReset();
   });
 
-  it("returns a LanguageModelV3 with correct provider and modelId", () => {
+  it("returns a LanguageModelV4 with correct provider and modelId", () => {
     const fakeModel = {
       specificationVersion: "v3" as const,
       provider: "openai",
@@ -192,7 +226,7 @@ describe("withHeadroom", () => {
       baseUrl: "http://localhost:8787",
     });
 
-    expect(wrapped.specificationVersion).toBe("v3");
+    expect(wrapped.specificationVersion).toBe("v4");
     expect(wrapped.modelId).toBe("gpt-4o");
     expect(wrapped.provider).toBe("openai");
   });
@@ -207,12 +241,17 @@ describe("withHeadroom", () => {
       provider: "test-provider",
       modelId: "test-model",
       supportedUrls: {},
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "response",
-        usage: { promptTokens: 10, completionTokens: 5 },
-        finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
-      }),
+        content: [{ type: "text", text: "response" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 5, text: 5, reasoning: undefined },
+        },
+        warnings: [],
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 
@@ -244,12 +283,17 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "ok",
-        usage: { promptTokens: 5, completionTokens: 3 },
-        finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
-      }),
+        content: [{ type: "text", text: "ok" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 5, noCache: 5, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 3, text: 3, reasoning: undefined },
+        },
+        warnings: [],
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 
@@ -278,12 +322,17 @@ describe("withHeadroom", () => {
       provider: "test",
       modelId: "test-model",
       supportedUrls: {},
+      // A real LanguageModelV3 result (type-checked below): `ai` >= 7.0.119 wraps v3 models
+      // in a v4 adapter that maps over `content` and forwards the rest unchanged.
       doGenerate: vi.fn().mockResolvedValue({
-        text: "ok",
-        usage: { promptTokens: 5, completionTokens: 3 },
-        finishReason: "stop",
-        rawCall: { rawPrompt: null, rawSettings: {} },
-      }),
+        content: [{ type: "text", text: "ok" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 5, noCache: 5, cacheRead: undefined, cacheWrite: undefined },
+          outputTokens: { total: 3, text: 3, reasoning: undefined },
+        },
+        warnings: [],
+      } satisfies Awaited<ReturnType<LanguageModelV3["doGenerate"]>>),
       doStream: vi.fn(),
     };
 

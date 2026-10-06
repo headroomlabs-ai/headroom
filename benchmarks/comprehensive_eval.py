@@ -41,7 +41,9 @@ def load_bfcl_samples(n: int = 20) -> list[dict]:
             "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
             "BFCL_v3_live_simple",
             split="train",
-            trust_remote_code=True,
+            # BFCL is plain parquet; never execute a dataset repository's own
+            # loading script, here or anywhere else in the tree.
+            trust_remote_code=False,
         )
 
         samples = []
