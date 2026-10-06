@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import time
 
 import pytest
@@ -100,6 +101,38 @@ def test_fetch_latest_version_network_error_returns_none(monkeypatch):
 
     monkeypatch.setattr(uc.urllib.request, "urlopen", _boom)
     assert uc.fetch_latest_version() is None
+
+
+def test_fetch_latest_version_uses_headroom_trust_policy(monkeypatch):
+    """The PyPI probe must use the same verifying trust policy as other egress."""
+    from headroom.proxy import ssl_context
+
+    context = ssl.create_default_context()
+    monkeypatch.setattr(ssl_context, "build_urlopen_context", lambda: context)
+    payload = json.dumps({"info": {"version": "0.39.1"}}).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return payload
+
+    def urlopen(request, *, timeout, context=None):
+        if context is not expected_context:
+            raise ssl.SSLCertVerificationError("interpreter trust store has no CA bundle")
+        assert timeout == 4.0
+        return Response()
+
+    expected_context = context
+    monkeypatch.setattr(uc.urllib.request, "urlopen", urlopen)
+
+    assert uc.fetch_latest_version() == "0.39.1"
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
 
 
 # --------------------------------------------------------------------------- #

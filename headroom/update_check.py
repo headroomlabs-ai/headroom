@@ -191,13 +191,19 @@ def fetch_latest_version(*, allow_pre: bool = False, timeout: float = 4.0) -> st
     """Query the PyPI JSON API for the latest release. Returns None on any error.
 
     Uses ``urllib`` (stdlib) so the base CLI install needs no HTTP dependency.
+    Resolves Headroom's TLS trust policy explicitly, including bundled CAs
+    when the interpreter has no usable trust store.
     """
     try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+
         req = urllib.request.Request(
             _PYPI_JSON_URL,
             headers={"Accept": "application/json", "User-Agent": "headroom-update-check"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed https URL
+        with urllib.request.urlopen(  # noqa: S310 — fixed https URL
+            req, timeout=timeout, context=build_urlopen_context()
+        ) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return _select_latest(data, allow_pre=allow_pre)
     except Exception:
