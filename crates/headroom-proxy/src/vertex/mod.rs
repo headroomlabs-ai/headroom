@@ -121,6 +121,33 @@ pub async fn handle_vertex_predict_dispatch(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // The upstream URL is built from the raw request path (which
+    // `crate::upstream_path` already refuses to normalise), but the
+    // decoded parameters are logged, labelled and handed to the
+    // envelope logic. Reject the shapes that could only mean a
+    // traversal attempt (`..`, empty, control characters) before any of
+    // that happens, so a later refactor that interpolates these values
+    // cannot reopen the hole.
+    for (name, value) in [
+        ("project", project.as_str()),
+        ("location", location.as_str()),
+        ("model_action", model_action.as_str()),
+    ] {
+        if let Err(e) = crate::upstream_path::validate_segment(value) {
+            tracing::warn!(
+                event = "vertex_path_rejected",
+                request_id = %request_id,
+                segment = name,
+                error = %e,
+                "vertex path parameter would rewrite the upstream path; refusing"
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("vertex path: {name} rejected: {e}")))
+                .expect("static");
+        }
+    }
+
     let (model_id, verb_str) = match split_model_action(&model_action) {
         Some(parts) => parts,
         None => {

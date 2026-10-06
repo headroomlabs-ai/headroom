@@ -9,7 +9,8 @@
     # Cloud mode (managed CCR, TOIN, analytics via Headroom Cloud):
     litellm.callbacks = [HeadroomCallback(api_key="hdr_xxx")]
 
-Works with LiteLLM's completion(), acompletion(), and proxy modes.
+Works with LiteLLM's completion(), acompletion(), the Anthropic Messages
+proxy routes (/v1/messages), and proxy modes.
 Cloud mode requires httpx: pip install httpx
 """
 
@@ -18,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +125,16 @@ class HeadroomCallback(_CustomLogger):
         if data is None:
             return None
 
-        if call_type not in ("completion", "acompletion"):
+        # LiteLLM's proxy maps the Anthropic Messages API routes to their own
+        # call types (CallTypes.anthropic_messages for /v1/messages and
+        # /anthropic/v1/messages, plus the async twin), and the payload still
+        # carries "messages" in Anthropic format, which compress() handles.
+        if call_type not in (
+            "completion",
+            "acompletion",
+            "anthropic_messages",
+            "aanthropic_messages",
+        ):
             return data
 
         messages = data.get("messages", [])
@@ -174,7 +186,18 @@ class HeadroomCallback(_CustomLogger):
         }
 
     async def _cloud_compress(self, messages: list[dict], model: str) -> dict[str, Any] | None:
-        """Compress via Headroom Cloud API (managed CCR, TOIN, analytics)."""
+        """Compress via Headroom Cloud API (managed CCR, TOIN, analytics).
+
+        This is the one path in this file that puts the caller's prompt
+        content on the wire to a Headroom-operated host, so it is exactly what
+        HEADROOM_OFFLINE exists to stop. "Opt-in by configuration" was the old
+        reason for leaving it open, and it is not good enough: an operator who
+        sets an air-gap switch is overriding earlier configuration on purpose.
+        The refusal is loud rather than a silent fall-through to local
+        compression, because silently compressing locally would hide the fact
+        that the deployment is no longer doing what it was configured to do.
+        """
+        guard_egress("Headroom Cloud compression", self._api_url)
         if self._client is None:
             try:
                 import httpx

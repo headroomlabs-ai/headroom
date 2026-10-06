@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +18,115 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     import tomli as tomllib  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_release_slack_payload_reports_the_completed_github_release(tmp_path: Path) -> None:
+    """A release notification must identify the exact published artifact boundary."""
+    output = tmp_path / "payload.json"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "actions" / "release-slack-notification" / "build_payload.py"),
+            "--release-name",
+            "Headroom 1.2.3",
+            "--tag",
+            "v1.2.3",
+            "--url",
+            "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3",
+            "--repository",
+            "headroomlabs-ai/headroom",
+            "--actor",
+            "release<bot>",
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["text"] == (
+        "Headroom 1.2.3 (v1.2.3) GitHub Release assets are ready: "
+        "https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3"
+    )
+    assert payload["blocks"] == [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Headroom 1.2.3 is ready", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": "*Tag*\n`v1.2.3`"},
+                {"type": "mrkdwn", "text": "*Repository*\n`headroomlabs-ai/headroom`"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "GitHub Release assets are ready. "
+                    "<https://github.com/headroomlabs-ai/headroom/releases/tag/v1.2.3|"
+                    "View release notes and downloads>"
+                ),
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": "Published by `release&lt;bot&gt;` after the release asset job completed.",
+                }
+            ],
+        },
+    ]
+
+
+def test_release_workflow_notifies_slack_only_after_github_release_assets_are_ready() -> None:
+    """PR/manual runs and failed asset publication must never reach Slack delivery."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["notify-release"]
+
+    assert job["needs"] == "create-release"
+    condition = str(job["if"])
+    assert "github.event_name == 'release'" in condition
+    assert "github.event.action == 'published'" in condition
+    assert "needs.create-release.result == 'success'" in condition
+
+    notify_step = next(
+        step
+        for step in job["steps"]
+        if step.get("uses") == "./.github/actions/release-slack-notification"
+    )
+    assert notify_step["with"]["url"] == "${{ github.event.release.html_url }}"
+    assert notify_step["with"]["tag"] == "${{ github.event.release.tag_name }}"
+    assert notify_step["with"]["webhook-url"] == "${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}"
+
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "release-slack-notification" / "action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    build_step = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Build Slack release payload"
+    )
+    assert "build_payload.py" in build_step["run"]
+    assert build_step["env"]["RELEASE_URL"] == "${{ inputs.url }}"
+
+    post_step = next(
+        step for step in action["runs"]["steps"] if step.get("name") == "Post release to Slack"
+    )
+    assert str(post_step["if"]) == "${{ !env.ACT }}"
+    assert post_step["env"] == {"SLACK_RELEASES_WEBHOOK_URL": "${{ inputs.webhook-url }}"}
+    assert '--data-binary @"$RUNNER_TEMP/slack-release-payload.json"' in post_step["run"]
+    assert "--fail-with-body" in post_step["run"]
+    assert "webhook-url" not in str(build_step)
 
 
 def test_every_published_docker_variant_includes_bedrock_auth_dependencies() -> None:
@@ -70,6 +183,68 @@ def test_docker_workflow_normalizes_repository_name_for_signing() -> None:
     assert "steps.image-name.outputs.image_name" in content
 
 
+def test_docker_bake_metadata_never_travels_through_env() -> None:
+    """Bake metadata must reach scripts through a file, never through ``env:``.
+
+    The runner exports every ``env:`` entry when it spawns bash, and bake
+    metadata for the larger targets exceeds the kernel's per-string limit, so
+    the step dies with "Argument list too long" before its script runs.
+    f3d5392c fixed this by piping the JSON through a heredoc file; the arm64
+    rework (ed36676c) reintroduced an unused ``env: BAKE_METADATA`` beside that
+    heredoc, and every build job of a Docker run can fail on it again.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+
+    offenders = [
+        f"{job_name} / {step.get('name', step.get('id'))} / {key}"
+        for job_name, job in workflow["jobs"].items()
+        for step in job.get("steps", [])
+        for key, value in (step.get("env") or {}).items()
+        if "outputs.metadata" in str(value)
+    ]
+    assert not offenders, f"bake metadata passed via env (E2BIG risk): {offenders}"
+
+    export = next(
+        step
+        for step in workflow["jobs"]["docker-build"]["steps"]
+        if step.get("name") == "Export digest"
+    )
+    assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
+    assert (
+        "${{ steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata }}"
+        in export["run"]
+    )
+
+
+def test_docker_build_cache_failures_are_best_effort() -> None:
+    """A missing remote cache blob must not block publishing an image."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    build_steps = workflow["jobs"]["docker-build"]["steps"]
+    cached = next(step for step in build_steps if step.get("id") == "bake")
+    fallback_builder = next(step for step in build_steps if step.get("id") == "fallback-buildx")
+    fallback = next(step for step in build_steps if step.get("id") == "bake-fallback")
+    digest = next(step for step in build_steps if step.get("id") == "digest")
+
+    cached_overrides = cached["with"]["set"].splitlines()
+    fallback_overrides = fallback["with"]["set"].splitlines()
+    cache_to = next(line for line in cached_overrides if ".cache-to=" in line)
+
+    assert cached["continue-on-error"] is True
+    assert "ignore-error=true" in cache_to
+    assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback["uses"] == cached["uses"]
+    assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
+    assert fallback["with"]["no-cache"] is True
+    assert not any(".cache-from=" in line for line in fallback_overrides)
+    assert not any(".cache-to=" in line for line in fallback_overrides)
+    assert (
+        "steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata"
+        in digest["run"]
+    )
+
+
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
     jobs = workflow["jobs"]
@@ -102,7 +277,8 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
-    assert manifest["if"] == "${{ always() }}"
+    # Publishing requires every architecture's digest, including after cancellation.
+    assert manifest["if"] == "${{ success() }}"
     step_names = [step["name"] for step in manifest["steps"]]
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
@@ -118,6 +294,51 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     guard_start = manifest_script.index('"${digest_count}" -ne 2')
     create_start = manifest_script.index("docker buildx imagetools create")
     assert guard_start < manifest_script.index("exit 1", guard_start) < create_start
+
+
+def test_only_the_root_cell_can_ever_publish_a_bare_latest_tag() -> None:
+    """`:latest` must have exactly one writer (#3150).
+
+    The sibling test above proves the *promotion step* is owned by the root
+    cell. That was never the whole contract: it checked the intended writer
+    and not the absence of unintended ones.
+
+    ``docker/metadata-action`` defaults to ``latest=auto``, which appends a
+    bare ``latest`` for any semver release. Its own log line reads
+    ``suffixLatest=false`` — the per-tag ``suffix=`` that keeps every other
+    tag variant-scoped does not reach it. So all eight variant cells emitted
+    ``ghcr.io/.../headroom:latest`` and the last to finish won the tag. At
+    0.36.0 that was ``code-slim``: ``:latest`` resolved to the distroless
+    build, whose ``import onnxruntime`` segfaults on arm64, and
+    ``headroom deploy`` crash-looped on Apple Silicon with SIGSEGV.
+
+    Two things hold the line, and both are asserted here: ``latest=false``
+    stops the tag being generated at all, and a runtime guard refuses to
+    publish if a suffixed variant ever carries one anyway.
+    """
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    manifest = workflow["jobs"]["docker-manifest"]
+
+    meta = next(step for step in manifest["steps"] if step.get("id") == "meta")
+    flavor = meta["with"].get("flavor", "")
+    assert "latest=false" in flavor, (
+        "docker/metadata-action defaults to latest=auto; without latest=false "
+        "every variant cell publishes a bare :latest and the last one wins"
+    )
+
+    # No tag rule may reintroduce it explicitly either.
+    assert "value=latest" not in meta["with"]["tags"]
+
+    create = next(
+        step for step in manifest["steps"] if step["name"] == "Create multi-arch manifest"
+    )
+    script = create["run"]
+    # The guard reads the variant name from env, never spliced inline.
+    assert create["env"].get("VARIANT_NAME") == "${{ matrix.variant.name }}"
+    assert 'endswith(":latest")' in script
+    assert script.index('endswith(":latest")') < script.index("docker buildx imagetools create"), (
+        "the bare-latest guard must run before anything is pushed"
+    )
 
 
 def test_docker_manifest_downloads_exactly_one_artifact_per_architecture() -> None:
@@ -294,23 +515,35 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     import subprocess
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        # Same environment gates as the openssl-sys dual above: a cargo
+        # failure that is not "package did not match" means the Linux wheel
+        # target is unavailable here, not that native-tls came back.
         not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
+        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
+            result.stderr + result.stdout
+        ):
+            pytest.skip(
+                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+            )
         assert not_in_tree, (
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
@@ -758,7 +991,11 @@ def test_openclaw_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
@@ -771,7 +1008,11 @@ def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_python_release_smoke_imports_installed_wheel_outside_source_tree() -> None:
@@ -865,7 +1106,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert "uses: pypa/gh-action-pypi-publish@v1.13.0" in pypi_job
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -874,7 +1115,7 @@ def test_glibc_compat_shim_present_in_headroom_py() -> None:
     """STRUCTURAL INVARIANT: the headroom-py crate ships a glibc-2.38
     compatibility shim that defines weak `__isoc23_*` aliases.
 
-    Issue #355 (https://github.com/chopratejas/headroom/issues/355) —
+    Issue #355 (https://github.com/headroomlabs-ai/headroom/issues/355) —
     the published wheel's `_core.so` references `__isoc23_strtoll`
     (glibc 2.38+) because we statically link prebuilt ONNX Runtime
     artifacts compiled with gcc 14. Users with libc < 2.38 (Ubuntu
@@ -1002,7 +1243,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
         # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-14",
+        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (
@@ -1467,3 +1708,69 @@ def test_version_sync_covers_every_file_the_verifier_gates() -> None:
         "server.json",
     ]:
         assert fragment in sync, f"version-sync.py no longer propagates a version to {fragment}"
+
+
+def test_metadata_sync_does_not_persist_credentials_for_branch_supplied_code() -> None:
+    """The release credential must not be readable by the synced branch's code.
+
+    ``release-metadata-sync`` triggers on a push to the ``release-please--branches--**``
+    glob, which is not a protected namespace, and then runs
+    ``scripts/version-sync.py`` *from the checked-out branch*. With
+    ``actions/checkout``'s default ``persist-credentials: true`` the token is
+    written to ``.git/config`` before that script runs, so anyone able to push a
+    matching branch could read it. The credential reaches PyPI, npm and GHCR via
+    the ``release: published`` publishes, so this is not a theoretical leak.
+    """
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/release-metadata-sync.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["sync"]["steps"]
+
+    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkouts, "expected a checkout step"
+    for step in checkouts:
+        assert step.get("with", {}).get("persist-credentials") is False, step
+        # A token passed to checkout is exactly what persist-credentials would
+        # write to disk; the push step supplies it via env instead.
+        assert "token" not in step.get("with", {}), step
+
+
+@pytest.mark.parametrize(
+    "workflow_path,job",
+    [
+        (".github/workflows/release-please.yml", "release-please"),
+        (".github/workflows/release-metadata-sync.yml", "sync"),
+    ],
+)
+def test_release_workflows_prefer_scoped_app_token(workflow_path: str, job: str) -> None:
+    """A repo-scoped, short-lived app token must be preferred over the PAT.
+
+    The PAT carries a maintainer's entire account and bypasses branch and tag
+    protection (#2955). The app-token step is gated on ``vars.RELEASE_APP_ID``
+    and marked ``continue-on-error`` so an unconfigured app falls back to the
+    existing chain rather than blocking a release.
+    """
+    workflow = yaml.safe_load((ROOT / workflow_path).read_text(encoding="utf-8"))
+    steps = workflow["jobs"][job]["steps"]
+
+    minters = [
+        s for s in steps if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    ]
+    assert len(minters) == 1, steps
+    minter = minters[0]
+    assert minter["id"] == "app-token"
+    assert minter["continue-on-error"] is True
+    assert "vars.RELEASE_APP_ID" in str(minter["if"])
+
+    # Whatever consumes the credential must try the app token first.
+    consumers = [
+        value
+        for step in steps
+        for value in list(step.get("with", {}).values()) + list(step.get("env", {}).values())
+        if "RELEASE_PLEASE_TOKEN" in str(value)
+    ]
+    assert consumers, "expected a step consuming the release credential"
+    for value in consumers:
+        assert str(value).index("steps.app-token.outputs.token") < str(value).index(
+            "secrets.RELEASE_PLEASE_TOKEN"
+        ), value

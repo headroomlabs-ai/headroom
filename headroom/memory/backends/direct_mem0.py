@@ -51,6 +51,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,6 +60,7 @@ from typing import Any
 from headroom.memory import qdrant_env
 from headroom.memory.models import Memory
 from headroom.memory.ports import MemorySearchResult
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +102,7 @@ class Mem0Config:
     # Neo4j settings
     neo4j_uri: str = "neo4j://localhost:7687"
     neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("NEO4J_PASSWORD", ""))
 
     # Qdrant settings (defaults resolve from HEADROOM_QDRANT_* env vars)
     qdrant_url: str | None = field(default_factory=qdrant_env.qdrant_env_url)
@@ -168,7 +170,12 @@ class DirectMem0Adapter:
         if self._initialized:
             return
 
-        # Initialize embedder (OpenAI)
+        # Initialize embedder (OpenAI). The air-gap switch outranks the
+        # backend configuration: this embeds the user's memories by shipping
+        # them to api.openai.com, which is precisely what an operator who set
+        # HEADROOM_OFFLINE is refusing. Use the ONNX or Ollama embedder
+        # instead on an air-gapped box.
+        guard_egress("OpenAI embedding API (direct mem0 backend)", "api.openai.com")
         try:
             from openai import OpenAI
 

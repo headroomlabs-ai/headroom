@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import click
@@ -8,6 +10,9 @@ from click.testing import CliRunner
 
 from headroom.cli import install as inst
 from headroom.cli.main import main
+from headroom.install.models import DeploymentManifest, ManagedMutation
+from headroom.install.planner import build_tool_envs
+from headroom.install.state import load_manifest as load_state_manifest
 
 
 def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
@@ -124,6 +129,9 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -144,7 +152,7 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
         "headroom.cli.install.apply_mutations",
         lambda deployment: calls.append("apply") or [],
     )
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr(
         "headroom.cli.install.save_manifest", lambda deployment: calls.append("save")
     )
@@ -159,7 +167,7 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
         lambda deployment: calls.append("start_docker"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
@@ -169,7 +177,7 @@ def test_install_apply_starts_service_supervisor(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     assert "Installed persistent deployment 'default'" in result.output
     assert "Targets: claude, codex" in result.output
-    assert calls == ["save", "start_service", "apply", "save"]
+    assert calls == ["save", "save", "start_service", "apply", "save"]
 
 
 def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
@@ -177,6 +185,9 @@ def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -190,7 +201,7 @@ def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install._is_windows", lambda: True)
     monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
@@ -199,7 +210,7 @@ def test_install_apply_announces_windows_service_fallback(monkeypatch) -> None:
         "headroom.cli.install.start_detached_agent", lambda profile: calls.append("start_agent")
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(main, ["install", "apply", "--preset", "persistent-service"])
@@ -215,6 +226,9 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -236,18 +250,119 @@ def test_install_apply_forwards_no_http2_to_build_manifest(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(main, ["install", "apply", "--no-http2"])
 
     assert result.exit_code == 0, result.output
     assert captured["no_http2"] is True
+
+
+def _patch_apply_pipeline(monkeypatch, captured: dict[str, object]):
+    """Stub out the apply side effects and capture ``build_manifest`` kwargs."""
+
+    class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        targets = ["claude"]
+        mutations: list = []
+        artifacts: list = []
+
+    def fake_build_manifest(**kwargs):
+        captured.update(kwargs)
+        return Manifest()
+
+    monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
+    monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
+    )
+
+
+def test_install_apply_honors_headroom_port_env(monkeypatch) -> None:
+    """An explicit HEADROOM_PORT must reach build_manifest, like `proxy --port` honors it.
+
+    Regression for #3072 bug 1: `install apply` ignored HEADROOM_PORT and always
+    configured 8787 because the --port option had no envvar binding.
+    """
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
+
+
+def test_install_apply_explicit_port_overrides_env(monkeypatch) -> None:
+    """An explicit --port still wins over HEADROOM_PORT (Click precedence)."""
+    captured: dict[str, object] = {}
+    _patch_apply_pipeline(monkeypatch, captured)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["install", "apply", "--port", "9999"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 9999
+
+
+def test_deploy_honors_headroom_port_env(monkeypatch) -> None:
+    """`headroom deploy` must honor HEADROOM_PORT the same way (#3072 bug 1)."""
+    captured: dict[str, object] = {}
+
+    plan = SimpleNamespace(
+        preset="persistent-service",
+        runtime="python",
+        reason="test",
+        supervisor_kind="service",
+        base_env={},
+    )
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        port=0,
+        health_url="http://127.0.0.1:8788/readyz",
+        targets=["claude"],
+    )
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return manifest
+
+    monkeypatch.setattr(
+        "headroom.cli.install._select_turnkey_plan", lambda prefer_docker=True: plan
+    )
+    monkeypatch.setattr("headroom.cli.install._build_deployment_manifest", fake_build)
+    monkeypatch.setattr("headroom.cli.install._apply_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install._echo_installed", lambda m, prefix="": None)
+    monkeypatch.setenv("HEADROOM_PORT", "8788")
+
+    result = CliRunner().invoke(main, ["deploy"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["port"] == 8788
 
 
 def test_install_apply_help_lists_no_http2() -> None:
@@ -278,6 +393,9 @@ def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -295,12 +413,12 @@ def _apply_capturing_build_manifest(monkeypatch) -> dict[str, object]:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
     return captured
 
@@ -335,6 +453,8 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -345,7 +465,10 @@ def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
+    monkeypatch.setattr(
+        "headroom.cli.install.runtime_status",
+        lambda manifest: "running",
+    )
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr(
         "headroom.cli.install.probe_json",
@@ -366,6 +489,8 @@ def test_install_status_survives_non_dict_config(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -392,6 +517,10 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -414,13 +543,14 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
         "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds=45, **kwargs: True
     )
     monkeypatch.setattr(
         "headroom.cli.install.apply_mutations", lambda manifest: calls.append("apply") or []
     )
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: calls.append("save"))
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.wait_stopped", lambda manifest: True)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
 
     result = runner.invoke(main, ["install", "restart"])
@@ -438,11 +568,190 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize("supervisor_kind", ["service", "task"])
+def test_stop_deployment_stops_external_supervisor_before_docker(
+    monkeypatch, supervisor_kind: str
+) -> None:
+    calls: list[str] = []
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="docker",
+        supervisor_kind=supervisor_kind,
+        health_url="http://127.0.0.1:8787/readyz",
+    )
+    monkeypatch.setattr(inst, "stop_supervisor", lambda current: calls.append("supervisor"))
+    monkeypatch.setattr(inst, "stop_runtime", lambda current: calls.append("runtime"))
+    monkeypatch.setattr(inst, "wait_stopped", lambda current: calls.append("wait_stopped") or True)
+
+    inst._stop_deployment(manifest)
+
+    assert calls == ["supervisor", "runtime", "wait_stopped"]
+
+
+def test_stop_deployment_stops_docker_even_when_supervisor_stop_fails(monkeypatch) -> None:
+    calls: list[str] = []
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="docker",
+        supervisor_kind="service",
+    )
+
+    def fail_supervisor(current):
+        calls.append("supervisor")
+        raise RuntimeError("supervisor unavailable")
+
+    monkeypatch.setattr(inst, "stop_supervisor", fail_supervisor)
+    monkeypatch.setattr(inst, "stop_runtime", lambda current: calls.append("runtime"))
+
+    with pytest.raises(RuntimeError, match="supervisor unavailable"):
+        inst._stop_deployment(manifest)
+    assert calls == ["supervisor", "runtime"]
+
+
+def test_remove_deployment_retains_manifest_when_supervisor_stop_fails(monkeypatch) -> None:
+    calls: list[str] = []
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="docker",
+        supervisor_kind="service",
+        mutations=[],
+    )
+    monkeypatch.setattr(
+        inst,
+        "stop_supervisor",
+        lambda current: (_ for _ in ()).throw(RuntimeError("supervisor unavailable")),
+    )
+    monkeypatch.setattr(inst, "stop_runtime", lambda current: calls.append("runtime"))
+    monkeypatch.setattr(
+        inst, "remove_supervisor", lambda current: calls.append("remove-supervisor")
+    )
+    monkeypatch.setattr(inst, "delete_manifest", lambda profile: calls.append("delete"))
+
+    with pytest.raises(RuntimeError, match="supervisor unavailable"):
+        inst._remove_deployment(manifest)
+    assert calls == ["runtime", "remove-supervisor"]
+
+
+def test_remove_deployment_reports_all_cleanup_failures(monkeypatch) -> None:
+    manifest = SimpleNamespace(profile="default", mutations=[object()])
+    monkeypatch.setattr(
+        inst,
+        "_deactivate_deployment_mutations",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("mutation failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "_stop_deployment",
+        lambda current: (_ for _ in ()).throw(RuntimeError("runtime failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "remove_supervisor",
+        lambda current: (_ for _ in ()).throw(RuntimeError("supervisor failed")),
+    )
+
+    with pytest.raises(RuntimeError) as exc:
+        inst._remove_deployment(manifest)
+
+    message = str(exc.value)
+    assert all(
+        item in message for item in ("mutation failed", "runtime failed", "supervisor failed")
+    )
+
+
+def _restart_race_manifest():
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        port = 8787
+        health_url = "http://127.0.0.1:8787/readyz"
+        backend = "anthropic"
+        targets: list[str] = []
+        tool_envs: dict[str, dict[str, str]] = {}
+        mutations: list = []
+
+    return Manifest()
+
+
+def test_install_restart_waits_for_old_process_before_starting(monkeypatch) -> None:
+    """#3658: the old proxy still answers /readyz right after stop; restart must
+    wait for it to go away, otherwise start is skipped and the service stays down."""
+
+    runner = CliRunner()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop_runtime")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped",
+        lambda manifest, timeout_seconds=15: calls.append("wait_stopped") or True,
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready",
+        lambda manifest, timeout_seconds=45, **kwargs: True,
+    )
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda manifest: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+
+    result = runner.invoke(main, ["install", "restart"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["stop_supervisor", "stop_runtime", "wait_stopped", "start_supervisor"]
+
+
+@pytest.mark.parametrize("command", ["stop", "restart"])
+def test_install_stop_and_restart_fail_when_old_process_never_stops(monkeypatch, command) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr("headroom.cli.install.stop_supervisor", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped", lambda manifest, timeout_seconds=15: False
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+
+    result = runner.invoke(main, ["install", command])
+
+    assert result.exit_code != 0
+    assert "still answering" in result.output
+    assert "deployment 'default'." not in result.output
+    assert calls == []
+
+
 def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -452,6 +761,7 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
         mutations = [object()]
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr(
         "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
@@ -464,10 +774,36 @@ def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     assert calls == []
 
 
+def test_start_deployment_requires_identity_for_post_start_readiness(monkeypatch) -> None:
+    manifest = SimpleNamespace(
+        profile="default",
+        preset="persistent-task",
+        runtime_kind="python",
+        supervisor_kind="none",
+        health_url="http://127.0.0.1:8787/readyz",
+    )
+    waits: list[dict[str, object]] = []
+    monkeypatch.setattr(inst, "runtime_status", lambda current: "stopped")
+    monkeypatch.setattr(inst, "start_detached_agent", lambda profile: None)
+    monkeypatch.setattr(
+        inst,
+        "wait_ready",
+        lambda current, timeout_seconds, **kwargs: waits.append(kwargs) or True,
+    )
+
+    inst._start_deployment(manifest, assume_start_lock=True)
+
+    assert waits == [{"require_identity": True}]
+
+
 def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = build_tool_envs(8787, "anthropic", ["claude"])
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -477,13 +813,14 @@ def test_install_start_noops_for_healthy_docker_without_docker_on_path(monkeypat
         mutations = [object()]
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr("headroom.cli.install.shutil.which", lambda name, *args, **kwargs: None)
 
     result = runner.invoke(main, ["install", "start"])
 
-    assert result.exit_code == 0, result.output
-    assert "Started deployment 'default'." in result.output
+    assert result.exit_code != 0
+    assert "docker' was not found on PATH" in result.output
 
 
 def test_install_start_does_not_spawn_when_start_lock_is_contended(monkeypatch) -> None:
@@ -491,6 +828,10 @@ def test_install_start_does_not_spawn_when_start_lock_is_contended(monkeypatch) 
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -525,6 +866,10 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -544,7 +889,8 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     wait_results = iter([False, True])
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: next(wait_results)
+        "headroom.cli.install.wait_ready",
+        lambda manifest, timeout_seconds, **kwargs: next(wait_results),
     )
     monkeypatch.setattr(
         "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
@@ -590,6 +936,9 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -609,12 +958,12 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build_manifest)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.start_detached_agent", lambda profile: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(
@@ -641,6 +990,11 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
+
         def __init__(self, profile: str, targets: list[str]) -> None:
             self.profile = profile
             self.preset = "persistent-service"
@@ -664,7 +1018,9 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     )
     monkeypatch.setattr(
         "headroom.cli.install.install_supervisor",
-        lambda deployment: calls.append(f"supervisor:{','.join(deployment.targets)}") or [],
+        lambda deployment, **kwargs: (
+            calls.append(f"supervisor:{','.join(deployment.targets)}") or []
+        ),
     )
     monkeypatch.setattr(
         "headroom.cli.install.save_manifest",
@@ -690,6 +1046,10 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "headroom.cli.install.delete_manifest",
         lambda profile: calls.append(f"delete:{profile}"),
     )
+    monkeypatch.setattr(
+        "headroom.cli.install.delete_recovery_manifest",
+        lambda profile: calls.append(f"delete-recovery:{profile}"),
+    )
 
     def _start(deployment) -> None:
         calls.append(f"start:{','.join(deployment.targets)}")
@@ -708,6 +1068,7 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "stop-runtime:codex",
         "remove-supervisor:codex",
         "delete:default",
+        "save:claude",
         "supervisor:claude",
         "save:claude",
         "start:claude",
@@ -720,13 +1081,407 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
         "start:codex",
         "apply:codex",
         "save:codex",
+        "delete-recovery:default",
     ]
+
+
+def test_install_apply_reports_restore_failure_with_recovery_path(monkeypatch) -> None:
+    previous = SimpleNamespace(profile="default")
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: None)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "_restore_deployment",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("restore failed")),
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    message = str(exc.value)
+    assert "restore failed" in message
+    assert "recovery snapshot:" in message
+    assert "restore it after resolving the failure" in message
+
+
+def test_install_apply_old_removal_failure_is_actionable_and_does_not_start_new(
+    monkeypatch,
+) -> None:
+    previous = SimpleNamespace(profile="default")
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    calls: list[str] = []
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: calls.append("snapshot"))
+    monkeypatch.setattr(
+        inst,
+        "_remove_deployment",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("old removal failed")),
+    )
+    monkeypatch.setattr(inst, "_start_deployment", lambda manifest: calls.append("start"))
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    assert "old removal failed" in str(exc.value)
+    assert "no new owner was started" in str(exc.value)
+    assert calls == ["snapshot"]
+
+
+def test_install_apply_uses_requested_profile_for_recovery_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    previous = DeploymentManifest(
+        profile="loaded-profile",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["old"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    new = DeploymentManifest(
+        profile="requested-profile",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["new"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+
+    with pytest.raises(click.ClickException):
+        inst._apply_manifest(new)
+
+    assert (tmp_path / ".headroom" / "deploy" / "requested-profile.recovery.json").exists()
+    assert not (tmp_path / ".headroom" / "deploy" / "loaded-profile.recovery.json").exists()
+
+
+def test_restore_deployment_requires_durable_manifest_before_start(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(inst, "install_supervisor", lambda current, **kwargs: [])
+    monkeypatch.setattr(
+        inst,
+        "_save_apply_manifest",
+        lambda current: (_ for _ in ()).throw(OSError("restore manifest busy")),
+    )
+    monkeypatch.setattr(inst, "_start_deployment", lambda current: calls.append("start"))
+
+    with pytest.raises(OSError, match="restore manifest busy"):
+        inst._restore_deployment(manifest)
+    assert calls == []
+
+
+def test_apply_persists_before_darwin_bootstrap_or_start_on_save_failure(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    install_calls: list[bool] = []
+    bootstrap_calls: list[str] = []
+    start_calls: list[str] = []
+    save_calls = 0
+
+    def save(current) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError("active manifest busy")
+
+    def install(current, *, start=True):
+        install_calls.append(start)
+        if start:
+            bootstrap_calls.append(current.profile)
+        return []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", save)
+    monkeypatch.setattr(inst, "install_supervisor", install)
+    monkeypatch.setattr(
+        inst, "_start_deployment", lambda current: start_calls.append(current.profile)
+    )
+    monkeypatch.setattr(inst, "_remove_deployment", lambda current: None)
+
+    with pytest.raises(click.ClickException, match="active manifest busy"):
+        inst._apply_manifest(manifest)
+
+    assert install_calls == [False]
+    assert bootstrap_calls == []
+    assert start_calls == []
+
+
+def test_activate_mutations_reverts_side_effects_when_strict_save_fails(monkeypatch) -> None:
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    mutation = ManagedMutation(target="env", kind="shell-block", path="settings")
+    reverted: list[ManagedMutation] = []
+    monkeypatch.setattr(inst, "apply_mutations", lambda current: [mutation])
+    monkeypatch.setattr(
+        inst,
+        "_save_apply_manifest",
+        lambda current: (_ for _ in ()).throw(OSError("manifest busy")),
+    )
+    monkeypatch.setattr(
+        inst, "revert_mutations", lambda current: reverted.extend(current.mutations)
+    )
+
+    with pytest.raises(OSError, match="manifest busy"):
+        inst._activate_deployment_mutations(manifest)
+    assert reverted == [mutation]
+    assert manifest.mutations == []
+
+
+def test_recovery_snapshot_delete_failure_is_actionable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        inst,
+        "delete_recovery_manifest",
+        lambda profile: (_ for _ in ()).throw(OSError("snapshot busy")),
+    )
+
+    with pytest.raises(click.ClickException, match="could not be deleted") as exc:
+        inst._delete_recovery_snapshot("default")
+    assert "snapshot busy" in str(exc.value)
+    assert "retained" in str(exc.value)
+
+
+def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["old"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    new = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["new"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    real_save_recovery = inst._save_recovery_snapshot
+
+    def save_recovery(manifest, profile):
+        real_save_recovery(manifest, profile)
+        calls.append("snapshot")
+
+    monkeypatch.setattr(inst, "_save_recovery_snapshot", save_recovery)
+
+    def remove(manifest):
+        calls.append("remove-new" if manifest is new else "remove-old")
+        if manifest is new:
+            raise RuntimeError("new deployment cleanup failed")
+
+    monkeypatch.setattr(inst, "_remove_deployment", remove)
+    real_save_apply = inst._save_apply_manifest
+
+    def save_apply(manifest):
+        real_save_apply(manifest)
+        calls.append("save-new")
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", save_apply)
+    monkeypatch.setattr(
+        inst, "install_supervisor", lambda manifest, **kwargs: calls.append("install-new") or []
+    )
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore-old"))
+    monkeypatch.setattr(
+        inst, "delete_recovery_manifest", lambda profile: calls.append("delete-snapshot")
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    message = str(exc.value)
+    assert "startup failed" in message
+    assert "new deployment cleanup failed" in message
+    assert "recovery snapshot" in message
+    assert "remove the new owner before restoring the snapshot" in message
+    assert calls == ["snapshot", "remove-old", "save-new", "install-new", "save-new", "remove-new"]
+    assert load_state_manifest("default") is not None
+    recovery = tmp_path / ".headroom" / "deploy" / "default.recovery.json"
+    assert json.loads(recovery.read_text(encoding="utf-8"))["targets"] == ["old"]
+
+
+def test_install_apply_keeps_snapshot_when_active_persistence_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["old"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    new = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="service",
+        scope="user",
+        provider_mode="manual",
+        targets=["new"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    saves = 0
+
+    def fail_active_save(manifest):
+        nonlocal saves
+        saves += 1
+        if saves == 1:
+            inst.save_manifest_strict(manifest)
+            return
+        raise OSError("active manifest busy")
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", fail_active_save)
+    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore"))
+    monkeypatch.setattr(inst, "delete_recovery_manifest", lambda profile: calls.append("delete"))
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    assert "active manifest persistence failed" in str(exc.value)
+    assert "recovery snapshot:" in str(exc.value)
+    assert calls == ["cleanup", "cleanup"]
+    assert load_state_manifest("default") is not None
+    assert (tmp_path / ".headroom" / "deploy" / "default.recovery.json").exists()
+
+
+def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypatch) -> None:
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    calls: list[str] = []
+
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: calls.append("save"))
+    monkeypatch.setattr(
+        inst,
+        "install_supervisor",
+        lambda manifest, **kwargs: (_ for _ in ()).throw(RuntimeError("install failed")),
+    )
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
+
+    with pytest.raises(click.ClickException, match="install failed"):
+        inst._apply_manifest(new)
+
+    assert calls == ["save", "cleanup"]
+
+
+def test_install_apply_without_previous_has_no_recovery_guidance(monkeypatch) -> None:
+    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    monkeypatch.setattr(
+        inst,
+        "_start_deployment",
+        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
+    )
+    monkeypatch.setattr(
+        inst,
+        "_remove_deployment",
+        lambda manifest: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+
+    with pytest.raises(click.ClickException) as exc:
+        inst._apply_manifest(new)
+
+    message = str(exc.value)
+    assert "startup failed" in message and "cleanup failed" in message
+    assert "recovery snapshot" not in message
 
 
 def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -747,6 +1502,9 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -761,7 +1519,7 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: Manifest())
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -778,7 +1536,7 @@ def test_install_apply_uses_docker_runtime_for_persistent_docker(monkeypatch) ->
         lambda deployment: calls.append("start_docker"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -804,6 +1562,9 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -828,7 +1589,7 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -845,7 +1606,7 @@ def test_deploy_prefers_docker_when_available(monkeypatch) -> None:
         lambda deployment: calls.append("start_docker"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(main, ["deploy"])
@@ -863,6 +1624,9 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-docker"
         runtime_kind = "docker"
@@ -889,7 +1653,7 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.build_manifest", fake_build)
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: None)
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
-    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment: [])
+    monkeypatch.setattr("headroom.cli.install.install_supervisor", lambda deployment, **kwargs: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda deployment: "stopped")
@@ -903,7 +1667,7 @@ def test_deploy_prefers_gpu_docker_when_available(monkeypatch) -> None:
     monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
     monkeypatch.setattr("headroom.cli.install.start_persistent_docker", lambda deployment: None)
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(main, ["deploy"])
@@ -920,6 +1684,9 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     calls: list[str] = []
 
     class Manifest:
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-task"
         runtime_kind = "python"
@@ -938,7 +1705,7 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda deployment: [])
     monkeypatch.setattr(
         "headroom.cli.install.install_supervisor",
-        lambda deployment: calls.append(f"supervisor:{deployment.supervisor_kind}") or [],
+        lambda deployment, **kwargs: calls.append(f"supervisor:{deployment.supervisor_kind}") or [],
     )
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda deployment: None)
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
@@ -956,7 +1723,7 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
         lambda profile: calls.append(f"agent:{profile}"),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45: True
+        "headroom.cli.install.wait_ready", lambda deployment, timeout_seconds=45, **kwargs: True
     )
 
     result = runner.invoke(main, ["deploy", "--no-docker"])
@@ -967,11 +1734,15 @@ def test_deploy_falls_back_to_detached_python_without_supervisor(monkeypatch) ->
     assert calls == ["supervisor:none", "agent:default"]
 
 
-def test_install_remove_continues_when_runtime_teardown_errors(monkeypatch) -> None:
+def test_install_remove_retains_manifest_when_runtime_teardown_errors(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         preset = "persistent-service"
         runtime_kind = "python"
@@ -1001,18 +1772,26 @@ def test_install_remove_continues_when_runtime_teardown_errors(monkeypatch) -> N
 
     result = runner.invoke(main, ["install", "remove"])
 
-    assert result.exit_code == 0, result.output
-    assert calls == ["revert", "remove_supervisor", "delete"]
+    assert result.exit_code != 0
+    assert "Error: Failed to remove deployment 'default': cleanup failed:" in result.output
+    assert "Traceback" not in result.output
+    assert calls == ["revert", "remove_supervisor"]
 
 
 def test_install_agent_ensure_reports_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
+        mutations = []
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
@@ -1025,6 +1804,10 @@ def test_install_agent_run_exits_with_foreground_status(monkeypatch) -> None:
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
@@ -1042,10 +1825,15 @@ def test_install_agent_ensure_no_spawn_when_lock_not_acquired(monkeypatch) -> No
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
 
     import contextlib
@@ -1076,6 +1864,10 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1092,7 +1884,13 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
-    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: False)
+    wait_calls: list[dict[str, object]] = []
+
+    def fake_wait_ready(manifest, timeout_seconds, **kwargs):
+        wait_calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr("headroom.cli.install.wait_ready", fake_wait_ready)
     monkeypatch.setattr(
         "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
     )
@@ -1128,6 +1926,7 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
     assert calls.index("revert") < calls.index("stop")
     assert calls.index("stop") < calls.index("start_deployment")
     assert calls.index("start_deployment") < calls.index("apply")
+    assert wait_calls == [{"require_identity": True}]
     assert "start_agent" not in calls
     assert "start_docker" not in calls
 
@@ -1138,6 +1937,10 @@ def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1168,7 +1971,9 @@ def test_install_agent_ensure_starts_when_stopped_and_lock_acquired(monkeypatch)
         yield True
 
     monkeypatch.setattr("headroom.cli.install.acquire_runtime_start_lock", fake_lock)
-    monkeypatch.setattr("headroom.cli.install.wait_ready", lambda manifest, timeout_seconds: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds, **kwargs: True
+    )
 
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code == 0, result.output
@@ -1181,12 +1986,17 @@ def test_install_agent_ensure_no_duplicate_spawn_after_lock_recheck(monkeypatch)
     calls: list[str] = []
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
 
     # First probe_ready (before lock) returns False, second (after lock) returns True
     probe_results = iter([False, True])
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: next(probe_results))
 
     monkeypatch.setattr(
@@ -1219,6 +2029,10 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     runner = CliRunner()
 
     class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs = {}
         profile = "default"
         health_url = "http://127.0.0.1:8787/readyz"
         preset = "persistent-task"
@@ -1246,3 +2060,89 @@ def test_install_agent_ensure_propagates_start_deployment_failure(monkeypatch) -
     result = runner.invoke(main, ["install", "agent", "ensure"])
     assert result.exit_code != 0, f"expected non-zero exit, got {result.exit_code}: {result.output}"
     assert "simulated start failure" in result.output
+
+
+def test_install_start_reconciles_a_healthy_deployment(monkeypatch) -> None:
+    """The regression this whole change exists for.
+
+    ``install start`` activated mutations only when the deployment had NONE
+    recorded. A normally-installed, working deployment always has some, so the
+    reconcile never ran on the one command the affected users actually type --
+    and the stale env var stayed stale forever.
+    """
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        # Pre-#746: base URL written, tool search never enabled.
+        tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]  # healthy AND already mutated: the skipped case
+        artifacts = []
+
+    manifest = Manifest()
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda m, timeout_seconds=None, **kwargs: True
+    )
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert "ENABLE_TOOL_SEARCH" in manifest.tool_envs["claude"]
+    assert applied == ["apply"]  # re-applied so the new key reaches the config
+
+
+def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
+    """A deployment that is already current must not be perturbed."""
+    runner = CliRunner()
+    applied: list[str] = []
+
+    class Manifest:
+        targets = ["claude"]
+        port = 8787
+        backend = "anthropic"
+        tool_envs: dict = {}
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations = [object()]
+        artifacts = []
+
+    manifest = Manifest()
+    from headroom.cli.install import _reconcile_tool_envs
+
+    _reconcile_tool_envs(manifest)  # bring it fully up to date first
+
+    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: manifest)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        "headroom.cli.install.apply_mutations", lambda m: applied.append("apply") or []
+    )
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda m: None)
+    monkeypatch.setattr("headroom.cli.install.start_supervisor", lambda m: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda m, timeout_seconds=None, **kwargs: True
+    )
+
+    result = runner.invoke(main, ["install", "start"])
+
+    assert result.exit_code == 0, result.output
+    assert applied == []
