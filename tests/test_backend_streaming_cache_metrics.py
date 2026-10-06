@@ -57,14 +57,7 @@ def _find_perf_record(records: list[logging.LogRecord]) -> tuple[int, int, int]:
 
 
 class _ListHandler(logging.Handler):
-    """Tiny direct handler that survives the proxy disabling propagation.
-
-    ``caplog`` attaches to root; ``headroom.proxy.helpers._setup_file_logging``
-    flips ``logging.getLogger("headroom").propagate = False`` once a proxy
-    instance is constructed in the test, after which root-attached handlers
-    stop receiving headroom-namespaced records. Attaching directly to
-    ``headroom.proxy`` sidesteps that.
-    """
+    """Tiny direct handler immune to unrelated propagation mutations."""
 
     def __init__(self) -> None:
         super().__init__(level=logging.INFO)

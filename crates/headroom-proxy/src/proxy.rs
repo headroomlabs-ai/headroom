@@ -97,7 +97,19 @@ const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
-        let client = reqwest::Client::builder()
+        // Two rustls crypto providers are linked into this binary (ring via
+        // reqwest, aws-lc-rs via the AWS SDK), so anything that reaches for
+        // the process default — reqwest below, tokio-tungstenite, any future
+        // dependency — would panic without one. Pin it before the first TLS
+        // client is built. Idempotent; see `crate::tls`.
+        crate::tls::install_process_crypto_provider();
+        let mut builder = reqwest::Client::builder();
+        // Corporate roots handed over as PEM files, added on top of the
+        // bundled + OS roots (see `crate::tls`).
+        for cert in crate::tls::extra_root_certificates() {
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .connect_timeout(config.upstream_connect_timeout)
             .timeout(config.upstream_timeout)
             // Don't auto-follow redirects: pass them through verbatim.
@@ -149,6 +161,36 @@ impl AppState {
     }
 }
 
+/// Per-route middleware for `/metrics`, attached only when
+/// `--metrics-require-loopback` is enabled. Rejects any scrape whose
+/// peer address is not loopback (`127.0.0.0/8` / `::1`) with
+/// `403 Forbidden`, keeping operational metrics off the wire on a
+/// non-loopback bind. Relies on the server being served with
+/// `ConnectInfo<SocketAddr>` (see `main.rs`); requests synthesised
+/// without connect info (e.g. `oneshot` in unit tests) would fail the
+/// `ConnectInfo` extractor — which is one reason the gate defaults off.
+async fn require_metrics_loopback(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if peer.ip().is_loopback() {
+        next.run(req).await
+    } else {
+        tracing::warn!(
+            event = "metrics_scrape_rejected_non_loopback",
+            peer = %peer,
+            "rejected /metrics scrape from non-loopback client \
+             (--metrics-require-loopback is enabled)"
+        );
+        (
+            StatusCode::FORBIDDEN,
+            "metrics endpoint restricted to loopback",
+        )
+            .into_response()
+    }
+}
+
 /// Build the axum app. `/healthz` and `/healthz/upstream` are intercepted;
 /// everything else hits the catch-all forwarder. WebSocket upgrades are
 /// handled inside the catch-all handler when an `Upgrade: websocket` header
@@ -158,14 +200,6 @@ pub fn build_app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
         .route("/rollout/status", get(rollout_status))
-        // PR-D3: Prometheus scrape endpoint. Renders the global
-        // registry in text format. The handler is stateless — no
-        // `AppState` needed — and idempotent across concurrent
-        // scrapes (`prometheus`'s registry uses internal locking).
-        // Mounted unconditionally because it has no dependencies on
-        // any feature flag; an operator who doesn't want it scraped
-        // simply firewalls the path.
-        .route("/metrics", get(crate::observability::handle_metrics))
         // PR-C2: explicit POST route for /v1/chat/completions. The
         // handler buffers the body and re-injects it into
         // `forward_http`, which runs the OpenAI live-zone gate
@@ -199,6 +233,27 @@ pub fn build_app(state: AppState) -> Router {
             "/v1beta1/projects/{project}/locations/{location}/publishers/anthropic/models/{model_action}",
             post(crate::vertex::handle_vertex_predict_dispatch),
         );
+
+    // PR-D3: Prometheus scrape endpoint. Renders the global registry in
+    // text format. The handler is stateless — no `AppState` needed — and
+    // idempotent across concurrent scrapes (`prometheus`'s registry uses
+    // internal locking). Mounted as its own sub-router so the optional
+    // loopback gate can wrap ONLY this route. `/metrics` exposes
+    // operational detail (token counts, per-session cache-hit rates,
+    // rate-limit gauges); when `--metrics-require-loopback` is set,
+    // `require_metrics_loopback` rejects non-loopback peers with 403 —
+    // defense-in-depth alongside firewalling the path. Default off,
+    // preserving the previous "mounted unconditionally; operator
+    // firewalls the path" behaviour.
+    let metrics_router: Router<AppState> = {
+        let base = Router::new().route("/metrics", get(crate::observability::handle_metrics));
+        if state.config.metrics_require_loopback {
+            base.route_layer(axum::middleware::from_fn(require_metrics_loopback))
+        } else {
+            base
+        }
+    };
+    router = router.merge(metrics_router);
 
     // PR-D1: native AWS Bedrock InvokeModel route. Mounts only when
     // `enable_bedrock_native` is on (default). The handler runs the
@@ -373,30 +428,21 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
-    Ok(join_upstream_path(base, uri.path(), uri.query()))
+    join_upstream_path(base, uri.path(), uri.query())
 }
 
 /// Shared path-join helper used by HTTP and WebSocket handlers.
-/// Appends `path` to `base`, preserving any base path prefix, then sets `query`.
-pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str>) -> url::Url {
-    let mut joined = base.clone();
-    // Strip trailing slash from base path so "http://x:1/api" + "/v1/foo"
-    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
-    let base_path = joined.path().trim_end_matches('/').to_string();
-    let combined = if path.is_empty() || path == "/" {
-        if base_path.is_empty() {
-            "/".to_string()
-        } else {
-            base_path
-        }
-    } else if base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_path}{path}")
-    };
-    joined.set_path(&combined);
-    joined.set_query(query);
-    joined
+/// Appends `path` to `base`, preserving any base path prefix, then sets
+/// `query`. Rejects (400) any path the URL parser would rewrite — dot
+/// segments, backslashes — so the upstream always receives exactly the path
+/// the client sent, under exactly the configured prefix. See
+/// [`crate::upstream_path`].
+pub(crate) fn join_upstream_path(
+    base: &url::Url,
+    path: &str,
+    query: Option<&str>,
+) -> Result<url::Url, ProxyError> {
+    Ok(crate::upstream_path::join_request_path(base, path, query)?)
 }
 
 /// Forward an HTTP request to the upstream and stream the response back.
@@ -1692,5 +1738,56 @@ mod tests {
         let uri: Uri = "/".parse().unwrap();
         let out = build_upstream_url(&base, &uri).unwrap();
         assert_eq!(out.as_str(), "http://up:8080/");
+    }
+
+    // `require_metrics_loopback` gate, driven directly via `oneshot`
+    // with a manually-injected `ConnectInfo` so BOTH branches are
+    // covered — including the non-loopback 403 path the real-server
+    // integration test can't reach from a loopback-only client.
+    fn metrics_gate_router() -> Router {
+        Router::new()
+            .route("/metrics", get(|| async { "metrics-body" }))
+            .route_layer(axum::middleware::from_fn(require_metrics_loopback))
+    }
+
+    async fn scrape_status_from(peer: &str) -> StatusCode {
+        use tower::util::ServiceExt;
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let addr: SocketAddr = peer.parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        metrics_gate_router().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn metrics_gate_allows_ipv4_loopback() {
+        assert_eq!(scrape_status_from("127.0.0.1:5555").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_gate_allows_ipv6_loopback() {
+        assert_eq!(scrape_status_from("[::1]:5555").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_gate_rejects_non_loopback_with_403() {
+        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — never loopback.
+        assert_eq!(
+            scrape_status_from("203.0.113.7:5555").await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn url_build_refuses_to_escape_base_path() {
+        // `url::Url::set_path` would resolve this to `/tenant-b/v1/messages`.
+        let base: url::Url = "http://gw/tenant-a".parse().unwrap();
+        let uri: Uri = "/../tenant-b/v1/messages".parse().unwrap();
+        let err = build_upstream_url(&base, &uri).unwrap_err();
+        assert!(matches!(err, ProxyError::InvalidPath(_)), "{err:?}");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }

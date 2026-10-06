@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from headroom.memory.writers.base import (
     MARKER_END,
@@ -309,3 +314,100 @@ class TestGenericWriter:
 
         assert (tmp_path / "HEADROOM_MEMORY.md").exists()
         assert result.memories_exported == 3
+
+
+# =============================================================================
+# LF newline contract (#3698)
+# =============================================================================
+
+
+@pytest.mark.windows_newline
+class TestNewlineContract:
+    """Every memory write pins ``newline="\n"`` — see #3698.
+
+    These files overlap with the learn writers (``CLAUDE.md``, ``AGENTS.md``,
+    ``MEMORY.md``), so an unpinned write here flips a file the learn writers
+    just wrote as LF back to CRLF on Windows, producing spurious whole-file
+    diffs in any repo that commits them.
+
+    Asserted at the call, not the artifact: ``TextIOWrapper`` picks its
+    translation target at C-compile time (``#ifdef MS_WINDOWS``), so on POSIX
+    an unpinned write is indistinguishable from a pinned one on disk.
+    """
+
+    @staticmethod
+    def _spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, str | None]]:
+        calls: list[tuple[Path, str | None]] = []
+        original = Path.write_text
+
+        def spy(self, data, encoding=None, errors=None, newline=None):
+            calls.append((self, newline))
+            return original(self, data, encoding=encoding, errors=errors, newline=newline)
+
+        monkeypatch.setattr(Path, "write_text", spy)
+        return calls
+
+    @staticmethod
+    def _assert_all_lf(calls: list[tuple[Path, str | None]]) -> None:
+        assert calls, "no writes captured — this test no longer drives the writers"
+        unpinned = sorted(str(path) for path, newline in calls if newline != "\n")
+        assert not unpinned, f"memory writers wrote without newline='\\n': {unpinned}"
+
+    def test_memory_writers_pin_lf(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """base.py, cursor_writer.py and claude_writer.py write sites."""
+        entries = _make_entries(6)
+        calls = self._spy(monkeypatch)
+
+        # base.MemoryWriter.export — shared by the codex/generic writers.
+        CodexMemoryWriter(project_path=tmp_path).export(entries, dry_run=False)
+        GenericMemoryWriter(project_path=tmp_path).export(entries, dry_run=False)
+        # cursor_writer.export overrides base.export with its own write.
+        CursorMemoryWriter(project_path=tmp_path).export(entries, dry_run=False)
+        # claude_writer.export_topics writes per-category topic files.
+        claude = ClaudeCodeMemoryWriter(project_path=tmp_path, memory_dir=tmp_path / "memory")
+        claude.export(entries, dry_run=False)
+        claude.export_topics(entries, dry_run=False)
+
+        self._assert_all_lf(calls)
+        names = {path.name for path, _ in calls}
+        assert {"AGENTS.md", "HEADROOM_MEMORY.md", "headroom-memory.mdc", "MEMORY.md"} <= names
+        assert any(name.startswith("headroom_") for name in names), names
+
+    def test_bridge_writes_pin_lf(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """bridge.py write sites: markdown export, markdown append, sync state."""
+        from headroom.memory.bridge import MemoryBridge
+        from headroom.memory.bridge_config import BridgeConfig
+
+        memories = [
+            SimpleNamespace(
+                content="use uv, not pip",
+                metadata={"topic": "Environment"},
+                entity_refs=[],
+                importance=0.8,
+                created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+        ]
+
+        async def get_user_memories(user_id, limit=200):
+            return list(memories)
+
+        config = BridgeConfig(sync_state_path=tmp_path / "state" / "bridge_state.json")
+        bridge = MemoryBridge(
+            config=config, backend=SimpleNamespace(get_user_memories=get_user_memories)
+        )
+
+        target = tmp_path / "CLAUDE.md"
+        target.write_text("# Notes\n\n## Environment\n- existing\n", encoding="utf-8")
+
+        calls = self._spy(monkeypatch)
+
+        # export_to_markdown covers the export write *and* the sync-state write.
+        asyncio.run(bridge.export_to_markdown(path=tmp_path / "export" / "MEMORY.md"))
+        asyncio.run(bridge._append_to_markdown(target, memories))
+
+        self._assert_all_lf(calls)
+        assert {path.name for path, _ in calls} == {
+            "MEMORY.md",  # export_to_markdown
+            "bridge_state.json",  # _save_sync_state
+            "CLAUDE.md",  # _append_to_markdown
+        }

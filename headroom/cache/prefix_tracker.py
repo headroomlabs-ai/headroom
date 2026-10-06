@@ -367,6 +367,81 @@ def _classify_history_canonical(
     )
 
 
+_TRANSIENT_SYSTEM_LINEAGE_ENV = "HEADROOM_TRANSIENT_SYSTEM_LINEAGE"
+
+
+def _transient_system_lineage_enabled() -> bool:
+    return os.environ.get(_TRANSIENT_SYSTEM_LINEAGE_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _extends_past_system_tail(current_messages: list[Any], previous_messages: list[Any]) -> bool:
+    """Whether ``current`` continues ``previous`` once its trailing system turn is set aside.
+
+    Claude Code ends some requests with a ``role:"system"`` reminder and
+    replaces it on the next turn, so the recorded history is never a prefix of
+    the new one.  Only that last message is excluded: everything before it
+    must survive unchanged and include real user/assistant history, so a
+    changed leading or historical system instruction still diverges, and the
+    new history must be longer, so a sibling that only swaps the final
+    instruction is not a continuation.
+    """
+    if len(previous_messages) < 2 or len(current_messages) <= len(previous_messages):
+        return False
+    tail = previous_messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "system":
+        return False
+    stable = previous_messages[:-1]
+    return current_messages[: len(stable)] == stable and any(
+        isinstance(message, dict) and message.get("role") in ("user", "assistant")
+        for message in stable
+    )
+
+
+def _replaced_system_tail_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Cache-stable split for a request that replaced the previous trailing system turn.
+
+    The handlers record the model's reply after the request it answered, so the
+    replaced reminder is the last recorded message or sits right before that
+    reply.  It is left out of the replayed prefix (it is not in this request);
+    every other recorded message must match ``current`` position for position.
+    """
+    if not _transient_system_lineage_enabled() or len(previous_forwarded_messages) != len(
+        previous_original_messages
+    ):
+        return None
+    current = _lineage_snapshot(_canonicalize_for_prefix_compare(current_messages))
+    previous = _lineage_snapshot(_canonicalize_for_prefix_compare(previous_original_messages))
+    if len(current) != len(current_messages) or len(previous) != len(previous_original_messages):
+        # The projection dropped a directive-only message; raw indices would shift.
+        return None
+    for request_len in (len(previous), len(previous) - 1):
+        reply = previous[request_len:]
+        if reply and not (isinstance(reply[0], dict) and reply[0].get("role") == "assistant"):
+            continue
+        reminder = request_len - 1
+        if (
+            _extends_past_system_tail(current, previous[:request_len])
+            and current[reminder : reminder + len(reply)] == reply
+        ):
+            return (
+                copy.deepcopy(
+                    previous_forwarded_messages[:reminder]
+                    + previous_forwarded_messages[request_len:]
+                ),
+                copy.deepcopy(current_messages[reminder + len(reply) :]),
+            )
+    return None
+
+
 def classify_history_relation(
     current_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
@@ -427,10 +502,18 @@ def extract_cache_stable_delta(
     This is a COMPARISON + slice only: the returned prefix is the previously-forwarded
     bytes verbatim and the delta is the raw appended messages — never a rebuild from the
     canonical projection — so the projection dropping non-semantic fields is safe.
+
+    A previous request that ended in a ``role:"system"`` reminder the client has since
+    replaced also qualifies: its forwarded bytes are replayed without that reminder
+    (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
     """
     if not previous_original_messages or previous_forwarded_messages is None:
         return None
     relation = classify_history_relation(current_messages, previous_original_messages)
+    if relation.kind == RELATION_DIVERGED:
+        return _replaced_system_tail_delta(
+            current_messages, previous_original_messages, previous_forwarded_messages
+        )
     if relation.kind not in (RELATION_EXACT, RELATION_MESSAGE_APPEND):
         # A same-message block append needs a block-level splice in
         # ``overlay_cached_prefix``; slicing only whole messages would silently
@@ -868,6 +951,77 @@ def normalize_message_cache_control(
         _place(last_block_idx, marker, anchor=True)
         changed = True
     return out if changed else messages
+
+
+def mirror_client_message_cache_control(
+    messages: list[dict[str, Any]],
+    client_messages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Keep ``cache_control`` outside content blocks exactly where the client put it.
+
+    OpenAI-compatible clients that talk to Anthropic models through a gateway
+    (OpenCode via ``@ai-sdk/openai-compatible``, then LiteLLM) do not mark
+    content blocks. They mark the MESSAGE dict — ``{"role": "tool", "content":
+    "...", "cache_control": {...}}`` — and, on an assistant turn, the entries of
+    its ``tool_calls`` list, which the gateway turns into ``tool_use`` blocks.
+    ``normalize_message_cache_control`` only sees block markers
+    (``_client_marker_positions`` reads list content), so after
+    ``overlay_cached_prefix`` / ``finalize_turn`` replay an earlier turn's
+    forwarded messages, these markers ride along untouched. A client that marks
+    three places per request (system, the newest tool call, the newest tool
+    result) ends up forwarding four, then five and more, and the gateway's
+    translation to Anthropic blocks crosses the limit of four (``A maximum of 4
+    blocks with cache_control may be provided. Found 6``).
+
+    The client's current request is the authority for these markers, the same
+    rule the block-level normalizer applies: on each message and on each of its
+    ``tool_calls``, drop the marker unless the client put one there in this
+    request, in which case copy the client's own value. Content — and any
+    block-level marker in it — is left alone, so the replayed bytes the provider
+    cached stay byte-identical.
+
+    Index alignment is the invariant (the pipeline preserves message count and
+    each message's tool calls); where it does not hold, that message or list is
+    returned unchanged rather than guessing, and the breakpoint budget guard
+    still bounds the total.
+    """
+    if not isinstance(client_messages, list) or len(client_messages) != len(messages):
+        return messages
+    changed = False
+    out: list[dict[str, Any]] = []
+    for msg, client in zip(messages, client_messages):
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        new_msg, msg_changed = _mirror_marker(msg, client)
+        calls = new_msg.get("tool_calls")
+        client_calls = client.get("tool_calls") if isinstance(client, dict) else None
+        if (
+            isinstance(calls, list)
+            and isinstance(client_calls, list)
+            and len(calls) == len(client_calls)
+        ):
+            mirrored = [_mirror_marker(c, cc) for c, cc in zip(calls, client_calls)]
+            if any(c for _, c in mirrored):
+                new_msg = {**new_msg, "tool_calls": [c for c, _ in mirrored]}
+                msg_changed = True
+        out.append(new_msg)
+        changed = changed or msg_changed
+    return out if changed else messages
+
+
+def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
+    """Give ``holder`` the client's own ``cache_control`` (or none); report change."""
+    if not isinstance(holder, dict):
+        return holder, False
+    client_marker = client_holder.get("cache_control") if isinstance(client_holder, dict) else None
+    if isinstance(client_marker, dict):
+        if holder.get("cache_control") == client_marker:
+            return holder, False
+        return {**holder, "cache_control": dict(client_marker)}, True
+    if "cache_control" in holder:
+        return {k: v for k, v in holder.items() if k != "cache_control"}, True
+    return holder, False
 
 
 class PrefixCacheTracker:
@@ -1362,7 +1516,10 @@ class SessionTrackerStore:
         where a large leading run and two-block identity suffix survive while
         the middle tail is regenerated; all other rewrites start a fresh
         lineage. This keeps #2671's stable cache boundary attached without
-        merging unrelated parallel sub-calls.
+        merging unrelated parallel sub-calls. When nothing else matches, an
+        Anthropic chain whose trailing ``role:"system"`` reminder the client
+        replaced is matched on the history before that reminder
+        (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
         Byte-identical histories (templated fan-outs before they diverge)
         intentionally share a tracker: their provider cache line is identical
         too, so sharing is harmless.
@@ -1456,6 +1613,28 @@ class SessionTrackerStore:
                 len(rewrite_candidates) == 1 or rewrite_candidates[0][0] != rewrite_candidates[1][0]
             ):
                 best_key = rewrite_candidates[0][1]
+            elif (
+                not rewrite_candidates
+                and provider == "anthropic"
+                and _transient_system_lineage_enabled()
+            ):
+                # Nothing matched as recorded.  A chain whose only change is
+                # its replaced trailing system reminder is still this
+                # conversation; without it every such turn starts a cold
+                # tracker, the confirmed prefix is not replayed, and any
+                # recompressed history re-writes the provider cache.  Only a
+                # unique longest chain qualifies, so equal-length siblings
+                # that differ in their reminder stay separate.
+                tail_candidates = [
+                    (len(chain), key)
+                    for key, chain in by_length
+                    if self._lineage_affinities.get(key) == cache_affinity
+                    and _extends_past_system_tail(snap, chain)
+                ]
+                if tail_candidates and (
+                    len(tail_candidates) == 1 or tail_candidates[0][0] != tail_candidates[1][0]
+                ):
+                    best_key = tail_candidates[0][1]
 
         if best_key is None:
             cap = self._default_config.max_lineages_per_session

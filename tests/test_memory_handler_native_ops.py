@@ -751,7 +751,10 @@ async def test_execute_memory_tool_save_returns_dedup_hint(handler: MemoryHandle
 
     backend.raise_on = "save"
     errored = json.loads(await handler._execute_memory_tool("memory_save", {"content": "x"}, "u1"))
-    assert errored == {"status": "error", "error": "save failed"}
+    # Backend exception text is logged, never returned to the model.
+    assert errored["status"] == "error"
+    assert errored["error"] == "internal_error"
+    assert "save failed" not in json.dumps(errored)
 
 
 @pytest.mark.asyncio

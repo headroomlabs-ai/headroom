@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -75,7 +76,7 @@ class _MemoryWsHandler:
         self.config = SimpleNamespace(
             inject_context=False,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self._backend = False
 
@@ -101,6 +102,8 @@ class _MemoryWsHandler:
         args: dict,
         user_id: str,
         provider: str,
+        *,
+        request_context=None,
     ) -> str:
         assert (name, args, user_id, provider) == (
             "memory_search",
@@ -195,7 +198,13 @@ class _FakeWebSocket:
         hold_after_initial: bool = False,
         call_log: list[str] | None = None,
     ) -> None:
-        self.headers = dict(headers or {"authorization": "Bearer test"})
+        self.headers = dict(
+            headers
+            or {
+                "authorization": "Bearer test",
+                "user-agent": "codex-cli/0.5",
+            }
+        )
         self._frames = list(frames or [])
         self._hold_after_initial = hold_after_initial
         self._disconnect_after_n_sends = disconnect_after_n_sends
@@ -1995,7 +2004,7 @@ async def test_ws_late_memory_call_after_streamed_message_passes_through():
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, *, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 
@@ -2082,7 +2091,7 @@ async def test_ws_memory_continuation_normalizes_malformed_arguments():
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, *, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 
@@ -2205,7 +2214,7 @@ async def test_ws_memory_continuation_continues_pre_stream_and_passes_late_call(
     handler.memory_handler = _MemoryWsHandler()
     executed: list[tuple[str, dict, str, str]] = []
 
-    async def _execute_memory_tool(name, args, user_id, provider):
+    async def _execute_memory_tool(name, args, user_id, provider, *, request_context=None):
         executed.append((name, args, user_id, provider))
         return '{"memories": []}'
 
