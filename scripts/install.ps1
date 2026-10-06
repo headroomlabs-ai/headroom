@@ -159,6 +159,18 @@ function Get-PassthroughEnvArgs {
     return ,$args.ToArray()
 }
 
+# Publish the proxy on host loopback only. The container itself must bind
+# 0.0.0.0 for Docker port forwarding to reach it, and the proxy refuses a
+# token-less non-loopback bind unless the operator states that the runtime
+# already confines the port. This is the only place that statement is made,
+# and it is always made together with the 127.0.0.1 publication it relies on.
+function Get-LoopbackPublishArgs {
+    param([int]$Port)
+    # Leading comma: return the array as one object so AddRange receives a
+    # string[] rather than an unrolled object[] (same as Get-SharedDockerArgs).
+    return ,[string[]]@('-p',"127.0.0.1`:$Port`:$Port",'--env','HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1')
+}
+
 function Get-SharedDockerArgs {
     Ensure-HostDirs
     $args = New-Object System.Collections.Generic.List[string]
@@ -194,14 +206,10 @@ function Get-SharedDockerArgs {
 function Add-TtyArgs {
     param($ArgsList)
 
+    # MCP stdio always uses a pipe for stdin. Docker only forwards stdin when
+    # explicitly given -i, regardless of whether the host console is redirected.
+    $ArgsList.Add('-i')
     if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-        $ArgsList.Add('-it')
-        return
-    }
-    if (-not [Console]::IsInputRedirected) {
-        $ArgsList.Add('-i')
-    }
-    if (-not [Console]::IsOutputRedirected) {
         $ArgsList.Add('-t')
     }
 }
@@ -257,7 +265,8 @@ function Start-ProxyContainer {
 
     $containerName = "headroom-proxy-$Port-$PID"
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName,'-p',"$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--rm','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-SharedDockerArgs))
     $dockerArgs.Add($HeadroomImage)
     $dockerArgs.Add('--host')
@@ -552,7 +561,8 @@ function Start-PersistentDockerInstall {
     docker rm -f $containerName | Out-Null 2>$null
 
     $dockerArgs = New-Object System.Collections.Generic.List[string]
-    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName,'-p',"127.0.0.1`:$Port`:$Port"))
+    $dockerArgs.AddRange([string[]]@('run','-d','--restart','unless-stopped','--name',$containerName))
+    $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $Port))
     $dockerArgs.AddRange((Get-PersistentDockerArgs))
     Add-DashboardGatewayEnv -ArgsList $dockerArgs
     $dockerArgs.AddRange([string[]]@(
@@ -1727,7 +1737,7 @@ switch ($args[0]) {
     'proxy' {
         $port = 8787
         $forwardArgs = New-Object System.Collections.Generic.List[string]
-        foreach ($arg in $args) { $forwardArgs.Add($arg) }
+        for ($i = 1; $i -lt $args.Count; $i++) { $forwardArgs.Add($args[$i]) }
         for ($i = 1; $i -lt $args.Count; $i++) {
             if ($args[$i] -eq '--port' -or $args[$i] -eq '-p') {
                 Require-OptionValue -Arguments $args -Index $i -Option $args[$i]
@@ -1743,11 +1753,16 @@ switch ($args[0]) {
         $dockerArgs = New-Object System.Collections.Generic.List[string]
         $dockerArgs.AddRange([string[]]@('run','--rm'))
         Add-TtyArgs -ArgsList $dockerArgs
-        $dockerArgs.AddRange([string[]]@('-p',"$port`:$port"))
+        $dockerArgs.AddRange((Get-LoopbackPublishArgs -Port $port))
         $dockerArgs.AddRange((Get-SharedDockerArgs))
         $dockerArgs.Add('--entrypoint')
         $dockerArgs.Add('headroom')
         $dockerArgs.Add($HeadroomImage)
+        $dockerArgs.Add('proxy')
+        $dockerArgs.Add('--host')
+        $dockerArgs.Add('0.0.0.0')
+        $dockerArgs.Add('--port')
+        $dockerArgs.Add("$port")
         foreach ($arg in $forwardArgs) {
             $dockerArgs.Add($arg)
         }
@@ -1803,4 +1818,4 @@ Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Restart PowerShell"
 Write-Host "  2. Try: headroom proxy"
-Write-Host "  3. Docs: https://github.com/chopratejas/headroom/blob/main/docs/docker-install.md"
+Write-Host "  3. Docs: https://docs.headroomlabs.ai/docs/docker-install"

@@ -18,7 +18,7 @@ from headroom.observability import (
     set_otel_metrics,
     unregister_otel_metric_attribute_provider,
 )
-from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.prometheus_metrics import MAX_DISTINCT_PATHS, PrometheusMetrics
 from headroom.telemetry.context import MAX_DISTINCT_MODELS
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -356,9 +356,54 @@ async def test_prometheus_metrics_reads_late_configured_otel_metrics() -> None:
         await metrics.record_rate_limited(provider="anthropic", model="claude-sonnet")
 
         assert spy.failed_calls == [{"provider": "openai", "model": None}]
-        assert spy.rate_limited_calls == [{"provider": "anthropic", "model": "claude-sonnet"}]
+        # ``source`` reaches OTel too — the split must not exist in Prometheus only.
+        assert spy.rate_limited_calls == [
+            {"provider": "anthropic", "model": "claude-sonnet", "source": "headroom"}
+        ]
     finally:
         reset_otel_metrics()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_forwards_rate_limit_source_to_otel() -> None:
+    """An upstream 429 must reach OTel labelled as upstream, not as our own limiter."""
+
+    spy = _SpyProxyMetrics()
+    metrics = PrometheusMetrics(stateless=True)
+    set_otel_metrics(spy)  # type: ignore[arg-type]
+
+    try:
+        await metrics.record_rate_limited(provider="anthropic", source="upstream")
+        await metrics.record_rate_limited(provider="anthropic", source="headroom")
+        # An unrecognised value is clamped rather than exported as a new label.
+        await metrics.record_rate_limited(provider="anthropic", source="nonsense")
+
+        assert [call["source"] for call in spy.rate_limited_calls] == [
+            "upstream",
+            "headroom",
+            "headroom",
+        ]
+    finally:
+        reset_otel_metrics()
+
+
+def test_otel_rate_limited_counter_carries_source_attribute() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_proxy_rate_limited(provider="anthropic", source="upstream")
+    otel_metrics.record_proxy_rate_limited(provider="openai", source="headroom")
+
+    metrics = _collect_metrics(reader)
+    upstream = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="anthropic", source="upstream"
+    )
+    headroom_side = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="openai", source="headroom"
+    )
+    assert upstream.value == 1
+    assert headroom_side.value == 1
 
 
 @pytest.mark.asyncio
@@ -505,6 +550,61 @@ async def test_prometheus_metrics_reset_rearms_cardinality_warning() -> None:
     assert metrics._model_cardinality_warned is False
     assert len(metrics.requests_by_model) == 0
     assert len(metrics._cache_requests_by_model) == 0
+
+
+def test_prometheus_metrics_caps_inbound_path_cardinality() -> None:
+    """A client hitting unbounded distinct paths (ID-bearing passthrough routes)
+    cannot grow inbound_requests_by_path past MAX_DISTINCT_PATHS + the "other"
+    sentinel, while the total request count stays exact."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    # Fill exactly to the cap with distinct paths: no bucketing yet.
+    for i in range(MAX_DISTINCT_PATHS):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS
+    assert "other" not in metrics.inbound_requests_by_path
+
+    # New distinct paths past the cap bucket into "other", never their own key.
+    for i in range(5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/responses/resp_{i}")
+    assert "/v1/responses/resp_0" not in metrics.inbound_requests_by_path
+    assert metrics.inbound_requests_by_path["other"] == 5
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS + 1
+
+    # An already-tracked path keeps incrementing after the cap is reached.
+    metrics.record_inbound_request(method="GET", path="/v1/files/file_0")
+    assert metrics.inbound_requests_by_path["/v1/files/file_0"] == 2
+
+    # Accounting is preserved: every inbound request is counted somewhere.
+    total_calls = MAX_DISTINCT_PATHS + 5 + 1
+    assert metrics.inbound_requests_total == total_calls
+    assert sum(metrics.inbound_requests_by_path.values()) == total_calls
+
+
+def test_prometheus_metrics_path_cardinality_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bucketing inbound paths into "other" logs exactly one warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        for i in range(MAX_DISTINCT_PATHS + 10):
+            metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    cap_warnings = [r for r in caplog.records if "path cardinality cap" in r.getMessage()]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_reset_rearms_path_cardinality_warning() -> None:
+    """reset_runtime clears the path dict and re-arms the one-shot cap warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_PATHS + 5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert metrics._path_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._path_cardinality_warned is False
+    assert len(metrics.inbound_requests_by_path) == 0
 
 
 @pytest.mark.asyncio

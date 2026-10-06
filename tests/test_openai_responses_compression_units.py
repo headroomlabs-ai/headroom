@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import threading
+import time
 from types import MethodType, SimpleNamespace
+
+import pytest
 
 from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
@@ -584,7 +589,22 @@ def test_openai_responses_adapter_accepts_empty_input_list():
     assert strategy_chain == []
 
 
-def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("mcp__headroom__headroom_retrieve", "{}"),
+        # Hermes' single-underscore MCP alias and OpenCode's doubled prefix,
+        # which the old ``== / endswith("__headroom_retrieve")`` check missed.
+        ("mcp_headroom_headroom_retrieve", "{}"),
+        ("headroom_headroom_retrieve", "{}"),
+        # Hermes deferred-tool bridge, batch shape (#3837).
+        (
+            "tool_call",
+            '{"calls": [{"name": "headroom_retrieve", "arguments": {"hash": "abc"}}]}',
+        ),
+    ],
+)
+def test_openai_responses_adapter_preserves_headroom_retrieve_outputs(name, arguments):
     router = ContentRouter()
 
     def compress(self, content: str, **_kwargs):
@@ -603,8 +623,8 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
             {
                 "type": "function_call",
                 "call_id": "call_retrieve",
-                "name": "mcp__headroom__headroom_retrieve",
-                "arguments": "{}",
+                "name": name,
+                "arguments": arguments,
             },
             {
                 "type": "function_call_output",
@@ -822,6 +842,44 @@ def test_openai_responses_adapter_losslessly_folds_excluded_grep_output_content_
     assert folded_list[1]["image_url"] == "https://example.com/img.png"
     assert folded_list[2]["type"] == "refusal"
     assert folded_list[2]["refusal"] == "I cannot process this request"
+
+
+@pytest.mark.parametrize("tool", ["read", "Read"])
+@pytest.mark.parametrize("as_content_part", [False, True], ids=["plain", "content_part"])
+def test_openai_responses_adapter_never_folds_a_file_read(tool, as_content_part):
+    """A file read stays byte-exact on the Responses wire too.
+
+    This is the Codex wire, where `read` genuinely returns raw file bytes rather
+    than Claude Code's `cat -n` rendering — so it is the shape where folding a
+    read really does destroy the `Edit(old_string=…)` anchor the model is about
+    to type. See DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS. The grep folds above must keep
+    working; only reads opt out.
+    """
+    router = ContentRouter()
+    handler = _handler_with_router(router)
+    # Pretty-printed JSON: json-min is the fold that used to eat this.
+    file_bytes = json.dumps(
+        {"deps": [{"name": f"pkg{i}", "version": "1.0.0"} for i in range(40)]}, indent=2
+    )
+    output = [{"type": "output_text", "text": file_bytes}] if as_content_part else file_bytes
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "function_call", "call_id": "call_1", "name": tool, "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": output},
+        ],
+    }
+
+    new_payload, _modified, _saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id=f"req_read_verbatim_{tool}_{as_content_part}",
+        )
+    )
+
+    assert "router:excluded:lossless" not in transforms
+    assert new_payload["input"][1]["output"] == output
 
 
 def test_openai_responses_adapter_excludes_tool_case_insensitively_with_debug(monkeypatch):
@@ -1153,3 +1211,374 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_openai_responses_adapter_preserves_excluded_custom_tool_outputs():
+    """Codex freeform tools pair ``custom_tool_call`` with its output by call_id.
+
+    The exclude check must resolve their names exactly like ``function_call``.
+    """
+    router = ContentRouter()
+    router.config.exclude_tools = {"serena.find_symbol", "find_symbol"}
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="should not be used",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = " ".join(f"sym{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "serena.find_symbol",
+                "input": "find_symbol main",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": output,
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is False
+    assert saved == 0
+    assert transforms == []
+    assert new_payload == payload
+
+
+def test_openai_responses_adapter_excludes_custom_tool_beside_compressed_function_call():
+    """An excluded custom tool stays raw while a non-excluded function call compresses."""
+    router = ContentRouter()
+    router.config.exclude_tools = {"exec"}
+
+    def compress(self, content: str, **_kwargs):
+        return RouterCompressionResult(
+            compressed="compressed tool output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    excluded_output = " ".join(f"line{i}" for i in range(180))
+    other_output = " ".join(f"word{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "input": "cat build.log",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec",
+                "output": excluded_output,
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_other",
+                "name": "some.other_tool",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_other",
+                "output": other_output,
+            },
+        ],
+    }
+
+    new_payload, modified, _saved, _transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == excluded_output
+    assert new_payload["input"][3]["output"] == "compressed tool output"
+
+
+def test_openai_responses_cache_mode_never_batches_old_small_outputs():
+    """Cache mode: an appended output must not pull earlier outputs into a batch.
+
+    Turn 1 forwards four small outputs raw (under the batch floor). Turn 2
+    appends two more, crossing the floor. Batching then would rewrite the
+    four outputs already in the provider's cached prefix.
+    """
+    router = ContentRouter()
+    calls: list[str] = []
+    floor = OpenAIHandlerMixin.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+    outputs = [" ".join(f"unit{index}_{token}" for token in range(12)) for index in range(6)]
+    assert sum(len(output.encode("utf-8")) for output in outputs[:4]) < floor
+    assert sum(len(output.encode("utf-8")) for output in outputs) >= floor
+
+    def compress(self, content: str, **_kwargs):
+        calls.append(content)
+        compressed = content
+        for output in outputs:
+            compressed = compressed.replace(output, "x")
+        return RouterCompressionResult(
+            compressed=compressed,
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config = SimpleNamespace(mode="cache")
+
+    def turn(count: int) -> dict:
+        return {
+            "model": "gpt-5",
+            "input": [
+                {"type": "local_shell_call_output", "call_id": f"c{index}", "output": output}
+                for index, output in enumerate(outputs[:count])
+            ],
+        }
+
+    first, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        turn(4), model="gpt-5", request_id="req_turn_1"
+    )
+    second, modified, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        turn(6), model="gpt-5", request_id="req_turn_2"
+    )
+
+    assert calls == []
+    assert modified is False
+    assert second["input"][:4] == first["input"]
+
+
+def test_openai_responses_adapter_compresses_historical_messages_not_current_user():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": historical_text}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, saved, transforms, units_by_category, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_history"
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert new_payload["input"][0]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][1]["content"][0]["text"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text
+    assert units_by_category == {"applied": 2}
+    assert any(t.startswith("router:openai:responses:message:") for t in transforms)
+
+
+class _RecordingKompress:
+    """Stands in for KompressCompressor, recording the deadline origin it gets."""
+
+    shares_request_deadline = True
+
+    def __init__(self, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.deadlines: list[float | None] = []
+
+    def is_ready(self) -> bool:
+        return True
+
+    def compress(self, content: str, **kwargs):
+        self.deadlines.append(kwargs.get("_deadline_started_at"))
+        time.sleep(self.delay)
+        compressed = " ".join(content.split()[:20])
+        return SimpleNamespace(compressed=compressed, compressed_tokens=20)
+
+
+def _kompress_payload(units: int) -> dict:
+    return {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": f"call_{i}",
+                "output": "\n".join(
+                    " ".join(f"unit{i}line{line}word{j}" for j in range(10)) for line in range(70)
+                ),
+            }
+            for i in range(units)
+        ],
+    }
+
+
+def _compress_through_executor(router: ContentRouter, payload: dict) -> tuple:
+    handler = _handler_with_router(router)
+
+    async def _run_compression(fn, *, timeout):  # noqa: ANN001, ANN202
+        return fn()
+
+    handler._run_compression_in_executor = _run_compression
+    return asyncio.run(
+        handler._compress_openai_responses_payload_in_executor(
+            payload, model="gpt-5", request_id="req_deadline"
+        )
+    )
+
+
+def test_openai_responses_units_share_one_kompress_deadline(monkeypatch):
+    """The fan-out must draw down ONE request deadline (#3693), pool threads too.
+
+    Each unit is its own ContentRouter.compress call, and Kompress started a
+    fresh HEADROOM_COMPRESSION_DEADLINE_MS clock in every one, so a request
+    that blew its timeout kept running inference for minutes afterwards.
+    """
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")
+    router = ContentRouter()
+    kompress = _RecordingKompress()
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+
+    _compress_through_executor(router, _kompress_payload(6))
+
+    assert len(kompress.deadlines) >= 6, kompress.deadlines
+    assert None not in kompress.deadlines, kompress.deadlines
+    assert len(set(kompress.deadlines)) == 1, kompress.deadlines
+
+
+def test_openai_responses_units_after_the_deadline_pass_through_unchanged(monkeypatch):
+    """Finished units are kept; units not started by the deadline are not started."""
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "1")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "200")
+    router = ContentRouter()
+    kompress = _RecordingKompress(delay=0.3)
+    monkeypatch.setattr(router, "_get_kompress", lambda: kompress)
+    payload = _kompress_payload(4)
+    original = json.loads(json.dumps(payload))
+
+    result = _compress_through_executor(router, payload)
+
+    assert len(kompress.deadlines) == 1
+    outputs = [item["output"] for item in result[0]["input"]]
+    assert outputs[0] != original["input"][0]["output"]
+    assert outputs[1:] == [item["output"] for item in original["input"][1:]]
+    assert result[2] > 0
+
+
+@pytest.mark.parametrize(
+    ("deadline_ms", "timeout", "budget"),
+    [("20000", 30.0, 20.0), ("20000", 5.0, 3.75), ("0", 30.0, None)],
+    ids=["deadline-binds", "timeout-binds", "disabled"],
+)
+def test_openai_responses_deadline_budget_stays_inside_the_timeout(
+    monkeypatch, deadline_ms, timeout, budget
+):
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", deadline_ms)
+    before = time.perf_counter()
+    origin = openai_handler._openai_responses_deadline_started_at(timeout)
+    after = time.perf_counter()
+
+    if budget is None:
+        assert origin is None
+        return
+    expires_at = origin + int(deadline_ms) / 1000
+    assert before + budget <= expires_at <= after + budget
+
+
+@pytest.mark.parametrize(
+    ("compress_user_messages", "expected_user_text"),
+    [(False, None), (None, "compressed history")],
+)
+def test_openai_responses_adapter_historical_user_follows_compress_user_messages(
+    compress_user_messages, expected_user_text
+):
+    # An explicit off (HEADROOM_COMPRESS_USER_MESSAGES=0) keeps earlier user
+    # turns verbatim on Responses too; unset keeps the coding profile's default.
+    from headroom.proxy.models import ProxyConfig
+
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config = ProxyConfig(
+        savings_profile="coding", compress_user_messages=compress_user_messages
+    )
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    tool_output = " ".join(f"line{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": tool_output},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, _saved, _transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_user_flag"
+        )
+    )
+
+    assert modified is True
+    assert new_payload["input"][0]["content"][0]["text"] == (expected_user_text or historical_text)
+    assert new_payload["input"][1]["output"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text

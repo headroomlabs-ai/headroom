@@ -57,7 +57,14 @@ import logging
 
 import httpx
 
-from .kompress_compressor import KompressConfig, KompressResult, store_kompress_in_ccr
+from ..offline import guard_egress
+from .kompress_compressor import (
+    KompressConfig,
+    KompressResult,
+    ccr_retrieval_marker,
+    payload_tokens,
+    store_kompress_in_ccr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +101,6 @@ _MIN_WORDS = 10
 
 # Accept-any-shrink CCR gate, identical to KompressCompressor.compress: only
 # store + mark when the shrink is worth the retrieval marker's own cost.
-_CCR_RATIO_GATE = 0.8
 
 
 class RemoteKompressCompressor:
@@ -134,6 +140,13 @@ class RemoteKompressCompressor:
         # without needing a separate auth-scheme setting.
         if headers:
             self._headers.update(headers)
+        # Air-gap chokepoint. HEADROOM_KOMPRESS_ENDPOINT points at a box that is
+        # by definition off this host, so under HEADROOM_OFFLINE this class must
+        # not exist at all. Guarding at construction (not at the POST) means the
+        # connection pool is never created and the operator hears about the
+        # contradictory configuration the first time the router reaches for
+        # Kompress, rather than discovering it in a packet capture.
+        guard_egress("remote Kompress inference", self._url)
         # httpx.Client is safe to share across the proxy's worker threads.
         self._client = httpx.Client(timeout=timeout)
 
@@ -200,8 +213,22 @@ class RemoteKompressCompressor:
         whole deployment while the proxy kept reporting success.
         """
         n_words = len(content.split())
-        if n_words < _MIN_WORDS:
+        # Same floor contract as the in-process compressor: lossy
+        # word-dropping below config.min_input_words is a net loss (the
+        # retrieval marker alone is ~20 words) and garbles short
+        # instruction-like blocks. _MIN_WORDS stays the hard clamp.
+        if n_words < max(_MIN_WORDS, self.config.min_input_words):
             return self._passthrough(content, n_words)
+
+        # Re-check outside the fail-open try. __init__ already refused if the
+        # flag was set then, but the env can be flipped after this object was
+        # cached on the ContentRouter (the router builds it once per instance
+        # and reuses it for the process lifetime), and the security property we
+        # owe is "no socket", not "no construction". It is outside the try on
+        # purpose: the except below turns every exception into a silent
+        # pass-through, and a policy refusal that degrades silently is exactly
+        # the hole this guard closes.
+        guard_egress("remote Kompress inference", self._url)
 
         try:
             resp = self._client.post(
@@ -234,7 +261,9 @@ class RemoteKompressCompressor:
         # CCR stays PROXY-LOCAL: endpoint is stateless (enable_ccr=False), so we
         # store the mapping + append the retrieval marker here — same policy and
         # marker format as KompressCompressor.compress.
-        if self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE:
+        if self.config.enable_ccr and compressed != content:
+            # Same gate as KompressCompressor: the marked payload must save
+            # tokens, and a result that cannot pay for the marker passes through.
             # Store the PRE-protection text when the caller supplied it. ``content``
             # may be the tag-protected placeholder intermediate, and storing that
             # makes a later full retrieval hand back {{HEADROOM_TAG_N}} instead of
@@ -249,15 +278,23 @@ class RemoteKompressCompressor:
             )
             cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens)
             if cache_key:
-                result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                source_lines = ccr_source.count("\n") + 1
-                line_word = "line" if source_lines == 1 else "lines"
-                result.compressed += (
-                    f"\n[{result.original_tokens} items compressed to "
-                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
-                    f" Retrieve more: hash={cache_key}]"
+                marked = compressed + ccr_retrieval_marker(
+                    result.original_tokens, result.compressed_tokens, ccr_source, cache_key
+                )
+                # Whole original against whole marked candidate, one unit,
+                # and the accounting reports that measurement.
+                original_tokens = payload_tokens(content)
+                compressed_tokens = payload_tokens(marked)
+                if compressed_tokens >= original_tokens:
+                    return self._passthrough(content, n_words)
+                result.cache_key = cache_key
+                result.compressed = marked
+                result.original_tokens = original_tokens
+                result.compressed_tokens = compressed_tokens
+                result.compression_ratio = (
+                    compressed_tokens / original_tokens if original_tokens else 1.0
                 )
 
         return result

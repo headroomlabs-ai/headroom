@@ -163,8 +163,10 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
     if not text:
         return signals
 
-    # HTML tags and comments
-    html_matches = HTML_TAG_PATTERN.findall(text) + HTML_COMMENT_PATTERN.findall(text)
+    # HTML tags and comments. Comments are removed before tag matching so a
+    # comment is counted once (and tags inside comments are not counted).
+    comment_matches = HTML_COMMENT_PATTERN.findall(text)
+    html_matches = HTML_TAG_PATTERN.findall(HTML_COMMENT_PATTERN.sub("", text)) + comment_matches
     if html_matches:
         html_text = "".join(html_matches)
         signals.html_noise_tokens = tokenizer.count_text(html_text)
@@ -180,7 +182,9 @@ def detect_waste_signals(text: str, tokenizer: Tokenizer) -> WasteSignals:
     if ws_matches:
         # Count tokens that could be saved by normalizing whitespace to single spaces
         ws_text = "".join(ws_matches)
-        normalized_text = " ".join(ws_matches)
+        # Each matched run (4+ spaces/tabs or 3+ newlines) collapses to a
+        # single space, so the normalized form is one space per run.
+        normalized_text = " " * len(ws_matches)
         signals.whitespace_tokens = max(
             0, tokenizer.count_text(ws_text) - tokenizer.count_text(normalized_text)
         )

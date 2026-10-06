@@ -28,16 +28,16 @@ The router auto-detects content type by analyzing structure and patterns. No man
 
 | Content Type | Detection Signal | Compressor | Typical Savings |
 |---|---|---|---|
-| JSON arrays | Valid JSON with array elements | SmartCrusher | 70-90% |
-| Source code | Syntax patterns, indentation, keywords | CodeAwareCompressor | 40-70% (opt-in; disabled by default) |
-| Search results | `file:line:content` format | SearchCompressor | 80-95% |
-| Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% |
-| Diffs | Unified diff format | DiffCompressor | 60-80% |
-| HTML | Tag structure | HTMLExtractor | 50-70% |
-| Tabular (CSV/TSV/markdown tables) | Delimited rows / table syntax | TabularCompressor | 60-90% |
-| Structured config (YAML/TOML/INI) | Config syntax | ConfigCompressor | 40-70% |
-| Plain text | Text with no stronger signal | TextCrusher | 30-60% |
-| Anything else | ML fallback | Kompress | varies |
+| JSON arrays | Valid JSON with array elements | SmartCrusher | Varies with redundancy -- measured 26-54% on realistic (non-duplicate) tool-output arrays of 100-10,000 items; highly repetitive arrays compress far more. See `benchmarks/compression_benchmark.py`. |
+| Source code | Syntax patterns, indentation, keywords | Kompress via the library `compress()`/`HeadroomClient` path (`enable_code_aware` defaults to `False` there); CodeAwareCompressor via `headroom proxy` (`HEADROOM_CODE_AWARE_ENABLED` defaults to on) | workload-dependent |
+| Search results | `file:line:content` format | SearchCompressor | 80-95% (measured ~91% on a synthetic 40-file ripgrep-style corpus) |
+| Build/test logs | Timestamps, log levels, pytest/npm markers | LogCompressor | 85-95% (measured ~93% on a synthetic 1,000-line log with clustered errors) |
+| Diffs | Unified diff format | DiffCompressor | 60-80% (measured ~70% on a multi-file diff with default `max_context_lines`/`max_hunks_per_file` limits) |
+| HTML | Tag structure | HTMLExtractor | 70-90% (module docstring; measured ~81% on a synthetic nav/ads/script-heavy page) |
+| Tabular (CSV/TSV/markdown tables) | Delimited rows / table syntax | TabularCompressor | Varies with redundancy -- TabularCompressor bridges to SmartCrusher, so it inherits the same range (measured 26-28% on non-duplicate rows) |
+| Structured config (YAML/TOML/INI) | Config syntax | ConfigCompressor | 40-70% (measured ~50% on a commented/blank-line-heavy YAML file) |
+| Plain text | Text with no stronger signal | Kompress | workload-dependent |
+| Anything else | Fallback chain, then passthrough if no safe saving is found | Kompress / passthrough | varies |
 
 ## Quick Start
 
@@ -61,9 +61,13 @@ console.log(`Compression ratio: ${result.compressionRatio}`);
 ```python
 from headroom import compress
 
-result = compress(content)
-print(result.compressed)
-print(f"Saved {result.savings_percentage:.0f}% tokens")
+messages = [
+    {"role": "user", "content": "Summarize the tool output."},
+    {"role": "tool", "tool_call_id": "call_1", "content": large_output},
+]
+result = compress(messages, model="gpt-4o")
+print(result.messages)
+print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 ```
 </Tab>
 </Tabs>
@@ -87,22 +91,18 @@ console.log(`Transforms: ${result.transformsApplied.join(", ")}`);
 </Tab>
 <Tab value="Python">
 ```python
-# Advanced / Internal API -- prefer `from headroom import compress` for typical use
-from headroom.compression import UniversalCompressor, UniversalCompressorConfig
+from headroom import CompressConfig, compress
 
-config = UniversalCompressorConfig(
-    compression_ratio_target=0.5,  # Keep 50% of content
-    use_entropy_preservation=True,  # Preserve UUIDs, hashes
-    use_magika=True,                # ML-based content detection
-    ccr_enabled=True,               # Store originals for retrieval
+config = CompressConfig(
+    compress_user_messages=True,
+    protect_recent=0,
+    target_ratio=0.5,             # Kompress keep ratio; structural compressors use their own rules
+    min_tokens_to_compress=250,
 )
 
-compressor = UniversalCompressor(config=config)
-result = compressor.compress(content)
-
-print(f"Type: {result.content_type}")
-print(f"Handler: {result.handler_used}")
-print(f"Saved: {result.savings_percentage:.0f}%")
+result = compress(messages, model="gpt-4o", config=config)
+print(f"Saved: {result.tokens_saved} tokens")
+print(result.transforms_applied)
 ```
 </Tab>
 </Tabs>
@@ -120,44 +120,50 @@ Headroom doesn't blindly truncate. It identifies what matters in each content ty
 
 ## Real Compression Ratios
 
-| Content Type | Compression | Speed | What's Preserved |
-|---|---|---|---|
-| JSON (large arrays) | 70-90% | ~1ms | All keys, structure |
-| Source code (Python) | 50-70% | ~10ms | Signatures, imports |
-| Search results | 80-95% | ~2ms | Relevant matches |
-| Build logs | 85-95% | ~3ms | Errors, stack traces |
-| Plain text | 60-80% | ~5ms | High-entropy tokens |
+Compression ratio and latency both depend heavily on the shape of the input
+(how redundant the data is, how large the payload is, and -- for Kompress --
+what `target_ratio` is configured). There's no single number that holds
+across workloads, so treat the ranges in the table above as directional and
+reproduce them on your own traffic with the harnesses in
+[`benchmarks/`](https://github.com/headroomlabs-ai/headroom/tree/main/benchmarks)
+(for example `compression_benchmark.py`, `bench_transforms.py`,
+`text_crusher_quality_eval.py`). What stays constant across content types is
+*what's preserved*:
 
-## Batch Compression
+| Content Type | What's Preserved |
+|---|---|
+| JSON (large arrays) | All keys, structure |
+| Source code (Python) | Signatures, imports |
+| Search results | Relevant matches |
+| Build logs | Errors, stack traces |
+| Plain text | High-entropy tokens |
 
-For multiple contents, batch compression is more efficient:
+## Compressing multiple documents
+
+The public `compress()` API accepts an LLM message list. Put documents in
+separate messages or call it once per independent request; this preserves the
+same message shape you will send to the provider:
 
 ```python
-# Advanced / Internal API -- prefer `from headroom import compress` for typical use
-from headroom.compression import UniversalCompressor
+from headroom import compress
 
-compressor = UniversalCompressor()
-
-contents = [
-    '{"users": [...]}',
-    'def hello(): pass',
-    'Plain text content',
+messages = [
+    {"role": "user", "content": "Compare these documents."},
+    {"role": "tool", "tool_call_id": "doc_1", "content": first_document},
+    {"role": "tool", "tool_call_id": "doc_2", "content": second_document},
 ]
-
-results = compressor.compress_batch(contents)
-
-for result in results:
-    print(f"{result.content_type}: {result.savings_percentage:.0f}% saved")
+result = compress(messages, model="gpt-4o")
 ```
 
 ## What Happens Under the Hood
 
 When you call `compress()`, here is the full sequence:
 
-1. **Content detection** -- Magika (ML-based) or pattern matching identifies the content type
-2. **Structure extraction** -- A handler extracts a structure mask marking what to preserve
-3. **Compression** -- Non-structural content is compressed (SmartCrusher, Kompress ML, or text utilities like TextCrusher)
-4. **CCR storage** -- If enabled, the original is stored for retrieval when the LLM needs full context
+1. **Safety gates** -- protected tools, recent turns, frozen cache prefixes, and minimum-size rules decide what may change.
+2. **Content detection** -- Magika when available plus deterministic pattern matching identifies the content type.
+3. **Structural compression** -- format-specific handlers compact JSON, logs, search results, tables, configuration, HTML, and other recognized structures.
+4. **Fallback compression** -- Kompress handles eligible text when its runtime is available; a no-saving or failed transform passes the original through.
+5. **CCR storage in proxy flows** -- when CCR is enabled, originals for marker-bearing compression are retained for later retrieval. `--lossless` and `--no-ccr` intentionally use different contracts; see [Reversible Compression](/docs/ccr).
 
 <Callout type="info" title="Zero-config by default">
   The pipeline works out of the box with no configuration. All detection, routing, and compression happens automatically. Configuration is available when you need fine-grained control.
