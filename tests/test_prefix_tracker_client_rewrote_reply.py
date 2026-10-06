@@ -93,3 +93,21 @@ def test_earlier_history_edit_is_still_a_divergence():
         )
         is None
     )
+
+
+def test_debug_dump_is_owner_only_even_if_it_exists(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from headroom.proxy.handlers.anthropic import _dump_prefix_mismatch
+
+    monkeypatch.setenv("HEADROOM_DEBUG_PREFIX_MISMATCH", str(tmp_path))
+    existing = tmp_path / "req1.json"
+    existing.write_text("{}")
+    os.chmod(existing, 0o644)  # left world-readable by an earlier run
+
+    _dump_prefix_mismatch("req1", [USER, CLIENT_REPLY], [USER, RAW_REPLY])
+    _dump_prefix_mismatch("req2", [USER, CLIENT_REPLY], [USER, RAW_REPLY])
+
+    for name in ("req1.json", "req2.json"):
+        assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o600, name
