@@ -32,12 +32,49 @@ import logging
 from threading import RLock
 from typing import TYPE_CHECKING, Any
 
+from ..offline import OFFLINE_ENV, OfflineEgressBlocked
 from .config import ML_MODEL_DEFAULTS
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+class ModelUnavailableOffline(RuntimeError):
+    """A model is not in the local cache and ``HEADROOM_OFFLINE`` forbids fetching it.
+
+    The legible form of an air-gap refusal at a model-loader boundary. Fetching
+    public weights is not data leaving the box, so the loader degrades instead
+    of failing the request: every caller of this registry already treats a
+    load failure as "feature unavailable" (the image router preserves the
+    image, the memory embedder falls back, ...). The original
+    :class:`~headroom.offline.OfflineEgressBlocked` is chained.
+    """
+
+    def __init__(self, purpose: str, name_or_path: str) -> None:
+        self.purpose = purpose
+        self.name_or_path = name_or_path
+        super().__init__(
+            f"{purpose} {name_or_path!r} is not in the local HuggingFace cache and "
+            f"{OFFLINE_ENV} forbids downloading it. Pre-seed the cache to use this feature."
+        )
+
+
+def _load_local_first(loader: Any, name_or_path: str, *, purpose: str, **kwargs: Any) -> Any:
+    """Cache-first load with the air-gap refusal translated and logged.
+
+    Thin wrapper over :func:`headroom.onnx_runtime.hf_from_pretrained_local_first`
+    (the one place the cache-first + ``guard_egress`` order lives).
+    """
+    from ..onnx_runtime import hf_from_pretrained_local_first
+
+    try:
+        return hf_from_pretrained_local_first(loader, name_or_path, purpose=purpose, **kwargs)
+    except OfflineEgressBlocked as blocked:
+        unavailable = ModelUnavailableOffline(purpose, name_or_path)
+        logger.warning("%s (%s)", unavailable, blocked)
+        raise unavailable from blocked
 
 
 class MLModelRegistry:
@@ -168,7 +205,12 @@ class MLModelRegistry:
                 if device is None:
                     device = cls._detect_device()
 
-                model = SentenceTransformer(model_name, device=device)
+                model = _load_local_first(
+                    SentenceTransformer,
+                    model_name,
+                    purpose="SentenceTransformer model",
+                    device=device,
+                )
                 instance._models[key] = model
                 logger.info(f"Loaded SentenceTransformer: {model_name} on {device}")
 
@@ -207,8 +249,12 @@ class MLModelRegistry:
                 if device is None:
                     device = cls._detect_device()
 
-                model = AutoModel.from_pretrained(model_name)
-                processor = AutoProcessor.from_pretrained(model_name)
+                model = _load_local_first(
+                    AutoModel.from_pretrained, model_name, purpose="SigLIP model"
+                )
+                processor = _load_local_first(
+                    AutoProcessor.from_pretrained, model_name, purpose="SigLIP processor"
+                )
 
                 # Move to device and set eval mode
                 if device != "cpu":
@@ -295,8 +341,16 @@ class MLModelRegistry:
                 if device is None:
                     device = cls._detect_device()
 
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
-                model = AutoModelForSequenceClassification.from_pretrained(model_path)
+                tokenizer = _load_local_first(
+                    AutoTokenizer.from_pretrained,
+                    model_path,
+                    purpose="technique-router tokenizer",
+                )
+                model = _load_local_first(
+                    AutoModelForSequenceClassification.from_pretrained,
+                    model_path,
+                    purpose="technique-router model",
+                )
 
                 # Move to device and set eval mode
                 if device != "cpu":

@@ -544,6 +544,25 @@ def _caller_key_travels_to(model: str, key: str) -> bool:
     return provider not in _REJECTS_ANTHROPIC_KEY
 
 
+def _caller_key_from_headers(headers: dict[str, str]) -> str:
+    """Extract the caller's API key from inbound request headers.
+
+    The ``Authorization`` auth-scheme token is case-insensitive per RFC 7235
+    §2.1, so ``Authorization: bearer <key>`` must be read the same as
+    ``Bearer <key>``. A case-sensitive ``startswith("Bearer ")`` dropped the
+    credential for a lowercase (or otherwise differently-cased) scheme, and the
+    request then fell back to the target provider's env key — which may not
+    exist, yielding a spurious upstream 401. Only the scheme is case-folded; the
+    credential itself is returned verbatim. Falls back to ``x-api-key`` when the
+    header carries no bearer credential (matching the prior behavior).
+    """
+    auth_header = headers.get("authorization", headers.get("Authorization", ""))
+    scheme, sep, credentials = auth_header.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        return credentials
+    return headers.get("x-api-key", "")
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -555,6 +574,44 @@ def get_provider_config(provider: str) -> ProviderConfig:
         model_map={},
         pass_through=True,
     )
+
+
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+}
+
+_OPENAI_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "invalid_api_key",
+    403: "permission_error",
+    404: "model_not_found",
+    413: "invalid_request_error",
+    422: "invalid_request_error",
+    429: "rate_limit_exceeded",
+}
+
+
+def _upstream_client_error(exc: Exception, error_types: dict[int, str]) -> tuple[int, str] | None:
+    """Map a LiteLLM exception's own 4xx ``status_code`` to ``(status, error type)``.
+
+    A 4xx status outside ``error_types`` keeps its status with the generic
+    ``invalid_request_error`` type. Returns None when the exception carries no
+    4xx status, so the caller falls back to matching on the message.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    if status in error_types:
+        return status, error_types[status]
+    if 400 <= status <= 499:
+        return status, "invalid_request_error"
+    return None
 
 
 def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
@@ -606,8 +663,8 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def _convert_tool_choice(choice: Any) -> Any:
     """Convert Anthropic tool_choice to OpenAI format.
 
-    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "tool", "name": "..."}
-    OpenAI:    "auto", "required", {"type": "function", "function": {"name": "..."}}
+    Anthropic: {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "..."}
+    OpenAI:    "auto", "required", "none", {"type": "function", "function": {"name": "..."}}
     """
     if isinstance(choice, str):
         return choice
@@ -617,6 +674,13 @@ def _convert_tool_choice(choice: Any) -> Any:
             return "auto"
         if choice_type == "any":
             return "required"
+        if choice_type == "none":
+            # Anthropic's {"type": "none"} means "do not use any tool this turn".
+            # Without this branch it fell through to the "auto" default below,
+            # inverting the instruction into "you may use tools" — the model
+            # could then call a tool the client explicitly forbade. OpenAI's
+            # equivalent is the string "none".
+            return "none"
         if choice_type == "tool":
             return {"type": "function", "function": {"name": choice.get("name", "")}}
     return "auto"
@@ -1245,12 +1309,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1284,7 +1343,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _ANTHROPIC_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "authentication_error"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
@@ -1368,12 +1430,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1424,6 +1481,14 @@ class LiteLLMBackend(Backend):
             final_input_tokens = 0
             final_cache_read_tokens = 0
             final_cache_write_tokens = 0
+            # Real output-token count from the trailing usage chunk. The
+            # ``output_tokens`` counter incremented per content_block_delta below
+            # is only a delta *count* (one per SSE chunk), which undercounts the
+            # true token total several-fold. Prefer the provider's
+            # completion_tokens when the usage chunk carries it, exactly like the
+            # non-streaming path (_anthropic_usage_from_litellm), and fall back to
+            # the delta count only when no usage chunk arrives.
+            final_output_tokens = 0
 
             # Extended thinking is BUFFERED, not streamed live. A thinking block
             # is only legal to replay if it leads the turn and carries a real
@@ -1526,6 +1591,7 @@ class LiteLLMBackend(Backend):
                     final_cache_write_tokens = int(
                         getattr(cu, "cache_creation_input_tokens", 0) or 0
                     )
+                    final_output_tokens = int(getattr(cu, "completion_tokens", 0) or 0)
 
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
@@ -1662,9 +1728,21 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
-            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            delta_usage: dict[str, Any] = {"output_tokens": final_output_tokens or output_tokens}
             if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
-                delta_usage["input_tokens"] = final_input_tokens
+                # LiteLLM's prompt_tokens is the *total* prompt size, inclusive
+                # of the cache-read and cache-write tokens (Bedrock reports raw
+                # inputTokens and LiteLLM's AmazonConverseConfig._transform_usage
+                # adds cacheReadInputTokens + cacheWriteInputTokens onto it).
+                # Anthropic's input_tokens must exclude both, since the cache
+                # fields below report them separately and clients treat the three
+                # buckets as disjoint. Without the subtraction a cached streaming
+                # turn double-counts the cached prefix in input_tokens at the full
+                # input rate. Mirrors the non-streaming path in
+                # _anthropic_usage_from_litellm (#1345 / #1848).
+                delta_usage["input_tokens"] = max(
+                    final_input_tokens - final_cache_read_tokens - final_cache_write_tokens, 0
+                )
                 if final_cache_read_tokens:
                     delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
                 if final_cache_write_tokens:
@@ -1755,12 +1833,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1897,7 +1970,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _OPENAI_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "invalid_api_key"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
@@ -1967,12 +2043,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key

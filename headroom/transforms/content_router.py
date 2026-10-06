@@ -63,6 +63,7 @@ from ..config import (
     is_tool_excluded,
     unwrap_tool_call,
 )
+from ..offline import OfflineEgressBlocked
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
 from ..tokenizers.base import count_content_blocks
@@ -1185,7 +1186,7 @@ def _detect_content(content: str) -> DetectionResult:
         # "json_array"); translate to the Python `ContentType` enum so
         # downstream mapping keys match.
         content_type = ContentType(rust_result.content_type)
-    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+    except (KeyboardInterrupt, SystemExit, GeneratorExit, OfflineEgressBlocked):
         raise
     except BaseException as exc:  # noqa: BLE001
         # A native Rust panic surfaces as pyo3_runtime.PanicException, which
@@ -1194,7 +1195,9 @@ def _detect_content(content: str) -> DetectionResult:
         # (panic, or an unrecognized content-type tag) degrades to the
         # pure-Python detector instead of aborting the request. See #1123.
         # Guard: don't swallow cancellation/control-flow BaseExceptions such
-        # as asyncio.CancelledError — keep them propagating.
+        # as asyncio.CancelledError — keep them propagating. OfflineEgressBlocked
+        # is in that list for the same reason: it is a policy refusal, not a
+        # detector failure, and degrading it here would hide the air-gap switch.
         if isinstance(exc, asyncio.CancelledError):
             raise
         if isinstance(exc, TimeoutError):
@@ -2394,6 +2397,27 @@ class ContentRouter(Transform):
             self._runtime_state_var.set(state)
         return state
 
+    def share_request_deadline(self, started_at: float) -> bool:
+        """Join a request whose kompress deadline started at ``started_at``.
+
+        ``apply()`` stamps its own origin. A caller that fans ONE request out
+        over many ``compress()`` calls (the OpenAI Responses unit adapter) calls
+        this before each one instead, so every call draws down the same
+        ``HEADROOM_COMPRESSION_DEADLINE_MS`` budget rather than restarting it.
+        Binds a fresh ``_PerRequestRuntimeState`` in the CURRENT Context, so a
+        worker-pool task must run in its own ``contextvars.copy_context()``.
+
+        Returns ``False``, binding nothing, once the deadline has passed: the
+        caller should leave the content unchanged rather than start new work.
+        """
+        deadline_s = _compression_deadline_seconds()
+        if deadline_s and time.perf_counter() - started_at > deadline_s:
+            return False
+        self._runtime_state_var.set(
+            _PerRequestRuntimeState(kompress_deadline_started_at=started_at)
+        )
+        return True
+
     @property
     def _runtime_compression_policy(self) -> Any:
         return self._runtime_state_var.get().compression_policy
@@ -3493,6 +3517,12 @@ class ContentRouter(Transform):
                 name,
                 type(out).__name__,
             )
+            return None
+        # A passthrough (``compressed=False``) is the compressor declining this
+        # block, not a result; fall back so the built-in path still gets its
+        # turn instead of the block going out uncompressed.
+        if not out.compressed:
+            logger.debug("external compressor %r passed through; falling back to built-in", name)
             return None
         compressed = out.content
         # Never blank out a non-empty block (an empty user/tool block makes
@@ -5500,7 +5530,7 @@ class ContentRouter(Transform):
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
         )
-        min_tokens = kwargs.get("min_tokens_to_compress", 50)
+        min_tokens = int(kwargs.get("min_tokens_to_compress", 50) or 50)
         # Cache-safety knobs for content-block (Anthropic-format) handling:
         compress_assistant_text_blocks = kwargs.get(
             "compress_assistant_text_blocks",

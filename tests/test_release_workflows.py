@@ -210,7 +210,39 @@ def test_docker_bake_metadata_never_travels_through_env() -> None:
         if step.get("name") == "Export digest"
     )
     assert "<<'__HEADROOM_BAKE_META_EOF__'" in export["run"]
-    assert "${{ steps.bake.outputs.metadata }}" in export["run"]
+    assert (
+        "${{ steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata }}"
+        in export["run"]
+    )
+
+
+def test_docker_build_cache_failures_are_best_effort() -> None:
+    """A missing remote cache blob must not block publishing an image."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "docker.yml").read_text())
+    build_steps = workflow["jobs"]["docker-build"]["steps"]
+    cached = next(step for step in build_steps if step.get("id") == "bake")
+    fallback_builder = next(step for step in build_steps if step.get("id") == "fallback-buildx")
+    fallback = next(step for step in build_steps if step.get("id") == "bake-fallback")
+    digest = next(step for step in build_steps if step.get("id") == "digest")
+
+    cached_overrides = cached["with"]["set"].splitlines()
+    fallback_overrides = fallback["with"]["set"].splitlines()
+    cache_to = next(line for line in cached_overrides if ".cache-to=" in line)
+
+    assert cached["continue-on-error"] is True
+    assert "ignore-error=true" in cache_to
+    assert fallback_builder["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback_builder["uses"] == "docker/setup-buildx-action@v4"
+    assert fallback["if"] == "steps.bake.outcome == 'failure'"
+    assert fallback["uses"] == cached["uses"]
+    assert fallback["with"]["builder"] == "${{ steps.fallback-buildx.outputs.name }}"
+    assert fallback["with"]["no-cache"] is True
+    assert not any(".cache-from=" in line for line in fallback_overrides)
+    assert not any(".cache-to=" in line for line in fallback_overrides)
+    assert (
+        "steps.bake.outcome == 'success' && steps.bake.outputs.metadata || steps.bake-fallback.outputs.metadata"
+        in digest["run"]
+    )
 
 
 def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
@@ -245,7 +277,8 @@ def test_docker_latest_promotion_is_owned_by_root_manifest_cell() -> None:
     assert '"${IMAGE}:${VERSION}"' in command
     assert "promote-latest" not in jobs
     assert manifest["needs"] == "docker-build"
-    assert manifest["if"] == "${{ always() }}"
+    # Publishing requires every architecture's digest, including after cancellation.
+    assert manifest["if"] == "${{ success() }}"
     step_names = [step["name"] for step in manifest["steps"]]
     assert step_names.index("Sign multi-arch index manifest with cosign") < step_names.index(
         "Re-tag root image as :latest"
@@ -1210,7 +1243,7 @@ def test_release_workflow_has_smoke_import_wheel_gate() -> None:
         # ubuntu:22.04 + Python 3.12.
         'image: "ubuntu:22.04"',
         # macOS native (no container) — Apple Silicon wheel.
-        "runner: macos-14",
+        "runner: macos-26",
     ]
     for sub in required_matrix_substrings:
         assert sub in content, (

@@ -85,6 +85,39 @@ async def test_worker_timeout_fails_open(monkeypatch) -> None:
     assert recovered_result is not None
 
 
+async def test_worker_timeout_kills_the_abandoned_worker(monkeypatch) -> None:
+    # shutdown(wait=False) alone left the worker running the abandoned call to
+    # the end while the next request cold-started a fresh worker beside it.
+    messages = _messages()
+    monkeypatch.setattr(image_isolation, "_IMAGE_WORKER", image_isolation._success_worker)
+    await image_isolation.run_image_compression_isolated(messages, provider="openai", timeout=30.0)
+    (worker,) = image_isolation._IMAGE_POOL._processes.values()
+
+    monkeypatch.setattr(image_isolation, "_IMAGE_WORKER", image_isolation._hang_worker)
+    returned, result = await image_isolation.run_image_compression_isolated(
+        messages,
+        provider="openai",
+        timeout=0.5,
+    )
+
+    assert returned is messages
+    assert result is None
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+
+
+def test_late_failure_leaves_a_rebuilt_pool_alone() -> None:
+    # A call that fails after another request already replaced its pool must
+    # not drop (and kill the worker of) the replacement.
+    old = image_isolation._image_pool()
+    image_isolation._reset_image_pool(old)
+    rebuilt = image_isolation._image_pool()
+
+    image_isolation._reset_image_pool(old)
+
+    assert image_isolation._IMAGE_POOL is rebuilt
+
+
 async def test_worker_success_returns_compressed(monkeypatch) -> None:
     messages = _messages()
     monkeypatch.setattr(image_isolation, "_IMAGE_WORKER", image_isolation._success_worker)

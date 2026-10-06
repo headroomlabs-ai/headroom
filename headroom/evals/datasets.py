@@ -28,10 +28,14 @@ Custom:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from headroom.evals.core import EvalCase, EvalSuite
+from headroom.offline import guard_egress, is_offline
+
+logger = logging.getLogger(__name__)
 
 
 def _check_datasets_installed() -> None:
@@ -43,6 +47,36 @@ def _check_datasets_installed() -> None:
             "HuggingFace datasets required for this loader. "
             "Install with: pip install headroom-ai[evals]"
         ) from e
+
+
+def load_hf_dataset(path: str, *args: Any, **kwargs: Any) -> Any:
+    """``datasets.load_dataset``, cache first under ``HEADROOM_OFFLINE``.
+
+    ``load_dataset`` takes no ``local_files_only``, and with an explicit
+    ``HF_HUB_OFFLINE=0`` it fetches from the Hub even when ``HEADROOM_OFFLINE``
+    is set. So, as ``relevance/embedding._load_text_embedding`` does for
+    fastembed: under the switch, try the load with the datasets and
+    huggingface_hub offline constants forced on (a pre-seeded cache still
+    loads), and only on a miss reach :func:`guard_egress`, which refuses
+    before any remote attempt. Online, nothing changes.
+    """
+    from datasets import load_dataset
+
+    if is_offline():
+        import datasets.config as datasets_config
+        from huggingface_hub import constants as hf_constants
+
+        previous = (datasets_config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE)
+        datasets_config.HF_HUB_OFFLINE = True
+        hf_constants.HF_HUB_OFFLINE = True
+        try:
+            return load_dataset(path, *args, **kwargs)
+        except Exception as cache_miss:  # noqa: BLE001 - any local-lookup failure
+            logger.debug("eval dataset %s not in the local cache: %s", path, cache_miss)
+        finally:
+            datasets_config.HF_HUB_OFFLINE, hf_constants.HF_HUB_OFFLINE = previous
+    guard_egress(f"HuggingFace eval-dataset download ({path})", "huggingface.co")
+    return load_dataset(path, *args, **kwargs)
 
 
 # =============================================================================
@@ -69,9 +103,8 @@ def load_hotpotqa(
         EvalSuite with HotpotQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split=split)
+    ds = load_hf_dataset("hotpotqa/hotpot_qa", "fullwiki", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -121,9 +154,8 @@ def load_natural_questions(
         EvalSuite with Natural Questions cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("google-research-datasets/natural_questions", "default", split=split)
+    ds = load_hf_dataset("google-research-datasets/natural_questions", "default", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -198,9 +230,8 @@ def load_triviaqa(
         EvalSuite with TriviaQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("trivia_qa", subset, split=split)
+    ds = load_hf_dataset("trivia_qa", subset, split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -269,9 +300,8 @@ def load_msmarco(
         EvalSuite with MS MARCO cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("microsoft/ms_marco", "v2.1", split=split)
+    ds = load_hf_dataset("microsoft/ms_marco", "v2.1", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -337,9 +367,8 @@ def load_squad(
         EvalSuite with SQuAD cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("rajpurkar/squad_v2", split=split)
+    ds = load_hf_dataset("rajpurkar/squad_v2", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -398,10 +427,9 @@ def load_longbench(
         EvalSuite with LongBench cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("THUDM/LongBench", task, split="test")
+        ds = load_hf_dataset("THUDM/LongBench", task, split="test")
     except Exception as e:
         raise ValueError(f"Failed to load LongBench task '{task}': {e}") from e
 
@@ -460,10 +488,9 @@ def load_multi_wiki_qa(
         EvalSuite with multi-wiki-qa cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("alexandrainst/multi-wiki-qa", lang, split=f"train[:{n}]")
+        ds = load_hf_dataset("alexandrainst/multi-wiki-qa", lang, split=f"train[:{n}]")
     except Exception as e:
         raise ValueError(f"Failed to load multi-wiki-qa '{lang}': {e}") from e
 
@@ -513,9 +540,8 @@ def load_narrativeqa(
         EvalSuite with NarrativeQA cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("deepmind/narrativeqa", split=split)
+    ds = load_hf_dataset("deepmind/narrativeqa", split=split)
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):
@@ -590,6 +616,7 @@ def load_bfcl(
     import urllib.request
 
     base_url = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+    guard_egress("BFCL eval-dataset download", base_url)
     data_file = f"BFCL_v3_{category}.json"
     gt_file = f"possible_answer/BFCL_v3_{category}.json"
 
@@ -676,10 +703,9 @@ def load_toolbench(
         EvalSuite with ToolBench cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("ToolBench/ToolBench", category, split="test")
+        ds = load_hf_dataset("ToolBench/ToolBench", category, split="test")
     except Exception as e:
         raise ValueError(f"Failed to load ToolBench category '{category}': {e}") from e
 
@@ -759,10 +785,9 @@ def load_codesearchnet(
         EvalSuite with CodeSearchNet cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
     try:
-        ds = load_dataset("code_search_net", language, split=split)
+        ds = load_hf_dataset("code_search_net", language, split=split)
     except Exception as e:
         raise ValueError(f"Failed to load CodeSearchNet for '{language}': {e}") from e
 
@@ -815,9 +840,8 @@ def load_humaneval(
         EvalSuite with HumanEval cases
     """
     _check_datasets_installed()
-    from datasets import load_dataset
 
-    ds = load_dataset("openai_humaneval", split="test")
+    ds = load_hf_dataset("openai_humaneval", split="test")
 
     cases: list[EvalCase] = []
     for i, item in enumerate(ds):

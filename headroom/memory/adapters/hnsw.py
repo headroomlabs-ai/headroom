@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ...fileperms import ensure_private_file, open_owner_only
 from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
@@ -812,8 +813,11 @@ class HNSWVectorIndex:
         path = Path(path)
 
         with self._lock:
-            # Save HNSW index
+            # Save HNSW index. hnswlib opens the path itself and would create
+            # it at the umask, so make it a private regular file first (refusing
+            # a symlink); its truncating write keeps the 0600 mode.
             hnsw_path = path.with_suffix(".hnsw")
+            ensure_private_file(hnsw_path, what="HNSW index")
             self._index.save_index(str(hnsw_path))
 
             # Save metadata, mappings, and embeddings
@@ -834,7 +838,9 @@ class HNSWVectorIndex:
                 "embeddings": {mid: emb.tolist() for mid, emb in self._embeddings.items()},
             }
 
-            with open(meta_path, "w") as f:
+            # Memory metadata and raw embeddings: owner-only, like every other
+            # memory store file.
+            with open_owner_only(meta_path, "w") as f:
                 json.dump(meta_data, f)
 
     def load_index(self, path: str | Path) -> None:

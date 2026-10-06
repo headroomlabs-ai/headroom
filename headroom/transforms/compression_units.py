@@ -56,6 +56,8 @@ class CompressionUnit:
 #                      Responses handler's unit-result cache) and is surfaced
 #                      via RouterCompressionResult.cache_hit, not as a reason
 #                      here — no code path produces this category today
+# - deadline:          the request's compression deadline had passed before
+#                      this unit started, so it was left unchanged
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
@@ -66,6 +68,7 @@ UNIT_REASON_CATEGORIES = {
     "router_no_change": "compressor_noop",
     "already_compressed": "already_compressed",
     "rejected_not_smaller": "rejected_not_smaller",
+    "deadline_exceeded": "deadline",
 }
 
 
@@ -221,11 +224,17 @@ def compress_unit_with_router(
     router: ContentRouter,
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
+    deadline_started_at: float | None = None,
 ) -> UnitCompressionResult:
     """Compress one safe text unit through ContentRouter.
 
     The final accept/reject gate uses the provider/model tokenizer, not the
     router's internal word-count estimates.
+
+    ``deadline_started_at`` is the deadline origin of the request this unit
+    belongs to (see ``ContentRouter.share_request_deadline``). Once that
+    deadline has passed the unit is returned unchanged without entering the
+    router.
     """
 
     tokens_before = tokenizer.count_text(unit.text)
@@ -256,7 +265,7 @@ def compress_unit_with_router(
 
     if not unit.mutable:
         return _with_reason(reason="immutable")
-    if unit.role == "user":
+    if unit.role == "user" and unit.metadata.get("compress_user") != "true":
         return _with_reason(reason="protected_user_message")
     if unit.role in {"system", "developer"}:
         return _with_reason(reason="protected_system_message")
@@ -266,6 +275,8 @@ def compress_unit_with_router(
         return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
     if text_bytes < unit.min_bytes:
         return _with_reason(reason="below_unit_floor")
+    if deadline_started_at is not None and not router.share_request_deadline(deadline_started_at):
+        return _with_reason(reason="deadline_exceeded")
 
     prior_target_ratio = getattr(router, "_runtime_target_ratio", None)
     if target_ratio is not None:

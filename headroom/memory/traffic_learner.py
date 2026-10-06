@@ -1511,7 +1511,9 @@ class TrafficLearner:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         def _bump() -> bool:
-            conn = sqlite3.connect(str(db_path))
+            from ..fileperms import connect_private_sqlite
+
+            conn = connect_private_sqlite(db_path, what="memory store")
             try:
                 cursor = conn.execute(
                     "UPDATE memories SET metadata = json_set("
@@ -1729,12 +1731,17 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
     if not candidates:
         return None
 
+    # A path inside a worktree folded into a project belongs to that project.
     # Longest root first — most specific wins
-    roots_sorted = sorted(roots, key=lambda p: len(str(p.project_path)), reverse=True)
+    roots_sorted = sorted(
+        ((path, root) for root in roots for path in (root.project_path, *root.worktree_paths)),
+        key=lambda item: len(str(item[0])),
+        reverse=True,
+    )
 
     for cand in candidates:
-        for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/\\")
+        for path, root in roots_sorted:
+            root_str = str(path).rstrip("/\\")
             if not root_str:
                 continue
             if (
@@ -1869,6 +1876,14 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
     """
     from headroom.learn.models import Recommendation, RecommendationTarget
 
+    # Authoritative lifecycle signal for the item-level merge in the writer:
+    # every pattern the learner still holds for this project, captured before
+    # any per-category ranking or capping so that an item omitted from a
+    # rendered section is not mistaken for an expired one. `_collect_all_patterns`
+    # already dropped rows that no longer exist in memory.db, so an id missing
+    # here means the pattern is gone, not merely unrendered.
+    active_item_ids = frozenset(p.content_hash for p in patterns if p.content_hash)
+
     by_category: dict[PatternCategory, list[ExtractedPattern]] = {}
     for p in patterns:
         by_category.setdefault(p.category, []).append(p)
@@ -1890,7 +1905,15 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
             items.sort(key=lambda p: p.evidence_count, reverse=True)
         if not items:
             continue
-        bullets = "\n".join(f"- {p.content}" for p in items)
+        preserve_prior_items = category is not PatternCategory.ERROR_RECOVERY
+        bullets = "\n".join(
+            (
+                f"- {p.content} <!-- headroom:pattern-id:{p.content_hash} -->"
+                if preserve_prior_items
+                else f"- {p.content}"
+            )
+            for p in items
+        )
         recs.append(
             Recommendation(
                 target=target,
@@ -1898,6 +1921,12 @@ def _patterns_to_recommendations(patterns: list[ExtractedPattern]) -> list:
                 content=bullets,
                 confidence=max((p.importance for p in items), default=0.5),
                 evidence_count=sum(p.evidence_count for p in items),
+                preserve_prior_items=preserve_prior_items,
+                # error_recovery is rebuilt from scratch on every render and
+                # `_refine_error_recovery` deliberately drops rows, so the
+                # pre-refine set above is not its lifecycle signal; it must
+                # stay unset while that section replaces rather than merges.
+                active_item_ids=active_item_ids if preserve_prior_items else None,
             )
         )
     return recs

@@ -217,9 +217,28 @@ class TestDetectWasteSignals:
         assert signals.base64_tokens > 0
 
     def test_detect_excessive_whitespace(self, mock_tokenizer, whitespace_waste_text):
-        """Detects excessive whitespace as waste."""
+        """Detects excessive whitespace as waste.
+
+        The fixture has a 4-newline run and a 6-space run. Each run collapses
+        to a single space when normalized, so there are real savings to report:
+        ws_text "\\n\\n\\n\\n      " (10 chars -> 3 tokens) vs normalized "  "
+        (2 chars -> 1 token) = 2 tokens saved with the mock tokenizer.
+        """
         signals = detect_waste_signals(whitespace_waste_text, mock_tokenizer)
-        assert signals.whitespace_tokens >= 0  # May be 0 if normalized tokens <= matches
+        assert signals.whitespace_tokens == 2
+
+    def test_whitespace_savings_scale_with_run_length(self, mock_tokenizer):
+        """Long whitespace runs report proportionally large savings.
+
+        Regression guard: normalizing must collapse each matched run to a
+        single space, not just join the runs together (which left the runs
+        intact and made the signal always report 0).
+        """
+        text = "ERROR" + " " * 200 + "stack" + "\n" * 60 + "end"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        # 260 whitespace chars collapse to 2 spaces; with ~1 token/4 chars the
+        # savings are large and clearly non-zero.
+        assert signals.whitespace_tokens > 50
 
     def test_detect_json_bloat(self, mock_tokenizer, json_bloat_text):
         """Detects large JSON blocks as bloat."""
@@ -248,6 +267,37 @@ class TestDetectWasteSignals:
         assert signals.html_noise_tokens == 0
         assert signals.base64_tokens == 0
         assert signals.json_bloat_tokens == 0
+
+    def test_html_comment_counted_once(self, mock_tokenizer):
+        """A comment matches both HTML_TAG_PATTERN and HTML_COMMENT_PATTERN;
+        it must contribute its token count once, not twice."""
+        comment = "<!--" + "x" * 600 + "-->"
+        text = "before " + comment + " after"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_tags_inside_comments_not_counted(self, mock_tokenizer):
+        """Tags inside a comment are part of the comment, not extra noise."""
+        comment = '<!-- <img src="diagram.png" alt="chart"> -->'
+        text = "text " + comment + " end"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len(comment) // 4 + 1)
+
+    def test_mixed_tags_and_comments_counted_once_each(self, mock_tokenizer):
+        """Plain tags and comments each contribute exactly once."""
+        tag_open = '<div class="a">'
+        tag_close = "</div>"
+        comment = "<!-- note -->"
+        text = tag_open + "content" + tag_close + comment + tag_open + "more" + tag_close
+        signals = detect_waste_signals(text, mock_tokenizer)
+        expected = 2 * len(tag_open) + 2 * len(tag_close) + len(comment)
+        assert signals.html_noise_tokens == (expected // 4 + 1)
+
+    def test_plain_tags_unchanged(self, mock_tokenizer):
+        """Regular tags keep their existing count when no comments are present."""
+        text = "<div>Hello</div>"
+        signals = detect_waste_signals(text, mock_tokenizer)
+        assert signals.html_noise_tokens == (len("<div>") + len("</div>")) // 4 + 1
 
 
 # --- TestIsRagContent ---
