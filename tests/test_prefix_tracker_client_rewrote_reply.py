@@ -7,6 +7,11 @@ message was replaced by its original: a full cache re-write (observed 66.8K
 tokens per occurrence in benchmarks/tool_search_vs_native).
 """
 
+import os
+import stat
+
+import pytest
+
 from headroom.cache.prefix_tracker import extract_cache_stable_delta
 
 USER = {"role": "user", "content": "fix the bug"}
@@ -95,9 +100,8 @@ def test_earlier_history_edit_is_still_a_divergence():
     )
 
 
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="POSIX file modes only")
 def test_debug_dump_is_owner_only_even_if_it_exists(tmp_path, monkeypatch):
-    import os
-    import stat
 
     from headroom.proxy.handlers.anthropic import _dump_prefix_mismatch
 
@@ -111,3 +115,28 @@ def test_debug_dump_is_owner_only_even_if_it_exists(tmp_path, monkeypatch):
 
     for name in ("req1.json", "req2.json"):
         assert stat.S_IMODE((tmp_path / name).stat().st_mode) == 0o600, name
+
+
+def test_debug_dump_closes_its_descriptor_when_chmod_fails(tmp_path, monkeypatch):
+    # A long-running proxy must not leak a descriptor per failed debug dump.
+    from headroom.proxy.handlers import anthropic as handler
+
+    monkeypatch.setenv("HEADROOM_DEBUG_PREFIX_MISMATCH", str(tmp_path))
+    opened = []
+    real_fdopen = os.fdopen
+
+    def tracking_fdopen(fd, *args, **kwargs):
+        fh = real_fdopen(fd, *args, **kwargs)
+        opened.append(fh)
+        return fh
+
+    def failing_fchmod(fd, mode):
+        raise PermissionError("not permitted")
+
+    monkeypatch.setattr(handler.os, "fdopen", tracking_fdopen)
+    monkeypatch.setattr(handler.os, "fchmod", failing_fchmod, raising=False)
+
+    handler._dump_prefix_mismatch("req1", [USER, CLIENT_REPLY], [USER, RAW_REPLY])
+
+    assert len(opened) == 1
+    assert opened[0].closed

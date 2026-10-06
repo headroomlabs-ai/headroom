@@ -325,9 +325,11 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
         # os.open applies only when the file is created, so tighten an existing
         # file too before writing into it.
         fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        if hasattr(os, "fchmod"):  # POSIX; Windows has no POSIX modes to fix
-            os.fchmod(fd, 0o600)
+        # The context manager owns the descriptor from here, so it is closed
+        # even if tightening the mode fails.
         with os.fdopen(fd, "w") as fh:
+            if hasattr(os, "fchmod"):  # POSIX; Windows has no POSIX modes to fix
+                os.fchmod(fh.fileno(), 0o600)
             json.dump(
                 {"first_diff_index": first, "current": current, "previous": previous},
                 fh,
