@@ -6,5 +6,8 @@
   "dependencies": {
     "@openai/codex": "0.158.0",
     "openclaw": "2026.9.6"
+  },
+  "overrides": {
+    "@modelcontextprotocol/sdk": "1.32.1"
   }
 }
