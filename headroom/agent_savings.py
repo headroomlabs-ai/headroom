@@ -55,7 +55,6 @@ class AgentSavingsProfile:
     lossless_then_lossy: bool = False
     protect_reads: bool = False
     code_aware: bool = True
-    effort_router: bool = True
     lossless: bool = False
     min_chars_for_block: int | None = None
 
@@ -87,7 +86,6 @@ class AgentSavingsProfile:
             "HEADROOM_LOSSLESS_THEN_LOSSY": "1" if self.lossless_then_lossy else "0",
             "HEADROOM_PROTECT_READS": "1" if self.protect_reads else "0",
             "HEADROOM_CODE_AWARE_ENABLED": "1" if self.code_aware else "0",
-            "HEADROOM_EFFORT_ROUTER": "1" if self.effort_router else "0",
             "HEADROOM_LOSSLESS": "1" if self.lossless else "0",
         }
         # Only pin a keep-ratio when the profile sets one; workload personas
@@ -182,7 +180,6 @@ _PROFILES: dict[str, AgentSavingsProfile] = {
         lossless_then_lossy=True,
         protect_reads=True,
         code_aware=True,
-        effort_router=False,
         lossless=False,
         min_chars_for_block=25,
     ),
@@ -327,7 +324,7 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         #
         # NOTE: this does not make the profile fully config-deliverable. The
         # profile's ``cross_turn_dedup`` / ``tool_search`` / ``lossless_then_lossy``
-        # / ``protect_reads`` / ``code_aware`` / ``effort_router`` / ``lossless``
+        # / ``protect_reads`` / ``code_aware`` / ``lossless``
         # fields are still env-only, but by a different mechanism: their consumers
         # read ``os.environ`` directly (ContentRouter.__init__ for HEADROOM_DEDUPE,
         # the Anthropic handler for HEADROOM_TOOL_SEARCH) and never pass through
@@ -339,8 +336,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         if profile.min_chars_for_block is not None:
             kwargs["min_chars_for_block_compression"] = profile.min_chars_for_block
 
-    if getattr(config, "compress_user_messages", False):
-        kwargs["compress_user_messages"] = True
+    compress_user_messages = getattr(config, "compress_user_messages", None)
+    if compress_user_messages is not None:
+        kwargs["compress_user_messages"] = bool(compress_user_messages)
 
     compress_system_messages = getattr(config, "compress_system_messages", None)
     if compress_system_messages is not None:
@@ -390,7 +388,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     return kwargs
 
 
-def seed_proxy_env_defaults(env: MutableMapping[str, str] | None = None) -> None:
+def seed_proxy_env_defaults(
+    env: MutableMapping[str, str] | None = None,
+) -> frozenset[str]:
     """Seed the process env with the savings-profile defaults (default: coding).
 
     Call at proxy EXECUTABLE entry points (the ``headroom proxy`` command and the
@@ -403,9 +403,11 @@ def seed_proxy_env_defaults(env: MutableMapping[str, str] | None = None) -> None
     keep clean (unseeded) defaults and test isolation is preserved.
     """
     target = os.environ if env is None else env
+    before = set(target)
     # apply_agent_savings_env_defaults honors an explicit HEADROOM_SAVINGS_PROFILE
     # already in the env and otherwise falls back to DEFAULT_PROFILE (coding).
     apply_agent_savings_env_defaults(target)
+    return frozenset(key for key in target if key not in before)
 
 
 def with_target_savings(

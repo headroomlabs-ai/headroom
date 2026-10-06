@@ -18,14 +18,15 @@ from agno.agent import Agent
 from agno.models.openai import OpenAIChat
 from headroom.integrations.agno import HeadroomAgnoModel
 
-model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+model = HeadroomAgnoModel(wrapped_model=OpenAIChat(id="gpt-4o"))
 agent = Agent(model=model)
 
 response = agent.run("What's the capital of France?")
 
 print(f"Tokens saved: {model.total_tokens_saved}")
 print(model.get_savings_summary())
-# {'total_requests': 1, 'total_tokens_saved': 245, 'average_savings_percent': 12.3}
+# {'total_requests': 1, 'total_tokens_saved': 245, 'average_savings_percent': 12.3,
+#  'total_tokens_before': 1990, 'total_tokens_after': 1745}
 ```
 
 Works with any Agno provider:
@@ -34,8 +35,8 @@ Works with any Agno provider:
 from agno.models.anthropic import Claude
 from agno.models.google import Gemini
 
-claude_model = HeadroomAgnoModel(Claude(id="claude-sonnet-4-20250514"))
-gemini_model = HeadroomAgnoModel(Gemini(id="gemini-2.0-flash"))
+claude_model = HeadroomAgnoModel(wrapped_model=Claude(id="claude-sonnet-4-20250514"))
+gemini_model = HeadroomAgnoModel(wrapped_model=Gemini(id="gemini-2.0-flash"))
 ```
 
 ## Observability hooks
@@ -49,7 +50,7 @@ from headroom.integrations.agno import (
     HeadroomPostHook,
 )
 
-model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+model = HeadroomAgnoModel(wrapped_model=OpenAIChat(id="gpt-4o"))
 
 pre_hook = HeadroomPreHook()
 post_hook = HeadroomPostHook(token_alert_threshold=10000)
@@ -85,7 +86,7 @@ Tool outputs (JSON, logs, search results) see the biggest compression gains at 7
 ```python
 from agno.tools.duckduckgo import DuckDuckGoTools
 
-model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+model = HeadroomAgnoModel(wrapped_model=OpenAIChat(id="gpt-4o"))
 
 agent = Agent(
     model=model,
@@ -103,7 +104,7 @@ print(f"Tokens saved: {model.total_tokens_saved}")
 import asyncio
 
 async def process():
-    model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+    model = HeadroomAgnoModel(wrapped_model=OpenAIChat(id="gpt-4o"))
 
     response = await model.aresponse(messages)
 
@@ -129,7 +130,7 @@ print(f"Tokens saved: {metrics['tokens_saved']}")
 Reset metrics between sessions:
 
 ```python
-model = HeadroomAgnoModel(OpenAIChat(id="gpt-4o"))
+model = HeadroomAgnoModel(wrapped_model=OpenAIChat(id="gpt-4o"))
 
 # Session 1
 agent.run("First conversation...")

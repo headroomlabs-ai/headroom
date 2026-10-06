@@ -94,7 +94,7 @@ class TestStrategySuccessRates:
             )
 
         # Set high success rate
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.strategy_success_rates["smart_sample"] = 0.8
         pattern.optimal_strategy = "smart_sample"
 
@@ -120,7 +120,7 @@ class TestStrategySuccessRates:
             )
 
         # Set low success rate
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.strategy_success_rates["bad_strategy"] = 0.2
         pattern.optimal_strategy = "bad_strategy"
 
@@ -149,7 +149,7 @@ class TestStrategySuccessRates:
             )
 
         # Set up multiple strategies with different success rates
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.strategy_success_rates = {
             "bad_strategy": 0.2,
             "good_strategy": 0.9,
@@ -182,7 +182,7 @@ class TestPreserveFieldsMerging:
             compressed_tokens=500,
             strategy="smart_sample",
         )
-        local_pattern = fresh_toin._patterns[("unknown", "unknown", sig_hash)]
+        local_pattern = fresh_toin._patterns[("global", "unknown", "unknown", sig_hash)]
         local_pattern.preserve_fields = ["field_a", "field_b"]
 
         # Import pattern with different preserve_fields
@@ -201,7 +201,7 @@ class TestPreserveFieldsMerging:
         fresh_toin.import_patterns(import_data)
 
         # Verify merge
-        pattern = fresh_toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", sig_hash)]
         assert "field_a" in pattern.preserve_fields
         assert "field_b" in pattern.preserve_fields
         assert "field_c" in pattern.preserve_fields
@@ -222,7 +222,7 @@ class TestPreserveFieldsMerging:
             compressed_tokens=500,
             strategy="smart_sample",
         )
-        pattern = fresh_toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", sig_hash)]
         pattern.preserve_fields = [f"field_{i}" for i in range(8)]
 
         # Import with 5 more fields
@@ -240,7 +240,7 @@ class TestPreserveFieldsMerging:
         fresh_toin.import_patterns(import_data)
 
         # Should be capped at 10
-        pattern = fresh_toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", sig_hash)]
         assert len(pattern.preserve_fields) <= 10
 
 
@@ -262,7 +262,7 @@ class TestUserCountTracking:
             strategy="smart_sample",
         )
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         assert pattern.user_count == 1
         assert len(pattern._seen_instance_hashes) == 1
         assert fresh_toin._instance_id in pattern._seen_instance_hashes
@@ -283,7 +283,7 @@ class TestUserCountTracking:
                 strategy="smart_sample",
             )
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         assert pattern.user_count == 1  # Still 1
 
     def test_instance_hashes_serialized_and_loaded(self):
@@ -312,7 +312,9 @@ class TestUserCountTracking:
             # Load in new instance
             toin2 = ToolIntelligenceNetwork(TOINConfig(storage_path=storage_path))
 
-            pattern = toin2._patterns.get(("unknown", "unknown", signature.structure_hash))
+            pattern = toin2._patterns.get(
+                ("global", "unknown", "unknown", signature.structure_hash)
+            )
             assert pattern is not None
             assert pattern.user_count >= 1
             assert len(pattern._seen_instance_hashes) >= 1
@@ -348,7 +350,7 @@ class TestUserCountTracking:
 
         fresh_toin.import_patterns(import_data)
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", sig_hash)]
         # Should have local + 2 imported = 3
         assert pattern.user_count >= 3
 
@@ -377,7 +379,7 @@ class TestFieldRetrievalFrequencyWeighting:
 
         # Record retrievals for "status" field
         status_hash = fresh_toin._hash_field_name("status")
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.field_retrieval_frequency = {
             status_hash: 50,
             fresh_toin._hash_field_name("category"): 10,
@@ -406,7 +408,7 @@ class TestFieldRetrievalFrequencyWeighting:
                 strategy="smart_sample",
             )
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         field_a = fresh_toin._hash_field_name("field_a")
         field_b = fresh_toin._hash_field_name("field_b")
         field_c = fresh_toin._hash_field_name("field_c")
@@ -453,7 +455,7 @@ class TestQueryContextUsage:
             )
 
         # Low retrieval rate = aggressive compression
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.total_retrievals = 0
 
         # Query with exhaustive keyword
@@ -479,7 +481,7 @@ class TestQueryContextUsage:
                 strategy="smart_sample",
             )
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.total_retrievals = 0
 
         hint = fresh_toin.get_recommendation(signature, "find every user")
@@ -501,7 +503,7 @@ class TestQueryContextUsage:
                 strategy="smart_sample",
             )
 
-        pattern = fresh_toin._patterns[("unknown", "unknown", signature.structure_hash)]
+        pattern = fresh_toin._patterns[("global", "unknown", "unknown", signature.structure_hash)]
         pattern.total_retrievals = 0
         # Add a problematic query pattern
         pattern.common_query_patterns = ["status:*"]
