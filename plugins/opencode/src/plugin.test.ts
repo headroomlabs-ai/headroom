@@ -281,6 +281,83 @@ describe("headroomSetup (OpenCode 2.x)", () => {
     });
   });
 
+  it("keeps hosts excluded by option off the model rewrite", async () => {
+    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+    const models: FakeModel[] = [
+      { id: "zen", providerID: "opencode-go" },
+      { id: "kept", providerID: "gateway" },
+    ];
+    const { context } = pluginContextV2(
+      { proxyUrl: "http://127.0.0.1:8787", excludeHosts: [".opencode.ai"] },
+      {
+        providers: [
+          {
+            id: "opencode-go",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://opencode.ai/zen/go/v1" },
+          },
+          {
+            id: "gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: "https://gateway.example/api/v1" },
+          },
+        ],
+        models,
+      },
+    );
+
+    try {
+      const cleanup = await headroomSetup(context);
+      await cleanup?.();
+    } finally {
+      if (originalExclude === undefined) {
+        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+      } else {
+        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
+      }
+    }
+
+    expect(models[0].settings).toBeUndefined();
+    expect(models[0].headers).toBeUndefined();
+    expect(models[1]).toMatchObject({
+      settings: { baseURL: "http://127.0.0.1:8787/v1" },
+      headers: { "x-headroom-base-url": "https://gateway.example" },
+    });
+  });
+
+  it("keeps hosts excluded by environment off the model rewrite", async () => {
+    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+    process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "opencode.ai";
+    try {
+      const models: FakeModel[] = [{ id: "zen", providerID: "opencode-go" }];
+      const { context } = pluginContextV2(
+        { proxyUrl: "http://127.0.0.1:8787" },
+        {
+          providers: [
+            {
+              id: "opencode-go",
+              package: "@opencode/ai/providers/openai-compatible",
+              settings: { baseURL: "https://zen.opencode.ai/zen/go/v1" },
+            },
+          ],
+          models,
+        },
+      );
+
+      const cleanup = await headroomSetup(context);
+      await cleanup?.();
+
+      expect(models[0].settings).toBeUndefined();
+      expect(models[0].headers).toBeUndefined();
+    } finally {
+      if (originalExclude === undefined) {
+        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
+      } else {
+        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
+      }
+    }
+  });
+
   it("leaves local, already-proxied, non-OpenAI-wire and URL-less models alone", async () => {
     const models: FakeModel[] = [
       { id: "llama", providerID: "ollama" },

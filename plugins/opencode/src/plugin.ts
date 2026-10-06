@@ -6,10 +6,12 @@ import { z } from "zod";
 import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
 import {
   BASE_URL_HEADER,
+  EXCLUDE_HOSTS_ENV,
   ORIGINAL_PATH_HEADER,
   PROJECT_HEADER,
   installHeadroomTransport,
-  routesThroughProxy,
+  modelBaseRoutesThroughProxy,
+  normalizeExcludeHosts,
 } from "./transport.js";
 
 export interface HeadroomOpenCodePluginOptions {
@@ -33,6 +35,13 @@ function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
       process.env.HEADROOM_BASE_URL ??
       getDefaultProxyUrl(),
   );
+}
+
+// The exclusion list governs both the transport patch and the 2.x model
+// rewrite, so resolve it once: option over environment variable, normalized
+// the same way the transport does.
+function resolveExcludeHosts(options?: HeadroomOpenCodePluginOptions): string[] {
+  return normalizeExcludeHosts(options?.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
 }
 
 function headroomShellEnv(
@@ -72,6 +81,7 @@ function routeModelsThroughProxy(
   models: ModelEditor,
   proxyUrl: string,
   project: string,
+  excludeHosts: string[],
 ): void {
   for (const model of models.list()) {
     // DeepMutable turns the branded ID strings into object types.
@@ -81,7 +91,7 @@ function routeModelsThroughProxy(
     const suffix = openAiWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
-    if (!routesThroughProxy(baseURL, proxyUrl)) continue;
+    if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
@@ -143,15 +153,17 @@ export const headroomSetup: PluginV2.Plugin["setup"] = async (ctx) => {
   const project =
     pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
+  const excludeHosts = resolveExcludeHosts(pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    excludeHosts,
     debug: pluginOptions.debug,
   });
 
   try {
     await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project);
+      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts);
     });
     await ctx.tool.transform((editor) => {
       editor.add({

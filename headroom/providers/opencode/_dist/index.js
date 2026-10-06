@@ -12620,7 +12620,7 @@ function isExcludedHost(hostname3, excludeHosts) {
 function isLlmEndpointPath(pathname) {
   return pathname.endsWith("/chat/completions") || pathname.endsWith("/responses") || pathname.endsWith("/messages") || pathname.endsWith(":generateContent") || pathname.endsWith(":streamGenerateContent");
 }
-function shouldRoute(url2, proxy, excludeHosts) {
+function isRoutableUpstream(url2, proxy, excludeHosts) {
   if (url2.protocol !== "http:" && url2.protocol !== "https:") {
     return false;
   }
@@ -12633,11 +12633,14 @@ function shouldRoute(url2, proxy, excludeHosts) {
   if (isExcludedHost(url2.hostname, excludeHosts)) {
     return false;
   }
-  return isLlmEndpointPath(url2.pathname);
+  return true;
 }
-function routesThroughProxy(upstream, proxyUrl) {
+function shouldRoute(url2, proxy, excludeHosts) {
+  return isRoutableUpstream(url2, proxy, excludeHosts) && isLlmEndpointPath(url2.pathname);
+}
+function modelBaseRoutesThroughProxy(baseUrl, proxyUrl, excludeHosts = []) {
   try {
-    return shouldRoute(new URL(upstream), normalizeProxyUrl(proxyUrl));
+    return isRoutableUpstream(new URL(baseUrl), normalizeProxyUrl(proxyUrl), excludeHosts);
   } catch {
     return false;
   }
@@ -12911,6 +12914,9 @@ function resolveProxyUrl(options) {
     options?.proxyUrl ?? process.env.HEADROOM_PROXY_URL ?? process.env.HEADROOM_BASE_URL ?? getDefaultProxyUrl()
   );
 }
+function resolveExcludeHosts(options) {
+  return normalizeExcludeHosts(options?.excludeHosts ?? process.env[EXCLUDE_HOSTS_ENV] ?? "");
+}
 function headroomShellEnv(proxyUrl, project, options) {
   return {
     HEADROOM_ACTIVE: "1",
@@ -12927,7 +12933,7 @@ function openAiWireSuffix(pkg) {
   if (pkg.endsWith("-responses") || pkg.endsWith("/responses")) return "/responses";
   return void 0;
 }
-function routeModelsThroughProxy(models, proxyUrl, project) {
+function routeModelsThroughProxy(models, proxyUrl, project, excludeHosts) {
   for (const model of models.list()) {
     const providerID = String(model.providerID);
     const modelID = String(model.id);
@@ -12935,7 +12941,7 @@ function routeModelsThroughProxy(models, proxyUrl, project) {
     const suffix = openAiWireSuffix(model.package ?? provider?.package);
     const baseURL = model.settings?.baseURL ?? provider?.settings?.baseURL;
     if (!suffix || typeof baseURL !== "string") continue;
-    if (!routesThroughProxy(baseURL, proxyUrl)) continue;
+    if (!modelBaseRoutesThroughProxy(baseURL, proxyUrl, excludeHosts)) continue;
     const upstream = new URL(baseURL);
     models.update(providerID, modelID, (draft) => {
       draft.settings = { ...draft.settings, baseURL: `${proxyUrl}/v1` };
@@ -12984,14 +12990,16 @@ var headroomSetup = async (ctx) => {
   const proxyUrl = resolveProxyUrl(pluginOptions);
   const project = pluginOptions.project ?? ctx.location.project.id ?? ctx.location.directory;
   const retrieveTool = createHeadroomRetrieveTool({ proxyBaseUrl: proxyUrl });
+  const excludeHosts = resolveExcludeHosts(pluginOptions);
   const uninstallTransport = installHeadroomTransport({
     proxyUrl,
     project,
+    excludeHosts,
     debug: pluginOptions.debug
   });
   try {
     await ctx.model.transform((models) => {
-      routeModelsThroughProxy(models, proxyUrl, project);
+      routeModelsThroughProxy(models, proxyUrl, project, excludeHosts);
     });
     await ctx.tool.transform((editor) => {
       editor.add({
