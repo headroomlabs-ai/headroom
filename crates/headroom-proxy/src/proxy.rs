@@ -217,15 +217,7 @@ pub fn build_app(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
-        .route("/rollout/status", get(rollout_status))
-        // PR-D3: Prometheus scrape endpoint. Renders the global
-        // registry in text format. The handler is stateless — no
-        // `AppState` needed — and idempotent across concurrent
-        // scrapes (`prometheus`'s registry uses internal locking).
-        // Mounted unconditionally because it has no dependencies on
-        // any feature flag; an operator who doesn't want it scraped
-        // simply firewalls the path.
-        .route("/metrics", get(crate::observability::handle_metrics));
+        .route("/rollout/status", get(rollout_status));
 
     // Native savings stats + dashboard. Served locally (never
     // tunnelled upstream) so the Rust proxy is self-sufficient for
