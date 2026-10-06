@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 # Prompt template for LLM judge
@@ -73,6 +75,7 @@ def create_openai_judge(
             "OpenAI package required for LLM judge. Install with: pip install openai"
         ) from e
 
+    guard_egress("OpenAI API for the memory eval LLM judge", "api.openai.com")
     client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
@@ -124,6 +127,7 @@ def create_anthropic_judge(
             "Anthropic package required for LLM judge. Install with: pip install anthropic"
         ) from e
 
+    guard_egress("Anthropic API for the memory eval LLM judge", "api.anthropic.com")
     client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
 
     def judge(question: str, ground_truth: str, prediction: str) -> tuple[float, str]:
