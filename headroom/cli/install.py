@@ -23,11 +23,13 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
+from headroom.install.paths import recovery_manifest_path
 from headroom.install.planner import build_manifest, build_tool_envs
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     run_foreground,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -38,9 +40,12 @@ from headroom.install.runtime import (
 from headroom.install.state import (
     ManifestError,
     delete_manifest,
+    delete_recovery_manifest,
     list_manifests,
     load_manifest,
     save_manifest,
+    save_manifest_strict,
+    save_recovery_manifest,
 )
 from headroom.install.supervisors import (
     install_supervisor,
@@ -155,19 +160,27 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             _start_deployment(manifest, assume_start_lock=True)
             return
 
-    if probe_ready(manifest.health_url):
-        return
-    if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value and shutil.which("docker") is None:
+    docker_owned = runtime_ownership(manifest) == "docker-supervisor"
+    if docker_owned and shutil.which("docker") is None:
         raise click.ClickException(
             "Docker is required for this deployment but 'docker' was not found on PATH."
         )
-    if runtime_status(manifest) == "running":
-        if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+    status = runtime_status(manifest)
+    if status == "running" and probe_ready(manifest.health_url):
+        return
+    if status == "unknown":
+        raise click.ClickException(
+            f"Cannot start deployment '{manifest.profile}': runtime identity is unavailable."
+        )
+    if status == "running":
+        if wait_ready(
+            manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS, require_identity=True
+        ):
             return
         stop_runtime(manifest)
 
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -182,25 +195,42 @@ def _start_deployment(manifest: DeploymentManifest, *, assume_start_lock: bool =
             f"({' '.join(map(str, e.cmd)) if isinstance(e.cmd, list | tuple) else e.cmd})"
         ) from None
 
-    if not wait_ready(manifest, timeout_seconds=45):
+    if not wait_ready(manifest, timeout_seconds=45, require_identity=True):
         raise click.ClickException(
             f"Deployment '{manifest.profile}' did not become ready after start."
         )
 
 
 def _stop_deployment(manifest: DeploymentManifest) -> None:
-    if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        stop_supervisor(manifest)
-    stop_runtime(manifest)
-    # Stopping returns before the old process has finished shutting down, so it
-    # can keep answering /readyz. `_start_deployment` treats a ready endpoint as
-    # "already running" and would skip the start, leaving the deployment stopped
-    # once the old process exits. Block until it is really gone.
-    if not wait_stopped(manifest):
-        raise click.ClickException(
-            f"Deployment '{manifest.profile}' is still answering on "
-            f"{manifest.health_url} after stop."
-        )
+    errors: list[tuple[str, Exception]] = []
+    if manifest.supervisor_kind in {
+        SupervisorKind.SERVICE.value,
+        SupervisorKind.TASK.value,
+    }:
+        try:
+            stop_supervisor(manifest)
+        except Exception as exc:
+            errors.append(("supervisor stop", exc))
+    try:
+        stop_runtime(manifest)
+    except Exception as exc:
+        errors.append(("runtime stop", exc))
+    try:
+        if not wait_stopped(manifest):
+            timeout_error = click.ClickException(
+                f"Deployment '{manifest.profile}' is still answering on "
+                f"{manifest.health_url} after stop."
+            )
+            if errors:
+                errors.append(("runtime shutdown", timeout_error))
+            else:
+                raise timeout_error
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        errors.append(("runtime shutdown", exc))
+    if errors:
+        raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in errors))
 
 
 def _deactivate_deployment_mutations(
@@ -285,30 +315,75 @@ def pending_tool_envs(manifest: DeploymentManifest) -> dict[str, dict[str, str]]
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
     for target, names in sorted(_reconcile_tool_envs(manifest).items()):
         click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
-    manifest.mutations = apply_mutations(manifest)
-    save_manifest(manifest)
+    try:
+        manifest.mutations = apply_mutations(manifest)
+        _save_apply_manifest(manifest)
+    except Exception as exc:
+        if manifest.mutations:
+            try:
+                revert_mutations(manifest)
+            except Exception as rollback_exc:
+                raise RuntimeError(
+                    f"mutation activation failed: {exc}; rollback failed: {rollback_exc}"
+                ) from exc
+            else:
+                manifest.mutations = []
+        raise
+
+
+def _save_apply_manifest(manifest: DeploymentManifest) -> None:
+    """Use strict persistence for real manifests while keeping helper doubles light."""
+
+    if isinstance(manifest, DeploymentManifest):
+        save_manifest_strict(manifest)
+    else:
+        save_manifest(manifest)
+
+
+def _save_recovery_snapshot(manifest: DeploymentManifest, profile: str | None = None) -> None:
+    if isinstance(manifest, DeploymentManifest):
+        snapshot = deepcopy(manifest)
+        if profile is not None:
+            snapshot.profile = profile
+        save_recovery_manifest(snapshot)
+
+
+def _delete_recovery_snapshot(profile: str) -> None:
+    try:
+        delete_recovery_manifest(profile)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Recovery snapshot {recovery_manifest_path(profile)} could not be deleted: {exc}. "
+            "It was retained; resolve the filesystem failure and retry."
+        ) from None
 
 
 def _remove_deployment(manifest: DeploymentManifest) -> None:
+    errors: list[tuple[str, Exception]] = []
     try:
         _deactivate_deployment_mutations(manifest, persist_manifest=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(("mutation cleanup", exc))
     try:
         _stop_deployment(manifest)
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(("owner stop", exc))
     try:
         remove_supervisor(manifest)
-    except Exception:
-        pass
-    delete_manifest(manifest.profile)
+    except Exception as exc:
+        errors.append(("supervisor removal", exc))
+    if errors:
+        raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in errors))
+    try:
+        delete_manifest(manifest.profile)
+    except Exception as exc:
+        raise RuntimeError(f"manifest removal: {exc}") from exc
 
 
 def _restore_deployment(manifest: DeploymentManifest) -> None:
     restored = deepcopy(manifest)
-    restored.artifacts = install_supervisor(restored)
-    save_manifest(restored)
+    restored.artifacts = install_supervisor(restored, start=False)
+    _save_apply_manifest(restored)
     _start_deployment(restored)
     _activate_deployment_mutations(restored)
 
@@ -437,6 +512,7 @@ def _build_deployment_manifest(
     extra_env: dict[str, str] | None = None,
     supervisor_kind: str | None = None,
     extra_base_env: dict[str, str] | None = None,
+    no_rate_limit: bool = False,
 ) -> DeploymentManifest:
     manifest = build_manifest(
         profile=profile,
@@ -452,6 +528,7 @@ def _build_deployment_manifest(
         proxy_mode=proxy_mode,
         memory_enabled=memory,
         telemetry_enabled=telemetry and not no_telemetry,
+        no_rate_limit=no_rate_limit,
         image=image,
         no_http2=no_http2,
         code_aware=code_aware,
@@ -502,33 +579,99 @@ def _capture_passthrough_env(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def _apply_manifest(manifest: DeploymentManifest) -> None:
+    profile = manifest.profile
+    recovery_saved = False
+    active_persistence_failed = False
+    existing = None
     try:
-        existing = load_manifest(manifest.profile)
-    except ManifestError as e:
-        # A corrupt existing manifest shouldn't block a fresh apply; overwrite it.
-        click.echo(f"Warning: {e}; overwriting.")
-        existing = None
-    if existing is not None:
-        click.echo(f"Updating existing deployment profile '{manifest.profile}'...")
-        _remove_deployment(existing)
+        try:
+            existing = load_manifest(profile)
+        except ManifestError as e:
+            click.echo(f"Warning: {e}; overwriting.")
+        if existing is not None:
+            click.echo(f"Updating existing deployment profile '{profile}'...")
+            _save_recovery_snapshot(existing, profile)
+            recovery_saved = True
+            _remove_deployment(existing)
+    except Exception as exc:
+        recovery_detail = (
+            f" Recovery snapshot: {recovery_manifest_path(profile)} is retained; "
+            "no new owner was started."
+            if recovery_saved
+            else " No new owner was started."
+        )
+        raise click.ClickException(
+            f"Failed to prepare deployment '{profile}': {exc}.{recovery_detail}"
+        ) from exc
 
     try:
-        manifest.artifacts = install_supervisor(manifest)
-        save_manifest(manifest)
-        _start_deployment(manifest)
-        _activate_deployment_mutations(manifest)
-    except Exception as exc:
-        _remove_deployment(manifest)
-        if existing is not None:
-            click.echo(f"Restoring previous deployment '{manifest.profile}'...")
-            _restore_deployment(existing)
-        # Surface non-Click errors (OSError, CalledProcessError, ...) as a clean
-        # message rather than a raw traceback; Click errors pass through as-is.
-        if isinstance(exc, click.ClickException | click.Abort):
+        try:
+            _save_apply_manifest(manifest)
+        except Exception:
+            active_persistence_failed = True
             raise
-        raise click.ClickException(
-            f"Failed to install deployment '{manifest.profile}': {exc}"
-        ) from exc
+        manifest.artifacts = install_supervisor(manifest, start=False)
+        try:
+            _save_apply_manifest(manifest)
+        except Exception:
+            active_persistence_failed = True
+            raise
+        _start_deployment(manifest)
+        try:
+            _activate_deployment_mutations(manifest)
+        except Exception:
+            active_persistence_failed = True
+            raise
+    except Exception as exc:
+        cleanup_errors: list[Exception] = []
+        try:
+            _remove_deployment(manifest)
+        except Exception as cleanup_exc:
+            cleanup_errors.append(cleanup_exc)
+        if not cleanup_errors and not active_persistence_failed and existing is not None:
+            click.echo(f"Restoring previous deployment '{profile}'...")
+            try:
+                _restore_deployment(existing)
+            except Exception as restore_error:
+                raise click.ClickException(
+                    f"Failed to install deployment '{profile}': {exc}; "
+                    f"previous deployment restoration also failed: {restore_error}; "
+                    f"recovery snapshot: {recovery_manifest_path(profile)}; "
+                    "restore it after resolving the failure"
+                ) from exc
+            _delete_recovery_snapshot(profile)
+
+        def _recovery_detail() -> str:
+            if recovery_saved:
+                return (
+                    f"; recovery snapshot: {recovery_manifest_path(profile)}; "
+                    "remove the new owner before restoring the snapshot"
+                )
+            return ""
+
+        cleanup_detail = ""
+        if cleanup_errors:
+            cleanup_detail = "; cleanup also failed: " + " | ".join(map(str, cleanup_errors))
+        persistence_detail = (
+            "; active manifest persistence failed; keep the recovery snapshot"
+            if active_persistence_failed and recovery_saved
+            else ""
+        )
+        if isinstance(exc, click.ClickException | click.Abort):
+            if cleanup_errors or persistence_detail:
+                raise click.ClickException(
+                    f"Failed to install deployment '{profile}': {exc}"
+                    f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
+                ) from exc
+            raise
+        if cleanup_errors or persistence_detail:
+            raise click.ClickException(
+                f"Failed to install deployment '{profile}': {exc}"
+                f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
+            ) from exc
+        raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
+    if recovery_saved:
+        _delete_recovery_snapshot(profile)
 
 
 def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed persistent") -> None:
@@ -621,6 +764,18 @@ def _echo_installed(manifest: DeploymentManifest, *, prefix: str = "Installed pe
     help="Force anonymous telemetry off in the runtime (already the default).",
 )
 @click.option(
+    "--no-rate-limit",
+    "no_rate_limit",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the proxy's built-in rate limiter (default: 60 req/min). "
+        "Recommended for always-on agentic targets (Claude Code, Codex) that "
+        "burst above the default threshold. The flag is persisted in the "
+        "deployment manifest so reinstalls don't silently reintroduce throttling."
+    ),
+)
+@click.option(
     "--image",
     default="ghcr.io/headroomlabs-ai/headroom:latest",
     show_default=True,
@@ -691,6 +846,7 @@ def install_apply(
     memory: bool,
     telemetry: bool,
     no_telemetry: bool,
+    no_rate_limit: bool,
     image: str,
     no_http2: bool,
     code_aware: bool | None,
@@ -737,6 +893,7 @@ def install_apply(
         memory=memory,
         telemetry=telemetry,
         no_telemetry=no_telemetry,
+        no_rate_limit=no_rate_limit,
         image=image,
         no_http2=no_http2,
         code_aware=code_aware,
@@ -962,21 +1119,13 @@ def install_remove(profile: str) -> None:
     """Remove a persistent deployment and undo managed config."""
 
     manifest = _require_manifest(profile)
-    _deactivate_deployment_mutations(manifest, persist_manifest=False)
     try:
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            stop_supervisor(manifest)
-    except Exception:
-        pass
-    try:
-        stop_runtime(manifest)
-    except Exception:
-        pass
-    try:
-        remove_supervisor(manifest)
-    except Exception:
-        pass
-    delete_manifest(profile)
+        _remove_deployment(manifest)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Failed to remove deployment '{profile}': cleanup failed: {exc}. "
+            "The deployment manifest was retained; resolve the cleanup failure and retry."
+        ) from exc
     click.echo(f"Removed deployment '{profile}'.")
 
 
@@ -1003,7 +1152,7 @@ def install_agent_ensure(profile: str) -> None:
     """Ensure a persistent deployment is healthy, starting it when needed."""
 
     manifest = _require_manifest(profile)
-    if probe_ready(manifest.health_url):
+    if runtime_status(manifest) == "running" and probe_ready(manifest.health_url):
         click.echo(f"Deployment '{profile}' is already healthy.")
         return
     with acquire_runtime_start_lock(manifest.profile) as acquired:
@@ -1012,13 +1161,15 @@ def install_agent_ensure(profile: str) -> None:
             return
         # Double-check after acquiring the lock — another ensure may have
         # started the runtime while we waited for the lock.
-        if probe_ready(manifest.health_url):
+        if runtime_status(manifest) == "running" and probe_ready(manifest.health_url):
             click.echo(f"Deployment '{profile}' is already healthy.")
             return
         if runtime_status(manifest) == "running":
             # Runtime exists but isn't ready yet — give it a grace period
             # before deciding it's wedged and restarting.
-            if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+            if wait_ready(
+                manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS, require_identity=True
+            ):
                 click.echo(f"Deployment '{profile}' is healthy.")
                 return
             _deactivate_deployment_mutations(manifest)

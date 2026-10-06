@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from ctypes import wintypes
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
@@ -26,6 +26,7 @@ from headroom import paths
 from headroom._subprocess import run
 from headroom.copilot_linux_secret import read_copilot_oauth_token as read_linux_secret_token
 from headroom.copilot_macos_keychain import read_copilot_oauth_token as read_macos_keychain_token
+from headroom.offline import guard_egress
 from headroom.proxy import ssl_context as proxy_ssl_context
 
 logger = logging.getLogger(__name__)
@@ -79,8 +80,20 @@ _EXPIRY_KEYS = ("expires_at", "expiresAt", "expiry", "expires")
 
 
 def _urlopen(request: urllib_request.Request, *, timeout: float) -> Any:
-    """Open a GitHub request with Headroom's configured corporate trust roots."""
+    """Open a GitHub request with Headroom's configured corporate trust roots.
 
+    Every GitHub call in this module bottoms out here, so this is also the
+    backstop for the air-gap switch. The four call sites guard individually
+    too — they can name the specific step ("device-flow authorisation",
+    "token exchange") in the refusal, which this frame cannot — but a fifth
+    call site added later inherits the refusal from here whether its author
+    thought about ``HEADROOM_OFFLINE`` or not.
+    """
+
+    guard_egress(
+        "GitHub Copilot authentication",
+        urlparse(request.full_url).hostname or request.full_url,
+    )
     context = proxy_ssl_context.build_urlopen_context()
     if context is not None:
         return urllib_request.urlopen(request, timeout=timeout, context=context)
@@ -591,9 +604,19 @@ def _parse_expiry(value: Any) -> float | None:
             pass
         try:
             normalized = raw.replace("Z", "+00:00")
-            return datetime.fromisoformat(normalized).timestamp()
+            parsed = datetime.fromisoformat(normalized)
         except ValueError:
             return None
+        # A timezone-naive ISO string (no `Z`, no offset) must be read as UTC,
+        # not the host's local zone. `datetime.timestamp()` assumes local time
+        # for naive datetimes, so on a non-UTC box the same expiry resolves to a
+        # different epoch — hours early or late — silently expiring a live token
+        # or trusting a dead one. Every other ISO parser in the codebase treats
+        # naive as UTC (see telemetry/traffic_learner, proxy/memory_rank_policy);
+        # match that here.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
 
     return None
 
@@ -689,6 +712,7 @@ def start_copilot_device_authorization(
     """Start the GitHub Copilot OAuth device-code flow."""
 
     urls = _github_oauth_urls(domain)
+    guard_egress("GitHub Copilot device-flow authorisation", domain)
     body = urlencode({"client_id": COPILOT_CHAT_OAUTH_CLIENT_ID, "scope": "read:user"}).encode(
         "utf-8"
     )
@@ -720,6 +744,7 @@ def poll_copilot_device_authorization(
     """Poll GitHub until the device-code OAuth flow returns an access token."""
 
     urls = _github_oauth_urls(domain)
+    guard_egress("GitHub Copilot device-flow authorisation", domain)
     deadline = time.time() + max(1, expires_in)
     poll_interval = max(1, interval)
     while time.time() < deadline:
@@ -1413,6 +1438,7 @@ def _fetch_copilot_user_info(token: str) -> dict[str, Any] | None:
     if not token:
         return None
 
+    guard_egress("GitHub Copilot account lookup", urlparse(_user_info_url()).hostname)
     headers = _copilot_token_exchange_headers(token)
     request = urllib_request.Request(_user_info_url(), headers=headers, method="GET")
     try:
@@ -1530,6 +1556,10 @@ class CopilotTokenProvider:
 
     @staticmethod
     def _exchange_token_sync(headers: dict[str, str]) -> dict[str, Any]:
+        guard_egress(
+            "GitHub Copilot API token exchange",
+            urlparse(_token_exchange_url()).hostname,
+        )
         request = urllib_request.Request(_token_exchange_url(), headers=headers, method="GET")
         try:
             with _urlopen(request, timeout=10.0) as response:

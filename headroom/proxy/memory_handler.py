@@ -43,6 +43,7 @@ from headroom.memory.storage_router import (
     RequestContext,
     ResolvedScope,
 )
+from headroom.proxy.public_errors import tool_result_error
 
 if TYPE_CHECKING:
     from headroom.memory.backends.local import LocalBackend
@@ -240,8 +241,11 @@ class MemoryHandler:
 
             self._native_memory_dir = _paths.native_memory_dir()
 
-        # Create directory if it doesn't exist
-        self._native_memory_dir.mkdir(parents=True, exist_ok=True)
+        # Create the directory owner-only (and narrow it if an earlier run left
+        # it wider): it holds the model's memory files verbatim.
+        from headroom import fileperms as _fileperms
+
+        _fileperms.private_dir(self._native_memory_dir)
         logger.info(f"Memory: Native memory directory: {self._native_memory_dir}")
 
     def get_beta_headers(self) -> dict[str, str]:
@@ -1232,7 +1236,7 @@ your responses, not to drive new actions."""
 
         except Exception as e:
             logger.error(f"Memory: Tool {tool_name} failed: {e}")
-            return json.dumps({"status": "error", "error": str(e)})
+            return json.dumps(tool_result_error(e))
 
     async def _execute_save(
         self,
@@ -1521,7 +1525,7 @@ your responses, not to drive new actions."""
                 results = await list_fn(user_id=effective_user_id, limit=limit)
             except Exception as e:
                 logger.warning(f"Memory: list_memories failed for user {effective_user_id}: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
         else:
             try:
                 results = await backend.search_memories(
@@ -1531,7 +1535,7 @@ your responses, not to drive new actions."""
                 )
             except Exception as e:
                 logger.warning(f"Memory: list fallback search failed: {e}")
-                return json.dumps({"status": "error", "error": str(e)})
+                return json.dumps(tool_result_error(e))
 
         entries: list[dict[str, Any]] = []
         for r in results:
