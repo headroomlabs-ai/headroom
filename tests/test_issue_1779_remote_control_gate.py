@@ -19,6 +19,8 @@ import pytest
 from headroom.providers.claude.runtime import (
     REMOTE_CONTROL_GATED_MIN_VERSION,
     REMOTE_CONTROL_SIBLING_GATE_NOTE,
+    claude_auth_conflict_message,
+    claude_auth_conflict_sources,
     detect_claude_code_version,
     is_custom_anthropic_base_url,
     parse_claude_code_version,
@@ -32,6 +34,34 @@ _CUSTOM = "http://127.0.0.1:8787"
 _NATIVE = "https://api.anthropic.com"
 _GATED = REMOTE_CONTROL_GATED_MIN_VERSION  # (2, 1, 196)
 _OLD = (2, 1, 195)
+
+
+def test_claude_auth_conflict_tracks_precedence_without_returning_values() -> None:
+    conflict = claude_auth_conflict_sources(
+        ("user settings", {"ANTHROPIC_AUTH_TOKEN": "secret-token"}),
+        ("project settings", {"ANTHROPIC_API_KEY": "secret-api"}),
+        ("shell environment", {}),
+    )
+
+    assert conflict == {
+        "ANTHROPIC_API_KEY": "project settings",
+        "ANTHROPIC_AUTH_TOKEN": "user settings",
+    }
+    message = claude_auth_conflict_message(conflict)
+    assert "secret-token" not in message
+    assert "secret-api" not in message
+    assert "project settings" in message
+    assert "user settings" in message
+
+
+def test_claude_auth_conflict_higher_precedence_empty_value_clears_key() -> None:
+    assert (
+        claude_auth_conflict_sources(
+            ("settings", {"ANTHROPIC_AUTH_TOKEN": "token", "ANTHROPIC_API_KEY": "key"}),
+            ("shell", {"ANTHROPIC_API_KEY": ""}),
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,23 @@ def test_anthropic_steering_preserves_cached_prefix_block() -> None:
     assert body["system"][1] == {"type": "text", "text": steering_text(2)}
 
 
+def test_anthropic_steering_tolerates_non_string_system_block_text() -> None:
+    # A malformed client block ({"type": "text", "text": null}) must not crash
+    # `.startswith` and 500 the request; steering is still appended. The OpenAI
+    # chat sibling already guards this exact case.
+    body = {
+        "system": [
+            {"type": "text", "text": None},
+            {"type": "text", "text": "Real system prompt."},
+        ]
+    }
+
+    assert apply_verbosity_steering(body, 2) is True
+    # The malformed block is left as-is and a steering block is appended.
+    assert body["system"][0] == {"type": "text", "text": None}
+    assert body["system"][-1] == {"type": "text", "text": steering_text(2)}
+
+
 def test_openai_responses_steering_is_idempotent() -> None:
     body = {"instructions": "System."}
 

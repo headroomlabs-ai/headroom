@@ -177,7 +177,7 @@ def simulate_codex_maturation(root: Path) -> MaturationSimReport:
     """Run the maturation simulation over Codex shell-based transcripts.
 
     Codex has no structured ``Read`` tool. It reads files through
-    ``exec_command`` calls such as ``cat``, ``sed -n``, and ``rtk read``.
+    ``exec_command`` calls such as ``cat``, ``sed -n``, and ``head``.
     This mirrors ``simulate_maturation`` with the Codex command classifier
     so ``headroom audit-reads --codex --simulate-maturation`` sizes the
     same read-maturation policy from Codex traffic instead of returning an

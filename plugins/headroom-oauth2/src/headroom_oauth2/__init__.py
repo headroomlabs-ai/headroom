@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import logging
 import os
+import urllib.parse
 from typing import Any
 
 from .middleware import OAuth2Middleware
 from .provider import OAuth2ClientCredentials, OAuth2Error
 
-__all__ = ["install", "OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "parse_headers"]
-__version__ = "0.1.0"
+__all__ = ["OAuth2ClientCredentials", "OAuth2Error", "OAuth2Middleware", "install", "parse_headers"]
+__version__ = "0.1.1"
 log = logging.getLogger("headroom_oauth2")
 
 
@@ -42,6 +43,19 @@ def parse_headers(s: str | None) -> dict[str, str]:
             continue
         out[k] = v
     return out
+
+
+def _redact_url(url: str) -> str:
+    """``scheme://host[:port]`` only -- a tenant token URL can carry a query string or
+    embedded credentials, neither of which belongs in a startup log line."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or "?"
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return f"{parts.scheme}://{host}"
+    except ValueError:
+        return "<unparseable>"
 
 
 def _int(env, key):
@@ -116,7 +130,13 @@ def install(app: Any, config: Any) -> None:
             os.environ.update(_before)
             litellm.headers = {**(getattr(litellm, "headers", None) or {}), **static}
             log.info("headroom-oauth2: static upstream headers: %s", list(static))
-        except Exception as e:  # pragma: no cover
+        except (
+            ImportError,
+            AttributeError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as e:  # pragma: no cover
             log.warning("headroom-oauth2: could not set litellm.headers: %s", e)
     # The litellm backend auths bedrock/vertex/sagemaker from env and ignores a forwarded
     # bearer, so this extension is a no-op there -- warn loudly rather than silently do nothing.
@@ -131,6 +151,6 @@ def install(app: Any, config: Any) -> None:
     app.add_middleware(OAuth2Middleware, provider=provider)
     log.info(
         "headroom-oauth2: client-credentials auth installed (token_url=%s, style=%s)",
-        provider.token_url,
+        _redact_url(provider.token_url),
         provider.auth_style,
     )

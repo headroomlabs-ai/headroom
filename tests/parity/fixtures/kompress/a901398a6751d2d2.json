@@ -1,0 +1,22 @@
+{
+  "config": {
+    "chunk_words": 350,
+    "device": "auto",
+    "enable_ccr": false,
+    "model_id": "chopratejas/kompress-v2-base",
+    "score_threshold": 0.5
+  },
+  "input": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
+  "input_sha256": "a901398a6751d2d2fd3bd22de4f7962cd5e1bdbc8d84f085a5b8a283c6f629fa",
+  "output": {
+    "cache_key": null,
+    "compressed": "quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. quick brown fox jumps over lazy dog. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning. Meanwhile diligent engineer reviews compression output carefully ensure most salient tokens survive while redundant filler is discarded without losing essential meaning.",
+    "compressed_tokens": 70,
+    "compression_ratio": 0.7954545454545454,
+    "model_used": "chopratejas/kompress-v2-base",
+    "original": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. Meanwhile the diligent engineer reviews the compression output carefully to ensure the most salient tokens survive while redundant filler is discarded without losing the essential meaning. ",
+    "original_tokens": 88
+  },
+  "recorded_at": "2026-06-18T23:18:24.515863+00:00",
+  "transform": "kompress"
+}

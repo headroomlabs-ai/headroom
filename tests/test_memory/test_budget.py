@@ -67,6 +67,18 @@ class TestBudgetManager:
         if len(optimized) >= 2:
             assert optimized[0].content == "New memory"
 
+    def test_decay_does_not_inflate_future_timestamps(self, manager: MemoryBudgetManager):
+        # A future created_at (clock skew) made exp(-rate × negative) > 1, so the
+        # decayed importance rose above the original (and above 1.0) and the
+        # future memory outranked a fresh, genuinely-important one. Age is now
+        # clamped to >= 0, so a future memory decays like a brand-new one.
+        future = _make_entry("Future", importance=0.5, age_days=-30)  # created 30d ahead
+        decayed = manager._apply_decay([future])
+
+        assert decayed  # survives the min-importance filter
+        assert decayed[0].importance <= 0.5  # never inflated above the original
+        assert decayed[0].importance <= 1.0
+
     def test_access_count_boost(self, manager: MemoryBudgetManager):
         unused = _make_entry("Unused", importance=0.5, age_days=5, access_count=0)
         used = _make_entry("Heavily used", importance=0.5, age_days=5, access_count=10)
@@ -92,6 +104,35 @@ class TestBudgetManager:
         # The two identical ones should be merged
         assert report.merged >= 1
         assert report.kept <= 2
+
+    def test_merge_groups_transitively_like_pairwise_scan(self, manager: MemoryBudgetManager):
+        """The precomputed word-set scan must merge exactly the pairs the
+        original per-pair Jaccard scan did: high-overlap entries collapse to
+        the highest-importance representative, distinct entries survive."""
+        shared = "alpha beta gamma delta epsilon zeta eta theta iota kappa"
+        entries = [
+            _make_entry(shared, importance=0.3),
+            _make_entry(shared, importance=0.9),  # highest -> kept representative
+            _make_entry(shared, importance=0.5),
+            _make_entry("wholly unrelated content about something else", importance=0.6),
+        ]
+        merged = manager._merge_similar(list(entries))
+
+        # Three identical-content entries collapse to one; the unrelated one stays.
+        assert len(merged) == 2
+        kept_shared = [m for m in merged if m.content == shared]
+        assert len(kept_shared) == 1
+        # The surviving representative is the highest-importance of the group.
+        assert kept_shared[0].importance == 0.9
+
+    def test_text_similarity_matches_explicit_jaccard(self, manager: MemoryBudgetManager):
+        a = "the quick brown fox jumps"
+        b = "the quick brown dog runs"
+        wa, wb = set(a.split()), set(b.split())
+        expected = len(wa & wb) / len(wa | wb)
+        assert manager._text_similarity(a, b) == pytest.approx(expected)
+        # Empty side yields 0.0, not a ZeroDivisionError.
+        assert manager._text_similarity("", "anything") == 0.0
 
     def test_very_old_pruned(self, manager: MemoryBudgetManager):
         """Test that very old, low-importance memories get pruned by decay."""

@@ -5,6 +5,6 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: 'Headroom',
     },
-    githubUrl: 'https://github.com/chopratejas/headroom',
+    githubUrl: 'https://github.com/headroomlabs-ai/headroom',
   };
 }

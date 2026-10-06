@@ -13,6 +13,16 @@ if TYPE_CHECKING:
 from .main import main
 
 
+def _projects_at(projects: list[Any], path: Path) -> list[Any]:
+    """Projects checked out at ``path``, including linked worktrees merged into one.
+
+    ``getattr``: external plugins may return duck-typed projects without the field.
+    """
+    return [
+        p for p in projects if p.project_path == path or path in getattr(p, "worktree_paths", ())
+    ]
+
+
 class _AgentChoice(click.ParamType):
     """Dynamic Click type that validates against the plugin registry."""
 
@@ -161,7 +171,7 @@ def learn(
     """
     import os
 
-    from ..learn.analyzer import SessionAnalyzer, _detect_default_model
+    from ..learn.analyzer import SessionAnalyzer, _detect_default_model, _require_agy_opt_in
     from ..learn.registry import auto_detect_plugins, get_plugin
 
     # Flag-combination validation — reject contradictory/no-op combinations up
@@ -202,11 +212,18 @@ def learn(
     # Resolve model early to fail fast with a clear message
     try:
         resolved_model = model or _detect_default_model()
-    except RuntimeError as e:
+        if resolved_model == "agy-cli":
+            _require_agy_opt_in()
+    except (RuntimeError, ValueError) as e:
         click.echo(f"Error: {e}")
         raise SystemExit(1) from None
 
     analyzer = SessionAnalyzer(model=resolved_model)
+
+    def _on_progress(detail: str) -> None:
+        # Reuses the exact "  Analyzing with ..." prefix so wrapper UIs that
+        # whitelist known stage-line prefixes keep parsing without changes.
+        click.echo(f"  Analyzing with {resolved_model}... ({detail})")
 
     # Determine which agents to scan
     agent_configs: list[tuple[str, LearnPlugin]] = []
@@ -225,6 +242,7 @@ def learn(
     total_projects = 0
     total_failures = 0
     total_recommendations = 0
+    total_analysis_failures = 0
     matched_projects = 0
     available_projects: list[tuple[str, Path]] = []
 
@@ -249,15 +267,15 @@ def learn(
             targets = all_projects
         elif project:
             resolved = project.resolve()
-            targets = [p for p in all_projects if p.project_path == resolved]
+            targets = _projects_at(all_projects, resolved)
             if not targets:
                 continue
         else:
             cwd = Path.cwd().resolve()
-            targets = [p for p in all_projects if p.project_path == cwd]
+            targets = _projects_at(all_projects, cwd)
             if not targets:
                 for parent in cwd.parents:
-                    targets = [p for p in all_projects if p.project_path == parent]
+                    targets = _projects_at(all_projects, parent)
                     if targets:
                         break
             if not targets and len(agent_configs) == 1:
@@ -289,7 +307,7 @@ def learn(
                 continue
 
             click.echo(f"  Analyzing with {resolved_model}...")
-            result_data = analyzer.analyze(proj, sessions)
+            result_data = analyzer.analyze(proj, sessions, on_progress=_on_progress)
             total_projects += 1
             total_failures += result_data.total_failures
 
@@ -298,6 +316,12 @@ def learn(
                 f"Calls: {result_data.total_calls}  |  "
                 f"Failures: {result_data.total_failures} ({result_data.failure_rate:.1%})"
             )
+
+            analysis_error = getattr(result_data, "analysis_error", None)
+            if analysis_error:
+                total_analysis_failures += 1
+                click.echo(f"  Analysis failed: {analysis_error}", err=True)
+                continue
 
             if result_data.failure_rate == 0 and not result_data.recommendations:
                 click.echo("  No failures or patterns found.")
@@ -350,6 +374,9 @@ def learn(
             f"{total_recommendations} recommendations"
         )
 
+    if total_analysis_failures:
+        raise SystemExit(1)
+
 
 def _make_llm_judge(model: str) -> Any:
     """Build an LLM judge callable for verbosity, or None if unavailable.
@@ -400,8 +427,9 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     When a proxy is already running locally we hot-enable it via
     ``/admin/runtime-env`` (no restart, the same channel ``wrap`` uses), so
     ``--apply`` actually takes effect. Returns ``(status, port)`` where status is
-    ``"live"`` (enabled on a running proxy), ``"absent"`` (no reachable proxy),
-    or ``"error"``.
+    ``"live"`` (enabled on a running proxy), ``"blocked"`` (the proxy's
+    rollout channel rejected it), ``"absent"`` (no reachable proxy), or
+    ``"error"``.
     """
     import json as _json
     import os as _os
@@ -417,7 +445,22 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     )
     try:
         with urllib.request.urlopen(request, timeout=2) as response:
-            response.read()
+            raw_response = response.read()
+        payload = _json.loads(raw_response) if raw_response else {}
+        rollout = payload.get("rollout") if isinstance(payload, dict) else None
+        if isinstance(rollout, dict):
+            decisions = rollout.get("features")
+            if isinstance(decisions, list):
+                output_shaper = next(
+                    (
+                        item
+                        for item in decisions
+                        if isinstance(item, dict) and item.get("name") == "proxy_output_shaper"
+                    ),
+                    None,
+                )
+                if isinstance(output_shaper, dict) and not output_shaper.get("enabled", False):
+                    return "blocked", resolved_port
         return "live", resolved_port
     except (urllib.error.URLError, OSError):
         # ConnectionRefused (no proxy) or 404 (proxy predates the endpoint).
@@ -463,13 +506,13 @@ def _run_verbosity(
         targets = all_projects
     elif project:
         resolved = project.resolve()
-        targets = [p for p in all_projects if p.project_path == resolved]
+        targets = _projects_at(all_projects, resolved)
     else:
         cwd = Path.cwd().resolve()
-        targets = [p for p in all_projects if p.project_path == cwd]
+        targets = _projects_at(all_projects, cwd)
         if not targets:
             for parent in cwd.parents:
-                targets = [p for p in all_projects if p.project_path == parent]
+                targets = _projects_at(all_projects, parent)
                 if targets:
                     break
     if not targets:
@@ -488,7 +531,9 @@ def _run_verbosity(
     analyzed_count = 0
 
     for proj in targets:
-        session_paths = sorted(proj.data_path.glob("*.jsonl"))
+        session_paths = sorted(
+            f for d in (proj.data_path, *proj.extra_data_paths) for f in d.glob("*.jsonl")
+        )
         if not session_paths:
             continue
         profile, baseline = analyze(session_paths, str(proj.project_path), llm_judge=judge)
@@ -555,8 +600,17 @@ def _run_verbosity(
                 f"level {best_profile.level} is live now (while HEADROOM_VERBOSITY_LEVEL is unset)."
             )
             click.echo(
-                "    To keep it on across restarts: export HEADROOM_OUTPUT_SHAPER=1 "
-                "before `headroom wrap ...` (wrap pushes it to the proxy)."
+                "    To keep it on across restarts: export HEADROOM_ROLLOUT_CHANNEL=beta "
+                "and HEADROOM_OUTPUT_SHAPER=1 before `headroom wrap ...`."
+            )
+        elif status == "blocked":
+            click.echo(
+                "\n  ⚠ Level written, but the running proxy's rollout channel blocks the "
+                "beta output shaper."
+            )
+            click.echo(
+                "    Restart it with HEADROOM_ROLLOUT_CHANNEL=beta and "
+                "HEADROOM_OUTPUT_SHAPER=1; the learned level will be used automatically."
             )
         else:
             click.echo(
@@ -564,9 +618,10 @@ def _run_verbosity(
                 "NOT shaping output yet."
             )
             click.echo(
-                "    Enable it: export HEADROOM_OUTPUT_SHAPER=1 then `headroom wrap ...` "
-                "(or start `headroom proxy` with it set). The learned level is then used "
-                "automatically while HEADROOM_VERBOSITY_LEVEL is unset."
+                "    Enable it: export HEADROOM_ROLLOUT_CHANNEL=beta and "
+                "HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` (or restart "
+                "`headroom proxy`). The learned level is then used automatically while "
+                "HEADROOM_VERBOSITY_LEVEL is unset."
             )
     else:
         click.echo("\n  Dry run — use --apply to persist the level and baseline.")

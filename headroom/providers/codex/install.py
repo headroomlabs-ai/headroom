@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
+from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from headroom._subprocess import run
 from headroom.install.models import ConfigScope, DeploymentManifest, ManagedMutation, ToolTarget
 from headroom.install.paths import codex_config_path
 
@@ -36,6 +46,32 @@ _ROOT_MODEL_PROVIDER_RE = re.compile(r"^[ \t]*model_provider[ \t]*=")
 _ROOT_OPENAI_BASE_URL_RE = re.compile(r"^[ \t]*openai_base_url[ \t]*=")
 
 
+def _codex_credential_store(config_dir: Path) -> str | None:
+    try:
+        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    store = config.get("cli_auth_credentials_store")
+    return store.lower() if isinstance(store, str) else None
+
+
+def _codex_login_status(config_dir: Path) -> bool:
+    env = {**os.environ, "CODEX_HOME": str(config_dir)}
+    try:
+        result = run(
+            ["codex", "login", "status"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return False
+    message = result.stdout.strip() or result.stderr.strip()
+    return result.returncode == 0 and message.casefold() == "logged in using chatgpt"
+
+
 def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
     """Whether Codex authenticated via ChatGPT OAuth (vs an OpenAI API key).
 
@@ -45,8 +81,16 @@ def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
     emit it only in ChatGPT-OAuth mode, read from the sibling ``auth.json``.
     """
     try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = auth_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if _codex_credential_store(auth_path.parent) not in {"keyring", "auto"}:
+            return False
+        return _codex_login_status(auth_path.parent)
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw)
+    except ValueError:
         return False
     if not isinstance(data, dict):
         return False
@@ -57,8 +101,45 @@ def codex_uses_chatgpt_auth(auth_path: Path) -> bool:
     tokens = data.get("tokens")
     if isinstance(tokens, dict):
         account_id = tokens.get("account_id")
-        return isinstance(account_id, str) and bool(account_id.strip())
+        if isinstance(account_id, str) and account_id.strip():
+            return True
+        return _id_token_carries_chatgpt_account(tokens.get("id_token"))
     return False
+
+
+def _id_token_carries_chatgpt_account(raw: Any) -> bool:
+    """Whether an ``id_token`` carries the ChatGPT account claim (#3206).
+
+    Newer Codex releases can write an ``auth.json`` with neither ``auth_mode``
+    nor a top-level ``tokens.account_id``; the account identity lives only in
+    the ``id_token`` claims. Those configs then read as API-key mode, so
+    ``requires_openai_auth`` is omitted, Codex attaches no Authorization
+    header, and every request 401s with "Missing bearer".
+
+    The payload is decoded, not verified. This is a local config file the user
+    already owns, and the result only decides which key we write into their own
+    ``config.toml`` -- nothing is authenticated or authorised on the strength
+    of it. An API-key user has no ChatGPT id_token, so this cannot resurrect
+    the forced-OAuth-login regression in #406.
+    """
+    if not isinstance(raw, str):
+        return False
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return False
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+    except Exception:
+        return False
+    if not isinstance(claims, dict):
+        return False
+    auth_claim = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claim, dict):
+        return False
+    account_id = auth_claim.get("chatgpt_account_id")
+    return isinstance(account_id, str) and bool(account_id.strip())
 
 
 def build_provider_section(

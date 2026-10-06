@@ -102,7 +102,7 @@ class DeploymentManifest:
     backend: str
     anyllm_provider: str | None = None
     region: str | None = None
-    proxy_mode: str = "token"
+    proxy_mode: str = "cache"
     memory_enabled: bool = False
     memory_db_path: str = ""
     telemetry_enabled: bool = True

@@ -56,6 +56,7 @@ from typing import Any
 
 from headroom.config import HeadroomConfig, SmartCrusherConfig
 from headroom.providers.openai import OpenAIProvider
+from headroom.telemetry.session import BeaconCompressionObserver
 from headroom.transforms.smart_crusher import SmartCrusher
 
 
@@ -263,7 +264,18 @@ class HeadroomMCPCompressor:
             min_tokens_to_crush=profile.min_tokens_to_compress,
             max_items_after_crush=profile.max_items,
         )
-        crusher = SmartCrusher(config=smart_config, with_compaction=False)  # type: ignore[arg-type]
+        # observer: MCP runs outside the proxy, so PrometheusMetrics (the
+        # proxy's observer, which forwards to the beacon) never sees these
+        # compressions. Without one, an MCP install reports real tokens.saved
+        # with an empty compression.by_strategy.
+        crusher = SmartCrusher(
+            # headroom.config.SmartCrusherConfig vs the transform's own
+            # same-named dataclass; the ignore has to sit on the argument line
+            # because that is where mypy reports a multi-line call's arg-type.
+            config=smart_config,  # type: ignore[arg-type]
+            with_compaction=False,
+            observer=BeaconCompressionObserver(),
+        )
 
         # Build messages for SmartCrusher (it expects conversation format)
         messages = [
