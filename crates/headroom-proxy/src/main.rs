@@ -4,6 +4,8 @@
 //! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
 //! `--upstream`. See RUST_DEV.md for the operator runbook.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -28,8 +30,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_body_bytes = config.max_body_bytes,
         rewrite_host = config.rewrite_host,
         graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),
+        rollout_channel = config.rollout.config.channel.as_str(),
+        rollout_features_enabled = ?config.rollout.enabled(),
+        rollout_features_disabled = ?config.rollout.config.disabled,
+        unsafe_allow_unstable_features = config.rollout.config.unsafe_allow_unstable,
+        rollout_registry_digest = %config.rollout.registry_digest,
+        rollout_snapshot_digest = %config.rollout.snapshot_digest(),
+        qualification_eligible = config.rollout.qualification_eligible(),
         "headroom-proxy starting"
     );
+
+    // Session-sticky beta headers only run inside the compression
+    // interceptor: with `--compression` off the proxy is a strict
+    // byte-pipe and never mutates headers. Say so loudly at startup —
+    // an operator reading `beta_header_sticky=enabled` (the default)
+    // must not believe the protection is active when it isn't.
+    if config.beta_header_sticky.is_enabled() && !config.compression {
+        tracing::warn!(
+            event = "beta_header_sticky_inactive",
+            beta_header_sticky = config.beta_header_sticky.as_str(),
+            compression = config.compression,
+            "beta-header stickiness is enabled but the compression \
+             interceptor is off; enable --compression (or \
+             HEADROOM_PROXY_COMPRESSION=1) to activate it"
+        );
+    }
+
+    // The ~261 MB Kompress ONNX session must never build on the request
+    // path: dispatch answers NoOp until the model is ready. Warm it in
+    // the background at startup so steady-state traffic meets a settled
+    // slot; a byte-pipe proxy (--compression off) never loads a model.
+    if config.compression {
+        if let Err(e) = std::thread::Builder::new()
+            .name("live-zone-warmup".into())
+            .spawn(|| {
+                let ready = headroom_core::transforms::live_zone::warm_live_zone_compressors();
+                tracing::info!(event = "live_zone_warmup_complete", kompress_ready = ready);
+            })
+        {
+            // Non-fatal: the dispatcher's lazy path still initializes
+            // off-request; only the eager warmup is lost.
+            tracing::warn!(event = "live_zone_warmup_spawn_failed", error = %e);
+        }
+    }
 
     let mut state = AppState::new(config.clone())?;
 

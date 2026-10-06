@@ -28,6 +28,8 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import ensure_private_file
+
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
 
@@ -40,7 +42,10 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     created_at REAL NOT NULL,
     ttl INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_ccr_expiry ON ccr_entries (created_at);
+CREATE INDEX IF NOT EXISTS idx_ccr_expiry_deadline ON ccr_entries (created_at + ttl);
+-- Superseded by idx_ccr_expiry_deadline: no query searches or orders by bare
+-- created_at, so the old index only cost writes. Drop it from existing files.
+DROP INDEX IF EXISTS idx_ccr_expiry;
 """
 
 # Purge expired rows at most this often (seconds). Purging is hygiene,
@@ -80,7 +85,22 @@ class SQLiteBackend:
         self._last_purge = 0.0
         self._conn = self._open()
 
+    @staticmethod
+    def _ensure_private(path: Path) -> None:
+        """Make the database file 0600 *before* sqlite opens it, failing CLOSED.
+
+        The originals stored here can contain sensitive tool output (file
+        contents, command output). ``mkdir`` created the parent at the umask
+        default and sqlite would create the db at the umask default too, so the
+        file is created (or an existing one narrowed) through
+        :func:`headroom.fileperms.ensure_private_file`, which is symlink-race
+        resistant and raises :class:`PermissionError` rather than opening a
+        wide file. See that function for the exact guarantee per platform.
+        """
+        ensure_private_file(path, what="CCR store")
+
     def _open(self) -> sqlite3.Connection:
+        self._ensure_private(self._path)
         conn = sqlite3.connect(self._path, check_same_thread=False)
         # Wait for competing writers instead of failing with SQLITE_BUSY —
         # multiple proxy workers share this file, and writes are frequent
@@ -150,20 +170,44 @@ class SQLiteBackend:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return None
+        if not isinstance(data, dict):
+            return None
         known = {f.name for f in fields(CompressionEntry)}
-        return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        try:
+            return CompressionEntry(**{k: v for k, v in data.items() if k in known})
+        except (TypeError, ValueError):
+            # A blob that parses as JSON but is missing a required field (schema
+            # drift across an upgrade, a partially written row) must degrade to a
+            # miss, not raise. Otherwise a single bad row crashes get() — and,
+            # via items(), _clean_expired() runs it on every store's eviction, so
+            # one poison row would break all reads, evictions, and stores.
+            return None
+
+    def _purge_expired(self, now: float) -> int:
+        """Delete expired rows using metadata; caller holds ``_lock``."""
+        cursor = self._conn.execute(
+            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
+            (now,),
+        )
+        self._conn.commit()
+        self._last_purge = now
+        return cursor.rowcount
+
+    def purge_expired(self, now: float | None = None) -> int:
+        """Delete expired rows without deserializing their payloads."""
+        with self._lock:
+            try:
+                return self._purge_expired(time.time() if now is None else now)
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "purge")
+                return 0
 
     def _maybe_purge(self) -> None:
         """Delete expired rows; called opportunistically under the lock."""
         now = time.time()
         if now - self._last_purge < _PURGE_INTERVAL:
             return
-        self._last_purge = now
-        self._conn.execute(
-            "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (now,),
-        )
-        self._conn.commit()
+        self._purge_expired(now)
 
     def get(self, hash_key: str) -> CompressionEntry | None:
         with self._lock:
@@ -233,6 +277,16 @@ class SQLiteBackend:
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "op")
                 return 0
+        return int(row[0])
+
+    def external_revision(self) -> int | None:
+        """Return a token that changes when another connection commits."""
+        with self._lock:
+            try:
+                row = self._conn.execute("PRAGMA data_version").fetchone()
+            except sqlite3.DatabaseError as e:
+                self._handle_db_error(e, "revision")
+                return None
         return int(row[0])
 
     def keys(self) -> list[str]:

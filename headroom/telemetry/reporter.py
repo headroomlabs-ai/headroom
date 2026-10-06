@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 
 if TYPE_CHECKING:
@@ -358,14 +359,19 @@ class UsageReporter:
         self._last_report_time = datetime.now(timezone.utc)
 
     def _save_cache(self) -> None:
-        """Save license info to local cache file."""
+        """Save license info to local cache file (skipped in stateless mode)."""
         if self._license_info is None:
+            return
+        if not _paths.persistence_allowed("licence validation cache"):
             return
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_path.write_text(
-                json.dumps(self._license_info.to_dict(), indent=2), encoding="utf-8"
-            )
+            # Owner-only: the envelope names the org and plan.
+            # newline pinned: state files are LF on every platform (#3698).
+            with _fileperms.open_owner_only(
+                self._cache_path, "w", encoding="utf-8", newline="\n"
+            ) as fh:
+                fh.write(json.dumps(self._license_info.to_dict(), indent=2))
         except OSError:
             logger.warning("Could not save license cache to %s", self._cache_path)
 

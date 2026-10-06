@@ -43,7 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Single-wheel refactor side effect: `headroom` is now installed
     # from a wheel into site-packages, so `__file__.parents[2]` no
     # longer points at the repo root (it points at site-packages).
-    # `_marketplace_source()` falls back to `chopratejas/headroom`
+    # `_marketplace_source()` falls back to `headroomlabs-ai/headroom`
     # (the GitHub remote) instead of the local `/workspace` path the
     # `seq_claude_local` e2e assertion expects. Pin the source via
     # the existing override env var so the local `/workspace`
