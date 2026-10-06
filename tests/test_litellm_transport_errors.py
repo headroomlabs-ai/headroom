@@ -217,3 +217,160 @@ def test_bedrock_stream_names_transport_error_without_message() -> None:
     assert response.status_code == 200
     assert _TIMEOUT in response.text
     assert '"code": "upstream_timeout"' in response.text
+
+
+def _upstream_error(status_code: int, message: str) -> Exception:
+    """A LiteLLM-style exception: carries the upstream HTTP status as an attribute."""
+    import litellm
+
+    classes = {
+        400: litellm.BadRequestError,
+        401: litellm.AuthenticationError,
+        403: litellm.PermissionDeniedError,
+        404: litellm.NotFoundError,
+        422: litellm.UnprocessableEntityError,
+        429: litellm.RateLimitError,
+        500: litellm.InternalServerError,
+    }
+    if status_code not in classes:
+        # Unmapped 4xx: litellm bakes the status into each class, so use a bare
+        # exception carrying only the ``status_code`` attribute.
+        err = Exception(message)
+        err.status_code = status_code  # type: ignore[attr-defined]
+        return err
+    response = httpx.Response(status_code, request=httpx.Request("POST", "https://upstream.test"))
+    return classes[status_code](
+        message=message, model="bedrock/claude", llm_provider="bedrock", response=response
+    )
+
+
+_BAD_THINKING = (
+    "BedrockException - thinking.adaptive.display: Input should be 'summarized', 'omitted'"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (400, "invalid_request_error"),
+        (403, "permission_error"),
+        (422, "invalid_request_error"),
+        (401, "authentication_error"),
+        (404, "not_found_error"),
+        (429, "rate_limit_error"),
+        (402, "invalid_request_error"),
+        (408, "invalid_request_error"),
+        (409, "invalid_request_error"),
+        (500, "api_error"),
+    ],
+)
+async def test_send_message_keeps_upstream_litellm_status(status: int, error_type: str) -> None:
+    with (
+        patch(
+            "headroom.backends.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=_upstream_error(status, _BAD_THINKING),
+        ),
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+    ):
+        backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+        result = await backend.send_message(_BODY, {})
+
+    assert result.status_code == status
+    assert result.body["error"]["type"] == error_type
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (400, "invalid_request_error"),
+        (403, "permission_error"),
+        (422, "invalid_request_error"),
+        (401, "invalid_api_key"),
+        (404, "model_not_found"),
+        (429, "rate_limit_exceeded"),
+        (402, "invalid_request_error"),
+        (408, "invalid_request_error"),
+        (409, "invalid_request_error"),
+        (500, "api_error"),
+    ],
+)
+async def test_send_openai_message_keeps_upstream_litellm_status(
+    status: int, error_type: str
+) -> None:
+    with (
+        patch(
+            "headroom.backends.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=_upstream_error(status, _BAD_THINKING),
+        ),
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+    ):
+        backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+        result = await backend.send_openai_message(_BODY, {})
+
+    assert result.status_code == status
+    assert result.body["error"]["type"] == error_type
+
+
+@pytest.mark.asyncio
+async def test_send_message_substring_fallback_without_status_attribute() -> None:
+    with (
+        patch(
+            "headroom.backends.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("Authentication failed: bad credentials"),
+        ),
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+    ):
+        backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+        result = await backend.send_message(_BODY, {})
+
+    assert result.status_code == 401
+    assert result.body["error"]["type"] == "authentication_error"
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: object) -> None:
+        super().__init__("payload too large")
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "error_type"),
+    [("send_message", "request_too_large"), ("send_openai_message", "invalid_request_error")],
+)
+async def test_413_status_attribute_is_kept(method: str, error_type: str) -> None:
+    with (
+        patch(
+            "headroom.backends.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=_StatusError(413),
+        ),
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+    ):
+        backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+        result = await getattr(backend, method)(_BODY, {})
+
+    assert result.status_code == 413
+    assert result.body["error"]["type"] == error_type
+
+
+@pytest.mark.asyncio
+async def test_non_int_status_attribute_falls_back_to_substring() -> None:
+    with (
+        patch(
+            "headroom.backends.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=_StatusError("429"),
+        ),
+        patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
+    ):
+        backend = LiteLLMBackend(provider="bedrock", region="us-east-1")
+        result = await backend.send_message(_BODY, {})
+
+    assert result.status_code == 500
+    assert result.body["error"]["type"] == "api_error"
