@@ -862,6 +862,49 @@ class TestStreamingRatelimitHeaderForwarding:
         assert proxy.http_client.send.await_count == expected_sends
 
     @pytest.mark.asyncio
+    async def test_streaming_429_retry_after_reachable_across_retries_recovers(self):
+        """A reset beyond one capped wait but within the remaining retries is retried."""
+        proxy = self._create_mock_proxy()
+        proxy._config.retry_max_delay_ms = 20
+
+        def _rate_limited(retry_after):
+            response = self._create_mock_upstream_response()
+            response.status_code = 429
+            response.headers = httpx.Headers(
+                {"content-type": "application/json", "retry-after": retry_after}
+            )
+            response.aread = AsyncMock(return_value=b'{"type":"error"}')
+            response.aclose = AsyncMock()
+            return response
+
+        proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+        proxy.http_client.send = AsyncMock(
+            side_effect=[
+                _rate_limited("0.031"),
+                _rate_limited("0.001"),
+                self._create_mock_upstream_response(),
+            ]
+        )
+
+        result = await proxy._stream_response(
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "sk-ant-test"},
+            body={"model": "claude-sonnet-4-6", "stream": True, "messages": []},
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            request_id="test-reachable-429",
+            original_tokens=10,
+            optimized_tokens=10,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
+
+        assert result.status_code == 200
+        assert proxy.http_client.send.await_count == 3
+
+    @pytest.mark.asyncio
     async def test_anthropic_stream_leaves_codex_state_untouched(self):
         """The now-unconditional capture must be a no-op for non-Codex streams."""
         from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state

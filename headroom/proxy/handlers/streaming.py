@@ -1250,7 +1250,9 @@ class StreamingMixin:
                         and self.config.retry_enabled
                         and attempt < retry_attempts - 1
                         and not overload_retry_is_futile(
-                            upstream_response, self.config.retry_max_delay_ms
+                            upstream_response,
+                            self.config.retry_max_delay_ms,
+                            retries_left=retry_attempts - attempt - 1,
                         )
                     ):
                         delay_with_jitter = retry_after_ms(

@@ -2659,7 +2659,11 @@ class HeadroomProxy(
                         if (
                             not self.config.retry_enabled
                             or attempt >= self.config.retry_max_attempts - 1
-                            or overload_retry_is_futile(response, self.config.retry_max_delay_ms)
+                            or overload_retry_is_futile(
+                                response,
+                                self.config.retry_max_delay_ms,
+                                retries_left=self.config.retry_max_attempts - attempt - 1,
+                            )
                         ):
                             return response
                         delay_ms = retry_after_ms(

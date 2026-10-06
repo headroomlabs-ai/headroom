@@ -1646,19 +1646,22 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     return max(seconds, 0.0)
 
 
-def overload_retry_is_futile(response: httpx.Response, max_ms: int) -> bool:
+def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left: int = 1) -> bool:
     """True when retrying a 429/529 cannot succeed within the proxy's backoff.
 
     Upstream says so explicitly with ``x-should-retry: false``, or implicitly with a
-    ``Retry-After`` longer than ``max_ms``: sleeping the capped delay re-sends before
-    the reset, so the retry only delays the same error (an exhausted subscription
-    window answers with a reset hours away). Forwarding it at once lets the client,
-    or a credential-rotating proxy in front, act on it.
+    ``Retry-After`` beyond every wait still available: each of the ``retries_left``
+    retries sleeps at most ``max_ms``, so a reset further out than
+    ``retries_left * max_ms`` is never reached and the retries only delay the same
+    error (an exhausted subscription window answers with a reset hours away).
+    Forwarding it at once lets the client, or a credential-rotating proxy in front,
+    act on it. A reset within that window stays retryable: later 429s carry a
+    shorter Retry-After as the reset approaches.
     """
     if response.headers.get("x-should-retry", "").strip().lower() == "false":
         return True
     seconds = _retry_after_seconds(response)
-    return seconds is not None and seconds * 1000.0 > max_ms
+    return seconds is not None and seconds * 1000.0 > max(retries_left, 0) * max_ms
 
 
 # Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
