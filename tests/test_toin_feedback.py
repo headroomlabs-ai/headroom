@@ -106,7 +106,7 @@ class TestGetRecommendationObservations:
         toin.get_recommendation(sig)
 
         # Check observations incremented
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert pattern.observations == 1
 
         # Call again
@@ -133,7 +133,7 @@ class TestGetRecommendationObservations:
         result = toin.get_recommendation(sig)
         assert result.source == "local"  # Not enough samples
 
-        pattern = toin._patterns[("unknown", "unknown", sig.structure_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig.structure_hash)]
         assert pattern.observations == 1
 
     def test_no_increment_for_unknown_pattern(self):
@@ -199,7 +199,7 @@ class TestRecordRetrievalPopulatesFields:
                 query_fields=["error_message"],
             )
 
-        pattern = toin._patterns[("unknown", "unknown", sig_hash)]
+        pattern = toin._patterns[("global", "unknown", "unknown", sig_hash)]
         assert pattern.total_retrievals == 5
         assert pattern.search_retrievals == 5
         assert len(pattern.field_retrieval_frequency) > 0

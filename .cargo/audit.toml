@@ -1,0 +1,23 @@
+# cargo-audit configuration for the Rust workspace.
+#
+# Path matters: cargo-audit reads `.cargo/audit.toml`, not a root-level
+# `audit.toml`. A file at the repo root is silently ignored.
+#
+# The `audit` job in .github/workflows/rust.yml is a BLOCKING gate. It runs on
+# every PR touching Rust and nightly on the schedule (the `rust-changes` job
+# reports `rust=true` for `schedule`/`workflow_dispatch`, so a newly-disclosed
+# advisory surfaces without anyone touching Rust code).
+#
+# It was `continue-on-error: true` until the change that added this file, which meant it reported findings
+# nobody saw: RUSTSEC-2026-0258 (h2, unbounded empty DATA frames) sat in a green
+# run. Anything ignored here has to be listed explicitly, with a reason.
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained — an advisory of project status, not a
+    # vulnerability; there is no patched version to move to. It is transitive
+    # and unavoidable at our layer: tokenizers -> paste and rav1e -> paste,
+    # both reached via fastembed. Re-evaluate when tokenizers moves to
+    # `pastey` (the maintained drop-in fork).
+    "RUSTSEC-2024-0436",
+]

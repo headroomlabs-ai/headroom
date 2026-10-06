@@ -40,15 +40,40 @@ import importlib.util
 import logging
 import os
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _ENV_VAR = "ORT_DYLIB_PATH"
+_MIN_RUST_ORT_API_VERSION = (1, 24)
 
 # Tri-state module cache: unset sentinel / resolved path / None (no pin).
 _UNSET = object()
 _pinned: object = _UNSET
+_pinned_from_override = False
+
+
+def _installed_ort_version() -> tuple[int, int] | None:
+    """Return the installed ONNX Runtime major/minor without importing it."""
+    try:
+        raw = version("onnxruntime")
+        return tuple(int(part) for part in raw.split(".")[:2])  # type: ignore[return-value]
+    except (PackageNotFoundError, ValueError):
+        return None
+
+
+def rust_ort_runtime_compatible() -> bool:
+    """Whether native Rust detection can safely initialize ORT C API 24.
+
+    A caller-supplied ``ORT_DYLIB_PATH`` remains an explicit override: its
+    library may be newer than the separately installed Python package. The
+    auto-pinned package library, however, must advertise at least 1.24.
+    """
+    if _pinned_from_override:
+        return True
+    installed = _installed_ort_version()
+    return installed is not None and installed >= _MIN_RUST_ORT_API_VERSION
 
 
 def ensure_ort_dylib_pinned() -> str | None:
@@ -84,11 +109,23 @@ def _resolve_ort_native_library(capi_dir: Path) -> Path | None:
 
 
 def _resolve_and_pin() -> str | None:
+    global _pinned_from_override
     try:
         existing = os.environ.get(_ENV_VAR)
         if existing:
+            _pinned_from_override = True
             logger.debug("%s already set; respecting user override: %s", _ENV_VAR, existing)
             return existing
+
+        installed = _installed_ort_version()
+        if installed is not None and installed < _MIN_RUST_ORT_API_VERSION:
+            logger.warning(
+                "onnxruntime %d.%d exposes an older C API than Rust detection "
+                "requires (1.24+); leaving %s unset and using Python detection",
+                *installed,
+                _ENV_VAR,
+            )
+            return None
 
         spec = importlib.util.find_spec("onnxruntime")
         if spec is None or not spec.origin:
