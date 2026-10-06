@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from headroom._subprocess import run
+from headroom.offline import guard_egress
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,11 @@ def _mirror_url(url: str) -> str:
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
+    # HEADROOM_BINARIES_OFFLINE above is the narrow, binaries-only switch; this
+    # is the deployment-wide one. An operator who set the air-gap switch should
+    # not have to also discover a second, differently-named flag to stop
+    # Headroom fetching release assets from GitHub at install time.
+    guard_egress("release binary download", url)
     if not _has_writable_existing_parent(dest.parent):
         raise OSError(f"binary cache directory parent is not writable: {dest.parent}")
     dest.parent.mkdir(parents=True, exist_ok=True)
