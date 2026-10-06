@@ -1840,6 +1840,29 @@ def _mcp_result_min_chars() -> int:
         return 4000
 
 
+#: MCP tool-name prefixes seen on the wire: ``mcp__server__tool`` (Claude Code,
+#: Codex, Droid), ``mcp_server_tool`` (Gemini, VS Code Copilot), ``mcp--server--tool``
+#: (Roo). Harnesses that send bare MCP names cannot be told apart from built-ins.
+_MCP_NAME_PREFIXES = ("mcp_", "mcp--")
+
+
+def _is_small_mcp_result(tool_name: Any, text: Any) -> bool:
+    """True when ``text`` is an MCP tool's output short enough to keep verbatim.
+
+    A Jira ticket or a Slack thread is a few hundred tokens of high-value fields.
+    Compressing it saves tens of tokens, and when the model misses a field it
+    re-calls the tool or headroom_retrieve: a whole extra turn that re-reads the
+    entire cached conversation (measured: +2 turns, +15% cost on
+    benchmarks/tool_search_vs_native). ``HEADROOM_MCP_RESULT_MIN_CHARS=0``
+    restores the old behaviour.
+    """
+    return (
+        isinstance(text, str)
+        and str(tool_name or "").lower().startswith(_MCP_NAME_PREFIXES)
+        and len(text) < _mcp_result_min_chars()
+    )
+
+
 @dataclass
 class ContentRouterConfig:
     """Configuration for intelligent content routing.
@@ -6233,6 +6256,16 @@ class ContentRouter(Transform):
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
+                # Small MCP results stay verbatim: twin of the Anthropic
+                # tool_result branch in _process_content_blocks.
+                if _is_small_mcp_result(tool_name, content):
+                    result_slots[i] = message
+                    transforms_applied.append("router:mcp_small_result_verbatim")
+                    route_counts["mcp_small_result"] = route_counts.get("mcp_small_result", 0) + 1
+                    if collect_diagnostics:
+                        _diag[i] = "protected:mcp_small_result"
+                    continue
+
                 # Bash-search lossless pre-empt: a read-only search (grep/rg/git
                 # grep) run via a shell tool yields byte-losslessly foldable
                 # output. Fold it instead of the lossy strategy path.
@@ -7383,18 +7416,8 @@ class ContentRouter(Transform):
                     else tool_content
                 )
 
-                # Small MCP results stay verbatim. A Jira ticket or a Slack thread is
-                # a few hundred tokens of high-value fields; compressing it saves
-                # tens of tokens, and when the model misses a field it re-calls the
-                # tool or headroom_retrieve — a whole extra turn that re-reads the
-                # entire cached conversation (measured: +2 turns, +15% cost on
-                # benchmarks/tool_search_vs_native). HEADROOM_MCP_RESULT_MIN_CHARS=0
-                # restores the old behaviour.
-                if (
-                    isinstance(tool_text, str)
-                    and str(tool_name).lower().startswith("mcp_")
-                    and len(tool_text) < _mcp_result_min_chars()
-                ):
+                # Small MCP results stay verbatim (see _is_small_mcp_result).
+                if _is_small_mcp_result(tool_name, tool_text):
                     new_blocks.append(block)
                     transforms_applied.append("router:mcp_small_result_verbatim")
                     if route_counts is not None:

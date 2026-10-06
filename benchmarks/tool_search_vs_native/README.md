@@ -13,8 +13,7 @@ Every session does the same task:
 6. Post to Slack.
 
 Usage is read from Claude Code's own transcript, which records what the API billed,
-subagents included. A run passes only if the tests pass and all four MCP actions
-happened.
+subagents included.
 
 ```bash
 python3 benchmarks/tool_search_vs_native/run.py --arms native,hr_client,hr_server,hr_hot --reps 3 --warmup
@@ -33,6 +32,18 @@ of four arms with three reps and a warmup costs about $1 short and $5 long, on S
 | `hr_hot` | As `hr_server`, but the MCP tools a developer uses routinely stay loaded (`HEADROOM_TOOL_SEARCH_CORE_TOOLS`). |
 
 ## Results (2026-10-06, Claude Code 2.1.290, Sonnet 5.5, n=3 after warmup, median)
+
+Run on macOS 26.6 (arm64) with Python 3.12.13 (the repo's `.venv`) and real Anthropic API
+calls. Commands:
+
+```bash
+python3 benchmarks/tool_search_vs_native/run.py --arms native,hr_hot,hr_client --reps 3 --warmup
+python3 benchmarks/tool_search_vs_native/run.py --arms native,hr_hot,hr_client --reps 3 --warmup --context-kb 200
+```
+
+A run passes only if Claude Code exits 0, the fixture tests pass, and the session called
+Jira `get_issue`, Datadog `search_logs`, Jira `add_comment` and Slack `post_message`.
+All 73 recorded runs pass under that rule.
 
 | | native | hr_client | hr_server | hr_hot |
 |---|---|---|---|---|
@@ -67,7 +78,8 @@ The "after" rows held in every run: on the long task `hr_hot` cost $0.254–0.25
   tokens) was compressed and lost its description, so the model called
   `headroom_retrieve` and then re-fetched the ticket: two extra turns, about +15% on the
   long task. MCP results under `HEADROOM_MCP_RESULT_MIN_CHARS` (default 4000) are now
-  forwarded verbatim.
+  forwarded verbatim, in both Anthropic `tool_result` blocks and OpenAI `role: "tool"`
+  messages.
 
 The fake MCP schemas are terse compared with real servers such as GitHub's official one,
 so absolute savings here understate a real catalog.

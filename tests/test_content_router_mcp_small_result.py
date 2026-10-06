@@ -79,3 +79,54 @@ def test_floor_can_be_disabled(monkeypatch):
     assert cr._mcp_result_min_chars() == 0
     monkeypatch.setenv("HEADROOM_MCP_RESULT_MIN_CHARS", "junk")
     assert cr._mcp_result_min_chars() == 4000
+
+
+def _openai_messages(tool_name):
+    return [
+        {"role": "user", "content": "fix BENCH-42"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": '{"issue_key": "BENCH-42"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": TICKET},
+        {"role": "assistant", "content": "Reading the ticket."},
+        {"role": "user", "content": "go on"},
+    ]
+
+
+def _apply_openai(tool_name):
+    return ContentRouter().apply(
+        _openai_messages(tool_name),
+        get_tokenizer("claude-sonnet-5-5"),
+        min_tokens_to_compress=10,
+        min_chars_for_block_compression=25,
+    )
+
+
+def test_small_mcp_result_is_verbatim_openai_format(monkeypatch):
+    monkeypatch.delenv("HEADROOM_MCP_RESULT_MIN_CHARS", raising=False)
+    for name in ("mcp__jira__get_issue", "mcp_jira_get_issue", "mcp--jira--get_issue"):
+        out = _apply_openai(name)
+        assert out.messages[2]["content"] == TICKET, name
+        assert "router:mcp_small_result_verbatim" in out.transforms_applied, name
+
+
+def test_openai_floor_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("HEADROOM_MCP_RESULT_MIN_CHARS", "0")
+    out = _apply_openai("mcp__jira__get_issue")
+    assert "router:mcp_small_result_verbatim" not in out.transforms_applied
+
+
+def test_non_mcp_tool_is_not_covered():
+    from headroom.transforms.content_router import _is_small_mcp_result
+
+    assert _is_small_mcp_result("mcp__jira__get_issue", "x" * 100)
+    assert not _is_small_mcp_result("Bash", "x" * 100)
+    assert not _is_small_mcp_result("mcp__jira__get_issue", "x" * 5000)

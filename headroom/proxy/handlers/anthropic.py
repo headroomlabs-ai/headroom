@@ -320,12 +320,15 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
     )
     try:
         out = Path(os.environ["HEADROOM_DEBUG_PREFIX_MISMATCH"]) / f"{request_id}.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(
-                {"first_diff_index": first, "current": current, "previous": previous}, default=str
+        out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-only from creation: the dump holds the full conversation.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(
+                {"first_diff_index": first, "current": current, "previous": previous},
+                fh,
+                default=str,
             )
-        )
     except Exception:  # noqa: BLE001 - debug aid only
         pass
 

@@ -198,7 +198,7 @@ def check_task(work: Path, calls_log: Path) -> dict:
     did = lambda svc, tool: any(c["service"] == svc and c["tool"] == tool for c in calls)  # noqa: E731
     return {
         "tests_pass": tests.returncode == 0,
-        "read_ticket": did("jira", "get_issue") or did("jira", "search_issues"),
+        "read_ticket": did("jira", "get_issue"),  # a search result has no description
         "searched_logs": did("datadog", "search_logs"),
         "commented": did("jira", "add_comment"),
         "posted_slack": did("slack", "post_message"),
@@ -285,7 +285,8 @@ def run_one(
         **usage_from_transcripts(home),
         **check_task(work, calls_log),
     }
-    row["task_ok"] = all(
+    # A session that errored out does not pass, even if it got the actions done.
+    row["task_ok"] = row["exit"] == 0 and all(
         row[k] for k in ("tests_pass", "read_ticket", "searched_logs", "commented", "posted_slack")
     )
     return row
