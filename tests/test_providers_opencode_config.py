@@ -218,6 +218,84 @@ def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.M
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
 
 
+def test_inject_provider_config_keeps_the_users_models_and_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A third-party upstream needs its own model ids and key under `headroom`.
+
+    OpenCode only resolves `headroom/<id>` for listed ids, so wiping the user's
+    entries made `wrap opencode --openai-api-url ...` unusable for DeepSeek.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "npm": "something-else",
+                        "options": {
+                            "apiKey": "{env:DEEPSEEK_API_KEY}",
+                            "baseURL": "https://api.deepseek.com/v1",
+                        },
+                        "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                    },
+                    "anthropic": {"options": {"timeout": 5}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+    inject_opencode_provider_config(port=9999, keep_user_entries=True)
+
+    config = _parse_json_loose(config_file.read_text())
+    headroom = config["provider"]["headroom"]
+    # Headroom still owns how the provider reaches the proxy.
+    assert headroom["npm"] == "@ai-sdk/openai-compatible"
+    assert headroom["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
+    # The user's key and model ids survive alongside Headroom's defaults.
+    assert headroom["options"]["apiKey"] == "{env:DEEPSEEK_API_KEY}"
+    assert set(headroom["models"]) == {"deepseek-chat", "gpt-4o", "gpt-4.1"}
+    assert headroom["models"]["deepseek-chat"] == {"name": "DeepSeek Chat"}
+    assert config["provider"]["anthropic"] == {"options": {"timeout": 5}}
+
+
+def test_inject_provider_config_drops_user_entries_without_an_explicit_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a named upstream the proxy forwards to OpenAI, so a kept key would go there."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "npm": "something-else",
+                        "options": {
+                            "apiKey": "{env:DEEPSEEK_API_KEY}",
+                            "baseURL": "https://api.deepseek.com/v1",
+                        },
+                        "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                    },
+                    "anthropic": {"options": {"timeout": 5}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inject_opencode_provider_config(port=8787)
+
+    headroom = _parse_json_loose(config_file.read_text())["provider"]["headroom"]
+    assert "apiKey" not in headroom["options"]
+    assert set(headroom["models"]) == {"gpt-4o", "gpt-4.1"}
+
+
 # ---------------------------------------------------------------------------
 # Edge cases — JSON parsing
 # ---------------------------------------------------------------------------
