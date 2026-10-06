@@ -13,10 +13,12 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from headroom.observability import (
     HeadroomOtelMetrics,
     get_otel_meter,
+    register_otel_metric_attribute_provider,
     reset_otel_metrics,
     set_otel_metrics,
+    unregister_otel_metric_attribute_provider,
 )
-from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.prometheus_metrics import MAX_DISTINCT_PATHS, PrometheusMetrics
 from headroom.telemetry.context import MAX_DISTINCT_MODELS
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -61,6 +63,16 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         cache_write_5m_tokens=10,
         cache_write_1h_tokens=25,
         uncached_input_tokens=60,
+        attempted_input_tokens=165,
+        output_tokens_saved=8,
+        savings_usd={
+            "compression": 0.001,
+            "tool_schema": 0.0003,
+            "output_shaping": 0.0008,
+            "provider_cache": 0.0002,
+        },
+        project="checkout",
+        client="claude-code",
     )
     otel_metrics.record_proxy_cache_bust(tokens_lost=7)
     otel_metrics.record_pipeline_run(
@@ -102,6 +114,30 @@ def test_headroom_otel_metrics_records_proxy_and_pipeline_metrics() -> None:
         cached=True,
     )
     assert tool_schema_point.value == 15
+
+    attempted_input = metrics["headroom.proxy.tokens.attempted_input"]
+    attempted_point = _find_point(
+        attempted_input,
+        **{
+            "headroom.project": "checkout",
+            "headroom.client": "claude-code",
+        },
+    )
+    assert attempted_point.value == 165
+
+    output_saved = metrics["headroom.proxy.tokens.output_saved"]
+    output_saved_point = _find_point(
+        output_saved,
+        **{
+            "headroom.project": "checkout",
+            "headroom.client": "claude-code",
+        },
+    )
+    assert output_saved_point.value == 8
+
+    savings_usd = metrics["headroom.proxy.savings.usd"]
+    compression_usd = _find_point(savings_usd, source="compression", estimated=True)
+    assert compression_usd.value == pytest.approx(0.001)
 
     compression_saved = metrics["headroom.compression.tokens.saved"]
     compression_saved_point = _find_point(
@@ -176,6 +212,77 @@ def test_get_otel_meter_uses_headrooms_configured_provider() -> None:
         reset_otel_metrics()
 
 
+def test_request_attribute_provider_enriches_core_and_savings_metrics() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    def identity_attributes() -> dict[str, str]:
+        return {
+            "headroom.org": "acme",
+            "headroom.team": "payments",
+            "headroom.user": "alice",
+            # Canonical call-site dimensions must win over an extension.
+            "model": "must-not-override",
+            "source": "must-not-override",
+        }
+
+    register_otel_metric_attribute_provider(identity_attributes)
+    try:
+        otel_metrics.record_proxy_request(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            input_tokens=100,
+            output_tokens=10,
+            tokens_saved=25,
+            latency_ms=20,
+        )
+        otel_metrics.record_savings_attribution(
+            [{"source": "tool_search", "tokens": 20, "usd": 0.001}]
+        )
+
+        metrics = _collect_metrics(reader)
+        request = _find_point(
+            metrics["headroom.proxy.requests"],
+            model="claude-sonnet-4-5",
+            **{
+                "headroom.org": "acme",
+                "headroom.team": "payments",
+                "headroom.user": "alice",
+            },
+        )
+        assert request.value == 1
+        attributed = _find_point(
+            metrics["headroom.savings.attributed.tokens"],
+            source="tool_search",
+            **{"headroom.user": "alice"},
+        )
+        assert attributed.value == 20
+    finally:
+        unregister_otel_metric_attribute_provider(identity_attributes)
+
+
+def test_failing_request_attribute_provider_is_fail_open() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    def broken_provider() -> dict[str, str]:
+        raise RuntimeError("identity unavailable")
+
+    register_otel_metric_attribute_provider(broken_provider)
+    try:
+        otel_metrics.record_proxy_failed(provider="openai", model="gpt-5")
+        point = _find_point(
+            _collect_metrics(reader)["headroom.proxy.requests.failed"],
+            provider="openai",
+            model="gpt-5",
+        )
+        assert point.value == 1
+    finally:
+        unregister_otel_metric_attribute_provider(broken_provider)
+
+
 @dataclass
 class _SpyMetrics:
     pipeline_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -186,8 +293,12 @@ class _SpyMetrics:
 
 @dataclass
 class _SpyProxyMetrics:
+    request_calls: list[dict[str, Any]] = field(default_factory=list)
     failed_calls: list[dict[str, Any]] = field(default_factory=list)
     rate_limited_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_proxy_request(self, **kwargs: Any) -> None:
+        self.request_calls.append(kwargs)
 
     def record_proxy_failed(self, **kwargs: Any) -> None:
         self.failed_calls.append(kwargs)
@@ -245,7 +356,95 @@ async def test_prometheus_metrics_reads_late_configured_otel_metrics() -> None:
         await metrics.record_rate_limited(provider="anthropic", model="claude-sonnet")
 
         assert spy.failed_calls == [{"provider": "openai", "model": None}]
-        assert spy.rate_limited_calls == [{"provider": "anthropic", "model": "claude-sonnet"}]
+        # ``source`` reaches OTel too — the split must not exist in Prometheus only.
+        assert spy.rate_limited_calls == [
+            {"provider": "anthropic", "model": "claude-sonnet", "source": "headroom"}
+        ]
+    finally:
+        reset_otel_metrics()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_forwards_rate_limit_source_to_otel() -> None:
+    """An upstream 429 must reach OTel labelled as upstream, not as our own limiter."""
+
+    spy = _SpyProxyMetrics()
+    metrics = PrometheusMetrics(stateless=True)
+    set_otel_metrics(spy)  # type: ignore[arg-type]
+
+    try:
+        await metrics.record_rate_limited(provider="anthropic", source="upstream")
+        await metrics.record_rate_limited(provider="anthropic", source="headroom")
+        # An unrecognised value is clamped rather than exported as a new label.
+        await metrics.record_rate_limited(provider="anthropic", source="nonsense")
+
+        assert [call["source"] for call in spy.rate_limited_calls] == [
+            "upstream",
+            "headroom",
+            "headroom",
+        ]
+    finally:
+        reset_otel_metrics()
+
+
+def test_otel_rate_limited_counter_carries_source_attribute() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_proxy_rate_limited(provider="anthropic", source="upstream")
+    otel_metrics.record_proxy_rate_limited(provider="openai", source="headroom")
+
+    metrics = _collect_metrics(reader)
+    upstream = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="anthropic", source="upstream"
+    )
+    headroom_side = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="openai", source="headroom"
+    )
+    assert upstream.value == 1
+    assert headroom_side.value == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_forwards_savings_drilldown_fields_to_otel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_usd = {
+        "compression": 0.003,
+        "tool_schema": 0.0,
+        "output_shaping": 0.004,
+        "provider_cache": 0.0,
+    }
+    monkeypatch.setattr(
+        "headroom.proxy.prometheus_metrics.estimate_request_savings_usd",
+        lambda *_args, **_kwargs: expected_usd,
+    )
+    spy = _SpyProxyMetrics()
+    metrics = PrometheusMetrics(stateless=True)
+    set_otel_metrics(spy)  # type: ignore[arg-type]
+
+    try:
+        await metrics.record_request(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            input_tokens=90,
+            output_tokens=12,
+            tokens_saved=30,
+            latency_ms=5.0,
+            attempted_input_tokens=120,
+            output_tokens_saved=4,
+            project="checkout",
+            client="claude-code",
+        )
+
+        assert len(spy.request_calls) == 1
+        call = spy.request_calls[0]
+        assert call["attempted_input_tokens"] == 120
+        assert call["output_tokens_saved"] == 4
+        assert call["savings_usd"] == expected_usd
+        assert call["project"] == "checkout"
+        assert call["client"] == "claude-code"
     finally:
         reset_otel_metrics()
 
@@ -351,6 +550,61 @@ async def test_prometheus_metrics_reset_rearms_cardinality_warning() -> None:
     assert metrics._model_cardinality_warned is False
     assert len(metrics.requests_by_model) == 0
     assert len(metrics._cache_requests_by_model) == 0
+
+
+def test_prometheus_metrics_caps_inbound_path_cardinality() -> None:
+    """A client hitting unbounded distinct paths (ID-bearing passthrough routes)
+    cannot grow inbound_requests_by_path past MAX_DISTINCT_PATHS + the "other"
+    sentinel, while the total request count stays exact."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    # Fill exactly to the cap with distinct paths: no bucketing yet.
+    for i in range(MAX_DISTINCT_PATHS):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS
+    assert "other" not in metrics.inbound_requests_by_path
+
+    # New distinct paths past the cap bucket into "other", never their own key.
+    for i in range(5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/responses/resp_{i}")
+    assert "/v1/responses/resp_0" not in metrics.inbound_requests_by_path
+    assert metrics.inbound_requests_by_path["other"] == 5
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS + 1
+
+    # An already-tracked path keeps incrementing after the cap is reached.
+    metrics.record_inbound_request(method="GET", path="/v1/files/file_0")
+    assert metrics.inbound_requests_by_path["/v1/files/file_0"] == 2
+
+    # Accounting is preserved: every inbound request is counted somewhere.
+    total_calls = MAX_DISTINCT_PATHS + 5 + 1
+    assert metrics.inbound_requests_total == total_calls
+    assert sum(metrics.inbound_requests_by_path.values()) == total_calls
+
+
+def test_prometheus_metrics_path_cardinality_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bucketing inbound paths into "other" logs exactly one warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        for i in range(MAX_DISTINCT_PATHS + 10):
+            metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    cap_warnings = [r for r in caplog.records if "path cardinality cap" in r.getMessage()]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_reset_rearms_path_cardinality_warning() -> None:
+    """reset_runtime clears the path dict and re-arms the one-shot cap warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_PATHS + 5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert metrics._path_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._path_cardinality_warned is False
+    assert len(metrics.inbound_requests_by_path) == 0
 
 
 @pytest.mark.asyncio

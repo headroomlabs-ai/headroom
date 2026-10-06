@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from headroom import savings_ledger as L
+from tests._pricing_models import anthropic_pricing_model
+
+MODEL = anthropic_pricing_model()
 
 UTC = timezone.utc
 
@@ -110,6 +113,50 @@ def test_windows_today_week_last30(monkeypatch, tmp_path):
     assert report.windows["last_30_days"]["calls"] == 3
     # 500 saved out of 1000 before today
     assert report.windows["today"]["savings_percent"] == pytest.approx(50.0)
+
+
+def test_new_input_basis_pairs_compression_only_with_new_input(monkeypatch, tmp_path):
+    _events_env(monkeypatch, tmp_path)
+    # 400 saved, of which 100 is tool-schema deferral; 900 tokens newly entered
+    # context. Compression-only 300 / (900 + 300) = 25%, same as /stats.
+    L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=9_600,
+        model=None,
+        client="claude-code",
+        new_input_tokens=900,
+        deferred_tokens=100,
+    )
+    # An event without a cache breakdown (MCP tool, Bedrock) keeps writing the
+    # old line and must not lend its savings to the new-input ratio.
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    report = L.aggregate_savings()
+    window = report.windows["today"]
+    assert window["tokens_saved"] == 900
+    assert window["new_input_tokens"] == 900
+    assert window["new_input_savings_percent"] == pytest.approx(25.0)
+    clients = {row["client"]: row for row in report.by_client}
+    assert clients["mcp"]["new_input_tokens"] == 0
+    assert clients["mcp"]["new_input_savings_percent"] == 0.0
+    # The whole-wire ratio is untouched by the new field.
+    assert window["savings_percent"] == pytest.approx(900 / 11_000 * 100, abs=0.1)
+
+
+def test_savings_cli_prints_new_input_line_only_with_cache_data(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli.savings import savings
+
+    _events_env(monkeypatch, tmp_path)
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input" not in out
+    L.record_savings_event(
+        tokens_before=10_000, tokens_after=9_600, model=None, client="c", new_input_tokens=900
+    )
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input 30.8%" in out
+    assert "newly entered context" in out
 
 
 def test_retention_hard_capped_at_30_days(monkeypatch, tmp_path):
@@ -263,7 +310,10 @@ def test_proxy_record_request_appends_ledger_event(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_SAVINGS_EVENTS_PATH", str(tmp_path / "savings_events.jsonl"))
     monkeypatch.setattr(
         "headroom.proxy.server.CostTracker._get_cache_prices",
-        lambda self, model: (0.001, 0.0015, 0.002),
+        # (cache_read, cache_write_5m, cache_write_1h, uncached). **kwargs so
+        # the stub keeps standing in as the real signature grows -- it takes a
+        # keyword-only `long_context` tier selector.
+        lambda self, model, **kwargs: (0.001, 0.0015, 0.0024, 0.002),
     )
 
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
@@ -317,3 +367,157 @@ def test_cli_days_flag_capped_at_30(monkeypatch, tmp_path, bad_days):
     result = CliRunner().invoke(savings, ["--days", bad_days])
     assert result.exit_code != 0
     assert "30" in result.output  # IntRange error mentions the allowed max
+
+
+def test_compaction_backs_off_when_nothing_can_be_dropped(tmp_path, monkeypatch):
+    """A busy install's whole retention window can exceed the size threshold.
+
+    Compaction only removes events older than retention, so such a ledger has
+    NOTHING to drop — and without a back-off every subsequent append re-read and
+    rewrote the entire growing file under an exclusive lock, once per compressed
+    request. The back-off is per-process and purely a work-saver: retention is
+    enforced on read regardless.
+    """
+    import headroom.savings_ledger as sl
+
+    path = tmp_path / "events.jsonl"
+    # Tiny thresholds so a handful of in-retention events trips compaction.
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 200)
+    monkeypatch.setattr(sl, "_COMPACT_GROWTH_BYTES", 10_000)
+    monkeypatch.setattr(sl, "_compact_min_size", 200)
+
+    for _ in range(5):
+        sl.record_savings_event(
+            tokens_before=1_000, tokens_after=600, model="unknown", source="mcp", path=path
+        )
+
+    assert path.stat().st_size > 200
+    # Every event is fresh, so none aged out and the floor ratcheted above the
+    # current size rather than staying at the threshold.
+    assert sl._compact_min_size > 200
+
+    # All five events survive: skipping the rewrite must never lose data.
+    assert sl.aggregate_savings(path=path).lifetime["calls"] == 5
+
+
+def test_compaction_still_drops_out_of_retention_events(tmp_path, monkeypatch):
+    """The back-off must not disable compaction for ledgers that CAN shrink."""
+    import json
+    from datetime import timedelta
+
+    import headroom.savings_ledger as sl
+
+    path = tmp_path / "events.jsonl"
+    stale = (sl._utc_now() - timedelta(days=sl.MAX_RETENTION_DAYS + 5)).isoformat()
+    with path.open("w", encoding="utf-8") as fh:
+        for _ in range(50):
+            fh.write(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "ts": stale,
+                        "before": 1_000,
+                        "after": 600,
+                        "saved": 400,
+                        "cost_usd": 0.0012,
+                        "model": "unknown",
+                        "client": "mcp",
+                        "source": "mcp",
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    before_size = path.stat().st_size
+    monkeypatch.setattr(sl, "_COMPACT_SIZE_BYTES", 200)
+    monkeypatch.setattr(sl, "_compact_min_size", 200)
+
+    sl.record_savings_event(
+        tokens_before=1_000, tokens_after=600, model="unknown", source="mcp", path=path
+    )
+
+    assert path.stat().st_size < before_size
+    # Only the fresh event remains; the floor reset so compaction stays armed.
+    assert sl.aggregate_savings(path=path).lifetime["calls"] == 1
+    assert sl._compact_min_size == 200
+
+
+def test_v1_events_still_aggregate_alongside_v2(tmp_path):
+    """A ledger written across the upgrade must stay legible, not silently blend.
+
+    A v1 event has no cache mix and never can have one, so it contributes its
+    list dollar to both columns — and drags the reported basis down to `list`,
+    which is how a reader learns the total is not fully cache-aware.
+    """
+    import json
+
+    import headroom.savings_ledger as sl
+
+    path = tmp_path / "events.jsonl"
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": sl._utc_now().isoformat(),
+                    "before": 10_000,
+                    "after": 6_000,
+                    "saved": 4_000,
+                    "cost_usd": 0.012,
+                    "model": MODEL,
+                    "client": "claude-code",
+                    "source": "proxy",
+                }
+            )
+            + "\n"
+        )
+    sl.record_savings_event(
+        tokens_before=108_000,
+        tokens_after=100_000,
+        model=MODEL,
+        client="claude-code",
+        source="proxy",
+        saved_compression=1_000,
+        saved_tool_schema=7_000,
+        cache_read_tokens=95_000,
+        cache_write_tokens=4_000,
+        cache_write_5m_tokens=4_000,
+        uncached_input_tokens=1_000,
+        provider="anthropic",
+        path=path,
+    )
+
+    lifetime = sl.aggregate_savings(path=path).lifetime
+    assert lifetime["calls"] == 2
+    # The v2 event is discounted, so the effective total sits below the list one.
+    assert lifetime["cost_effective_usd"] < lifetime["cost_usd"]
+    # ...but the v1 event's list dollar is still counted, not dropped.
+    assert lifetime["cost_effective_usd"] > 0.012
+    assert lifetime["basis"] == "list"
+
+
+def test_zero_saving_request_keeps_its_place_in_the_new_input_denominator(monkeypatch, tmp_path):
+    """100 saved on 100 new input, then 0 saved on 10,000 new input. The
+    new-input basis is 100 / (10,100 + 100), under 1 percent, not the 50
+    percent that only counting requests that saved would report. The
+    saved-event figures do not see the second request at all."""
+    _events_env(monkeypatch, tmp_path)
+    assert L.record_savings_event(
+        tokens_before=200, tokens_after=100, model=None, client="claude-code", new_input_tokens=100
+    )
+    assert L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=10_000,
+        model=None,
+        client="claude-code",
+        new_input_tokens=10_000,
+    )
+    # Without a new-input figure a zero-saving request is still not an event.
+    assert not L.record_savings_event(
+        tokens_before=500, tokens_after=500, model=None, client="claude-code"
+    )
+    window = L.aggregate_savings().windows["today"]
+    assert window["tokens_saved"] == 100
+    assert window["new_input_tokens"] == 10_100
+    assert window["new_input_savings_percent"] == pytest.approx(1.0, abs=0.05)
+    assert window["savings_percent"] == pytest.approx(50.0)
