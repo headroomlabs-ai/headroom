@@ -218,7 +218,17 @@ export HEADROOM_LEARN_CLI=codex
 headroom learn
 ```
 
-Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`.
+Valid values for `HEADROOM_LEARN_CLI`: `claude`, `gemini`, `codex`, `agy`.
+
+`agy` (Antigravity CLI) is never auto-detected. It has no mode that starts a session without tools, so instructions embedded in analyzed session text could make it write files or run shell commands with your permissions. To use it anyway, opt in explicitly:
+
+```bash
+export HEADROOM_LEARN_CLI=agy
+export HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1
+headroom learn
+```
+
+Without `HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1`, selecting `agy` (via `HEADROOM_LEARN_CLI` or `--model agy-cli`) fails before any analysis runs.
 
 ## Real-World Results
 

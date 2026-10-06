@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from headroom import utils
 
@@ -46,6 +46,33 @@ def test_extract_user_query_and_message_hashes() -> None:
     assert utils.extract_user_query(messages) == "latest question"
     assert utils.extract_user_query([{"role": "assistant", "content": "skip"}]) == ""
 
+
+def test_extract_user_query_latest_user_turn_only() -> None:
+    """The flag stops at the newest user turn instead of resurrecting an older one."""
+    # A tool_result continuation: the newest user turn carries no text at all.
+    messages = [
+        {"role": "user", "content": "the original question"},
+        {"role": "assistant", "content": "calling a tool"},
+        {"role": "user", "content": [{"type": "tool_result", "content": "output"}]},
+    ]
+
+    # Default walks back and finds the older turn's question.
+    assert utils.extract_user_query(messages) == "the original question"
+    # Scoped to this turn, there is no question to score against.
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == ""
+
+
+def test_extract_user_query_latest_turn_only_agrees_on_normal_turns() -> None:
+    """With text present on the newest user turn, the flag changes nothing."""
+    messages = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": [{"type": "text", "text": " newest question "}]},
+    ]
+
+    assert utils.extract_user_query(messages) == "newest question"
+    assert utils.extract_user_query(messages, latest_user_turn_only=True) == "newest question"
+
     hash_one = utils.compute_messages_hash(messages)
     hash_two = utils.compute_messages_hash(list(messages))
     assert hash_one == hash_two
@@ -77,6 +104,22 @@ def test_timestamp_marker_and_json_helpers() -> None:
     assert ts == "2026-04-23T06:00:00Z"
     assert utils.parse_timestamp(ts) == datetime(2026, 4, 23, 6, 0, 0)
     assert utils.parse_timestamp("2026-04-23T06:00:00") == datetime(2026, 4, 23, 6, 0, 0)
+
+
+def test_format_timestamp_normalizes_aware_datetimes() -> None:
+    # Shipped integrations pass datetime.now(timezone.utc) (aware). Appending a
+    # bare "Z" to an aware isoformat used to emit "...+00:00Z" — invalid ISO
+    # 8601 that datetime.fromisoformat itself rejects.
+    aware_utc = datetime(2026, 4, 23, 6, 0, 0, tzinfo=timezone.utc)
+    ts = utils.format_timestamp(aware_utc)
+    assert ts == "2026-04-23T06:00:00Z"
+    # The stored string must round-trip through a strict parser.
+    assert datetime.fromisoformat(ts.rstrip("Z")) == datetime(2026, 4, 23, 6, 0, 0)
+
+    # A non-UTC offset must be converted to UTC, not just stamped "Z" onto the
+    # local wall-clock time (which would mislabel the instant).
+    east = datetime(2026, 4, 23, 6, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    assert utils.format_timestamp(east) == "2026-04-23T01:00:00Z"
 
     marker = utils.create_marker("tool_digest", sha256="abc", count="2")
     assert marker == '<headroom:tool_digest sha256="abc" count="2">'

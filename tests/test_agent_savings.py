@@ -16,6 +16,7 @@ from headroom.agent_savings import (
     apply_agent_savings_profile,
     get_agent_savings_profile,
     proxy_pipeline_kwargs,
+    seed_proxy_env_defaults,
     with_target_savings,
 )
 from headroom.cli import wrap as wrap_module
@@ -169,6 +170,18 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_TARGET_RATIO"] == "0.25"
     assert env["HEADROOM_MAX_ITEMS"] == "12"
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
+
+
+def test_seed_proxy_env_defaults_reports_only_generated_keys() -> None:
+    env = {"HEADROOM_MODE": "token", "HEADROOM_LOSSLESS": "1"}
+
+    seeded = seed_proxy_env_defaults(env)
+
+    assert "HEADROOM_MODE" not in seeded
+    assert "HEADROOM_LOSSLESS" not in seeded
+    assert "HEADROOM_SAVINGS_PROFILE" in seeded
+    assert env["HEADROOM_MODE"] == "token"
+    assert env["HEADROOM_LOSSLESS"] == "1"
 
 
 def test_unknown_agent_savings_profile_falls_back_to_default(
@@ -485,6 +498,17 @@ def test_proxy_explicit_config_overrides_agent_90_profile() -> None:
     assert kwargs["target_ratio"] == 0.25
     assert kwargs["protect_recent"] == 5
     assert kwargs["min_tokens_to_compress"] == 300
+
+
+def test_proxy_explicit_compress_user_messages_off_overrides_coding_profile() -> None:
+    # coding turns user-message compression on; an explicit off
+    # (HEADROOM_COMPRESS_USER_MESSAGES=0) must win like every other override,
+    # and leaving it unset must keep the profile default.
+    explicit_off = ProxyConfig(savings_profile="coding", compress_user_messages=False)
+    unset = ProxyConfig(savings_profile="coding")
+
+    assert proxy_pipeline_kwargs(explicit_off)["compress_user_messages"] is False
+    assert proxy_pipeline_kwargs(unset)["compress_user_messages"] is True
 
 
 def test_agent_90_router_uses_ccr_sampling_not_lossless_table() -> None:

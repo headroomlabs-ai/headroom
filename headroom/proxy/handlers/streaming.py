@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
@@ -28,11 +29,55 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.proxy import public_errors
+from headroom.proxy.memory_tool_stream import (
+    MemoryToolStreamFilter,
+    MemoryToolStreamOverflowError,
+)
 from headroom.proxy.stream_output_tokens import estimate_output_tokens
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
 
 logger = logging.getLogger("headroom.proxy")
+
+_ROUND_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _add_round_usage(stream_state: dict[str, Any], response: dict[str, Any] | None) -> None:
+    """Add a server-side continuation round's usage to the turn's totals."""
+    usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict):
+        return
+    for key in _ROUND_USAGE_KEYS:
+        value = usage.get(key)
+        if isinstance(value, int):
+            stream_state[key] = (stream_state.get(key) or 0) + value
+
+
+def _upstream_error_frame(error_bytes: bytes, request_id: str) -> bytes:
+    """Render an upstream error response as an Anthropic SSE ``error`` event.
+
+    An Anthropic error envelope is addressed to the caller and passes through
+    as is; anything else becomes the generic public error.
+    """
+    try:
+        payload = json.loads(error_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    if not (
+        isinstance(payload, dict)
+        and payload.get("type") == "error"
+        and isinstance(payload.get("error"), dict)
+    ):
+        payload = public_errors.anthropic_error_body(
+            public_errors.INTERNAL_ERROR, request_id=request_id
+        )
+    return f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
 
 
 def _thinking_for_stream(payload: object) -> ThinkingTokens:
@@ -310,7 +355,10 @@ class StreamingMixin:
                 if event_type == "message_start":
                     msg_usage = _sse_dict(_sse_dict(data.get("message")).get("usage"))
                     if msg_usage:
-                        usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
+                        # Absent stays absent: the finalizer falls back to the
+                        # tokenizer derivation only when input_tokens is None.
+                        if "input_tokens" in msg_usage:
+                            usage_found["input_tokens"] = msg_usage["input_tokens"]
                         usage_found["cache_read_input_tokens"] = msg_usage.get(
                             "cache_read_input_tokens", 0
                         )
@@ -441,6 +489,174 @@ class StreamingMixin:
         from headroom.proxy.anthropic_wire import render_anthropic_sse_response
 
         return render_anthropic_sse_response(response)
+
+    async def _continue_memory_tool_stream(
+        self,
+        memory_filter: MemoryToolStreamFilter,
+        response: dict[str, Any] | None,
+        *,
+        url: str,
+        outbound_headers: dict[str, str],
+        outbound_bytes: bytes,
+        memory_user_id: str | None,
+        memory_request_ctx: Any | None,
+        server_memory_tool_names: frozenset[str],
+        stream_state: dict[str, Any],
+        request_id: str,
+    ) -> AsyncIterator[bytes]:
+        """Execute withheld memory tool calls and stream continuation rounds.
+
+        ``memory_filter`` has forwarded one upstream round to the client minus
+        the proxy-owned memory tool calls and the message tail. When the round
+        stopped on memory tool calls alone, run them, send the results upstream
+        as the next turn, and stream that round's blocks into the same client
+        message. Otherwise end the client message. A round that also called a
+        client tool still has its memory calls executed, but the turn goes back
+        to the client, which cannot carry the memory results.
+        """
+        from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
+
+        try:
+            base_body = json.loads(outbound_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            base_body = None
+        messages = base_body.get("messages") if isinstance(base_body, dict) else None
+        if not isinstance(messages, list):
+            messages = None
+        headers = {k: v for k, v in outbound_headers.items() if k.lower() != "content-length"}
+
+        def is_memory_call(block: Any) -> bool:
+            return (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in server_memory_tool_names
+            )
+
+        rounds = 0
+        # What the client received across rounds; the prefix tracker must see
+        # this, not round one, because it is what the client sends back.
+        visible_content: list[Any] = []
+        # Usage of rounds whose message_delta the client never receives.
+        prior_usage: dict[str, int] = {}
+        while True:
+            content: list[Any] = []
+            if response is not None:
+                round_content = response.get("content")
+                content = round_content if isinstance(round_content, list) else []
+                visible_content.extend(block for block in content if not is_memory_call(block))
+                stream_state["memory_client_message"] = {
+                    **response,
+                    "content": list(visible_content),
+                }
+
+            if not memory_filter.hid_tool_calls:
+                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
+                    yield frame
+                return
+
+            # Run the calls the filter recorded, so they are not lost when the
+            # round could not be reconstructed. Only the proxy's own calls: a
+            # memory-named tool the client declared is the client's to run.
+            memory_calls = memory_filter.hidden_calls()
+            tool_results: list[dict[str, Any]] = []
+            if memory_calls and memory_user_id is not None and self.memory_handler is not None:
+                tool_results = await self.memory_handler.handle_memory_tool_calls(
+                    {"content": memory_calls},
+                    memory_user_id,
+                    "anthropic",
+                    request_context=memory_request_ctx,
+                )
+            logger.info(
+                f"[{request_id}] Memory: Executed {len(tool_results)}/"
+                f"{len(memory_filter.hidden_tool_names)} proxy-handled tool call(s) "
+                "withheld from the SSE stream"
+            )
+
+            replayable = response is not None and len(tool_results) == sum(
+                1 for block in content if is_memory_call(block)
+            )
+            can_continue = (
+                memory_filter.stop_reason == "tool_use"
+                and not memory_filter.visible_tool_use
+                and messages is not None
+                and replayable
+                and rounds < self._MEMORY_CONTINUATION_MAX_ROUNDS
+            )
+            if not can_continue:
+                if memory_filter.visible_tool_use:
+                    logger.info(
+                        f"[{request_id}] Memory: Round also called a client tool; "
+                        "returning the turn to the client"
+                    )
+                elif rounds >= self._MEMORY_CONTINUATION_MAX_ROUNDS:
+                    logger.warning(
+                        f"[{request_id}] Memory: Stopped after {rounds} continuation "
+                        "round(s) that only called memory tools"
+                    )
+                elif not replayable:
+                    logger.warning(
+                        f"[{request_id}] Memory: Could not rebuild the round for a "
+                        "continuation; ending the turn after running its memory calls"
+                    )
+                for frame in memory_filter.closing_frames(prior_usage=prior_usage):
+                    yield frame
+                return
+
+            assert response is not None and messages is not None and isinstance(base_body, dict)
+            round_usage = response.get("usage")
+            if isinstance(round_usage, dict):
+                for key in _ROUND_USAGE_KEYS:
+                    if isinstance(value := round_usage.get(key), int):
+                        prior_usage[key] = prior_usage.get(key, 0) + value
+            messages = [
+                *messages,
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": tool_results},
+            ]
+            continuation_bytes = json.dumps({**base_body, "messages": messages}).encode("utf-8")
+            assert self.http_client is not None
+            continuation_request = self.http_client.build_request(
+                "POST", url, content=continuation_bytes, headers=headers
+            )
+            continuation = await self.http_client.send(continuation_request, stream=True)
+            rounds += 1
+            async with contextlib.aclosing(continuation) as upstream:
+                if upstream.status_code >= 400:
+                    error_bytes = await upstream.aread()
+                    logger.warning(
+                        f"[{request_id}] Memory: Continuation round {rounds} failed "
+                        f"with upstream status {upstream.status_code}"
+                    )
+                    yield _upstream_error_frame(error_bytes, request_id)
+                    return
+                memory_filter = MemoryToolStreamFilter(
+                    server_memory_tool_names,
+                    index_offset=memory_filter.next_index,
+                    forward_message_start=False,
+                )
+                # Same cap as the first round's buffer; past it the round is
+                # still streamed, just not rebuilt for a further continuation.
+                round_bytes: bytearray | None = bytearray()
+                async for chunk in upstream.aiter_bytes():
+                    if round_bytes is not None:
+                        round_bytes.extend(chunk)
+                        if len(round_bytes) > MAX_SSE_BUFFER_SIZE:
+                            logger.warning(
+                                f"[{request_id}] Memory: Continuation round {rounds} "
+                                "exceeded the SSE buffer cap"
+                            )
+                            round_bytes = None
+                    for frame in memory_filter.feed(chunk):
+                        yield frame
+            response = (
+                self._parse_sse_to_response(round_bytes.decode("utf-8"), "anthropic")
+                if round_bytes is not None
+                else None
+            )
+            _add_round_usage(stream_state, response)
+            logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
+
+    _MEMORY_CONTINUATION_MAX_ROUNDS = 4
 
     def _record_ccr_feedback_from_response(
         self, response: dict, provider: str, request_id: str
@@ -654,9 +870,20 @@ class StreamingMixin:
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
         cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"] or 0
         cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"] or 0
-        uncached_input_tokens = max(
-            effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
-        )
+        if provider == "anthropic" and isinstance(provider_input_tokens, int):
+            # Anthropic's usage.input_tokens already IS the uncached count
+            # (tokens after the last cache breakpoint), the field the
+            # non-streaming path records. Deriving it from Headroom's own
+            # tokenizer count books the estimate's error as uncached input:
+            # where the estimate runs over the provider's count (long
+            # screenshot-heavy sessions, ~10%) every turn reported tens of
+            # thousands of phantom uncached tokens, and where it runs under,
+            # real uncached input clamped to 0.
+            uncached_input_tokens = max(provider_input_tokens, 0)
+        else:
+            uncached_input_tokens = max(
+                effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+            )
 
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
@@ -665,6 +892,16 @@ class StreamingMixin:
             import copy as _copy
 
             forwarded_messages = body.get("messages", [])
+            if not forwarded_messages and provider == "gemini":
+                # Gemini bodies carry contents[] rather than messages[] (Cloud
+                # Code Assist nests the payload under body["request"]).
+                # Convert with the same helper the Gemini handler used so the
+                # tracker walks the same message shape (#3394).
+                _gemini_payload = body["request"] if isinstance(body.get("request"), dict) else body
+                forwarded_messages, _ = self._gemini_contents_to_messages(
+                    _gemini_payload.get("contents", []),
+                    _gemini_payload.get("systemInstruction"),
+                )
             next_forwarded = _copy.deepcopy(forwarded_messages)
             next_original = _copy.deepcopy(original_messages or forwarded_messages)
 
@@ -701,9 +938,19 @@ class StreamingMixin:
                     )
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
+            tracker_cache_write = cache_write_tokens
+            if provider == "gemini" and tracker_cache_write == 0:
+                # Gemini's stream usage reports cache reads only
+                # (cachedContentTokenCount); implicit caching has no write
+                # counter, so the uncached input portion is the write proxy
+                # (same inference as the OpenAI buffered path). Kept as a
+                # tracker-local value: Gemini outcomes intentionally report no
+                # cache-write concept (#3394).
+                tracker_cache_write = max(effective_optimized_tokens - cache_read_tokens, 0)
+
             prefix_tracker.update_from_response(
                 cache_read_tokens=cache_read_tokens,
-                cache_write_tokens=cache_write_tokens,
+                cache_write_tokens=tracker_cache_write,
                 messages=next_forwarded,
                 original_messages=next_original,
             )
@@ -788,17 +1035,17 @@ class StreamingMixin:
         session_key: str | None = None,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        server_memory_tool_names: frozenset[str] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
         Parses SSE events to extract actual usage information from the API response
         for accurate token counting and cost calculation.
 
-        When memory is enabled (memory_user_id provided), this method:
-        1. Buffers the response to detect memory tool calls
-        2. Executes memory tools if found
-        3. Makes continuation requests until no memory tools remain
-        4. Streams the final response to the client
+        When the proxy injected memory tools (``server_memory_tool_names``),
+        this method streams live but withholds those tool calls from the
+        client, executes them, and streams server-side continuation rounds
+        into the same client message until no memory tool call remains.
         """
         session_key = session_key or self._get_session_key(body)
 
@@ -834,6 +1081,7 @@ class StreamingMixin:
                 session_key=session_key,
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
+                server_memory_tool_names=server_memory_tool_names,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -866,6 +1114,7 @@ class StreamingMixin:
         session_key: str,
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
+        server_memory_tool_names: frozenset[str] | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1070,17 +1319,17 @@ class StreamingMixin:
             from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
 
             tls_hint = await describe_upstream_failure_async(e, url)
-            client_message = tls_hint or f"Failed to connect to upstream API: {error_msg}"
+            # The exception text itself stays in the log above: it names the
+            # resolved upstream host and address (public_errors module doc).
+            error_body = public_errors.anthropic_error_body(
+                public_errors.classify_or_internal(e),
+                request_id=request_id,
+                error_type="connection_error",
+                hint=tls_hint,
+            )
 
             async def _error_gen():
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": client_message,
-                    },
-                }
-                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                yield f"event: error\ndata: {json.dumps(error_body)}\n\n".encode()
 
             self._cleanup_mid_turn_stream(session_key)
             return StreamingResponse(
@@ -1261,6 +1510,13 @@ class StreamingMixin:
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
             completed_normally = False
             pending_messages: list[dict] = []
+            # Proxy-injected memory tools are invisible to the client, so their
+            # tool_use blocks must never reach it (GH #2195).
+            memory_filter = (
+                MemoryToolStreamFilter(server_memory_tool_names)
+                if memory_enabled and server_memory_tool_names
+                else None
+            )
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
@@ -1293,7 +1549,11 @@ class StreamingMixin:
 
                         # Always stream immediately — buffering breaks
                         # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        if memory_filter is None:
+                            yield chunk
+                        else:
+                            for frame in memory_filter.feed(chunk):
+                                yield frame
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1370,22 +1630,42 @@ class StreamingMixin:
                             "do not support custom tool injection. Set ANTHROPIC_API_KEY "
                             "environment variable or use --no-memory-tools flag."
                         )
+                        if memory_filter is not None:
+                            for frame in memory_filter.closing_frames():
+                                yield frame
                         return
 
                     # Parse SSE to get response JSON
                     parsed_response = self._parse_sse_to_response(full_sse_data, provider)
 
-                    if parsed_response and self.memory_handler.has_memory_tool_calls(
+                    if memory_filter is not None:
+                        async for frame in self._continue_memory_tool_stream(
+                            memory_filter,
+                            parsed_response,
+                            url=url,
+                            outbound_headers=outbound_headers,
+                            outbound_bytes=outbound_bytes,
+                            memory_user_id=memory_user_id,
+                            memory_request_ctx=memory_request_ctx,
+                            server_memory_tool_names=server_memory_tool_names or frozenset(),
+                            stream_state=stream_state,
+                            request_id=request_id,
+                        ):
+                            yield frame
+                        memory_filter = None
+                        parsed_response = (
+                            stream_state.pop("memory_client_message", None) or parsed_response
+                        )
+                    elif parsed_response and self.memory_handler.has_memory_tool_calls(
                         parsed_response, provider
                     ):
                         logger.info(
                             f"[{request_id}] Memory: Detected tool calls in streaming response"
                         )
 
-                        # Execute memory tool calls — response already streamed
-                        # so results are saved but continuation is not possible
-                        # in SSE streaming mode. The WS and non-streaming paths
-                        # handle continuation properly.
+                        # The client declared these memory tools itself, so the
+                        # tool_use already reached it and the client continues
+                        # the turn; only the server-side save happens here.
                         tool_results = await self.memory_handler.handle_memory_tool_calls(
                             parsed_response,
                             memory_user_id,
@@ -1398,6 +1678,23 @@ class StreamingMixin:
                                 f"({len(tool_results)} results saved, SSE streaming — "
                                 "continuation handled by client)"
                             )
+
+                if memory_filter is not None:
+                    # Memory detection was skipped (empty stream or buffer cap):
+                    # still run the withheld calls, then end the message.
+                    async for frame in self._continue_memory_tool_stream(
+                        memory_filter,
+                        None,
+                        url=url,
+                        outbound_headers=outbound_headers,
+                        outbound_bytes=outbound_bytes,
+                        memory_user_id=memory_user_id,
+                        memory_request_ctx=memory_request_ctx,
+                        server_memory_tool_names=server_memory_tool_names or frozenset(),
+                        stream_state=stream_state,
+                        request_id=request_id,
+                    ):
+                        yield frame
 
                 # CCR Feedback: Record headroom_retrieve tool calls for TOIN learning.
                 # In streaming mode, the client handles actual retrieval, but we
@@ -1435,24 +1732,31 @@ class StreamingMixin:
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to upstream API: {e}",
-                    },
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="connection_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except httpx.HTTPStatusError as e:
                 logger.error(f"[{request_id}] HTTP error from upstream API: {e}")
                 # Forward the upstream error response
                 yield e.response.content
+            except MemoryToolStreamOverflowError as e:
+                # The filter dropped what it withheld; end the stream rather
+                # than forward it.
+                logger.error(f"[{request_id}] Memory: {e}; ending the stream")
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.INTERNAL_ERROR, request_id=request_id
+                )
+                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             except Exception as e:
                 logger.error(f"[{request_id}] Unexpected streaming error: {e}")
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
             finally:
                 pending_messages = self._cleanup_mid_turn_stream(
@@ -1680,10 +1984,11 @@ class StreamingMixin:
             except Exception as e:
                 error_message = format_exception_message(e)
                 logger.error(f"[{request_id}] Bedrock streaming error: {error_message}")
-                error_event = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
-                }
+                error_event = public_errors.anthropic_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             finally:
@@ -1875,13 +2180,11 @@ class StreamingMixin:
                     yield chunk_bytes
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
-                error_data = {
-                    "error": {
-                        "message": str(e),
-                        "type": "api_error",
-                        "code": "backend_error",
-                    }
-                }
+                error_data = public_errors.openai_error_body(
+                    public_errors.classify_or_internal(e),
+                    request_id=request_id,
+                    error_type="api_error",
+                )
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:

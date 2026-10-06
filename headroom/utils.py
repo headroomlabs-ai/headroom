@@ -49,12 +49,23 @@ def fast_hash(data: str | bytes, length: int = 16) -> str:
     return hashlib.md5(data).hexdigest()[:length]  # nosec B324
 
 
-def extract_user_query(messages: list[dict[str, Any]]) -> str:
+def extract_user_query(
+    messages: list[dict[str, Any]], *, latest_user_turn_only: bool = False
+) -> str:
     """Extract the most recent user question from messages.
 
     Used to pass context through the compression pipeline so transforms like
     SmartCrusher can score items by relevance to the user's actual question,
     not just by statistical properties (position, anomaly, boundary).
+
+    Args:
+        messages: Conversation messages, oldest first.
+        latest_user_turn_only: Stop at the newest user message instead of
+            walking back through earlier ones when it yields no text. Callers
+            that treat the query as "what this turn is about" want this: on a
+            tool_result continuation turn the newest user message carries no
+            text, and resurrecting an older turn's question would make them
+            act on a stale intent.
     """
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -67,6 +78,8 @@ def extract_user_query(messages: list[dict[str, Any]]) -> str:
                         text = str(block.get("text", "")).strip()
                         if text:
                             return text
+            if latest_user_turn_only:
+                return ""
     return ""
 
 
@@ -106,9 +119,19 @@ def compute_prefix_hash(messages: list[dict[str, Any]], prefix_count: int | None
 
 
 def format_timestamp(dt: datetime | None = None) -> str:
-    """Format datetime as ISO8601 string."""
+    """Format a datetime as an ISO 8601 UTC string with a ``Z`` suffix.
+
+    A timezone-aware ``dt`` is converted to UTC first; a naive ``dt`` is assumed
+    to already be UTC. This keeps the output valid: appending ``Z`` to an aware
+    datetime's ``isoformat()`` would emit ``...+00:00Z`` (which even
+    ``datetime.fromisoformat`` rejects), and for a non-UTC offset it would label
+    the wrong instant as UTC. Shipped integrations pass
+    ``datetime.now(timezone.utc)`` (aware), so this path is live.
+    """
     if dt is None:
-        dt = datetime.now(timezone.utc).replace(tzinfo=None)
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt.isoformat() + "Z"
 
 
@@ -255,3 +278,32 @@ def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     serialisation overhead on large conversation histories).
     """
     return copy.deepcopy(messages)
+
+
+def strip_streaming_only_content_fields_in_place(messages: Any) -> None:
+    """Remove streaming-only ``index`` keys from request content blocks, in place.
+
+    Shared in-place canonicalizer used right after the shared body readers
+    parse a request (the Anthropic handler has a private copy of this walk).
+    ``index`` is a field some providers emit on streaming RESPONSE content-block
+    deltas; it is not part of the request-message schema, so forwarding it
+    upstream triggers a 400 that aborts multi-turn sessions once a client
+    echoes a reconstructed assistant turn back. Stripping it before any
+    deepcopy / prefix recording keeps every derived copy identical. Nested
+    tool_result content lists are walked too.
+    """
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if isinstance(message, dict):
+            _strip_index_from_content_blocks_in_place(message.get("content"))
+
+
+def _strip_index_from_content_blocks_in_place(content: Any) -> None:
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict):
+            block.pop("index", None)
+            # tool_result blocks nest their own content list of blocks.
+            _strip_index_from_content_blocks_in_place(block.get("content"))

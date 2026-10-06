@@ -44,11 +44,9 @@ updates:
       # upgrading silently disables compression (GH #1216).
       - dependency-name: "tree-sitter-language-pack"
         versions: [">=1.0.0,<2.0.0"]
-      # These releases do not fix the optional-extra advisories documented in
+      # These releases do not fix the optional-extra advisory documented in
       # SECURITY.md. Keep future versions eligible for review; do not suppress
       # alerts or ignore these packages indefinitely.
-      - dependency-name: "chromadb"
-        versions: ["<=1.5.9"]
       - dependency-name: "accelerate"
         versions: ["<=1.15.0"]
     groups:
