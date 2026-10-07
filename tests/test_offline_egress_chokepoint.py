@@ -2272,9 +2272,10 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "is the main reason such a deployment exists.",
     ),
     "update_check.py": (
-        1,
+        2,
         "gated: is_update_check_enabled() returns False when is_offline(), so "
-        "the request is never built. See headroom/update_check.py.",
+        "neither the explicit-context nor default-context request is built. "
+        "See headroom/update_check.py.",
     ),
     "telemetry/session.py": (
         1,
