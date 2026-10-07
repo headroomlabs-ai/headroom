@@ -797,6 +797,31 @@ class OpenAIProvider(Provider):
         _, estimated = self._resolve_pricing(model)
         return estimated
 
+    def resolve_pricing_for_ledger(self, model: str) -> tuple[tuple[float, float] | None, str]:
+        """Per-1M (input, output) price and its provenance for ledger booking.
+
+        Lets the proxy outcome path (#3825) book the SAME price this provider
+        resolved for the request -- explicit overrides and catalog lookups
+        keep their measured provenance; only the unknown-model default comes
+        back flagged estimated. Never raises: a provider hiccup degrades to
+        the tracker's generic fallback rather than breaking response
+        bookkeeping.
+        """
+        # Local import: headroom.proxy must not become a load-time dependency
+        # of the provider package.
+        from headroom.proxy.budget_basis_policy import (
+            PRICE_BASIS_ESTIMATED,
+            PRICE_BASIS_MEASURED,
+        )
+
+        try:
+            pricing, is_estimated = self._resolve_pricing(model)
+        except Exception:  # noqa: BLE001 -- ledger bookkeeping must never break a response
+            return None, PRICE_BASIS_MEASURED
+        if pricing is None:
+            return None, PRICE_BASIS_MEASURED
+        return pricing, (PRICE_BASIS_ESTIMATED if is_estimated else PRICE_BASIS_MEASURED)
+
     def _warn_unknown_pricing(self, model: str) -> None:
         """Warn once per model priced at the unknown-model default (issue #3732).
 

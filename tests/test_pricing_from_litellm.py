@@ -18,8 +18,15 @@ import pytest
 
 from headroom.pricing.litellm_model_resolution import unwrapped_model_forms
 from headroom.providers.openai import OpenAIProvider
+from tests._dotenv import importorskip_no_env_leak
 
-litellm = pytest.importorskip("litellm")
+# NOTE: no module-level importorskip("litellm") here on purpose. Only the
+# catalog-price test below needs the live LiteLLM database; every other test
+# in this module either exercises the built-in-table/unknown-default fallback
+# (which must ALSO run on LiteLLM-free installs, including Python 3.14) or a
+# pure function. The litellm-dependent test skips itself at function level
+# via importorskip_no_env_leak, which quarantines litellm's dotenv import
+# side effect (see tests/_dotenv.py).
 
 
 def test_unwrapped_model_forms_drops_leading_segments() -> None:
@@ -45,8 +52,9 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
         # when it prunes a model the unwrap finds nothing and _get_pricing
         # silently returns the $2.50/$10.00 GPT-4o default, which is what
         # this test exists to catch. litellm dropped
-        # groq/llama-3.3-70b-versatile on 2026-09-23; see issue #3732.
-        ("groq/llama-guard-3-8b", 0.20, 0.20),
+        # groq/llama-3.3-70b-versatile on 2026-09-23 (since restored) and
+        # groq/llama-guard-3-8b (2026-10-07); see issue #3732.
+        ("groq/llama-3.3-70b-versatile", 0.59, 0.79),
         # Non-OpenAI models reachable through the OpenAI-compatible passthrough.
         ("gemini-2.5-flash", 0.30, 2.50),
         ("deepseek-chat", 0.28, 0.42),
@@ -55,6 +63,12 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
 def test_provider_prices_models_its_table_never_covered(
     model: str, want_in: float, want_out: float
 ) -> None:
+    # The only test in this module that needs the live LiteLLM database --
+    # it asserts real catalog prices. Everything else here must also run on
+    # LiteLLM-free installs (including Python 3.14), so the skip lives on
+    # this test, not the module.
+    importorskip_no_env_leak("litellm")
+
     got_in, got_out = OpenAIProvider()._get_pricing(model)
 
     assert (round(got_in, 2), round(got_out, 2)) == (want_in, want_out)
