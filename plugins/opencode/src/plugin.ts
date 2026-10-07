@@ -2,7 +2,11 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { z } from "zod";
 
-import { createHeadroomRetrieveTool, getDefaultProxyUrl } from "./retrieve.js";
+import {
+  createHeadroomRetrieveTool,
+  getDefaultProxyUrl,
+  trimTrailingSlashes,
+} from "./retrieve.js";
 import { installHeadroomTransport } from "./transport.js";
 
 export interface HeadroomOpenCodePluginOptions {
@@ -14,7 +18,7 @@ export interface HeadroomOpenCodePluginOptions {
 }
 
 function normalizeProxyUrl(url: string): string {
-  return url.replace(/\/+$/, "");
+  return trimTrailingSlashes(url);
 }
 
 function resolveProxyUrl(options?: HeadroomOpenCodePluginOptions): string {
