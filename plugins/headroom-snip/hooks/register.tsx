@@ -11,6 +11,8 @@ import {
   crossed,
   explain,
   fmt,
+  isOwn,
+  ownProject,
   pages,
   parseRecent,
   proxyUrl,
@@ -30,7 +32,9 @@ const totals = atom({ plugin: 'headroom-snip', key: 'totals' } as const, {
   biggest: null,
 })
 const anim = atom({ plugin: 'headroom-snip', key: 'anim' } as const, null)
-const proxy = atom({ plugin: 'headroom-snip', key: 'proxy' } as const, { url: '', isUp: null })
+const proxy = atom({ plugin: 'headroom-snip', key: 'proxy' } as const, { url: '', isUp: null, project: null })
+// When this session started, in $.clock time; requests stamped earlier are history. Kept across reloads.
+const startedAt = atom({ plugin: 'headroom-snip', key: 'startedAt' } as const, null)
 const isHidden = atom({ plugin: 'headroom-snip', key: 'isHidden' } as const, false)
 
 const TONE: Record<Tone, { color?: string; dimColor?: boolean; bold?: boolean }> = {
@@ -44,20 +48,27 @@ const TONE: Record<Tone, { color?: string; dimColor?: boolean; bold?: boolean }>
 const pct = (t: Pick<Totals, 'saved' | 'original'>) =>
   t.original > 0 ? Math.round((t.saved / t.original) * 100) : 0
 
+// Without a project tag the proxy's requests can't be told apart by client, so the totals are proxy-wide.
+const scope = (project: string | null) => (project ? 'session' : 'proxy')
+
 // The module's own bookkeeping; a reload starts it over while $.state keeps the drawing's values.
 const live = {
   seen: new Set<string>(),
   url: proxyUrl(),
+  project: null as string | null,
   poller: undefined as Timer | undefined,
   animTimer: undefined as Timer | undefined,
   tail: 0,
+  // Set once a poll has succeeded: a request with no usable timestamp counts only if it shows up after that.
   isBaselined: false,
   isPolling: false,
 }
 
 async function setProxy($: EngineInterface, next: Proxy) {
   const now = await read($, proxy)
-  if (now.isUp !== next.isUp || now.url !== next.url) await update($, proxy, () => next)
+  if (now.isUp !== next.isUp || now.url !== next.url || now.project !== next.project) {
+    await update($, proxy, () => next)
+  }
 }
 
 async function snipAnimation($: EngineInterface, id: string) {
@@ -77,9 +88,9 @@ async function land($: EngineInterface, fresh: Snip[]) {
   const after = await update($, totals, t => addToTotals(t, fresh))
   $.ui.status(`✂ ${fmt(after.saved)} tok saved · ${pct(after)}%`)
 
-  const milestone = crossed(before, after.saved)
-  if (milestone !== undefined) {
-    $.ui.toast(`✂ ${fmt(milestone)} tokens snipped this session: ${pages(milestone)} Claude didn't have to reread`)
+  const where = live.project ? 'this session' : 'on this proxy since this session started'
+  for (const milestone of crossed(before, after.saved)) {
+    $.ui.toast(`✂ ${fmt(milestone)} tokens snipped ${where}: ${pages(milestone)} Claude didn't have to reread`)
   }
 
   const added = fresh.reduce((n, s) => n + s.saved, 0)
@@ -96,21 +107,20 @@ async function poll($: EngineInterface) {
   try {
     const res = await $.http.fetch(`${live.url}/stats?cached=1`)
     if (!res.ok) {
-      await setProxy($, { url: live.url, isUp: false })
+      await setProxy($, { url: live.url, isUp: false, project: live.project })
       return
     }
-    await setProxy($, { url: live.url, isUp: true })
+    await setProxy($, { url: live.url, isUp: true, project: live.project })
     for (const s of await read($, feed)) live.seen.add(s.id)
-    const fresh = parseRecent(res.text).filter(s => !live.seen.has(s.id))
-    fresh.forEach(s => live.seen.add(s.id))
-    // Requests the proxy served before this session are history, not this session's snips.
-    if (!live.isBaselined) {
-      live.isBaselined = true
-      return
-    }
+    const since = (await read($, startedAt)) ?? 0
+    const unseen = parseRecent(res.text).filter(s => !live.seen.has(s.id))
+    unseen.forEach(s => live.seen.add(s.id))
+    // A request stamped before the session started is history, however late the first poll lands.
+    const fresh = unseen.filter(s => isOwn(s, since, live.project) ?? live.isBaselined)
+    live.isBaselined = true
     if (fresh.length > 0) await land($, fresh)
   } catch {
-    await setProxy($, { url: live.url, isUp: false })
+    await setProxy($, { url: live.url, isUp: false, project: live.project })
   } finally {
     live.isPolling = false
   }
@@ -131,6 +141,9 @@ function keepPolling($: EngineInterface) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     live.url = proxyUrl(await $.env.get('HEADROOM_PROXY_URL'), await $.env.get('ANTHROPIC_BASE_URL'))
+    live.project = ownProject(await $.env.get('ANTHROPIC_CUSTOM_HEADERS'))
+    const now = await $.clock.now()
+    await update($, startedAt, at => at ?? now)
     await $.command.register({
       name: 'headroom',
       description: 'Show what Headroom snipped from each request (add "hide" or "show" for the band)',
@@ -229,7 +242,7 @@ export const register: Register = on => {
         <Box>
           <Text dimColor wrap="truncate-end">
             {'  '}
-            {cuts.length > 0 ? `${cuts.slice(0, 3).join(' · ')}   ` : ''}session {fmt(sum.saved)} saved ({pct(sum)}%) over{' '}
+            {cuts.length > 0 ? `${cuts.slice(0, 3).join(' · ')}   ` : ''}{scope(px.project)} {fmt(sum.saved)} saved ({pct(sum)}%) over{' '}
             {sum.requests} req ≈ {pages(sum.saved)}{' '}
           </Text>
           <Button key="details" label="details" plain onPress={() => $.ui.open({ id: PANE, title: '✂ Headroom' })} />
@@ -254,7 +267,8 @@ export const register: Register = on => {
           <Text color="#f472b6" bold>
             ✂ {fmt(sum.saved)}
           </Text>{' '}
-          tokens snipped this session ({pct(sum)}% of {fmt(sum.original)}) over {sum.requests} requests
+          tokens snipped {px.project ? 'this session' : 'on this proxy'} ({pct(sum)}% of {fmt(sum.original)}) over{' '}
+          {sum.requests} requests
         </Text>
         <Text dimColor>
           ≈ {pages(sum.saved)} Claude didn't have to reread · {fmt(lifetime)} all-time
@@ -266,6 +280,11 @@ export const register: Register = on => {
           </Text>
         )}
         <Text dimColor>{px.isUp === false ? `proxy unreachable at ${px.url}` : `proxy ${px.url}`}</Text>
+        <Text dimColor wrap="truncate-end">
+          {px.project
+            ? `counting requests tagged ${px.project} since this session started`
+            : 'counting every client on this proxy since this session started (`headroom wrap claude` tags them)'}
+        </Text>
         <Text> </Text>
         {list.length === 0 && <Text dimColor>No requests through Headroom yet. Send a prompt.</Text>}
         {list

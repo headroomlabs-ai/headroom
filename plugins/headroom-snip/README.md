@@ -33,8 +33,20 @@ count drops as it goes:
 While a turn runs, the mod polls the proxy's loopback `GET /stats?cached=1`
 once a second. It reads the `recent_requests` tail (per-request token counts
 and `transforms_applied`), and keeps polling for a few seconds after the turn
-ends. Requests the proxy served before the session started count as history:
-they aren't animated or added to the totals. Nothing leaves your machine.
+ends. Requests stamped before the session started count as history: they
+aren't animated or added to the totals, even if the proxy only comes up later.
+Nothing leaves your machine.
+
+What counts as this session's depends on how Claude Code reaches the proxy:
+
+- **Through `headroom wrap claude`:** each request carries an
+  `X-Headroom-Project` header. The mod only counts requests tagged with this
+  session's project, so other projects and clients on the same proxy are left
+  out (two sessions in the same project still share a count). The band and
+  `/headroom` say "session".
+- **Any other way:** the proxy can't tell clients apart, so the totals cover
+  every client on the proxy since this session started. The band says "proxy"
+  and `/headroom` says so.
 
 It finds the proxy in this order:
 

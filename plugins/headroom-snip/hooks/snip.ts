@@ -45,15 +45,32 @@ type RawRequest = {
   optimization_latency_ms?: number | null
 }
 
+type RawLog = { request_id?: string | null; tags?: Record<string, unknown> | null }
+
+/** Request id → the proxy's project tag, from the raw `request_logs` tail a loopback `/stats` carries. */
+function projectsById(logs: unknown): Map<string, string | null> {
+  const byId = new Map<string, string | null>()
+  if (!Array.isArray(logs)) return byId
+  for (const log of logs as RawLog[]) {
+    if (!log?.request_id) continue
+    const project = log.tags?.project
+    byId.set(String(log.request_id), typeof project === 'string' && project.trim() ? project.trim() : null)
+  }
+
+  return byId
+}
+
 /** The per-request rows of a loopback `/stats` payload, oldest first. */
 export function parseRecent(text: string): Snip[] {
-  let body: { recent_requests?: RawRequest[] }
+  let body: { recent_requests?: RawRequest[]; request_logs?: unknown }
   try {
     body = JSON.parse(text)
   } catch {
     return []
   }
-  const rows = Array.isArray(body?.recent_requests) ? body.recent_requests : []
+  // The proxy lists recent_requests newest first.
+  const rows = Array.isArray(body?.recent_requests) ? [...body.recent_requests].reverse() : []
+  const projects = projectsById(body?.request_logs)
 
   return rows.flatMap(row => {
     const original = row.input_tokens_original
@@ -75,6 +92,7 @@ export function parseRecent(text: string): Snip[] {
         percent,
         transforms: Array.isArray(row.transforms_applied) ? row.transforms_applied : [],
         latencyMs: typeof row.optimization_latency_ms === 'number' ? row.optimization_latency_ms : null,
+        ...(projects.has(String(row.request_id)) ? { project: projects.get(String(row.request_id)) ?? null } : {}),
       },
     ]
   })
@@ -150,9 +168,43 @@ export function addToTotals(totals: Totals, snips: readonly Snip[]): Totals {
   )
 }
 
-/** The milestone a step from `before` to `after` saved tokens crosses, if any. */
-export function crossed(before: number, after: number): number | undefined {
-  return [...MILESTONES].reverse().find(m => before < m && after >= m)
+/** Every milestone a step from `before` to `after` saved tokens crosses, lowest first. */
+export function crossed(before: number, after: number): number[] {
+  return MILESTONES.filter(m => before < m && after >= m)
+}
+
+/** The X-Headroom-Project this session sends, read from ANTHROPIC_CUSTOM_HEADERS as `headroom wrap claude` sets it. */
+export function ownProject(customHeaders?: string): string | null {
+  for (const line of (customHeaders ?? '').split(/\r?\n/)) {
+    const colon = line.indexOf(':')
+    if (colon < 0 || line.slice(0, colon).trim().toLowerCase() !== 'x-headroom-project') continue
+    const raw = line.slice(colon + 1).trim()
+    let name = raw
+    try {
+      name = decodeURIComponent(raw)
+    } catch {
+      // A value that is not percent-encoded is used as written.
+    }
+
+    return name.trim() || null
+  }
+
+  return null
+}
+
+/** How far before session start a request may be stamped and still count, for clock rounding. */
+const START_SLACK_MS = 1000
+
+/**
+ * Whether a request belongs to this session: stamped at or after `startedAt` and, when the session
+ * sends a project, tagged with that project. Undefined when the request carries no usable timestamp.
+ */
+export function isOwn(snip: Snip, startedAt: number, project: string | null): boolean | undefined {
+  if (project !== null && snip.project !== undefined && snip.project !== project) return false
+  const at = Date.parse(snip.at)
+  if (!Number.isFinite(at)) return undefined
+
+  return at >= startedAt - START_SLACK_MS
 }
 
 export type Tone = 'kept' | 'doomed' | 'blade' | 'crumb' | 'gone'

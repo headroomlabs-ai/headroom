@@ -1,11 +1,15 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { bar, explain, FRAMES, parseRecent, proxyUrl } from '../hooks/snip'
+import { bar, crossed, explain, FRAMES, isOwn, ownProject, parseRecent, proxyUrl } from '../hooks/snip'
 
-const row = (id: string, original: number, optimized: number, transforms: string[]) => ({
+// Session start in the tests; the proxy stamps requests in UTC ISO 8601.
+const T0 = Date.parse('2026-10-04T12:00:00+00:00')
+const stamp = (offsetSeconds: number) => new Date(T0 + offsetSeconds * 1000).toISOString().replace('Z', '+00:00')
+
+const row = (id: string, original: number, optimized: number, transforms: string[], at = 5) => ({
   request_id: id,
-  timestamp: '2026-10-04T12:00:00',
+  timestamp: stamp(at),
   model: 'claude-sonnet',
   input_tokens_original: original,
   input_tokens_optimized: optimized,
@@ -80,47 +84,116 @@ test('the finished bar keeps the sent share and dusts the rest', async () => {
   expect(parseRecent('not json')).toEqual([])
 })
 
-const stage = (on: On, rows: () => unknown[]) => {
-  const clock = mock.clock(on)
+test('rows come back oldest first, with their project tags', async () => {
+  const text = JSON.stringify({
+    recent_requests: [row('new', 3000, 1000, [], 9), row('old', 2000, 1000, [], 1), row('bare', 100, 100, [], 2)],
+    request_logs: [
+      { request_id: 'old', tags: { project: 'headroom' } },
+      { request_id: 'bare', tags: {} },
+    ],
+  })
+  const rows = parseRecent(text)
+  expect(rows.map(r => r.id)).toEqual(['bare', 'old', 'new'])
+  expect(rows.map(r => r.project)).toEqual([null, 'headroom', undefined])
+})
+
+test('the session project is read from the wrapped custom headers', async () => {
+  expect(ownProject('X-Other: 1\nX-Headroom-Project: my%20app\nX-Headroom-Cwd: /x')).toBe('my app')
+  expect(ownProject('x-headroom-project:headroom')).toBe('headroom')
+  expect(ownProject('X-Headroom-Project: 100%')).toBe('100%')
+  expect(ownProject(undefined)).toBe(null)
+  expect(ownProject('X-Headroom-Project:   ')).toBe(null)
+})
+
+test('a request is this session\'s by its stamp and project', async () => {
+  const snip = parseRecent(JSON.stringify({ recent_requests: [row('a', 10, 5, [], 3)] }))[0]!
+  expect(isOwn(snip, T0, null)).toBe(true)
+  expect(isOwn(snip, T0 + 60_000, null)).toBe(false)
+  expect(isOwn({ ...snip, project: 'other' }, T0, 'mine')).toBe(false)
+  expect(isOwn({ ...snip, project: 'mine' }, T0, 'mine')).toBe(true)
+  // Logged without a project while this session sends one: another, unwrapped client.
+  expect(isOwn({ ...snip, project: null }, T0, 'mine')).toBe(false)
+  expect(isOwn({ ...snip, project: 'mine' }, T0, null)).toBe(true)
+  expect(isOwn({ ...snip, at: '' }, T0, null)).toBeUndefined()
+})
+
+test('every milestone a step crosses is announced, lowest first', async () => {
+  expect(crossed(0, 70_000)).toEqual([10_000, 50_000])
+  expect(crossed(9_000, 9_500)).toEqual([])
+  expect(crossed(10_000, 10_001)).toEqual([])
+})
+
+type Stage = {
+  rows?: () => unknown[]
+  logs?: () => unknown[]
+  env?: Record<string, string>
+  isDown?: () => boolean
+}
+
+const stage = (on: On, { rows = () => [], logs = () => [], env = {}, isDown = () => false }: Stage) => {
+  const clock = mock.clock(on, { now: T0 })
+  const seen = { fetches: 0, toasts: [] as string[] }
   mock.store(on)
-  mock.env(on, {})
-  on('http.fetch', () => ({
-    value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ recent_requests: rows() }) },
-  }))
+  mock.env(on, env)
+  on('http.fetch', () => {
+    seen.fetches += 1
+    if (isDown()) throw new Error('ECONNREFUSED')
+    // The proxy lists recent_requests newest first.
+    const text = JSON.stringify({ recent_requests: [...rows()].reverse(), request_logs: logs() })
+    return { value: { status: 200, ok: true, headers: {}, text } }
+  })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: undefined as never }))
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => {
+    seen.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.render', ($, e) => {
     const { Box } = $.ui.resolve(e)
     return <Box />
   })
 
-  return clock
+  return { clock, seen }
 }
+
+const START = { cwd: '/w', surface: 'terminal', isInteractive: true } as never
+const TURN_DONE = { answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as never
 
 const BAND = {
   component: 'AbovePrompt',
   props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100 } as never,
 } as const
 
-test('a request made during a turn is snipped in the band', async ($, on) => {
-  let rows: unknown[] = [row('old', 5000, 5000, [])]
-  const clock = stage(on, () => rows)
+const PANE = {
+  component: 'Pane',
+  requestId: 'headroom-snip',
+  props: { title: '✂ Headroom', isFocused: false, bodyColumns: 80, placement: 'dock' } as never,
+  viewport: { columns: 80, rows: 40 },
+} as const
 
-  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as never)
+const settleSnip = (clock: { advance: (ms: number) => Promise<void> }) => clock.advance(1000 + 45 * (FRAMES + 2))
+
+test('a request made during a turn is snipped in the band', async ($, on) => {
+  let rows: unknown[] = [row('old', 5000, 5000, [], -30)]
+  const { clock } = stage(on, { rows: () => rows })
+
+  await $.session.start(START)
   await clock.settle()
   rows = [...rows, row('r1', 20_000, 4_000, ['smart:array', 'kompress:tool:0.40'])]
   await $.turn.start({ text: 'hi', turnId: 't1' })
-  await clock.advance(1000 + 45 * (FRAMES + 2))
+  await settleSnip(clock)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'headroom-snip', surface, ...BAND })
-    expect((await ui.find({ text: /20k → 4\.0k/ }))).toBeDefined()
-    expect((await ui.find({ text: /−80%/ }))).toBeDefined()
-    expect((await ui.find({ text: /JSON crush · Kompress text/ }))).toBeDefined()
-    expect((await ui.find({ text: /session 16k saved/ }))).toBeDefined()
+    expect(await ui.find({ text: /20k → 4\.0k/ })).toBeDefined()
+    expect(await ui.find({ text: /−80%/ })).toBeDefined()
+    expect(await ui.find({ text: /JSON crush · Kompress text/ })).toBeDefined()
+    // No project header, so the total is labelled proxy-wide; the pre-session request is not in it.
+    expect(await ui.find({ text: /proxy 16k saved \(80%\) over 1 req/ })).toBeDefined()
     await ui.press({ key: 'hide' })
     expect(await ui.find({ text: /headroom/ })).toBeUndefined()
     await ui.unmount()
@@ -128,22 +201,124 @@ test('a request made during a turn is snipped in the band', async ($, on) => {
   }
 })
 
-test('a missing proxy says how to start one', async ($, on) => {
-  const clock = mock.clock(on)
-  mock.store(on)
-  mock.env(on, {})
-  on('http.fetch', () => {
-    throw new Error('ECONNREFUSED')
-  })
-  on('session.start', (_$, e) => ({ cwd: e.cwd }))
-  on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('ui.render', ($, e) => {
-    const { Box } = $.ui.resolve(e)
-    return <Box />
+test('two new requests in one poll show the newest in the band and newest first in the pane', async ($, on) => {
+  let rows: unknown[] = []
+  const { clock } = stage(on, { rows: () => rows })
+
+  await $.session.start(START)
+  await clock.settle()
+  rows = [row('first', 10_000, 9_000, [], 5), row('second', 30_000, 3_000, ['smart:array'], 6)]
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await settleSnip(clock)
+
+  const band = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
+  expect(await band.find({ text: /30k → 3\.0k/ })).toBeDefined()
+  expect(await band.find({ text: /10k → 9\.0k/ })).toBeUndefined()
+  await band.unmount()
+
+  const pane = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...PANE })
+  const lines = (await pane.findAll({ type: 'Text', text: /→/ })).map(t => t.text)
+  const newest = lines.findIndex(t => /30k→3\.0k/.test(t))
+  const oldest = lines.findIndex(t => /10k→9\.0k/.test(t))
+  expect(newest).toBeGreaterThanOrEqual(0)
+  expect(oldest).toBeGreaterThan(newest)
+  expect(await pane.find({ text: /28k\b|28\.0k|29k/ })).toBeDefined()
+  expect(await pane.find({ text: /over 2 requests/ })).toBeDefined()
+  expect(await pane.find({ text: /counting every client on this proxy/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('a proxy that comes up after the session started still counts the session\'s requests', async ($, on) => {
+  let isDown = true
+  let rows: unknown[] = []
+  const { clock } = stage(on, { rows: () => rows, isDown: () => isDown })
+
+  await $.session.start(START)
+  await clock.settle()
+  const down = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
+  expect(await down.find({ text: /headroom wrap claude/ })).toBeDefined()
+  await down.unmount()
+
+  // The proxy starts mid-turn; its first successful poll already holds an in-session request
+  // alongside one it served before this session.
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await clock.advance(1000)
+  isDown = false
+  rows = [row('before', 8_000, 2_000, [], -120), row('during', 12_000, 3_000, ['smart:array'], 2)]
+  await settleSnip(clock)
+
+  const ui = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
+  expect(await ui.find({ text: /12k → 3\.0k/ })).toBeDefined()
+  expect(await ui.find({ text: /proxy 9\.0k saved \(75%\) over 1 req/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('with a project header, other clients on the proxy are left out', async ($, on) => {
+  let rows: unknown[] = []
+  let logs: unknown[] = []
+  const { clock } = stage(on, {
+    rows: () => rows,
+    logs: () => logs,
+    env: { ANTHROPIC_CUSTOM_HEADERS: 'X-Headroom-Project: headroom\nX-Headroom-Cwd: /w' },
   })
 
-  await $.session.start({ cwd: '/w', surface: 'terminal', isInteractive: true } as never)
+  await $.session.start(START)
   await clock.settle()
+  rows = [row('mine', 20_000, 4_000, ['smart:array'], 3), row('theirs', 40_000, 4_000, ['smart:array'], 4)]
+  logs = [
+    { request_id: 'mine', tags: { project: 'headroom' } },
+    { request_id: 'theirs', tags: { project: 'other-app' } },
+  ]
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await settleSnip(clock)
+
+  const band = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
+  expect(await band.find({ text: /20k → 4\.0k/ })).toBeDefined()
+  expect(await band.find({ text: /session 16k saved \(80%\) over 1 req/ })).toBeDefined()
+  await band.unmount()
+
+  const pane = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...PANE })
+  expect(await pane.find({ text: /tokens snipped this session/ })).toBeDefined()
+  expect(await pane.find({ text: /counting requests tagged headroom/ })).toBeDefined()
+  expect(await pane.find({ text: /40k→4\.0k/ })).toBeUndefined()
+  await pane.unmount()
+})
+
+test('one big snip announces each milestone it crosses', async ($, on) => {
+  let rows: unknown[] = []
+  const { clock, seen } = stage(on, { rows: () => rows })
+
+  await $.session.start(START)
+  await clock.settle()
+  rows = [row('huge', 90_000, 20_000, ['smart:array'])]
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await settleSnip(clock)
+
+  const milestones = seen.toasts.filter(t => /tokens snipped/.test(t))
+  expect(milestones.length).toBe(2)
+  expect(milestones[0]).toMatch(/^✂ 10k tokens snipped/)
+  expect(milestones[1]).toMatch(/^✂ 50k tokens snipped/)
+})
+
+test('polling picks up a request that lands just after the turn, then stops', async ($, on) => {
+  let rows: unknown[] = []
+  const { clock, seen } = stage(on, { rows: () => rows })
+
+  await $.session.start(START)
+  await clock.settle()
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await clock.advance(2000)
+  await $.turn.complete(TURN_DONE)
+  rows = [row('late', 6_000, 1_500, ['smart:array'])]
+  await settleSnip(clock)
+
   const ui = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
-  expect(await ui.find({ text: /headroom wrap claude/ })).toBeDefined()
+  expect(await ui.find({ text: /6\.0k → 1\.5k/ })).toBeDefined()
+  await ui.unmount()
+
+  // The tail runs out four seconds after the turn; after that nothing polls.
+  await clock.advance(5000)
+  const before = seen.fetches
+  await clock.advance(10_000)
+  expect(seen.fetches).toBe(before)
 })
