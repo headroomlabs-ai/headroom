@@ -120,21 +120,6 @@ def _thinking_tokens_for(payload: object) -> ThinkingTokens:
         return ThinkingTokens()
 
 
-def _is_anthropic_upstream(url: str | None) -> bool:
-    """Whether this upstream is Anthropic's own API (or unset, which means it).
-
-    Host-based rather than a prefix match, so a lookalike host cannot pass by
-    embedding the real one in a path or userinfo segment.
-    """
-    if not url:
-        return True
-    try:
-        host = (urlsplit(url).hostname or "").lower()
-    except ValueError:
-        return False
-    return host == "api.anthropic.com" or host.endswith(".anthropic.com")
-
-
 def _is_googleapis_endpoint(value: object) -> bool:
     """Return whether *value* targets Google APIs by parsed hostname.
 
@@ -3935,7 +3920,7 @@ class AnthropicHandlerMixin:
                 request.url.query,
             )
 
-            # Never hand an Anthropic key to a non-Anthropic host.
+            # Never hand an Anthropic key to GitHub.
             #
             # One proxy has one default destination for this wire, so a proxy
             # pinned at Copilot (what `wrap copilot --native` needs, and what the
@@ -3946,16 +3931,19 @@ class AnthropicHandlerMixin:
             # so a dropped header degrades to a clear local error instead of a
             # silent credential disclosure.
             #
+            # Scoped to Copilot hosts on purpose: an Anthropic-compatible
+            # gateway the user configured (LiteLLM, Foundry, an inherited
+            # ANTHROPIC_BASE_URL -- see #1358) is *meant* to receive that key.
             # Copilot's own clients authenticate with `Authorization`, never
             # `x-api-key`, so this cannot fire on the traffic the pin exists for.
             if (
                 not upstream_base_url
                 and headers.get("x-api-key")
                 and not headers.get("authorization")
-                and not _is_anthropic_upstream(self.ANTHROPIC_API_URL)
+                and is_copilot_upstream_url(self.ANTHROPIC_API_URL)
             ):
                 logger.error(
-                    "Refusing to forward an Anthropic x-api-key to non-Anthropic upstream %s",
+                    "Refusing to forward an Anthropic x-api-key to Copilot upstream %s",
                     self.ANTHROPIC_API_URL,
                 )
                 return JSONResponse(
@@ -3966,7 +3954,7 @@ class AnthropicHandlerMixin:
                             "type": "api_error",
                             "message": (
                                 "This Headroom proxy's Anthropic upstream is "
-                                f"{self.ANTHROPIC_API_URL}, not Anthropic, so forwarding your "
+                                f"{self.ANTHROPIC_API_URL} (GitHub Copilot), so forwarding your "
                                 "x-api-key would disclose it to another vendor. Use a proxy "
                                 "port of your own, or send "
                                 "'X-Headroom-Base-Url: https://api.anthropic.com'."

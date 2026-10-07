@@ -1270,9 +1270,10 @@ def _ensure_chatgpt_responses_store_false(
     ``store: true`` on every ``/responses`` request unless the model is declared
     zero-data-retention, so without this rewrite those models fail on first use.
 
-    Returns True when a rewrite happened, so the caller can log it **and mark the
-    body mutated**: the forwarder replays the original bytes verbatim for an
-    unmutated body, so a body nothing else touched would lose this rewrite.
+    Returns True when a rewrite happened, so the caller can log it. The forwarder
+    replays the original bytes verbatim for an unmutated body, so the caller must
+    also mark the body mutated wherever the rewrite has to reach the wire (an
+    explicit ``store`` bound for Copilot).
     """
 
     if (is_chatgpt_auth or is_copilot_upstream) and payload.get("store") is not False:
@@ -6849,16 +6850,25 @@ class OpenAIHandlerMixin:
         client_declared_response_tools = bool(
             body.get("tools")
         ) or _client_can_receive_memory_tools(memory_client)
+        responses_store_before = body.get("store")
+        responses_copilot_upstream = is_copilot_api_url(openai_upstream_base_url)
         if _ensure_chatgpt_responses_store_false(
             body,
             is_chatgpt_auth=is_chatgpt_auth,
-            is_copilot_upstream=is_copilot_api_url(openai_upstream_base_url),
+            is_copilot_upstream=responses_copilot_upstream,
         ):
             logger.info(f"[{request_id}] Responses: forced store=false (upstream rejects it)")
-            # Belt and braces: today other mutations happen to mark this body,
-            # so the rewrite survives by accident. Marking it here means the
-            # request stops depending on that accident.
-            if body_mutation_tracker is not None:
+            # The forwarder replays the original bytes for an unmutated body, so
+            # a rewrite that must reach the wire has to mark it. That is only
+            # Copilot receiving an explicit non-false `store` (VS Code's BYOK
+            # client sends `store: true`, which Copilot rejects with a 400; an
+            # absent `store` is accepted). Everything else keeps the
+            # byte-faithful passthrough, as on main.
+            if (
+                body_mutation_tracker is not None
+                and responses_copilot_upstream
+                and responses_store_before is not None
+            ):
                 body_mutation_tracker.mark_mutated("responses_store_false")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
 

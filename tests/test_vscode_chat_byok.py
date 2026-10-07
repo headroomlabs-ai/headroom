@@ -716,6 +716,69 @@ def test_store_rewrite_is_scoped_to_the_upstreams_that_need_it() -> None:
     assert untouched["store"] is True
 
 
+def _post_responses_through_copilot_proxy(monkeypatch: pytest.MonkeyPatch, body: dict) -> dict:
+    """Send one /v1/responses request through a Copilot-pinned proxy; return the wire body."""
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    # Keep the planner on its name heuristic so no catalog fetch leaves the test.
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "off")
+    captured: dict[str, bytes] = {}
+
+    class _Capture(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = b"".join([chunk async for chunk in request.stream])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_1",
+                    "object": "response",
+                    "status": "completed",
+                    "model": body["model"],
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            )
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            openai_api_url="https://api.githubcopilot.com",
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = httpx.AsyncClient(transport=_Capture())
+        response = client.post(
+            "/v1/responses",
+            headers={"authorization": "Bearer gho_test_token"},
+            content=json.dumps(body, indent=2).encode("utf-8"),
+        )
+    assert response.status_code == 200, response.text
+    return json.loads(captured["body"])
+
+
+def test_copilot_store_true_reaches_the_wire_as_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end: the rewrite survives the byte-faithful forwarder for Copilot."""
+    wire = _post_responses_through_copilot_proxy(
+        monkeypatch, {"model": "gpt-5.5", "input": "hello", "store": True}
+    )
+    assert wire["store"] is False
+
+
+def test_copilot_absent_store_keeps_the_original_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absent `store` is accepted upstream, so it must not force a re-serialization."""
+    wire = _post_responses_through_copilot_proxy(
+        monkeypatch, {"model": "gpt-5.5", "input": "hello"}
+    )
+    assert "store" not in wire
+
+
 # ---------------------------------------------------------------------------
 # Sharing one proxy between the Copilot CLI and VS Code
 # ---------------------------------------------------------------------------
@@ -813,15 +876,19 @@ def test_tool_search_deferral_is_scoped_to_a_real_anthropic_upstream() -> None:
 
     The damage is not partial: the core-tool allowlist is Claude Code's names,
     which match none of VS Code's, so every tool was marked `defer_loading` and
-    the agent correctly reported it had no subagent tool to call.
+    the agent correctly reported it had no subagent tool to call. The gate that
+    prevents it is `anthropic_first_party_tool_search_supported`.
     """
-    from headroom.proxy.handlers.anthropic import _is_anthropic_upstream
+    from headroom.proxy.helpers import anthropic_first_party_tool_search_supported
 
-    assert _is_anthropic_upstream("https://api.anthropic.com") is True
-    assert _is_anthropic_upstream(None) is True
+    assert anthropic_first_party_tool_search_supported("https://api.anthropic.com") is True
+    assert anthropic_first_party_tool_search_supported(None) is True
     # The configurations this bug was reported from:
-    assert _is_anthropic_upstream("https://api.githubcopilot.com") is False
-    assert _is_anthropic_upstream("https://copilot-api.enterprise.ghe.com") is False
+    assert anthropic_first_party_tool_search_supported("https://api.githubcopilot.com") is False
+    assert (
+        anthropic_first_party_tool_search_supported("https://copilot-api.enterprise.ghe.com")
+        is False
+    )
 
 
 def test_capi_override_round_trips_and_leaves_other_settings_alone(tmp_path: Path) -> None:
@@ -1312,7 +1379,62 @@ def test_capi_and_byok_blocks_are_independent(tmp_path: Path) -> None:
     assert settings.read_text(encoding="utf-8") == '{\n\t"editor.fontSize": 14\n}\n'
 
 
-def test_anthropic_key_is_never_forwarded_to_another_vendor() -> None:
+class _RecordingUpstream:
+    """Stands in for the proxy's upstream HTTP client and records what it was sent."""
+
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def post(self, url, **kwargs):  # type: ignore[no-untyped-def]
+        import httpx
+
+        self.urls.append(str(url))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _post_messages_with_api_key(anthropic_api_url: str):
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url=anthropic_api_url,
+        )
+    )
+    upstream = _RecordingUpstream()
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = upstream
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "sk-ant-test"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    return response, upstream
+
+
+def test_anthropic_key_is_never_forwarded_to_copilot() -> None:
     """The backstop that makes one shared proxy safe for Claude Code.
 
     The Anthropic handler forwards the client's own ``x-api-key`` unchanged, and
@@ -1322,16 +1444,23 @@ def test_anthropic_key_is_never_forwarded_to_another_vendor() -> None:
     GitHub (reproduced live: Copilot answers ``missing required Authorization
     header``, having already received it).
     """
-    from headroom.proxy.handlers.anthropic import _is_anthropic_upstream
+    response, upstream = _post_messages_with_api_key("https://api.githubcopilot.com")
 
-    assert _is_anthropic_upstream("https://api.anthropic.com") is True
-    assert _is_anthropic_upstream(None) is True  # unset means the default
-    assert _is_anthropic_upstream("https://api.githubcopilot.com") is False
-    # Host-based, so a lookalike cannot smuggle the real host into a path or
-    # userinfo segment and be mistaken for Anthropic.
-    assert _is_anthropic_upstream("https://evil.example.com/api.anthropic.com") is False
-    assert _is_anthropic_upstream("https://api.anthropic.com.evil.example") is False
-    assert _is_anthropic_upstream("https://api.anthropic.com@evil.example") is False
+    assert response.status_code == 502
+    assert "GitHub Copilot" in response.json()["error"]["message"]
+    assert upstream.urls == [], "the x-api-key reached the Copilot host"
+
+
+def test_anthropic_key_still_reaches_a_user_configured_gateway() -> None:
+    """The backstop must not break an Anthropic-compatible gateway (#1358).
+
+    A LiteLLM/Foundry gateway or an inherited ``ANTHROPIC_BASE_URL`` is *meant*
+    to receive the key, so only Copilot hosts are refused.
+    """
+    response, upstream = _post_messages_with_api_key("https://litellm.example.internal/anthropic")
+
+    assert response.status_code == 200, response.text
+    assert upstream.urls and upstream.urls[0].startswith("https://litellm.example.internal/")
 
 
 def test_claude_upstream_pin_only_fires_when_the_proxy_points_elsewhere(
