@@ -72,6 +72,15 @@ Keep the stable prefix first, keep volatile content out of it, and treat CacheAl
 
 CacheAligner surfaces prefix instability, provider caches reward byte-identical prefixes, and the caller owns the actual message layout.
 
+Anthropic prefix trackers are retained for at least the resolved provider cache
+lifetime plus a 60-second cleanup margin, or the configured session cleanup TTL,
+whichever is longer. The lifetime is resolved before request-time cleanup, so a
+one-hour cache keeps its frozen forwarded prefix across pauses longer than the
+usual ten-minute session cleanup floor. Retention is tracked per conversation
+lineage: a one-hour session does not extend an unrelated five-minute session.
+Retaining a tracker is not a guarantee that the provider still has its cache.
+
+
 ## Cold-prefix recompaction (when the cache lapses)
 
 Byte-identical forwarding only pays off while the prompt cache is warm. When a

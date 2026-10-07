@@ -341,6 +341,76 @@ class TestSessionTrackerStore:
 
         assert store.active_sessions == 0
 
+    def test_request_cache_ttl_preserves_frozen_lineage_through_cleanup(self, monkeypatch):
+        """A warm one-hour cache lineage survives cleanup and replays its prefix."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore(PrefixFreezeConfig(min_cached_tokens=1))
+        original = [{"role": "user", "content": "original prompt " + "x" * 2000}]
+        forwarded = [{"role": "user", "content": "compressed cached prompt"}]
+        tracker = store.resolve_tracker(
+            "one-hour", "anthropic", messages=original, cache_ttl_seconds=3600
+        )
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=1500,
+            messages=forwarded,
+            message_token_counts=[1500],
+            original_messages=original,
+        )
+        assert tracker.get_frozen_message_count() == 1
+
+        now[0] += 660
+        store._last_cleanup = now[0] - store._cleanup_interval
+        resumed = store.resolve_tracker(
+            "one-hour", "anthropic", messages=original, cache_ttl_seconds=3600
+        )
+        assert resumed is tracker
+        assert resumed.get_frozen_message_count() == 1
+        assert (
+            overlay_cached_prefix(
+                original,
+                original,
+                resumed.get_last_original_messages(),
+                resumed.get_last_forwarded_messages(),
+                confirmed_frozen_count=resumed.get_frozen_message_count(),
+            )
+            == forwarded
+        )
+
+        now[0] += 3901
+        store._last_cleanup = now[0] - store._cleanup_interval
+        expired = store.resolve_tracker(
+            "one-hour", "anthropic", messages=original, cache_ttl_seconds=3600
+        )
+        assert expired is not tracker
+
+    def test_request_cache_ttl_is_isolated_per_session(self, monkeypatch):
+        """A one-hour cache in one session must not extend another session."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore()
+        messages = [{"role": "user", "content": "prompt " + "x" * 1000}]
+        long_lived = store.resolve_tracker(
+            "one-hour", "anthropic", messages=messages, cache_ttl_seconds=3600
+        )
+        short_lived = store.resolve_tracker(
+            "five-minute", "anthropic", messages=messages, cache_ttl_seconds=300
+        )
+
+        now[0] += 661
+        store._last_cleanup = now[0] - store._cleanup_interval
+        assert (
+            store.resolve_tracker(
+                "one-hour", "anthropic", messages=messages, cache_ttl_seconds=3600
+            )
+            is long_lived
+        )
+        replacement = store.resolve_tracker(
+            "five-minute", "anthropic", messages=messages, cache_ttl_seconds=300
+        )
+        assert replacement is not short_lived
+
     def test_compute_session_id_from_header(self, store):
         """Should use x-headroom-session-id header if present."""
 

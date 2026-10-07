@@ -1704,6 +1704,11 @@ class AnthropicHandlerMixin:
                     "output_config": body.get("output_config"),
                 }
             )
+            # Resolve the request's actual provider TTL before tracker lookup:
+            # get_or_create may sweep expired sessions on this request.
+            from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
+            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             # Resolve the tracker by conversation lineage within the session id
             # (#2085): one model + system prompt spans a Claude Code session and
             # all its parallel subagents, so concurrent conversations share this
@@ -1715,6 +1720,7 @@ class AnthropicHandlerMixin:
                 "anthropic",
                 messages=session_messages,
                 cache_affinity=cache_affinity,
+                cache_ttl_seconds=_cc_ttl,
             )
             # Snapshot lineage state once.  Reusing the same pair for delta
             # extraction, byte-stable replay, and breakpoint placement keeps
@@ -1748,14 +1754,8 @@ class AnthropicHandlerMixin:
             # lossless whole-prefix recompaction instead of the byte-identical splice
             # (the splice preserves a dead cache) and skips the overlay replay. Both are
             # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
-            from headroom.transforms.cold_prefix import (
-                anthropic_cache_ttl_seconds,
-                is_cold_prefix,
-            )
+            from headroom.transforms.cold_prefix import is_cold_prefix
 
-            # Resolve the authoritative request-level prompt-cache tier once.
-            # The same value drives cold-prefix handling and net-cost pricing.
-            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",

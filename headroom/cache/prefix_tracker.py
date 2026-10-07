@@ -59,6 +59,10 @@ _PROVIDER_CACHE_TTL_SECONDS = {
     "bedrock": 300,
 }
 
+# Keep tracker state through the same post-TTL confidence margin used by
+# cold-prefix detection, but never below the configured session cleanup floor.
+_CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
+
 
 @dataclass
 class PrefixFreezeConfig:
@@ -1105,6 +1109,7 @@ class PrefixCacheTracker:
     def __init__(self, provider: str, config: PrefixFreezeConfig | None = None):
         self.provider = provider
         self.config = config or PrefixFreezeConfig()
+        self._cache_ttl_seconds: int | None = None
         self._cached_token_count: int = 0
         self._cached_message_count: int = 0
         self._turn_number: int = 0
@@ -1371,18 +1376,30 @@ class PrefixCacheTracker:
 
     @property
     def is_expired(self) -> bool:
-        """Check if this tracker has been idle beyond TTL."""
-        return (time.time() - self._last_activity) > self.config.session_ttl_seconds
+        """Check if this tracker has been idle beyond its effective retention."""
+        return self.is_expired_for_cache_ttl(None)
+
+    def is_expired_for_cache_ttl(self, cache_ttl_seconds: int | None) -> bool:
+        """Check expiry including a cache lifetime known from the current request."""
+        observed_ttl = max(self._cache_ttl_seconds or 0, cache_ttl_seconds or 0)
+        retention = max(
+            self.config.session_ttl_seconds,
+            observed_ttl + _CACHE_TTL_CLEANUP_MARGIN_SECONDS if observed_ttl else 0,
+        )
+        return (time.time() - self._last_activity) > retention
+
+    def observe_cache_ttl(self, cache_ttl_seconds: int | None) -> None:
+        """Remember the longest provider cache lifetime observed for this lineage."""
+        if cache_ttl_seconds is not None:
+            self._cache_ttl_seconds = max(self._cache_ttl_seconds or 0, cache_ttl_seconds)
 
     def seconds_since_activity(self) -> float:
         """Wall-clock seconds since this tracker last saw activity.
 
         #856 P3b feeds this to the net-cost gate as an idle signal: as it
-        approaches the provider's prompt-cache TTL (~300s for Anthropic),
-        P_alive decays toward 0 and deep edits near cache lapse become free.
-        Distinct from :attr:`is_expired`, which uses the much longer
-        session-tracker *cleanup* TTL (``session_ttl_seconds``), not the cache
-        TTL.
+        approaches the provider's prompt-cache TTL, P_alive decays toward 0.
+        Unlike provider cache freshness, tracker cleanup uses the configured
+        session floor or the observed cache lifetime plus its cleanup margin.
 
         Wiring caveat: ``SessionTrackerStore.get_or_create`` refreshes
         ``_last_activity`` on access, so a caller that wants the idle gap
@@ -1535,21 +1552,25 @@ class SessionTrackerStore:
             return None
         return tracker
 
-    def get_or_create(self, session_id: str, provider: str) -> PrefixCacheTracker:
+    def get_or_create(
+        self, session_id: str, provider: str, cache_ttl_seconds: int | None = None
+    ) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
+        tracker = self._trackers.get(session_id)
+        if tracker is not None:
+            # Extend retention before the request-time cleanup sweep.
+            tracker.observe_cache_ttl(cache_ttl_seconds)
         self._maybe_cleanup()
 
-        if session_id in self._trackers:
-            tracker = self._trackers[session_id]
-            # Snapshot idle-since-last-response BEFORE bumping the access clock,
-            # so the net-cost/TTL gate sees the true gap (see the attribute's
-            # docstring in PrefixCacheTracker.__init__).
+        if tracker is not None and session_id in self._trackers:
+            # Snapshot idle-since-last-response BEFORE bumping the access clock.
             tracker._idle_seconds_at_fetch = max(0.0, time.time() - tracker._last_activity)
             tracker._last_activity = time.time()
             return tracker
 
         tracker = PrefixCacheTracker(provider, self._default_config)
-        tracker._idle_seconds_at_fetch = 0.0  # cold start: nothing cached to lapse
+        tracker.observe_cache_ttl(cache_ttl_seconds)
+        tracker._idle_seconds_at_fetch = 0.0
         self._trackers[session_id] = tracker
         return tracker
 
@@ -1559,6 +1580,7 @@ class SessionTrackerStore:
         provider: str,
         messages: list[dict[str, Any]] | None = None,
         cache_affinity: str | None = None,
+        cache_ttl_seconds: int | None = None,
     ) -> PrefixCacheTracker:
         """Resolve the tracker for THIS conversation within a session id (#2085).
 
@@ -1600,20 +1622,19 @@ class SessionTrackerStore:
             cache_affinity: Stable fingerprint of the provider's non-message
                 cache-key segments (model/tools/tool choice/thinking). Lineages
                 with different affinity never share a tracker.
+            cache_ttl_seconds: Resolved provider cache lifetime for this
+                request. It extends this lineage's cleanup retention before
+                the periodic sweep.
 
         Returns:
             The ``PrefixCacheTracker`` for this conversation's lineage.
         """
         if not messages or not self._default_config.enabled:
-            # No lineage signal, or prefix freeze is disabled (there is no
-            # frozen state to protect): legacy one-tracker-per-session-id.
-            return self.get_or_create(session_id, provider)
+            # No lineage signal, or freeze disabled: use the session tracker.
+            return self.get_or_create(session_id, provider, cache_ttl_seconds)
 
-        # Prune expired trackers BEFORE matching, so a dead lineage cannot win
-        # the match. This also arms the cleanup interval: the get_or_create
-        # calls below cannot re-trigger a prune mid-function, so the family
-        # read here stays attached through the stamp at the end.
-        self._maybe_cleanup()
+        # Defer the sweep until the request has matched its lineage, allowing
+        # that tracker to record the provider TTL before cleanup evaluates it.
 
         # The repo's canonical cross-turn equivalence, shared with the
         # cache-stable delta path: a moved cache breakpoint, string<->block
@@ -1625,7 +1646,7 @@ class SessionTrackerStore:
         if not canon:
             # Degenerate: every message projected away (pure directive
             # content) — no lineage signal to match on.
-            return self.get_or_create(session_id, provider)
+            return self.get_or_create(session_id, provider, cache_ttl_seconds)
         snap = _lineage_snapshot(canon)
 
         family = self._lineages.setdefault(session_id, OrderedDict())
@@ -1634,6 +1655,14 @@ class SessionTrackerStore:
         # Rewritten-tail matches are deliberately last and require a unique best
         # structural score; ambiguity starts a fresh lineage instead of making
         # sibling sub-calls ping-pong one tracker.
+        for key in [
+            key
+            for key in family
+            if key not in self._trackers
+            or self._trackers[key].is_expired_for_cache_ttl(cache_ttl_seconds)
+        ]:
+            del family[key]
+            self._lineage_affinities.pop(key, None)
         by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
         best_key: str | None = None
         for accepted in (
@@ -1717,7 +1746,7 @@ class SessionTrackerStore:
                         cap,
                         session_id,
                     )
-                return self.get_or_create(overflow_key, provider)
+                return self.get_or_create(overflow_key, provider, cache_ttl_seconds)
             if not family:
                 # First lineage rides the bare session id; this also adopts a
                 # tracker created earlier via plain get_or_create.
@@ -1725,11 +1754,10 @@ class SessionTrackerStore:
             else:
                 best_key = f"{session_id}\x00{next(self._lineage_counter)}"
 
-        # get_or_create (not a private fetch) so test stubs that patch the
-        # instance method keep intercepting tracker creation; its internal
-        # cleanup is interval-gated and was armed above, so it cannot prune
-        # the family before the stamp below.
-        tracker = self.get_or_create(best_key, provider)
+        # Fetch through the public method so test stubs can intercept tracker
+        # creation. The selected lineage's TTL is applied before its cleanup
+        # sweep, then its snapshot is stamped after the family has been pruned.
+        tracker = self.get_or_create(best_key, provider, cache_ttl_seconds)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
         return tracker
