@@ -13,6 +13,7 @@ from headroom.install.paths import opencode_config_path
 from .config import (
     _inject_key_into_json,
     _parse_json_loose,
+    migrate_legacy_opencode_jsonc_backup,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -33,10 +34,9 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
 
     config_file = opencode_config_path()
     config_file.parent.mkdir(parents=True, exist_ok=True)
-
-    snapshot_opencode_config_if_unwrapped(
-        config_file, config_file.with_name(config_file.name + ".headroom-backup")
-    )
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
+    snapshot_opencode_config_if_unwrapped(config_file, backup_file)
 
     if config_file.exists():
         content = fsutil.read_text(config_file)
@@ -61,6 +61,16 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     )
 
 
+def restore_opencode_backup(config_path: str, backup_path: str) -> None:
+    """Restore the owned OpenCode snapshot, if it still exists."""
+    path = Path(config_path)
+    backup_file = Path(backup_path)
+    migrate_legacy_opencode_jsonc_backup(path, backup_file)
+    if backup_file.exists():
+        shutil.copy2(backup_file, path)
+        backup_file.unlink()
+
+
 def revert_provider_scope(
     mutation: ManagedMutation,
     manifest: DeploymentManifest,
@@ -77,10 +87,10 @@ def revert_provider_scope(
         return
     path = Path(mutation.path)
     backup_file = path.with_name(path.name + ".headroom-backup")
+    migrate_legacy_opencode_jsonc_backup(path, backup_file)
     if restore_backup and backup_file.exists():
         try:
-            shutil.copy2(backup_file, path)
-            backup_file.unlink()
+            restore_opencode_backup(str(path), str(backup_file))
             return
         except OSError:
             pass

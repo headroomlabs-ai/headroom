@@ -125,9 +125,18 @@ Provider scope is intentionally conservative. The current direct adapters are:
 For OpenCode provider scope, reapplying the deployment, restarting it, or
 recovering a stopped proxy removes and reinjects only the managed `headroom`
 provider. Later edits to themes, other providers, and MCP configuration stay
-intact. The original `<config filename>.headroom-backup` is kept across these
-transitions for both `.json` and `.jsonc` configurations. Final
-`headroom install remove` restores that original snapshot and deletes the backup.
+intact. JSONC input may contain comments and trailing commas.
+Active configuration is serialized as JSON; original formatting and comments
+are preserved in the snapshot. The original `<config filename>.headroom-backup`
+is kept across these transitions for both `.json` and `.jsonc` configurations.
+Final `headroom install remove` restores that original snapshot and deletes the
+backup, including after a stop and manifest reload.
+
+Existing JSONC snapshots using the older `<name>.json.headroom-backup` filename
+are migrated before taking a new snapshot. Migration leaves an ambiguous legacy
+backup alone when a sibling `.json` config exists. Successfully replacing a
+deployment with one that no longer targets OpenCode restores and consumes the
+original snapshot; a failed replacement retains it for recovery.
 
 
 For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user` or `--scope system`.

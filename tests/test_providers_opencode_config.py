@@ -346,11 +346,6 @@ def test_parse_json_loose_returns_empty_on_whitespace() -> None:
     assert _parse_json_loose("   \n  \t  ") == {}
 
 
-def test_parse_json_loose_returns_empty_on_trailing_comma() -> None:
-    """_parse_json_loose returns {} for malformed JSON (trailing comma)."""
-    assert _parse_json_loose('{"model": "gpt-4o",}') == {}
-
-
 def test_parse_json_loose_returns_empty_on_unclosed_brace() -> None:
     """_parse_json_loose returns {} for malformed JSON (unclosed brace)."""
     assert _parse_json_loose('{"model": "gpt-4o"') == {}

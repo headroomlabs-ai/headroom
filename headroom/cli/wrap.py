@@ -191,6 +191,7 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
+    migrate_legacy_opencode_jsonc_backup,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
@@ -8510,6 +8511,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
     config_file, backup_file = opencode_config_paths()
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
 
     if backup_file.exists():
         try:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -215,3 +216,260 @@ def test_provider_config_writes_pin_lf(tmp_path: Path, monkeypatch: pytest.Monke
 
     cleaned = json.loads(config_file.read_text())
     assert cleaned == {"theme": "kept", "mcp": {"remote": {}}}
+
+
+@pytest.mark.parametrize("suffix", [".json", ".jsonc"])
+def test_install_stop_remove_restores_original_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    from headroom.cli import install as cli_install
+
+    config_file = tmp_path / f"opencode{suffix}"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_file))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    original = (
+        b'{"theme":"before","provider":{"anthropic":{}},}\n'
+        if suffix == ".jsonc"
+        else b'{"theme":"before","provider":{"anthropic":{}}}\n'
+    )
+    config_file.write_bytes(original)
+    manifest = _manifest()
+    manifest.targets = ["opencode"]
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda current: None)
+    monkeypatch.setattr(cli_install, "save_manifest", lambda current: None)
+    monkeypatch.setattr(cli_install, "stop_runtime", lambda current: None)
+    monkeypatch.setattr(cli_install, "wait_stopped", lambda current: True)
+    monkeypatch.setattr(cli_install, "remove_supervisor", lambda current: None)
+    monkeypatch.setattr(cli_install, "delete_manifest", lambda profile: None)
+
+    cli_install._activate_deployment_mutations(manifest)
+    cli_install._deactivate_deployment_mutations(manifest)
+    assert manifest.mutations == []
+    cli_install._remove_deployment(manifest, restore_backup=True)
+
+    assert config_file.read_bytes() == original
+    assert not config_file.with_name(config_file.name + ".headroom-backup").exists()
+
+
+def test_failed_activation_retains_backup_for_final_remove_after_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.cli import install as cli_install
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "headroom-state"))
+    config_file = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_file))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    original = b'{"theme":"original"}\n'
+    config_file.write_bytes(original)
+    manifest = _manifest()
+    manifest.targets = ["opencode"]
+    real_save = cli_install._save_apply_manifest
+    real_save(manifest)
+
+    def fail_activation_save(current):
+        if current.mutations:
+            raise OSError("manifest save failed")
+        real_save(current)
+
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", fail_activation_save)
+    with pytest.raises(OSError, match="manifest save failed"):
+        cli_install._activate_deployment_mutations(manifest)
+
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
+    assert manifest.mutations == []
+    assert backup_file.read_bytes() == original
+    from headroom.install.state import load_manifest as load_state_manifest
+
+    persisted = load_state_manifest(manifest.profile)
+    assert persisted is not None
+
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda current: None)
+    monkeypatch.setattr(cli_install, "stop_runtime", lambda current: None)
+    monkeypatch.setattr(cli_install, "wait_stopped", lambda current: True)
+    monkeypatch.setattr(cli_install, "remove_supervisor", lambda current: None)
+    monkeypatch.setattr(cli_install, "delete_manifest", lambda profile: None)
+    cli_install._remove_deployment(persisted, restore_backup=True)
+    assert config_file.read_bytes() == original
+    assert not backup_file.exists()
+
+
+@pytest.mark.parametrize("config_name", ["opencode.jsonc", "custom-settings.jsonc"])
+def test_legacy_jsonc_backup_migrates_before_restart_and_final_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_name: str
+) -> None:
+    from headroom.cli import install as cli_install
+
+    config_file = tmp_path / config_name
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_file))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    original = b'// user\'s original JSONC\n{"theme":"original",}\n'
+    config_file.write_bytes(b'{"theme":"edited","provider":{"headroom":{}}}\n')
+    legacy_backup = config_file.with_suffix(".json.headroom-backup")
+    legacy_backup.write_bytes(original)
+    canonical_backup = config_file.with_name(config_file.name + ".headroom-backup")
+    canonical_backup.write_bytes(b'{"theme":"stale managed snapshot"}\n')
+    manifest = _manifest()
+    manifest.targets = ["opencode"]
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda current: None)
+    monkeypatch.setattr(cli_install, "save_manifest", lambda current: None)
+    monkeypatch.setattr(cli_install, "stop_runtime", lambda current: None)
+    monkeypatch.setattr(cli_install, "wait_stopped", lambda current: True)
+    monkeypatch.setattr(cli_install, "remove_supervisor", lambda current: None)
+    monkeypatch.setattr(cli_install, "delete_manifest", lambda profile: None)
+
+    cli_install._activate_deployment_mutations(manifest)
+    assert canonical_backup.read_bytes() == original
+    assert not legacy_backup.exists()
+    cli_install._deactivate_deployment_mutations(manifest)
+    cli_install._activate_deployment_mutations(manifest)
+    cli_install._remove_deployment(
+        manifest,
+        restore_backup=True,
+    )
+    assert config_file.read_bytes() == original
+    assert not canonical_backup.exists()
+
+
+def test_jsonc_trailing_commas_preserve_consumer_edits_across_reactivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.cli import install as cli_install
+    from headroom.install.providers import revert_mutations
+    from headroom.providers.opencode.config import _parse_json_loose
+
+    config_file = tmp_path / "opencode.jsonc"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_file))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    original = (
+        b'// original comment\n{"theme":"original","provider":{"anthropic":{"name":"Claude"},},'
+        b'"mcp":{"local":{},},}\n'
+    )
+    config_file.write_bytes(original)
+    manifest = _manifest()
+    manifest.targets = ["opencode"]
+
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda current: None)
+    cli_install._activate_deployment_mutations(manifest)
+    config_file.write_text(
+        '// consumer edit\n{"theme":"edited","provider":{"anthropic":{"name":"Claude",},'
+        '"headroom":{"options":{"baseURL":"http://127.0.0.1:8787/v1",},},},'
+        '"mcp":{"remote":{"url":"https://example.test",},},}\n'
+    )
+    cli_install._deactivate_deployment_mutations(manifest)
+    inactive = _parse_json_loose(config_file.read_text())
+    assert inactive["theme"] == "edited"
+    assert inactive["provider"] == {"anthropic": {"name": "Claude"}}
+    assert inactive["mcp"]["remote"]["url"] == "https://example.test"
+    cli_install._activate_deployment_mutations(manifest)
+    active = _parse_json_loose(config_file.read_text())
+    assert active["theme"] == "edited"
+    assert active["provider"]["headroom"]["options"]["baseURL"].endswith("/v1")
+    assert active["mcp"]["remote"]["url"] == "https://example.test"
+    revert_mutations(manifest, restore_backup=True)
+    assert config_file.read_bytes() == original
+
+
+def test_successful_replacement_dropping_opencode_restores_original_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.cli import install as cli_install
+    from headroom.install.state import save_manifest_strict
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "headroom-state"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    config_file = tmp_path / "opencode.json"
+    original = b'{"theme":"original"}\n'
+    config_file.write_bytes(original)
+    previous = _manifest()
+    previous.targets = ["opencode"]
+    cli_install._activate_deployment_mutations(previous)
+    save_manifest_strict(previous)
+    replacement = _manifest()
+    replacement.targets = []
+
+    monkeypatch.setattr(cli_install, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(cli_install, "install_supervisor", lambda current, **kwargs: [])
+    monkeypatch.setattr(cli_install, "_start_deployment", lambda current: None)
+    monkeypatch.setattr(cli_install, "stop_runtime", lambda current: None)
+    monkeypatch.setattr(cli_install, "wait_stopped", lambda current: True)
+    monkeypatch.setattr(cli_install, "remove_supervisor", lambda current: None)
+
+    cli_install._apply_manifest(replacement)
+
+    assert config_file.read_bytes() == original
+    assert not config_file.with_name("opencode.json.headroom-backup").exists()
+
+
+def test_failed_replacement_retains_opencode_snapshot_and_reinstates_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import click
+
+    from headroom.cli import install as cli_install
+    from headroom.install.state import save_manifest_strict
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "headroom-state"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    config_file = tmp_path / "opencode.json"
+    original = b'{"theme":"original"}\n'
+    config_file.write_bytes(original)
+    previous = _manifest()
+    previous.targets = ["opencode"]
+    cli_install._activate_deployment_mutations(previous)
+    save_manifest_strict(previous)
+    replacement = _manifest()
+    replacement.targets = []
+    backup_file = config_file.with_name("opencode.json.headroom-backup")
+
+    monkeypatch.setattr(cli_install, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(cli_install, "install_supervisor", lambda current, **kwargs: [])
+
+    def start(current):
+        if not current.targets:
+            raise click.ClickException("replacement startup failed")
+
+    monkeypatch.setattr(cli_install, "_start_deployment", start)
+    monkeypatch.setattr(cli_install, "stop_runtime", lambda current: None)
+    monkeypatch.setattr(cli_install, "wait_stopped", lambda current: True)
+    monkeypatch.setattr(cli_install, "remove_supervisor", lambda current: None)
+
+    with pytest.raises(click.ClickException, match="replacement startup failed"):
+        cli_install._apply_manifest(replacement)
+
+    assert backup_file.read_bytes() == original
+    from headroom.install.state import load_manifest as load_state_manifest
+
+    restored = load_state_manifest(previous.profile)
+    assert restored is not None and restored.mutations
+    active = json.loads(config_file.read_text())
+    assert active["provider"]["headroom"]["options"]["baseURL"].endswith("/v1")
+
+
+def test_jsonc_migration_does_not_claim_json_installation_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from headroom.cli import install as cli_install
+
+    config_file = tmp_path / "opencode.jsonc"
+    json_config = tmp_path / "opencode.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config_file))
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    json_config.write_bytes(b'{"theme":"json install"}\n')
+    config_file.write_bytes(b'{"theme":"jsonc install"}\n')
+    legacy_backup = tmp_path / "opencode.json.headroom-backup"
+    legacy_original = b'{"theme":"json original"}\n'
+    legacy_backup.write_bytes(legacy_original)
+    manifest = _manifest()
+    manifest.targets = ["opencode"]
+    monkeypatch.setattr(cli_install, "_save_apply_manifest", lambda current: None)
+
+    cli_install._activate_deployment_mutations(manifest)
+
+    canonical_backup = tmp_path / "opencode.jsonc.headroom-backup"
+    assert canonical_backup.read_bytes() == b'{"theme":"jsonc install"}\n'
+    assert legacy_backup.read_bytes() == legacy_original
