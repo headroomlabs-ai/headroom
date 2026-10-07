@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
 
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
@@ -368,6 +369,27 @@ def sanitize_forwarded_response_headers(
     return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
 
 
+def _path_for_log(path: str) -> str:
+    """Drop the query string, fragment and userinfo from an outbound URL.
+
+    Callers pass the full upstream URL, and Google routes put the API key in
+    the query (``?key=...``), so logging it verbatim writes the key to disk.
+    Scheme, host and path are enough to tell forwarder calls apart.
+    """
+    try:
+        parts = urlsplit(path)
+        port = parts.port
+    except ValueError:
+        return "<unparseable>"
+    host = parts.hostname or ""
+    # ``hostname`` drops the brackets around an IPv6 literal; put them back
+    # so the logged URL still names the upstream that was contacted.
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -383,8 +405,8 @@ def log_outbound_request(
     """Structured log line for every outbound forwarder call.
 
     Per realignment build constraints: every cache-affecting decision is
-    logged. Never includes ``Authorization``/``x-api-key`` content or full
-    body bytes.
+    logged. Never includes ``Authorization``/``x-api-key`` content, the URL
+    query string (where Google puts ``key=``) or full body bytes.
 
     ``dropped_mutation_reasons`` records edits that byte-faithful passthrough
     discarded before the wire. That is a WARNING, not a detail: the line above
@@ -396,7 +418,7 @@ def log_outbound_request(
         "body_mutated=%s mutation_reasons=%s source=%s request_id=%s",
         forwarder,
         method,
-        path,
+        _path_for_log(path),
         body_bytes_count,
         "true" if body_mutated else "false",
         ",".join(mutation_reasons) if mutation_reasons else "",

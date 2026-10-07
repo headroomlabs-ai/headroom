@@ -11,6 +11,7 @@ Usage:
     headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap grok                      # Start proxy + Grok CLI
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
+    headroom wrap antigravity               # Start proxy + print Antigravity config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --port 9999        # Custom proxy port
@@ -83,6 +84,9 @@ from headroom.copilot_auth import (
     token_fingerprint,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
+from headroom.providers.antigravity import (
+    render_setup_lines as _render_antigravity_setup_lines,
+)
 from headroom.providers.claude import (
     CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
@@ -316,7 +320,15 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+    "opencode",
+}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -332,7 +344,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
+_AGENT_SAVINGS_WRAP_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -6214,6 +6233,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap vibe                # Mistral Vibe
         headroom wrap grok                # Grok CLI (xAI)
         headroom wrap cursor              # Cursor (prints config instructions)
+        headroom wrap antigravity         # Antigravity IDE (prints config instructions)
         headroom wrap grok-build          # Grok Build (updates ~/.grok/config.toml)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -8672,6 +8692,62 @@ def cursor(
         memory=memory,
         agent_type="cursor",
         print_setup_lines=_print_cursor_setup,
+    )
+
+
+# =============================================================================
+# Antigravity IDE
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def antigravity(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Antigravity IDE.
+
+    \b
+    Antigravity reads its model endpoints from its model-provider settings,
+    not from environment variables. This command starts the proxy and prints
+    the settings to add as a custom OpenAI-compatible model provider.
+
+    \b
+    After running this command, open Antigravity and add a custom model
+    provider with the printed base URL. Antigravity fetches the model list
+    from GET /v1/models automatically.
+
+    \b
+    Example:
+        headroom wrap antigravity                # Start proxy + Antigravity settings
+        headroom wrap antigravity --port 9999    # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    def _print_antigravity_setup(actual_port: int) -> None:
+        for line in _render_antigravity_setup_lines(actual_port, project=_project_name_from_cwd()):
+            click.echo(line)
+
+    _run_proxy_only_watcher(
+        agent_label="antigravity",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="antigravity",
+        print_setup_lines=_print_antigravity_setup,
     )
 
 

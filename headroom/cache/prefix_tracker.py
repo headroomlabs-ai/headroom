@@ -442,6 +442,63 @@ def _replaced_system_tail_delta(
     return None
 
 
+def _block_identity(block: Any) -> tuple[Any, ...]:
+    """What identifies a reply block across a client's own re-serialization."""
+    if not isinstance(block, dict):
+        return ("raw", block)
+    kind = block.get("type")
+    if kind in ("tool_use", "server_tool_use"):
+        return (kind, block.get("id"), block.get("name"))
+    return (kind,)
+
+
+def _client_rewrote_reply_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]],
+    previous_forwarded_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """Cache-stable split when the client re-serialized the model's last reply.
+
+    The handlers record the model's raw reply as the last message of the previous
+    turn, but a client may send that reply back edited: Claude Code strips a leading
+    ``cd <cwd> &&`` from Bash commands and drops the ``caller`` annotation. Every
+    earlier message still matches, and the reply itself was model output, never part
+    of a cached prefix, so the forwarded history up to the reply is still exactly what
+    the provider cached. Replay it, take the client's version of the reply, and
+    treat what follows as the delta. Falling back to raw forwarding here instead
+    replaces every earlier compressed message with its original and re-writes the
+    whole conversation to cache.
+
+    The reply must be the same turn: an assistant message with the same block kinds
+    in the same order and the same tool_use ids.
+    """
+    n = len(previous_original_messages)
+    if n < 2 or len(previous_forwarded_messages) != n or len(current_messages) < n:
+        return None
+    prev_reply, cur_reply = previous_original_messages[-1], current_messages[n - 1]
+    if not (
+        isinstance(prev_reply, dict)
+        and isinstance(cur_reply, dict)
+        and prev_reply.get("role") == "assistant"
+        and cur_reply.get("role") == "assistant"
+    ):
+        return None
+    if _canonicalize_for_prefix_compare(
+        current_messages[: n - 1]
+    ) != _canonicalize_for_prefix_compare(previous_original_messages[: n - 1]):
+        return None
+    prev_blocks = _canonicalize_for_prefix_compare(prev_reply).get("content")
+    cur_blocks = _canonicalize_for_prefix_compare(cur_reply).get("content")
+    if not isinstance(prev_blocks, list) or not isinstance(cur_blocks, list):
+        return None
+    if [_block_identity(b) for b in prev_blocks] != [_block_identity(b) for b in cur_blocks]:
+        return None
+    return (
+        copy.deepcopy(previous_forwarded_messages[: n - 1] + [cur_reply]),
+        copy.deepcopy(current_messages[n:]),
+    )
+
+
 def classify_history_relation(
     current_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
@@ -512,6 +569,8 @@ def extract_cache_stable_delta(
     relation = classify_history_relation(current_messages, previous_original_messages)
     if relation.kind == RELATION_DIVERGED:
         return _replaced_system_tail_delta(
+            current_messages, previous_original_messages, previous_forwarded_messages
+        ) or _client_rewrote_reply_delta(
             current_messages, previous_original_messages, previous_forwarded_messages
         )
     if relation.kind not in (RELATION_EXACT, RELATION_MESSAGE_APPEND):
