@@ -245,7 +245,7 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: ""
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             manylinux: ""
           # Windows x86_64. `windows-latest` ships the MSVC toolchain and
@@ -498,7 +498,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
           - { runner: ubuntu-24.04-arm, image: "ubuntu:22.04", python: "3.12", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.35" }
           # macOS arm64 — runs natively on the host runner; no container.
-          - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+          - { runner: macos-26, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-26-aarch64-apple-darwin, glibc_label: "" }
           # macOS x86_64 (Intel) — `ort-load-dynamic`; see build-wheels
           # matrix comment for rationale.
           - { runner: macos-15-intel, image: "", python: "3.12", wheel_target: x86_64-apple-darwin, wheel_artifact: wheels-macos-15-intel-x86_64-apple-darwin, glibc_label: "" }
@@ -713,7 +713,7 @@ jobs:
           echo "Installing: $whl"
 
           # Use the system python at the requested minor version. The
-          # macos-14 runner image preinstalls multiple Python versions.
+          # macOS runner image preinstalls multiple Python versions.
           "python$PYTHON_VERSION" -m venv /tmp/venv
           /tmp/venv/bin/pip install --quiet --upgrade pip
           /tmp/venv/bin/pip install --quiet "$whl"
@@ -1060,6 +1060,26 @@ jobs:
             gh release edit "$TAG" --title "$TITLE"
           else
             gh release create "$TAG" --title "$TITLE" --notes-file .changelog.md
+          fi
+
+      # Appends once: a re-run finds this step's own marker and leaves the notes
+      # alone. Keyed on the marker, not the link, so a changelog entry that
+      # happens to mention the perks page does not suppress the footer.
+      # Release notes stay the changelog; this is one line under it.
+      - name: Add Headroom for Teams footer to release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.detect-version.outputs.version }}"
+          MARKER='<!-- headroom-teams-footer -->'
+          gh release view "$TAG" --json body --jq .body > release-notes.md
+          if ! grep -qF "$MARKER" release-notes.md; then
+            {
+              printf '\n%s\n\n---\n\n' "$MARKER"
+              printf '**Headroom for Teams:** 3 months of Headroom Enterprise free with a 12-month plan. '
+              printf '[Claim the perk →](https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=release-notes&utm_content=%s)\n' "$TAG"
+            } >> release-notes.md
+            gh release edit "$TAG" --notes-file release-notes.md
           fi
 
       - name: Publish ${{ env.PYPI_PACKAGE }} Python distributions to GitHub Release

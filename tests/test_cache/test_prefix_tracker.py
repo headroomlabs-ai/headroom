@@ -13,6 +13,8 @@ from headroom.cache.prefix_tracker import (
     PrefixCacheTracker,
     PrefixFreezeConfig,
     SessionTrackerStore,
+    extract_cache_stable_delta,
+    overlay_cached_prefix,
 )
 
 
@@ -774,6 +776,149 @@ class TestConversationLineageResolution:
         # evicted conversation starts cold.
         fresh = store.resolve_tracker("sid", "anthropic", messages=self._history("A", 2))
         assert fresh._turn_number == 0
+
+    @staticmethod
+    def _reminder_turns() -> tuple[list[dict], list[dict]]:
+        """Claude Code shape: a trailing system reminder replaced by the next turn."""
+        history = [
+            {"role": "user", "content": "Inspect example.py."},
+            {"role": "assistant", "content": "Reading the file."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "read-1",
+                        "content": "original source line\n" * 400,
+                    }
+                ],
+            },
+        ]
+        reminder = {"role": "system", "content": "Batch independent tools this turn."}
+        previous = [*history, reminder]
+        current = [
+            *history,
+            {"role": "assistant", "content": "Now run the checks."},
+            {"role": "user", "content": "The checks passed."},
+            dict(reminder),
+        ]
+        return previous, current
+
+    def test_replaced_system_tail_keeps_confirmed_tracker(self, store):
+        """The previous request ended in a system reminder the client swapped
+        for new turns. Its unchanged history must keep the tracker and its
+        confirmed frozen prefix instead of starting a cold lineage."""
+        previous, current = self._reminder_turns()
+        forwarded = [dict(m) for m in previous]
+        forwarded[2] = {**previous[2], "content": "previously cached compressed result"}
+        tracker = store.resolve_tracker("sid", "anthropic", previous, cache_affinity="a")
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=1_000_000,
+            messages=forwarded,
+            original_messages=previous,
+            message_token_counts=[100] * len(previous),
+        )
+        frozen = tracker.get_frozen_message_count()
+        assert frozen > 0
+
+        assert store.resolve_tracker("sid", "anthropic", current, cache_affinity="a") is tracker
+        assert tracker.get_frozen_message_count() == frozen
+        # The existing replay restores the unchanged prefix and stops at the
+        # replaced reminder; this turn's tail is forwarded as processed.
+        processed = [dict(m) for m in current]
+        processed[2] = {**current[2], "content": "a different compressed result"}
+        replayed = overlay_cached_prefix(
+            processed, current, previous, forwarded, confirmed_frozen_count=frozen
+        )
+        assert replayed[:3] == forwarded[:3]
+        assert replayed[3:] == processed[3:]
+
+    def test_moving_system_tail_records_full_snapshots(self, store):
+        """The reminder moves and changes every turn; each turn stays on one
+        tracker and the store records the full current history."""
+        previous, current = self._reminder_turns()
+        tracker = store.resolve_tracker("sid", "anthropic", previous)
+        for i in range(4):
+            current[-1] = {"role": "system", "content": f"reminder {i}"}
+            assert store.resolve_tracker("sid", "anthropic", current) is tracker
+            assert store._lineages["sid"]["sid"][-1]["content"][0]["text"] == f"reminder {i}"
+            assert len(store._lineages["sid"]["sid"]) == len(current)
+            current = [
+                *current[:-1],
+                {"role": "assistant", "content": f"reply {i}"},
+                {"role": "user", "content": f"next {i}"},
+                current[-1],
+            ]
+
+    def test_system_tail_fallback_respects_affinity_and_provider(self):
+        previous, current = self._reminder_turns()
+        for provider, affinity in (("anthropic", "other-tools"), ("openai", "a")):
+            store = SessionTrackerStore()
+            tracker = store.resolve_tracker("sid", provider, previous, cache_affinity="a")
+            resolved = store.resolve_tracker("sid", provider, current, cache_affinity=affinity)
+            assert resolved is not tracker
+
+    @pytest.mark.parametrize(
+        ("index", "role"),
+        [(0, "user"), (0, "system"), (2, "system")],
+        ids=["changed-history", "changed-leading-system", "changed-historical-system"],
+    )
+    def test_system_tail_fallback_requires_unchanged_history(self, store, index, role):
+        """Only the trailing reminder is set aside: any other change, including
+        a changed leading or historical system instruction, still diverges."""
+        previous, current = self._reminder_turns()
+        previous.insert(index, {"role": role, "content": "original"})
+        current.insert(index, {"role": role, "content": "changed"})
+        tracker = store.resolve_tracker("sid", "anthropic", previous)
+        assert store.resolve_tracker("sid", "anthropic", current) is not tracker
+
+    def test_swapped_final_instruction_is_not_a_continuation(self, store):
+        """Same-length siblings that differ only in their final system message
+        stay separate: the new history must extend past the old reminder."""
+        first = [{"role": "user", "content": "task"}, {"role": "system", "content": "A"}]
+        second = [{"role": "user", "content": "task"}, {"role": "system", "content": "B"}]
+        tracker = store.resolve_tracker("sid", "anthropic", first)
+        assert store.resolve_tracker("sid", "anthropic", second) is not tracker
+        assert store.resolve_tracker("sid", "anthropic", first) is tracker
+
+    def test_ambiguous_system_tail_siblings_are_not_merged(self, store, monkeypatch):
+        """Two lineages that differ only in their reminder (recorded here with
+        the fallback disabled) are an ambiguous match: start a fresh lineage
+        instead of guessing, and an exact match still wins."""
+        previous, current = self._reminder_turns()
+        sibling = [*previous[:-1], {"role": "system", "content": "other reminder"}]
+        monkeypatch.setenv("HEADROOM_TRANSIENT_SYSTEM_LINEAGE", "0")
+        tracker = store.resolve_tracker("sid", "anthropic", previous)
+        other = store.resolve_tracker("sid", "anthropic", sibling)
+        assert other is not tracker
+        monkeypatch.delenv("HEADROOM_TRANSIENT_SYSTEM_LINEAGE")
+        assert store.resolve_tracker("sid", "anthropic", current) not in (tracker, other)
+        assert store.resolve_tracker("sid", "anthropic", sibling) is other
+
+    def test_cache_delta_replays_prefix_past_replaced_system_tail(self, monkeypatch):
+        """Cache mode's delta split leaves the replaced reminder out of the
+        replayed prefix, with or without the model reply the handlers record
+        after the request, and compresses everything after it as new."""
+        previous, current = self._reminder_turns()
+        reply = current[3]
+        forwarded = [*previous[:2], {**previous[2], "content": "compressed"}, previous[3], reply]
+        for recorded in ([*previous, reply], previous):
+            replay = forwarded[: len(recorded)]
+            prefix, delta = extract_cache_stable_delta(current, recorded, replay)
+            assert prefix == replay[:3] + replay[4:]
+            assert delta == current[len(prefix) :]
+
+        # A system message followed by a client turn is history, not a reminder.
+        changed = [*previous, {"role": "user", "content": "Continue."}]
+        dropped = [*previous[:3], changed[4], *current[3:]]
+        assert extract_cache_stable_delta(dropped, changed, changed) is None
+        # The client's copy of the reply must match the recorded one.
+        other = [*previous, {"role": "assistant", "content": "Something else."}]
+        assert extract_cache_stable_delta(current, other, other) is None
+
+        monkeypatch.setenv("HEADROOM_TRANSIENT_SYSTEM_LINEAGE", "0")
+        assert extract_cache_stable_delta(current, [*previous, reply], forwarded) is None
 
     def test_shared_session_id_is_not_rotated(self, store):
         """Composition guard: lineage resolution must not leak into session-id

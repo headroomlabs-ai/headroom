@@ -231,6 +231,13 @@ class NormalizedUsage:
     output_tokens: int | None = None
     cache_read: int | None = None
     cache_write: int | None = None
+    # Whether ``input_tokens`` already counts the cached prompt. Anthropic's
+    # ``input_tokens`` is the uncached remainder (reads and writes are reported
+    # beside it); OpenAI's ``prompt_tokens`` is the whole prompt with
+    # ``cached_tokens`` as a subset of it. Billing the prompt correctly needs to
+    # know which of the two arrived, so normalize_usage records it rather than
+    # letting each consumer guess.
+    input_includes_cache: bool = False
 
     @property
     def has_cache_signal(self) -> bool:
@@ -327,6 +334,16 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     input_tokens = _usage_int(usage, "input_tokens")
     if input_tokens is None:
         input_tokens = _usage_int(usage, "prompt_tokens")
+    # Anthropic alone reports the prompt split in two: ``input_tokens`` is the
+    # uncached remainder and the cached part sits in its own two counters.
+    # Everywhere else the reported prompt total already contains the cached
+    # prefix — including OpenAI's Responses API, which names its field
+    # ``input_tokens`` too, so the key name cannot be the discriminator. Keying
+    # off Anthropic's cache fields can misread only a relay that mixes the two
+    # vocabularies, and then it errs towards not inflating the prompt.
+    input_includes_cache = not (
+        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    )
     output_tokens = _usage_int(usage, "output_tokens")
     if output_tokens is None:
         output_tokens = _usage_int(usage, "completion_tokens")
@@ -351,6 +368,7 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
         output_tokens=output_tokens,
         cache_read=cache_read,
         cache_write=cache_write,
+        input_includes_cache=input_includes_cache,
     )
 
 
@@ -1358,14 +1376,33 @@ def complete_outcome(
     tokenizer scale), output and the two cache counters as reported, provider
     status so a 5xx is funnelled as a failure, and the gateway's provider
     latency added to the compress-side wall clock.
+
+    ``provider_input_tokens`` is the WHOLE billed prompt, cached part included,
+    matching what the direct Anthropic handler records. Anthropic's
+    ``input_tokens`` counts only the uncached remainder, so on that shape the
+    cache counters are added back; every other shape already contains them, so
+    the cached part is subtracted to get ``uncached_input_tokens``.
+    Recording only the uncached sliver here left every ratio built on the input
+    counter (notably ``/stats`` ``tokens.savings_percent``) dividing savings by
+    a denominator tens of times too small on cache-heavy agent traffic.
     """
     usage = usage or NormalizedUsage()
+    cache_read = usage.cache_read or 0
+    cache_write = usage.cache_write or 0
+    reported_input = usage.input_tokens or 0
+    if usage.input_includes_cache:
+        billed_input = reported_input
+        uncached_input = max(reported_input - cache_read - cache_write, 0)
+    else:
+        billed_input = reported_input + cache_read + cache_write
+        uncached_input = reported_input
     return dataclasses.replace(
         draft,
         output_tokens=usage.output_tokens or 0,
-        provider_input_tokens=usage.input_tokens or 0,
-        cache_read_tokens=usage.cache_read or 0,
-        cache_write_tokens=usage.cache_write or 0,
+        provider_input_tokens=billed_input,
+        uncached_input_tokens=uncached_input,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
         status_code=status,
         total_latency_ms=draft.total_latency_ms + float(latency_ms or 0.0),
     )

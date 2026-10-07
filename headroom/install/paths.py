@@ -40,6 +40,13 @@ def manifest_path(profile: str) -> Path:
     return profile_root(profile) / "manifest.json"
 
 
+def recovery_manifest_path(profile: str) -> Path:
+    """Return the inactive recovery snapshot path for a named profile."""
+
+    validated = validate_profile_name(profile)
+    return deploy_root() / f"{validated}.recovery.json"
+
+
 def log_path(profile: str) -> Path:
     """Return the log path used by persistent runner scripts."""
 

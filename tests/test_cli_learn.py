@@ -112,6 +112,38 @@ def test_learn_exits_cleanly_when_model_detection_fails(
     assert "Error: no model" in result.output
 
 
+@pytest.mark.parametrize(
+    ("args", "env"),
+    [
+        (["learn"], {"HEADROOM_LEARN_CLI": "agy"}),
+        (["learn", "--model", "agy-cli"], {}),
+    ],
+)
+def test_learn_agy_without_unsafe_opt_in_exits_cleanly(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, args: list[str], env: dict[str, str]
+) -> None:
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "HEADROOM_LEARN_CLI",
+        "HEADROOM_LEARN_ALLOW_UNSAFE_AGY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    monkeypatch.setattr(
+        "headroom.learn.registry.auto_detect_plugins",
+        lambda: pytest.fail("sessions must not be scanned without the agy opt-in"),
+    )
+
+    result = runner.invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1" in result.output
+
+
 def test_learn_auto_agent_reports_no_detected_plugins(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner
 ) -> None:
@@ -176,6 +208,34 @@ def test_learn_project_lookup_and_apply_flow(
     assert plugin.writer.calls[0][2] is False
 
 
+@pytest.mark.parametrize("from_cwd", [False, True])
+def test_learn_selects_the_project_a_worktree_was_merged_into(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, from_cwd: bool
+) -> None:
+    main_checkout, worktree = tmp_path / "repo", tmp_path / "workspaces" / "ws"
+    (worktree / "src").mkdir(parents=True)
+    worktree = worktree.resolve()
+    merged = SimpleNamespace(
+        name="repo", project_path=main_checkout, worktree_paths=[worktree], extra_data_paths=[]
+    )
+    plugin = FakePlugin("claude", "Claude Code", [merged])
+    analyzer = FakeAnalyzer()
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", lambda model=None: analyzer)
+
+    args = ["learn", "--agent", "claude"]
+    if from_cwd:
+        monkeypatch.chdir(worktree / "src")
+    else:
+        args += ["--project", str(worktree)]
+    result = runner.invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert [call[0] for call in plugin.scan_calls] == [merged]
+
+
 class ProgressEchoingAnalyzer(FakeAnalyzer):
     def analyze(self, project, sessions, on_progress=None):  # noqa: ANN001, ANN201
         self.calls.append((project, sessions))
@@ -231,8 +291,12 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
     for d in (proj_a_dir, proj_b_dir):
         d.mkdir()
         (d / "s.jsonl").write_text("{}")
-    proj_a = SimpleNamespace(name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir)
-    proj_b = SimpleNamespace(name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir)
+    proj_a = SimpleNamespace(
+        name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir, extra_data_paths=[]
+    )
+    proj_b = SimpleNamespace(
+        name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir, extra_data_paths=[]
+    )
     plugin = FakePlugin("claude", "Claude Code", [proj_a, proj_b])
 
     # Per-project synthetic baselines. Project A has more samples, so its level
