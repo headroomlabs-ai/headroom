@@ -587,6 +587,17 @@ def test_canonical_snapshot_wins_over_ambiguous_legacy_backup(
     assert not canonical.exists()
     assert legacy.read_bytes() == legacy_original
 
+    later = b'// edited after removal\n{"theme":"new choice",}\n'
+    config.write_bytes(later)
+    second = _manifest()
+    second.targets = ["opencode"]
+    cli_install._activate_deployment_mutations(second)
+    assert canonical.read_bytes() == later
+    cli_install._remove_deployment(second, restore_backup=True)
+    assert config.read_bytes() == later
+    assert not canonical.exists()
+    assert legacy.read_bytes() == legacy_original
+
 
 def test_replacement_restore_failure_can_finish_after_manifest_reload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opencode_transaction
@@ -619,3 +630,135 @@ def test_replacement_restore_failure_can_finish_after_manifest_reload(
 
     assert config.read_bytes() == original
     assert not config.with_name(config.name + ".headroom-backup").exists()
+
+
+@pytest.mark.parametrize(
+    ("config_name", "location"),
+    [
+        ("opencode.jsonc", "override"),
+        ("custom-settings.jsonc", "override"),
+        ("opencode.jsonc", "opencode_home"),
+        ("opencode.jsonc", "default_home"),
+    ],
+)
+@pytest.mark.parametrize("ambiguity", ["canonical", "sibling"])
+def test_ambiguous_legacy_backup_stays_unowned_across_two_install_remove_cycles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_name: str,
+    location: str,
+    ambiguity: str,
+) -> None:
+    """Removing the conflicting file must not grant ownership of legacy bytes."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("OPENCODE_HOME", raising=False)
+    config_dir = tmp_path / ".config" / "opencode" if location == "default_home" else tmp_path
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config = config_dir / config_name
+    if location == "override":
+        monkeypatch.setenv("OPENCODE_CONFIG", str(config))
+    elif location == "opencode_home":
+        monkeypatch.setenv("OPENCODE_HOME", str(config_dir))
+    live = b'{"theme":"live"}\n'
+    original = b'// current original\r\n{"theme":"light",}\r\n'
+    unrelated = b'// unrelated original\r\n{"theme":"dark",}\r\n'
+    config.write_bytes(live if ambiguity == "canonical" else original)
+    canonical = config.with_name(config.name + ".headroom-backup")
+    legacy = config.with_suffix(".json.headroom-backup")
+    legacy.write_bytes(unrelated)
+    sibling = config.with_suffix(".json")
+    if ambiguity == "canonical":
+        canonical.write_bytes(original)
+    else:
+        sibling.write_bytes(b'{"theme":"separate JSON installation"}\n')
+
+    first = _manifest()
+    mutation = apply_provider_scope(first)
+    assert mutation is not None
+    revert_provider_scope(mutation, first)
+    assert config.read_bytes() == original
+    assert not canonical.exists()
+    assert legacy.read_bytes() == unrelated
+    if ambiguity == "sibling":
+        sibling.unlink()
+
+    # A new deployment after the first snapshot has been consumed must take a
+    # fresh snapshot, even though the formerly ambiguous legacy file remains.
+    later = b'// edited between installations\r\n{"theme":"new choice",}\r\n'
+    config.write_bytes(later)
+    second = _manifest()
+    mutation = apply_provider_scope(second)
+    assert mutation is not None
+    assert canonical.read_bytes() == later
+    assert legacy.read_bytes() == unrelated
+    revert_provider_scope(mutation, second, restore_backup=False)
+    mutation = apply_provider_scope(second)
+    assert mutation is not None
+    revert_provider_scope(mutation, second)
+    assert config.read_bytes() == later
+    assert not canonical.exists()
+    assert legacy.read_bytes() == unrelated
+
+
+@pytest.mark.parametrize("operation", ["apply", "restore"])
+def test_ambiguous_legacy_backup_marker_failure_preserves_all_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from headroom.providers.opencode.install import restore_opencode_backup
+
+    config = tmp_path / "opencode.jsonc"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config))
+    live = b'{"theme":"live"}\n'
+    original = b'{"theme":"original"}\n'
+    unrelated = b'{"theme":"unrelated"}\n'
+    config.write_bytes(live)
+    canonical = config.with_name(config.name + ".headroom-backup")
+    canonical.write_bytes(original)
+    legacy = config.with_suffix(".json.headroom-backup")
+    legacy.write_bytes(unrelated)
+    touch = Path.touch
+
+    def fail_marker(path: Path, *args, **kwargs) -> None:
+        if path.name.endswith(".jsonc-migration-blocked"):
+            raise PermissionError("migration marker is not writable")
+        touch(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(Path, "touch", fail_marker)
+        with pytest.raises(PermissionError, match="migration marker"):
+            if operation == "apply":
+                apply_provider_scope(_manifest())
+            else:
+                restore_opencode_backup(str(config), str(canonical))
+
+    assert config.read_bytes() == live
+    assert canonical.read_bytes() == original
+    assert legacy.read_bytes() == unrelated
+    restore_opencode_backup(str(config), str(canonical))
+    assert config.read_bytes() == original
+    assert not canonical.exists()
+    assert legacy.read_bytes() == unrelated
+
+
+@pytest.mark.parametrize("config_name", ["opencode.jsonc", "custom-settings.jsonc"])
+def test_unambiguous_legacy_backup_still_migrates_and_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_name: str
+) -> None:
+    config = tmp_path / config_name
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config))
+    config.write_bytes(b'{"theme":"live"}\n')
+    legacy = config.with_suffix(".json.headroom-backup")
+    original = b'// original\r\n{"theme":"original",}\r\n'
+    legacy.write_bytes(original)
+    canonical = config.with_name(config.name + ".headroom-backup")
+    manifest = _manifest()
+
+    mutation = apply_provider_scope(manifest)
+    assert mutation is not None
+    assert canonical.read_bytes() == original
+    assert not legacy.exists()
+    revert_provider_scope(mutation, manifest)
+    assert config.read_bytes() == original
+    assert not canonical.exists()

@@ -79,15 +79,22 @@ def opencode_config_paths() -> tuple[Path, Path]:
 
 
 def migrate_legacy_opencode_jsonc_backup(config_file: Path, backup_file: Path) -> None:
-    """Move the historical JSONC backup to the selected config's canonical path.
+    """Migrate only legacy JSONC snapshots whose ownership is unambiguous.
 
-    The legacy ``opencode.json.headroom-backup`` name is ambiguous when a
-    separate ``opencode.json`` installation exists, so never claim it then.
+    Remember ambiguity on disk before a canonical snapshot can be consumed.
+    Otherwise a later install/remove cycle could claim an unrelated legacy
+    backup after the canonical backup or sibling JSON config disappears.
     """
-    if config_file.suffix.lower() != ".jsonc" or backup_file.exists():
+    if config_file.suffix.lower() != ".jsonc":
         return
     legacy_backup = config_file.with_suffix(".json.headroom-backup")
-    if not legacy_backup.exists() or config_file.with_suffix(".json").exists():
+    migration_block = legacy_backup.with_name(legacy_backup.name + ".jsonc-migration-blocked")
+    if os.path.lexists(migration_block) or not legacy_backup.exists():
+        return
+    if os.path.lexists(backup_file) or os.path.lexists(config_file.with_suffix(".json")):
+        # Keep the legacy bytes in place for their owner or manual recovery.
+        # Fail closed if this marker cannot be persisted, before any restore.
+        migration_block.touch(exist_ok=True)
         return
     backup_file.parent.mkdir(parents=True, exist_ok=True)
     legacy_backup.replace(backup_file)

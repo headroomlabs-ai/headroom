@@ -133,9 +133,15 @@ Final `headroom install remove` restores that original snapshot and deletes the
 backup, including after a stop and manifest reload.
 
 Existing JSONC snapshots using the older `<name>.json.headroom-backup` filename
-are migrated only when the canonical backup is absent. Migration leaves an
-ambiguous legacy backup alone when a sibling `.json` config or a canonical
-snapshot already exists; it never overwrites the canonical original.
+are migrated only when the canonical backup is absent. When a sibling `.json`
+config or a canonical snapshot already exists, Headroom preserves the ambiguous
+legacy backup in place and creates a `<name>.json.headroom-backup.jsonc-migration-blocked`
+marker. This marker survives removal and prevents later installs from claiming
+the legacy backup, even after the conflicting config or snapshot disappears.
+The legacy bytes remain available for manual recovery; copy them to the intended
+config only after inspecting them. Keep the marker to prevent automatic migration.
+If the marker cannot be created, the operation fails before changing the config
+or consuming its canonical snapshot.
 
 Backup ownership follows the config path recorded in the deployment, not a
 later `OPENCODE_CONFIG` value. A successful replacement restores snapshots for

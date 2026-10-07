@@ -631,3 +631,29 @@ def test_inject_provider_config_strips_existing_markers(
     second = config_file.read_text()
     assert "headroom" in second
     assert second.count("headroom") == first.count("headroom")
+
+
+@pytest.mark.parametrize("conflict", ["canonical", "sibling"])
+def test_jsonc_migration_treats_dangling_conflict_as_ambiguous(
+    tmp_path: Path, conflict: str
+) -> None:
+    from headroom.providers.opencode.config import migrate_legacy_opencode_jsonc_backup
+
+    config = tmp_path / "opencode.jsonc"
+    canonical = config.with_name(config.name + ".headroom-backup")
+    legacy = config.with_suffix(".json.headroom-backup")
+    original = b'{"theme":"unrelated legacy"}\n'
+    legacy.write_bytes(original)
+    conflicting_path = canonical if conflict == "canonical" else config.with_suffix(".json")
+    try:
+        conflicting_path.symlink_to(tmp_path / "missing-target")
+    except OSError:
+        pytest.skip("creating symlinks requires platform permissions")
+
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert conflicting_path.is_symlink()
+    assert legacy.read_bytes() == original
+    conflicting_path.unlink()
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert not canonical.exists()
+    assert legacy.read_bytes() == original
