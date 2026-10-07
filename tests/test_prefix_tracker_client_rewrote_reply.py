@@ -106,9 +106,15 @@ def test_debug_dump_is_owner_only_even_if_it_exists(tmp_path, monkeypatch):
     from headroom.proxy.handlers.anthropic import _dump_prefix_mismatch
 
     monkeypatch.setenv("HEADROOM_DEBUG_PREFIX_MISMATCH", str(tmp_path))
+    # A dump left world-readable by an earlier run: created under the common
+    # 022 umask, so it gets the default 0644 without any explicit chmod.
     existing = tmp_path / "req1.json"
-    existing.write_text("{}")
-    os.chmod(existing, 0o644)  # left world-readable by an earlier run
+    previous_umask = os.umask(0o022)
+    try:
+        existing.write_text("{}")
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o644
 
     _dump_prefix_mismatch("req1", [USER, CLIENT_REPLY], [USER, RAW_REPLY])
     _dump_prefix_mismatch("req2", [USER, CLIENT_REPLY], [USER, RAW_REPLY])
