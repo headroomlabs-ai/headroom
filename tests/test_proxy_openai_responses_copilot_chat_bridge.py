@@ -408,3 +408,87 @@ def test_bypass_skips_routing_and_body_rewriting(
     assert "messages" not in body
     assert body.get("input") == "hello"
     assert body.get("instructions") == "be brief"
+
+
+# ---------------------------------------------------------------------------
+# Follow-up turns (turn-hook re-drives, CCR / memory continuations) must be
+# bridged exactly like the first request.
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_translates_a_turn_hook_tool_re_drive(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hook that re-drives a bridged turn must not send Responses items to /chat/completions.
+
+    The re-drive POSTs to the same URL as the first request. On the bridge that
+    is ``/chat/completions``, which rejects ``input`` with 400, and the hook
+    parses the reply as a Responses payload, so both directions need the same
+    translation as the initial call.
+    """
+    from headroom.proxy import turn_hooks
+
+    client, _captured = _build_bridge_client(
+        monkeypatch, chat_response_json=_chat_completion_json()
+    )
+    proxy = client.app.state.proxy
+    calls: list[tuple[str, dict]] = []
+    replies = iter(["first reply", "after the tool"])
+
+    async def _fake_retry(method, url, headers, body, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append((url, body))
+        reply = _chat_completion_json()
+        reply["choices"][0]["message"]["content"] = next(replies)  # type: ignore[index]
+        return httpx.Response(200, json=reply)
+
+    proxy._retry_request = _fake_retry
+    seen: dict[str, object] = {}
+
+    class _ToolReDrive:
+        name = "test-tool-re-drive"
+
+        async def on_response(self, ctx, response, call_model):  # type: ignore[no-untyped-def]
+            seen["first"] = response
+            return await call_model(
+                [
+                    *ctx.messages,
+                    {"type": "function_call", "call_id": "c1", "name": "lookup", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "c1", "output": "42"},
+                ]
+            )
+
+    monkeypatch.setattr(turn_hooks, "_hooks", [_ToolReDrive()])
+
+    response = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "Bearer test",
+            "x-headroom-base-url": _COPILOT_BASE,
+            "x-headroom-original-path": "/responses",
+        },
+        json={
+            "model": "claude-sonnet-4.6",
+            "input": [{"role": "user", "content": "What is the answer?"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "stream": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(calls) == 2, "the hook's re-drive never reached upstream"
+    for url, body in calls:
+        assert url.endswith("/chat/completions")
+        assert "messages" in body and "input" not in body, "a Responses body hit /chat/completions"
+    re_drive_roles = [m.get("role") for m in calls[1][1]["messages"]]
+    assert "tool" in re_drive_roles, "the tool result was lost in translation"
+
+    # The hook saw a Responses-shaped first reply, and the client gets the
+    # re-driven turn back in Responses shape.
+    assert isinstance(seen["first"], dict) and seen["first"]["object"] == "response"
+    payload = response.json()
+    assert payload["object"] == "response"
+    assert payload["output"][0]["content"][0]["text"] == "after the tool"

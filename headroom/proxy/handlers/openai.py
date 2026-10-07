@@ -7496,6 +7496,49 @@ class OpenAIHandlerMixin:
                 )
             else:
 
+                async def _post_responses_turn(
+                    turn_body: dict[str, Any],
+                    turn_headers: dict[str, str],
+                    **retry_kwargs: Any,
+                ) -> httpx.Response:
+                    """POST a follow-up Responses turn exactly as the first one went out.
+
+                    Turn-hook re-drives, CCR continuations and memory-tool
+                    continuations all re-POST to ``url``. On a Copilot
+                    responses/chat-completions bridge that URL is
+                    ``/chat/completions``, which rejects a Responses-shaped body
+                    with 400, and every caller here parses a Responses-shaped
+                    reply. So a bridged follow-up is translated both ways, like
+                    the initial request. A reply that cannot be translated
+                    raises: each caller already treats a failed follow-up as a
+                    failure rather than handing the client a malformed success.
+                    """
+                    if not is_copilot_chat_bridge:
+                        return await self._retry_request(
+                            "POST", url, turn_headers, turn_body, **retry_kwargs
+                        )
+                    chat_body = _responses_body_to_chat_completion_body(
+                        model, turn_body, plan=transport_plan
+                    )
+                    turn_response = await self._retry_request(
+                        "POST", url, turn_headers, chat_body, **retry_kwargs
+                    )
+                    if turn_response.status_code != 200:
+                        return turn_response
+                    translated = _chat_completion_json_to_responses_json(
+                        responses_api_request=turn_body,
+                        chat_completion_json=turn_response.json(),
+                    )
+                    return httpx.Response(
+                        status_code=200,
+                        content=json.dumps(translated).encode(),
+                        headers={
+                            k: v
+                            for k, v in turn_response.headers.items()
+                            if k.lower() not in ("content-length", "content-encoding")
+                        },
+                    )
+
                 async def _buffered_ccr_operation():
                     nonlocal headers
                     headers = await apply_copilot_api_auth(headers, url=url)
@@ -7651,11 +7694,9 @@ class OpenAIHandlerMixin:
                                 body[_key] = _items
                                 if _resp_hook_ctx.tools is not None:
                                     body["tools"] = _resp_hook_ctx.tools
-                                _rr = await self._retry_request(
-                                    "POST",
-                                    url,
-                                    headers,
+                                _rr = await _post_responses_turn(
                                     body,
+                                    headers,
                                     request_id=request_id,
                                     forwarder_name="openai_responses_turn_hook",
                                     path_for_log=url,
@@ -7845,11 +7886,9 @@ class OpenAIHandlerMixin:
                                 f"[{request_id}] CCR: Issuing Responses continuation "
                                 f"({len(items)} input items)"
                             )
-                            cont_response = await self._retry_request(
-                                "POST",
-                                url,
-                                continuation_headers,
+                            cont_response = await _post_responses_turn(
                                 continuation_body,
+                                continuation_headers,
                                 request_id=request_id,
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
@@ -7953,8 +7992,8 @@ class OpenAIHandlerMixin:
                                 }
                                 continuation_body.pop("previous_response_id", None)
 
-                                cont_response = await self._retry_request(
-                                    "POST", url, headers, continuation_body
+                                cont_response = await _post_responses_turn(
+                                    continuation_body, headers
                                 )
                                 resp_json = cont_response.json()
                                 response = cont_response
