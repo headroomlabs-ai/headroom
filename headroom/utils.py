@@ -278,3 +278,32 @@ def deep_copy_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     serialisation overhead on large conversation histories).
     """
     return copy.deepcopy(messages)
+
+
+def strip_streaming_only_content_fields_in_place(messages: Any) -> None:
+    """Remove streaming-only ``index`` keys from request content blocks, in place.
+
+    Shared in-place canonicalizer used right after the shared body readers
+    parse a request (the Anthropic handler has a private copy of this walk).
+    ``index`` is a field some providers emit on streaming RESPONSE content-block
+    deltas; it is not part of the request-message schema, so forwarding it
+    upstream triggers a 400 that aborts multi-turn sessions once a client
+    echoes a reconstructed assistant turn back. Stripping it before any
+    deepcopy / prefix recording keeps every derived copy identical. Nested
+    tool_result content lists are walked too.
+    """
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if isinstance(message, dict):
+            _strip_index_from_content_blocks_in_place(message.get("content"))
+
+
+def _strip_index_from_content_blocks_in_place(content: Any) -> None:
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict):
+            block.pop("index", None)
+            # tool_result blocks nest their own content list of blocks.
+            _strip_index_from_content_blocks_in_place(block.get("content"))

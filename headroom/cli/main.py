@@ -2,7 +2,37 @@
 
 import click
 
+from headroom.offline import OfflineEgressBlocked
+
 CLI_CONTEXT_SETTINGS = {"help_option_names": ["--help", "-?"]}
+
+
+class OfflineAwareGroup(click.Group):
+    """The CLI's single translation point for an air-gap refusal.
+
+    ``OfflineEgressBlocked`` is a ``BaseException`` on purpose, so no
+    ``except Exception`` anywhere in the tree can downgrade a policy refusal
+    into "that feature is having a bad day". The cost of that choice is that
+    nothing catches it either — Click's own error handling only knows about
+    ``ClickException``/``Abort``, so an operator who ran ``headroom auth
+    copilot`` on an air-gapped box would have got a stack trace ending in a
+    type they have never heard of.
+
+    Translating here, once, at the outermost boundary of every subcommand,
+    turns it into the ordinary ``Error: ...`` line Click prints for any other
+    bad invocation — with the switch, the feature and the host already in the
+    message, because :class:`OfflineEgressBlocked` builds them in. The guard
+    keeps its unswallowable property everywhere inside; only the last frame
+    before the user's terminal is allowed to make it readable.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except OfflineEgressBlocked as blocked:
+            # ``from None``: the traceback is Headroom's own plumbing and
+            # tells the operator nothing they can act on. The message does.
+            raise click.ClickException(str(blocked)) from None
 
 
 def get_version() -> str:
@@ -15,7 +45,7 @@ def get_version() -> str:
         return "unknown"
 
 
-@click.group(context_settings=CLI_CONTEXT_SETTINGS)
+@click.group(cls=OfflineAwareGroup, context_settings=CLI_CONTEXT_SETTINGS)
 @click.version_option(get_version(), "--version", "-v", prog_name="headroom")
 @click.pass_context
 def main(ctx: click.Context) -> None:

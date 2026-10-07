@@ -7,6 +7,9 @@ from typing import Any
 WIRE_DEBUG_REDACTED = "[REDACTED]"
 WIRE_DEBUG_SECRET_KEYS = (
     "authorization",
+    # A proxy sees Proxy-Authorization on the hop it makes itself; it carries
+    # the same kind of credential as Authorization.
+    "proxy-authorization",
     "cookie",
     "set-cookie",
     "api-key",
@@ -19,8 +22,23 @@ WIRE_DEBUG_SECRET_KEYS = (
     "bearer",
     "password",
     "secret",
+    "secret_key",
     "token",
     "credential",
+    "credentials",
+)
+
+# Suffixes that make a prefixed key a secret. ``_token`` covers the auth,
+# session, api, id and security token names providers use, and does not touch
+# the usage counters (``max_tokens``, ``input_tokens``, ...), which are plural.
+_SECRET_KEY_SUFFIXES = (
+    "_api_key",
+    "_secret",
+    "_secret_key",
+    "_password",
+    "_token",
+    "_credential",
+    "_credentials",
 )
 
 
@@ -29,13 +47,7 @@ def should_redact_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     if normalized in {marker.replace("-", "_") for marker in WIRE_DEBUG_SECRET_KEYS}:
         return True
-    return (
-        normalized.endswith("_api_key")
-        or normalized.endswith("_secret")
-        or normalized.endswith("_password")
-        or normalized.endswith("_access_token")
-        or normalized.endswith("_refresh_token")
-    )
+    return normalized.endswith(_SECRET_KEY_SUFFIXES)
 
 
 def redact_for_wire_debug(value: Any) -> Any:
