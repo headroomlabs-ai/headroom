@@ -43,10 +43,10 @@ logger = logging.getLogger("headroom.proxy")
 
 
 def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
-    """Return True when Grok CLI traffic should be redirected to ``api.x.ai``.
+    """Return True when Grok CLI / Grok Build traffic should be redirected to ``api.x.ai``.
 
-    Grok CLI cannot set ``x-headroom-base-url``, so a shared proxy started for
-    Claude/Codex has to recognize it from wire signals or it forwards xAI
+    Neither Grok client can set ``x-headroom-base-url``, so a shared proxy started for
+    Claude/Codex has to recognize them from wire signals or it forwards xAI
     session tokens to ``api.openai.com``.
 
     Only applies while the OpenAI target is still the default. An operator who
@@ -70,7 +70,7 @@ def route_grok_to_xai(headers: Mapping[str, str], openai_target: str) -> bool:
 def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
     """Resolve upstream for OpenAI-compatible metadata/passthrough traffic.
 
-    Routes official Grok CLI to ``api.x.ai`` so ``GET /v1/models`` and catch-all
+    Routes official Grok CLI / Grok Build to ``api.x.ai`` so ``GET /v1/models`` and catch-all
     passthrough succeed on a shared proxy whose OpenAI target is the default.
     """
     target = api_target(proxy, "openai")
