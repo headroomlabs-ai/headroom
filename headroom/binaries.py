@@ -277,10 +277,10 @@ def _ssl_context():
     """
     try:
         from headroom.proxy.ssl_context import build_urlopen_context
-
-        return build_urlopen_context()
-    except Exception:
+    except ImportError:
         return None
+
+    return build_urlopen_context()
 
 
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:

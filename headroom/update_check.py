@@ -198,10 +198,10 @@ def _urlopen_ssl_context():
     """
     try:
         from headroom.proxy.ssl_context import build_urlopen_context
-
-        return build_urlopen_context()
-    except Exception:
+    except ImportError:
         return None
+
+    return build_urlopen_context()
 
 
 def fetch_latest_version(*, allow_pre: bool = False, timeout: float = 4.0) -> str | None:
