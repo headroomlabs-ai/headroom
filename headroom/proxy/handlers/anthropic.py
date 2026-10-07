@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -285,6 +286,57 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
         return True
     head = response.content[:64].lstrip()
     return head.startswith(b"event:") or head.startswith(b"data:")
+
+
+def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> None:
+    """Debug aid (HEADROOM_DEBUG_PREFIX_MISMATCH=<dir>): log where the client's
+    history stopped matching the last turn, and dump both sides for diffing.
+
+    The dump holds the full conversation, user content included. It is for local
+    debugging only: never set this on a shared or production proxy.
+    """
+    from headroom.cache.prefix_tracker import (
+        _canonicalize_for_prefix_compare,
+        classify_history_relation,
+    )
+
+    rel = classify_history_relation(current, previous)
+    first = next(
+        (
+            i
+            for i in range(min(len(current), len(previous)))
+            if _canonicalize_for_prefix_compare(current[i])
+            != _canonicalize_for_prefix_compare(previous[i])
+        ),
+        None,
+    )
+    logger.info(
+        "[%s] prefix_mismatch_debug relation=%s first_diff_index=%s current_len=%d previous_len=%d",
+        request_id,
+        rel.kind,
+        first,
+        len(current),
+        len(previous),
+    )
+    try:
+        out = Path(os.environ["HEADROOM_DEBUG_PREFIX_MISMATCH"]) / f"{request_id}.json"
+        out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-only: the dump holds the full conversation. The mode passed to
+        # os.open applies only when the file is created, so tighten an existing
+        # file too before writing into it.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # The context manager owns the descriptor from here, so it is closed
+        # even if tightening the mode fails.
+        with os.fdopen(fd, "w") as fh:
+            if hasattr(os, "fchmod"):  # POSIX; Windows has no POSIX modes to fix
+                os.fchmod(fh.fileno(), 0o600)
+            json.dump(
+                {"first_diff_index": first, "current": current, "previous": previous},
+                fh,
+                default=str,
+            )
+    except Exception:  # noqa: BLE001 - debug aid only
+        pass
 
 
 class AnthropicHandlerMixin:
@@ -2276,6 +2328,10 @@ class AnthropicHandlerMixin:
                                 "[%s] Compression skipped: reason=cache_mode_prefix_mismatch",
                                 request_id,
                             )
+                            if os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"):
+                                _dump_prefix_mismatch(
+                                    request_id, original_client_messages, previous_original_messages
+                                )
                             optimized_messages = messages
                             optimized_tokens = original_tokens
                         elif tracker_frozen_count > 0:

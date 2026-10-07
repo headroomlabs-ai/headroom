@@ -1062,6 +1062,26 @@ jobs:
             gh release create "$TAG" --title "$TITLE" --notes-file .changelog.md
           fi
 
+      # Appends once: a re-run finds this step's own marker and leaves the notes
+      # alone. Keyed on the marker, not the link, so a changelog entry that
+      # happens to mention the perks page does not suppress the footer.
+      # Release notes stay the changelog; this is one line under it.
+      - name: Add Headroom for Teams footer to release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.detect-version.outputs.version }}"
+          MARKER='<!-- headroom-teams-footer -->'
+          gh release view "$TAG" --json body --jq .body > release-notes.md
+          if ! grep -qF "$MARKER" release-notes.md; then
+            {
+              printf '\n%s\n\n---\n\n' "$MARKER"
+              printf '**Headroom for Teams:** 3 months of Headroom Enterprise free with a 12-month plan. '
+              printf '[Claim the perk →](https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=release-notes&utm_content=%s)\n' "$TAG"
+            } >> release-notes.md
+            gh release edit "$TAG" --notes-file release-notes.md
+          fi
+
       - name: Publish ${{ env.PYPI_PACKAGE }} Python distributions to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

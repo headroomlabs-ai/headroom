@@ -36,7 +36,7 @@ Separately, an **anonymous usage beacon is on by default** (opt-out). Once a ses
 
 The install id is a random UUID generated on first run and stored in your config directory. It is deliberately not derived from hostname, MAC address, or any hardware property — delete the file and you get a new one.
 
-Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `--offline` (which also disables update checks and license reporting).
+Disable it with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or `HEADROOM_OFFLINE=1` (which also disables update checks and license reporting).
 
 ## CLI options
 
@@ -401,7 +401,7 @@ with a privileged job.
 | `HEADROOM_PROXY_TOKEN` | none | Require a token from non-loopback callers, as `X-Headroom-Proxy-Token: <token>` or `Authorization: Bearer <token>`. The token is removed from the request before it is forwarded upstream; clients that also send a provider credential should use `X-Headroom-Proxy-Token` and keep `Authorization` for the provider. Also gates the read-only operator routes (`/stats-history`, `/quota`, `/subscription-window`, `/metrics`), which otherwise answer loopback and trusted-CIDR callers only. |
 | `HEADROOM_ALLOW_UNAUTHENTICATED_BIND` | `false` | Acknowledge a non-loopback bind (`--host 0.0.0.0`, `::`, a LAN address) with **no** `HEADROOM_PROXY_TOKEN`. Without a token or this flag the proxy refuses to start, because `/v1/*` would relay upstream with the operator's credentials for every peer that can reach the port. Only set it when the runtime already restricts reachability (a container published on `127.0.0.1`). |
 | `HEADROOM_COMPRESS_ALLOW_REMOTE` | `false` | Allow non-loopback callers to reach [`POST /v1/compress`](#post-v1compress) and `POST /v1/usage`. Required to run Headroom as a remote gateway/sidecar; without it remote callers get `404`. |
-| `--offline` / `HEADROOM_OFFLINE` | `false` | Air-gap mode: refuse every connection Headroom itself initiates — telemetry, update checks, license reporting, model/tokenizer/binary/dataset downloads, remote Kompress, OTLP and Langfuse export, Copilot auth, the subscription pollers, the OpenAI embedders, Headroom Cloud compression and the TLS diagnostics (`headroom doctor --network` reports them as skipped). Four things still work on purpose: forwarding your own requests to the upstream you configured, operator-configured local endpoints (the Ollama embedder), loopback health probes, and paths an `is_offline()` check already disables. Refusals surface as messages, not tracebacks. See the air-gap notes in `docs/metrics-technical-guide.md`. |
+| `HEADROOM_OFFLINE` | `false` | Air-gap mode: refuse every connection Headroom itself initiates — telemetry, update checks, license reporting, model/tokenizer/binary/dataset downloads, remote Kompress, OTLP and Langfuse export, Copilot auth, the subscription pollers, the OpenAI embedders, Headroom Cloud compression and the TLS diagnostics (`headroom doctor --network` reports them as skipped). Four things still work on purpose: forwarding your own requests to the upstream you configured, operator-configured local endpoints (the Ollama embedder), loopback health probes, and paths an `is_offline()` check already disables. Refusals surface as messages, not tracebacks. See the air-gap notes in `docs/metrics-technical-guide.md`. |
 | `HEADROOM_LICENSE` | unset | Licence token, read by core and every licensed extension. `HEADROOM_LICENSE_KEY` is a deprecated alias for one release and logs a warning. A licence on its own sends nothing to Headroom. |
 | `HEADROOM_USAGE_REPORTING` | `false` | Set `1` to let the proxy validate the licence and post aggregate usage counts (no content) to the Headroom cloud. Off unless set; `HEADROOM_OFFLINE` still overrides it. |
 | `--stateless` / `HEADROOM_STATELESS` | `false` | Keep all state in memory; no filesystem writes (disables logs, memory, TOIN). |
@@ -518,6 +518,26 @@ Google Cloud Code Assist / Antigravity compatibility endpoint used by Pi-style `
 
 The proxy also accepts:
 - `POST /v1/v1internal:streamGenerateContent`
+
+### Antigravity IDE
+
+Google's Antigravity IDE can route its model traffic through the proxy:
+
+```bash
+headroom wrap antigravity          # Start proxy + print Antigravity setup instructions
+headroom mcp install --agent antigravity   # Register the Headroom MCP server in Antigravity
+```
+
+`wrap antigravity` prints a custom OpenAI-compatible model-provider base URL
+to add in Antigravity's model-provider settings; Antigravity fetches the model
+list from `GET /v1/models` on its own. Native Cloud Code Assist traffic
+(`google-antigravity` clients) is accepted on
+[`POST /v1internal:streamGenerateContent`](#post-v1internalstreamgeneratecontent)
+and routed upstream like any other Cloud Code request.
+
+MCP registration writes to Antigravity's global `mcp_config.json` under
+`~/.gemini/` (preferring the install's current location when one already
+exists) and refuses to overwrite a config file that does not parse as JSON.
 
 ### `POST /v1/compress`
 
