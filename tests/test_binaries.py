@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ssl
 import sys
 import tarfile
 import zipfile
@@ -216,6 +217,20 @@ def test_mirror_substitution(monkeypatch):
     )
     # Non-matching URLs are left alone.
     assert binaries._mirror_url("https://example.com/x") == "https://example.com/x"
+
+
+def test_download_wraps_tls_context_error_and_preserves_cause(monkeypatch, tmp_path):
+    error = ssl.SSLError("invalid configured certificate bundle")
+    monkeypatch.setattr(
+        binaries,
+        "_ssl_context",
+        lambda: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(binaries.BinaryFetchError, match="failed to configure TLS trust") as exc:
+        binaries._download("https://example.invalid/tool.tar.gz", tmp_path / "tool.tar.gz")
+
+    assert exc.value.__cause__ is error
 
 
 def test_mirror_url_with_query_params_strips_them_from_download_filename(

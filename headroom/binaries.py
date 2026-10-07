@@ -300,7 +300,10 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if not final_url.startswith("https://"):
         raise BinaryFetchError(f"refusing non-https download URL: {final_url!r}")
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
-    ctx = _ssl_context()
+    try:
+        ctx = _ssl_context()
+    except Exception as e:
+        raise BinaryFetchError(f"failed to configure TLS trust for binary download: {e}") from e
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
