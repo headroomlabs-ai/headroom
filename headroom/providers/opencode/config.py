@@ -84,7 +84,7 @@ def migrate_legacy_opencode_jsonc_backup(config_file: Path, backup_file: Path) -
     The legacy ``opencode.json.headroom-backup`` name is ambiguous when a
     separate ``opencode.json`` installation exists, so never claim it then.
     """
-    if config_file.suffix.lower() != ".jsonc":
+    if config_file.suffix.lower() != ".jsonc" or backup_file.exists():
         return
     legacy_backup = config_file.with_suffix(".json.headroom-backup")
     if not legacy_backup.exists() or config_file.with_suffix(".json").exists():

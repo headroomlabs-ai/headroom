@@ -9,6 +9,7 @@ import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 
 import click
 from click.core import ParameterSource
@@ -318,7 +319,7 @@ def pending_tool_envs(manifest: DeploymentManifest) -> dict[str, dict[str, str]]
     return pending
 
 
-def _track_opencode_backup(manifest: DeploymentManifest) -> None:
+def _track_opencode_backup(manifest: DeploymentManifest, *, activating: bool = False) -> None:
     if getattr(manifest, "scope", None) != ConfigScope.PROVIDER.value or "opencode" not in getattr(
         manifest, "targets", []
     ):
@@ -326,16 +327,28 @@ def _track_opencode_backup(manifest: DeploymentManifest) -> None:
     artifacts = getattr(manifest, "artifacts", None)
     if artifacts is None:
         return
-    config_path = opencode_config_path()
-    backup_path = config_path.with_name(config_path.name + ".headroom-backup")
-    if not any(item.kind == "opencode-config-backup" for item in artifacts):
+    paths = {
+        mutation.path
+        for mutation in getattr(manifest, "mutations", [])
+        if mutation.target == "opencode" and mutation.path
+    }
+    if activating:
+        paths.add(str(opencode_config_path()))
+    changed = False
+    for path in sorted(paths):
+        if any(item.kind == "opencode-config-backup" and item.path == path for item in artifacts):
+            continue
+        config_path = Path(path)
+        backup_path = config_path.with_name(config_path.name + ".headroom-backup")
         artifacts.append(
             ArtifactRecord(
                 kind="opencode-config-backup",
-                path=str(config_path),
+                path=path,
                 metadata={"backup_path": str(backup_path)},
             )
         )
+        changed = True
+    if changed:
         # Persist ownership before provider mutation or snapshot creation.
         _save_apply_manifest(manifest)
 
@@ -344,7 +357,7 @@ def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
     for target, names in sorted(_reconcile_tool_envs(manifest).items()):
         click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
     try:
-        _track_opencode_backup(manifest)
+        _track_opencode_backup(manifest, activating=True)
         manifest.mutations = apply_mutations(manifest)
         _save_apply_manifest(manifest)
     except Exception as exc:
@@ -388,18 +401,25 @@ def _delete_recovery_snapshot(profile: str) -> None:
         ) from None
 
 
-def _restore_owned_opencode_backup(manifest: DeploymentManifest) -> None:
+def _restore_owned_opencode_backup(
+    manifest: DeploymentManifest, *, preserve_paths: set[str] | None = None
+) -> None:
     artifacts = getattr(manifest, "artifacts", None)
     if artifacts is None:
         return
     for artifact in artifacts:
-        if artifact.kind != "opencode-config-backup":
+        if artifact.kind != "opencode-config-backup" or (
+            preserve_paths is not None and artifact.path in preserve_paths
+        ):
             continue
         backup_path = artifact.metadata.get("backup_path")
         if isinstance(backup_path, str):
             restore_opencode_backup(artifact.path, backup_path)
     manifest.artifacts = [
-        artifact for artifact in artifacts if artifact.kind != "opencode-config-backup"
+        artifact
+        for artifact in artifacts
+        if artifact.kind != "opencode-config-backup"
+        or (preserve_paths is not None and artifact.path in preserve_paths)
     ]
 
 
@@ -407,15 +427,16 @@ def _remove_deployment(
     manifest: DeploymentManifest,
     *,
     restore_backup: bool = False,
+    preserve_opencode_paths: set[str] | None = None,
 ) -> None:
     errors: list[tuple[str, Exception]] = []
     try:
-        if manifest.mutations:
-            _deactivate_deployment_mutations(
-                manifest, persist_manifest=False, restore_backup=restore_backup
-            )
         if restore_backup:
-            _restore_owned_opencode_backup(manifest)
+            _track_opencode_backup(manifest)
+        if manifest.mutations:
+            _deactivate_deployment_mutations(manifest, persist_manifest=False, restore_backup=False)
+        if restore_backup:
+            _restore_owned_opencode_backup(manifest, preserve_paths=preserve_opencode_paths)
     except Exception as exc:
         errors.append(("mutation cleanup", exc))
     try:
@@ -639,6 +660,7 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
     recovery_saved = False
     active_persistence_failed = False
     existing = None
+    existing_opencode_paths: set[str] = set()
     try:
         try:
             existing = load_manifest(profile)
@@ -647,6 +669,16 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         if existing is not None:
             click.echo(f"Updating existing deployment profile '{profile}'...")
             _track_opencode_backup(existing)
+            existing_opencode_paths = {
+                artifact.path
+                for artifact in getattr(existing, "artifacts", [])
+                if artifact.kind == "opencode-config-backup"
+            }
+            manifest.artifacts.extend(
+                artifact
+                for artifact in getattr(existing, "artifacts", [])
+                if artifact.kind == "opencode-config-backup" and artifact not in manifest.artifacts
+            )
             _save_recovery_snapshot(existing, profile)
             recovery_saved = True
             _remove_deployment(existing)
@@ -668,7 +700,9 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         except Exception:
             active_persistence_failed = True
             raise
-        manifest.artifacts = install_supervisor(manifest, start=False)
+        manifest.artifacts = [
+            artifact for artifact in manifest.artifacts if artifact.kind == "opencode-config-backup"
+        ] + install_supervisor(manifest, start=False)
         try:
             _save_apply_manifest(manifest)
         except Exception:
@@ -683,7 +717,11 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
     except Exception as exc:
         cleanup_errors: list[Exception] = []
         try:
-            _remove_deployment(manifest, restore_backup=existing is None)
+            _remove_deployment(
+                manifest,
+                restore_backup=True,
+                preserve_opencode_paths=existing_opencode_paths,
+            )
         except Exception as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
         if not cleanup_errors and not active_persistence_failed and existing is not None:
@@ -728,12 +766,24 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
                 f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
             ) from exc
         raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
-    if (
-        existing is not None
-        and "opencode" in getattr(existing, "targets", [])
-        and "opencode" not in getattr(manifest, "targets", [])
+    active_opencode_paths = {
+        mutation.path
+        for mutation in manifest.mutations
+        if mutation.target == "opencode" and mutation.path
+    }
+    if any(
+        artifact.kind == "opencode-config-backup" and artifact.path not in active_opencode_paths
+        for artifact in manifest.artifacts
     ):
-        _restore_owned_opencode_backup(existing)
+        try:
+            _restore_owned_opencode_backup(manifest, preserve_paths=active_opencode_paths)
+            _save_apply_manifest(manifest)
+        except Exception as exc:
+            raise click.ClickException(
+                f"Deployment '{profile}' is active, but OpenCode snapshot restoration failed: "
+                f"{exc}. Backup ownership is retained in the deployment manifest; "
+                "resolve the filesystem failure and retry install apply."
+            ) from exc
     if recovery_saved:
         _delete_recovery_snapshot(profile)
 

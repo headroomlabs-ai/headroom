@@ -133,10 +133,18 @@ Final `headroom install remove` restores that original snapshot and deletes the
 backup, including after a stop and manifest reload.
 
 Existing JSONC snapshots using the older `<name>.json.headroom-backup` filename
-are migrated before taking a new snapshot. Migration leaves an ambiguous legacy
-backup alone when a sibling `.json` config exists. Successfully replacing a
-deployment with one that no longer targets OpenCode restores and consumes the
-original snapshot; a failed replacement retains it for recovery.
+are migrated only when the canonical backup is absent. Migration leaves an
+ambiguous legacy backup alone when a sibling `.json` config or a canonical
+snapshot already exists; it never overwrites the canonical original.
+
+Backup ownership follows the config path recorded in the deployment, not a
+later `OPENCODE_CONFIG` value. A successful replacement restores snapshots for
+retired config paths and transfers any pending restoration to the new manifest.
+If restoration fails, the replacement remains active; resolve the filesystem
+error and retry `headroom install apply` to complete it.
+
+Failed replacement cleanup consumes snapshots newly created by that attempt,
+but preserves snapshots owned by the previous deployment for recovery.
 
 
 For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user` or `--scope system`.
