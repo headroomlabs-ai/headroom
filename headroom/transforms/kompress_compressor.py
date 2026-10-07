@@ -441,6 +441,21 @@ def _time_budget_seconds() -> float | None:
     return raw if raw > 0 else None
 
 
+def _capped_time_budget(cap: float | None) -> float | None:
+    """The per-call budget, lowered to *cap* when the caller has less to give.
+
+    The router passes what is left of its request-scoped ML budget, so a call
+    -- including the first one of a request, which has no measured cost to be
+    refused on -- stops at a chunk boundary when that budget runs out instead
+    of running to its own, larger, per-call budget.
+    """
+    budget = _time_budget_seconds()
+    if cap is None:
+        return budget
+    cap = max(0.0, cap)
+    return cap if budget is None else min(budget, cap)
+
+
 def _canary_threshold_seconds() -> float | None:
     """Startup canary threshold; inference slower than this disables Kompress.
 
@@ -1616,11 +1631,15 @@ class KompressCompressor(Transform):
 
     # ``compress()`` accepts ``_deadline_started_at``, so a caller that
     # compresses many blocks for ONE request can hand every call the same
-    # origin and have the deadline bound the request. Duck-typed rather than
+    # origin and have the deadline bound the request. It also accepts
+    # ``_time_budget_cap_seconds``, which lowers this call's time budget to
+    # what the caller's request-scoped ML budget has left. Duck-typed rather than
     # isinstance-checked at the call site because ``RemoteKompressCompressor``
-    # is the other compressor the router may get back and its ``compress()``
-    # does not take the argument.
+    # is the other compressor the router may get back: its ``compress()`` takes
+    # the cap (flagged by ``accepts_time_budget_cap``) but not the deadline
+    # origin.
     shares_request_deadline: bool = True
+    accepts_time_budget_cap: bool = True
 
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
@@ -1762,6 +1781,7 @@ class KompressCompressor(Transform):
         allow_download: bool = True,
         ccr_original: str | None = None,
         _deadline_started_at: float | None = None,
+        _time_budget_cap_seconds: float | None = None,
     ) -> KompressResult:
         """Compress content using Kompress model.
 
@@ -1824,6 +1844,7 @@ class KompressCompressor(Transform):
                     batch_size=_batch_size(),
                     ccr_originals=[ccr_original],
                     _deadline_started_at=t_deadline,
+                    _time_budget_cap_seconds=_time_budget_cap_seconds,
                 )
                 if batch_result:
                     return batch_result[0]
@@ -1834,7 +1855,7 @@ class KompressCompressor(Transform):
             chunk_count = 0
 
             acquire_timeout = _acquire_timeout_seconds()
-            budget = _time_budget_seconds()
+            budget = _capped_time_budget(_time_budget_cap_seconds)
             deadline = time.monotonic() + budget if budget is not None else None
 
             for chunk_start in range(0, n_words, max_chunk_words):
@@ -2104,6 +2125,7 @@ class KompressCompressor(Transform):
         *,
         ccr_originals: list[str | None] | None = None,
         _deadline_started_at: float | None = None,
+        _time_budget_cap_seconds: float | None = None,
     ) -> list[KompressResult]:
         """Compress multiple texts. Uses batched inference on GPU, sequential on CPU.
 
@@ -2198,6 +2220,12 @@ class KompressCompressor(Transform):
         # per-item slowdown measured on ONNX CPU (~0.7-0.9x vs sequential).
         # GPU users still benefit from the batched forward pass below.
         if self._should_use_sequential_fallback():
+            # The cap is for the whole batch, so each item gets what is left.
+            cap_ends_at = (
+                None
+                if _time_budget_cap_seconds is None
+                else time.monotonic() + _time_budget_cap_seconds
+            )
             return [
                 self.compress(
                     content,
@@ -2207,6 +2235,9 @@ class KompressCompressor(Transform):
                     target_ratio=r,
                     ccr_original=ccr_source,
                     _deadline_started_at=t_deadline,
+                    _time_budget_cap_seconds=(
+                        None if cap_ends_at is None else cap_ends_at - time.monotonic()
+                    ),
                 )
                 for content, r, ccr_source in zip(contents, ratios, ccr_sources, strict=True)
             ]
@@ -2257,7 +2288,7 @@ class KompressCompressor(Transform):
             self._deadline_s = deadline_s
 
         acquire_timeout = _acquire_timeout_seconds()
-        budget = _time_budget_seconds()
+        budget = _capped_time_budget(_time_budget_cap_seconds)
         deadline = time.monotonic() + budget if budget is not None else None
 
         def _bail_remaining(reason: str, batch_start: int) -> None:
