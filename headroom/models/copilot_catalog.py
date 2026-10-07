@@ -93,15 +93,22 @@ _NEGATIVE_TTL_SECONDS = 60.0
 
 
 def catalog_enabled() -> bool:
-    """True only when live catalog-driven routing is explicitly enabled."""
-    return os.environ.get("HEADROOM_MODEL_CATALOG", "").strip().lower() in {
-        "1",
-        "on",
-        "true",
-        "yes",
-        "enable",
-        "enabled",
-    }
+    """Whether live catalog-driven routing is on, per the runtime rollout policy.
+
+    Rollout-managed as ``copilot_model_catalog`` (see ``headroom/rollout.py``):
+    default-on from the ``beta`` channel, opt-in on ``stable`` via
+    ``HEADROOM_MODEL_CATALOG=1`` or ``HEADROOM_FEATURES=copilot_model_catalog``,
+    and ``HEADROOM_MODEL_CATALOG=0`` is the kill switch on every channel.
+    Resolved per call so a changed environment takes effect, and never raises:
+    an unreadable policy keeps today's name heuristic.
+    """
+    from headroom.rollout import resolve_rollout
+
+    try:
+        return resolve_rollout().is_enabled("copilot_model_catalog")
+    except Exception:  # noqa: BLE001 - routing must never fail on policy resolution
+        logger.debug("rollout policy unavailable; live model catalog stays off", exc_info=True)
+        return False
 
 
 def catalog_ttl_seconds() -> float:

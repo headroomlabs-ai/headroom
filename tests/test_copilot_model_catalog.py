@@ -429,13 +429,45 @@ def test_launcher_wire_api_uses_published_endpoints(monkeypatch: pytest.MonkeyPa
     assert resolve("gpt-4o", api_url="https://api.githubcopilot.com", token="t") == "completions"
 
 
-def test_live_catalog_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_catalog_follows_the_rollout_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opt-in on stable, default-on from beta, and one kill switch everywhere."""
     from headroom.models.copilot_catalog import catalog_enabled
 
-    monkeypatch.delenv("HEADROOM_MODEL_CATALOG", raising=False)
+    for name in (
+        "HEADROOM_MODEL_CATALOG",
+        "HEADROOM_ROLLOUT_CHANNEL",
+        "HEADROOM_FEATURES",
+        "HEADROOM_DISABLE_FEATURES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    # Stable (the default channel): the heuristic, unless asked for.
     assert catalog_enabled() is False
     monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "true")
     assert catalog_enabled() is True
+    monkeypatch.delenv("HEADROOM_MODEL_CATALOG")
+    monkeypatch.setenv("HEADROOM_FEATURES", "copilot_model_catalog")
+    assert catalog_enabled() is True
+    monkeypatch.delenv("HEADROOM_FEATURES")
+
+    # Beta and later: on by default...
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
+    assert catalog_enabled() is True
+    # ...and the legacy variable is still the kill switch.
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "off")
+    assert catalog_enabled() is False
+    monkeypatch.delenv("HEADROOM_MODEL_CATALOG")
+    monkeypatch.setenv("HEADROOM_DISABLE_FEATURES", "copilot_model_catalog")
+    assert catalog_enabled() is False
+
+
+def test_rollout_registry_declares_the_catalog() -> None:
+    from headroom.rollout import FEATURES, RolloutChannel
+
+    spec = FEATURES["copilot_model_catalog"]
+    assert spec.available_in is RolloutChannel.STABLE
+    assert spec.default_enabled_in is RolloutChannel.BETA
+    assert spec.legacy_env == ("HEADROOM_MODEL_CATALOG",)
 
 
 def test_launcher_wire_api_survives_an_unreachable_models_endpoint(
