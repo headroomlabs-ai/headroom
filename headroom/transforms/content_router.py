@@ -3056,6 +3056,9 @@ class ContentRouter(Transform):
         if detection is None:
             detection = _detect_content(content)
 
+        if detection.metadata.get("format") == "git_status":
+            return CompressionStrategy.TABULAR
+
         # 1. Check for mixed content
         if mixed:
             # 2. Verify with the native detector: ``is_mixed_content`` uses

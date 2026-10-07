@@ -2009,8 +2009,13 @@ def _block_out(router: ContentRouter, content: str, model_limit: int) -> str:
     return result.messages[0]["content"][0]["content"]
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    ["", '\n```python\nprint("hello")\n```\n', '\n{"records":[{"name":"extra","value":1}]}\n'],
+    ids=["status", "fenced-code", "json"],
+)
 def test_git_status_output_stays_byte_exact_on_direct_and_tool_routes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, suffix: str
 ) -> None:
     status = """On branch feature/status
 Changes to be committed:
@@ -2029,6 +2034,7 @@ Untracked files:
   (use "git add <file>..." to include in what will be committed)
 \tnew untracked path.txt
 """
+    status += suffix
     router = ContentRouter(ContentRouterConfig())
 
     class LossyProseCompressor:
