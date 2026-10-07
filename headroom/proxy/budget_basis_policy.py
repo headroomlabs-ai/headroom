@@ -31,6 +31,17 @@ logger = logging.getLogger("headroom.proxy")
 COST_BASIS_MEASURED = "measured"
 COST_BASIS_ESTIMATED = "estimated"
 
+# Provenance of the PRICE behind a booked cost record — a second, independent
+# dimension from the input-token-count basis above. A record can carry
+# provider-reported usage priced at a guessed default (unknown model, #3732),
+# so the two must stay separable in the ledger rather than collapsing into
+# COST_BASIS_ESTIMATED. Concretely: ``estimated_pct`` keeps meaning "the input
+# count was estimated", and price-guessed spend is reported under its own
+# ``price_estimated_*`` keys. Budget enforcement treats a record as
+# non-authoritative when EITHER dimension is estimated.
+PRICE_BASIS_MEASURED = "measured"
+PRICE_BASIS_ESTIMATED = "price_estimated"
+
 # What estimated spend does to budget enforcement.
 BUDGET_BASIS_COUNT = "count"
 BUDGET_BASIS_IGNORE = "ignore"
