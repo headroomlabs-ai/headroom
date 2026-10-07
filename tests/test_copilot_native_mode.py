@@ -477,7 +477,27 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) 
 
 # ---------------------------------------------------------------------------
 # Cross-contamination: a native proxy must never be reused by `wrap claude`
+#
+# These follow the shared-proxy ownership contract in headroom/cli/wrap.py: an
+# idle mismatched proxy is restarted on the same port, an attached one is left
+# alone and the session gets a dedicated proxy elsewhere.
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _hermetic_routing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A developer's own upstream overrides would change the requested routing."""
+    for name in (
+        "ANTHROPIC_TARGET_API_URL",
+        "OPENAI_TARGET_API_URL",
+        "GEMINI_TARGET_API_URL",
+        "CLOUDCODE_TARGET_API_URL",
+        "VERTEX_TARGET_API_URL",
+        "AUGMENT_TARGET_API_URL",
+        "FACTORY_TARGET_API_URL",
+        "HEADROOM_BACKEND",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _drive_ensure_proxy(monkeypatch: pytest.MonkeyPatch, running_config: dict, **kwargs):
@@ -505,6 +525,9 @@ def _drive_ensure_proxy(monkeypatch: pytest.MonkeyPatch, running_config: dict, *
     monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: len(calls) == 0)
     monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda port: health)
     monkeypatch.setattr(wrap_mod, "_port_bind_error", lambda port: None)
+    # Idle unless a test says otherwise: a real wrap session on the developer's
+    # machine must not flip these into the "attached" branch.
+    monkeypatch.setattr(wrap_mod, "_live_proxy_clients", lambda *a, **k: [])
     monkeypatch.setattr(
         wrap_mod, "_kill_proxy_by_pid", lambda pid, port: calls.append(("kill", pid, port)) or True
     )
@@ -513,6 +536,7 @@ def _drive_ensure_proxy(monkeypatch: pytest.MonkeyPatch, running_config: dict, *
     return port, calls
 
 
+@pytest.mark.usefixtures("_hermetic_routing_env")
 def test_native_proxy_is_not_shared_with_claude(monkeypatch: pytest.MonkeyPatch) -> None:
     """The credential-substitution hazard: `wrap claude` must not inherit it.
 
@@ -536,9 +560,10 @@ def test_native_proxy_is_not_shared_with_claude(monkeypatch: pytest.MonkeyPatch)
     assert started, "no replacement proxy was started"
     assert started[0][1].get("anthropic_api_url") is None
     assert started[0][1].get("openai_api_url") is None
-    assert port == 8787, "restart should reclaim the same port, not take a new one"
+    assert port == 8787, "an idle proxy is restarted on the same port, not abandoned"
 
 
+@pytest.mark.usefixtures("_hermetic_routing_env")
 def test_plain_proxy_is_still_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     """Guard against over-correcting into restarting on every launch."""
     port, calls = _drive_ensure_proxy(
@@ -548,6 +573,7 @@ def test_plain_proxy_is_still_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     assert port == 8787
 
 
+@pytest.mark.usefixtures("_hermetic_routing_env")
 def test_matching_native_proxy_is_reused(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two `--native` sessions on one port share the proxy rather than fighting."""
     copilot = "https://api.githubcopilot.com"
@@ -561,16 +587,17 @@ def test_matching_native_proxy_is_reused(monkeypatch: pytest.MonkeyPatch) -> Non
     assert port == 8787
 
 
+@pytest.mark.usefixtures("_hermetic_routing_env")
 def test_pinned_proxy_is_not_shared_even_when_another_wrapper_is_attached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An upstream conflict must not fall into the "reuse as-is" branch.
 
     That branch exists so a *missing feature* does not disrupt other sessions'
-    in-flight requests — correct for a feature, wrong for an upstream: sharing a
+    in-flight requests -- correct for a feature, wrong for an upstream: sharing a
     Copilot-pinned proxy sends this session's traffic to another vendor with the
-    credential substituted. Found by review after an earlier rework routed the
-    conflict through the `missing` list, which lands in exactly that branch.
+    credential substituted. Under the ownership contract the attached proxy is
+    left alone and this session gets a dedicated proxy on another port.
     """
     from headroom.cli import wrap as wrap_mod
 

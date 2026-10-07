@@ -80,6 +80,7 @@ from headroom.copilot_auth import (
     resolve_client_bearer_token,
     resolve_copilot_api_url,
     resolve_subscription_bearer_token_details,
+    token_fingerprint,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import (
@@ -3692,7 +3693,9 @@ _ANTHROPIC_DEFAULT_UPSTREAM = "https://api.anthropic.com"
 _ANTHROPIC_UPSTREAM_PIN_HEADER = "X-Headroom-Base-Url"
 
 
-def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str | None:
+def _apply_anthropic_upstream_pin_env(
+    env: dict[str, str], *, port: int, requested_upstream: str | None = None
+) -> str | None:
     """Let Claude Code share a proxy whose Anthropic upstream points elsewhere.
 
     A proxy has exactly one destination for ``/v1/messages``. ``wrap copilot
@@ -3709,9 +3712,16 @@ def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str 
     answered by Anthropic's own error shape). That is what makes one proxy for
     the Copilot CLI, VS Code *and* Claude Code safe rather than merely possible.
 
-    No-ops when the proxy is absent or already Anthropic-pinned, so the ordinary
-    single-client setup is untouched. A user-supplied override always wins.
-    Returns the pinned upstream when one was written, for the caller to report.
+    The pin targets the upstream *this* session asked for (``requested_upstream``:
+    a Foundry resource or an inherited LiteLLM/custom gateway, see #1358), and
+    only defaults to api.anthropic.com when none was requested -- pinning every
+    session to Anthropic would silently route a gateway user's traffic past
+    their gateway.
+
+    No-ops when the proxy is absent, on its default upstream, or already points
+    at that upstream, so the ordinary single-client setup is untouched. A
+    user-supplied override always wins. Returns the pinned upstream when one
+    was written, for the caller to report.
     """
     try:
         helpers = _live_wrap_module()
@@ -3720,11 +3730,12 @@ def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str 
         return None
     if not running:
         return None
+    target = requested_upstream or _ANTHROPIC_DEFAULT_UPSTREAM
     current = _normalize_proxy_api_url(running.get("anthropic_api_url"))
-    if current is None or current == _normalize_proxy_api_url(_ANTHROPIC_DEFAULT_UPSTREAM):
+    if current is None or current == _normalize_proxy_api_url(target):
         return None
 
-    header_line = f"{_ANTHROPIC_UPSTREAM_PIN_HEADER}: {_ANTHROPIC_DEFAULT_UPSTREAM}"
+    header_line = f"{_ANTHROPIC_UPSTREAM_PIN_HEADER}: {target}"
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
     if existing:
         for line in existing.splitlines():
@@ -3733,7 +3744,7 @@ def _apply_anthropic_upstream_pin_env(env: dict[str, str], *, port: int) -> str 
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
     else:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
-    return _ANTHROPIC_DEFAULT_UPSTREAM
+    return target
 
 
 # Codex's own built-in providers plus Headroom's injected one — never treated
@@ -4441,8 +4452,6 @@ def _proxy_serves_same_copilot_seed(
     running = running_config.get("copilot_token_fingerprint")
     if not isinstance(running, str) or not running:
         return False
-    from headroom.copilot_auth import token_fingerprint
-
     return running == token_fingerprint(requested_oauth_token)
 
 
@@ -4552,6 +4561,7 @@ def _proxy_routing_mismatches(
     *,
     backend: str | None,
     requested_api_urls: Mapping[str, str | None] | None = None,
+    requested_copilot_fingerprint: str | None = None,
 ) -> list[str]:
     """Return routing-level keys where a running proxy differs from the request.
 
@@ -4560,6 +4570,12 @@ def _proxy_routing_mismatches(
     proxy would forward this session's traffic to a backend or upstream the
     caller did not ask for. URL comparison is symmetric: a running proxy with
     a non-default upstream the caller did not request is a mismatch too.
+
+    The Copilot credential a proxy was seeded with is part of its routing
+    identity (``copilot_credential``): an unseeded session must never reuse a
+    seeded proxy -- its traffic would go upstream under someone else's token --
+    and a seeded session must never reuse one it cannot prove is its own
+    account. Unknown counts as different, so this fails closed.
     """
     mismatches: list[str] = []
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "anthropic"
@@ -4581,6 +4597,11 @@ def _proxy_routing_mismatches(
             strip_provider_v1=strip_provider_v1,
         ):
             mismatches.append(key)
+    running_fingerprint = running_config.get("copilot_token_fingerprint")
+    if not isinstance(running_fingerprint, str) or not running_fingerprint:
+        running_fingerprint = None
+    if running_fingerprint != requested_copilot_fingerprint:
+        mismatches.append("copilot_credential")
     return mismatches
 
 
@@ -5074,6 +5095,25 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
     click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
 
 
+# Shared-proxy ownership contract
+# --------------------------------
+# 1. A proxy's identity is (backend, upstream URLs, copilot_credential), where
+#    copilot_credential is the non-secret fingerprint /health reports for the
+#    OAuth token that seeded it (None = unseeded or unknown).
+# 2. A session that requests no seed never reuses a seeded proxy, and a seeded
+#    session never reuses a proxy whose credential is not provably its own.
+#    Unknown counts as different: this fails closed.
+# 3. Any mismatch is handled by one policy (``_proxy_routing_mismatches``):
+#    an idle proxy is restarted on the same port with this session's config;
+#    a proxy with attached clients, a persistent deployment, or one that does
+#    not report its config is left alone and this session gets a dedicated
+#    proxy on another port. Nothing is killed from under another session.
+# 4. Same-account exception: a seeded session may share a running proxy only
+#    when ``_proxy_serves_same_copilot_seed`` holds AND routing matches. This is
+#    how ``wrap copilot --native`` and ``wrap vscode-chat`` share one proxy.
+# 5. ``wrap claude`` sharing a proxy pinned elsewhere relies on the per-request
+#    ``X-Headroom-Base-Url`` pin (``_apply_anthropic_upstream_pin_env``), which
+#    targets the upstream that session requested.
 def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
@@ -5106,6 +5146,11 @@ def _ensure_proxy_unlocked(
         bool(copilot_api_token)
         or bool(copilot_refresh_oauth_token)
         or copilot_api_token_expires_at is not None
+    )
+    # The proxy-side identity of this session's credential (see
+    # ``_proxy_routing_mismatches``). None when no OAuth seed is handed over.
+    requested_copilot_fingerprint = (
+        token_fingerprint(copilot_refresh_oauth_token) if copilot_refresh_oauth_token else None
     )
     requested_backend, requested_api_urls = helpers._effective_requested_proxy_routing(
         backend=backend,
@@ -5176,6 +5221,7 @@ def _ensure_proxy_unlocked(
                         running_config,
                         backend=requested_backend,
                         requested_api_urls=requested_api_urls,
+                        requested_copilot_fingerprint=requested_copilot_fingerprint,
                     )
                 )
                 if running_config is None:
@@ -5259,6 +5305,7 @@ def _ensure_proxy_unlocked(
                             running_config,
                             backend=requested_backend,
                             requested_api_urls=requested_api_urls,
+                            requested_copilot_fingerprint=requested_copilot_fingerprint,
                         )
                         if routing_mismatches:
                             keys_str = ", ".join(routing_mismatches)
@@ -5341,6 +5388,7 @@ def _ensure_proxy_unlocked(
                     running_config,
                     backend=requested_backend,
                     requested_api_urls=requested_api_urls,
+                    requested_copilot_fingerprint=requested_copilot_fingerprint,
                 )
             )
             if running_config is None and not helpers._proxy_needs_version_restart(health_payload):
@@ -6622,7 +6670,11 @@ def claude(
 
         # Sharing a Copilot-pinned proxy (the CLI + VS Code central proxy) is
         # only safe once this client's own upstream is pinned per request.
-        _pinned_upstream = _apply_anthropic_upstream_pin_env(env, port=port)
+        _pinned_upstream = _apply_anthropic_upstream_pin_env(
+            env,
+            port=actual_port,
+            requested_upstream=upstream_for_proxy or os.environ.get("ANTHROPIC_TARGET_API_URL"),
+        )
         if _pinned_upstream:
             click.echo(
                 f"  Sharing a proxy pinned elsewhere; this session's Anthropic "

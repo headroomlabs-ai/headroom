@@ -1162,6 +1162,37 @@ def test_claude_upstream_pin_only_fires_when_the_proxy_points_elsewhere(
     assert "X-Headroom-Base-Url: https://api.anthropic.com" in env["ANTHROPIC_CUSTOM_HEADERS"]
 
 
+def test_claude_upstream_pin_targets_the_upstream_this_session_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user's own gateway (#1358) must never be bypassed by the shared-proxy pin."""
+    import headroom.cli.wrap as wrap_mod
+
+    gateway = "https://litellm.example.internal/anthropic"
+
+    def fake_proxy(config: dict | None):
+        monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda port: {"config": config})
+        monkeypatch.setattr(wrap_mod, "_proxy_health_config", lambda payload: config)
+
+    # The proxy already forwards to the gateway this session asked for.
+    fake_proxy({"anthropic_api_url": gateway})
+    env: dict[str, str] = {}
+    assert (
+        wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970, requested_upstream=gateway)
+        is None
+    )
+    assert env == {}
+
+    # A Copilot-pinned shared proxy: pin to the gateway, not to api.anthropic.com.
+    fake_proxy({"anthropic_api_url": "https://api.githubcopilot.com"})
+    env = {}
+    assert (
+        wrap_mod._apply_anthropic_upstream_pin_env(env, port=8970, requested_upstream=gateway)
+        == gateway
+    )
+    assert env["ANTHROPIC_CUSTOM_HEADERS"] == f"X-Headroom-Base-Url: {gateway}"
+
+
 def test_schema_required_fields_are_always_present(payload: dict) -> None:
     """A model missing these yields NaN token limits rather than a visible error."""
     for entry in build_model_entries(payload, BASE):
