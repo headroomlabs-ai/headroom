@@ -2639,15 +2639,23 @@ class HeadroomProxy(
         if timeout is not None:
             post_kwargs["timeout"] = timeout
 
+        from headroom.proxy.handlers.openai import prefers_http1_passthrough
+
+        req_client = (
+            getattr(self, "http_client_h1", None) or self.http_client
+            if prefers_http1_passthrough(url)
+            else self.http_client
+        )
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
-                    return await self.http_client.post(  # type: ignore[union-attr]
+                    return await req_client.post(  # type: ignore[union-attr]
                         url, **post_kwargs
                     )
                 else:
-                    response = await self.http_client.post(  # type: ignore[union-attr]
+                    response = await req_client.post(  # type: ignore[union-attr]
                         url, **post_kwargs
                     )
 

@@ -604,6 +604,63 @@ def test_streaming_client_selection() -> None:
     assert mixin._select_streaming_client("https://chatgpt.com/backend-api/codex/responses") == "h2"
 
 
+@pytest.mark.asyncio
+async def test_retry_request_selects_http1_for_chatgpt(monkeypatch) -> None:
+    calls = []
+
+    class DummyClient:
+        def __init__(self, name: str):
+            self.name = name
+
+        async def post(self, url, **kwargs):
+            calls.append((self.name, url))
+            return httpx.Response(200, json={"ok": True})
+
+    proxy = object.__new__(HeadroomProxy)
+    proxy.config = type("Config", (), {"retry_max_attempts": 1, "retry_enabled": False})()
+    proxy.http_client = DummyClient("h2")
+    proxy.http_client_h1 = DummyClient("h1")
+
+    await proxy._retry_request("POST", "https://chatgpt.com/backend-api/codex/responses", {}, {})
+    assert calls == [("h1", "https://chatgpt.com/backend-api/codex/responses")]
+
+    calls.clear()
+    await proxy._retry_request("POST", "https://api.openai.com/v1/chat/completions", {}, {})
+    assert calls == [("h2", "https://api.openai.com/v1/chat/completions")]
+
+
+@pytest.mark.asyncio
+async def test_proxy_routes_openai_responses_subpath_selects_http1(monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from headroom.providers.openai_responses import OpenAIResponsesSubpathRoute
+    from headroom.providers.proxy_routes import _register_openai_responses_subpath_route
+
+    received_clients = []
+
+    async def fake_subpath(http_client, request, sub_path):
+        received_clients.append(http_client)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(
+        "headroom.providers.proxy_routes.handle_chatgpt_codex_responses_subpath",
+        fake_subpath,
+    )
+
+    app = FastAPI()
+    proxy = type("Proxy", (), {"http_client": "h2", "http_client_h1": "h1"})()
+    spec = OpenAIResponsesSubpathRoute(
+        path="/v1/responses/{sub_path:path}",
+        methods=("GET", "POST"),
+    )
+    _register_openai_responses_subpath_route(app, proxy, spec)
+
+    client = TestClient(app)
+    client.get("/v1/responses/items/resp_1")
+    assert received_clients == ["h1"]
+
+
 def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:
     usage = _passthrough_usage_from_json(
         {
