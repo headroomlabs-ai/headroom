@@ -73,10 +73,31 @@ def _opencode_home_dir() -> Path:
 
 
 def opencode_config_paths() -> tuple[Path, Path]:
-    """Return ``(config_file, backup_file)`` for OpenCode."""
+    """Return the selected config and its canonical Headroom backup path."""
     config_file = opencode_config_path()
-    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
-    return config_file, backup_file
+    return config_file, config_file.with_name(config_file.name + ".headroom-backup")
+
+
+def migrate_legacy_opencode_jsonc_backup(config_file: Path, backup_file: Path) -> None:
+    """Migrate only legacy JSONC snapshots whose ownership is unambiguous.
+
+    Remember ambiguity on disk before a canonical snapshot can be consumed.
+    Otherwise a later install/remove cycle could claim an unrelated legacy
+    backup after the canonical backup or sibling JSON config disappears.
+    """
+    if config_file.suffix.lower() != ".jsonc":
+        return
+    legacy_backup = config_file.with_suffix(".json.headroom-backup")
+    migration_block = legacy_backup.with_name(legacy_backup.name + ".jsonc-migration-blocked")
+    if os.path.lexists(migration_block) or not legacy_backup.exists():
+        return
+    if os.path.lexists(backup_file) or os.path.lexists(config_file.with_suffix(".json")):
+        # Keep the legacy bytes in place for their owner or manual recovery.
+        # Fail closed if this marker cannot be persisted, before any restore.
+        migration_block.touch(exist_ok=True)
+        return
+    backup_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_backup.replace(backup_file)
 
 
 def snapshot_opencode_config_if_unwrapped(config_file: Path, backup_file: Path) -> None:
@@ -85,6 +106,7 @@ def snapshot_opencode_config_if_unwrapped(config_file: Path, backup_file: Path) 
     Guarantees that ``headroom unwrap opencode`` can restore the user's
     original file byte-for-byte.
     """
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
     if backup_file.exists():
         return
     if not config_file.exists():
@@ -123,23 +145,88 @@ def _render_provider_block(port: int) -> str:
     return "\n".join(lines)
 
 
-def _parse_json_loose(text: str) -> dict[str, Any]:
-    """Parse JSON text, stripping line comments (// ...) when needed.
+def _strip_jsonc_comments(text: str) -> str:
+    """Remove JSONC line and block comments while preserving quoted strings."""
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            output.append(char)
+        elif text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            if newline < 0:
+                break
+            output.append("\n")
+            index = newline
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end < 0:
+                break
+            output.extend("\n" for char in text[index : end + 2] if char == "\n")
+            index = end + 1
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
 
-    Tries standard JSON first to avoid corrupting URLs that contain ``//``.
-    Falls back to stripping ``//`` comments when standard parsing fails.
-    Two-pass: (1) remove comment-only lines, (2) strip inline trailing
-    comments that follow a comma.
+
+def _strip_jsonc_trailing_commas(text: str) -> str:
+    """Remove commas before JSONC closing delimiters without touching strings."""
+    output: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            output.append(char)
+        elif char == ",":
+            next_index = index + 1
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            if next_index < len(text) and text[next_index] in "}]":
+                index += 1
+                continue
+            output.append(char)
+        else:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _parse_json_loose(text: str) -> dict[str, Any]:
+    """Parse JSON text and JSONC comments/trailing commas.
+
+    Standard JSON is tried first so URLs containing ``//`` remain untouched.
     """
     try:
         parsed = json.loads(text)
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         pass
-    # Pass 1: remove lines that are ONLY a comment.
-    cleaned = re.sub(r"^\s*//[^\n]*\n", "", text, flags=re.MULTILINE)
-    # Pass 2: remove inline trailing comments (", // comment").
-    cleaned = re.sub(r",\s*//[^\n]*", ",", cleaned)
+    cleaned = _strip_jsonc_comments(text)
+    cleaned = _strip_jsonc_trailing_commas(cleaned)
     try:
         parsed = json.loads(cleaned)
         return parsed if isinstance(parsed, dict) else {}
@@ -195,6 +282,7 @@ def inject_opencode_provider_config(port: int, *, keep_user_entries: bool = Fals
 
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
+        migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
         snapshot_opencode_config_if_unwrapped(config_file, backup_file)
 
         if config_file.exists():

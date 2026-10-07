@@ -11,6 +11,7 @@ Usage:
     headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap grok                      # Start proxy + Grok CLI
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
+    headroom wrap antigravity               # Start proxy + print Antigravity config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --port 9999        # Custom proxy port
@@ -81,6 +82,9 @@ from headroom.copilot_auth import (
     resolve_subscription_bearer_token_details,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
+from headroom.providers.antigravity import (
+    render_setup_lines as _render_antigravity_setup_lines,
+)
 from headroom.providers.claude import (
     CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
@@ -191,6 +195,7 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
+    migrate_legacy_opencode_jsonc_backup,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
@@ -318,7 +323,15 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+    "opencode",
+}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -334,7 +347,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
+_AGENT_SAVINGS_WRAP_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -5116,7 +5136,13 @@ def _ensure_proxy_unlocked(
             _warn_proxy_mode_mismatch(running_config)
         elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
+        elif (
+            vertex_api_url
+            or clear_vertex_api_url
+            or os.environ.get("HEADROOM_MODE")
+            or os.environ.get("HEADROOM_MIN_TOKENS") is not None
+            or os.environ.get("HEADROOM_EXCLUDE_TOOLS") is not None
+        ):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
@@ -5638,6 +5664,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap vibe                # Mistral Vibe
         headroom wrap grok                # Grok CLI (xAI)
         headroom wrap cursor              # Cursor (prints config instructions)
+        headroom wrap antigravity         # Antigravity IDE (prints config instructions)
         headroom wrap grok-build          # Grok Build (updates ~/.grok/config.toml)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -7667,6 +7694,62 @@ def cursor(
 
 
 # =============================================================================
+# Antigravity IDE
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def antigravity(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Antigravity IDE.
+
+    \b
+    Antigravity reads its model endpoints from its model-provider settings,
+    not from environment variables. This command starts the proxy and prints
+    the settings to add as a custom OpenAI-compatible model provider.
+
+    \b
+    After running this command, open Antigravity and add a custom model
+    provider with the printed base URL. Antigravity fetches the model list
+    from GET /v1/models automatically.
+
+    \b
+    Example:
+        headroom wrap antigravity                # Start proxy + Antigravity settings
+        headroom wrap antigravity --port 9999    # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    def _print_antigravity_setup(actual_port: int) -> None:
+        for line in _render_antigravity_setup_lines(actual_port, project=_project_name_from_cwd()):
+            click.echo(line)
+
+    _run_proxy_only_watcher(
+        agent_label="antigravity",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="antigravity",
+        print_setup_lines=_print_antigravity_setup,
+    )
+
+
+# =============================================================================
 # Grok Build
 # =============================================================================
 
@@ -8522,6 +8605,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
     config_file, backup_file = opencode_config_paths()
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
 
     if backup_file.exists():
         try:
@@ -8977,12 +9061,49 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
 
 
 def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
-    """Warn when a reused proxy runs a different mode than this session asked for.
+    """Warn when reuse ignores this session's startup-only settings.
 
-    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
-    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
-    other clients may be attached to the running proxy.
+    Do not restart a shared proxy: other clients may be attached to it.
     """
+    config = running_config or {}
+    mismatches: list[str] = []
+    requested_min = os.environ.get("HEADROOM_MIN_TOKENS")
+    running_min = config.get("min_tokens_to_crush")
+    if requested_min is not None and isinstance(running_min, int):
+        try:
+            requested_min_value = int(requested_min)
+        except ValueError:
+            requested_min_value = None
+        if requested_min_value is not None and requested_min_value != running_min:
+            mismatches.append(f"HEADROOM_MIN_TOKENS={requested_min_value} (running: {running_min})")
+
+    requested_excludes = os.environ.get("HEADROOM_EXCLUDE_TOOLS")
+    running_excludes = config.get("exclude_tools")
+    if (
+        requested_excludes is not None
+        and isinstance(running_excludes, list)
+        and all(isinstance(name, str) for name in running_excludes)
+    ):
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        defaults = {name.lower() for name in DEFAULT_EXCLUDE_TOOLS}
+        requested_names = {
+            name.strip().lower() for name in requested_excludes.split(",") if name.strip()
+        }
+        running_names = {name.lower() for name in running_excludes}
+        if requested_names | defaults != running_names | defaults:
+            mismatches.append(
+                f"HEADROOM_EXCLUDE_TOOLS={sorted(requested_names)!r} "
+                f"(running: {sorted(running_names)!r})"
+            )
+
+    if mismatches:
+        click.echo(
+            "  Warning: this session requested "
+            + "; ".join(mismatches)
+            + ", but those settings are fixed at proxy startup. "
+            "Restart the proxy, or use --port for a separate one."
+        )
     requested = os.environ.get("HEADROOM_MODE")
     running = (running_config or {}).get("mode")
     if not requested or not isinstance(running, str):

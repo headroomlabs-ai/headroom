@@ -80,6 +80,7 @@ from .compressor_registry import (
 from .content_detector import (
     ContentType,
     DetectionResult,
+    _try_detect_git_status,
     _try_detect_log,
     _try_detect_search,
     _try_detect_structured_config,
@@ -1202,6 +1203,12 @@ def _detect_content(content: str) -> DetectionResult:
     # Detect on the unwrapped payload so a tool-output envelope's tags don't get
     # the whole result misclassified as HTML/XML (#route-converter corruption).
     content = _strip_detection_envelope(content)
+
+    # Status paths/state are structural ground truth even if Magika assigns
+    # another content type; retain the format metadata on both backends.
+    git_status = _try_detect_git_status(content)
+    if git_status is not None:
+        return git_status
 
     backend = _resolve_detect_backend()
     if backend == "python":
@@ -3049,6 +3056,9 @@ class ContentRouter(Transform):
         if detection is None:
             detection = _detect_content(content)
 
+        if detection.metadata.get("format") == "git_status":
+            return CompressionStrategy.TABULAR
+
         # 1. Check for mixed content
         if mixed:
             # 2. Verify with the native detector: ``is_mixed_content`` uses
@@ -3829,6 +3839,11 @@ class ContentRouter(Transform):
             log]``). Log readers use this to see *how* we got to the
             final compressor without parsing decision_reason strings.
         """
+        # Git status is path/state ground truth, not a rectangular CSV table.
+        # Preserve it before embedded-JSON, lossy-after-fold and external stages.
+        if _try_detect_git_status(_strip_detection_envelope(content)) is not None:
+            return content, _estimate_tokens(content), [CompressionStrategy.TABULAR.value]
+
         # ── STRUCTURAL (embedded) JSON routing ───────────────────────────────
         # Before anything else: if this block is not a single JSON value but
         # CONTAINS balanced JSON span(s), route each span through this very

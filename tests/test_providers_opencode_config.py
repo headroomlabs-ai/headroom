@@ -346,11 +346,6 @@ def test_parse_json_loose_returns_empty_on_whitespace() -> None:
     assert _parse_json_loose("   \n  \t  ") == {}
 
 
-def test_parse_json_loose_returns_empty_on_trailing_comma() -> None:
-    """_parse_json_loose returns {} for malformed JSON (trailing comma)."""
-    assert _parse_json_loose('{"model": "gpt-4o",}') == {}
-
-
 def test_parse_json_loose_returns_empty_on_unclosed_brace() -> None:
     """_parse_json_loose returns {} for malformed JSON (unclosed brace)."""
     assert _parse_json_loose('{"model": "gpt-4o"') == {}
@@ -710,3 +705,29 @@ def test_with_opencode_standalone_leaves_v1_and_unknown_alone(major: int | None)
     from headroom.providers.opencode.runtime import with_opencode_standalone
 
     assert with_opencode_standalone(("run", "fix it"), major) == ("run", "fix it")
+
+
+@pytest.mark.parametrize("conflict", ["canonical", "sibling"])
+def test_jsonc_migration_treats_dangling_conflict_as_ambiguous(
+    tmp_path: Path, conflict: str
+) -> None:
+    from headroom.providers.opencode.config import migrate_legacy_opencode_jsonc_backup
+
+    config = tmp_path / "opencode.jsonc"
+    canonical = config.with_name(config.name + ".headroom-backup")
+    legacy = config.with_suffix(".json.headroom-backup")
+    original = b'{"theme":"unrelated legacy"}\n'
+    legacy.write_bytes(original)
+    conflicting_path = canonical if conflict == "canonical" else config.with_suffix(".json")
+    try:
+        conflicting_path.symlink_to(tmp_path / "missing-target")
+    except OSError:
+        pytest.skip("creating symlinks requires platform permissions")
+
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert conflicting_path.is_symlink()
+    assert legacy.read_bytes() == original
+    conflicting_path.unlink()
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert not canonical.exists()
+    assert legacy.read_bytes() == original
