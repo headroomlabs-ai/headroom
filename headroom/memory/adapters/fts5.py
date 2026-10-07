@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...fileperms import connect_private_sqlite
 from ..models import Memory
 from ..ports import TextFilter, TextSearchResult
 
@@ -75,7 +76,7 @@ class FTS5TextIndex:
         Commits on clean exit, rolls back on exception, and always closes
         the connection -- callers use ``with self._get_conn() as conn:``.
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = connect_private_sqlite(self.db_path, what="memory text index")
         conn.row_factory = sqlite3.Row
         try:
             with conn:

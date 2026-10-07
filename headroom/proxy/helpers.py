@@ -9,6 +9,7 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -1620,6 +1621,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
     exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
     covers other upstreams. Fails open on any parse error.
     """
+    seconds = _retry_after_seconds(response)
+    if seconds is None:
+        return None
+    return min(seconds * 1000.0, float(max_ms))
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Uncapped, non-negative ``Retry-After`` in seconds, or ``None`` if absent/unparseable."""
     value = response.headers.get("retry-after")
     if not value:
         return None
@@ -1634,7 +1643,25 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
             seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+    return max(seconds, 0.0)
+
+
+def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left: int = 1) -> bool:
+    """True when retrying a 429/529 cannot succeed within the proxy's backoff.
+
+    Upstream says so explicitly with ``x-should-retry: false``, or implicitly with a
+    ``Retry-After`` beyond every wait still available: each of the ``retries_left``
+    retries sleeps at most ``max_ms``, so a reset further out than
+    ``retries_left * max_ms`` is never reached and the retries only delay the same
+    error (an exhausted subscription window answers with a reset hours away).
+    Forwarding it at once lets the client, or a credential-rotating proxy in front,
+    act on it. A reset within that window stays retryable: later 429s carry a
+    shorter Retry-After as the reset approaches.
+    """
+    if response.headers.get("x-should-retry", "").strip().lower() == "false":
+        return True
+    seconds = _retry_after_seconds(response)
+    return seconds is not None and seconds * 1000.0 > max(retries_left, 0) * max_ms
 
 
 # Transient upstream statuses worth retrying with backoff: 429 (rate limit) and
@@ -3031,6 +3058,65 @@ def _brotli_bounded(raw: bytes) -> bytes:
     return bytes(out)
 
 
+def _decompress_bounded(raw: bytes, encoding: str) -> bytes:
+    """Decode a ``Content-Encoding:``-compressed body off the event loop.
+
+    One dispatch point for the four bounded decompressors below, run inside
+    a worker thread by :func:`_read_request_body_bytes`. Message behavior is
+    identical to the previous inline branches: ``ValueError`` (including the
+    ``RequestBodyTooLarge`` subclass and the "Failed to decompress ..."
+    diagnostics, which also cover a missing optional codec — a zstd/br
+    ``ImportError`` is reworded, never let through raw) propagates
+    verbatim; any other error type is reworded into a decompression
+    ``ValueError`` with the codec named.
+    """
+    if encoding in ("zstd", "zstandard"):
+        try:
+            return _zstd_bounded(raw)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics.
+            raise
+        except ImportError:
+            raise ValueError(
+                "Request body is zstd-compressed but the 'zstandard' package is not installed. "
+                "Install it with: pip install zstandard"
+            ) from None
+        except Exception as exc:
+            raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
+    if encoding == "gzip":
+        import zlib
+
+        try:
+            return _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
+        except ValueError:
+            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
+            # both already carrying the message we want.
+            raise
+        except Exception as exc:
+            raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
+    if encoding == "deflate":
+        import zlib
+
+        try:
+            return _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
+    if encoding == "br":
+        try:
+            return _brotli_bounded(raw)
+        except ValueError:
+            raise
+        except ImportError:
+            raise ValueError(
+                "Request body is brotli-compressed but the 'brotli' package is not installed."
+            ) from None
+        except Exception as exc:
+            raise ValueError(f"Failed to decompress brotli request body: {exc}") from exc
+    raise ValueError(f"Unsupported Content-Encoding: {encoding}")
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
@@ -3078,49 +3164,41 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     # MAX_DECOMPRESSED_BODY_SIZE. RequestBodyTooLarge is re-raised ahead of the
     # generic handlers so the size refusal is not reworded into a vague
     # "failed to decompress" (#3284).
-    if encoding in ("zstd", "zstandard"):
+    #
+    # The decode itself is offloaded to a worker thread: it is the CPU-heavy
+    # part of this function (a gzip/zstd/br body can be megabytes of
+    # decompressed JSON) and running it inline on the event loop stalls every
+    # other in-flight request for its duration (#1701 pattern, see
+    # _run_compression_in_executor). The bounded decompressors keep every
+    # intermediate allocation capped, so the thread cannot OOM the process;
+    # exceptions propagate verbatim across asyncio.to_thread.
+    if encoding in (
+        "zstd",
+        "zstandard",
+        "gzip",
+        "deflate",
+        "br",
+    ):
         try:
-            raw = _zstd_bounded(raw)
-        except RequestBodyTooLarge:
+            raw = await asyncio.to_thread(
+                _decompress_bounded,
+                raw,
+                encoding,
+            )
+        except ValueError:
+            # RequestBodyTooLarge is a ValueError subclass; the bounded
+            # decompressors raise ValueError with their own message on a
+            # truncated/stalled stream. Re-raise unchanged — the wrapping
+            # below would reword a size refusal into a vague failure.
             raise
         except ImportError:
+            # _decompress_bounded rewords every codec ImportError into a
+            # ValueError, so this clause is defensive (the to_thread hop
+            # cannot turn one into the other) — kept so a codec-import
+            # failure can never surface as a raw 500.
             raise ValueError(
-                "Request body is zstd-compressed but the 'zstandard' package is not installed. "
-                "Install it with: pip install zstandard"
+                "Failed to decompress request body: optional codec unavailable"
             ) from None
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress zstd request body: {exc}") from exc
-    elif encoding == "gzip":
-        import zlib
-
-        try:
-            raw = _inflate_bounded(raw, wbits=16 + zlib.MAX_WBITS, label="gzip", multi_member=True)
-        except ValueError:
-            # Covers RequestBodyTooLarge and the explicit stream diagnostics,
-            # both already carrying the message we want.
-            raise
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress gzip request body: {exc}") from exc
-    elif encoding == "deflate":
-        import zlib
-
-        try:
-            raw = _inflate_bounded(raw, wbits=zlib.MAX_WBITS, label="deflate")
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress deflate request body: {exc}") from exc
-    elif encoding == "br":
-        try:
-            raw = _brotli_bounded(raw)
-        except ValueError:
-            raise
-        except ImportError:
-            raise ValueError(
-                "Request body is brotli-compressed but the 'brotli' package is not installed."
-            ) from None
-        except Exception as exc:
-            raise ValueError(f"Failed to decompress brotli request body: {exc}") from exc
     elif encoding and encoding != "identity":
         raise ValueError(f"Unsupported Content-Encoding: {encoding}")
 
@@ -3211,9 +3289,17 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
     if strip_output_only_request_blocks(result.get("messages")):
         logger.warning(
             "removed output-only content block(s) (%s) from request messages "
-            "before forwarding (not valid on the request path)",
+            "(not valid on the request path)",
             ",".join(sorted(OUTPUT_ONLY_REQUEST_BLOCK_TYPES)),
         )
+
+    # Canonicalize streaming-only ``index`` keys here too, so every parsed
+    # request (both body readers) is schema-valid before any handler
+    # snapshots or forwards it. Idempotent and a no-op for well-formed
+    # requests.
+    from headroom.utils import strip_streaming_only_content_fields_in_place
+
+    strip_streaming_only_content_fields_in_place(result.get("messages"))
 
     return result
 
@@ -3250,6 +3336,18 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
             "before forwarding (not valid on the request path)",
             ",".join(sorted(OUTPUT_ONLY_REQUEST_BLOCK_TYPES)),
         )
+
+    # Canonicalize streaming-only ``index`` keys on every parsed request, in
+    # place, before any handler deep-copies ``messages``: the snapshot the
+    # handler takes (the ``original_client_messages`` deepcopy) must be
+    # schema-valid for session-id hashing and prefix replay, and re-running
+    # the strip later in a single handler only would leave the snapshot (and
+    # the replayed prefix) carrying keys the upstream rejects with a 400.
+    # Idempotent and a no-op for well-formed requests, so existing behavior
+    # is unchanged.
+    from headroom.utils import strip_streaming_only_content_fields_in_place
+
+    strip_streaming_only_content_fields_in_place(result.get("messages"))
 
     return result, raw
 
@@ -4603,3 +4701,20 @@ def apply_keep_last_turns(
     if dropped == 0:
         return messages, 0
     return result, dropped
+
+
+def snapshot_original_messages(
+    messages: list[Any], *, hooks: Any = None, extensions: Any = None
+) -> list[Any]:
+    """The request's original messages, as later stages must see them.
+
+    Aliasing the live list is safe only while nothing between ingress and the
+    pipeline's own deepcopy can mutate it in place. A configured
+    ``config.hooks`` (``pre_compress`` and friends receive the live list) or an
+    enabled pipeline extension can, so in that case the snapshot is an
+    independently owned deep copy; with neither configured the alias is kept
+    and costs nothing.
+    """
+    if hooks is not None or bool(getattr(extensions, "enabled", False)):
+        return copy.deepcopy(messages)
+    return messages

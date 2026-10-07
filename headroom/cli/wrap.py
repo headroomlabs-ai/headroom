@@ -96,6 +96,7 @@ from headroom.providers.claude import (
     remote_control_applies_to_auth,
     remote_control_gate_active,
     remote_control_gate_message,
+    remote_control_gate_short_message,
     remote_control_sibling_gate_note,
     remove_vscode_claude_settings,
     resolve_1m_model,
@@ -116,6 +117,7 @@ from headroom.providers.copilot import (
 from headroom.providers.copilot import (
     configure_vscode_proxy_settings,
     remove_vscode_proxy_settings,
+    unrouted_vscode_profiles,
     vscode_proxy_url,
     vscode_settings_path,
 )
@@ -4018,6 +4020,48 @@ def _normalize_proxy_api_url(url: object, *, strip_provider_v1: bool = True) -> 
     return normalized or None
 
 
+def _require_no_proxy_openai_upstream(port: int, openai_api_url: str) -> dict[str, Any]:
+    """Refuse ``--no-proxy`` unless the proxy on ``port`` already targets ``openai_api_url``.
+
+    ``--no-proxy`` reuses a listener wrap does not own, so it can neither
+    start nor re-point one. Reusing it unchecked would present a third-party
+    key (DeepSeek, Together, ...) to whatever upstream that proxy was started
+    with — usually OpenAI, which rejects it with a 401 — while the flag
+    implies the key went to the requested provider (#3107). Fail closed
+    instead: require a healthy Headroom listener whose advertised upstream
+    matches exactly after normalization.
+    """
+    helpers = _live_wrap_module()
+    start_cmd = f"headroom proxy --port {port} --openai-api-url {openai_api_url}"
+    if not helpers._check_proxy(port):
+        raise click.ClickException(
+            f"No Headroom proxy is listening on port {port}, so --no-proxy cannot honor "
+            f"the requested OpenAI-compatible upstream {openai_api_url}. "
+            f"Start it separately with `{start_cmd}`, or drop --no-proxy so wrap can start it."
+        )
+    running_config: dict[str, Any] | None = helpers._proxy_health_config(
+        helpers._query_proxy_health(port)
+    )
+    if running_config is None:
+        running_config = helpers._query_proxy_config(port)
+    if running_config is None:
+        raise click.ClickException(
+            f"The listener on port {port} did not report a Headroom config, so wrap "
+            f"cannot confirm it forwards to {openai_api_url}. "
+            f"Start a Headroom proxy separately with `{start_cmd}`, or drop --no-proxy "
+            "so wrap can start it."
+        )
+    running_url = running_config.get("openai_api_url")
+    if _normalize_proxy_api_url(running_url) != _normalize_proxy_api_url(openai_api_url):
+        raise click.ClickException(
+            f"The Headroom proxy on port {port} forwards OpenAI-compatible traffic to "
+            f"{running_url or 'https://api.openai.com/v1'}, not {openai_api_url}. "
+            f"Restart it with `{start_cmd}`, or drop --no-proxy so wrap can restart it "
+            "when no other wrapper is attached."
+        )
+    return running_config
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -4393,22 +4437,40 @@ def _find_persistent_manifest(port: int) -> Any:
     return manifests[0] if manifests else None
 
 
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep wrap recovery gated by both readiness and runtime identity."""
+    from headroom.install.runtime import wait_ready
+
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
+
 def _recover_persistent_proxy(port: int) -> bool:
     """Start or recover a matching persistent deployment for the requested port."""
-    from headroom.install.health import probe_ready
-    from headroom.install.models import InstallPreset, SupervisorKind
-    from headroom.install.runtime import start_detached_agent, start_persistent_docker, wait_ready
+    from headroom.install.models import SupervisorKind
+    from headroom.install.runtime import (
+        runtime_ownership,
+        runtime_ready,
+        start_detached_agent,
+        start_persistent_docker,
+    )
     from headroom.install.supervisors import start_supervisor
 
     manifest = _find_persistent_manifest(port)
     if manifest is None:
         return False
 
-    if probe_ready(manifest.health_url):
+    ownership = runtime_ownership(manifest)
+    if runtime_ready(manifest):
         click.echo(f"  Reusing persistent deployment '{manifest.profile}' on port {port}")
         return True
 
-    if manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if ownership == "docker-supervisor":
+        click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
+    elif manifest.supervisor_kind == SupervisorKind.TASK.value:
         click.echo(
             f"  Warning: task-based deployment '{manifest.profile}' cannot be auto-recovered via wrap"
         )
@@ -4416,7 +4478,7 @@ def _recover_persistent_proxy(port: int) -> bool:
 
     click.echo(f"  Recovering persistent deployment '{manifest.profile}' on port {port}...")
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if ownership == "docker-supervisor":
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             start_supervisor(manifest)
@@ -4428,7 +4490,7 @@ def _recover_persistent_proxy(port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Recovered persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4438,12 +4500,12 @@ def _recover_persistent_proxy(port: int) -> bool:
 
 def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
     """Restart a persistent deployment after an idle stale-version detection."""
-    from headroom.install.models import InstallPreset, SupervisorKind
+    from headroom.install.models import SupervisorKind
     from headroom.install.runtime import (
+        runtime_ownership,
         start_detached_agent,
         start_persistent_docker,
         stop_runtime,
-        wait_ready,
     )
     from headroom.install.supervisors import start_supervisor
 
@@ -4452,7 +4514,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         f"with Headroom {_HEADROOM_VERSION}..."
     )
     try:
-        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+        if runtime_ownership(manifest) == "docker-supervisor":
             stop_runtime(manifest)
             start_persistent_docker(manifest)
         elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
@@ -4468,7 +4530,7 @@ def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
         )
         return False
 
-    if wait_ready(manifest, timeout_seconds=45):
+    if _wait_for_runtime_ready(manifest, 45):
         click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
         return True
 
@@ -4577,6 +4639,7 @@ def _ensure_proxy_unlocked(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    require_openai_api_url: bool = False,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
@@ -4640,9 +4703,9 @@ def _ensure_proxy_unlocked(
             )
             manifest = None
         if not isolated_copilot_subscription_proxy and manifest is not None:
-            from headroom.install.health import probe_ready
+            from headroom.install.runtime import runtime_ready
 
-            if probe_ready(manifest.health_url):
+            if runtime_ready(manifest):
                 health_payload = helpers._query_proxy_health(port)
                 running_config = helpers._proxy_health_config(health_payload)
                 if running_config is None:
@@ -4689,8 +4752,11 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                     if helpers._restart_persistent_proxy(manifest, port):
+                        # Restarted from the manifest, whose mode need not be ours.
+                        _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                         return None, port
                     raise click.ClickException(
                         f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4706,8 +4772,8 @@ def _ensure_proxy_unlocked(
                     if code_graph and not running_config.get("code_graph"):
                         missing.append("code_graph")
                     if not missing:
-                        click.echo(f"  Proxy already running on port {port}")
-                        click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                        click.echo(_proxy_status_line("Proxy already running", port))
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
                 # Features mismatch or config unavailable — fall through to the
                 # non-persistent path which handles proxy restart. A routing
@@ -4753,6 +4819,7 @@ def _ensure_proxy_unlocked(
                                 missing.append("code-graph")
 
                             if not missing:
+                                _warn_proxy_mode_mismatch(running_config)
                                 return None, port
                             flags_str = ", ".join(f"--{f}" for f in missing)
                             click.echo(
@@ -4760,6 +4827,8 @@ def _ensure_proxy_unlocked(
                                 f"is missing: {flags_str}; restarting..."
                             )
                             if helpers._restart_persistent_proxy(manifest, port):
+                                # Restarted from the manifest, whose mode need not be ours.
+                                _warn_proxy_mode_mismatch(helpers._query_proxy_config(port))
                                 return None, port
                             raise click.ClickException(
                                 f"Persistent deployment '{manifest.profile}' on port {port} "
@@ -4859,6 +4928,7 @@ def _ensure_proxy_unlocked(
                             f"  Leaving it running because {detail} "
                             "are still attached; it will be restarted when idle."
                         )
+                        _warn_proxy_mode_mismatch(running_config)
                         return None, port
 
                 else:
@@ -4937,6 +5007,7 @@ def _ensure_proxy_unlocked(
                                 f"  Please stop the proxy on port {port} manually "
                                 f"and rerun with {flags_str}."
                             )
+                            _warn_proxy_mode_mismatch(running_config)
                             return None, port
 
                 # Routing-level config (backend, upstream URLs) must match in
@@ -4980,8 +5051,8 @@ def _ensure_proxy_unlocked(
                         needs_restart = True
 
             if not needs_restart and reuse_running:
-                click.echo(f"  Proxy already running on port {port}")
-                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
+                click.echo(_proxy_status_line("Proxy already running", port))
+                _warn_proxy_mode_mismatch(running_config)
                 return None, port
 
         # Start (or restart) the proxy with the requested flags.
@@ -5027,32 +5098,39 @@ def _ensure_proxy_unlocked(
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
                 ),
             )
-            click.echo(f"  Proxy ready on http://127.0.0.1:{actual_port}")
-            click.echo(f"  Dashboard:    http://127.0.0.1:{actual_port}/dashboard")
+            click.echo(_proxy_status_line("Proxy ready", actual_port))
             return proc, actual_port
         except RuntimeError as e:
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
-        if not helpers._check_proxy(port):
+        if require_openai_api_url and openai_api_url:
+            # A user-chosen upstream cannot be applied to a proxy wrap does
+            # not own; fail closed unless the running one already matches.
+            running_config = _require_no_proxy_openai_upstream(port, openai_api_url)
+            click.echo(f"  Proxy on port {port} already targets {openai_api_url}")
+            _warn_proxy_mode_mismatch(running_config)
+        elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url:
+        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
                 running_config = helpers._query_proxy_config(port)
-            running_vertex_url = (
-                _normalize_proxy_api_url(running_config.get("vertex_api_url"))
-                if running_config is not None
-                else None
-            )
-            requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
-            if running_vertex_url != requested_vertex_url:
-                click.echo(
-                    "  Warning: --no-proxy is set, but the running proxy does not "
-                    "advertise the requested Vertex target. Requests may still go "
-                    "to the proxy's existing Vertex upstream."
+            if vertex_api_url or clear_vertex_api_url:
+                running_vertex_url = (
+                    _normalize_proxy_api_url(running_config.get("vertex_api_url"))
+                    if running_config is not None
+                    else None
                 )
+                requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
+                if running_vertex_url != requested_vertex_url:
+                    click.echo(
+                        "  Warning: --no-proxy is set, but the running proxy does not "
+                        "advertise the requested Vertex target. Requests may still go "
+                        "to the proxy's existing Vertex upstream."
+                    )
+            _warn_proxy_mode_mismatch(running_config)
         return None, port
 
 
@@ -5083,6 +5161,11 @@ def _proxy_start_lock(port: int) -> Any:
         return
     with _locked_file(lock_file):
         yield
+
+
+def _proxy_status_line(status: str, port: int) -> str:
+    """One banner line for the proxy, naming its host:port once (#3426)."""
+    return f"  {status} — dashboard: http://127.0.0.1:{port}/dashboard"
 
 
 @wraps(_ensure_proxy_unlocked)
@@ -5991,7 +6074,12 @@ def claude(
                 if remote_control_applies_to_auth(os.environ)
                 else None
             )
-            if remote_control_gate_active(proxy_url, os.environ, _cc_version):
+            _rc_gated = remote_control_gate_active(proxy_url, os.environ, _cc_version)
+            if _rc_gated and not verbose:
+                # Issue #3426: one actionable line by default; -v restores the
+                # full explanation (versions, sibling gates) below.
+                click.echo("  " + remote_control_gate_short_message(version=_cc_version))
+            elif _rc_gated:
                 click.echo(
                     "  "
                     + remote_control_gate_message(
@@ -6080,14 +6168,23 @@ def claude(
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
             # rather than repeat "kept on" (issue #1779 accuracy rule).
-            _tool_search_state = (
-                "on-demand tool loading kept on"
-                if _tool_search_mode_is_active(_tool_search_value)
-                else "on-demand tool loading DISABLED per your setting"
-            )
-            click.echo(
-                f"  {_TOOL_SEARCH_ENV}={_tool_search_value} ({_tool_search_state}; issue #746)"
-            )
+            _tool_search_active = _tool_search_mode_is_active(_tool_search_value)
+            if verbose:
+                _tool_search_state = (
+                    "on-demand tool loading kept on"
+                    if _tool_search_active
+                    else "on-demand tool loading DISABLED per your setting"
+                )
+                click.echo(
+                    f"  {_TOOL_SEARCH_ENV}={_tool_search_value} ({_tool_search_state}; issue #746)"
+                )
+            else:
+                # Issue #3426: state the outcome once; -v shows the env var and issue.
+                click.echo(
+                    "  On-demand tool loading: kept on (this session)"
+                    if _tool_search_active
+                    else "  On-demand tool loading: off (this session)"
+                )
         elif verbose:
             click.echo(
                 f"  {_TOOL_SEARCH_ENV}={env.get(_TOOL_SEARCH_ENV)} "
@@ -6658,6 +6755,12 @@ def vscode_copilot(
                 vscode_proxy_url(actual_port, _project_name_from_cwd()),
             )
             click.echo(f"  VS Code Copilot proxy settings {action}: {target_settings}")
+            for name, profile_settings in unrouted_vscode_profiles(target_settings.parent):
+                click.echo(
+                    f"  Warning: VS Code profile '{name}' keeps its own settings, so Copilot "
+                    "there still bypasses Headroom. Route it with: headroom wrap vscode "
+                    f'--settings-file "{profile_settings}"'
+                )
             click.echo(
                 "  Keep using Copilot's normal model picker; the selected model is preserved."
             )
@@ -7831,6 +7934,7 @@ def continue_dev(
 
 
 # =============================================================================
+
 # OpenClaw
 # =============================================================================
 
@@ -8115,6 +8219,16 @@ def openclaw(
     is_flag=True,
     help="Route headroom/* models through the authenticated GitHub Copilot subscription",
 )
+@click.option(
+    "--openai-api-url",
+    default=None,
+    envvar="OPENAI_TARGET_API_URL",
+    help=(
+        "Upstream base URL for OpenAI-compatible traffic, e.g. "
+        "https://api.deepseek.com/v1. Without it the proxy forwards to "
+        "https://api.openai.com/v1 (env: OPENAI_TARGET_API_URL)."
+    ),
+)
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
@@ -8132,6 +8246,7 @@ def opencode(
     code_graph: bool,
     no_proxy: bool,
     copilot_subscription: bool,
+    openai_api_url: str | None,
     learn: bool,
     memory: bool,
     backend: str | None,
@@ -8157,9 +8272,25 @@ def opencode(
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
+        headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+
+    \b
+    Without --openai-api-url the proxy forwards OpenAI-compatible traffic to
+    https://api.openai.com/v1, so a third-party key (DeepSeek, Together,
+    OpenRouter, ...) is rejected upstream with OpenAI's 401 "Incorrect API key
+    provided". Point the proxy at the real upstream instead:
+
+    \b
+        headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+        OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode
     """
     subscription_resolution = None
     if copilot_subscription:
+        if openai_api_url:
+            raise click.ClickException(
+                "--openai-api-url cannot be combined with --copilot-subscription; "
+                "the subscription resolves its own upstream."
+            )
         effective_backend = backend or os.environ.get("HEADROOM_BACKEND")
         if effective_backend not in (None, "", "anthropic"):
             raise click.ClickException(
@@ -8191,6 +8322,12 @@ def opencode(
             click.echo("Error: 'opencode' not found in PATH.")
             click.echo("Install OpenCode: https://opencode.ai")
             raise SystemExit(1)
+
+    # Likewise refuse a reused proxy that cannot honor --openai-api-url before
+    # touching OpenCode's config or registering a client marker; the same check
+    # inside _ensure_proxy would only fire after those edits.
+    if not prepare_only and no_proxy and openai_api_url:
+        _require_no_proxy_openai_upstream(port, openai_api_url)
 
     # Snapshot OpenCode config.json BEFORE any wrap-time mutation so
     # `headroom unwrap opencode` can restore the user's pre-wrap state.
@@ -8229,7 +8366,7 @@ def opencode(
         _inject_memory_agents_md(agents_md)
 
     if prepare_only:
-        inject_opencode_provider_config(port)
+        inject_opencode_provider_config(port, keep_user_entries=bool(openai_api_url))
         return
 
     # Past the prepare-only return the launch path always ran the binary check
@@ -8253,7 +8390,10 @@ def opencode(
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        openai_api_url=(subscription_resolution.api_url if subscription_resolution else None),
+        openai_api_url=(
+            subscription_resolution.api_url if subscription_resolution else openai_api_url
+        ),
+        require_openai_api_url=bool(openai_api_url),
         copilot_api_token=(subscription_resolution.token if subscription_resolution else None),
         copilot_refresh_oauth_token=(
             subscription_resolution.refresh_oauth_token if subscription_resolution else None
@@ -8283,7 +8423,7 @@ def opencode(
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-        inject_opencode_provider_config(actual_port)
+        inject_opencode_provider_config(actual_port, keep_user_entries=bool(openai_api_url))
         if memory:
             mem_dir = Path.cwd() / ".headroom"
             _inject_memory_mcp_config(
@@ -8824,6 +8964,28 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
 
+def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
+    """Warn when a reused proxy runs a different mode than this session asked for.
+
+    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
+    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
+    other clients may be attached to the running proxy.
+    """
+    requested = os.environ.get("HEADROOM_MODE")
+    running = (running_config or {}).get("mode")
+    if not requested or not isinstance(running, str):
+        return
+    from headroom.proxy.proxy_mode_policy import normalize_proxy_mode_decision
+
+    decision = normalize_proxy_mode_decision(requested, default=running)
+    if not decision.unknown and decision.normalized != running:
+        click.echo(
+            f"  Warning: this session requested {decision.normalized!r} mode but the "
+            f"running proxy is in {running!r} mode (mode is fixed at proxy startup). "
+            "Restart the proxy, or use --port for a separate one."
+        )
+
+
 # =============================================================================
 # Registry-generated wrap commands
 # =============================================================================
@@ -8854,12 +9016,32 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             click.echo(target.install_hint)
             raise SystemExit(1)
 
+        # Exported before proxy startup so _start_proxy forwards it as --mode;
+        # an explicit HEADROOM_MODE always wins.
+        if target.default_mode and not os.environ.get("HEADROOM_MODE"):
+            os.environ["HEADROOM_MODE"] = target.default_mode
+
         env, env_vars_display = _build_registry_launch_env(
             target,
             port,
             os.environ,
             project=_project_name_from_cwd() if target.project_prefix else None,
         )
+
+        configure_launch = None
+        if target.preflight is not None:
+            preflight = target.preflight
+
+            def configure_launch(
+                actual_port: int, args: tuple, env: dict[str, str], display: list[str]
+            ) -> tuple[tuple, dict[str, str], list[str]]:
+                # Runs on the final env: _ensure_proxy may have moved to another
+                # port, and the saved-gateway comparison must use that URL.
+                # Raising here still tears the proxy down via _launch_tool's
+                # cleanup.
+                if problem := preflight(env):
+                    raise click.ClickException(problem)
+                return args, env, display
 
         _launch_tool(
             binary=tool_bin,
@@ -8876,6 +9058,8 @@ def _make_registry_command(target: WrapTarget) -> click.Command:
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
+            openai_api_url=target.openai_api_url,
+            configure_launch=configure_launch,
         )
 
     _run.__doc__ = target.help_text
