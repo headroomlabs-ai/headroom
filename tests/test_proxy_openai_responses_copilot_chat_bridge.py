@@ -573,3 +573,161 @@ def test_bridge_translates_a_ccr_retrieval_continuation(monkeypatch: pytest.Monk
     assert continuation["first"]["object"] == "response"  # type: ignore[index]
     assert continuation["result"]["object"] == "response"  # type: ignore[index]
     assert response.json()["output"][0]["content"][0]["text"] == "answer after retrieval"
+
+
+def _responses_json(model: str) -> dict[str, object]:
+    return {
+        "id": "resp_1",
+        "object": "response",
+        "created_at": 111,
+        "model": model,
+        "status": "completed",
+        "output": [],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    }
+
+
+def _build_routing_client(
+    monkeypatch: pytest.MonkeyPatch, *, openai_api_url: str | None = None
+) -> tuple[TestClient, list[tuple[str, dict]]]:
+    """A proxy whose upstream answers by endpoint, recording every (url, body) sent."""
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "off")
+    extra = {"openai_api_url": openai_api_url} if openai_api_url else {}
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        **extra,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    calls: list[tuple[str, dict]] = []
+
+    async def _fake_apply_copilot_api_auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
+        return {**headers, "Authorization": "Bearer fake-copilot-token"}
+
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.openai.apply_copilot_api_auth",
+        _fake_apply_copilot_api_auth,
+    )
+
+    async def _fake_retry(
+        method: str, url: str, headers: dict[str, str], body: dict, **_kwargs: object
+    ) -> httpx.Response:
+        calls.append((url, body))
+        model = str(body.get("model"))
+        if url.endswith("/chat/completions"):
+            return httpx.Response(200, json=_chat_completion_json(model=model))
+        return httpx.Response(200, json=_responses_json(model))
+
+    proxy._retry_request = _fake_retry
+
+    async def _record_request_outcome(outcome: object) -> None:
+        return None
+
+    proxy._record_request_outcome = _record_request_outcome
+    return TestClient(app), calls
+
+
+@pytest.mark.parametrize("path", ["/v1/responses", "/p/project/v1/responses"])
+def test_a_model_in_no_known_family_stays_on_responses(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """The Wrap E2E shape: Copilot served at http://127.0.0.1:<port>/v1, model names
+    outside every known family. Bridging them to /chat/completions turned the
+    E2E's model-swap probe into a 404; they belong on the wire the client chose."""
+    base = "http://127.0.0.1:9/v1"
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", base)
+    client, calls = _build_routing_client(monkeypatch, openai_api_url=base)
+
+    models = ["gpt-model-swap-a", "gpt-model-swap-b", "gpt-model-swap-a"]
+    for model in models:
+        response = client.post(
+            path, json={"model": model, "input": "model swap probe", "stream": False}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["model"] == model
+
+    assert [url.rsplit("/", 1)[-1] for url, _ in calls] == ["responses"] * 3
+    assert [body["model"] for _, body in calls] == models
+    assert all("input" in body and "messages" not in body for _, body in calls)
+
+
+def test_a_chat_only_family_is_still_bridged_on_that_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = "http://127.0.0.1:9/v1"
+    monkeypatch.setenv("GITHUB_COPILOT_API_URL", base)
+    client, calls = _build_routing_client(monkeypatch, openai_api_url=base)
+
+    response = client.post(
+        "/p/project/v1/responses",
+        json={"model": "claude-sonnet-4.6", "input": "Hi there", "stream": False},
+    )
+
+    assert response.status_code == 200, response.text
+    ((url, body),) = calls
+    assert url.endswith("/chat/completions")
+    assert "messages" in body and "input" not in body
+    assert response.json()["object"] == "response"
+
+
+@pytest.mark.parametrize(
+    ("original_path", "model", "expected"),
+    [
+        (None, "claude-sonnet-4.6", "/chat/completions"),
+        (None, "gpt-5.4", "/responses"),
+        ("/api/v1/responses", "claude-sonnet-4.6", "/api/v1/chat/completions"),
+        ("/api/v1/responses", "gpt-5.4", "/api/v1/responses"),
+    ],
+)
+def test_the_routed_endpoint_keeps_a_preserved_sub_path(
+    monkeypatch: pytest.MonkeyPatch, original_path: str | None, model: str, expected: str
+) -> None:
+    """Responses and chat-bridge targets, without an original-path header and with a
+    valid preserved sub-path: never a doubled /v1, never a dropped sub-path."""
+    client, calls = _build_routing_client(monkeypatch)
+    headers = {"Authorization": "Bearer test", "x-headroom-base-url": _COPILOT_BASE}
+    if original_path is not None:
+        headers["x-headroom-original-path"] = original_path
+
+    response = client.post(
+        "/v1/responses", headers=headers, json={"model": model, "input": "Hi", "stream": False}
+    )
+
+    assert response.status_code == 200, response.text
+    ((url, _),) = calls
+    assert url == f"{_COPILOT_BASE}{expected}"
+
+
+@pytest.mark.parametrize(
+    ("original_path", "handler_path", "inbound_path", "expected"),
+    [
+        (None, "/responses", "/responses", "/v1/responses"),
+        (None, "/chat/completions", "/responses", "/v1/chat/completions"),
+        (None, "/responses", "/chat/completions", "/v1/responses"),
+        ("/api/v1/responses", "/responses", "/responses", "/api/v1/responses"),
+        ("/api/v1/responses", "/chat/completions", "/responses", "/api/v1/chat/completions"),
+        ("/api/v1/chat/completions", "/responses", "/chat/completions", "/api/v1/responses"),
+        ("/api/v1/chat/completions", "/chat/completions", None, "/api/v1/chat/completions"),
+        ("/api/v1/embeddings", "/chat/completions", "/responses", "/v1/chat/completions"),
+        ("//evil.example/v1/responses", "/chat/completions", "/responses", "/v1/chat/completions"),
+        ("/api/v1/responses?x=1", "/chat/completions", "/responses", "/v1/chat/completions"),
+    ],
+)
+def test_handler_path_resolution(
+    original_path: str | None, handler_path: str, inbound_path: str | None, expected: str
+) -> None:
+    from headroom.proxy.handlers.openai import _resolve_openai_handler_path
+
+    headers = {} if original_path is None else {"x-headroom-original-path": original_path}
+    resolved = _resolve_openai_handler_path(
+        headers, handler_path=handler_path, inbound_path=inbound_path
+    )
+    assert resolved == expected

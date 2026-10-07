@@ -16,6 +16,7 @@ from headroom.providers.copilot.wrap import (
     is_auto_model,
     model_configured,
     model_prefers_responses_api,
+    model_requires_chat_completions,
     provider_key_source,
     query_proxy_config,
     resolve_provider_type,
@@ -108,6 +109,32 @@ def test_model_prefers_responses_api_for_reasoning_models(
 ) -> None:
     assert model_prefers_responses_api(model) is expected
     assert default_wire_api_for_model(model) == ("responses" if expected else "completions")
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-sonnet-4.6", True),
+        ("copilot/Claude-Opus-4.8", True),
+        ("gemini-3.5-flash", True),
+        ("gpt-4.1", True),
+        ("gpt-4o-mini", True),
+        ("gpt-3.5-turbo", True),
+        ("kimi-k2.7-code", True),
+        ("gpt-5.4", False),
+        ("o3-mini", False),
+        ("mai-code-1-flash-picker", False),
+        ("gpt-model-swap-a", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_model_requires_chat_completions_only_for_known_chat_only_families(
+    model: str | None,
+    expected: bool,
+) -> None:
+    """A name in no known family is not presumed chat-only (it may be served only on /responses)."""
+    assert model_requires_chat_completions(model) is expected
 
 
 def test_copilot_model_from_args_prefers_cli_over_environment() -> None:

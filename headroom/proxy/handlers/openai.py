@@ -77,7 +77,11 @@ from headroom.providers.codex.runtime import (
 from headroom.providers.codex.runtime import (
     resolve_codex_routing_headers as _resolve_codex_routing_headers,
 )
-from headroom.providers.copilot import VSCODE_MODEL_ID_PREFIX, model_prefers_responses_api
+from headroom.providers.copilot import (
+    VSCODE_MODEL_ID_PREFIX,
+    model_prefers_responses_api,
+    model_requires_chat_completions,
+)
 from headroom.providers.grok.runtime import DEFAULT_API_URL as XAI_API_URL
 from headroom.providers.proxy_targets import route_grok_to_xai
 from headroom.proxy import public_errors
@@ -571,7 +575,17 @@ def _resolve_openai_handler_path(
     request_headers: dict[str, str],
     *,
     handler_path: str,
+    inbound_path: str | None = None,
 ) -> str:
+    """Return the upstream path for ``handler_path``, an unprefixed suffix like ``/responses``.
+
+    Without a usable ``x-headroom-original-path`` this is ``/v1`` plus the
+    suffix. A client path naming the same endpoint is kept, so a gateway served
+    from a sub-path (``/api/v1/responses``) keeps it. When the request is
+    bridged to another endpoint, ``inbound_path`` is the suffix the client
+    called, and its sub-path carries over to the target
+    (``/api/v1/responses`` -> ``/api/v1/chat/completions``).
+    """
     raw_path = _header_get(request_headers, _OPENAI_ORIGINAL_PATH_HEADER)
     upstream_path = raw_path.strip() if raw_path is not None else None
 
@@ -587,7 +601,13 @@ def _resolve_openai_handler_path(
         return default_path
 
     if not parsed.path.endswith(handler_path):
-        return f"/v1{handler_path}"
+        if (
+            inbound_path is not None
+            and inbound_path != handler_path
+            and parsed.path.endswith(inbound_path)
+        ):
+            return parsed.path[: -len(inbound_path)] + handler_path
+        return default_path
 
     return parsed.path
 
@@ -631,19 +651,24 @@ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
 def _resolve_openai_responses_handler_path(base_url: str, model: str | None) -> str:
     """Return the upstream path suffix for an OpenAI Responses-API request.
 
-    GitHub Copilot's hosted API only serves gpt-5*/o1*/o3* reasoning models via
-    ``/responses``; every other model family (gpt-4.x, Claude, Gemini, etc.) is
-    only served via ``/chat/completions``. A Copilot session pins one wire API
-    for the whole process based on the *main* model, so once the main model is
-    a reasoning model, the CLI sends every request on that connection --
+    GitHub Copilot serves some model families (Claude, Gemini, gpt-4.x, ...)
+    only via ``/chat/completions``. A Copilot session pins one wire API for the
+    whole process based on the *main* model, so once the main model is a
+    reasoning model, the CLI sends every request on that connection --
     including subagent ("task tool") requests for a different, non-reasoning
     model -- to ``/v1/responses``. Forwarding those verbatim causes GitHub's
     hosted API to reject them with ``400 unsupported_api_for_model``. Route
     those specific requests to ``/chat/completions`` instead, mirroring
     ``_resolve_openai_chat_handler_path``'s Copilot-aware routing in the
     opposite direction.
+
+    Only those known families are bridged. Any other name stays on
+    ``/responses``, the wire the client chose: Copilot serves models outside
+    the gpt-5*/o1*/o3* names there too (``mai-code-1-flash-picker`` only
+    there), and a gateway that names Copilot's host may serve whatever it
+    likes. The catalog-backed plan corrects a known model either way.
     """
-    if is_copilot_api_url(base_url) and not model_prefers_responses_api(model):
+    if is_copilot_api_url(base_url) and model_requires_chat_completions(model):
         return _OPENAI_CHAT_COMPLETIONS_PATH
     return _OPENAI_RESPONSES_PATH
 
@@ -1719,8 +1744,8 @@ def _responses_body_to_chat_completion_body(
     chat_kwargs.pop("context_management", None)
     # This bridge only ever runs for non-reasoning models (see
     # _resolve_openai_responses_handler_path: it downgrades to
-    # /chat/completions precisely when model_prefers_responses_api(model) is
-    # False). A Copilot session pinned to the Responses wire API by a
+    # /chat/completions only for the model families Copilot serves there
+    # alone). A Copilot session pinned to the Responses wire API by a
     # reasoning main model still puts `reasoning: {effort: ...}` on every
     # request on that connection, including subagent requests for a
     # different, non-reasoning model. Forwarding that as `reasoning_effort`
@@ -4298,7 +4323,11 @@ class OpenAIHandlerMixin:
             model,
         )
         handler_path = (
-            _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
+            _resolve_openai_handler_path(
+                request.headers,
+                handler_path=handler_path_suffix,
+                inbound_path=_OPENAI_CHAT_COMPLETIONS_PATH,
+            )
             if custom_upstream_base_url is not None
             else f"/v1{handler_path_suffix}"
         )
@@ -7211,7 +7240,11 @@ class OpenAIHandlerMixin:
                 handler_path_suffix = transport_plan.upstream_path
             is_copilot_chat_bridge = handler_path_suffix == _OPENAI_CHAT_COMPLETIONS_PATH
             handler_path = (
-                _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
+                _resolve_openai_handler_path(
+                    request.headers,
+                    handler_path=handler_path_suffix,
+                    inbound_path=_OPENAI_RESPONSES_PATH,
+                )
                 if custom_upstream_base_url is not None
                 else f"/v1{handler_path_suffix}"
             )

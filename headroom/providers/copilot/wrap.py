@@ -131,6 +131,23 @@ def model_prefers_responses_api(model: str | None) -> bool:
     return value.startswith(("gpt-5", "o1", "o3"))
 
 
+#: Copilot model families served on ``/chat/completions`` only: none of them
+#: lists ``/responses`` in the live ``/models`` catalog.
+_CHAT_COMPLETIONS_ONLY_PREFIXES = ("claude", "gemini", "gpt-4", "gpt-3.5", "kimi")
+
+
+def model_requires_chat_completions(model: str | None) -> bool:
+    """Return True for model families GitHub Copilot serves only on /chat/completions.
+
+    Not the inverse of :func:`model_prefers_responses_api`. A name in neither
+    family (``mai-code-1-flash-picker`` is served only on ``/responses``) must
+    stay on the wire the client chose, since bridging it would turn a working
+    request into a 400.
+    """
+    value = _normalized_model_name(model)
+    return value.startswith(_CHAT_COMPLETIONS_ONLY_PREFIXES)
+
+
 def copilot_model_from_args(
     copilot_args: tuple[str, ...],
     env: Mapping[str, str] | None = None,
