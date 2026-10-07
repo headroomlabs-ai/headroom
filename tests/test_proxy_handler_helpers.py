@@ -17,7 +17,9 @@ from headroom.proxy.handlers.openai import (
     _decode_openai_bearer_payload,
     _passthrough_usage_from_json,
     _prefers_http1_passthrough,
+    prefers_http1_passthrough,
 )
+from headroom.proxy.handlers.streaming import StreamingMixin
 from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     relocate_system_messages_to_top_level,
@@ -585,6 +587,21 @@ def test_chatgpt_passthrough_falls_back_when_h1_client_missing() -> None:
     assert response.status_code == 200
     assert json.loads(response.body)["client"] == "h2"
     assert handler.http_client.calls == 1
+
+
+def test_streaming_client_selection() -> None:
+    assert prefers_http1_passthrough("https://chatgpt.com/backend-api/codex/responses") is True
+    assert prefers_http1_passthrough("https://api.openai.com/v1/chat/completions") is False
+
+    mixin = object.__new__(StreamingMixin)
+    mixin.http_client = "h2"
+    mixin.http_client_h1 = "h1"
+
+    assert mixin._select_streaming_client("https://chatgpt.com/backend-api/codex/responses") == "h1"
+    assert mixin._select_streaming_client("https://api.openai.com/v1/chat/completions") == "h2"
+
+    mixin.http_client_h1 = None
+    assert mixin._select_streaming_client("https://chatgpt.com/backend-api/codex/responses") == "h2"
 
 
 def test_passthrough_usage_normalizes_vertex_usage_metadata() -> None:

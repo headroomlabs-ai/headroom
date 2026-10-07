@@ -134,6 +134,18 @@ class StreamingMixin:
     _mid_turn_queues: dict[str, asyncio.Queue] = {}
     _active_streams: set[str] = set()
 
+    def _select_streaming_client(self, url: str) -> httpx.AsyncClient:
+        """Select HTTP client for upstream streaming.
+
+        ChatGPT endpoints prefer HTTP/1.1 to avoid Cloudflare bot-management
+        challenges and HTTP/2 flow-control window stalls on large turns.
+        """
+        from headroom.proxy.handlers.openai import prefers_http1_passthrough
+
+        if prefers_http1_passthrough(url):
+            return getattr(self, "http_client_h1", None) or self.http_client
+        return self.http_client
+
     @staticmethod
     def _get_session_key(body: dict, session_header: str | None = None) -> str:
         """Return session identity from an explicit header or a body-derived hash.
@@ -609,10 +621,11 @@ class StreamingMixin:
             ]
             continuation_bytes = json.dumps({**base_body, "messages": messages}).encode("utf-8")
             assert self.http_client is not None
-            continuation_request = self.http_client.build_request(
+            continuation_client = self._select_streaming_client(url)
+            continuation_request = continuation_client.build_request(
                 "POST", url, content=continuation_bytes, headers=headers
             )
-            continuation = await self.http_client.send(continuation_request, stream=True)
+            continuation = await continuation_client.send(continuation_request, stream=True)
             rounds += 1
             async with contextlib.aclosing(continuation) as upstream:
                 if upstream.status_code >= 400:
@@ -1278,6 +1291,7 @@ class StreamingMixin:
         # Open connection before generator to capture upstream response headers
         # (needed to forward ratelimit headers to the client via StreamingResponse)
         assert self.http_client is not None, "http_client must be initialized before streaming"
+        streaming_client = self._select_streaming_client(url)
         try:
             retry_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
             upstream_response = None
@@ -1285,10 +1299,10 @@ class StreamingMixin:
 
             for attempt in range(retry_attempts):
                 try:
-                    _upstream_req = self.http_client.build_request(
+                    _upstream_req = streaming_client.build_request(
                         "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
-                    upstream_response = await self.http_client.send(_upstream_req, stream=True)
+                    upstream_response = await streaming_client.send(_upstream_req, stream=True)
                     if _codex_wire_debug:
                         capture_codex_wire_debug(
                             "http_stream_upstream_response_headers",

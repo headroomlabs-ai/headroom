@@ -1837,14 +1837,19 @@ def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int,
     return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
 
 
-def _prefers_http1_passthrough(base_url: str) -> bool:
-    """Whether passthrough to this host must use HTTP/1.1.
+def prefers_http1_passthrough(base_url: str) -> bool:
+    """Whether passthrough/streaming to this host must use HTTP/1.1.
 
     ChatGPT's Cloudflare edge issues a managed challenge to our HTTP/2
-    fingerprint on sensitive account endpoints; HTTP/1.1 is accepted.
+    fingerprint on sensitive account endpoints, and multiplexing large
+    streaming request bodies over HTTP/2 can stall on flow-control windows.
+    HTTP/1.1 avoids both issues.
     """
     host = (urlparse(base_url).hostname or "").lower()
     return host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+_prefers_http1_passthrough = prefers_http1_passthrough
 
 
 class OpenAIHandlerMixin:

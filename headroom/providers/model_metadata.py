@@ -51,8 +51,9 @@ async def handle_model_metadata_endpoint(
 ) -> Response:
     """Handle OpenAI-compatible model metadata with Codex ChatGPT-auth support."""
     assert proxy.http_client is not None
+    chatgpt_client = getattr(proxy, "http_client_h1", None) or proxy.http_client
     chatgpt_response = await handle_chatgpt_model_metadata(
-        proxy.http_client,
+        chatgpt_client,
         request,
         endpoint.upstream_path,
     )
