@@ -1,8 +1,6 @@
 import type { CompressResult } from "headroom-ai";
 import { compress } from "headroom-ai";
 
-import { stripTrailingSlashes } from "./strings.js";
-
 let _proxyUrlCache: string | null = null;
 
 export function setDefaultProxyUrl(url: string): void {
@@ -17,8 +15,18 @@ export interface RetrieveToolConfig {
   proxyBaseUrl: string;
 }
 
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
-  const origin = stripTrailingSlashes(config.proxyBaseUrl);
+  const origin = trimTrailingSlashes(config.proxyBaseUrl);
 
   return {
     name: "headroom_retrieve",

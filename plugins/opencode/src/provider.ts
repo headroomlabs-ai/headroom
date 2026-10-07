@@ -1,4 +1,4 @@
-import { stripTrailingSlashes } from "./strings.js";
+import { trimTrailingSlashes } from "./retrieve.js";
 
 export interface HeadroomModelMapping {
   name: string;
@@ -41,7 +41,7 @@ export const DEFAULT_MODELS: Record<string, HeadroomModelMapping> = {
 export const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 function resolveBaseUrl(options: HeadroomProviderOptions): string {
-  if (options.proxyBaseUrl) return stripTrailingSlashes(options.proxyBaseUrl);
+  if (options.proxyBaseUrl) return trimTrailingSlashes(options.proxyBaseUrl);
   const port = options.proxyPort ?? 8787;
   return `http://127.0.0.1:${port}`;
 }
