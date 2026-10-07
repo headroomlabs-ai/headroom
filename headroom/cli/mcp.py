@@ -139,9 +139,9 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
     \b
     By default this installs into every agent that has a registrar and is
-    detected on this system (Claude Code today; Cursor / Codex / Continue /
-    others added in subsequent releases). Pass ``--agent NAME`` one or more
-    times to restrict the installation.
+    detected on this system (Antigravity IDE, Claude Code, Codex, Grok CLI,
+    OpenCode today; Cursor / Continue / others added in subsequent releases).
+    Pass ``--agent NAME`` one or more times to restrict the installation.
 
     \b
     Examples:
@@ -188,18 +188,38 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 
 @mcp.command("uninstall")
-def mcp_uninstall() -> None:
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    help="Restrict uninstallation to specific agents (default: every detected agent).",
+)
+def mcp_uninstall(agents: tuple[str, ...]) -> None:
     """Remove Headroom MCP server from detected agent configs.
 
     \b
     Removes headroom from every agent registrar known to Headroom. Other MCP
-    servers are preserved.
+    servers are preserved. Pass ``--agent NAME`` one or more times to restrict
+    the uninstallation.
+
+    \b
+    Examples:
+        headroom mcp uninstall                       # every detected agent
+        headroom mcp uninstall --agent antigravity   # Antigravity IDE only
     """
     from headroom.mcp_registry import get_all_registrars
 
+    registrars = get_all_registrars()
+    if agents:
+        wanted = {agent.strip().lower() for agent in agents if agent.strip()}
+        registrars = [registrar for registrar in registrars if registrar.name in wanted]
+        if not registrars:
+            click.echo("No agents matched the requested filter.")
+            raise SystemExit(1)
+
     removed = False
 
-    for registrar in get_all_registrars():
+    for registrar in registrars:
         if not registrar.detect():
             continue
         removed_names: list[str] = []
