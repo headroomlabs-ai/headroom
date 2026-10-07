@@ -1,4 +1,5 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
+import { Banner } from 'fumadocs-ui/components/banner';
 import './global.css';
 import { Inter } from 'next/font/google';
 import type { Metadata } from 'next';
@@ -48,7 +49,18 @@ export default function Layout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en" className={inter.className} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
-        <RootProvider>{children}</RootProvider>
+        <RootProvider>
+          {/* Dismissible; Fumadocs remembers the dismissal per id in localStorage. */}
+          <Banner id="teams-perk-2026">
+            <a
+              href="https://headroom-perks.vercel.app/?source=github&utm_source=docs&utm_medium=banner"
+              className="font-medium underline-offset-4 hover:underline"
+            >
+              Headroom for Teams: 3 months free with a 12-month plan →
+            </a>
+          </Banner>
+          {children}
+        </RootProvider>
       </body>
     </html>
   );
