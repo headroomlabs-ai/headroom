@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -229,25 +230,61 @@ def _provenance_path(path: Path) -> Path:
     return paths.workspace_dir() / "vscode_chat_models" / f"{digest}.json"
 
 
-def _require_provenance(path: Path, block: dict[str, Any]) -> None:
-    """Record a block's digest, or refuse to write it at all.
+#: Ownership record layout. v1 (``{"path", "sha256"}``) held a single digest of
+#: the whole block; v2 holds the committed digest plus a pending one, so a
+#: refresh can be interrupted at any point without losing proof (see
+#: ``configure_chat_models``).
+_PROVENANCE_VERSION = 2
 
-    Called before ``path`` is touched, mirroring the settings-block writer's
-    ``_require_settings_provenance``: ownership is deliberately **not** inferred
-    from the file's contents (a user may legitimately hand-edit or copy our
-    provider entry, and a name match alone would then license overwriting their
-    edits), so the recorded digest is the only proof a later run ever accepts.
-    With no record, that later run can never prove this block is Headroom's,
-    which strands both refresh (``configure_chat_models`` raises "already has a
-    provider...") and removal (``remove_chat_models`` returns ``False``) until a
-    hand edit. Refusing here instead means nothing has touched the user's file.
+
+@dataclass(frozen=True)
+class _Provenance:
+    """What the ownership record proves about the Headroom entry on disk.
+
+    ``committed`` is the digest of the block believed to be in the file;
+    ``pending`` is the digest of a block whose write may or may not have landed.
+    Either one proves ownership: a crash between the record write and the config
+    write leaves the old block (``committed``), a crash after the config write
+    leaves the new one (``pending``). ``legacy`` is a v1 whole-block digest,
+    honoured so records written by earlier builds are not stranded, and replaced
+    by a v2 record on the next write.
+    """
+
+    committed: str | None
+    pending: str | None
+    legacy: str | None = None
+
+    def proves(self, entry: Mapping[str, Any]) -> bool:
+        digest = _block_digest(entry)
+        if digest in {self.committed, self.pending} - {None}:
+            return True
+        return self.legacy is not None and _legacy_block_digest(entry) == self.legacy
+
+
+def _write_provenance(path: Path, *, committed: str | None, pending: str | None) -> None:
+    """Write the ownership record atomically, or refuse with a clear error.
+
+    Ownership is deliberately **not** inferred from the file's contents (a user
+    may legitimately hand-edit or copy our provider entry, and a name match alone
+    would then license overwriting their edits), so the recorded digest is the
+    only proof a later run ever accepts. A record that cannot be written must
+    therefore stop the config write before it happens: otherwise the file would
+    hold a Headroom block no later run can prove it owns, stranding both refresh
+    and removal until a hand edit.
     """
     try:
         record = _provenance_path(path)
         record.parent.mkdir(parents=True, exist_ok=True)
         fsutil.write_text(
             record,
-            json.dumps({"path": str(path), "sha256": _block_digest(block)}),
+            json.dumps(
+                {
+                    "version": _PROVENANCE_VERSION,
+                    "path": str(path),
+                    "committed": committed,
+                    "pending": pending,
+                }
+            ),
         )
     except OSError as exc:
         raise click.ClickException(
@@ -256,13 +293,25 @@ def _require_provenance(path: Path, block: dict[str, Any]) -> None:
         ) from exc
 
 
-def _read_provenance(path: Path) -> str | None:
+def _read_provenance(path: Path) -> _Provenance | None:
     try:
         rec = json.loads(fsutil.read_text(_provenance_path(path)))
     except (OSError, ValueError):
         return None
-    sha = rec.get("sha256") if isinstance(rec, dict) else None
-    return sha if isinstance(sha, str) and sha else None
+    if not isinstance(rec, dict):
+        return None
+
+    def _digest(key: str) -> str | None:
+        value = rec.get(key)
+        return value if isinstance(value, str) and value else None
+
+    if rec.get("version") == _PROVENANCE_VERSION:
+        prov = _Provenance(committed=_digest("committed"), pending=_digest("pending"))
+    else:
+        prov = _Provenance(committed=None, pending=None, legacy=_digest("sha256"))
+    if prov.committed is None and prov.pending is None and prov.legacy is None:
+        return None
+    return prov
 
 
 def _clear_provenance(path: Path) -> None:
@@ -272,22 +321,30 @@ def _clear_provenance(path: Path) -> None:
         pass
 
 
-def _block_digest(block: dict[str, Any]) -> str:
-    # Hashes the whole block, including ``apiKey`` -- which is always the
-    # hardcoded ``PLACEHOLDER_API_KEY``, never a real secret, since the proxy
-    # substitutes the actual Copilot credential itself. A CodeQL scan flags this
-    # call as hashing password-like data because of that field's name; it is a
-    # false positive (this is a content-equality digest for ownership tracking,
-    # not a password hash, and SHA256 is entirely appropriate for that). Do NOT
-    # "fix" it by excluding the field: every provenance record already on a
-    # tester's disk was written against a digest that includes it, and doing so
-    # would make `configure_chat_models` unable to recognize its own past
-    # writes -- reintroducing, for every existing record, exactly the stuck
-    # state (refresh refuses, removal no-ops) this file's ownership scheme
-    # exists to prevent. The alert should be dismissed as a false positive
-    # instead.
+def _digest_view(block: Mapping[str, Any]) -> dict[str, Any]:
+    # Explicit literal-key reads rather than a filtered copy of ``block``. The
+    # ``apiKey`` field is always the inert ``PLACEHOLDER_API_KEY`` and carries no
+    # identity, so leaving it out loses nothing -- and a value named like a
+    # credential has no business in a digest input anyway (CodeQL classifies it
+    # as password-like by name and flags any plain hash over it).
+    return {
+        "name": block.get("name"),
+        "vendor": block.get("vendor"),
+        "models": block.get("models"),
+    }
+
+
+def _block_digest(block: Mapping[str, Any]) -> str:
+    """Content-equality digest identifying a Headroom provider block."""
     return hashlib.sha256(
-        json.dumps(block, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        json.dumps(_digest_view(block), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _legacy_block_digest(entry: Mapping[str, Any]) -> str:
+    """The v1 whole-block digest, only ever computed over entries read from disk."""
+    return hashlib.sha256(
+        json.dumps(entry, sort_keys=True, ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 
@@ -320,17 +377,26 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
     """Write/refresh Headroom's provider entry, preserving every other provider.
 
     Returns ``"added"`` or ``"updated"``. Raises rather than clobbering a
-    same-named entry Headroom cannot prove it wrote, rather than leaving an
-    ownership record for a block that was never actually written, and rather
-    than leaving a stale record after a write that fails partway.
+    same-named entry Headroom cannot prove it wrote.
+
+    The update is a three-step transaction, each step individually atomic:
+
+    1. record ``{committed: <block on disk>, pending: <new block>}``;
+    2. write the config;
+    3. finalize the record to ``{committed: <new block>, pending: None}``.
+
+    Refresh and removal accept either digest, so an interruption between any two
+    steps (an exception, a kill, a power loss) leaves the entry that is actually
+    on disk provable. An interrupted *initial* add leaves a pending digest that
+    matches nothing, which is harmless: the next run adds normally.
     """
     providers = _load_providers(path)
-    expected = _read_provenance(path)
+    prov = _read_provenance(path)
 
     owned_indexes = [
         index
         for index, entry in enumerate(providers)
-        if isinstance(entry, dict) and expected and _block_digest(entry) == expected
+        if isinstance(entry, dict) and prov is not None and prov.proves(entry)
     ]
     if len(owned_indexes) > 1:
         raise click.ClickException(
@@ -338,7 +404,11 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
             "remove the duplicate so Headroom can tell which to update."
         )
 
+    committed_before: str | None
     if owned_indexes:
+        # Recomputed from disk rather than copied from the record, so a record
+        # left pending (or in the v1 format) is normalized by this write.
+        committed_before = _block_digest(providers[owned_indexes[0]])
         providers[owned_indexes[0]] = block
         action = "updated"
     else:
@@ -354,33 +424,36 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
                 "or pass --no-configure."
             )
         providers.append(block)
+        committed_before = None
         action = "added"
 
-    # Captured before the record below is overwritten, so a failed file write
-    # can restore it. The record is keyed on ``path`` alone (see
-    # ``_provenance_path``), not on the block's digest, so on a refresh this is
-    # the *previous* block's record -- if the write then fails, restoring it is
-    # what keeps that still-current-on-disk block provable.
-    record_path = _provenance_path(path)
-    try:
-        previous_record = fsutil.read_text(record_path)
-    except OSError:
-        previous_record = None
+    proposed = _block_digest(block)
 
-    _require_provenance(path, block)
+    # Step 1. Raises before the user's file is touched if no record can be made.
+    _write_provenance(path, committed=committed_before, pending=proposed)
 
+    # Step 2.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fsutil.write_text(path, json.dumps(providers, indent=2, ensure_ascii=False) + "\n")
     except OSError as exc:
-        if previous_record is None:
+        # Best effort: drop the pending digest. If this fails too, the pending
+        # record left behind still proves the (unchanged) entry on disk.
+        if committed_before is None:
             _clear_provenance(path)
         else:
             try:
-                fsutil.write_text(record_path, previous_record)
-            except OSError:
+                _write_provenance(path, committed=committed_before, pending=None)
+            except click.ClickException:
                 pass
         raise click.ClickException(f"Could not write {path} ({exc}). Nothing was changed.") from exc
+
+    # Step 3. Not fatal: the config is committed and the pending digest already
+    # proves it; the next write finalizes the record.
+    try:
+        _write_provenance(path, committed=proposed, pending=None)
+    except click.ClickException:
+        pass
 
     return action
 
@@ -393,15 +466,16 @@ def remove_chat_models(path: Path) -> bool:
         providers = _load_providers(path)
     except click.ClickException:
         return False
-    expected = _read_provenance(path)
-    if not expected:
+    prov = _read_provenance(path)
+    if prov is None:
         return False
     remaining = [
-        entry
-        for entry in providers
-        if not (isinstance(entry, dict) and _block_digest(entry) == expected)
+        entry for entry in providers if not (isinstance(entry, dict) and prov.proves(entry))
     ]
     if len(remaining) == len(providers):
+        # A record whose digests match nothing on disk proves nothing (e.g. an
+        # interrupted initial add); dropping it keeps the next run clean.
+        _clear_provenance(path)
         return False
     fsutil.write_text(path, json.dumps(remaining, indent=2, ensure_ascii=False) + "\n")
     _clear_provenance(path)

@@ -356,6 +356,225 @@ def test_refresh_is_never_written_without_its_ownership_record(
 
 
 # ---------------------------------------------------------------------------
+# Crash-recoverable ownership record (review on e14d3e57)
+# ---------------------------------------------------------------------------
+
+
+class _PowerLoss(BaseException):
+    """Simulates the process dying mid-transaction.
+
+    A ``BaseException`` on purpose: ``configure_chat_models`` rolls back on
+    ``OSError``, and a real kill or power loss gives it no chance to do that.
+    """
+
+
+@pytest.fixture
+def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Keep ownership records out of the developer's real ``~/.headroom``."""
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    return workspace
+
+
+def _interrupt_nth_write(monkeypatch: pytest.MonkeyPatch, target: Path, nth: int) -> None:
+    """Make the ``nth`` write to ``target`` die before it lands."""
+    from headroom import fsutil
+
+    real_write_text = fsutil.write_text
+    seen = {"count": 0}
+
+    def _write_text(path: Path, content: str) -> None:
+        if Path(path) == target:
+            seen["count"] += 1
+            if seen["count"] == nth:
+                raise _PowerLoss(f"power lost before write #{nth} to {target.name}")
+        real_write_text(path, content)
+
+    monkeypatch.setattr(fsutil, "write_text", _write_text)
+
+
+def _headroom_entries(p: Path) -> list[dict]:
+    return [
+        entry
+        for entry in json.loads(p.read_text(encoding="utf-8"))
+        if entry.get("name") == HEADROOM_PROVIDER_NAME
+    ]
+
+
+def test_refresh_interrupted_before_config_write_recovers_on_refresh(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    """The seam the review named: pending record written, config write never lands."""
+    from headroom.providers.copilot.vscode_chat import (
+        _block_digest,
+        _Provenance,
+        _read_provenance,
+    )
+
+    p = tmp_path / "chatLanguageModels.json"
+    a, b, c = _block(payload, 1), _block(payload, 2), _block(payload, 3)
+    configure_chat_models(p, a)
+    original = p.read_bytes()
+
+    with monkeypatch.context() as m:
+        _interrupt_nth_write(m, p, 1)
+        with pytest.raises(_PowerLoss):
+            configure_chat_models(p, b)
+
+    assert p.read_bytes() == original, "the interrupted refresh touched the config"
+    assert _read_provenance(p) == _Provenance(_block_digest(a), _block_digest(b)), (
+        "the record must keep proof of the still-current block while the refresh is pending"
+    )
+
+    # A fresh call (as after a restart) can still prove and refresh the entry.
+    assert configure_chat_models(p, c) == "updated"
+    assert _headroom_entries(p) == [c]
+    assert _read_provenance(p) == _Provenance(_block_digest(c), None)
+
+
+def test_refresh_interrupted_before_config_write_recovers_on_removal(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    from headroom.providers.copilot.vscode_chat import _provenance_path
+
+    p = tmp_path / "chatLanguageModels.json"
+    mine = {"name": "My Ollama", "vendor": "customendpoint", "models": []}
+    p.write_text(json.dumps([mine]), encoding="utf-8")
+    configure_chat_models(p, _block(payload, 1))
+
+    with monkeypatch.context() as m:
+        _interrupt_nth_write(m, p, 1)
+        with pytest.raises(_PowerLoss):
+            configure_chat_models(p, _block(payload, 2))
+
+    assert remove_chat_models(p) is True
+    assert json.loads(p.read_text(encoding="utf-8")) == [mine]
+    assert not _provenance_path(p).exists()
+
+
+def test_refresh_interrupted_after_config_write_before_finalize_is_recoverable(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    """The other seam: the new block landed but the record was never finalized."""
+    from headroom.providers.copilot.vscode_chat import (
+        _block_digest,
+        _Provenance,
+        _provenance_path,
+        _read_provenance,
+    )
+
+    p = tmp_path / "chatLanguageModels.json"
+    a, b = _block(payload, 1), _block(payload, 2)
+    configure_chat_models(p, a)
+
+    with monkeypatch.context() as m:
+        # Write #1 to the record is the pending record; #2 would finalize it.
+        _interrupt_nth_write(m, _provenance_path(p), 2)
+        with pytest.raises(_PowerLoss):
+            configure_chat_models(p, b)
+
+    assert _headroom_entries(p) == [b]
+    assert _read_provenance(p) == _Provenance(_block_digest(a), _block_digest(b))
+
+    snapshot = p.read_bytes()
+    record_snapshot = _provenance_path(p).read_bytes()
+    assert configure_chat_models(p, _block(payload, 3)) == "updated"
+    assert _headroom_entries(p) == [_block(payload, 3)]
+
+    # Removal from the same interrupted state also recovers.
+    p.write_bytes(snapshot)
+    _provenance_path(p).write_bytes(record_snapshot)
+    assert remove_chat_models(p) is True
+    assert _headroom_entries(p) == []
+
+
+def test_initial_add_interrupted_after_pending_record_is_harmless(
+    tmp_path: Path, payload: dict, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    from headroom.providers.copilot.vscode_chat import (
+        _block_digest,
+        _Provenance,
+        _provenance_path,
+        _read_provenance,
+    )
+
+    p = tmp_path / "chatLanguageModels.json"
+    mine = {"name": "My Ollama", "vendor": "customendpoint", "models": []}
+    original = json.dumps([mine])
+    p.write_text(original, encoding="utf-8")
+    a = _block(payload, 1)
+
+    with monkeypatch.context() as m:
+        _interrupt_nth_write(m, p, 1)
+        with pytest.raises(_PowerLoss):
+            configure_chat_models(p, a)
+
+    assert p.read_text(encoding="utf-8") == original
+    assert _read_provenance(p) == _Provenance(None, _block_digest(a))
+
+    # Nothing of ours is on disk, so removal is a no-op that also drops the
+    # record, and a fresh add is not mistaken for a conflict.
+    assert remove_chat_models(p) is False
+    assert p.read_text(encoding="utf-8") == original
+    assert not _provenance_path(p).exists()
+
+    with monkeypatch.context() as m:
+        _interrupt_nth_write(m, p, 1)
+        with pytest.raises(_PowerLoss):
+            configure_chat_models(p, a)
+    assert configure_chat_models(p, a) == "added"
+    assert _headroom_entries(p) == [a]
+    assert _read_provenance(p) == _Provenance(_block_digest(a), None)
+
+
+def test_legacy_v1_record_is_honoured_and_upgraded(
+    tmp_path: Path, payload: dict, isolated_workspace: Path
+) -> None:
+    """Records written before the v2 format must not strand their entries."""
+    import hashlib
+
+    from headroom.providers.copilot.vscode_chat import (
+        _block_digest,
+        _Provenance,
+        _provenance_path,
+        _read_provenance,
+    )
+
+    def write_v1(p: Path, block: dict) -> None:
+        digest = hashlib.sha256(
+            json.dumps(block, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        record = _provenance_path(p)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"path": str(p), "sha256": digest}), encoding="utf-8")
+
+    a, b = _block(payload, 1), _block(payload, 2)
+
+    refreshed = tmp_path / "refreshed.json"
+    refreshed.write_text(json.dumps([a], indent=2), encoding="utf-8")
+    write_v1(refreshed, a)
+    assert configure_chat_models(refreshed, b) == "updated"
+    assert _headroom_entries(refreshed) == [b]
+    assert _read_provenance(refreshed) == _Provenance(_block_digest(b), None)
+    assert json.loads(_provenance_path(refreshed).read_text(encoding="utf-8"))["version"] == 2
+
+    removed = tmp_path / "removed.json"
+    removed.write_text(json.dumps([a], indent=2), encoding="utf-8")
+    write_v1(removed, a)
+    assert remove_chat_models(removed) is True
+    assert _headroom_entries(removed) == []
+
+
+def test_block_digest_ignores_the_inert_api_key(payload: dict) -> None:
+    """The placeholder key carries no identity, so it stays out of the digest."""
+    from headroom.providers.copilot.vscode_chat import _block_digest
+
+    a = _block(payload, 2)
+    assert _block_digest(a) == _block_digest({**a, "apiKey": "something-else"})
+    assert _block_digest(a) != _block_digest(_block(payload, 3))
+
+
+# ---------------------------------------------------------------------------
 # settings.json: the 1.132 visibility gate
 # ---------------------------------------------------------------------------
 
