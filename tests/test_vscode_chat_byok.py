@@ -1432,7 +1432,7 @@ class _RecordingUpstream:
         return None
 
 
-def _post_messages_with_api_key(anthropic_api_url: str):
+def _post_messages_with_api_key(anthropic_api_url: str, headers: dict[str, str] | None = None):
     from fastapi.testclient import TestClient
 
     from headroom.proxy.server import ProxyConfig, create_app
@@ -1450,7 +1450,7 @@ def _post_messages_with_api_key(anthropic_api_url: str):
         client.app.state.proxy.http_client = upstream
         response = client.post(
             "/v1/messages",
-            headers={"x-api-key": "sk-ant-test"},
+            headers=headers if headers is not None else {"x-api-key": "sk-ant-test"},
             json={
                 "model": "claude-sonnet-4-6",
                 "max_tokens": 16,
@@ -1475,6 +1475,41 @@ def test_anthropic_key_is_never_forwarded_to_copilot() -> None:
     assert response.status_code == 502
     assert "GitHub Copilot" in response.json()["error"]["message"]
     assert upstream.urls == [], "an Anthropic-keyed request was sent to the Copilot host"
+
+
+def test_anthropic_bearer_credential_is_never_served_on_a_copilot_seat() -> None:
+    """Claude Code can authenticate with `Authorization: Bearer sk-ant-...`, not just x-api-key.
+
+    On a Copilot host the forwarder swaps any non-Copilot bearer for the proxy's
+    seeded Copilot token, so without this the request would be answered (and
+    billed) on that seat with a 200.
+    """
+    response, upstream = _post_messages_with_api_key(
+        "https://api.githubcopilot.com", {"authorization": "Bearer sk-ant-oat01-example"}
+    )
+
+    assert response.status_code == 502
+    assert upstream.urls == [], "an Anthropic bearer was sent to the Copilot host"
+
+
+def test_copilot_shaped_bearer_still_reaches_the_copilot_host() -> None:
+    """The backstop must not catch the traffic the Copilot-pinned proxy exists for."""
+    response, upstream = _post_messages_with_api_key(
+        "https://api.githubcopilot.com", {"authorization": "Bearer gho_example_copilot_token"}
+    )
+
+    assert response.status_code != 502 or "Copilot credential" not in response.text
+    assert upstream.urls, "a Copilot client was refused by the Anthropic-credential backstop"
+
+
+def test_anthropic_bearer_still_reaches_a_user_configured_gateway() -> None:
+    response, upstream = _post_messages_with_api_key(
+        "https://litellm.example.internal/anthropic",
+        {"authorization": "Bearer sk-ant-api03-example"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert upstream.urls and upstream.urls[0].startswith("https://litellm.example.internal/")
 
 
 def test_anthropic_key_still_reaches_a_user_configured_gateway() -> None:

@@ -3936,16 +3936,23 @@ class AnthropicHandlerMixin:
             # Scoped to Copilot hosts on purpose: an Anthropic-compatible
             # gateway the user configured (LiteLLM, Foundry, an inherited
             # ANTHROPIC_BASE_URL -- see #1358) is *meant* to receive that key.
-            # Copilot's own clients authenticate with `Authorization`, never
-            # `x-api-key`, so this cannot fire on the traffic the pin exists for.
+            # An Anthropic credential arrives either as `x-api-key` or as an
+            # `Authorization: Bearer sk-ant-...` (Claude Code's OAuth / API key).
+            # Copilot's own clients never send either -- they authenticate with a
+            # Copilot or GitHub bearer, and BYOK sessions with a placeholder the
+            # proxy replaces -- so this cannot fire on the traffic the pin exists for.
+            _inbound_authorization = str(headers.get("authorization") or "")
+            _auth_scheme, _, _auth_value = _inbound_authorization.partition(" ")
+            _anthropic_bearer = _auth_scheme.lower() == "bearer" and _auth_value.strip().startswith(
+                "sk-ant-"
+            )
             if (
                 not upstream_base_url
-                and headers.get("x-api-key")
-                and not headers.get("authorization")
                 and is_copilot_upstream_url(self.ANTHROPIC_API_URL)
+                and ((headers.get("x-api-key") and not _inbound_authorization) or _anthropic_bearer)
             ):
                 logger.error(
-                    "Refusing to forward an Anthropic x-api-key to Copilot upstream %s",
+                    "Refusing to forward an Anthropic credential to Copilot upstream %s",
                     self.ANTHROPIC_API_URL,
                 )
                 return JSONResponse(
@@ -3958,7 +3965,7 @@ class AnthropicHandlerMixin:
                                 "This Headroom proxy's Anthropic upstream is "
                                 f"{self.ANTHROPIC_API_URL} (GitHub Copilot), so this request "
                                 "would be served on the proxy's Copilot credential instead of "
-                                "your Anthropic key. Use a proxy "
+                                "your Anthropic credential. Use a proxy "
                                 "port of your own, or send "
                                 "'X-Headroom-Base-Url: https://api.anthropic.com'."
                             ),
