@@ -129,3 +129,48 @@ def test_anthropic_enumerates_from_the_live_endpoint(monkeypatch: pytest.MonkeyP
     assert reason is None
     assert {r.id for r in rows} == {"claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929"}
     assert all(r.provider == "anthropic" for r in rows)
+
+
+def test_anthropic_follows_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`/v1/models` is paginated; a second page must not be silently dropped."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    seen_params: list[dict] = []
+    pages = {
+        None: {
+            "data": [{"id": "claude-a", "display_name": "A"}],
+            "has_more": True,
+            "last_id": "claude-a",
+        },
+        "claude-a": {
+            "data": [{"id": "claude-b", "display_name": "B"}],
+            "has_more": False,
+            "last_id": "claude-b",
+        },
+    }
+
+    def fake_get(*_a, params=None, **_k):  # type: ignore[no-untyped-def]
+        seen_params.append(dict(params or {}))
+        return httpx.Response(200, json=pages[(params or {}).get("after_id")])
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    rows, reason = models_cmd._anthropic_rows()
+    assert reason is None
+    assert [r.id for r in rows] == ["claude-a", "claude-b"]
+    assert [p.get("after_id") for p in seen_params] == [None, "claude-a"]
+
+
+def test_anthropic_pagination_stops_on_a_repeated_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server that keeps answering `has_more` with the same cursor must not loop."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    calls: list[int] = []
+
+    def fake_get(*_a, **_k):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        return httpx.Response(
+            200, json={"data": [{"id": "claude-a"}], "has_more": True, "last_id": "claude-a"}
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    rows, reason = models_cmd._anthropic_rows()
+    assert reason is None
+    assert len(calls) == 2, "pagination did not stop on a repeated cursor"

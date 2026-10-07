@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json as jsonlib
 from dataclasses import dataclass
+from typing import Any
 
 import click
 
@@ -97,6 +98,10 @@ def _copilot_rows() -> tuple[list[_Row], str | None]:
     return rows, None
 
 
+#: Upper bound on `/v1/models` pages followed (100 models each).
+_ANTHROPIC_MAX_PAGES = 20
+
+
 def _anthropic_rows() -> tuple[list[_Row], str | None]:
     """Enumerate Anthropic models via the official ``/v1/models`` endpoint.
 
@@ -119,30 +124,45 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
             "already lists what the subscription allows.)"
         )
     base = (os.environ.get("ANTHROPIC_API_URL") or "https://api.anthropic.com").rstrip("/")
-    try:
-        import httpx
+    # `/v1/models` is paginated (`has_more` + `last_id`, continued with
+    # `after_id`). Reading only the first page silently truncated the list for
+    # accounts with more than one page of models. The page cap only guards
+    # against a misbehaving server that never stops paginating.
+    entries: list[Any] = []
+    after_id: str | None = None
+    for _page in range(_ANTHROPIC_MAX_PAGES):
+        params: dict[str, Any] = {"limit": 100}
+        if after_id:
+            params["after_id"] = after_id
+        try:
+            import httpx
 
-        response = httpx.get(
-            f"{base}/v1/models",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-            },
-            params={"limit": 100},
-            timeout=15,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return [], f"anthropic: could not reach {base}/v1/models ({exc})."
-    if response.status_code != 200:
-        return [], (
-            f"anthropic: {base}/v1/models returned HTTP {response.status_code}: "
-            f"{response.text[:160]}"
-        )
+            response = httpx.get(
+                f"{base}/v1/models",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                },
+                params=params,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return [], f"anthropic: could not reach {base}/v1/models ({exc})."
+        if response.status_code != 200:
+            return [], (
+                f"anthropic: {base}/v1/models returned HTTP {response.status_code}: "
+                f"{response.text[:160]}"
+            )
 
-    payload = response.json()
-    entries = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        return [], "anthropic: /v1/models returned an unexpected body shape."
+        payload = response.json()
+        page = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(page, list):
+            return [], "anthropic: /v1/models returned an unexpected body shape."
+        entries.extend(page)
+        next_id = payload.get("last_id")
+        if not payload.get("has_more") or not isinstance(next_id, str) or next_id == after_id:
+            break
+        after_id = next_id
 
     rows: list[_Row] = []
     for entry in entries:
