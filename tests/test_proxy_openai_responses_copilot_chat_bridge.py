@@ -659,16 +659,19 @@ def test_a_model_in_no_known_family_stays_on_responses(
     assert all("input" in body and "messages" not in body for _, body in calls)
 
 
-def test_a_chat_only_family_is_still_bridged_on_that_upstream(
+@pytest.mark.parametrize("model", ["claude-sonnet-4.6", "trajectory-compaction"])
+def test_a_chat_only_model_is_still_bridged_on_that_upstream(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
 ) -> None:
+    """With the catalog off, the name fallback still bridges a chat-only model."""
     base = "http://127.0.0.1:9/v1"
     monkeypatch.setenv("GITHUB_COPILOT_API_URL", base)
     client, calls = _build_routing_client(monkeypatch, openai_api_url=base)
 
     response = client.post(
         "/p/project/v1/responses",
-        json={"model": "claude-sonnet-4.6", "input": "Hi there", "stream": False},
+        json={"model": model, "input": "Hi there", "stream": False},
     )
 
     assert response.status_code == 200, response.text

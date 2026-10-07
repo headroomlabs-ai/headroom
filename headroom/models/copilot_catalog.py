@@ -15,7 +15,7 @@ Headroom already builds (``Copilot-Integration-Id: vscode-chat``). Concretely,
 against a live subscription:
 
 * ``mai-code-1-flash-picker`` is served **only** on ``/responses`` yet does not
-  match the ``gpt-5*`` heuristic, so name-based routing sends it to
+  match the ``gpt-5*`` heuristic, so name-based routing sent it to
   ``/chat/completions`` -> ``400 unsupported_api_for_model``.
 * ``reasoning_effort`` is a per-model **value set**, not a flag:
   ``claude-opus-4.6`` accepts ``max`` but rejects ``xhigh``; ``gpt-5.4`` accepts

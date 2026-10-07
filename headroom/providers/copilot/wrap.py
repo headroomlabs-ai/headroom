@@ -131,13 +131,19 @@ def model_prefers_responses_api(model: str | None) -> bool:
     return value.startswith(("gpt-5", "o1", "o3"))
 
 
-#: Copilot model families served on ``/chat/completions`` only: none of them
-#: lists ``/responses`` in the live ``/models`` catalog.
+#: Copilot model families served on ``/chat/completions`` only. In the captured
+#: ``/models`` catalog (``tests/fixtures/copilot_models/models_list.json``) no
+#: model of theirs that publishes endpoints lists ``/responses``; ``gpt-4*`` and
+#: ``gpt-3.5*`` publish none and are kept from the pre-catalog heuristic.
 _CHAT_COMPLETIONS_ONLY_PREFIXES = ("claude", "gemini", "gpt-4", "gpt-3.5", "kimi")
+
+#: Single chat-only models outside those families, matched by exact name so a
+#: future ``trajectory-*`` model is not swept in.
+_CHAT_COMPLETIONS_ONLY_MODELS = frozenset({"trajectory-compaction"})
 
 
 def model_requires_chat_completions(model: str | None) -> bool:
-    """Return True for model families GitHub Copilot serves only on /chat/completions.
+    """Return True for models GitHub Copilot serves only on /chat/completions.
 
     Not the inverse of :func:`model_prefers_responses_api`. A name in neither
     family (``mai-code-1-flash-picker`` is served only on ``/responses``) must
@@ -145,7 +151,9 @@ def model_requires_chat_completions(model: str | None) -> bool:
     request into a 400.
     """
     value = _normalized_model_name(model)
-    return value.startswith(_CHAT_COMPLETIONS_ONLY_PREFIXES)
+    return value in _CHAT_COMPLETIONS_ONLY_MODELS or value.startswith(
+        _CHAT_COMPLETIONS_ONLY_PREFIXES
+    )
 
 
 def copilot_model_from_args(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from pathlib import Path
 from unittest.mock import patch
 
 import click
@@ -121,6 +122,9 @@ def test_model_prefers_responses_api_for_reasoning_models(
         ("gpt-4o-mini", True),
         ("gpt-3.5-turbo", True),
         ("kimi-k2.7-code", True),
+        ("trajectory-compaction", True),
+        ("copilot/trajectory-compaction", True),
+        ("trajectory-compaction-next", False),
         ("gpt-5.4", False),
         ("o3-mini", False),
         ("mai-code-1-flash-picker", False),
@@ -135,6 +139,24 @@ def test_model_requires_chat_completions_only_for_known_chat_only_families(
 ) -> None:
     """A name in no known family is not presumed chat-only (it may be served only on /responses)."""
     assert model_requires_chat_completions(model) is expected
+
+
+def _catalog_models_with_endpoints() -> list[tuple[str, list[str]]]:
+    path = Path(__file__).parent / "fixtures" / "copilot_models" / "models_list.json"
+    rows = json.loads(path.read_text(encoding="utf-8"))["data"]
+    return [
+        (row["id"], row["supported_endpoints"]) for row in rows if row.get("supported_endpoints")
+    ]
+
+
+@pytest.mark.parametrize(("model", "endpoints"), _catalog_models_with_endpoints())
+def test_model_requires_chat_completions_agrees_with_the_captured_catalog(
+    model: str,
+    endpoints: list[str],
+) -> None:
+    """The name fallback bridges exactly the models the catalog serves only on /chat/completions."""
+    chat_only = "/chat/completions" in endpoints and "/responses" not in endpoints
+    assert model_requires_chat_completions(model) is chat_only
 
 
 def test_copilot_model_from_args_prefers_cli_over_environment() -> None:

@@ -662,7 +662,8 @@ def _resolve_openai_responses_handler_path(base_url: str, model: str | None) -> 
     ``_resolve_openai_chat_handler_path``'s Copilot-aware routing in the
     opposite direction.
 
-    Only those known families are bridged. Any other name stays on
+    Only the models ``model_requires_chat_completions`` names (those families
+    plus ``trajectory-compaction``) are bridged. Any other name stays on
     ``/responses``, the wire the client chose: Copilot serves models outside
     the gpt-5*/o1*/o3* names there too (``mai-code-1-flash-picker`` only
     there), and a gateway that names Copilot's host may serve whatever it
@@ -1711,8 +1712,8 @@ def _responses_body_to_chat_completion_body(
     """Convert a Responses-API request body into a Chat-Completions request body.
 
     Used when a Copilot-hosted /responses request is downgraded to
-    /chat/completions by `_resolve_openai_responses_handler_path` (non-reasoning
-    model on a session pinned to the Responses wire API, see #1745 / #2643).
+    /chat/completions by the transport plan (a chat-only model on a session
+    pinned to the Responses wire API, see #1745 / #2643).
     GitHub's /chat/completions endpoint requires a `messages` array and rejects
     Responses-shaped bodies (`input`/`instructions`) with 400 "messages must be
     non-empty". Delegates to litellm's own Responses<->Chat-Completions bridge
@@ -1742,17 +1743,18 @@ def _responses_body_to_chat_completion_body(
     chat_kwargs.pop("custom_llm_provider", None)
     chat_kwargs.pop("extra_headers", None)
     chat_kwargs.pop("context_management", None)
-    # This bridge only ever runs for non-reasoning models (see
-    # _resolve_openai_responses_handler_path: it downgrades to
-    # /chat/completions only for the model families Copilot serves there
-    # alone). A Copilot session pinned to the Responses wire API by a
-    # reasoning main model still puts `reasoning: {effort: ...}` on every
-    # request on that connection, including subagent requests for a
-    # different, non-reasoning model. Forwarding that as `reasoning_effort`
-    # to a model that doesn't support it causes GitHub's hosted API to
-    # either reject the request outright ("reasoning_effort ... was
-    # provided, but model X does not support reasoning effort") or -- worse
-    # -- silently return an empty completion. Drop it unconditionally here.
+    # This bridge only ever runs for models Copilot serves on
+    # /chat/completions alone (the catalog plan, or the name fallback in
+    # _resolve_openai_responses_handler_path). A Copilot session pinned to
+    # the Responses wire API by a reasoning main model still puts
+    # `reasoning: {effort: ...}` on every request on that connection,
+    # including subagent requests for a different, non-reasoning model.
+    # Forwarding that as `reasoning_effort` to a model that doesn't support
+    # it causes GitHub's hosted API to either reject the request outright
+    # ("reasoning_effort ... was provided, but model X does not support
+    # reasoning effort") or -- worse -- silently return an empty completion.
+    # Without a catalog plan it is dropped; with one it is kept or clamped to
+    # what the target model accepts (see _apply_plan_reasoning_effort).
     _coerce_reasoning_effort(chat_kwargs)
     _apply_plan_reasoning_effort(chat_kwargs, plan)
     # Also drop optional fields that are either OpenAI/Responses-specific
@@ -2400,10 +2402,13 @@ class OpenAIHandlerMixin:
         endpoint list at all. That fallback is what makes this a strict
         improvement rather than a new class of misroute.
 
-        The heuristic alone is wrong in the unsafe direction for at least one
-        real model: ``mai-code-1-flash-picker`` is served only on ``/responses``
-        but does not match ``gpt-5*/o1*/o3*``, so name-based routing downgrades
-        it to ``/chat/completions`` and turns a working request into a 400.
+        The original heuristic was wrong in the unsafe direction for at least
+        one real model: ``mai-code-1-flash-picker`` is served only on
+        ``/responses`` but does not match ``gpt-5*/o1*/o3*``, so name-based
+        routing downgraded it to ``/chat/completions`` and turned a working
+        request into a 400. The fallback now bridges only the models
+        ``model_requires_chat_completions`` names, so an unknown name stays on
+        the wire the client chose.
 
         **Returns the plan rather than stashing it on ``self``.** An earlier
         version assigned ``self._last_transport_plan`` and had the caller read it
@@ -4323,11 +4328,7 @@ class OpenAIHandlerMixin:
             model,
         )
         handler_path = (
-            _resolve_openai_handler_path(
-                request.headers,
-                handler_path=handler_path_suffix,
-                inbound_path=_OPENAI_CHAT_COMPLETIONS_PATH,
-            )
+            _resolve_openai_handler_path(request.headers, handler_path=handler_path_suffix)
             if custom_upstream_base_url is not None
             else f"/v1{handler_path_suffix}"
         )
@@ -7210,7 +7211,7 @@ class OpenAIHandlerMixin:
         # Route to correct endpoint based on auth mode.
         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
         # `is_copilot_chat_bridge` tracks whether _resolve_openai_responses_handler_path
-        # downgraded this Copilot-hosted request to /chat/completions (non-reasoning
+        # downgraded this Copilot-hosted request to /chat/completions (a chat-only
         # model on a session pinned to the Responses wire API, see #1745 / #2643).
         # That endpoint requires a `messages` array and rejects Responses-shaped
         # bodies (`input`/`instructions`) with 400 "messages must be non-empty", so
