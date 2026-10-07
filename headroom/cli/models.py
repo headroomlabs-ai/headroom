@@ -127,9 +127,12 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
     # `/v1/models` is paginated (`has_more` + `last_id`, continued with
     # `after_id`). Reading only the first page silently truncated the list for
     # accounts with more than one page of models. The page cap only guards
-    # against a misbehaving server that never stops paginating.
+    # against a misbehaving server that never stops paginating. Every early stop
+    # while the server still says `has_more` comes back as a note, so a partial
+    # list is never presented as the whole one.
     entries: list[Any] = []
     after_id: str | None = None
+    incomplete: str | None = None
     for _page in range(_ANTHROPIC_MAX_PAGES):
         params: dict[str, Any] = {"limit": 100}
         if after_id:
@@ -159,13 +162,22 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
         if not isinstance(page, list):
             return [], "anthropic: /v1/models returned an unexpected body shape."
         entries.extend(page)
+        if not payload.get("has_more"):
+            break
         next_id = payload.get("last_id")
-        if not payload.get("has_more") or not isinstance(next_id, str) or next_id == after_id:
-            truncated = False
+        if not isinstance(next_id, str) or not next_id or next_id == after_id:
+            # Another request could only repeat this page, so stop, but say so.
+            incomplete = (
+                "anthropic: /v1/models said more models remain but gave no new cursor to "
+                "continue from; the list above may be incomplete."
+            )
             break
         after_id = next_id
     else:
-        truncated = True
+        incomplete = (
+            f"anthropic: stopped after {_ANTHROPIC_MAX_PAGES} pages of /v1/models; "
+            "the list above may be incomplete."
+        )
 
     rows: list[_Row] = []
     for entry in entries:
@@ -190,12 +202,7 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
                 provider="anthropic",
             )
         )
-    if truncated:
-        return rows, (
-            f"anthropic: stopped after {_ANTHROPIC_MAX_PAGES} pages of /v1/models; "
-            "the list above may be incomplete."
-        )
-    return rows, None
+    return rows, incomplete
 
 
 @main.command("models")

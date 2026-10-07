@@ -160,7 +160,8 @@ def test_anthropic_follows_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_anthropic_pagination_stops_on_a_repeated_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A server that keeps answering `has_more` with the same cursor must not loop."""
+    """A server that keeps answering `has_more` with the same cursor must not loop,
+    and the rows read so far must not be presented as the whole list."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
     calls: list[int] = []
 
@@ -172,8 +173,46 @@ def test_anthropic_pagination_stops_on_a_repeated_cursor(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(httpx, "get", fake_get)
     rows, reason = models_cmd._anthropic_rows()
-    assert reason is None
     assert len(calls) == 2, "pagination did not stop on a repeated cursor"
+    assert [r.id for r in rows] == ["claude-a", "claude-a"]
+    assert reason is not None and "no new cursor" in reason and "may be incomplete" in reason
+
+
+@pytest.mark.parametrize("last_id", [None, "", 7])
+def test_anthropic_says_so_when_has_more_comes_without_a_cursor(
+    monkeypatch: pytest.MonkeyPatch, last_id: object
+) -> None:
+    """`has_more` with no usable `last_id` stops after one request, with a note."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    calls: list[int] = []
+
+    def fake_get(*_a, **_k):  # type: ignore[no-untyped-def]
+        calls.append(1)
+        body: dict[str, object] = {"data": [{"id": "claude-a"}], "has_more": True}
+        if last_id is not None:
+            body["last_id"] = last_id
+        return httpx.Response(200, json=body)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    rows, reason = models_cmd._anthropic_rows()
+    assert len(calls) == 1
+    assert [r.id for r in rows] == ["claude-a"]
+    assert reason is not None and "may be incomplete" in reason
+
+
+def test_anthropic_last_page_has_no_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A last page (`has_more` false) is complete even without a `last_id`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: httpx.Response(
+            200, json={"data": [{"id": "claude-a"}], "has_more": False}
+        ),
+    )
+    rows, reason = models_cmd._anthropic_rows()
+    assert [r.id for r in rows] == ["claude-a"]
+    assert reason is None
 
 
 def test_anthropic_says_so_when_it_stops_at_the_page_cap(monkeypatch: pytest.MonkeyPatch) -> None:
