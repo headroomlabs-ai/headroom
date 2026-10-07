@@ -22,6 +22,9 @@ def test_profile_and_artifact_paths(monkeypatch, tmp_path: Path) -> None:
     assert install_paths.deploy_root() == tmp_path / "deploy"
     assert install_paths.profile_root("demo") == tmp_path / "deploy" / "demo"
     assert install_paths.manifest_path("demo") == tmp_path / "deploy" / "demo" / "manifest.json"
+    assert install_paths.recovery_manifest_path("demo") == (
+        tmp_path / "deploy" / "demo.recovery.json"
+    )
     assert install_paths.log_path("demo") == tmp_path / "deploy" / "demo" / "runner.log"
     assert install_paths.pid_path("demo") == tmp_path / "deploy" / "demo" / "runner.pid"
     assert (
@@ -69,3 +72,25 @@ def test_env_target_and_config_paths(monkeypatch, tmp_path: Path) -> None:
     assert (
         install_paths.opencode_config_path() == tmp_path / ".config" / "opencode" / "opencode.json"
     )
+
+
+def test_opencode_config_path_honors_opencode_home(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "unused")
+    other_home = tmp_path / "custom-opencode-home"
+    other_home.mkdir()
+    monkeypatch.setenv("OPENCODE_HOME", str(other_home))
+
+    assert install_paths.opencode_config_path() == other_home / "opencode.json"
+
+    (other_home / "opencode.jsonc").write_text("{}", encoding="utf-8")
+    assert install_paths.opencode_config_path() == other_home / "opencode.jsonc"
+
+
+def test_opencode_config_path_opencode_config_env_wins_over_home(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OPENCODE_HOME", str(tmp_path / "home"))
+    explicit = tmp_path / "explicit.json"
+    monkeypatch.setenv("OPENCODE_CONFIG", str(explicit))
+
+    assert install_paths.opencode_config_path() == explicit

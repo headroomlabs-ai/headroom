@@ -112,6 +112,109 @@ more random text
         assert len(file_matches) == 2
 
 
+class TestContextLineBodyReference:
+    """A ``name:N:`` reference in a context line's body must not become the marker.
+
+    ripgrep emits ``path-line-content`` for *context* lines and
+    ``path:line:content`` for *match* lines, and real bodies routinely carry
+    their own ``name:N:`` references. The colon tier used to claim such a
+    reference as the line-number marker whenever no whitespace preceded it,
+    which pushed the real ``-N-`` marker into the path and reported the body's
+    number as the line number -- inventing a file that does not exist and
+    pairing content with a line it never came from (issue #3545).
+    """
+
+    def test_body_reference_does_not_become_the_line_number(self):
+        content = "app/settings.py-476-a:7:b:8:c"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["app/settings.py"]
+        matches = file_matches["app/settings.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "a:7:b:8:c"
+
+    def test_extensionless_context_path_keeps_its_own_line_number(self):
+        content = "CHANGELOG-12-a:99:b"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["CHANGELOG"]
+        matches = file_matches["CHANGELOG"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 12
+        assert matches[0].content == "a:99:b"
+
+    def test_colon_row_with_dashed_path_is_unaffected(self):
+        """The dash marker sits in the *path* here, so the colon tier still wins."""
+        content = "logs/2026-05-03/app.log:12:ERROR"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["logs/2026-05-03/app.log"]
+        matches = file_matches["logs/2026-05-03/app.log"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 12
+        assert matches[0].content == "ERROR"
+
+    def test_filename_style_body_reference_keeps_the_context_coordinates(self):
+        """A body reference that looks like a *filename* must not take the row.
+
+        ``app.py-476-foo.rs:12:ref`` is a ripgrep context row for ``app.py``
+        line 476 whose body is ``foo.rs:12:ref``. The dash tier confirms the
+        boundary (the segment carries an extension), so the extension dot
+        inside the body says nothing about where the path ended. Before the
+        fix the colon tier reclaimed the row as the nonexistent path
+        ``app.py-476-foo.rs`` at line 12.
+        """
+        content = "app.py-476-foo.rs:12:ref"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["app.py"]
+        matches = file_matches["app.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "foo.rs:12:ref"
+
+    def test_filename_style_body_reference_behind_a_directory(self):
+        """Same shape with a directory component, which also looks path-like."""
+        content = "pkg/server.ts-91-lib/index.js:7:import"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["pkg/server.ts"]
+        matches = file_matches["pkg/server.ts"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 91
+        assert matches[0].content == "lib/index.js:7:import"
+
+    def test_bare_path_body_keeps_the_context_coordinates(self):
+        """The body needs no reference at all to be path-like."""
+        content = "app.py-476-./vendor/other.py"
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["app.py"]
+        matches = file_matches["app.py"].matches
+        assert len(matches) == 1
+        assert matches[0].line_number == 476
+        assert matches[0].content == "./vendor/other.py"
+
+    def test_many_context_rows_keep_their_own_coordinates(self):
+        """Every coordinate an agent would act on survives across many rows."""
+        content = "\n".join(f"pkg/mod/file.py-{476 + i * 7}-hits:{i}:of:9" for i in range(12))
+        compressor = SearchCompressor()
+        file_matches = compressor._parse_search_results(content)
+
+        assert list(file_matches) == ["pkg/mod/file.py"]
+        matches = file_matches["pkg/mod/file.py"].matches
+        assert [m.line_number for m in matches] == [476 + i * 7 for i in range(12)]
+        for i, match in enumerate(matches):
+            assert match.content == f"hits:{i}:of:9"
+
+
 class TestFileGrouping:
     """Tests for grouping matches by file."""
 

@@ -3,7 +3,9 @@ title: OpenCode + DeepSeek
 description: Configure OpenCode to route DeepSeek traffic through the Headroom proxy for compression, output shaping, and savings visibility.
 ---
 
-Save 20-60% on DeepSeek API costs with Headroom's context compression proxy.
+Cut DeepSeek API costs with Headroom's context compression proxy: tool outputs,
+logs, and search results are compressed before they reach the model, and
+responses can be shaped to be more concise.
 
 ## How it works
 
@@ -22,9 +24,9 @@ concise. DeepSeek's API is OpenAI-compatible — one flag and you're running.
 ## 1. Install Headroom
 
 ```bash
-pip install headroom-ai
+pip install "headroom-ai[proxy]"
 # or via uv:
-uv tool install headroom-ai
+uv tool install "headroom-ai[proxy]"
 ```
 
 You get SmartCrusher (structural compression), the proxy, output shaping, and
@@ -71,7 +73,7 @@ curl -s http://127.0.0.1:8787/v1/models \
 Output shaping makes the model's responses shorter — fewer tokens, lower cost:
 
 ```bash
-HEADROOM_ROLLOUT_CHANNEL=beta HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
+HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=2 \
 headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
 ```
 
@@ -130,15 +132,21 @@ Edit `~/.config/opencode/opencode.json`:
 
 **Important:** Only include model IDs that appear in the proxy's `/v1/models`
 response. OpenCode validates config models against the proxy's model list.
-The current DeepSeek model names are `deepseek-v4-pro` and `deepseek-v4-flash`.
-`deepseek-chat` and `deepseek-reasoner` are deprecated compatibility aliases.
+The current DeepSeek model names are `deepseek-flash` and `deepseek-v4-pro`.
+The retired `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are still
+accepted and billed at the Flash price; `deepseek-chat` and `deepseek-reasoner`
+are deprecated compatibility aliases.
 
 ### Model comparison
 
-| Model | Input / Output (per 1M) | Context | Max Output |
-|---|---|---|---|
-| `deepseek-v4-pro` | $0.435 / $0.87 | 1M | 384K |
-| `deepseek-v4-flash` | $0.14 / $0.28 | 1M | 384K |
+All prices are USD per 1M tokens, at DeepSeek's **off-peak** tier. Peak hours —
+Beijing 09:00-12:00 and 14:00-18:00, i.e. 01:00-04:00 and 06:00-10:00 UTC — cost
+exactly twice these rates.
+
+| Model | Input / Output (per 1M, off-peak) | Context | Max Output | Vision |
+|---|---|---|---|---|
+| `deepseek-flash` (V4.1-Flash) | $0.15 / $0.60 | 1M | 384K | yes |
+| `deepseek-v4-pro` | $0.66 / $1.98 | 1M | 384K | no |
 
 Both models support **thinking mode** for step-by-step reasoning (see below).
 
@@ -153,7 +161,7 @@ opencode
 ```
 
 Run `/models` to confirm both DeepSeek models appear under "Headroom Proxy".
-Select one with `/model deepseek-v4-flash` or `/model deepseek-v4-pro`.
+Select one with `/model deepseek-flash` or `/model deepseek-v4-pro`.
 
 ---
 
@@ -193,9 +201,57 @@ API key to the proxy, and the proxy forwards it to DeepSeek. Make sure
 
 ### Models appear but requests fail
 
-You ran `headroom wrap opencode`. That command replaces your config with Claude
-and GPT models. **Do not use `headroom wrap`.** Configure OpenCode manually as
-shown above, and launch OpenCode directly with `opencode`.
+You ran `headroom wrap opencode` without telling it about DeepSeek. Without an
+explicit upstream the proxy it starts forwards OpenAI-compatible traffic to
+OpenAI, so wrap leaves the `apiKey` and `models` entries from step 4 out of the
+`headroom` provider rather than send your DeepSeek key there. Pass
+`--openai-api-url` as shown in the next section, or launch OpenCode directly
+with `opencode` against the proxy you started in step 3.
+
+### I used `headroom wrap opencode` and get "Incorrect API key provided"
+
+```
+Incorrect API key provided: sk-13005***********************898d.
+You can find your API key at https://platform.openai.com/account/api-keys.
+```
+
+That 401 comes from **OpenAI**, not DeepSeek. `headroom wrap opencode` starts
+the proxy for you, and unless it is told otherwise the proxy forwards
+OpenAI-compatible traffic to its default upstream, `https://api.openai.com/v1`.
+Your DeepSeek key is then presented to OpenAI, which rejects it and points you
+at a dashboard for a key you never had.
+
+Pass the upstream to wrap, exactly like `headroom proxy --openai-api-url`:
+
+```bash
+headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+```
+
+The equivalent environment variable also works, and is honored by both
+commands:
+
+```bash
+OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode
+```
+
+If a proxy is already running on the port with a different upstream, stop it
+first (`headroom unwrap opencode`) — wrap will not silently re-point a proxy
+that other clients may be sharing.
+
+### When is `headroom wrap opencode` safe?
+
+- **Safe as-is** when your traffic goes to the default upstreams — OpenAI
+  (`api.openai.com`) or Anthropic (`api.anthropic.com`).
+- **Needs `--openai-api-url`** (or `OPENAI_TARGET_API_URL`) for any third-party
+  OpenAI-compatible provider: DeepSeek, Together, OpenRouter, Groq, a
+  self-hosted gateway, and so on.
+- **Keep the step 4 provider entries.** OpenCode only offers the
+  `headroom/<id>` models listed under `provider.headroom.models`, and DeepSeek
+  needs your key in `options.apiKey` (for example `"{env:DEEPSEEK_API_KEY}"`).
+  With `--openai-api-url`, wrap keeps both. It rewrites the provider's `npm`,
+  `name` and `baseURL` and adds its default `gpt-4o` and `gpt-4.1` ids next to
+  your models. Without the flag it leaves your key and models out, because the
+  proxy would forward them to OpenAI.
 
 ### "headroom" command not found
 
@@ -223,10 +279,9 @@ shaper is active immediately — the numbers just need calibration.
 ## What's NOT in this guide
 
 - **Claude or GPT models** — this setup uses DeepSeek exclusively
-- **`headroom wrap`** — do not use it; it overrides the config
 - **Deprecated model names** — `deepseek-chat` and `deepseek-reasoner` are
-  compatibility aliases that will be deprecated on 2026-07-24; use
-  `deepseek-v4-pro` and `deepseek-v4-flash` instead
+  compatibility aliases slated for removal; use `deepseek-v4-pro` and
+  `deepseek-v4-flash` instead
 - **Kompress (ML compression)** — requires extra dependencies; SmartCrusher
   handles the majority of use cases
 - **Any code changes** — headroom ships full DeepSeek support natively

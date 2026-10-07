@@ -210,13 +210,14 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next request re-probes the proxy via `/health`. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
+| `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
 
 ## Comparison with lossless-claw
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | Content-aware compression (zero LLM) |
-| Cost of compaction | Tokens (LLM calls) | Zero |
+| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
+| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
 

@@ -419,7 +419,7 @@ def build_native_launch_env(
         env.pop(var, None)
     return env, [
         f"{COPILOT_NATIVE_API_URL_ENV}={base_url}",
-        "COPILOT_AUTH_MODE=github-native (Copilot's own model routing)",
+        "COPILOT_AUTH_MODE=github-native",
     ]
 
 
