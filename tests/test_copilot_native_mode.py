@@ -140,6 +140,39 @@ def test_native_support_probe_is_unknown_when_a_bundle_cannot_be_fully_read(
     )
 
 
+def test_native_support_probe_never_lets_an_older_bundle_vote_for_an_unreadable_newest(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Newest bundle unreadable + an older one that still has the variable = unknown.
+
+    Falling back to the older bundle is exactly the "old bundle vouches for a new
+    one that may have dropped support" case the newest-only rule exists to stop.
+    """
+    root = tmp_path / "copilot" / "pkg" / "win32-x64"
+    old = root / "1.0.70"
+    new = root / "1.0.77"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "app.js").write_text(f"process.env.{COPILOT_NATIVE_API_URL_ENV};\n", encoding="utf-8")
+    newest = new / "app.js"
+    newest.write_text("var x = 1;\n", encoding="utf-8")
+
+    real_open = open
+
+    def _fake_open(path, *args, **kwargs):
+        if str(path) == str(newest):
+            raise OSError("locked by an updater")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    assert (
+        native_api_url_supported(
+            environ={"LOCALAPPDATA": str(tmp_path)}, home=str(tmp_path / "none")
+        )
+        is None
+    )
+
+
 # ---------------------------------------------------------------------------
 # The BYOK path must be untouched — it works today and is still the only option
 # for genuine third-party keys.

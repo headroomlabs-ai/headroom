@@ -289,26 +289,25 @@ def native_api_url_supported(
         return None  # nothing to inspect: unknown, not unsupported
 
     bundles.sort()
-    for _key, path in reversed(bundles):
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                # Overlap successive reads so the needle cannot be missed by
-                # landing across a chunk boundary (it silently returned False for
-                # a supported CLI, which then hard-refused the launch).
-                carry = ""
-                overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
-                while chunk := fh.read(1 << 20):
-                    if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
-                        return True
-                    carry = chunk[-overlap:] if overlap else ""
-        except OSError:
-            continue
-        # The newest readable bundle is authoritative; do not let older ones vote.
-        return False
-    # Every located bundle failed to open, or failed mid-read (e.g. deleted or
-    # locked concurrently) -- unknown, not confirmed unsupported, since no
-    # bundle's content was ever actually inspected.
-    return None
+    _key, path = bundles[-1]
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            # Overlap successive reads so the needle cannot be missed by
+            # landing across a chunk boundary (it silently returned False for
+            # a supported CLI, which then hard-refused the launch).
+            carry = ""
+            overlap = len(COPILOT_NATIVE_API_URL_ENV) - 1
+            while chunk := fh.read(1 << 20):
+                if COPILOT_NATIVE_API_URL_ENV in carry + chunk:
+                    return True
+                carry = chunk[-overlap:] if overlap else ""
+    except OSError:
+        # The newest bundle could not be opened, or failed mid-read (deleted or
+        # locked concurrently). That is unknown, not unsupported -- and an older
+        # bundle must not vote in its place, for the reason given above.
+        return None
+    # The newest bundle is authoritative.
+    return False
 
 
 def _version_key(path: str) -> tuple[int, ...]:
