@@ -264,6 +264,25 @@ def _mirror_url(url: str) -> str:
 # ---------- Download + verify --------------------------------------------- #
 
 
+def _ssl_context():
+    """Return Headroom's configured SSL context for urllib.request.urlopen, or
+    ``None`` (urlopen's default) when the trust helper cannot be loaded.
+
+    This ensures binary downloads from GitHub releases (and any configured
+    mirror) trust the same roots as the proxy — including corporate
+    TLS-inspection roots installed in the OS store and bundles referenced via
+    ``HEADROOM_CA_BUNDLE`` / ``SSL_CERT_FILE``. Without this, ``uv tool``
+    installs (where certifi may not yet be wired to the stdlib path) raise
+    ``CERTIFICATE_VERIFY_FAILED`` even though certifi is already a dependency.
+    """
+    try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+
+        return build_urlopen_context()
+    except Exception:
+        return None
+
+
 def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if os.environ.get("HEADROOM_BINARIES_OFFLINE"):
         raise OfflineError(f"offline mode (HEADROOM_BINARIES_OFFLINE=1) but fetch required: {url}")
@@ -281,10 +300,15 @@ def _download(url: str, dest: Path, *, progress: bool = True) -> None:
     if not final_url.startswith("https://"):
         raise BinaryFetchError(f"refusing non-https download URL: {final_url!r}")
     req = urllib.request.Request(final_url, headers={"User-Agent": "headroom-binaries/1"})
+    ctx = _ssl_context()
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 (https)
+            if ctx is not None:
+                resp = urllib.request.urlopen(req, timeout=60, context=ctx)  # noqa: S310 (https)
+            else:
+                resp = urllib.request.urlopen(req, timeout=60)  # noqa: S310 (https)
+            with resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 _stream_to(resp, dest, total, label=dest.name, show_progress=progress)
             return

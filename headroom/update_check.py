@@ -187,17 +187,43 @@ def _select_latest(data: dict[str, Any], *, allow_pre: bool) -> str | None:
     return None
 
 
+def _urlopen_ssl_context():
+    """Return an SSL context for urllib.request.urlopen that honors Headroom's
+    trust policy (OS store + certifi, HEADROOM_CA_BUNDLE, etc).
+
+    Imported lazily so this module's dependency footprint stays at stdlib +
+    packaging when the trust helpers aren't yet importable (e.g. during early
+    startup or in minimal test environments). Falls back to ``None`` (urlopen's
+    default) when the helper cannot be loaded.
+    """
+    try:
+        from headroom.proxy.ssl_context import build_urlopen_context
+
+        return build_urlopen_context()
+    except Exception:
+        return None
+
+
 def fetch_latest_version(*, allow_pre: bool = False, timeout: float = 4.0) -> str | None:
     """Query the PyPI JSON API for the latest release. Returns None on any error.
 
     Uses ``urllib`` (stdlib) so the base CLI install needs no HTTP dependency.
+    Passes Headroom's configured SSL context so corporate TLS-inspection roots
+    (Zscaler, Netskope, ...) installed in the OS trust store — or referenced via
+    ``HEADROOM_CA_BUNDLE`` / ``SSL_CERT_FILE`` — are trusted the same way the
+    proxy trusts them.
     """
     try:
         req = urllib.request.Request(
             _PYPI_JSON_URL,
             headers={"Accept": "application/json", "User-Agent": "headroom-update-check"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — fixed https URL
+        ctx = _urlopen_ssl_context()
+        if ctx is not None:
+            resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)  # noqa: S310 — fixed https URL
+        else:
+            resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 — fixed https URL
+        with resp:
             data = json.loads(resp.read().decode("utf-8"))
         return _select_latest(data, allow_pre=allow_pre)
     except Exception:
