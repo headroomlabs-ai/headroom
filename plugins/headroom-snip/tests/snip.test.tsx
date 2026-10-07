@@ -114,6 +114,12 @@ test('a request is this session\'s by its stamp and project', async () => {
   // Logged without a project while this session sends one: another, unwrapped client.
   expect(isOwn({ ...snip, project: null }, T0, 'mine')).toBe(false)
   expect(isOwn({ ...snip, project: 'mine' }, T0, null)).toBe(true)
+  // No tag known for the row (outside the proxy's tagged log tail): not counted for a tagged session.
+  expect(isOwn(snip, T0, 'mine')).toBe(false)
+  expect(isOwn(snip, T0, null)).toBe(true)
+  // Stamped before the session started, however slightly: history.
+  expect(isOwn({ ...snip, at: stamp(-0.5) }, T0, null)).toBe(false)
+  expect(isOwn({ ...snip, at: stamp(0) }, T0, null)).toBe(true)
   expect(isOwn({ ...snip, at: '' }, T0, null)).toBeUndefined()
 })
 
@@ -264,7 +270,12 @@ test('with a project header, other clients on the proxy are left out', async ($,
 
   await $.session.start(START)
   await clock.settle()
-  rows = [row('mine', 20_000, 4_000, ['smart:array'], 3), row('theirs', 40_000, 4_000, ['smart:array'], 4)]
+  rows = [
+    row('untagged', 50_000, 5_000, ['smart:array'], 2),
+    row('mine', 20_000, 4_000, ['smart:array'], 3),
+    row('theirs', 40_000, 4_000, ['smart:array'], 4),
+  ]
+  // 'untagged' fell outside the proxy's ten-row tagged log tail, so its project is unknown.
   logs = [
     { request_id: 'mine', tags: { project: 'headroom' } },
     { request_id: 'theirs', tags: { project: 'other-app' } },
@@ -281,6 +292,7 @@ test('with a project header, other clients on the proxy are left out', async ($,
   expect(await pane.find({ text: /tokens snipped this session/ })).toBeDefined()
   expect(await pane.find({ text: /counting requests tagged headroom/ })).toBeDefined()
   expect(await pane.find({ text: /40k→4\.0k/ })).toBeUndefined()
+  expect(await pane.find({ text: /50k→5\.0k/ })).toBeUndefined()
   await pane.unmount()
 })
 

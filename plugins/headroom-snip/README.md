@@ -42,7 +42,9 @@ What counts as this session's depends on how Claude Code reaches the proxy:
 - **Through `headroom wrap claude`:** each request carries an
   `X-Headroom-Project` header. The mod only counts requests tagged with this
   session's project, so other projects and clients on the same proxy are left
-  out (two sessions in the same project still share a count). The band and
+  out (two sessions in the same project still share a count). The proxy only
+  reports tags for its last ten requests, so a request it can't attribute is
+  left out rather than guessed. The band and
   `/headroom` say "session".
 - **Any other way:** the proxy can't tell clients apart, so the totals cover
   every client on the proxy since this session started. The band says "proxy"

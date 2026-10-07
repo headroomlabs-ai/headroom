@@ -192,19 +192,17 @@ export function ownProject(customHeaders?: string): string | null {
   return null
 }
 
-/** How far before session start a request may be stamped and still count, for clock rounding. */
-const START_SLACK_MS = 1000
-
 /**
  * Whether a request belongs to this session: stamped at or after `startedAt` and, when the session
- * sends a project, tagged with that project. Undefined when the request carries no usable timestamp.
+ * sends a project, tagged with exactly that project. A row whose tag is unknown (outside the proxy's
+ * tagged log tail) is not counted then. Undefined when the request carries no usable timestamp.
  */
 export function isOwn(snip: Snip, startedAt: number, project: string | null): boolean | undefined {
-  if (project !== null && snip.project !== undefined && snip.project !== project) return false
+  if (project !== null && snip.project !== project) return false
   const at = Date.parse(snip.at)
   if (!Number.isFinite(at)) return undefined
 
-  return at >= startedAt - START_SLACK_MS
+  return at >= startedAt
 }
 
 export type Tone = 'kept' | 'doomed' | 'blade' | 'crumb' | 'gone'
