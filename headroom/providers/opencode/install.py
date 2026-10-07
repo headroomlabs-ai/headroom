@@ -35,7 +35,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     config_file.parent.mkdir(parents=True, exist_ok=True)
 
     snapshot_opencode_config_if_unwrapped(
-        config_file, config_file.with_suffix(".json.headroom-backup")
+        config_file, config_file.with_name(config_file.name + ".headroom-backup")
     )
 
     if config_file.exists():
@@ -53,7 +53,7 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     }
     data = _inject_key_into_json(data, "provider", provider)
 
-    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
     return ManagedMutation(
         target=ToolTarget.OPENCODE.value,
         kind="json-block",
@@ -61,18 +61,23 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     )
 
 
-def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifest) -> None:
-    """Revert OpenCode provider-scope configuration.
+def revert_provider_scope(
+    mutation: ManagedMutation,
+    manifest: DeploymentManifest,
+    *,
+    restore_backup: bool = True,
+) -> None:
+    """Undo OpenCode provider-scope configuration.
 
-    Restores from pre-wrap backup when available, otherwise strips the
-    headroom provider from the config file.
+    Final removal restores the pre-install snapshot when available. Temporary
+    deactivation removes only the managed provider and retains that snapshot.
     """
     del manifest
     if not mutation.path:
         return
     path = Path(mutation.path)
-    backup_file = path.with_suffix(".json.headroom-backup")
-    if backup_file.exists():
+    backup_file = path.with_name(path.name + ".headroom-backup")
+    if restore_backup and backup_file.exists():
         try:
             shutil.copy2(backup_file, path)
             backup_file.unlink()
@@ -82,8 +87,16 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     if not path.exists():
         return
     content = fsutil.read_text(path)
+    data = _parse_json_loose(content)
+    providers = data.get("provider")
+    if isinstance(providers, dict) and "headroom" in providers:
+        providers.pop("headroom")
+        if not providers:
+            data.pop("provider", None)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
+        return
     cleaned = strip_opencode_headroom_blocks(content)
-    if cleaned:
-        path.write_text(cleaned + "\n", encoding="utf-8")
-    else:
+    if cleaned != content.strip():
+        path.write_text(cleaned + "\n", encoding="utf-8", newline="\n")
+    elif not data and not content.strip():
         path.unlink(missing_ok=True)

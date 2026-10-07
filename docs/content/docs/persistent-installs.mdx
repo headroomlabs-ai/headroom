@@ -122,6 +122,14 @@ Provider scope is intentionally conservative. The current direct adapters are:
 - OpenClaw → existing `wrap openclaw` / `unwrap openclaw` flow
 - OpenCode → managed block in `~/.config/opencode/opencode.json`
 
+For OpenCode provider scope, reapplying the deployment, restarting it, or
+recovering a stopped proxy removes and reinjects only the managed `headroom`
+provider. Later edits to themes, other providers, and MCP configuration stay
+intact. The original `<config filename>.headroom-backup` is kept across these
+transitions for both `.json` and `.jsonc` configurations. Final
+`headroom install remove` restores that original snapshot and deletes the backup.
+
+
 For Copilot, Aider, Cursor, and broader env-driven setups, prefer `--scope user` or `--scope system`.
 
 ## Provider selection

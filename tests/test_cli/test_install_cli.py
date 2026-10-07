@@ -531,7 +531,8 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
@@ -893,7 +894,8 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
         lambda manifest, timeout_seconds, **kwargs: next(wait_results),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.apply_mutations", lambda manifest: calls.append("apply") or []
@@ -1040,7 +1042,7 @@ def test_install_apply_restores_previous_deployment_after_failed_update(monkeypa
     )
     monkeypatch.setattr(
         "headroom.cli.install.revert_mutations",
-        lambda deployment: calls.append(f"revert:{','.join(deployment.targets)}"),
+        lambda deployment, **kwargs: calls.append(f"revert:{','.join(deployment.targets)}"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.delete_manifest",
@@ -1276,7 +1278,9 @@ def test_activate_mutations_reverts_side_effects_when_strict_save_fails(monkeypa
         lambda current: (_ for _ in ()).throw(OSError("manifest busy")),
     )
     monkeypatch.setattr(
-        inst, "revert_mutations", lambda current: reverted.extend(current.mutations)
+        inst,
+        "revert_mutations",
+        lambda current, **kwargs: reverted.extend(current.mutations),
     )
 
     with pytest.raises(OSError, match="manifest busy"):
@@ -1753,7 +1757,8 @@ def test_install_remove_retains_manifest_when_runtime_teardown_errors(monkeypatc
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.stop_supervisor",
@@ -1892,7 +1897,8 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
 
     monkeypatch.setattr("headroom.cli.install.wait_ready", fake_wait_ready)
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.apply_mutations", lambda manifest: calls.append("apply") or []
@@ -2146,3 +2152,83 @@ def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert applied == []
+
+
+@pytest.mark.parametrize("lifecycle", ["apply", "restart", "ensure"])
+def test_opencode_reactivation_preserves_edits(
+    lifecycle: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reapply, restart, and watchdog recovery keep edits made after installation."""
+    import contextlib
+
+    from headroom.install.providers import apply_mutations
+
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    config_file = tmp_path / "opencode.json"
+    original = {"theme": "original", "mcp": {"local": {}}}
+    config_file.write_text(json.dumps(original))
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="none",
+        scope="provider",
+        provider_mode="manual",
+        targets=["opencode"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    apply_mutations(previous)
+
+    edited = json.loads(config_file.read_text())
+    edited["theme"] = "edited after install"
+    edited["provider"] = {"other": {"name": "User provider"}}
+    edited["mcp"]["remote"] = {"url": "https://example.test"}
+    config_file.write_text(json.dumps(edited))
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "save_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_stop_deployment", lambda manifest: None)
+    monkeypatch.setattr(inst, "_start_deployment", lambda manifest, **kwargs: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    monkeypatch.setattr(inst, "remove_supervisor", lambda manifest: None)
+    monkeypatch.setattr(inst, "delete_manifest", lambda profile: None)
+
+    if lifecycle == "apply":
+        monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: None)
+        monkeypatch.setattr(inst, "_delete_recovery_snapshot", lambda profile: None)
+        new = DeploymentManifest(
+            profile="default",
+            preset="persistent-service",
+            runtime_kind="python",
+            supervisor_kind="none",
+            scope="provider",
+            provider_mode="manual",
+            targets=["opencode"],
+            port=8787,
+            host="127.0.0.1",
+            backend="anthropic",
+        )
+        inst._apply_manifest(new)
+    elif lifecycle == "restart":
+        monkeypatch.setattr(inst, "probe_ready", lambda url: False)
+        result = CliRunner().invoke(main, ["install", "restart"])
+        assert result.exit_code == 0, result.output
+    else:
+        monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+        monkeypatch.setattr(inst, "probe_ready", lambda url: False)
+        monkeypatch.setattr(inst, "wait_ready", lambda *args, **kwargs: False)
+        monkeypatch.setattr(inst, "stop_runtime", lambda manifest: None)
+        monkeypatch.setattr(
+            inst, "acquire_runtime_start_lock", lambda profile: contextlib.nullcontext(True)
+        )
+        result = CliRunner().invoke(main, ["install", "agent", "ensure"])
+        assert result.exit_code == 0, result.output
+
+    actual = json.loads(config_file.read_text())
+    assert actual["theme"] == "edited after install"
+    assert actual["provider"]["other"] == {"name": "User provider"}
+    assert actual["provider"]["headroom"]["options"]["baseURL"] == ("http://127.0.0.1:8787/v1")
+    assert actual["mcp"]["remote"] == {"url": "https://example.test"}

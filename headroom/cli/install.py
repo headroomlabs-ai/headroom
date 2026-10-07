@@ -234,11 +234,15 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
 
 
 def _deactivate_deployment_mutations(
-    manifest: DeploymentManifest, *, persist_manifest: bool = True
+    manifest: DeploymentManifest,
+    *,
+    persist_manifest: bool = True,
+    restore_backup: bool = False,
 ) -> None:
     if not manifest.mutations:
         return
-    revert_mutations(manifest)
+    revert_mutations(manifest, restore_backup=restore_backup)
+
     manifest.mutations = []
     if persist_manifest:
         save_manifest(manifest)
@@ -321,7 +325,8 @@ def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
     except Exception as exc:
         if manifest.mutations:
             try:
-                revert_mutations(manifest)
+                revert_mutations(manifest, restore_backup=False)
+
             except Exception as rollback_exc:
                 raise RuntimeError(
                     f"mutation activation failed: {exc}; rollback failed: {rollback_exc}"
@@ -358,10 +363,18 @@ def _delete_recovery_snapshot(profile: str) -> None:
         ) from None
 
 
-def _remove_deployment(manifest: DeploymentManifest) -> None:
+def _remove_deployment(
+    manifest: DeploymentManifest,
+    *,
+    restore_backup: bool = False,
+) -> None:
     errors: list[tuple[str, Exception]] = []
     try:
-        _deactivate_deployment_mutations(manifest, persist_manifest=False)
+        if restore_backup:
+            _deactivate_deployment_mutations(manifest, persist_manifest=False, restore_backup=True)
+        else:
+            _deactivate_deployment_mutations(manifest, persist_manifest=False)
+
     except Exception as exc:
         errors.append(("mutation cleanup", exc))
     try:
@@ -593,6 +606,7 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
             _save_recovery_snapshot(existing, profile)
             recovery_saved = True
             _remove_deployment(existing)
+
     except Exception as exc:
         recovery_detail = (
             f" Recovery snapshot: {recovery_manifest_path(profile)} is retained; "
@@ -626,6 +640,7 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         cleanup_errors: list[Exception] = []
         try:
             _remove_deployment(manifest)
+
         except Exception as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
         if not cleanup_errors and not active_persistence_failed and existing is not None:
@@ -1120,7 +1135,7 @@ def install_remove(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     try:
-        _remove_deployment(manifest)
+        _remove_deployment(manifest, restore_backup=True)
     except Exception as exc:
         raise click.ClickException(
             f"Failed to remove deployment '{profile}': cleanup failed: {exc}. "
