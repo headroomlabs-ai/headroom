@@ -547,9 +547,12 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
 
     # Exactly what a v1 build left behind: the entry on disk includes the
     # placeholder apiKey, and the v1 digest was taken over that whole entry.
-    def write_v1(p: Path, block: dict) -> None:
+    # It is read back from the file, as the production reader does, rather
+    # than hashed from the in-memory block.
+    def write_v1(p: Path) -> None:
+        (entry,) = json.loads(p.read_text(encoding="utf-8"))
         digest = hashlib.sha256(
-            json.dumps(block, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            json.dumps(entry, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()
         record = _provenance_path(p)
         record.parent.mkdir(parents=True, exist_ok=True)
@@ -559,7 +562,7 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
 
     refreshed = tmp_path / "refreshed.json"
     refreshed.write_text(json.dumps([a], indent=2), encoding="utf-8")
-    write_v1(refreshed, a)
+    write_v1(refreshed)
     assert configure_chat_models(refreshed, b) == "updated"
     assert _headroom_entries(refreshed) == [b]
     assert _read_provenance(refreshed) == _Provenance(_block_digest(b), None)
@@ -567,7 +570,7 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
 
     removed = tmp_path / "removed.json"
     removed.write_text(json.dumps([a], indent=2), encoding="utf-8")
-    write_v1(removed, a)
+    write_v1(removed)
     assert remove_chat_models(removed) is True
     assert _headroom_entries(removed) == []
 
