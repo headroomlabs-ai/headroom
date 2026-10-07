@@ -9,6 +9,7 @@
 //! - **SearchResults**: grep / ripgrep output (`file:line:content`)
 //! - **BuildOutput**: Compiler / test / lint logs
 //! - **GitDiff**: Unified diff format → `DiffCompressor`
+//! - **Tabular**: lossless route for tables and human-readable Git status
 //! - **Html**: Web pages (needs extraction, not compression)
 //! - **PlainText**: Generic fallback
 //!
@@ -37,6 +38,7 @@ pub enum ContentType {
     BuildOutput,
     GitDiff,
     Html,
+    Tabular,
     PlainText,
 }
 
@@ -50,13 +52,14 @@ impl ContentType {
     /// extending this array is caught by the length annotation, and the
     /// exhaustive `match` in [`ContentType::as_str`] forces the author
     /// into this file in the first place.
-    pub const ALL: [ContentType; 7] = [
+    pub const ALL: [ContentType; 8] = [
         ContentType::JsonArray,
         ContentType::SourceCode,
         ContentType::SearchResults,
         ContentType::BuildOutput,
         ContentType::GitDiff,
         ContentType::Html,
+        ContentType::Tabular,
         ContentType::PlainText,
     ];
 
@@ -69,6 +72,7 @@ impl ContentType {
             ContentType::BuildOutput => "build",
             ContentType::GitDiff => "diff",
             ContentType::Html => "html",
+            ContentType::Tabular => "tabular",
             ContentType::PlainText => "text",
         }
     }
@@ -86,6 +90,7 @@ impl ContentType {
             ContentType::BuildOutput => "build_output",
             ContentType::GitDiff => "git_diff",
             ContentType::Html => "html",
+            ContentType::Tabular => "tabular",
             ContentType::PlainText => "plain_text",
         }
     }
@@ -287,6 +292,93 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitStatusSection {
+    Staged,
+    Unstaged,
+    Untracked,
+    Unmerged,
+}
+
+fn try_detect_git_status(content: &str) -> Option<DetectionResult> {
+    let mut lines = content.lines();
+    let first = lines.next()?;
+    if !first.starts_with("On branch ")
+        && !first.starts_with("HEAD detached at ")
+        && !first.starts_with("HEAD detached from ")
+    {
+        return None;
+    }
+
+    let mut has_heading = false;
+    let mut has_path = false;
+    let mut section = None;
+    for line in lines {
+        section = match line {
+            "Changes to be committed:" => {
+                has_heading = true;
+                Some(GitStatusSection::Staged)
+            }
+            "Changes not staged for commit:" => {
+                has_heading = true;
+                Some(GitStatusSection::Unstaged)
+            }
+            "Untracked files:" => {
+                has_heading = true;
+                Some(GitStatusSection::Untracked)
+            }
+            "Unmerged paths:" => {
+                has_heading = true;
+                Some(GitStatusSection::Unmerged)
+            }
+            _ => section,
+        };
+
+        if section == Some(GitStatusSection::Untracked)
+            && line
+                .strip_prefix('\t')
+                .is_some_and(|path| !path.trim().is_empty())
+        {
+            has_path = true;
+        } else if matches!(
+            section,
+            Some(
+                GitStatusSection::Staged | GitStatusSection::Unstaged | GitStatusSection::Unmerged
+            )
+        ) {
+            let Some((state, path)) = line.trim_start().split_once(": ") else {
+                continue;
+            };
+            if !path.trim().is_empty()
+                && matches!(
+                    state,
+                    "new file"
+                        | "modified"
+                        | "deleted"
+                        | "renamed"
+                        | "copied"
+                        | "typechange"
+                        | "both modified"
+                        | "both added"
+                        | "both deleted"
+                        | "added by us"
+                        | "deleted by us"
+                        | "added by them"
+                        | "deleted by them"
+                )
+            {
+                has_path = true;
+            }
+        }
+    }
+
+    (has_heading && has_path).then(|| {
+        let mut metadata = Map::new();
+        metadata.insert("format".into(), Value::String("git_status".into()));
+        DetectionResult::new(ContentType::Tabular, 1.0, metadata)
+    })
+}
+
 // ─── Public entry point ────────────────────────────────────────────────
 
 /// Detect the type of `content` for routing. Mirrors Python's
@@ -297,10 +389,11 @@ static HTML_STRUCTURAL_TAGS: LazyLock<Regex> = LazyLock::new(|| {
 /// 2. JSON array (highest priority for `SmartCrusher`)
 /// 3. Git diff (≥ 0.7 confidence required)
 /// 4. HTML (≥ 0.7 confidence required)
-/// 5. Search results (≥ 0.6 confidence required)
-/// 6. Build / log output (≥ 0.5 confidence required)
-/// 7. Source code (≥ 0.5 confidence required)
-/// 8. Fallback to `PlainText` confidence 0.5
+/// 5. Human-readable Git status → `Tabular` (lossless)
+/// 6. Search results (≥ 0.6 confidence required)
+/// 7. Build / log output (≥ 0.5 confidence required)
+/// 8. Source code (≥ 0.5 confidence required)
+/// 9. Fallback to `PlainText` confidence 0.5
 pub fn detect_content_type(content: &str) -> DetectionResult {
     if content.is_empty() || content.trim().is_empty() {
         return DetectionResult::plain_text(0.0);
@@ -319,6 +412,10 @@ pub fn detect_content_type(content: &str) -> DetectionResult {
             return r;
         }
     }
+    if let Some(r) = try_detect_git_status(content) {
+        return r;
+    }
+
     if let Some(r) = try_detect_search(content) {
         if r.confidence >= 0.6 {
             return r;
@@ -678,6 +775,39 @@ mod tests {
         let r = detect_content_type(content);
         assert_eq!(r.content_type, ContentType::SearchResults);
         assert!(r.confidence >= 0.6);
+    }
+
+    #[test]
+    fn git_status_with_staged_unstaged_and_untracked_paths_is_tabular() {
+        let content = "\
+On branch feature/status
+Changes to be committed:
+  (use \"git restore --staged <file>...\" to unstage)
+\tnew file:   staged file.txt
+
+Changes not staged for commit:
+  (use \"git add <file>...\" to update what will be committed)
+\tmodified:   path with spaces.txt
+
+Untracked files:
+  (use \"git add <file>...\" to include in what will be committed)
+\tuntracked path.txt
+";
+        let result = detect_content_type(content);
+        assert_eq!(result.content_type, ContentType::Tabular);
+        assert_eq!(
+            result.metadata.get("format").and_then(Value::as_str),
+            Some("git_status")
+        );
+    }
+
+    #[test]
+    fn ordinary_bullet_list_is_not_git_status() {
+        let prose = "The branch has many changes:\n- modified: item one\n- modified: item two";
+        assert_eq!(
+            detect_content_type(prose).content_type,
+            ContentType::PlainText
+        );
     }
 
     #[test]
