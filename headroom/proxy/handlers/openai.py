@@ -6863,11 +6863,13 @@ class OpenAIHandlerMixin:
             # Copilot receiving an explicit non-false `store` (VS Code's BYOK
             # client sends `store: true`, which Copilot rejects with a 400; an
             # absent `store` is accepted). Everything else keeps the
-            # byte-faithful passthrough, as on main.
+            # byte-faithful passthrough, as on main, and an explicit
+            # x-headroom-bypass always means "forward my bytes untouched".
             if (
                 body_mutation_tracker is not None
                 and responses_copilot_upstream
                 and responses_store_before is not None
+                and not _bypass
             ):
                 body_mutation_tracker.mark_mutated("responses_store_false")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)

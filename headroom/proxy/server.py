@@ -3781,6 +3781,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:  # noqa: BLE001 — health must never fail on this
             return None
 
+    def _copilot_seeded() -> bool:
+        """Whether this proxy was handed a Copilot credential at launch.
+
+        Reported next to the fingerprint because a seed can be an API token
+        alone, which has no durable identity to digest. A wrapper must still
+        treat such a proxy as credential-bearing, never as unseeded. Checks
+        presence only; no credential value is read.
+        """
+        return any(
+            name in os.environ
+            for name in ("GITHUB_COPILOT_API_TOKEN", "GITHUB_COPILOT_REFRESH_OAUTH_TOKEN")
+        )
+
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
         # Kompress is an optional soft component: model downloads lazily on
@@ -3846,6 +3859,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # "serving someone else's": the first is safe to share, the
                 # second must never be. Absent when no seed was handed over.
                 "copilot_token_fingerprint": _copilot_seed_fingerprint(),
+                "copilot_seeded": _copilot_seeded(),
                 "savings_profile": config.savings_profile,
                 "target_ratio": effective_target_ratio,
                 "target_savings_percent": (

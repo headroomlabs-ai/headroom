@@ -4562,6 +4562,7 @@ def _proxy_routing_mismatches(
     backend: str | None,
     requested_api_urls: Mapping[str, str | None] | None = None,
     requested_copilot_fingerprint: str | None = None,
+    requested_copilot_seeded: bool = False,
 ) -> list[str]:
     """Return routing-level keys where a running proxy differs from the request.
 
@@ -4575,7 +4576,9 @@ def _proxy_routing_mismatches(
     identity (``copilot_credential``): an unseeded session must never reuse a
     seeded proxy -- its traffic would go upstream under someone else's token --
     and a seeded session must never reuse one it cannot prove is its own
-    account. Unknown counts as different, so this fails closed.
+    account. Unknown counts as different, so this fails closed. A proxy seeded
+    with an API token alone has no fingerprint, so ``copilot_seeded`` is what
+    keeps it from looking unseeded.
     """
     mismatches: list[str] = []
     effective_backend = backend or os.environ.get("HEADROOM_BACKEND") or "anthropic"
@@ -4600,7 +4603,9 @@ def _proxy_routing_mismatches(
     running_fingerprint = running_config.get("copilot_token_fingerprint")
     if not isinstance(running_fingerprint, str) or not running_fingerprint:
         running_fingerprint = None
-    if running_fingerprint != requested_copilot_fingerprint:
+    running_seeded = running_config.get("copilot_seeded") is True or running_fingerprint is not None
+    requested_seeded = requested_copilot_seeded or requested_copilot_fingerprint is not None
+    if running_fingerprint != requested_copilot_fingerprint or running_seeded != requested_seeded:
         mismatches.append("copilot_credential")
     return mismatches
 
@@ -5111,9 +5116,12 @@ def _push_runtime_env(port: int, no_proxy: bool) -> None:
 # 4. Same-account exception: a seeded session may share a running proxy only
 #    when ``_proxy_serves_same_copilot_seed`` holds AND routing matches. This is
 #    how ``wrap copilot --native`` and ``wrap vscode-chat`` share one proxy.
-# 5. ``wrap claude`` sharing a proxy pinned elsewhere relies on the per-request
-#    ``X-Headroom-Base-Url`` pin (``_apply_anthropic_upstream_pin_env``), which
-#    targets the upstream that session requested.
+# 5. Under rule 3 ``wrap claude`` never lands on a proxy pinned elsewhere; only
+#    ``wrap claude --no-proxy`` attaches to whatever runs on the port. That case
+#    relies on the per-request ``X-Headroom-Base-Url`` pin
+#    (``_apply_anthropic_upstream_pin_env``), which targets the upstream that
+#    session requested, with the Copilot-host x-api-key refusal in the
+#    Anthropic handler as the backstop.
 def _ensure_proxy_unlocked(
     port: int,
     no_proxy: bool,
@@ -5222,6 +5230,7 @@ def _ensure_proxy_unlocked(
                         backend=requested_backend,
                         requested_api_urls=requested_api_urls,
                         requested_copilot_fingerprint=requested_copilot_fingerprint,
+                        requested_copilot_seeded=copilot_subscription_seed_requested,
                     )
                 )
                 if running_config is None:
@@ -5306,6 +5315,7 @@ def _ensure_proxy_unlocked(
                             backend=requested_backend,
                             requested_api_urls=requested_api_urls,
                             requested_copilot_fingerprint=requested_copilot_fingerprint,
+                            requested_copilot_seeded=copilot_subscription_seed_requested,
                         )
                         if routing_mismatches:
                             keys_str = ", ".join(routing_mismatches)
@@ -5389,6 +5399,7 @@ def _ensure_proxy_unlocked(
                     backend=requested_backend,
                     requested_api_urls=requested_api_urls,
                     requested_copilot_fingerprint=requested_copilot_fingerprint,
+                    requested_copilot_seeded=copilot_subscription_seed_requested,
                 )
             )
             if running_config is None and not helpers._proxy_needs_version_restart(health_payload):

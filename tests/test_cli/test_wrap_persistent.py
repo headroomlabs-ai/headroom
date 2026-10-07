@@ -1912,6 +1912,19 @@ def test_proxy_routing_mismatches_flags_copilot_credential(monkeypatch) -> None:
     # Neither side seeded (absent key or explicit None): compatible.
     assert check({}, backend=None) == []
     assert check({"copilot_token_fingerprint": None}, backend=None) == []
+    assert check({"copilot_seeded": False}, backend=None) == []
+    # Seeded with an API token alone has no fingerprint, but it is still not
+    # an unseeded proxy.
+    assert check({"copilot_seeded": True}, backend=None) == ["copilot_credential"]
+    assert (
+        check(
+            {"copilot_seeded": True, "copilot_token_fingerprint": mine},
+            backend=None,
+            requested_copilot_fingerprint=mine,
+            requested_copilot_seeded=True,
+        )
+        == []
+    )
 
 
 def test_ensure_proxy_shares_proxy_seeded_with_the_same_account(monkeypatch) -> None:
@@ -2031,6 +2044,19 @@ def test_ensure_proxy_unseeded_session_never_reuses_a_seeded_proxy(
     else:
         assert actual_port == 8787
         assert ("kill", 12345, 8787) in calls
+
+
+def test_ensure_proxy_unseeded_session_never_reuses_an_api_token_only_seed(monkeypatch) -> None:
+    """No fingerprint to compare, yet still credential-bearing: never shared."""
+    calls: list[object] = []
+    health = _seeded_health(fingerprint=None, anthropic_api_url=None)
+    health["config"]["copilot_seeded"] = True
+    _drive_running_proxy(monkeypatch, health, attached=[999], calls=calls)
+
+    proc, actual_port = wrap_cli._ensure_proxy(8787, False, openai_api_url=_COPILOT_HOST)
+
+    assert actual_port == 8799
+    assert not [c for c in calls if c[0] == "kill"]
 
 
 def test_ensure_proxy_unseeded_session_diverts_from_seeded_persistent_deployment(

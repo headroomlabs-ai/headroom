@@ -394,11 +394,15 @@ def _interrupt_nth_write(monkeypatch: pytest.MonkeyPatch, target: Path, nth: int
 
 
 def _headroom_entries(p: Path) -> list[dict]:
-    return [
-        entry
-        for entry in json.loads(p.read_text(encoding="utf-8"))
-        if entry.get("name") == HEADROOM_PROVIDER_NAME
-    ]
+    """Headroom's entries on disk, minus the inert placeholder key added at write time."""
+    from headroom.providers.copilot.vscode_chat import PLACEHOLDER_API_KEY
+
+    entries = []
+    for entry in json.loads(p.read_text(encoding="utf-8")):
+        if entry.get("name") == HEADROOM_PROVIDER_NAME:
+            assert entry.pop("apiKey") == PLACEHOLDER_API_KEY
+            entries.append(entry)
+    return entries
 
 
 def test_refresh_interrupted_before_config_write_recovers_on_refresh(
@@ -535,11 +539,14 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
 
     from headroom.providers.copilot.vscode_chat import (
         _block_digest,
+        _on_disk,
         _Provenance,
         _provenance_path,
         _read_provenance,
     )
 
+    # Exactly what a v1 build left behind: the entry on disk includes the
+    # placeholder apiKey, and the v1 digest was taken over that whole entry.
     def write_v1(p: Path, block: dict) -> None:
         digest = hashlib.sha256(
             json.dumps(block, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -548,7 +555,7 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(json.dumps({"path": str(p), "sha256": digest}), encoding="utf-8")
 
-    a, b = _block(payload, 1), _block(payload, 2)
+    a, b = _on_disk(_block(payload, 1)), _block(payload, 2)
 
     refreshed = tmp_path / "refreshed.json"
     refreshed.write_text(json.dumps([a], indent=2), encoding="utf-8")
@@ -566,11 +573,16 @@ def test_legacy_v1_record_is_honoured_and_upgraded(
 
 
 def test_block_digest_ignores_the_inert_api_key(payload: dict) -> None:
-    """The placeholder key carries no identity, so it stays out of the digest."""
-    from headroom.providers.copilot.vscode_chat import _block_digest
+    """The placeholder key carries no identity, so it stays out of the digest.
+
+    The in-memory block never holds it at all; only the serialized copy does, so
+    an entry read back from disk must still digest to the block it came from.
+    """
+    from headroom.providers.copilot.vscode_chat import _block_digest, _on_disk
 
     a = _block(payload, 2)
-    assert _block_digest(a) == _block_digest({**a, "apiKey": "something-else"})
+    assert "apiKey" not in a
+    assert _block_digest(a) == _block_digest(_on_disk(a))
     assert _block_digest(a) != _block_digest(_block(payload, 3))
 
 
@@ -630,7 +642,7 @@ def _strip(text: str) -> str:
     return re.sub(r",\s*([}\]])", r"\1", _strip_jsonc_comments(text))
 
 
-def test_api_key_is_an_inert_literal_not_an_input_prompt(payload: dict) -> None:
+def test_api_key_is_an_inert_literal_not_an_input_prompt(payload: dict, tmp_path: Path) -> None:
     """An ``${input:...}`` variable can prompt the user to type a key.
 
     The proxy substitutes the real Copilot credential itself, so the value is
@@ -640,9 +652,11 @@ def test_api_key_is_an_inert_literal_not_an_input_prompt(payload: dict) -> None:
     """
     from headroom.providers.copilot.vscode_chat import PLACEHOLDER_API_KEY
 
-    block = build_provider_block(build_model_entries(payload, BASE))
-    assert block["apiKey"] == PLACEHOLDER_API_KEY
-    assert "${input:" not in block["apiKey"]
+    p = tmp_path / "chatLanguageModels.json"
+    configure_chat_models(p, build_provider_block(build_model_entries(payload, BASE)))
+    [written] = json.loads(p.read_text(encoding="utf-8"))
+    assert written["apiKey"] == PLACEHOLDER_API_KEY
+    assert "${input:" not in written["apiKey"]
     assert "unused" in PLACEHOLDER_API_KEY
 
 
@@ -716,7 +730,9 @@ def test_store_rewrite_is_scoped_to_the_upstreams_that_need_it() -> None:
     assert untouched["store"] is True
 
 
-def _post_responses_through_copilot_proxy(monkeypatch: pytest.MonkeyPatch, body: dict) -> dict:
+def _post_responses_through_copilot_proxy(
+    monkeypatch: pytest.MonkeyPatch, body: dict, *, extra_headers: dict | None = None
+) -> dict:
     """Send one /v1/responses request through a Copilot-pinned proxy; return the wire body."""
     import httpx
     from fastapi.testclient import TestClient
@@ -756,7 +772,7 @@ def _post_responses_through_copilot_proxy(monkeypatch: pytest.MonkeyPatch, body:
         client.app.state.proxy.http_client = httpx.AsyncClient(transport=_Capture())
         response = client.post(
             "/v1/responses",
-            headers={"authorization": "Bearer gho_test_token"},
+            headers={"authorization": "Bearer gho_test_token", **(extra_headers or {})},
             content=json.dumps(body, indent=2).encode("utf-8"),
         )
     assert response.status_code == 200, response.text
@@ -769,6 +785,16 @@ def test_copilot_store_true_reaches_the_wire_as_false(monkeypatch: pytest.Monkey
         monkeypatch, {"model": "gpt-5.5", "input": "hello", "store": True}
     )
     assert wire["store"] is False
+
+
+def test_bypass_keeps_the_clients_store_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`x-headroom-bypass` means "forward my bytes untouched", even toward Copilot."""
+    wire = _post_responses_through_copilot_proxy(
+        monkeypatch,
+        {"model": "gpt-5.5", "input": "hello", "store": True},
+        extra_headers={"x-headroom-bypass": "true"},
+    )
+    assert wire["store"] is True
 
 
 def test_copilot_absent_store_keeps_the_original_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1437,18 +1463,18 @@ def _post_messages_with_api_key(anthropic_api_url: str):
 def test_anthropic_key_is_never_forwarded_to_copilot() -> None:
     """The backstop that makes one shared proxy safe for Claude Code.
 
-    The Anthropic handler forwards the client's own ``x-api-key`` unchanged, and
-    the shared proxy's ``/v1/messages`` upstream is the Copilot host so the
-    Copilot CLI can drive Claude models. Without this check, a Claude Code
-    request that lost its upstream pin would hand the user's Anthropic key to
-    GitHub (reproduced live: Copilot answers ``missing required Authorization
-    header``, having already received it).
+    The shared proxy's ``/v1/messages`` upstream is the Copilot host so the
+    Copilot CLI can drive Claude models, and for a Copilot host the forwarder
+    swaps the client's credential for the proxy's own Copilot token. Without
+    this check, a Claude Code request that lost its upstream pin would be
+    silently answered on that Copilot seat instead of the user's Anthropic
+    account.
     """
     response, upstream = _post_messages_with_api_key("https://api.githubcopilot.com")
 
     assert response.status_code == 502
     assert "GitHub Copilot" in response.json()["error"]["message"]
-    assert upstream.urls == [], "the x-api-key reached the Copilot host"
+    assert upstream.urls == [], "an Anthropic-keyed request was sent to the Copilot host"
 
 
 def test_anthropic_key_still_reaches_a_user_configured_gateway() -> None:

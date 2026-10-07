@@ -3920,16 +3920,18 @@ class AnthropicHandlerMixin:
                 request.url.query,
             )
 
-            # Never hand an Anthropic key to GitHub.
+            # Never answer an Anthropic-keyed client on someone's Copilot seat.
             #
             # One proxy has one default destination for this wire, so a proxy
             # pinned at Copilot (what `wrap copilot --native` needs, and what the
-            # shared Copilot CLI + VS Code proxy uses) would forward this
-            # client's `x-api-key` straight to GitHub -- the key is passed
-            # through unchanged. `wrap claude` pins its own upstream per request
-            # to avoid that; this is the backstop for anything that does not,
-            # so a dropped header degrades to a clear local error instead of a
-            # silent credential disclosure.
+            # shared Copilot CLI + VS Code proxy uses) would send this client's
+            # request to GitHub. For a Copilot host the forwarder drops the
+            # client's `x-api-key` and substitutes the proxy's own Copilot token
+            # (`apply_copilot_api_auth`), so the request would be silently served
+            # on that credential instead of the Anthropic account the client
+            # chose. `wrap claude` pins its own upstream per request to avoid
+            # that; this is the backstop for anything that does not, so a
+            # dropped pin degrades to a clear local error.
             #
             # Scoped to Copilot hosts on purpose: an Anthropic-compatible
             # gateway the user configured (LiteLLM, Foundry, an inherited
@@ -3954,8 +3956,9 @@ class AnthropicHandlerMixin:
                             "type": "api_error",
                             "message": (
                                 "This Headroom proxy's Anthropic upstream is "
-                                f"{self.ANTHROPIC_API_URL} (GitHub Copilot), so forwarding your "
-                                "x-api-key would disclose it to another vendor. Use a proxy "
+                                f"{self.ANTHROPIC_API_URL} (GitHub Copilot), so this request "
+                                "would be served on the proxy's Copilot credential instead of "
+                                "your Anthropic key. Use a proxy "
                                 "port of your own, or send "
                                 "'X-Headroom-Base-Url: https://api.anthropic.com'."
                             ),

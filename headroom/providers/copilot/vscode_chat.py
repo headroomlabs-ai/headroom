@@ -214,13 +214,24 @@ PLACEHOLDER_API_KEY = "headroom-local-unused"
 
 
 def build_provider_block(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """The single provider object Headroom owns in ``chatLanguageModels.json``."""
+    """The single provider object Headroom owns in ``chatLanguageModels.json``.
+
+    Deliberately without ``apiKey``: the inert placeholder is attached only to
+    the copy that is serialized to disk (``_on_disk``). That keeps the block the
+    ownership digest is computed from free of any credential-named value -- the
+    placeholder carries no identity, and a value named like a key has no
+    business flowing into a hash.
+    """
     return {
         "name": HEADROOM_PROVIDER_NAME,
         "vendor": CUSTOM_ENDPOINT_VENDOR,
-        "apiKey": PLACEHOLDER_API_KEY,
         "models": entries,
     }
+
+
+def _on_disk(block: Mapping[str, Any]) -> dict[str, Any]:
+    """The block as written to ``chatLanguageModels.json``, placeholder key included."""
+    return {**block, "apiKey": PLACEHOLDER_API_KEY}
 
 
 def _provenance_path(path: Path) -> Path:
@@ -322,11 +333,10 @@ def _clear_provenance(path: Path) -> None:
 
 
 def _digest_view(block: Mapping[str, Any]) -> dict[str, Any]:
-    # Explicit literal-key reads rather than a filtered copy of ``block``. The
-    # ``apiKey`` field is always the inert ``PLACEHOLDER_API_KEY`` and carries no
-    # identity, so leaving it out loses nothing -- and a value named like a
-    # credential has no business in a digest input anyway (CodeQL classifies it
-    # as password-like by name and flags any plain hash over it).
+    # ``apiKey`` is always the inert ``PLACEHOLDER_API_KEY`` and carries no
+    # identity, so it is not part of what makes a block Headroom's. Entries read
+    # back from disk carry it; blocks built in memory never do (see
+    # ``build_provider_block``), so both reduce to the same view.
     return {
         "name": block.get("name"),
         "vendor": block.get("vendor"),
@@ -400,16 +410,18 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
     ]
     if len(owned_indexes) > 1:
         raise click.ClickException(
-            f"{path} contains multiple identical Headroom provider entries; "
-            "remove the duplicate so Headroom can tell which to update."
+            f"{path} contains more than one provider entry matching Headroom's "
+            "ownership record (for example a copy of Headroom's entry); remove the "
+            "extra one so Headroom can tell which to update."
         )
 
     committed_before: str | None
+    written = _on_disk(block)
     if owned_indexes:
         # Recomputed from disk rather than copied from the record, so a record
         # left pending (or in the v1 format) is normalized by this write.
         committed_before = _block_digest(providers[owned_indexes[0]])
-        providers[owned_indexes[0]] = block
+        providers[owned_indexes[0]] = written
         action = "updated"
     else:
         conflicting = [
@@ -423,7 +435,7 @@ def configure_chat_models(path: Path, block: dict[str, Any]) -> str:
                 "Headroom did not write; refusing to replace it. Rename or remove it, "
                 "or pass --no-configure."
             )
-        providers.append(block)
+        providers.append(written)
         committed_before = None
         action = "added"
 
