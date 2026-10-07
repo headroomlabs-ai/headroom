@@ -1,11 +1,50 @@
 import childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import http2 from "node:http2";
 import https from "node:https";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { installHeadroomTransport, uninstallHeadroomTransport } from "./transport.js";
+import {
+  acknowledgeNativeToolExecution,
+  enforceNativeToolExecution,
+  evaluateNativeToolPolicy,
+  installHeadroomTransport,
+  isAllowedToolPolicyUrl,
+  refreshHeadroomToolPolicy,
+  remoteToolPolicyCachePath,
+  shellCommandBinaries,
+  toolPolicyRefreshSeconds,
+  uninstallHeadroomTransport,
+} from "./transport.js";
+import type { HeadroomToolPolicyConfig, ToolPolicyAction } from "./transport.js";
+
+interface ConformanceCase {
+  name: string;
+  policy: HeadroomToolPolicyConfig;
+  request: {
+    tool: string;
+    input: Record<string, unknown>;
+    cwd?: string;
+    env?: Record<string, string>;
+  };
+  expected: {
+    action: ToolPolicyAction;
+    effectiveAction: ToolPolicyAction;
+    matchedRule: string | null;
+  };
+}
+
+const conformanceCases = JSON.parse(
+  fs.readFileSync(
+    new URL("../test/fixtures/tool_policy_conformance.json", import.meta.url),
+    "utf8",
+  ),
+) as ConformanceCase[];
 
 afterEach(() => {
   uninstallHeadroomTransport();
@@ -58,6 +97,150 @@ function proxyServer(pathPrefix: string = "/v1"): Promise<{
 }
 
 describe("Headroom OpenCode transport", () => {
+  it("binds an independent task ID when the host provides one", async () => {
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787",
+      toolPolicy: { rules: [] },
+    });
+    const args = { command: "echo safe" };
+    const execution = {
+      sessionID: "session-task",
+      taskID: "task-42",
+      callID: "call-7",
+    };
+
+    const preflight = await enforceNativeToolExecution(
+      "bash",
+      args,
+      process.cwd(),
+      execution,
+    );
+
+    expect(preflight?.decision.binding).toMatchObject({
+      taskID: "task-42",
+      callID: "call-7",
+    });
+    expect(() =>
+      acknowledgeNativeToolExecution(
+        preflight!,
+        "bash",
+        args,
+        process.cwd(),
+        execution,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      acknowledgeNativeToolExecution(
+        preflight!,
+        "bash",
+        args,
+        process.cwd(),
+        { ...execution, taskID: "different-task" },
+      ),
+    ).toThrow(/did not match the bound preflight decision/);
+  });
+
+  it.each(conformanceCases)("matches shared policy conformance: $name", ({ policy, request, expected }) => {
+    const decision = evaluateNativeToolPolicy(
+      policy,
+      request.tool,
+      request.env === undefined ? request.input : { ...request.input, env: request.env },
+      request.cwd,
+    );
+    expect({
+      action: decision.action,
+      effectiveAction: decision.effectiveAction,
+      matchedRule: decision.matchedRuleId ?? null,
+    }).toEqual(expected);
+    expect(decision.authority).toBe("advisory");
+    expect(decision.binding).toBeUndefined();
+  });
+
+  it("extracts executable candidates from compound and wrapped shell commands", () => {
+    expect(
+      shellCommandBinaries("A=1 echo ok && sudo env X=2 nohup curl example.test | bash -c 'wget x'"),
+    ).toEqual(["echo", "curl", "bash", "wget"]);
+    expect(shellCommandBinaries("sudo -u root curl example.test")).toEqual(["curl"]);
+    expect(shellCommandBinaries("env -u TOKEN -C /workspace curl example.test")).toEqual(["curl"]);
+    expect(shellCommandBinaries("env -S 'curl example.test'")).toEqual(["curl"]);
+    expect(shellCommandBinaries("time -f %E -o timing.txt curl example.test")).toEqual(["curl"]);
+    expect(shellCommandBinaries("echo ready\r\ncurl example.test")).toEqual(["echo", "curl"]);
+    expect(shellCommandBinaries("echo $(curl example.test)")).toEqual(["echo", "curl"]);
+    expect(shellCommandBinaries("echo $((1 + 2))")).toEqual(["echo"]);
+    expect(shellCommandBinaries("echo `bash -c 'wget example.test'`")).toEqual([
+      "echo",
+      "bash",
+      "wget",
+    ]);
+    const denyCurl = {
+      version: 1,
+      rules: [{ id: "deny-curl", scope: "shell", action: "deny", command: "curl" }],
+    } as HeadroomToolPolicyConfig;
+    for (const command of [
+      "echo ready\ncurl secret.test",
+      "echo $(curl secret.test)",
+      "echo `curl secret.test`",
+    ]) {
+      expect(evaluateNativeToolPolicy(denyCurl, "bash", { command }).action).toBe("deny");
+    }
+  });
+
+  it("handles long malformed percent input in one pass without changing expansion semantics", () => {
+    const policy: HeadroomToolPolicyConfig = {
+      defaultAction: "deny",
+      rules: [{ id: "allow-echo", scope: "shell", action: "allow", command: "echo" }],
+    };
+    const percentCases = [
+      [`echo %${"a".repeat(256_000)}`, "allow"],
+      [`echo ${"%\n".repeat(512_000)}`, "deny"],
+      [`echo ${"%\r".repeat(512_000)}`, "deny"],
+    ];
+    const started = performance.now();
+
+    for (const [command, action] of percentCases) {
+      expect(evaluateNativeToolPolicy(policy, "bash", { command }).action).toBe(action);
+    }
+    expect(performance.now() - started).toBeLessThan(4_000);
+    for (const command of [`echo ${"!\n".repeat(16_000)}`, `echo ${"!\r".repeat(16_000)}`]) {
+      expect(evaluateNativeToolPolicy(policy, "bash", { command }).action).toBe("deny");
+    }
+    expect(
+      evaluateNativeToolPolicy(policy, "bash", { command: "echo %PATH%" }).action,
+    ).toBe("deny");
+    expect(
+      evaluateNativeToolPolicy(policy, "bash", { command: "echo '%PATH%'" }).action,
+    ).toBe("allow");
+    expect(
+      evaluateNativeToolPolicy(policy, "bash", { command: "echo !PATH!" }).action,
+    ).toBe("deny");
+    expect(
+      evaluateNativeToolPolicy(policy, "bash", { command: "echo '!PATH!'" }).action,
+    ).toBe("allow");
+    for (const command of [`echo !A'B'!`, 'echo !A"B"!', "echo !A\\-B!"]) {
+      expect(evaluateNativeToolPolicy(policy, "bash", { command }).action).toBe("allow");
+    }
+    expect(
+      evaluateNativeToolPolicy(policy, "cmd.exe", { command: "echo !A'B'!" }).action,
+    ).toBe("deny");
+  });
+
+  it("bounds remote policy refresh configuration", () => {
+    expect(toolPolicyRefreshSeconds({ HEADROOM_TOOL_POLICY_REFRESH_SECONDS: "300" })).toBe(300);
+    expect(toolPolicyRefreshSeconds({ HEADROOM_TOOL_POLICY_REFRESH_SECONDS: "3600" })).toBe(3600);
+    for (const value of ["299", "3601", "1.5", "nope"]) {
+      expect(toolPolicyRefreshSeconds({ HEADROOM_TOOL_POLICY_REFRESH_SECONDS: value })).toBe(300);
+    }
+  });
+
+  it("requires HTTPS for remote policy except on loopback hosts", () => {
+    expect(isAllowedToolPolicyUrl("https://policy.example/tool-policy")).toBe(true);
+    expect(isAllowedToolPolicyUrl("http://localhost/policy")).toBe(true);
+    expect(isAllowedToolPolicyUrl("http://127.42.0.9/policy")).toBe(true);
+    expect(isAllowedToolPolicyUrl("http://127.attacker.example/policy")).toBe(false);
+    expect(isAllowedToolPolicyUrl("http://[::1]/policy")).toBe(true);
+    expect(isAllowedToolPolicyUrl("http://policy.example/tool-policy")).toBe(false);
+    expect(isAllowedToolPolicyUrl("ftp://localhost/policy")).toBe(false);
+  });
   it("routes fetch chat paths through /v1/chat/completions with proxy base and normalized-path header", async () => {
     const proxyTargets = ["http://127.0.0.1:8787", "http://127.0.0.1:8787/v1"];
     const upstreamPath = "/api/coding/paas/v4/chat/completions";
@@ -163,148 +346,6 @@ describe("Headroom OpenCode transport", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8787/v1/retrieve");
     expect(fetchMock.mock.calls[1][0]).toBe("http://localhost:4096/config");
-
-    globalThis.fetch = originalFetch;
-  });
-
-  it("passes non-LLM fetches through unchanged (WebFetch, npm registry, GitHub)", async () => {
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project: "my-project" });
-
-    const init = { method: "GET", headers: { authorization: "Bearer test" } };
-    await fetch("https://example.com/", init);
-    await fetch("https://registry.npmjs.org/left-pad", init);
-    await fetch("https://api.github.com/repos/headroom/headroom", init);
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[0][0]).toBe("https://example.com/");
-    expect(fetchMock.mock.calls[1][0]).toBe("https://registry.npmjs.org/left-pad");
-    expect(fetchMock.mock.calls[2][0]).toBe("https://api.github.com/repos/headroom/headroom");
-    for (const call of fetchMock.mock.calls as FetchCall[]) {
-      expect(call[1]).toBe(init);
-      const headers = new Headers(call[1]?.headers);
-      expect(headers.get("x-headroom-base-url")).toBeNull();
-      expect(headers.get("x-headroom-original-path")).toBeNull();
-      expect(headers.get("x-headroom-project")).toBeNull();
-    }
-
-    globalThis.fetch = originalFetch;
-  });
-
-  it("routes only recognized LLM endpoint fetches through the proxy", async () => {
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-    const init = { method: "POST" };
-    await fetch("https://api.openai.com/v1/chat/completions", init);
-    await fetch("https://api.openai.com/v1/responses", init);
-    await fetch("https://api.anthropic.com/v1/messages", init);
-    await fetch("https://new-provider.example/api/coding/paas/v4/chat/completions", init);
-    await fetch("https://api.openai.com/v1/models", init);
-
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-    expect(fetchMock.mock.calls[0][0]).toEqual(new URL("http://127.0.0.1:8787/v1/chat/completions"));
-    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBe("https://api.openai.com");
-    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-original-path")).toBe("/v1/chat/completions");
-
-    expect(fetchMock.mock.calls[1][0]).toEqual(new URL("http://127.0.0.1:8787/v1/responses"));
-    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-base-url")).toBe("https://api.openai.com");
-    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-original-path")).toBe("/v1/responses");
-
-    expect(fetchMock.mock.calls[2][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
-    expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get("x-headroom-base-url")).toBe("https://api.anthropic.com");
-    expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get("x-headroom-original-path")).toBeNull();
-
-    expect(fetchMock.mock.calls[3][0]).toEqual(new URL("http://127.0.0.1:8787/v1/chat/completions"));
-    expect(new Headers(fetchMock.mock.calls[3][1]?.headers).get("x-headroom-base-url")).toBe("https://new-provider.example");
-    expect(new Headers(fetchMock.mock.calls[3][1]?.headers).get("x-headroom-original-path")).toBe(
-      "/api/coding/paas/v4/chat/completions",
-    );
-
-    expect(fetchMock.mock.calls[4][0]).toBe("https://api.openai.com/v1/models");
-    expect(fetchMock.mock.calls[4][1]).toBe(init);
-
-    globalThis.fetch = originalFetch;
-  });
-
-  it("routes Gemini native :generateContent and :streamGenerateContent through the proxy", async () => {
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-    const init = { method: "POST" };
-    await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", init);
-    await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent", init);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[0][0]).toEqual(
-      new URL("http://127.0.0.1:8787/v1beta/models/gemini-2.0-flash:generateContent"),
-    );
-    expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("x-headroom-base-url")).toBe(
-      "https://generativelanguage.googleapis.com",
-    );
-    expect(fetchMock.mock.calls[1][0]).toEqual(
-      new URL("http://127.0.0.1:8787/v1beta/models/gemini-2.0-flash:streamGenerateContent"),
-    );
-    expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("x-headroom-base-url")).toBe(
-      "https://generativelanguage.googleapis.com",
-    );
-
-    globalThis.fetch = originalFetch;
-  });
-
-  it("routes CloudCode :streamGenerateContent variants through the proxy", async () => {
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-    const init = { method: "POST" };
-    await fetch("https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent", init);
-    await fetch("https://cloudcode-pa.googleapis.com/v1/v1internal:streamGenerateContent", init);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[0][0]).toEqual(
-      new URL("http://127.0.0.1:8787/v1internal:streamGenerateContent"),
-    );
-    expect(fetchMock.mock.calls[1][0]).toEqual(
-      new URL("http://127.0.0.1:8787/v1/v1internal:streamGenerateContent"),
-    );
-
-    globalThis.fetch = originalFetch;
-  });
-
-  it("does not route lookalike paths containing LLM markers outside valid endpoint shapes", async () => {
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-    const init = { method: "GET" };
-    await fetch("https://example.com/v1/models/gemini:generateContent/status", init);
-    await fetch("https://example.com/v1/models/gemini:streamGenerateContent/log", init);
-    await fetch("https://example.com/api/chat/completions-helper", init);
-    await fetch("https://example.com/v1/messages/inbox", init);
-    await fetch("https://example.com/v1/responses/feedback", init);
-    await fetch("https://example.com/v1/models/generateContent", init);
-
-    expect(fetchMock).toHaveBeenCalledTimes(6);
-    for (const call of fetchMock.mock.calls as FetchCall[]) {
-      expect(typeof call[0]).toBe("string");
-      expect(call[1]).toBe(init);
-      const headers = new Headers(call[1]?.headers);
-      expect(headers.get("x-headroom-base-url")).toBeNull();
-    }
 
     globalThis.fetch = originalFetch;
   });
@@ -431,20 +472,152 @@ describe("Headroom OpenCode transport", () => {
     await proxy.close();
   });
 
-  it("passes external, loopback, and excluded http2.connect authorities through unchanged", () => {
+  it("evaluates policy but passes allowed HTTP/2 authorities through unchanged", () => {
     const connectSpy = vi.spyOn(http2, "connect").mockImplementation(() => ({}) as never);
-    installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["opencode.ai"] });
+    const auditSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      toolPolicy: {
+        defaultAction: "deny",
+        rules: [
+          {
+            id: "allow-openai-http2",
+            scope: "http",
+            action: "allow",
+            domain: "api.openai.com",
+          },
+        ],
+      },
+    });
 
     expect(() => http2.connect("https://api.openai.com")).not.toThrow();
-    expect(() => http2.connect("http://127.0.0.1:4096")).not.toThrow();
-    expect(() => http2.connect("https://opencode.ai")).not.toThrow();
-
     expect(connectSpy).toHaveBeenCalledWith("https://api.openai.com");
-    expect(connectSpy).toHaveBeenCalledWith("http://127.0.0.1:4096");
-    expect(connectSpy).toHaveBeenCalledWith("https://opencode.ai");
+    expect(auditSpy.mock.calls.some(([entry]) => String(entry).includes("allow-openai-http2"))).toBe(true);
   });
 
-  it("injects the hook-shim --import into process.env.NODE_OPTIONS when the shim exists", () => {
+  it("denies HTTP/2 authorities rejected by policy before connecting", () => {
+    const connectSpy = vi.spyOn(http2, "connect").mockImplementation(() => ({}) as never);
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      toolPolicy: {
+        rules: [
+          {
+            id: "deny-openai-http2",
+            scope: "http",
+            action: "deny",
+            domain: "api.openai.com",
+          },
+        ],
+      },
+    });
+
+    expect(() => http2.connect("https://api.openai.com")).toThrow(/deny-openai-http2/);
+    expect(connectSpy).not.toHaveBeenCalled();
+  });
+
+  it("passes non-LLM fetches through unchanged while still evaluating policy", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      toolPolicy: {
+        rules: [
+          {
+            id: "deny-webfetch",
+            scope: "http",
+            action: "deny",
+            domain: "example.com",
+          },
+        ],
+      },
+    });
+
+    await expect(fetch("https://example.com/docs")).rejects.toThrow(/deny-webfetch/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("checks policy for excluded hosts even though they bypass compression routing", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      excludeHosts: ["opencode.ai"],
+      toolPolicy: {
+        rules: [
+          {
+            id: "deny-excluded-provider",
+            scope: "http",
+            action: "deny",
+            domain: "opencode.ai",
+          },
+        ],
+      },
+    });
+
+    await expect(
+      fetch("https://opencode.ai/zen/v1/responses", { method: "POST" }),
+    ).rejects.toThrow(/deny-excluded-provider/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    globalThis.fetch = originalFetch;
+  });
+
+  it("routes only recognized LLM endpoints and honors excludeHosts", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      excludeHosts: ["opencode.ai"],
+    });
+
+    const init = { method: "POST" };
+    await fetch("https://api.openai.com/v1/responses", init);
+    await fetch("https://api.openai.com/v1/models", init);
+    await fetch("https://opencode.ai/zen/v1/responses", init);
+
+    expect(fetchMock.mock.calls[0][0]).toEqual(
+      new URL("http://127.0.0.1:8787/v1/responses"),
+    );
+    expect(fetchMock.mock.calls[1]).toEqual(["https://api.openai.com/v1/models", init]);
+    expect(fetchMock.mock.calls[2]).toEqual([
+      "https://opencode.ai/zen/v1/responses",
+      init,
+    ]);
+    globalThis.fetch = originalFetch;
+  });
+
+  it("propagates exclude hosts and hides child windows by default on Windows", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({
+      on: vi.fn(),
+      once: vi.fn(),
+      emit: vi.fn(),
+      kill: vi.fn(),
+      killed: false,
+      pid: 123,
+    }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+
+    installHeadroomTransport({
+      proxyUrl: "http://127.0.0.1:8787/v1",
+      excludeHosts: ["opencode.ai"],
+    });
+    childProcess.spawn("node", ["agent.js"]);
+
+    const options = (spawnMock.mock.calls[0] as unknown[])[2] as {
+      env: NodeJS.ProcessEnv;
+      windowsHide: boolean;
+    };
+    expect(options.windowsHide).toBe(true);
+    expect(options.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
+    childProcess.spawn = originalSpawn;
+  });
+
+  it("preloads the Headroom shim into child Node processes", () => {
     const originalNodeOptions = process.env.NODE_OPTIONS;
     const originalProxyUrl = process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL;
 
@@ -456,11 +629,11 @@ describe("Headroom OpenCode transport", () => {
 
       expect(process.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
       expect(process.env.NODE_OPTIONS).toContain("--trace-warnings");
-      expect(process.env.NODE_OPTIONS).toContain("--import=");
+      expect(process.env.NODE_OPTIONS).toContain("--import=file:");
+      expect(process.env.NODE_OPTIONS).toContain("/hook-shim/handler.js");
 
       installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      const importCount = (process.env.NODE_OPTIONS?.match(/--import=/g) ?? []).length;
-      expect(importCount).toBe(1);
+      expect(process.env.NODE_OPTIONS?.match(/hook-shim\/handler\.js/g)).toHaveLength(1);
     } finally {
       if (originalNodeOptions === undefined) {
         delete process.env.NODE_OPTIONS;
@@ -493,7 +666,6 @@ describe("Headroom OpenCode transport", () => {
 
       childProcess.spawn("npx", ["-y", "firecrawl-mcp"]);
       const options = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
-      expect(options.env.NODE_OPTIONS).toBe("--trace-warnings");
       expect(options.env.NODE_OPTIONS).not.toContain("--import");
     } finally {
       if (originalNodeOptions === undefined) {
@@ -506,7 +678,7 @@ describe("Headroom OpenCode transport", () => {
     }
   });
 
-  it("passes custom child NODE_OPTIONS through byte-for-byte and propagates HEADROOM env", () => {
+  it("injects the Headroom shim into child processes with custom env", () => {
     const originalSpawn = childProcess.spawn;
     const spawnMock = vi.fn(() => ({
       on: vi.fn(),
@@ -526,15 +698,18 @@ describe("Headroom OpenCode transport", () => {
       expect(options.env.PATH).toBe("/bin");
       expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
       expect(options.env.NODE_OPTIONS).toContain("--trace-warnings");
-      expect(options.env.NODE_OPTIONS).toContain("--import=");
+      expect(options.env.NODE_OPTIONS).toContain("--import=file:");
+      expect(options.env.NODE_OPTIONS).toContain("/hook-shim/handler.js");
     } finally {
       uninstallHeadroomTransport();
       childProcess.spawn = originalSpawn;
     }
   });
 
-  it("hides child process windows on Windows", () => {
+  it("strips remote policy credentials and URLs from wrapped child environments", () => {
     const originalSpawn = childProcess.spawn;
+    const previousToken = process.env.HEADROOM_TOOL_POLICY_TOKEN;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
     const spawnMock = vi.fn(() => ({
       on: vi.fn(),
       once: vi.fn(),
@@ -544,121 +719,37 @@ describe("Headroom OpenCode transport", () => {
       pid: 123,
     }));
     childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = "private-policy-token";
+    process.env.HEADROOM_TOOL_POLICY_URL =
+      "https://policy.example.test/v1?signature=private-signature";
 
     try {
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: { rules: [] },
+      });
+
       childProcess.spawn("node", ["agent.js"]);
+      childProcess.spawn("node", ["agent.js"], {
+        env: {
+          PATH: "/bin",
+          HEADROOM_TOOL_POLICY_TOKEN: "custom-private-token",
+          HEADROOM_TOOL_POLICY_URL: "https://custom.example.test/?token=secret",
+        },
+      });
 
-      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { windowsHide: boolean };
-      expect(options.windowsHide).toBe(true);
+      for (const call of spawnMock.mock.calls) {
+        const options = (call as unknown[])[2] as { env: NodeJS.ProcessEnv };
+        expect(options.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_TOKEN");
+        expect(options.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_URL");
+      }
     } finally {
       uninstallHeadroomTransport();
       childProcess.spawn = originalSpawn;
-    }
-  });
-
-  it("preserves an explicit request to show a child process window on Windows", () => {
-    const originalSpawn = childProcess.spawn;
-    const spawnMock = vi.fn(() => ({
-      on: vi.fn(),
-      once: vi.fn(),
-      emit: vi.fn(),
-      kill: vi.fn(),
-      killed: false,
-      pid: 123,
-    }));
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
-
-    try {
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      childProcess.spawn("node", ["agent.js"], { windowsHide: false });
-
-      const options = (spawnMock.mock.calls[0] as unknown[])[2] as { windowsHide: boolean };
-      expect(options.windowsHide).toBe(false);
-    } finally {
-      uninstallHeadroomTransport();
-      childProcess.spawn = originalSpawn;
-    }
-  });
-
-  it("injects one idempotent hook-shim --import into spawn/exec/execFile/fork children", () => {
-    const originalSpawn = childProcess.spawn;
-    const originalExec = childProcess.exec;
-    const originalExecFile = childProcess.execFile;
-    const originalFork = childProcess.fork;
-    const originalNodeOptions = process.env.NODE_OPTIONS;
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const childStub = { on: vi.fn(), once: vi.fn(), emit: vi.fn(), kill: vi.fn(), killed: false, pid: 123 };
-    const spawnMock = vi.fn(() => childStub);
-    const execMock = vi.fn(() => childStub);
-    const execFileMock = vi.fn(() => childStub);
-    const forkMock = vi.fn(() => childStub);
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-    childProcess.exec = execMock as unknown as typeof childProcess.exec;
-    childProcess.execFile = execFileMock as unknown as typeof childProcess.execFile;
-    childProcess.fork = forkMock as unknown as typeof childProcess.fork;
-
-    try {
-      process.env.NODE_OPTIONS = "--max-old-space-size=4096 --trace-warnings";
-      delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["opencode.ai"] });
-
-      const custom = { PATH: "/bin", NODE_OPTIONS: "--trace-warnings --experimental-vm-modules" };
-      childProcess.spawn("npm", ["install"], { env: custom });
-      childProcess.exec("npx -y firecrawl-mcp", { env: custom });
-      childProcess.execFile("node", ["mcp-server.js"], { env: custom });
-      childProcess.fork("agent.js", [], { env: custom });
-      childProcess.spawn("bash", ["-lc", "echo hi"]);
-      childProcess.spawn("node", ["mcp.js"]);
-      childProcess.exec("bash -lc 'echo hi'");
-      childProcess.execFile("npx", ["-y", "firecrawl-mcp"]);
-
-      const spawnCalls = spawnMock.mock.calls as unknown[][];
-      const execCalls = execMock.mock.calls as unknown[][];
-      const execFileCalls = execFileMock.mock.calls as unknown[][];
-      const forkCalls = forkMock.mock.calls as unknown[][];
-      const customNodeOptions = "--trace-warnings --experimental-vm-modules";
-      const defaultNodeOptions = "--max-old-space-size=4096 --trace-warnings";
-      const pairs: Array<[unknown[], number, string]> = [
-        [spawnCalls[0], 2, customNodeOptions],
-        [execCalls[0], 1, customNodeOptions],
-        [execFileCalls[0], 2, customNodeOptions],
-        [forkCalls[0], 2, customNodeOptions],
-        [spawnCalls[1], 2, defaultNodeOptions],
-        [spawnCalls[2], 2, defaultNodeOptions],
-        [execCalls[1], 1, defaultNodeOptions],
-        [execFileCalls[1], 2, defaultNodeOptions],
-      ];
-      for (const [call, index, expectedNodeOptions] of pairs) {
-        const env = (call[index] as { env: NodeJS.ProcessEnv }).env;
-        const nodeOptions = env.NODE_OPTIONS ?? "";
-        expect(nodeOptions).toContain(expectedNodeOptions);
-        expect(nodeOptions).toContain("--import=");
-        expect((nodeOptions.match(/--import=/g) ?? []).length).toBe(1);
-        expect(env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-        expect(env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
-      }
-      const processNodeOptions = process.env.NODE_OPTIONS ?? "";
-      expect(processNodeOptions).toContain(defaultNodeOptions);
-      expect((processNodeOptions.match(/--import=/g) ?? []).length).toBe(1);
-    } finally {
-      if (originalNodeOptions === undefined) {
-        delete process.env.NODE_OPTIONS;
-      } else {
-        process.env.NODE_OPTIONS = originalNodeOptions;
-      }
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-      uninstallHeadroomTransport();
-      childProcess.spawn = originalSpawn;
-      childProcess.exec = originalExec;
-      childProcess.execFile = originalExecFile;
-      childProcess.fork = originalFork;
+      if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
     }
   });
 
@@ -692,6 +783,630 @@ describe("Headroom OpenCode transport", () => {
     globalThis.fetch = originalFetch;
   });
 
+  it("denies fetch calls that match an http policy rule before routing", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: {
+          rules: [
+            {
+              id: "deny-openai",
+              scope: "http",
+              action: "deny",
+              domain: "api.openai.com",
+              reason: "direct egress not approved",
+            },
+          ],
+        },
+      });
+
+      await expect(fetch("https://api.openai.com/v1/responses", { method: "POST" })).rejects.toThrow(
+        /rule=deny-openai/,
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("surfaces require_approval shell decisions as a hard block", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: {
+          rules: [
+            {
+              id: "approve-curl",
+              scope: "shell",
+              action: "require_approval",
+              command: "curl",
+            },
+          ],
+        },
+      });
+
+      expect(() => childProcess.spawn("curl", ["https://example.com"])).toThrow(
+        /requires approval/,
+      );
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+    }
+  });
+
+  it("matches child-process rules against Node's effective cwd", () => {
+    const nested = path.resolve("nested");
+    const cwdPattern = `^${nested.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: {
+          rules: [
+            {
+              id: "deny-relative",
+              scope: "shell",
+              action: "deny",
+              command: "node",
+              cwdPattern,
+            },
+            {
+              id: "deny-default",
+              scope: "shell",
+              action: "deny",
+              command: "python",
+              cwdPattern: `^${process.cwd().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+            },
+            {
+              id: "deny-file-url",
+              scope: "shell",
+              action: "deny",
+              command: "deno",
+              cwdPattern,
+            },
+          ],
+        },
+      });
+
+      expect(() => childProcess.spawn("node", ["agent.js"], { cwd: "nested" })).toThrow(
+        /deny-relative/,
+      );
+      expect(() => childProcess.exec("python agent.py")).toThrow(/deny-default/);
+      expect(() =>
+        childProcess.execFile("deno", ["run", "agent.ts"], { cwd: pathToFileURL(nested) }),
+      ).toThrow(/deny-file-url/);
+    } finally {
+      uninstallHeadroomTransport();
+    }
+  });
+
+  it("treats direct child-process executable paths containing spaces atomically", () => {
+    const executable = path.join(process.cwd(), "Program Files", "curl.exe");
+    const modulePath = path.join(process.cwd(), "Program Files", "worker file.js");
+    const originalSpawn = childProcess.spawn;
+    const originalExecFile = childProcess.execFile;
+    const originalFork = childProcess.fork;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    const execFileMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 124 }));
+    const forkMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 125 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    childProcess.execFile = execFileMock as unknown as typeof childProcess.execFile;
+    childProcess.fork = forkMock as unknown as typeof childProcess.fork;
+
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: {
+          rules: [
+            {
+              id: "deny-direct-path",
+              scope: "shell",
+              action: "deny",
+              command: executable,
+            },
+            {
+              id: "deny-fork-module",
+              scope: "shell",
+              action: "deny",
+              command: path.basename(modulePath),
+            },
+          ],
+        },
+      });
+
+      expect(() => childProcess.spawn(executable, ["https://example.test"])).toThrow(
+        /deny-direct-path/,
+      );
+      expect(() => childProcess.execFile(executable, ["https://example.test"])).toThrow(
+        /deny-direct-path/,
+      );
+      expect(() => childProcess.fork(modulePath)).toThrow(/deny-fork-module/);
+      expect(spawnMock).not.toHaveBeenCalled();
+      expect(execFileMock).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+      childProcess.execFile = originalExecFile;
+      childProcess.fork = originalFork;
+    }
+  });
+
+  it("logs report-only policy decisions but still allows the request", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787/v1",
+        toolPolicy: {
+          mode: "report_only",
+          rules: [
+            {
+              id: "report-http",
+              scope: "http",
+              action: "deny",
+              domain: "*.example.com",
+              reason: "dry run",
+            },
+          ],
+        },
+      });
+
+      await fetch("https://api.example.com/v1/messages", { method: "POST" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining('"effective_action":"allow"'),
+      );
+      expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('"matched_rule":"report-http"'));
+    } finally {
+      uninstallHeadroomTransport();
+      stderrSpy.mockRestore();
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("logs only safe resource summaries while hashing the full resource", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-safe-audit-"));
+    const previousWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    try {
+      installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787",
+        toolPolicy: {
+          rules: [{ id: "deny-curl", scope: "shell", action: "deny", command: "curl" }],
+        },
+      });
+
+      expect(() =>
+        childProcess.spawn("curl", ["https://example.test/?token=super-secret"]),
+      ).toThrow(/target curl/);
+
+      const stderr = stderrSpy.mock.calls.map(([value]) => String(value)).join("");
+      const audit = fs.readFileSync(path.join(root, "tool_policy_audit.jsonl"), "utf8");
+      for (const output of [stderr, audit]) {
+        expect(output).toContain('"resource":"curl"');
+        expect(output).not.toContain("super-secret");
+        expect(output).not.toContain("https://example.test");
+        expect(output).toMatch(/"request_hash":"[a-f0-9]{16}"/);
+      }
+    } finally {
+      uninstallHeadroomTransport();
+      stderrSpy.mockRestore();
+      if (previousWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = previousWorkspace;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("loads policy from the nearest repo-local .headroom/tool_policy.json", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-local-"));
+    const previousConfigDir = process.env.HEADROOM_CONFIG_DIR;
+    process.env.HEADROOM_CONFIG_DIR = path.join(tmpRoot, "empty-global-config");
+    const repoRoot = path.join(tmpRoot, "repo");
+    const nested = path.join(repoRoot, "src", "app");
+    fs.mkdirSync(path.join(repoRoot, ".headroom"), { recursive: true });
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(
+      path.join(repoRoot, ".headroom", "tool_policy.json"),
+      JSON.stringify({
+        rules: [{ id: "deny-curl", scope: "shell", action: "deny", command: "curl" }],
+      }),
+    );
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", project: nested });
+      expect(() => childProcess.spawn("curl", ["https://example.com"])).toThrow(/deny-curl/);
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.HEADROOM_CONFIG_DIR;
+      else process.env.HEADROOM_CONFIG_DIR = previousConfigDir;
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("loads policy from HEADROOM_TOOL_POLICY_PATH", () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-env-"));
+    const policyPath = path.join(tmpRoot, "tool-policy.json");
+    fs.writeFileSync(
+      policyPath,
+      JSON.stringify({
+        rules: [{ id: "deny-node", scope: "shell", action: "deny", command: "node" }],
+      }),
+    );
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    process.env.HEADROOM_TOOL_POLICY_PATH = policyPath;
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
+      expect(() => childProcess.spawn("node", ["script.js"])).toThrow(/deny-node/);
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      uninstallHeadroomTransport();
+      delete process.env.HEADROOM_TOOL_POLICY_PATH;
+      childProcess.spawn = originalSpawn;
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("selects a higher-precedence local source once and never refreshes a remote URL", async () => {
+    const originalFetch = globalThis.fetch;
+    const previousJson = process.env.HEADROOM_TOOL_POLICY_JSON;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    const fetchMock = vi.fn<typeof fetch>();
+    globalThis.fetch = fetchMock;
+    process.env.HEADROOM_TOOL_POLICY_JSON = JSON.stringify({
+      rules: [{ id: "json-deny", scope: "shell", action: "deny", command: "curl" }],
+    });
+    process.env.HEADROOM_TOOL_POLICY_URL = "https://policy.example.test/ignored";
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy();
+      expect(() => childProcess.spawn("curl", ["example.test"])).toThrow(/json-deny/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      if (previousJson === undefined) delete process.env.HEADROOM_TOOL_POLICY_JSON;
+      else process.env.HEADROOM_TOOL_POLICY_JSON = previousJson;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+    }
+  });
+
+  it("gives the machine-global policy precedence and persists audit decisions", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-precedence-"));
+    const repo = path.join(root, "repo");
+    fs.mkdirSync(path.join(root, "config"), { recursive: true });
+    fs.mkdirSync(path.join(repo, ".headroom"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "config", "tool_policy.json"),
+      JSON.stringify({
+        rules: [{ id: "global-deny", scope: "shell", action: "deny", command: "curl" }],
+      }),
+    );
+    fs.writeFileSync(
+      path.join(repo, ".headroom", "tool_policy.json"),
+      JSON.stringify({ rules: [] }),
+    );
+    const originalWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787", project: repo });
+      expect(() => childProcess.spawn("curl", ["example.test"])).toThrow(/global-deny/);
+      const audit = fs.readFileSync(path.join(root, "tool_policy_audit.jsonl"), "utf8");
+      expect(audit).toContain('"matched_rule":"global-deny"');
+    } finally {
+      uninstallHeadroomTransport();
+      if (originalWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = originalWorkspace;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses remote auth, cache, ETag revalidation, and fails closed after an expired outage", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-remote-"));
+    const url = "https://policy.example/tool-policy";
+    const originalFetch = globalThis.fetch;
+    const originalEnv = {
+      workspace: process.env.HEADROOM_WORKSPACE_DIR,
+      url: process.env.HEADROOM_TOOL_POLICY_URL,
+      token: process.env.HEADROOM_TOOL_POLICY_TOKEN,
+      refresh: process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            version: 1,
+            rules: [{ id: "remote-deny", scope: "shell", action: "deny", command: "curl" }],
+          }),
+          { status: 200, headers: { etag: '"v1"' } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 304 }))
+      .mockRejectedValueOnce(new Error("offline"));
+    globalThis.fetch = fetchMock;
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    process.env.HEADROOM_TOOL_POLICY_URL = url;
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = "secret-token";
+    process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS = "300";
+    try {
+      const initialCachePath = remoteToolPolicyCachePath(url, "secret-token");
+      fs.mkdirSync(path.dirname(initialCachePath), { recursive: true });
+      fs.writeFileSync(initialCachePath, "{corrupt");
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy(1_000);
+      expect(fetchMock.mock.calls[0][1]?.redirect).toBe("manual");
+      expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get("authorization")).toBe(
+        "Bearer secret-token",
+      );
+      expect(fs.existsSync(initialCachePath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(initialCachePath, "utf8")).cache_version).toBe(2);
+      expect(fs.readdirSync(path.dirname(initialCachePath)).some((name) => name.endsWith(".tmp"))).toBe(
+        false,
+      );
+      await refreshHeadroomToolPolicy(1_100);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const cachePath = remoteToolPolicyCachePath(url, "secret-token");
+      const futureCache = JSON.parse(fs.readFileSync(cachePath, "utf8")) as {
+        fetched_at: number;
+      };
+      futureCache.fetched_at = 9_999;
+      fs.writeFileSync(cachePath, JSON.stringify(futureCache));
+      await refreshHeadroomToolPolicy(1_200);
+      expect(new Headers(fetchMock.mock.calls[1][1]?.headers).get("if-none-match")).toBe('"v1"');
+      await refreshHeadroomToolPolicy(1_501);
+      await expect(
+        import("./transport.js").then(({ enforceNativeToolExecution }) =>
+          enforceNativeToolExecution("bash", { command: "echo allowed" }),
+        ),
+      ).rejects.toThrow(/failing closed/);
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      const restore = (name: string, value: string | undefined) => {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      };
+      restore("HEADROOM_WORKSPACE_DIR", originalEnv.workspace);
+      restore("HEADROOM_TOOL_POLICY_URL", originalEnv.url);
+      restore("HEADROOM_TOOL_POLICY_TOKEN", originalEnv.token);
+      restore("HEADROOM_TOOL_POLICY_REFRESH_SECONDS", originalEnv.refresh);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shares loaded state between compatible installs using the same remote context", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-shared-"));
+    const originalFetch = globalThis.fetch;
+    const previousWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    const previousToken = process.env.HEADROOM_TOOL_POLICY_TOKEN;
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          version: 1,
+          rules: [{ id: "shared-deny", scope: "shell", action: "deny", command: "curl" }],
+        }),
+      ),
+    );
+    globalThis.fetch = fetchMock;
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    process.env.HEADROOM_TOOL_POLICY_URL = "https://policy.example.test/shared";
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = "shared-token";
+    let firstDispose: (() => void) | undefined;
+    let secondDispose: (() => void) | undefined;
+    try {
+      firstDispose = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy();
+      expect(() => {
+        secondDispose = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      }).not.toThrow();
+      expect(() => childProcess.spawn("curl", ["example.test"])).toThrow(/shared-deny/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      secondDispose?.();
+      firstDispose?.();
+      globalThis.fetch = originalFetch;
+      if (previousWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = previousWorkspace;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not renew an invalid cached policy after a 304 response", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-invalid-304-"));
+    const url = "https://policy.example.test/invalid-cache";
+    const token = "cache-token";
+    const originalFetch = globalThis.fetch;
+    const previousWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    const previousToken = process.env.HEADROOM_TOOL_POLICY_TOKEN;
+    const previousRefresh = process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS;
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    process.env.HEADROOM_TOOL_POLICY_URL = url;
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = token;
+    process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS = "300";
+    const cachePath = remoteToolPolicyCachePath(url, token);
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(
+      cachePath,
+      JSON.stringify({
+        cache_version: 2,
+        url_hash: createHash("sha256").update(url).digest("hex"),
+        etag: '"bad"',
+        fetched_at: 100,
+        policy: { version: 1, rules: "invalid" },
+      }),
+    );
+    globalThis.fetch = vi.fn(async () => new Response(null, { status: 304 }));
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy(1_000);
+      expect(JSON.parse(fs.readFileSync(cachePath, "utf8")).fetched_at).toBe(100);
+      await expect(
+        enforceNativeToolExecution("bash", { command: "echo blocked" }),
+      ).rejects.toThrow(/requires a rules array/);
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      if (previousWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = previousWorkspace;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+      if (previousRefresh === undefined) delete process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS;
+      else process.env.HEADROOM_TOOL_POLICY_REFRESH_SECONDS = previousRefresh;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates policy expiry without remote credentials and child shims fail closed", async () => {
+    const originalSpawn = childProcess.spawn;
+    const previousJson = process.env.HEADROOM_TOOL_POLICY_JSON;
+    const previousExpiry = process.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    const previousToken = process.env.HEADROOM_TOOL_POLICY_TOKEN;
+    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
+    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
+    process.env.HEADROOM_TOOL_POLICY_JSON = JSON.stringify({ version: 1, rules: [] });
+    process.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL = String(Date.now() / 1000 + 60);
+    process.env.HEADROOM_TOOL_POLICY_URL = "https://policy.example.test/?signature=secret";
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = "private-token";
+    try {
+      const disposeParent = installHeadroomTransport({
+        proxyUrl: "http://127.0.0.1:8787",
+      });
+      childProcess.spawn("node", ["agent.js"]);
+      const childEnv = (spawnMock.mock.calls[0] as unknown[])[2] as {
+        env: NodeJS.ProcessEnv;
+      };
+      expect(childEnv.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL).toBeDefined();
+      expect(childEnv.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_URL");
+      expect(childEnv.env).not.toHaveProperty("HEADROOM_TOOL_POLICY_TOKEN");
+      disposeParent();
+
+      process.env.HEADROOM_TOOL_POLICY_JSON = childEnv.env.HEADROOM_TOOL_POLICY_JSON;
+      process.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL = String(Date.now() / 1000 - 1);
+      delete process.env.HEADROOM_TOOL_POLICY_URL;
+      delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      expect(() => childProcess.spawn("node", ["agent.js"])).toThrow(/policy expired/);
+      expect(spawnMock).toHaveBeenCalledTimes(1);
+    } finally {
+      uninstallHeadroomTransport();
+      childProcess.spawn = originalSpawn;
+      if (previousJson === undefined) delete process.env.HEADROOM_TOOL_POLICY_JSON;
+      else process.env.HEADROOM_TOOL_POLICY_JSON = previousJson;
+      if (previousExpiry === undefined) {
+        delete process.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL;
+      } else {
+        process.env.HEADROOM_INTERNAL_TOOL_POLICY_VALID_UNTIL = previousExpiry;
+      }
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+    }
+  });
+
+  it("rejects remote policy responses larger than 1 MiB", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-oversize-"));
+    const originalFetch = globalThis.fetch;
+    const previousWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    globalThis.fetch = vi.fn(async () => new Response("x".repeat(1024 * 1024 + 1)));
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    process.env.HEADROOM_TOOL_POLICY_URL = "http://127.0.0.1/policy";
+    try {
+      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy();
+      await expect(
+        import("./transport.js").then(({ enforceNativeToolExecution }) =>
+          enforceNativeToolExecution("read_file", { path: "secret.txt" }),
+        ),
+      ).rejects.toThrow(/exceeds 1 MiB/);
+    } finally {
+      uninstallHeadroomTransport();
+      globalThis.fetch = originalFetch;
+      if (previousWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = previousWorkspace;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("isolates remote policy caches by bearer token", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "headroom-policy-token-cache-"));
+    const url = "https://policy.example/tool-policy";
+    const originalFetch = globalThis.fetch;
+    const previousWorkspace = process.env.HEADROOM_WORKSPACE_DIR;
+    const previousUrl = process.env.HEADROOM_TOOL_POLICY_URL;
+    const previousToken = process.env.HEADROOM_TOOL_POLICY_TOKEN;
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ version: 1, rules: [] })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ version: 1, rules: [] })));
+    globalThis.fetch = fetchMock;
+    process.env.HEADROOM_WORKSPACE_DIR = root;
+    process.env.HEADROOM_TOOL_POLICY_URL = url;
+    process.env.HEADROOM_TOOL_POLICY_TOKEN = "tenant-alpha";
+    let dispose: (() => void) | undefined;
+    try {
+      dispose = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy(1_000);
+      dispose();
+      dispose = undefined;
+      process.env.HEADROOM_TOOL_POLICY_TOKEN = "tenant-bravo";
+      dispose = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787" });
+      await refreshHeadroomToolPolicy(1_001);
+
+      const alphaCache = remoteToolPolicyCachePath(url, "tenant-alpha");
+      const bravoCache = remoteToolPolicyCachePath(url, "tenant-bravo");
+      expect(alphaCache).not.toBe(bravoCache);
+      expect(fs.existsSync(alphaCache)).toBe(true);
+      expect(fs.existsSync(bravoCache)).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(new Headers(fetchMock.mock.calls[1][1]?.headers).has("if-none-match")).toBe(false);
+      expect(fs.readFileSync(alphaCache, "utf8")).not.toContain("tenant-alpha");
+      expect(fs.readFileSync(bravoCache, "utf8")).not.toContain("tenant-bravo");
+    } finally {
+      dispose?.();
+      globalThis.fetch = originalFetch;
+      if (previousWorkspace === undefined) delete process.env.HEADROOM_WORKSPACE_DIR;
+      else process.env.HEADROOM_WORKSPACE_DIR = previousWorkspace;
+      if (previousUrl === undefined) delete process.env.HEADROOM_TOOL_POLICY_URL;
+      else process.env.HEADROOM_TOOL_POLICY_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.HEADROOM_TOOL_POLICY_TOKEN;
+      else process.env.HEADROOM_TOOL_POLICY_TOKEN = previousToken;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("sends x-headroom-project header on routed Node https.request calls when project is set", async () => {
     const proxy = await proxyServer();
     installHeadroomTransport({ proxyUrl: proxy.url, project: "my-project" });
@@ -712,202 +1427,6 @@ describe("Headroom OpenCode transport", () => {
     expect(proxy.seen[0].headers["x-headroom-project"]).toBe("my-project");
 
     await proxy.close();
-  });
-
-  it("keeps HEADROOM_OPENCODE_EXCLUDE_HOSTS hosts and their subdomains off the proxy (#3657)", async () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    try {
-      process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = " opencode.ai, .corp.internal ,, *.Gateway.Example ";
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-
-      const init = { method: "POST", headers: { authorization: "Bearer test" } };
-      await fetch("https://opencode.ai/zen/v1/responses", init);
-      await fetch("https://API.OpenCode.AI/zen/v1/chat/completions", init);
-      await fetch("https://llm.corp.internal/v1/chat/completions", init);
-      await fetch("https://gateway.example/v1/responses", init);
-      await fetch("https://notopencode.ai/v1/responses", init);
-      await fetch("https://api.anthropic.com/v1/messages", init);
-
-      for (const index of [0, 1, 2, 3]) {
-        expect(typeof fetchMock.mock.calls[index][0]).toBe("string");
-        expect(fetchMock.mock.calls[index][1]).toBe(init);
-      }
-      expect(fetchMock.mock.calls[0][0]).toBe("https://opencode.ai/zen/v1/responses");
-      expect(fetchMock.mock.calls[4][0]).toEqual(new URL("http://127.0.0.1:8787/v1/responses"));
-      expect(new Headers(fetchMock.mock.calls[4][1]?.headers).get("x-headroom-base-url")).toBe(
-        "https://notopencode.ai",
-      );
-      expect(fetchMock.mock.calls[5][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
-      expect(new Headers(fetchMock.mock.calls[5][1]?.headers).get("x-headroom-base-url")).toBe(
-        "https://api.anthropic.com",
-      );
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
-  });
-
-  it("prefers the excludeHosts option over HEADROOM_OPENCODE_EXCLUDE_HOSTS", async () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const originalFetch = globalThis.fetch;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-
-    try {
-      process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "api.anthropic.com";
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["opencode.ai"] });
-
-      await fetch("https://opencode.ai/zen/v1/responses", { method: "POST" });
-      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
-
-      expect(fetchMock.mock.calls[0][0]).toBe("https://opencode.ai/zen/v1/responses");
-      expect(fetchMock.mock.calls[1][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
-      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
-  });
-
-  it("leaves excluded hosts alone for Node https.request and http2.connect", () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const fakeRequest = { on: vi.fn(), end: vi.fn() };
-    const requestSpy = vi.spyOn(https, "request").mockImplementation(() => fakeRequest as never);
-    const connectSpy = vi.spyOn(http2, "connect").mockImplementation(() => ({}) as never);
-
-    try {
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["opencode.ai"] });
-
-      const options = { method: "POST", headers: { authorization: "Bearer test" } };
-      expect(https.request("https://opencode.ai/zen/v1/responses", options)).toBe(fakeRequest);
-      expect(requestSpy).toHaveBeenCalledWith("https://opencode.ai/zen/v1/responses", options);
-
-      expect(() => http2.connect("https://opencode.ai")).not.toThrow();
-      expect(connectSpy).toHaveBeenCalledWith("https://opencode.ai");
-      expect(() => http2.connect("https://api.openai.com")).not.toThrow();
-      expect(connectSpy).toHaveBeenCalledWith("https://api.openai.com");
-    } finally {
-      uninstallHeadroomTransport();
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
-  });
-
-  it("propagates excluded hosts into child process env so the hook-shim matches", () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const originalSpawn = childProcess.spawn;
-    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-
-    try {
-      delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1" });
-      childProcess.spawn("node", ["agent.js"], { env: { PATH: "/bin" } });
-      uninstallHeadroomTransport();
-
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["*.opencode.ai", "corp.internal"] });
-      childProcess.spawn("node", ["agent.js"], { env: { PATH: "/bin" } });
-
-      const plain = (spawnMock.mock.calls[0] as unknown[])[2] as { env: NodeJS.ProcessEnv };
-      const excluded = (spawnMock.mock.calls[1] as unknown[])[2] as { env: NodeJS.ProcessEnv };
-      expect(plain.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBeUndefined();
-      expect(excluded.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai,corp.internal");
-      expect(excluded.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-    } finally {
-      uninstallHeadroomTransport();
-      childProcess.spawn = originalSpawn;
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
-  });
-
-  it("clears a pre-existing HEADROOM_OPENCODE_EXCLUDE_HOSTS when excludeHosts is explicitly empty", async () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-    const originalFetch = globalThis.fetch;
-    const originalSpawn = childProcess.spawn;
-    const fetchMock = vi.fn(async (..._args: FetchCall) => new Response("ok"));
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-    const spawnMock = vi.fn(() => ({ on: vi.fn(), kill: vi.fn(), pid: 123 }));
-    childProcess.spawn = spawnMock as unknown as typeof childProcess.spawn;
-
-    try {
-      process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = "api.anthropic.com";
-      installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: [] });
-
-      // The option wins in-process: the host is routed, not excluded.
-      await fetch("https://api.anthropic.com/v1/messages", { method: "POST" });
-      expect(fetchMock.mock.calls[0][0]).toEqual(new URL("http://127.0.0.1:8787/v1/messages"));
-
-      // ...and the exported variable mirrors that, so the hook-shim in a child
-      // (default env, custom env, or a custom env carrying the stale value)
-      // resolves the same empty list instead of the pre-existing one.
-      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBeUndefined();
-      childProcess.spawn("node", ["agent.js"]);
-      childProcess.spawn("node", ["agent.js"], { env: { PATH: "/bin" } });
-      childProcess.spawn("node", ["agent.js"], {
-        env: { PATH: "/bin", HEADROOM_OPENCODE_EXCLUDE_HOSTS: "api.anthropic.com" },
-      });
-      for (const call of spawnMock.mock.calls as unknown[][]) {
-        const options = call[2] as { env: NodeJS.ProcessEnv };
-        expect(options.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBeUndefined();
-        expect(options.env.HEADROOM_OPENCODE_TRANSPORT_PROXY_URL).toBe("http://127.0.0.1:8787/v1");
-      }
-    } finally {
-      globalThis.fetch = originalFetch;
-      childProcess.spawn = originalSpawn;
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
-  });
-
-  it("keeps the exported variable in step with each re-install's resolved list", () => {
-    const originalExclude = process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-
-    try {
-      delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      const first = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["opencode.ai"] });
-      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("opencode.ai");
-
-      // A second install (refs = 2) that resolves to an empty list clears it...
-      const second = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: [] });
-      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBeUndefined();
-
-      // ...and one that resolves to a list sets it again.
-      const third = installHeadroomTransport({ proxyUrl: "http://127.0.0.1:8787/v1", excludeHosts: ["corp.internal"] });
-      expect(process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS).toBe("corp.internal");
-
-      third();
-      second();
-      first();
-    } finally {
-      uninstallHeadroomTransport();
-      if (originalExclude === undefined) {
-        delete process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS;
-      } else {
-        process.env.HEADROOM_OPENCODE_EXCLUDE_HOSTS = originalExclude;
-      }
-    }
   });
 
   it("restores patched transports only after the final disposer", () => {
