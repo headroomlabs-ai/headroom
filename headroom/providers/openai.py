@@ -730,35 +730,50 @@ class OpenAIProvider(Provider):
         and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
         a fallback means that drift only reaches installs with no LiteLLM.
         """
+        pricing, _ = self._resolve_pricing(model)
+        return pricing
+
+    def _resolve_pricing(self, model: str) -> tuple[tuple[float, float] | None, bool]:
+        """Resolve pricing and report whether it is the unknown-model default.
+
+        Returns ``(pricing, is_estimated)`` where ``is_estimated`` is True only
+        when the price fell all the way through to the GPT-4o-tier default
+        guess. The flag is derived from *this lookup* — explicit overrides and
+        the built-in table/family patterns are decisions or catalog data, not
+        guesses — so a model that later resolves (explicit config added,
+        LiteLLM catalog updated) stops being flagged without any cache to
+        clear. The module-global ``_UNKNOWN_PRICING_MODELS`` set is only the
+        warning-dedup mechanism; it is never consulted for provenance.
+        """
         # 1. Explicit configuration wins.
         override = self._pricing_overrides.get(model)
         if override is not None:
-            return override
+            return override, False
 
         # 2. LiteLLM.
         from headroom.pricing.litellm_pricing import pricing_per_1m
 
         live = pricing_per_1m(model)
         if live is not None:
-            return live
+            return live, False
 
         # 3. Built-in fallback. Only here does the staleness of this table
         #    matter, so this is the only path that should warn about it.
         self._warn_pricing_fallback(model)
 
         if model in self._pricing:
-            return self._pricing[model]
+            return self._pricing[model], False
 
         # Longest prefix first -- same shadowing hazard the context-limit and
         # encoding lookups had: in plain dict order the shorter "gpt-4" entry
         # claimed "gpt-4.1" and priced it at $30/$60.
         for model_prefix in sorted(self._pricing, key=len, reverse=True):
             if model.startswith(model_prefix):
-                return self._pricing[model_prefix]
+                return self._pricing[model_prefix], False
 
         family = _infer_model_family(model)
         if family and family in _PATTERN_DEFAULTS:
-            return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"])
+            return cast(tuple[float, float], _PATTERN_DEFAULTS[family]["pricing"]), False
 
         # Completely unknown: the GPT-4o-tier default. A number is genuinely
         # required here (callers must never get None for a model nobody knows),
@@ -766,7 +781,7 @@ class OpenAIProvider(Provider):
         # (issue #3732). Anything downstream that treats this price as measured
         # (budgets, cost cards) is enforcing against a fabrication.
         self._warn_unknown_pricing(model)
-        return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"])
+        return cast(tuple[float, float], _UNKNOWN_OPENAI_DEFAULT["pricing"]), True
 
     def pricing_is_estimated(self, model: str) -> bool:
         """True when ``model``'s price is the unknown-model default, not a lookup.
@@ -774,14 +789,22 @@ class OpenAIProvider(Provider):
         Lets callers (cost card, budget enforcement) distinguish a guessed
         price from a resolved one (issue #3732). The default tuple is still
         returned by :meth:`_get_pricing` -- a number is genuinely required
-        there -- but it is now visibly a default: the first call also emits
-        the once-per-model warning from :meth:`_warn_unknown_pricing`.
+        there -- but it is now visibly a default. Provenance comes from the
+        lookup that just ran, not from the warning-dedup set: resolving the
+        model later (explicit override, catalog update) clears the flag on the
+        next call.
         """
-        self._get_pricing(model)
-        return model in _UNKNOWN_PRICING_MODELS
+        _, estimated = self._resolve_pricing(model)
+        return estimated
 
     def _warn_unknown_pricing(self, model: str) -> None:
-        """Warn once per model priced at the unknown-model default (issue #3732)."""
+        """Warn once per model priced at the unknown-model default (issue #3732).
+
+        The ``_UNKNOWN_PRICING_MODELS`` set is ONLY the warning-dedup
+        mechanism. Pricing provenance is derived per lookup by
+        :meth:`_resolve_pricing`, never from this set, so a model that later
+        resolves (explicit override, catalog update) stops being flagged.
+        """
         if model in _UNKNOWN_PRICING_MODELS:
             return
         _UNKNOWN_PRICING_MODELS.add(model)

@@ -149,3 +149,42 @@ def test_resolved_prices_are_not_flagged_estimated(
         assert provider.pricing_is_estimated("my-custom-model") is False
 
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_pricing_provenance_is_per_lookup_not_sticky(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A later explicit override clears the estimated flag (review follow-up).
+
+    Provenance is derived from the lookup that just ran, never from the
+    module-global warning-dedup set: once a model resolves (explicit config,
+    catalog update), the next lookup reports it as a real price. The old
+    sticky-set implementation kept reporting True forever after the first
+    warning.
+    """
+    import logging
+
+    import headroom.pricing.litellm_pricing as lp
+    import headroom.providers.openai as openai_mod
+
+    monkeypatch.setattr(lp, "LITELLM_AVAILABLE", False)
+    monkeypatch.setattr(openai_mod, "_UNKNOWN_PRICING_MODELS", set())
+
+    provider = OpenAIProvider()
+    model = "mystery-model-per-lookup"
+
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        assert provider.pricing_is_estimated(model) is True
+
+    # The user adds the model to models.json (or HEADROOM_MODEL_LIMITS); the
+    # next lookup sees a decision, not a guess -- no process restart needed
+    # for the flag to clear, because nothing was cached.
+    provider._pricing_overrides[model] = (1.0, 2.0)
+    with caplog.at_level(logging.WARNING, logger="headroom.providers.openai"):
+        assert provider.pricing_is_estimated(model) is False
+        assert provider._get_pricing(model) == (1.0, 2.0)
+
+    # And the warning still fired exactly once for the unknown phase.
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert model in warnings[0].getMessage()

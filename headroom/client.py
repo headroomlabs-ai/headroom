@@ -795,10 +795,27 @@ class HeadroomClient:
             result.tokens_after, output_buffer, model, provider=self._provider
         )
 
+        # A price the provider had to guess (unknown-model default, #3732) is
+        # still shown -- a number is genuinely required -- but it must not read
+        # as authoritative. Only OpenAIProvider exposes the provenance probe;
+        # anything else is treated as a real lookup.
+        price_estimated = False
+        _provenance_probe = getattr(self._provider, "pricing_is_estimated", None)
+        if callable(_provenance_probe):
+            try:
+                price_estimated = bool(_provenance_probe(model))
+            except Exception:  # noqa: BLE001 -- display flag must never break simulate
+                price_estimated = False
+
         if cost_before is not None and cost_after is not None:
             savings = format_cost(cost_before - cost_after)
         else:
             savings = "N/A"
+        savings_display = (
+            f"{savings} per request (estimated price)"
+            if price_estimated
+            else f"{savings} per request"
+        )
 
         # Recalculate prefix hash after optimization
         optimized_prefix_hash = compute_prefix_hash(result.messages)
@@ -808,7 +825,7 @@ class HeadroomClient:
             tokens_after=result.tokens_after,
             tokens_saved=tokens_saved,
             transforms=result.transforms_applied,
-            estimated_savings=f"{savings} per request",
+            estimated_savings=savings_display,
             messages_optimized=result.messages,
             block_breakdown=block_breakdown,
             waste_signals=waste_signals.to_dict(),
