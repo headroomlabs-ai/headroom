@@ -492,3 +492,84 @@ def test_bridge_translates_a_turn_hook_tool_re_drive(monkeypatch: pytest.MonkeyP
     payload = response.json()
     assert payload["object"] == "response"
     assert payload["output"][0]["content"][0]["text"] == "after the tool"
+
+
+def test_bridge_translates_a_ccr_retrieval_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CCR continuation on the bridge goes out chat-shaped and comes back Responses-shaped.
+
+    It builds its own body and headers (``continuation_body`` /
+    ``continuation_headers``) and parses the reply with ``.json()``, so it is
+    the plumbing a turn-hook test does not exercise.
+    """
+    client, _captured = _build_bridge_client(
+        monkeypatch, chat_response_json=_chat_completion_json()
+    )
+    proxy = client.app.state.proxy
+    calls: list[tuple[str, dict]] = []
+    replies = iter(["needs a retrieval", "answer after retrieval"])
+
+    async def _fake_retry(method, url, headers, body, **_kwargs):  # type: ignore[no-untyped-def]
+        calls.append((url, body))
+        reply = _chat_completion_json()
+        reply["choices"][0]["message"]["content"] = next(replies)  # type: ignore[index]
+        return httpx.Response(200, json=reply)
+
+    proxy._retry_request = _fake_retry
+    continuation: dict[str, object] = {}
+
+    class _StubCCR:
+        config = type("C", (), {"enabled": True})()
+
+        def has_ccr_tool_calls(self, resp_json, provider):  # type: ignore[no-untyped-def]
+            return provider == "openai_responses" and not continuation
+
+        async def handle_response(self, resp_json, items, tools, api_call_fn, provider):  # type: ignore[no-untyped-def]
+            continuation["first"] = resp_json
+            result = await api_call_fn(
+                [
+                    *items,
+                    {
+                        "type": "function_call",
+                        "call_id": "r1",
+                        "name": "headroom_retrieve",
+                        "arguments": "{}",
+                    },
+                    {"type": "function_call_output", "call_id": "r1", "output": "retrieved text"},
+                ],
+                tools,
+            )
+            continuation["result"] = result
+            return result
+
+    proxy.ccr_response_handler = _StubCCR()
+
+    response = client.post(
+        "/v1/responses",
+        headers={
+            "Authorization": "Bearer test",
+            "x-headroom-base-url": _COPILOT_BASE,
+            "x-headroom-original-path": "/responses",
+        },
+        json={
+            "model": "claude-sonnet-4.6",
+            "input": [{"role": "user", "content": "Summarise the log."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "headroom_retrieve",
+                    "parameters": {"type": "object", "properties": {"hash": {"type": "string"}}},
+                }
+            ],
+            "stream": False,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert len(calls) == 2, "the CCR continuation never reached upstream"
+    for url, body in calls:
+        assert url.endswith("/chat/completions")
+        assert "messages" in body and "input" not in body, "a Responses body hit /chat/completions"
+    assert "tool" in [m.get("role") for m in calls[1][1]["messages"]]
+    assert continuation["first"]["object"] == "response"  # type: ignore[index]
+    assert continuation["result"]["object"] == "response"  # type: ignore[index]
+    assert response.json()["output"][0]["content"][0]["text"] == "answer after retrieval"

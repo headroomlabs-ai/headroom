@@ -92,6 +92,23 @@ _MAX_STALE_SECONDS = 86_400.0
 _NEGATIVE_TTL_SECONDS = 60.0
 
 
+#: Everything the ``copilot_model_catalog`` decision depends on. The result is
+#: memoised on these values: ``catalog_enabled()`` runs on every Copilot
+#: request, and a full policy resolution there both costs time and repeats any
+#: "unknown feature / channel" warning once per request.
+_CATALOG_POLICY_ENV = (
+    "HEADROOM_ROLLOUT_CHANNEL",
+    "HEADROOM_FEATURES",
+    "HEADROOM_DISABLE_FEATURES",
+    "HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES",
+    "HEADROOM_MODEL_CATALOG",
+)
+#: Spellings this variable accepted before it became a rollout alias, mapped onto
+#: the values the rollout policy understands so none of them changes meaning.
+_CATALOG_ALIAS_SPELLINGS = {"enable": "on", "disable": "off"}
+_catalog_policy_cache: dict[tuple[str | None, ...], bool] = {}
+
+
 def catalog_enabled() -> bool:
     """Whether live catalog-driven routing is on, per the runtime rollout policy.
 
@@ -99,16 +116,50 @@ def catalog_enabled() -> bool:
     default-on from the ``beta`` channel, opt-in on ``stable`` via
     ``HEADROOM_MODEL_CATALOG=1`` or ``HEADROOM_FEATURES=copilot_model_catalog``,
     and ``HEADROOM_MODEL_CATALOG=0`` is the kill switch on every channel.
-    Resolved per call so a changed environment takes effect, and never raises:
-    an unreadable policy keeps today's name heuristic.
+    ``HEADROOM_MODEL_CATALOG`` accepts ``1/true/yes/on/enable(d)`` and
+    ``0/false/no/off/disable(d)``; any other value is ignored with a warning.
+
+    Re-evaluated whenever one of the inputs changes, and never raises: an
+    unreadable policy keeps today's name heuristic.
     """
+    key = tuple(os.environ.get(name) for name in _CATALOG_POLICY_ENV)
+    cached = _catalog_policy_cache.get(key)
+    if cached is not None:
+        return cached
+
     from headroom.rollout import resolve_rollout
 
+    env = dict(zip(_CATALOG_POLICY_ENV, key, strict=True))
+    raw = (env.get("HEADROOM_MODEL_CATALOG") or "").strip().lower()
+    if raw in _CATALOG_ALIAS_SPELLINGS:
+        env["HEADROOM_MODEL_CATALOG"] = _CATALOG_ALIAS_SPELLINGS[raw]
+    elif raw and raw not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+        "0",
+        "false",
+        "no",
+        "off",
+        "disabled",
+    }:
+        logger.warning(
+            "HEADROOM_MODEL_CATALOG=%r is not a recognised on/off value; ignoring it",
+            env["HEADROOM_MODEL_CATALOG"],
+        )
     try:
-        return resolve_rollout().is_enabled("copilot_model_catalog")
+        enabled = resolve_rollout(
+            {name: value for name, value in env.items() if value is not None}
+        ).is_enabled("copilot_model_catalog")
     except Exception:  # noqa: BLE001 - routing must never fail on policy resolution
         logger.debug("rollout policy unavailable; live model catalog stays off", exc_info=True)
-        return False
+        enabled = False
+    if len(_catalog_policy_cache) >= 16:
+        _catalog_policy_cache.clear()
+    _catalog_policy_cache[key] = enabled
+    return enabled
 
 
 def catalog_ttl_seconds() -> float:

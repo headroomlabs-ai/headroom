@@ -174,3 +174,21 @@ def test_anthropic_pagination_stops_on_a_repeated_cursor(monkeypatch: pytest.Mon
     rows, reason = models_cmd._anthropic_rows()
     assert reason is None
     assert len(calls) == 2, "pagination did not stop on a repeated cursor"
+
+
+def test_anthropic_says_so_when_it_stops_at_the_page_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Truncation is never silent: hitting the page cap returns a note."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(models_cmd, "_ANTHROPIC_MAX_PAGES", 2)
+    cursor = iter(range(10))
+
+    def fake_get(*_a, **_k):  # type: ignore[no-untyped-def]
+        n = next(cursor)
+        return httpx.Response(
+            200, json={"data": [{"id": f"claude-{n}"}], "has_more": True, "last_id": f"claude-{n}"}
+        )
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    rows, reason = models_cmd._anthropic_rows()
+    assert [r.id for r in rows] == ["claude-0", "claude-1"]
+    assert reason is not None and "may be incomplete" in reason

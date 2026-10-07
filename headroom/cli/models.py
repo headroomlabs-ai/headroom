@@ -161,8 +161,11 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
         entries.extend(page)
         next_id = payload.get("last_id")
         if not payload.get("has_more") or not isinstance(next_id, str) or next_id == after_id:
+            truncated = False
             break
         after_id = next_id
+    else:
+        truncated = True
 
     rows: list[_Row] = []
     for entry in entries:
@@ -186,6 +189,11 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
                 preview=False,
                 provider="anthropic",
             )
+        )
+    if truncated:
+        return rows, (
+            f"anthropic: stopped after {_ANTHROPIC_MAX_PAGES} pages of /v1/models; "
+            "the list above may be incomplete."
         )
     return rows, None
 

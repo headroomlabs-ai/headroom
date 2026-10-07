@@ -461,6 +461,53 @@ def test_live_catalog_follows_the_rollout_policy(monkeypatch: pytest.MonkeyPatch
     assert catalog_enabled() is False
 
 
+def test_catalog_switch_keeps_its_old_spellings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`enable` / `disable` meant on / off before the switch became a rollout alias."""
+    from headroom.models.copilot_catalog import catalog_enabled
+
+    for name in ("HEADROOM_ROLLOUT_CHANNEL", "HEADROOM_FEATURES", "HEADROOM_DISABLE_FEATURES"):
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "enable")
+    assert catalog_enabled() is True
+    monkeypatch.setenv("HEADROOM_ROLLOUT_CHANNEL", "beta")
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "disable")
+    assert catalog_enabled() is False
+
+    # An unrecognised value is ignored (channel default), and says so.
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "maybe")
+    with caplog.at_level("WARNING", logger="headroom.models.copilot_catalog"):
+        assert catalog_enabled() is True
+    assert "not a recognised on/off value" in caplog.text
+
+
+def test_catalog_policy_is_resolved_once_per_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It runs on every Copilot request: no per-request resolution or warning flood."""
+    import headroom.rollout as rollout_mod
+    from headroom.models import copilot_catalog
+
+    copilot_catalog._catalog_policy_cache.clear()
+    monkeypatch.setenv("HEADROOM_FEATURES", "copilot_model_catalog,not_a_real_feature")
+    monkeypatch.delenv("HEADROOM_MODEL_CATALOG", raising=False)
+    calls: list[object] = []
+    real = rollout_mod.resolve_rollout
+
+    def counting(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rollout_mod, "resolve_rollout", counting)
+    assert all(copilot_catalog.catalog_enabled() for _ in range(50))
+    assert len(calls) == 1, "the policy was re-resolved per call"
+
+    # A changed environment is still picked up.
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "off")
+    assert copilot_catalog.catalog_enabled() is False
+    assert len(calls) == 2
+
+
 def test_rollout_registry_declares_the_catalog() -> None:
     from headroom.rollout import FEATURES, RolloutChannel
 
