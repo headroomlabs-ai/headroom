@@ -48,7 +48,10 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ssl
 
 from headroom._subprocess import run
 from headroom.offline import guard_egress
@@ -264,7 +267,7 @@ def _mirror_url(url: str) -> str:
 # ---------- Download + verify --------------------------------------------- #
 
 
-def _ssl_context():
+def _ssl_context() -> ssl.SSLContext | None:
     """Return Headroom's configured SSL context for urllib.request.urlopen, or
     ``None`` (urlopen's default) when the trust helper cannot be loaded.
 

@@ -26,7 +26,10 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ssl
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +190,7 @@ def _select_latest(data: dict[str, Any], *, allow_pre: bool) -> str | None:
     return None
 
 
-def _urlopen_ssl_context():
+def _urlopen_ssl_context() -> ssl.SSLContext | None:
     """Return an SSL context for urllib.request.urlopen that honors Headroom's
     trust policy (OS store + certifi, HEADROOM_CA_BUNDLE, etc).
 
