@@ -48,8 +48,9 @@ const TONE: Record<Tone, { color?: string; dimColor?: boolean; bold?: boolean }>
 const pct = (t: Pick<Totals, 'saved' | 'original'>) =>
   t.original > 0 ? Math.round((t.saved / t.original) * 100) : 0
 
-// Without a project tag the proxy's requests can't be told apart by client, so the totals are proxy-wide.
-const scope = (project: string | null) => (project ? 'session' : 'proxy')
+// The proxy tags requests by project (the launch directory's name), not by session, so the totals are
+// the project's traffic since this session started, or the whole proxy's when there is no tag.
+const scope = (project: string | null) => (project ? 'project' : 'proxy')
 
 // The module's own bookkeeping; a reload starts it over while $.state keeps the drawing's values.
 const live = {
@@ -88,7 +89,9 @@ async function land($: EngineInterface, fresh: Snip[]) {
   const after = await update($, totals, t => addToTotals(t, fresh))
   $.ui.status(`✂ ${fmt(after.saved)} tok saved · ${pct(after)}%`)
 
-  const where = live.project ? 'this session' : 'on this proxy since this session started'
+  const where = live.project
+    ? `in ${live.project} since this session started`
+    : 'on this proxy since this session started'
   for (const milestone of crossed(before, after.saved)) {
     $.ui.toast(`✂ ${fmt(milestone)} tokens snipped ${where}: ${pages(milestone)} Claude didn't have to reread`)
   }
@@ -267,7 +270,7 @@ export const register: Register = on => {
           <Text color="#f472b6" bold>
             ✂ {fmt(sum.saved)}
           </Text>{' '}
-          tokens snipped {px.project ? 'this session' : 'on this proxy'} ({pct(sum)}% of {fmt(sum.original)}) over{' '}
+          tokens snipped {px.project ? `in ${px.project}` : 'on this proxy'} since this session started ({pct(sum)}% of {fmt(sum.original)}) over{' '}
           {sum.requests} requests
         </Text>
         <Text dimColor>
@@ -282,8 +285,8 @@ export const register: Register = on => {
         <Text dimColor>{px.isUp === false ? `proxy unreachable at ${px.url}` : `proxy ${px.url}`}</Text>
         <Text dimColor wrap="truncate-end">
           {px.project
-            ? `counting requests tagged ${px.project} since this session started`
-            : 'counting every client on this proxy since this session started (`headroom wrap claude` tags them)'}
+            ? `counting every request tagged ${px.project}, other sessions in that project included`
+            : 'counting every client on this proxy (`headroom wrap claude` tags requests by project)'}
         </Text>
         <Text> </Text>
         {list.length === 0 && <Text dimColor>No requests through Headroom yet. Send a prompt.</Text>}

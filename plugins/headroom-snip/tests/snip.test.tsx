@@ -285,15 +285,54 @@ test('with a project header, other clients on the proxy are left out', async ($,
 
   const band = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
   expect(await band.find({ text: /20k → 4\.0k/ })).toBeDefined()
-  expect(await band.find({ text: /session 16k saved \(80%\) over 1 req/ })).toBeDefined()
+  expect(await band.find({ text: /project 16k saved \(80%\) over 1 req/ })).toBeDefined()
+  expect(await band.find({ text: /session/ })).toBeUndefined()
   await band.unmount()
 
   const pane = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...PANE })
-  expect(await pane.find({ text: /tokens snipped this session/ })).toBeDefined()
-  expect(await pane.find({ text: /counting requests tagged headroom/ })).toBeDefined()
+  expect(await pane.find({ text: /tokens snipped in headroom since this session started/ })).toBeDefined()
+  expect(await pane.find({ text: /counting every request tagged headroom, other sessions in that project included/ })).toBeDefined()
   expect(await pane.find({ text: /40k→4\.0k/ })).toBeUndefined()
   expect(await pane.find({ text: /50k→5\.0k/ })).toBeUndefined()
   await pane.unmount()
+})
+
+test('two sessions in one project share a count, and every label says project, not session', async ($, on) => {
+  let rows: unknown[] = []
+  let logs: unknown[] = []
+  const { clock, seen } = stage(on, {
+    rows: () => rows,
+    logs: () => logs,
+    env: { ANTHROPIC_CUSTOM_HEADERS: 'X-Headroom-Project: headroom' },
+  })
+
+  await $.session.start(START)
+  await clock.settle()
+  // 'this-session' and 'other-session' come from two Claude Code sessions launched in directories
+  // named headroom; the proxy tags both the same, so both count.
+  rows = [row('this-session', 40_000, 10_000, ['smart:array'], 3), row('other-session', 30_000, 6_000, ['smart:array'], 4)]
+  logs = [
+    { request_id: 'this-session', tags: { project: 'headroom' } },
+    { request_id: 'other-session', tags: { project: 'headroom' } },
+  ]
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await settleSnip(clock)
+
+  const band = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...BAND })
+  expect(await band.find({ text: /project 54k saved \(77%\) over 2 req/ })).toBeDefined()
+  expect(await band.find({ text: /session/ })).toBeUndefined()
+  await band.unmount()
+
+  const pane = await $.ui.mount({ plugin: 'headroom-snip', surface: 'terminal', ...PANE })
+  expect(await pane.find({ text: /tokens snipped in headroom since this session started/ })).toBeDefined()
+  expect(await pane.find({ text: /over 2 requests/ })).toBeDefined()
+  await pane.unmount()
+
+  const milestones = seen.toasts.filter(t => /tokens snipped/.test(t))
+  expect(milestones).toEqual([
+    expect.stringMatching(/^✂ 10k tokens snipped in headroom since this session started/),
+    expect.stringMatching(/^✂ 50k tokens snipped in headroom since this session started/),
+  ])
 })
 
 test('one big snip announces each milestone it crosses', async ($, on) => {

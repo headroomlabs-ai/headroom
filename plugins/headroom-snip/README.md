@@ -9,7 +9,7 @@ count drops as it goes:
 ✂ headroom 21k → 16k   tok ━━━━━━━━━━━━━━━━━━━━━━━✂⡀⠄⠂⠁⢀⠈⠐⠠ −81%
 ✂ headroom 21k → 7.6k  tok ━━━━━━━━━━━✂⠈⠐⠠⡀⠄⠂⠁⢀⠈⠐⠠⡀⠄⠂······ −81%
 ✂ headroom 21k → 4.1k  tok ━━━━━━·························· −81%
-  JSON crush ×2 · Kompress text · cache align   session 184k saved (62%) over 23 req ≈ 307 pages  details  hide
+  JSON crush ×2 · Kompress text · cache align   project 184k saved (62%) over 23 req ≈ 307 pages  details  hide
 ```
 
 ## What it shows
@@ -17,9 +17,9 @@ count drops as it goes:
 - **The band above the prompt.** The latest request: original → sent tokens,
   the snip animation, and the percentage cut. Below that, which compressors did
   the cutting (`JSON crush`, `code AST`, `Kompress text`, `log squash`,
-  `cache align`, ...) and the session total. A request sent unchanged says why,
+  `cache align`, ...) and the running total since the session started. A request sent unchanged says why,
   for example `kept: user message, recent code` or `nothing worth a snip`.
-- **`/headroom`.** Opens a pane with the session's requests: one bar per
+- **`/headroom`.** Opens a pane with the requests since the session started: one bar per
   request, what was cut and what was protected, how long compression took, the
   biggest snip so far, and an all-time total.
   `/headroom hide` and `/headroom show` toggle the band.
@@ -37,18 +37,19 @@ ends. Requests stamped before the session started count as history: they
 aren't animated or added to the totals, even if the proxy only comes up later.
 Nothing leaves your machine.
 
-What counts as this session's depends on how Claude Code reaches the proxy:
+The proxy can't tell Claude Code sessions apart, so the totals are never
+per session. What they cover depends on how Claude Code reaches the proxy:
 
 - **Through `headroom wrap claude`:** each request carries an
-  `X-Headroom-Project` header. The mod only counts requests tagged with this
-  session's project, so other projects and clients on the same proxy are left
-  out (two sessions in the same project still share a count). The proxy only
-  reports tags for its last ten requests, so a request it can't attribute is
-  left out rather than guessed. The band and
-  `/headroom` say "session".
-- **Any other way:** the proxy can't tell clients apart, so the totals cover
-  every client on the proxy since this session started. The band says "proxy"
-  and `/headroom` says so.
+  `X-Headroom-Project` header naming the launch directory (its basename, so
+  two directories with the same name share a tag). The mod counts every
+  request with this session's tag, including other sessions in the same
+  project, and leaves other projects out. The proxy only reports tags for its
+  last ten requests, so a request it can't attribute is left out rather than
+  guessed. The band says "project" and `/headroom` names the project.
+- **Any other way:** there is no tag, so the totals cover every client on the
+  proxy since this session started. The band says "proxy" and `/headroom` says
+  so.
 
 It finds the proxy in this order:
 
