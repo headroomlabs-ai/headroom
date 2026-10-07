@@ -127,24 +127,13 @@ def catalog_enabled() -> bool:
     if cached is not None:
         return cached
 
-    from headroom.rollout import resolve_rollout
+    from headroom.rollout import _FALSE_VALUES, _TRUE_VALUES, resolve_rollout
 
     env = dict(zip(_CATALOG_POLICY_ENV, key, strict=True))
     raw = (env.get("HEADROOM_MODEL_CATALOG") or "").strip().lower()
     if raw in _CATALOG_ALIAS_SPELLINGS:
         env["HEADROOM_MODEL_CATALOG"] = _CATALOG_ALIAS_SPELLINGS[raw]
-    elif raw and raw not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "enabled",
-        "0",
-        "false",
-        "no",
-        "off",
-        "disabled",
-    }:
+    elif raw and raw not in _TRUE_VALUES | _FALSE_VALUES:
         logger.warning(
             "HEADROOM_MODEL_CATALOG=%r is not a recognised on/off value; ignoring it",
             env["HEADROOM_MODEL_CATALOG"],

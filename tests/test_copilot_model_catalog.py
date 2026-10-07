@@ -465,7 +465,11 @@ def test_catalog_switch_keeps_its_old_spellings(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """`enable` / `disable` meant on / off before the switch became a rollout alias."""
+    from headroom.models import copilot_catalog
     from headroom.models.copilot_catalog import catalog_enabled
+
+    # The warning fires on a cache miss only; start from a clean memo.
+    copilot_catalog._catalog_policy_cache.clear()
 
     for name in ("HEADROOM_ROLLOUT_CHANNEL", "HEADROOM_FEATURES", "HEADROOM_DISABLE_FEATURES"):
         monkeypatch.delenv(name, raising=False)
