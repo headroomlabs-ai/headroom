@@ -217,6 +217,9 @@ def fetch_latest_version(*, allow_pre: bool = False, timeout: float = 4.0) -> st
     proxy trusts them.
     """
     try:
+        from headroom.offline import guard_egress
+
+        guard_egress("Headroom update check", _PYPI_JSON_URL)
         req = urllib.request.Request(
             _PYPI_JSON_URL,
             headers={"Accept": "application/json", "User-Agent": "headroom-update-check"},
