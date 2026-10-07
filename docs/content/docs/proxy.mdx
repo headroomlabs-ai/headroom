@@ -872,9 +872,10 @@ calling shell. `wrap` warns when an explicit `HEADROOM_MODE`,
 `HEADROOM_MIN_TOKENS`, or `HEADROOM_EXCLUDE_TOOLS` disagrees with the settings
 reported by that proxy. It does not restart a shared proxy or interrupt other
 clients. Restart the proxy with the desired settings, or use `--port` to start
-a separate instance. Tool exclusions are compared case-insensitively, including
-the built-in exclusions; older proxies that do not report a setting cannot be
-compared for that setting.
+a separate instance. Tool exclusions are compared case-insensitively using the
+effective router exclusions, including built-ins and tools protected by
+`HEADROOM_PROTECT_TOOL_RESULTS`. Older proxies that do not report a setting
+cannot be compared for that setting.
 
 
 `headroom wrap codex` keeps routing scoped to the Codex process it launches: it

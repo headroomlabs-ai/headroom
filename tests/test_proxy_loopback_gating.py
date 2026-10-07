@@ -482,6 +482,47 @@ def test_health_config_block_is_loopback_only(monkeypatch: pytest.MonkeyPatch) -
     assert "config" in local.json()
 
 
+@pytest.mark.parametrize(
+    ("exclude_tools", "requested"),
+    [(None, "Bash"), ({"WebSearch"}, "Bash,WebSearch")],
+)
+def test_protected_tool_reuse_does_not_warn_about_missing_exclusions(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exclude_tools: set[str] | None,
+    requested: str,
+) -> None:
+    from headroom.cli.wrap import _warn_proxy_mode_mismatch
+
+    monkeypatch.setenv("HEADROOM_SKIP_UPSTREAM_CHECK", "1")
+    monkeypatch.delenv("HEADROOM_MODE", raising=False)
+    monkeypatch.delenv("HEADROOM_MIN_TOKENS", raising=False)
+    monkeypatch.setenv("HEADROOM_EXCLUDE_TOOLS", requested)
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+            disable_kompress=True,
+            exclude_tools=exclude_tools,
+            protect_tool_results={"Bash"},
+        )
+    )
+    client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345))
+    response = client.get("/health")
+    assert response.status_code == 200
+
+    capsys.readouterr()
+    _warn_proxy_mode_mismatch(response.json()["config"])
+    assert capsys.readouterr().out == ""
+
+
 def test_stats_per_request_metadata_is_loopback_only() -> None:
     """/stats keeps aggregate counters public but restricts per-request metadata
     (recent_requests / request_logs) and `config` to loopback callers."""
