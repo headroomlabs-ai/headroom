@@ -55,6 +55,37 @@ def _get_litellm_module() -> Any | None:
 
 logger = logging.getLogger("headroom.proxy")
 
+# Unknown-model default pricing, USD per 1M tokens (GPT-4o tier). Last resort
+# ONLY: used when LiteLLM can't price a model and the caller supplied no
+# provider-resolved pricing (#3732). Mirrors
+# ``OpenAIProvider._UNKNOWN_OPENAI_DEFAULT["pricing"]``; every entry booked
+# at this price is stamped PRICE_BASIS_ESTIMATED, never as a real lookup.
+_UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M = (2.50, 10.00)
+
+
+def _fallback_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    pricing_per_1m: tuple[float, float],
+) -> float:
+    """Cost from per-1M (input, output) prices when LiteLLM can't price a model.
+
+    Mirrors the OpenAI cache convention the default pricing belongs to: cache
+    reads at a 50% discount, cache writes at list (an inferred write is
+    already zeroed by the caller via ``cache_write_tokens``). A guess, but a
+    recorded-and-labelled one (#3825) beats silently booking $0, which left
+    the budget unable to trip on unpriced models.
+    """
+    input_per_1m, output_per_1m = pricing_per_1m
+    read = max(0, cache_read_tokens)
+    write = max(0, cache_write_tokens)
+    uncached = max(0, input_tokens - read - write)
+    prompt_cost = ((uncached + write) + 0.5 * read) * input_per_1m / 1_000_000
+    return prompt_cost + max(0, output_tokens) * output_per_1m / 1_000_000
+
+
 # Pricing-lookup warnings are emitted on the per-request cost path, so an
 # unresolvable model (a custom / OpenAI-compatible name LiteLLM can't price,
 # e.g. glm-5.2) floods proxy.log with an identical WARNING every single request
@@ -1057,6 +1088,7 @@ class CostTracker:
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
         price_basis: str = PRICE_BASIS_MEASURED,
+        pricing: tuple[float, float] | None = None,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1087,6 +1119,14 @@ class CostTracker:
                 a record may carry provider-reported usage priced at the
                 unknown-model default guess (#3732). An unrecognized value
                 degrades to measured rather than silently changing enforcement.
+            pricing: Provider-resolved per-1M (input, output) USD for this
+                model, from the provider's own per-lookup resolution (explicit
+                config -> LiteLLM -> built-in table -> unknown default,
+                #3732). Used ONLY when ``estimate_cost`` (LiteLLM) can't price
+                the model, so the request books a labelled fallback entry
+                instead of silently recording $0. When None, the generic
+                unknown-model default ($2.50/$10 per 1M) stands in and the
+                entry is stamped PRICE_BASIS_ESTIMATED.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1236,12 +1276,35 @@ class CostTracker:
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=effective_cache_write,
         )
+        entry_price_basis = price_basis
+        if cost is None and not model.startswith("passthrough:"):
+            # LiteLLM can't price this model (unknown to the catalog, or
+            # LiteLLM absent). Book the provider's per-lookup fallback price
+            # instead of recording nothing: an unpriced model previously
+            # contributed $0 to the ledger and the budget could never trip on
+            # it (#3825 review). ``passthrough:`` models genuinely have no
+            # price and keep the old no-entry behaviour.
+            fallback = pricing if pricing is not None else _UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M
+            if pricing is None:
+                # Generic path: LiteLLM already failed, so this is the
+                # unknown-model default guess, not a lookup.
+                entry_price_basis = PRICE_BASIS_ESTIMATED
+            computed = _fallback_cost_usd(
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                effective_cache_write,
+                fallback,
+            )
+            cost = computed if computed > 0 else None
         if cost is not None:
             entry = CostEntry(
                 datetime.now(),
                 cost,
                 basis,
-                price_basis if price_basis == PRICE_BASIS_ESTIMATED else PRICE_BASIS_MEASURED,
+                entry_price_basis
+                if entry_price_basis == PRICE_BASIS_ESTIMATED
+                else PRICE_BASIS_MEASURED,
             )
             self._costs.append(entry)
             self._record_budget_cost(entry)

@@ -441,6 +441,44 @@ class RequestOutcome:
 # ── The funnel ───────────────────────────────────────────────────────
 
 
+def _resolve_outcome_pricing(
+    handler: Any, provider_name: str, model: str
+) -> tuple[tuple[float, float] | None, str]:
+    """Provider-resolved per-1M (input, output) price + price provenance.
+
+    Asks the handler's provider object for its own per-lookup resolution so
+    explicit pricing overrides and the built-in table keep their measured
+    provenance, and only the unknown-model default is flagged estimated
+    (#3732). Anything missing or raising degrades to ``(None, measured)``:
+    the cost tracker then applies its generic fallback, stamped estimated.
+    Bookkeeping must never break a response, so every step is defensive.
+    """
+    from headroom.proxy.budget_basis_policy import (
+        PRICE_BASIS_ESTIMATED,
+        PRICE_BASIS_MEASURED,
+    )
+
+    provider = None
+    runtime = getattr(handler, "provider_runtime", None)
+    if runtime is not None:
+        try:
+            provider = runtime.pipeline_provider(provider_name)
+        except Exception:  # noqa: BLE001 -- degrade, don't break the response
+            provider = None
+    if provider is None:
+        provider = getattr(handler, f"{provider_name}_provider", None)
+    resolve = getattr(provider, "resolve_pricing_for_ledger", None)
+    if not callable(resolve):
+        return None, PRICE_BASIS_MEASURED
+    try:
+        pricing, price_basis = resolve(model)
+    except Exception:  # noqa: BLE001 -- degrade, don't break the response
+        return None, PRICE_BASIS_MEASURED
+    if price_basis not in (PRICE_BASIS_MEASURED, PRICE_BASIS_ESTIMATED):
+        price_basis = PRICE_BASIS_MEASURED
+    return pricing, price_basis
+
+
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """Single funnel for per-request bookkeeping. The contract.
 
@@ -484,6 +522,14 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         timings_from_tags,
     )
     from headroom.telemetry.session import record_outcome
+
+    # Resolve the request's pricing provenance per lookup, BEFORE the Copilot
+    # relabel below: the relabelled "copilot" name has no provider object on
+    # the handler, and the wire provider (openai/anthropic) is what actually
+    # resolved the price. The outcome path previously never supplied this, so
+    # unknown-to-LiteLLM models booked zero ledger entries and the budget
+    # could never trip on them (#3825 review).
+    pricing, price_basis = _resolve_outcome_pricing(handler, outcome.provider, outcome.model)
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
     # Anthropic wire, so the handlers stamp the wire provider. Relabel to
@@ -704,6 +750,12 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # cost tracker feeds the dashboard's per-model table, which read
             # compression only while its own headline counted both layers.
             tool_schema_saved=tool_search_saved,
+            # Per-lookup price + provenance resolved above (#3732): an
+            # unknown-to-LiteLLM model books the provider's fallback price as
+            # an estimated-provenance entry instead of $0, so the selected
+            # budget policy applies to it like any other spend.
+            price_basis=price_basis,
+            pricing=pricing,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
