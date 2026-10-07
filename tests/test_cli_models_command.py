@@ -231,3 +231,44 @@ def test_anthropic_says_so_when_it_stops_at_the_page_cap(monkeypatch: pytest.Mon
     rows, reason = models_cmd._anthropic_rows()
     assert [r.id for r in rows] == ["claude-0", "claude-1"]
     assert reason is not None and "may be incomplete" in reason
+
+
+def test_a_partial_anthropic_list_is_incomplete_not_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Models that were listed before pagination stopped are reported as listed."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *_a, **_k: httpx.Response(
+            200, json={"data": [{"id": "claude-a"}], "has_more": True}
+        ),
+    )
+
+    result = CliRunner().invoke(main, ["models", "--provider", "anthropic", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert [m["id"] for m in payload["models"]] == ["claude-a"]
+    assert payload["unavailable"] == []
+    assert len(payload["incomplete"]) == 1 and "may be incomplete" in payload["incomplete"][0]
+
+    result = CliRunner().invoke(main, ["models", "--provider", "anthropic"])
+    assert result.exit_code == 0, result.output
+    assert "claude-a" in result.output
+    assert "\n  incomplete — anthropic:" in result.output
+    assert "not enumerated" not in result.output
+
+
+def test_an_unavailable_provider_is_not_reported_as_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setattr(httpx, "get", lambda *_a, **_k: httpx.Response(503, text="down"))
+
+    result = CliRunner().invoke(main, ["models", "--provider", "anthropic", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["models"] == []
+    assert payload["incomplete"] == []
+    assert len(payload["unavailable"]) == 1 and "HTTP 503" in payload["unavailable"][0]

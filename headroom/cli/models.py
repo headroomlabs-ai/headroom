@@ -110,6 +110,9 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
     require an API credential: a Claude subscription's OAuth token lives in the
     OS keychain and is not readable here, so subscription-only users get a clear
     "not enumerable" message rather than a guessed list.
+
+    Returns ``(rows, note)``. With no rows the note says why Anthropic is
+    unavailable; with rows it says the list may be incomplete.
     """
     import os
 
@@ -239,11 +242,14 @@ def models(provider: str, vendor: str | None, tier: str | None, as_json: bool) -
     wanted = ["copilot", "anthropic"] if provider in ("auto", "all") else [provider]
     rows: list[_Row] = []
     notes: list[str] = []
+    # A note that comes with rows means the provider was enumerated but stopped
+    # early, which is not the same as being unavailable.
+    incomplete: list[str] = []
     for name in wanted:
         got, reason = _copilot_rows() if name == "copilot" else _anthropic_rows()
         rows.extend(got)
         if reason:
-            notes.append(reason)
+            (incomplete if got else notes).append(reason)
 
     if vendor:
         needle = vendor.strip().lower()
@@ -272,6 +278,7 @@ def models(provider: str, vendor: str | None, tier: str | None, as_json: bool) -
                         for r in rows
                     ],
                     "unavailable": notes,
+                    "incomplete": incomplete,
                 },
                 indent=2,
             )
@@ -297,5 +304,7 @@ def models(provider: str, vendor: str | None, tier: str | None, as_json: bool) -
     else:
         click.echo("No models could be enumerated.")
 
+    for note in incomplete:
+        click.echo(f"\n  incomplete — {note}")
     for note in notes:
         click.echo(f"\n  not enumerated — {note}")
