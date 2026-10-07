@@ -41,6 +41,7 @@ from headroom.proxy.body_forwarding import (
     thinking_blocks_survived_mutation,
 )
 from headroom.proxy.helpers import (
+    _path_for_log,
     _reset_session_beta_tracker_for_test,
     append_text_to_latest_user_chat_message,
     get_session_beta_tracker,
@@ -507,6 +508,67 @@ def test_log_outbound_request_emits_structured_fields() -> None:
     # Never log auth / body content.
     assert "Authorization" not in msg
     assert "x-api-key" not in msg.lower()
+
+
+def test_log_outbound_request_strips_query_string_api_key() -> None:
+    """Google forwarders put the API key in ``?key=``; it must not reach the log."""
+    import logging
+
+    proxy_logger = logging.getLogger("headroom.proxy")
+    records: list[logging.LogRecord] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _ListHandler(level=logging.INFO)
+    prev_level = proxy_logger.level
+    proxy_logger.addHandler(handler)
+    proxy_logger.setLevel(logging.INFO)
+    try:
+        log_outbound_request(
+            forwarder="google_batch_passthrough",
+            method="POST",
+            path=(
+                "https://user:pw@generativelanguage.googleapis.com/v1beta/"
+                "models/gemini-2.5-pro:batchGenerateContent?key=AIzaSECRET#frag"
+            ),
+            body_bytes_count=1,
+            body_mutated=False,
+            mutation_reasons=[],
+            request_id=None,
+            source="passthrough",
+        )
+    finally:
+        proxy_logger.removeHandler(handler)
+        proxy_logger.setLevel(prev_level)
+
+    msg = next(r.getMessage() for r in records if "outbound_request" in r.getMessage())
+    assert (
+        "path=https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-pro:batchGenerateContent " in msg
+    )
+    assert "AIzaSECRET" not in msg
+    assert "key=" not in msg
+    assert "user:pw" not in msg
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        # IPv6 upstreams keep their brackets so the log stays a valid URL.
+        ("https://[::1]:8787/v1/messages?key=SECRET", "https://[::1]:8787/v1/messages"),
+        ("http://[2001:db8::1]/v1/chat", "http://[2001:db8::1]/v1/chat"),
+        ("https://api.example.com:8443/v1?x=1#f", "https://api.example.com:8443/v1"),
+        # Relative paths pass through without a query.
+        ("/v1/messages?key=SECRET", "/v1/messages"),
+        # An invalid port makes urlsplit raise; never fall back to the raw URL.
+        ("https://host:notaport/v1?key=SECRET", "<unparseable>"),
+        ("https://[::1/v1?key=SECRET", "<unparseable>"),
+    ],
+)
+def test_path_for_log(path: str, expected: str) -> None:
+    assert _path_for_log(path) == expected
 
 
 # ---------------------------------------------------------------------------
