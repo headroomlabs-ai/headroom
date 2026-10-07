@@ -5112,7 +5112,13 @@ def _ensure_proxy_unlocked(
             _warn_proxy_mode_mismatch(running_config)
         elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
+        elif (
+            vertex_api_url
+            or clear_vertex_api_url
+            or os.environ.get("HEADROOM_MODE")
+            or os.environ.get("HEADROOM_MIN_TOKENS") is not None
+            or os.environ.get("HEADROOM_EXCLUDE_TOOLS") is not None
+        ):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
@@ -8965,12 +8971,49 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
 
 
 def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
-    """Warn when a reused proxy runs a different mode than this session asked for.
+    """Warn when reuse ignores this session's startup-only settings.
 
-    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
-    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
-    other clients may be attached to the running proxy.
+    Do not restart a shared proxy: other clients may be attached to it.
     """
+    config = running_config or {}
+    mismatches: list[str] = []
+    requested_min = os.environ.get("HEADROOM_MIN_TOKENS")
+    running_min = config.get("min_tokens_to_crush")
+    if requested_min is not None and isinstance(running_min, int):
+        try:
+            requested_min_value = int(requested_min)
+        except ValueError:
+            requested_min_value = None
+        if requested_min_value is not None and requested_min_value != running_min:
+            mismatches.append(f"HEADROOM_MIN_TOKENS={requested_min_value} (running: {running_min})")
+
+    requested_excludes = os.environ.get("HEADROOM_EXCLUDE_TOOLS")
+    running_excludes = config.get("exclude_tools")
+    if (
+        requested_excludes is not None
+        and isinstance(running_excludes, list)
+        and all(isinstance(name, str) for name in running_excludes)
+    ):
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        defaults = {name.lower() for name in DEFAULT_EXCLUDE_TOOLS}
+        requested_names = {
+            name.strip().lower() for name in requested_excludes.split(",") if name.strip()
+        }
+        running_names = {name.lower() for name in running_excludes}
+        if requested_names | defaults != running_names | defaults:
+            mismatches.append(
+                f"HEADROOM_EXCLUDE_TOOLS={sorted(requested_names)!r} "
+                f"(running: {sorted(running_names)!r})"
+            )
+
+    if mismatches:
+        click.echo(
+            "  Warning: this session requested "
+            + "; ".join(mismatches)
+            + ", but those settings are fixed at proxy startup. "
+            "Restart the proxy, or use --port for a separate one."
+        )
     requested = os.environ.get("HEADROOM_MODE")
     running = (running_config or {}).get("mode")
     if not requested or not isinstance(running, str):

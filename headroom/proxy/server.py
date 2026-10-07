@@ -3847,6 +3847,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
                 ),
+                "exclude_tools": sorted(config.exclude_tools or ()),
                 "max_items_after_crush": profile_kwargs.get(
                     "max_items_after_crush",
                     config.max_items_after_crush,

@@ -291,6 +291,72 @@ class TestModeMismatchWarning:
         assert self._warnings(monkeypatch, running_config, requested) == []
 
 
+class TestStartupCompressionMismatchWarning:
+    @pytest.fixture(autouse=True)
+    def _session_env(self, monkeypatch):
+        for name in ("HEADROOM_MODE", "HEADROOM_MIN_TOKENS", "HEADROOM_EXCLUDE_TOOLS"):
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.mark.parametrize(
+        ("name", "value", "config"),
+        [
+            ("HEADROOM_MIN_TOKENS", "2000", {"min_tokens_to_crush": 120}),
+            ("HEADROOM_MIN_TOKENS", "0", {"min_tokens_to_crush": 120}),
+            ("HEADROOM_EXCLUDE_TOOLS", "Bash,Read", {"exclude_tools": []}),
+            ("HEADROOM_EXCLUDE_TOOLS", "", {"exclude_tools": ["Bash"]}),
+        ],
+    )
+    def test_warns_when_reuse_ignores_explicit_compression_settings(
+        self, monkeypatch, capsys, name, value, config
+    ):
+        monkeypatch.setenv(name, value)
+        _warn_proxy_mode_mismatch(config)
+        output = capsys.readouterr().out
+        assert name in output
+        assert "Restart" in output and "--port" in output
+
+    @pytest.mark.parametrize(
+        ("env", "config"),
+        [
+            ({}, {"min_tokens_to_crush": 120, "exclude_tools": ["Bash"]}),
+            ({"HEADROOM_MIN_TOKENS": "120"}, {"min_tokens_to_crush": 120}),
+            ({"HEADROOM_MIN_TOKENS": "invalid"}, {"min_tokens_to_crush": 120}),
+            ({"HEADROOM_MIN_TOKENS": "2000"}, {}),
+            (
+                {"HEADROOM_EXCLUDE_TOOLS": " Read, BASH, bash "},
+                {"exclude_tools": ["Bash", "bash"]},
+            ),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Read"}, {"exclude_tools": []}),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Bash"}, {}),
+            ({"HEADROOM_EXCLUDE_TOOLS": "Bash"}, {"exclude_tools": None}),
+        ],
+    )
+    def test_does_not_warn_for_matching_unrequested_or_unknown_settings(
+        self, monkeypatch, capsys, env, config
+    ):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        _warn_proxy_mode_mismatch(config)
+        assert capsys.readouterr().out == ""
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [("HEADROOM_MIN_TOKENS", "2000"), ("HEADROOM_EXCLUDE_TOOLS", "Bash")],
+    )
+    def test_no_start_reuse_warns_without_an_explicit_mode(self, monkeypatch, capsys, name, value):
+        monkeypatch.setenv(name, value)
+        monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+        monkeypatch.setattr(
+            wrap_mod,
+            "_query_proxy_health",
+            lambda _port: {"config": {"min_tokens_to_crush": 120, "exclude_tools": []}},
+        )
+
+        wrap_mod._ensure_proxy_unlocked(18795, True)
+
+        assert name in capsys.readouterr().out
+
+
 def test_passthrough_handler_roots_profile_at_origin_and_strips_region_domain():
     import asyncio
     from types import SimpleNamespace
