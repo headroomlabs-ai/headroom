@@ -74,10 +74,12 @@ CacheAligner surfaces prefix instability, provider caches reward byte-identical 
 
 Anthropic prefix trackers are retained for at least the resolved provider cache
 lifetime plus a 60-second cleanup margin, or the configured session cleanup TTL,
-whichever is longer. The lifetime is resolved before request-time cleanup, so a
-one-hour cache keeps its frozen forwarded prefix across pauses longer than the
-usual ten-minute session cleanup floor. Retention is tracked per conversation
-lineage: a one-hour session does not extend an unrelated five-minute session.
+whichever is longer. A configured cache lifetime also applies before the first
+confirmed cache write and when a request omits its TTL. Retention is tracked per
+conversation lineage: a one-hour session does not extend an unrelated
+five-minute session. Expired trackers are discarded before lookup; a later
+longer TTL cannot revive their frozen state. Cleanup and recreation retain the
+live lineage index, keeping sibling conversations and tool profiles isolated.
 Retaining a tracker is not a guarantee that the provider still has its cache.
 
 

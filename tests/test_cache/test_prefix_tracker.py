@@ -384,6 +384,119 @@ class TestSessionTrackerStore:
             "one-hour", "anthropic", messages=original, cache_ttl_seconds=3600
         )
         assert expired is not tracker
+        expired.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=1500,
+            messages=forwarded,
+            message_token_counts=[1500],
+            original_messages=original,
+        )
+        unrelated_messages = [{"role": "user", "content": "unrelated conversation"}]
+        unrelated = store.resolve_tracker(
+            "one-hour", "anthropic", messages=unrelated_messages, cache_ttl_seconds=3600
+        )
+
+        assert unrelated is not expired
+        assert (
+            overlay_cached_prefix(
+                unrelated_messages,
+                unrelated_messages,
+                unrelated.get_last_original_messages(),
+                unrelated.get_last_forwarded_messages(),
+                confirmed_frozen_count=unrelated.get_frozen_message_count(),
+            )
+            == unrelated_messages
+        )
+
+    def test_configured_cache_ttl_preserves_and_expires_tracker_without_request_ttl(
+        self, monkeypatch
+    ):
+        """Configured provider lifetime retains cached bytes without a per-request TTL."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore(PrefixFreezeConfig(min_cached_tokens=1, cache_ttl_seconds=3600))
+        original = [{"role": "user", "content": "original prompt " + "x" * 2000}]
+        forwarded = [{"role": "user", "content": "configured cache payload"}]
+        tracker = store.resolve_tracker("configured-hour", "anthropic", messages=original)
+        now[0] += 660
+        store._last_cleanup = now[0]
+        assert store.peek("configured-hour") is tracker
+        assert store.resolve_tracker("configured-hour", "anthropic", messages=original) is tracker
+        tracker.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=1500,
+            messages=forwarded,
+            message_token_counts=[1500],
+            original_messages=original,
+        )
+        assert tracker.get_frozen_message_count() == 1
+
+        now[0] += 660
+        store._last_cleanup = now[0]
+        resumed = store.resolve_tracker("configured-hour", "anthropic", messages=original)
+        assert resumed is tracker
+        assert (
+            overlay_cached_prefix(
+                original,
+                original,
+                resumed.get_last_original_messages(),
+                resumed.get_last_forwarded_messages(),
+                confirmed_frozen_count=resumed.get_frozen_message_count(),
+            )
+            == forwarded
+        )
+
+        now[0] += 3_661
+        expired = store.resolve_tracker("configured-hour", "anthropic", messages=original)
+        assert expired is not tracker
+        assert expired.get_frozen_message_count() == 0
+
+    def test_request_ttl_does_not_resurrect_expired_sibling_affinity(self, monkeypatch):
+        """A new long request TTL cannot revive an expired short-cache prefix."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore(PrefixFreezeConfig(min_cached_tokens=1))
+        short_history = [{"role": "user", "content": "short profile"}]
+        long_history = [{"role": "user", "content": "long profile"}]
+        short = store.resolve_tracker(
+            "mixed", "anthropic", short_history, cache_affinity="short", cache_ttl_seconds=300
+        )
+        short.update_from_response(
+            0,
+            1000,
+            [{"role": "user", "content": "old short-cache bytes"}],
+            message_token_counts=[1000],
+            original_messages=short_history,
+        )
+        long = store.resolve_tracker(
+            "mixed", "anthropic", long_history, cache_affinity="long", cache_ttl_seconds=3600
+        )
+
+        now[0] += 661
+        store._last_cleanup = now[0]
+        continued = store.resolve_tracker(
+            "mixed",
+            "anthropic",
+            long_history + [{"role": "assistant", "content": "next"}],
+            cache_affinity="long",
+            cache_ttl_seconds=3600,
+        )
+        assert continued is long
+        restarted = store.resolve_tracker(
+            "mixed", "anthropic", short_history, cache_affinity="short", cache_ttl_seconds=3600
+        )
+        assert restarted.get_frozen_message_count() == 0
+        current = [{"role": "user", "content": "current short-profile bytes"}]
+        assert (
+            overlay_cached_prefix(
+                current,
+                short_history,
+                restarted.get_last_original_messages(),
+                restarted.get_last_forwarded_messages(),
+                confirmed_frozen_count=restarted.get_frozen_message_count(),
+            )
+            == current
+        )
 
     def test_request_cache_ttl_is_isolated_per_session(self, monkeypatch):
         """A one-hour cache in one session must not extend another session."""
@@ -798,6 +911,75 @@ class TestConversationLineageResolution:
                     assert tracker is trackers[name], f"[{name}] turn {turn} lost its tracker"
                 else:
                     assert tracker is trackers["D"]  # stable overflow tracker
+
+    @pytest.mark.parametrize("new_affinity", ["profile-a", "profile-b"])
+    def test_expired_unswept_tracker_cannot_replay_prefix_across_affinities(
+        self, monkeypatch, new_affinity
+    ):
+        """An expired bare lineage is cold before lookup, without waiting for sweep."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore(PrefixFreezeConfig(min_cached_tokens=1, session_ttl_seconds=1))
+        history = self._history("shared", 1)
+        stale_forwarded = [{"role": "user", "content": "profile A's frozen forwarded bytes"}]
+        stale = store.resolve_tracker("shared", "anthropic", history, cache_affinity="profile-a")
+        stale.update_from_response(
+            cache_read_tokens=0,
+            cache_write_tokens=1_000,
+            messages=stale_forwarded,
+            message_token_counts=[1_000],
+            original_messages=history,
+        )
+        assert stale.get_frozen_message_count() == 1
+
+        now[0] += 2
+        # Keep the periodic sweep not due: lookup/pruning itself must enforce expiry.
+        store._last_cleanup = now[0]
+        fresh = store.resolve_tracker("shared", "anthropic", history, cache_affinity=new_affinity)
+        assert fresh is not stale
+        assert fresh.get_frozen_message_count() == 0
+        processed = [{"role": "user", "content": "current profile bytes"}]
+        replayed = overlay_cached_prefix(
+            processed,
+            history,
+            fresh.get_last_original_messages(),
+            fresh.get_last_forwarded_messages(),
+            confirmed_frozen_count=fresh.get_frozen_message_count(),
+        )
+        assert replayed == processed
+        assert replayed != stale_forwarded
+
+    def test_expired_legacy_tracker_rejoins_index_without_cross_affinity_replay(self, monkeypatch):
+        """Evicting a legacy bare tracker must not lose the new lineage index."""
+        now = [1_000.0]
+        monkeypatch.setattr("headroom.cache.prefix_tracker.time.time", lambda: now[0])
+        store = SessionTrackerStore(PrefixFreezeConfig(min_cached_tokens=1, session_ttl_seconds=1))
+        store.get_or_create("shared", "anthropic")
+        now[0] += 2
+        store._last_cleanup = now[0]
+        history = self._history("shared", 1)
+        first = store.resolve_tracker("shared", "anthropic", history, cache_affinity="profile-a")
+        first.update_from_response(
+            0,
+            1000,
+            [{"role": "user", "content": "profile A frozen bytes"}],
+            message_token_counts=[1000],
+            original_messages=history,
+        )
+        assert first.get_frozen_message_count() == 1
+
+        second = store.resolve_tracker("shared", "anthropic", history, cache_affinity="profile-b")
+        current = [{"role": "user", "content": "profile B bytes"}]
+        assert (
+            overlay_cached_prefix(
+                current,
+                history,
+                second.get_last_original_messages(),
+                second.get_last_forwarded_messages(),
+                confirmed_frozen_count=second.get_frozen_message_count(),
+            )
+            == current
+        )
 
     def test_empty_canonical_history_falls_back_to_legacy(self):
         """A history whose every message projects away (pure directive

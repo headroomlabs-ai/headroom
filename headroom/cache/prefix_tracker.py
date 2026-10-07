@@ -1380,8 +1380,12 @@ class PrefixCacheTracker:
         return self.is_expired_for_cache_ttl(None)
 
     def is_expired_for_cache_ttl(self, cache_ttl_seconds: int | None) -> bool:
-        """Check expiry including a cache lifetime known from the current request."""
-        observed_ttl = max(self._cache_ttl_seconds or 0, cache_ttl_seconds or 0)
+        """Check expiry including the longest configured or observed cache lifetime."""
+        observed_ttl = max(
+            self._cache_ttl_seconds or 0,
+            self.config.cache_ttl_seconds or 0,
+            cache_ttl_seconds or 0,
+        )
         retention = max(
             self.config.session_ttl_seconds,
             observed_ttl + _CACHE_TTL_CLEANUP_MARGIN_SECONDS if observed_ttl else 0,
@@ -1557,6 +1561,9 @@ class SessionTrackerStore:
     ) -> PrefixCacheTracker:
         """Get existing tracker or create a new one for this session."""
         tracker = self._trackers.get(session_id)
+        if tracker is not None and tracker.is_expired:
+            self._discard_tracker(session_id)
+            tracker = None
         if tracker is not None:
             # Extend retention before the request-time cleanup sweep.
             tracker.observe_cache_ttl(cache_ttl_seconds)
@@ -1573,6 +1580,15 @@ class SessionTrackerStore:
         tracker._idle_seconds_at_fetch = 0.0
         self._trackers[session_id] = tracker
         return tracker
+
+    def _discard_tracker(self, tracker_key: str) -> None:
+        """Remove a tracker and any lineage indexes that point to it."""
+        self._trackers.pop(tracker_key, None)
+        for session_id, family in list(self._lineages.items()):
+            family.pop(tracker_key, None)
+            self._lineage_affinities.pop(tracker_key, None)
+            if not family:
+                del self._lineages[session_id]
 
     def resolve_tracker(
         self,
@@ -1655,14 +1671,13 @@ class SessionTrackerStore:
         # Rewritten-tail matches are deliberately last and require a unique best
         # structural score; ambiguity starts a fresh lineage instead of making
         # sibling sub-calls ping-pong one tracker.
-        for key in [
-            key
-            for key in family
-            if key not in self._trackers
-            or self._trackers[key].is_expired_for_cache_ttl(cache_ttl_seconds)
-        ]:
-            del family[key]
+        expired_keys = [
+            key for key in family if key not in self._trackers or self._trackers[key].is_expired
+        ]
+        for key in expired_keys:
+            family.pop(key, None)
             self._lineage_affinities.pop(key, None)
+            self._trackers.pop(key, None)
         by_length = sorted(family.items(), key=lambda item: len(item[1]), reverse=True)
         best_key: str | None = None
         for accepted in (
@@ -1758,6 +1773,9 @@ class SessionTrackerStore:
         # creation. The selected lineage's TTL is applied before its cleanup
         # sweep, then its snapshot is stamped after the family has been pruned.
         tracker = self.get_or_create(best_key, provider, cache_ttl_seconds)
+        # Lookup can evict an expired bare tracker and detach an empty family.
+        # Stamp the replacement into the live index, not that detached mapping.
+        family = self._lineages.setdefault(session_id, family)
         family[best_key] = snap
         self._lineage_affinities[best_key] = cache_affinity
         return tracker
