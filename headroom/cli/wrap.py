@@ -2378,8 +2378,21 @@ def _copilot_models_provenance_path(file_path: Path) -> Path:
     return paths.workspace_dir() / "copilot_model_blocks" / f"{digest}.json"
 
 
-def _record_copilot_models_provenance(file_path: Path, block: str) -> None:
-    """Remember the exact bytes written, so a later launch can prove ownership."""
+#: Ownership record layout. v1 (``{"path", "sha256"}``) held one digest; v2 holds
+#: the committed digest plus a pending one, so a refresh interrupted between the
+#: record write and the file write never strands the block (see
+#: ``_inject_copilot_models_instructions``).
+_COPILOT_MODELS_PROVENANCE_VERSION = 2
+
+
+def _copilot_models_block_digest(block: str) -> str:
+    return hashlib.sha256(block.encode("utf-8")).hexdigest()
+
+
+def _write_copilot_models_provenance(
+    file_path: Path, *, committed: str | None, pending: str | None
+) -> bool:
+    """Record what Headroom has written (or is about to write). False on failure."""
     try:
         record = _copilot_models_provenance_path(file_path)
         record.parent.mkdir(parents=True, exist_ok=True)
@@ -2387,25 +2400,37 @@ def _record_copilot_models_provenance(file_path: Path, block: str) -> None:
             record,
             json.dumps(
                 {
+                    "version": _COPILOT_MODELS_PROVENANCE_VERSION,
                     "path": str(file_path),
-                    "sha256": hashlib.sha256(block.encode("utf-8")).hexdigest(),
+                    "committed": committed,
+                    "pending": pending,
                 }
             ),
         )
     except OSError:
-        # Provenance is an optimisation for *refreshing*. Losing it only means the
-        # next launch appends instead of replacing -- never that user text is cut.
-        pass
+        return False
+    return True
 
 
-def _copilot_models_provenance(file_path: Path) -> str | None:
-    """SHA-256 of the block Headroom last wrote here, or ``None``."""
+def _copilot_models_provenance(file_path: Path) -> frozenset[str]:
+    """Every digest that proves a block here is Headroom's (empty when none).
+
+    Both the committed and the pending digest count: a crash after the pending
+    record but before the file write leaves the old block (committed), a crash
+    after the file write leaves the new one (pending). v1 records still count.
+    """
     try:
         rec = json.loads(_read_text(_copilot_models_provenance_path(file_path)))
     except (OSError, ValueError):
-        return None
-    sha = rec.get("sha256") if isinstance(rec, dict) else None
-    return sha if isinstance(sha, str) and sha else None
+        return frozenset()
+    if not isinstance(rec, dict):
+        return frozenset()
+    candidates: tuple[object, ...]
+    if rec.get("version") == _COPILOT_MODELS_PROVENANCE_VERSION:
+        candidates = (rec.get("committed"), rec.get("pending"))
+    else:
+        candidates = (rec.get("sha256"),)
+    return frozenset(value for value in candidates if isinstance(value, str) and value)
 
 
 def _clear_copilot_models_provenance(file_path: Path) -> None:
@@ -2458,12 +2483,12 @@ def _owned_marked_block_spans(existing: str, file_path: Path) -> list[tuple[int,
     annoyance; cutting a span out of someone's instructions file is not.
     """
     expected = _copilot_models_provenance(file_path)
-    if expected is None:
+    if not expected:
         return []
     return [
         (start, end)
         for start, end in _marked_block_spans(existing)
-        if hashlib.sha256(existing[start:end].encode("utf-8")).hexdigest() == expected
+        if _copilot_models_block_digest(existing[start:end]) in expected
     ]
 
 
@@ -2526,10 +2551,36 @@ def _inject_copilot_models_instructions(
     follows the live catalog instead of going stale on the first launch that
     wrote it. Only the marked region is touched; everything the user wrote is
     preserved, including their line endings.
+
+    Every write is a three-step transaction, each step individually atomic:
+    record ``{committed: <block on disk>, pending: <new block>}``, write the
+    file, then finalize the record. Because ownership accepts either digest, an
+    interruption between any two steps leaves the block that is actually in the
+    file provable, so the next launch refreshes it instead of appending a
+    duplicate. If no ownership record can be written at all, the file is left
+    untouched: a block Headroom cannot later prove it wrote would be duplicated
+    on every launch.
     """
     if not model_ids:
         return False
     block = _copilot_models_instructions_block(model_ids)
+    new_block = block.rstrip("\n")
+    new_digest = _copilot_models_block_digest(new_block)
+
+    def begin(committed: str | None) -> bool:
+        if _write_copilot_models_provenance(file_path, committed=committed, pending=new_digest):
+            return True
+        click.echo(
+            f"  Note: could not record ownership of the available-models block for "
+            f"{file_path}; leaving the file untouched. Run `headroom models` to see "
+            "available models."
+        )
+        return False
+
+    def finish() -> None:
+        # Not fatal: the pending digest already proves the block just written.
+        _write_copilot_models_provenance(file_path, committed=new_digest, pending=None)
+
     if file_path.exists():
         raw = _read_instruction_file(file_path)
         if raw is None:
@@ -2550,29 +2601,35 @@ def _inject_copilot_models_instructions(
         span = _find_marked_block(existing, file_path)
         if span is not None:
             start, end = span
-            new_block = block.rstrip("\n")
             updated = existing[:start] + new_block + existing[end:]
             if updated == existing:
                 if verbose:
                     click.echo(f"  Available-models list already current in {file_path.name}")
+                if _copilot_models_provenance(file_path) != {new_digest}:
+                    finish()  # settle a record an earlier run left pending
                 return True
+            if not begin(_copilot_models_block_digest(existing[start:end])):
+                return False
             _write_preserving_line_endings(file_path, raw, updated)
-            _record_copilot_models_provenance(file_path, new_block)
+            finish()
             click.echo(
                 f"  Refreshed available-models list in {file_path} ({len(model_ids)} models)"
             )
             return True
         # Not provably ours: append rather than splice. A visible duplicate is
         # recoverable; cutting a span out of the user's file is not.
-        appended = block.rstrip("\n")
+        if not begin(None):
+            return False
         _write_preserving_line_endings(
-            file_path, raw, existing.rstrip("\n") + "\n\n" + appended + "\n"
+            file_path, raw, existing.rstrip("\n") + "\n\n" + new_block + "\n"
         )
-        _record_copilot_models_provenance(file_path, appended)
+        finish()
     else:
+        if not begin(None):
+            return False
         file_path.parent.mkdir(parents=True, exist_ok=True)
         _write_text(file_path, block)
-        _record_copilot_models_provenance(file_path, block.rstrip("\n"))
+        finish()
     click.echo(f"  Available-models list injected into {file_path} ({len(model_ids)} models)")
     return True
 

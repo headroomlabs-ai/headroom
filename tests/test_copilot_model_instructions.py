@@ -363,3 +363,130 @@ def test_utf16le_without_bom_fails_closed(tmp_path: Path) -> None:
     assert p.read_bytes() == before
     # Still readable in its own encoding.
     assert p.read_bytes().decode("utf-16-le") == "# Mine\nkeep me\n"
+
+
+# ---------------------------------------------------------------------------
+# Crash-recoverable ownership record
+# ---------------------------------------------------------------------------
+
+
+class _PowerLoss(BaseException):
+    """The process dying mid-write: no OSError handler gets to run."""
+
+
+@pytest.fixture
+def isolated_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    return workspace
+
+
+def _interrupt_nth_write(monkeypatch: pytest.MonkeyPatch, target: Path, nth: int) -> None:
+    import headroom.cli.wrap as wrap_mod
+
+    real = wrap_mod._write_text
+    seen = {"n": 0}
+
+    def _write_text(path: Path, content: str) -> None:
+        if Path(path) == target:
+            seen["n"] += 1
+            if seen["n"] == nth:
+                raise _PowerLoss(f"power lost before write #{nth} to {target.name}")
+        real(path, content)
+
+    monkeypatch.setattr(wrap_mod, "_write_text", _write_text)
+
+
+def _blocks(path: Path) -> int:
+    from headroom.cli.wrap import _COPILOT_MODELS_MARKER
+
+    return path.read_text(encoding="utf-8").count(_COPILOT_MODELS_MARKER)
+
+
+def test_refresh_interrupted_before_the_file_write_still_refreshes_in_place(
+    instructions: Path, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    """Pending record written, file write never lands: the next launch must not duplicate."""
+    _inject_copilot_models_instructions(instructions, ["a-1"])
+    before = instructions.read_bytes()
+
+    with monkeypatch.context() as m:
+        _interrupt_nth_write(m, instructions, 1)
+        with pytest.raises(_PowerLoss):
+            _inject_copilot_models_instructions(instructions, ["a-1", "b-2"])
+    assert instructions.read_bytes() == before
+
+    assert _inject_copilot_models_instructions(instructions, ["a-1", "b-2", "c-3"]) is True
+    assert _blocks(instructions) == 1, "an interrupted refresh made the next launch append"
+    assert "c-3" in instructions.read_text(encoding="utf-8")
+    assert _remove_copilot_models_instructions(instructions) is True
+    assert _blocks(instructions) == 0
+
+
+def test_refresh_interrupted_after_the_file_write_is_still_owned(
+    instructions: Path, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    """New block landed, record never finalized: refresh and unwrap both still work."""
+    from headroom.cli.wrap import _copilot_models_provenance_path
+
+    _inject_copilot_models_instructions(instructions, ["a-1"])
+    record = _copilot_models_provenance_path(instructions)
+    with monkeypatch.context() as m:
+        # Write #1 to the record is the pending record; #2 would finalize it.
+        _interrupt_nth_write(m, record, 2)
+        with pytest.raises(_PowerLoss):
+            _inject_copilot_models_instructions(instructions, ["a-1", "b-2"])
+    assert "b-2" in instructions.read_text(encoding="utf-8")
+
+    snapshot, record_snapshot = instructions.read_bytes(), record.read_bytes()
+    assert _inject_copilot_models_instructions(instructions, ["a-1", "b-2", "c-3"]) is True
+    assert _blocks(instructions) == 1
+
+    instructions.write_bytes(snapshot)
+    record.write_bytes(record_snapshot)
+    assert _remove_copilot_models_instructions(instructions) is True
+    assert _blocks(instructions) == 0
+
+
+def test_no_ownership_record_means_the_file_is_left_alone(
+    instructions: Path, monkeypatch: pytest.MonkeyPatch, isolated_workspace: Path
+) -> None:
+    """A block Headroom could never prove it wrote would be duplicated on every launch."""
+    import headroom.cli.wrap as wrap_mod
+
+    blocker = isolated_workspace.parent / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(wrap_mod, "_copilot_models_provenance_path", lambda p: blocker / "r.json")
+    before = instructions.read_bytes()
+
+    assert _inject_copilot_models_instructions(instructions, ["a-1"]) is False
+    assert instructions.read_bytes() == before
+
+
+def test_a_v1_ownership_record_is_still_honoured(
+    instructions: Path, isolated_workspace: Path
+) -> None:
+    import hashlib
+    import json
+
+    from headroom.cli.wrap import (
+        _copilot_models_instructions_block,
+        _copilot_models_provenance_path,
+    )
+
+    block = _copilot_models_instructions_block(["a-1"]).rstrip("\n")
+    instructions.write_text(
+        instructions.read_text(encoding="utf-8") + "\n" + block + "\n", encoding="utf-8"
+    )
+    record = _copilot_models_provenance_path(instructions)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text(
+        json.dumps(
+            {"path": str(instructions), "sha256": hashlib.sha256(block.encode()).hexdigest()}
+        ),
+        encoding="utf-8",
+    )
+
+    assert _inject_copilot_models_instructions(instructions, ["a-1", "b-2"]) is True
+    assert _blocks(instructions) == 1
+    assert json.loads(record.read_text(encoding="utf-8"))["version"] == 2
