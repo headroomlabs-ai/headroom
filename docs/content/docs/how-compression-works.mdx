@@ -40,7 +40,7 @@ The router auto-detects content type by analyzing structure and patterns. No man
 | Plain text | Text with no stronger signal | Kompress | workload-dependent |
 | Anything else | Fallback chain, then passthrough if no safe saving is found | Kompress / passthrough | varies |
 
-Human-readable Git status is structured output, not prose: it is preserved byte-for-byte, including section labels and paths containing spaces. This protection does not exclude all `Bash` results; ordinary prose and build logs still follow their normal routes. The recognizer covers the standard English status format (`LC_ALL=C`); localized formats are not covered.
+Human-readable Git status is structured output, not prose: it is preserved byte-for-byte, including section labels and paths containing spaces. The router checks its structure before model classification and before selected external or lossy compressors, so CSV and wildcard plugins cannot trim status entries. This protection does not exclude all `Bash` results; ordinary prose and build logs still follow their normal routes. The recognizer covers the standard English status format (`LC_ALL=C`); localized formats are not covered.
 
 ## Quick Start
 

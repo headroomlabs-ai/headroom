@@ -802,6 +802,24 @@ Untracked files:
     }
 
     #[test]
+    fn untracked_only_git_status_is_tabular() {
+        let content = "\
+On branch feature/status
+
+Untracked files:
+  (use \"git add <file>...\" to include in what will be committed)
+\tuntracked path with spaces.txt
+\tuntracked α.rs
+";
+        let result = detect_content_type(content);
+        assert_eq!(result.content_type, ContentType::Tabular);
+        assert_eq!(
+            result.metadata.get("format").and_then(Value::as_str),
+            Some("git_status")
+        );
+    }
+
+    #[test]
     fn ordinary_bullet_list_is_not_git_status() {
         let prose = "The branch has many changes:\n- modified: item one\n- modified: item two";
         assert_eq!(
