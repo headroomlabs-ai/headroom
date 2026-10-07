@@ -200,14 +200,15 @@ WRAP_TARGETS: dict[str, WrapTarget] = {
                 EnvVar("OPENAI_BASE_URL", "openai_v1"),
                 EnvVar("OPENAI_API_BASE", "openai_v1", display=False),
                 EnvVar("ANTHROPIC_BASE_URL", "anthropic"),
+                EnvVar("ANTHROPIC_HOST", "anthropic"),
             ),
             project_prefix=False,
             help_text=(
                 "Launch Goose (Block) CLI through Headroom proxy.\n"
                 "\n"
                 "\b\n"
-                "Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls\n"
-                "through Headroom.\n"
+                "Sets OPENAI_BASE_URL, ANTHROPIC_BASE_URL, and ANTHROPIC_HOST to route\n"
+                "Goose's API calls through Headroom.\n"
                 "\n"
                 "\b\n"
                 "Uninstall: there is no ``headroom unwrap goose`` subcommand — nothing is\n"
