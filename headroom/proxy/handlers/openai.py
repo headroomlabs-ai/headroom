@@ -2321,12 +2321,20 @@ class OpenAIHandlerMixin:
         from headroom.copilot_auth import (
             _is_forwardable_copilot_bearer_token,
             _is_managed_copilot_seeded_bearer,
+            resolve_copilot_integration_id,
             token_fingerprint,
         )
         from headroom.models.copilot_catalog import CopilotModelCatalog
 
         base_url = self._resolve_openai_upstream(request)
-        integration_id = os.environ.get("GITHUB_COPILOT_INTEGRATION_ID", "vscode-chat")
+        # The same resolution `apply_copilot_api_auth` uses, so the key names the
+        # integration the catalog fetch (and the traffic it describes) actually
+        # goes out under: the client's own Copilot-Integration-Id when it sends
+        # one, else the configured default. Keying on the env default alone let
+        # a `vscode-chat` client and a `copilot-chat` client share one entry.
+        integration_id = resolve_copilot_integration_id(
+            request.headers.get("copilot-integration-id")
+        )
         token = ""
         inbound = request.headers.get("authorization") or ""
         scheme, _, raw = inbound.partition(" ")

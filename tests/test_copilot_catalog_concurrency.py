@@ -175,3 +175,45 @@ async def test_lock_serialises_a_concurrent_wave(cards: dict[str, Any]) -> None:
 
     await asyncio.gather(*(fetch_once() for _ in range(8)))
     assert fetches == 1, f"{fetches} fetches issued for one credential"
+
+
+# ---------------------------------------------------------------------------
+# The cache identity names the integration the traffic actually goes out under
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_key_follows_the_clients_integration_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two integrations on one credential must never share a catalog entry.
+
+    ``apply_copilot_api_auth`` sends the client's own ``Copilot-Integration-Id``
+    when it has one (falling back to ``GITHUB_COPILOT_INTEGRATION_ID``), and
+    ``/models`` can answer differently per integration. Keying on the env
+    default alone let the first integration's catalog route the other's
+    requests.
+    """
+    from types import SimpleNamespace
+
+    from starlette.datastructures import Headers
+
+    from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+
+    monkeypatch.delenv("GITHUB_COPILOT_INTEGRATION_ID", raising=False)
+    monkeypatch.delenv("GITHUB_COPILOT_API_TOKEN", raising=False)
+    handler = SimpleNamespace(
+        _resolve_openai_upstream=lambda request: "https://api.githubcopilot.com"
+    )
+
+    def key_for(**headers: str) -> tuple[str, str, str]:
+        request = SimpleNamespace(
+            headers=Headers(headers={"authorization": "Bearer gho_same", **headers})
+        )
+        return OpenAIHandlerMixin._copilot_catalog_key(handler, request)  # type: ignore[arg-type]
+
+    vscode = key_for(**{"copilot-integration-id": "vscode-chat"})
+    cli = key_for(**{"copilot-integration-id": "copilot-developer-cli"})
+    assert vscode != cli, "two integrations shared one catalog entry"
+    assert vscode[0] == cli[0] and vscode[2] == cli[2], "only the integration should differ"
+
+    # Without a client header the configured default applies, exactly as auth does.
+    monkeypatch.setenv("GITHUB_COPILOT_INTEGRATION_ID", "copilot-developer-cli")
+    assert key_for() == cli
