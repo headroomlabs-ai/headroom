@@ -123,6 +123,9 @@ Enable or disable automatic Copilot review in **Settings → Rules → Rulesets 
 - Type hints on public functions; Google-style docstrings.
 - Cover new behavior + edge cases; aim >80% coverage on new code.
 - Python 3.10+. Optional features go behind extras.
+- For an optional-integration change, run its owner tests and `mypy headroom`
+  with the relevant extra installed. A hook environment without that dependency
+  does not check the imported library's types.
 - **Headroom writes LF and normalizes on read, on every platform.** Pass
   `newline="\n"` to every `write_text`/`open` that writes a context, memory,
   or state file, and normalize `\r\n`/`\r` when you read one back. Without
