@@ -443,13 +443,13 @@ class RequestOutcome:
 
 def _resolve_outcome_pricing(
     handler: Any, provider_name: str, model: str
-) -> tuple[tuple[float, float] | None, str]:
-    """Provider-resolved per-1M (input, output) price + price provenance.
+) -> tuple[tuple[float, float] | None, str, bool]:
+    """Provider-resolved price, provenance, and explicit-override selection.
 
     Asks the handler's provider object for its own per-lookup resolution so
     explicit pricing overrides and the built-in table keep their measured
     provenance, and only the unknown-model default is flagged estimated
-    (#3732). Anything missing or raising degrades to ``(None, measured)``:
+    (#3732). Anything missing or raising degrades to ``(None, measured, False)``:
     the cost tracker then applies its generic fallback, stamped estimated.
     Bookkeeping must never break a response, so every step is defensive.
     """
@@ -469,14 +469,19 @@ def _resolve_outcome_pricing(
         provider = getattr(handler, f"{provider_name}_provider", None)
     resolve = getattr(provider, "resolve_pricing_for_ledger", None)
     if not callable(resolve):
-        return None, PRICE_BASIS_MEASURED
+        return None, PRICE_BASIS_MEASURED, False
     try:
         pricing, price_basis = resolve(model)
     except Exception:  # noqa: BLE001 -- degrade, don't break the response
-        return None, PRICE_BASIS_MEASURED
+        return None, PRICE_BASIS_MEASURED, False
     if price_basis not in (PRICE_BASIS_MEASURED, PRICE_BASIS_ESTIMATED):
         price_basis = PRICE_BASIS_MEASURED
-    return pricing, price_basis
+    override_lookup = getattr(provider, "has_pricing_override", None)
+    try:
+        is_override = bool(override_lookup(model)) if callable(override_lookup) else False
+    except Exception:  # noqa: BLE001 -- degrade, don't break response
+        is_override = False
+    return pricing, price_basis, is_override
 
 
 async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
@@ -529,7 +534,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # resolved the price. The outcome path previously never supplied this, so
     # unknown-to-LiteLLM models booked zero ledger entries and the budget
     # could never trip on them (#3825 review).
-    pricing, price_basis = _resolve_outcome_pricing(handler, outcome.provider, outcome.model)
+    pricing, price_basis, pricing_override = _resolve_outcome_pricing(
+        handler, outcome.provider, outcome.model
+    )
 
     # GitHub Copilot: requests routed to the Copilot API travel on the OpenAI or
     # Anthropic wire, so the handlers stamp the wire provider. Relabel to
@@ -756,6 +763,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # budget policy applies to it like any other spend.
             price_basis=price_basis,
             pricing=pricing,
+            **({"pricing_override": True} if pricing_override else {}),
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is

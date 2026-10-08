@@ -797,6 +797,10 @@ class OpenAIProvider(Provider):
         _, estimated = self._resolve_pricing(model)
         return estimated
 
+    def has_pricing_override(self, model: str) -> bool:
+        """Whether the operator selected fixed input/output rates for this model."""
+        return model in self._pricing_overrides
+
     def resolve_pricing_for_ledger(self, model: str) -> tuple[tuple[float, float] | None, str]:
         """Per-1M (input, output) price and its provenance for ledger booking.
 

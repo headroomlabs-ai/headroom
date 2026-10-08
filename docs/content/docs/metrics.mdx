@@ -405,3 +405,5 @@ Example ad-hoc queries against the same metric family:
 | Lifetime Tokens Saved | `headroom_persistent_savings_tokens_saved_total` |
 | Mean Headroom Overhead | `rate(headroom_overhead_ms_sum[5m]) / rate(headroom_overhead_ms_count[5m])` |
 | Cache Hit Rate (by provider) | `sum by (provider) (rate(headroom_provider_cache_hit_requests_total[5m])) / sum by (provider) (rate(headroom_provider_cache_requests_total[5m]))` |
+
+Explicit OpenAI model pricing in `HEADROOM_MODEL_LIMITS` or `models.json` takes precedence over a successful catalog lookup when booking budget spend. These fixed input/output overrides use the provider's existing 50% cached-input convention, without charging inferred cache writes twice. Catalog-priced models retain LiteLLM's native cache discounts and context tiers. Usage and price provenance remain separate.
