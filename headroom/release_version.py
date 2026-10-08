@@ -32,6 +32,10 @@ except ModuleNotFoundError:  # bare-script context (the release workflow)
     run = _mod.run
 
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+PACKAGE_VERSION_RE = re.compile(
+    r"((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
+    r"(?:(a|b|rc)(0|[1-9][0-9]*))?"
+)
 RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$")
 CONVENTIONAL_COMMIT_RE = re.compile(
     r"^(feat|fix|ci|chore|perf|refactor|docs|style|test)(\(.+\))?(!)?:\s*(.+)$"
@@ -41,6 +45,19 @@ FIELD_SEP = "\x1f"
 RECORD_SEP = "\x1e"
 GIT_LOG_FORMAT = "%s%x1f%b%x1e"
 BUMP_PRIORITY = {"patch": 0, "minor": 1, "major": 2}
+
+
+def package_versions(value: str) -> tuple[str, str]:
+    """Validate a canonical Python release version and return its npm equivalent."""
+    match = PACKAGE_VERSION_RE.fullmatch(value)
+    if not match:
+        raise ValueError(f"Invalid semantic version: {value}")
+    base, stage, number = match.groups()
+    npm_version = value
+    if stage:
+        npm_stage = {"a": "alpha", "b": "beta", "rc": "rc"}[stage]
+        npm_version = f"{base}-{npm_stage}.{number}"
+    return value, npm_version
 
 
 @dataclass(frozen=True, order=True)
@@ -199,10 +216,10 @@ def compute_release_version(
     """Compute the next release version from the canonical version and existing tags."""
 
     if manual_version:
-        manual = str(SemVer.parse(manual_version))
+        manual, npm_version = package_versions(manual_version)
         return ReleaseVersionInfo(
             version=manual,
-            npm_version=manual,
+            npm_version=npm_version,
             canonical=canonical_version,
             height="0",
             bump="manual",
@@ -306,15 +323,13 @@ def main() -> None:
     root = Path.cwd()
     manual_version = os.environ.get("MANUAL_VER", "").strip()
     manual_raw = os.environ.get("MANUAL_VER") or os.environ.get("LEVEL") or "patch"
-    manual_match = re.fullmatch(
-        r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)",
-        manual_raw.strip(),
-    )
+    manual_value = manual_raw.strip().removeprefix("v")
+    manual_match = PACKAGE_VERSION_RE.fullmatch(manual_value)
     if manual_match:
-        version = manual_match.group(1)
+        version, npm_version = package_versions(manual_value)
         info = ReleaseVersionInfo(
             version=version,
-            npm_version=version,
+            npm_version=npm_version,
             canonical=get_canonical_version(root),
             bump="manual",
             height="0",
@@ -330,12 +345,13 @@ def main() -> None:
     tags = list_release_tags(root)
     previous_tag = find_latest_release_tag(tags) or ""
     level = os.environ.get("LEVEL", "").strip()
-    manual_match = re.fullmatch(r"v?(\d+\.\d+\.\d+(?:[abrc]\d+)?)", level.strip())
+    manual_value = level.strip().removeprefix("v")
+    manual_match = PACKAGE_VERSION_RE.fullmatch(manual_value)
     if manual_match:
-        version = manual_match.group(1)
+        version, npm_version = package_versions(manual_value)
         info = ReleaseVersionInfo(
             version=version,
-            npm_version=version,
+            npm_version=npm_version,
             canonical=get_canonical_version(root),
             bump="manual",
             height="0",

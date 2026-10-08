@@ -184,3 +184,34 @@ def test_release_version_script_runs_directly_without_importing_headroom_package
         "bump=manual",
         "previous_tag=",
     ]
+
+
+@pytest.mark.parametrize(
+    "version,npm_version",
+    [("0.37.0a1", "0.37.0-alpha.1"), ("0.37.0b2", "0.37.0-beta.2"), ("0.37.0rc3", "0.37.0-rc.3")],
+)
+@pytest.mark.parametrize("input_name", ["MANUAL_VER", "LEVEL"])
+def test_manual_prerelease_override_emits_valid_python_and_npm_versions(
+    tmp_path, version, npm_version, input_name
+):
+    output_path = tmp_path / "github-output.txt"
+    env = os.environ.copy()
+    env.pop("CANDIDATE_SOURCE_SHA", None)
+    env["GITHUB_OUTPUT"] = str(output_path)
+    env.pop("MANUAL_VER", None)
+    env.pop("LEVEL", None)
+    env[input_name] = version
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "headroom/release_version.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    outputs = dict(line.split("=", 1) for line in output_path.read_text().splitlines())
+    assert outputs["version"] == version
+    assert outputs["npm_version"] == npm_version
+    info = compute_release_version("0.37.0", "patch", [], manual_version=version)
+    assert info.version == version
+    assert info.npm_version == npm_version
