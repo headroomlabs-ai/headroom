@@ -34,7 +34,6 @@ def ensure_proxy_dependencies() -> None:
         "websockets",
         "onnxruntime",
         "transformers",
-        "watchdog",
     ]
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
@@ -223,10 +222,33 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
     help="Host to bind to (default: 127.0.0.1, env: HEADROOM_HOST)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    envvar="HEADROOM_UDS",
+    metavar="PATH",
+    help=(
+        "Serve on a Unix domain socket instead of --host/--port. POSIX only. "
+        "Lets a client keep a first-party base URL while its traffic still "
+        "reaches Headroom (env: HEADROOM_UDS)."
+    ),
 )
 @click.option(
     "--port",
@@ -373,7 +395,7 @@ def dashboard(port: int, no_open: bool) -> None:
     default=None,
     type=click.IntRange(min=1),
     envvar="HEADROOM_TPM",
-    help="Max tokens per minute. Env: HEADROOM_TPM. Default: 100000.",
+    help="Max tokens per minute. Env: HEADROOM_TPM. Default: unlimited.",
 )
 @click.option(
     "--no-ccr",
@@ -525,6 +547,18 @@ def dashboard(port: int, no_open: bool) -> None:
         "large bodies over a slow link. Lower it to fail over a dead pooled "
         "connection faster; --connect-timeout-seconds only guards a fresh connect. "
         "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--upstream-tcp-keepalive-seconds",
+    type=click.IntRange(min=0),
+    default=None,
+    envvar="HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS",
+    help=(
+        "Seconds an upstream connection may sit silent before TCP keepalive "
+        "probes it (default: 30, 0 disables). A link that dies without a reset "
+        "then fails over after about this + 60s instead of waiting out the read "
+        "timeout. Env: HEADROOM_UPSTREAM_TCP_KEEPALIVE_SECONDS."
     ),
 )
 @click.option(
@@ -736,9 +770,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1037,6 +1071,7 @@ def proxy(
     mode: str | None,
     target_ratio: float | None,
     host: str,
+    uds: str | None,
     port: int,
     workers: int,
     limit_concurrency: int,
@@ -1066,6 +1101,7 @@ def proxy(
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
     write_timeout_seconds: int | None,
+    upstream_tcp_keepalive_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1141,14 +1177,27 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     _reexec_with_malloc_tuning()
+
+    # Fail before any dependency loading or config work: an unusable --uds is a
+    # typo or an unsupported platform, and both are cheaper to report up front.
+    if uds:
+        from headroom.proxy.uds import UdsError, require_uds_support
+
+        try:
+            require_uds_support()
+        except UdsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,
+        _get_env_optional_bool,
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
+        default_periodic_malloc_trim,
         run_server,
     )
 
@@ -1298,12 +1347,20 @@ def proxy(
             _paths.codex_wire_debug_dir()
         )
 
-    # Stateless mode: suppress TOIN filesystem persistence
+    # Stateless mode: suppress TOIN filesystem persistence, and export the flag
+    # so code that runs before the proxy records it (the update check) and
+    # child processes see the same answer as paths.process_is_stateless().
     if is_stateless:
         os.environ["HEADROOM_TOIN_BACKEND"] = "none"
+        os.environ["HEADROOM_STATELESS"] = "1"
 
-    # License key for managed/enterprise deployments (optional)
-    license_key = os.environ.get("HEADROOM_LICENSE_KEY")
+    # Licence token (HEADROOM_LICENSE; HEADROOM_LICENSE_KEY is a deprecated
+    # alias). Having one set never enables outbound usage reporting: that
+    # needs the explicit HEADROOM_USAGE_REPORTING=1 opt-in.
+    from headroom.license_env import resolve_license_token, usage_reporting_enabled
+
+    license_key = resolve_license_token()
+    usage_reporting = usage_reporting_enabled()
 
     # Qdrant connection for the qdrant-neo4j backend. CLI flags default
     # to None; when omitted we let ProxyConfig's default_factory resolve
@@ -1321,6 +1378,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        uds=uds,
         rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
@@ -1335,10 +1393,11 @@ def proxy(
         cache_enabled=not no_cache,
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
-        rate_limit_tokens_per_minute=tpm if tpm is not None else 100_000,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        rate_limit_tokens_per_minute=tpm,
+        # Same parse as the server entry points: empty means unset (profile).
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         periodic_malloc_trim_enabled=_get_env_bool(
-            "HEADROOM_MALLOC_TRIM", sys.platform == "darwin"
+            "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
         malloc_trim_interval_seconds=_get_env_int("HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS", 60),
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", 500),
@@ -1402,6 +1461,9 @@ def proxy(
         if connect_timeout_seconds is not None
         else 10,
         write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
+        upstream_tcp_keepalive_seconds=(
+            upstream_tcp_keepalive_seconds if upstream_tcp_keepalive_seconds is not None else 30
+        ),
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
@@ -1474,6 +1536,7 @@ def proxy(
         anyllm_provider=effective_anyllm_provider,
         # License / Usage Reporting (managed/enterprise)
         license_key=license_key,
+        usage_reporting=usage_reporting,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
         # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
@@ -1499,9 +1562,16 @@ def proxy(
     if config.memory_enabled:
         memory_status = "ENABLED (multi-provider)"
 
-    license_status = "OSS (no license key)"
+    license_status = "OSS (no licence)"
     if license_key:
-        license_status = f"MANAGED (key={license_key[:8]}...)"
+        # Never print licence material, not even a prefix.
+        if not usage_reporting:
+            reporting = "off"
+        elif config.offline:
+            reporting = "suppressed by HEADROOM_OFFLINE"
+        else:
+            reporting = "ON"
+        license_status = f"LICENSED (usage reporting {reporting})"
 
     provider_api_targets = resolve_api_targets(config.provider_api_overrides)
     anthropic_url = provider_api_targets.anthropic
@@ -1569,18 +1639,36 @@ Memory (Multi-Provider):
             "  Stateless:    YES (no filesystem writes — memory, logs, TOIN disabled)\n"
         )
 
-    from headroom.telemetry.beacon import is_telemetry_enabled
+    # Build telemetry section for the startup banner.
+    #
+    # HEADROOM_TELEMETRY (local aggregate stats, off by default) and
+    # HEADROOM_BEACON (the anonymous upload beacon, ON by default —
+    # see telemetry/beacon.py) are two independent switches. This banner
+    # used to check only is_telemetry_enabled() and print "DISABLED" for
+    # any operator who had merely turned local stats off, even though the
+    # beacon — the switch that actually ships data off the machine — was
+    # still on and unmentioned. Delegate to format_telemetry_notice(), the
+    # one place that already gets the beacon-vs-local distinction right,
+    # instead of re-deriving (and re-drifting from) the same wording here.
+    from headroom.telemetry.beacon import (
+        format_telemetry_notice,
+        is_beacon_enabled,
+        is_telemetry_enabled,
+    )
 
-    # Build telemetry section for the startup banner. Telemetry is opt-in
-    # (off by default); the disabled line surfaces how to opt in.
-    if is_telemetry_enabled():
-        telemetry_line = (
-            "  Telemetry:    ENABLED (anonymous aggregate stats — you opted in)\n"
-            "                Disable: HEADROOM_TELEMETRY=off or headroom proxy --no-telemetry"
-        )
+    _notice = format_telemetry_notice(prefix="  ")
+    if _notice:
+        telemetry_line = _notice
+    elif is_beacon_enabled() or is_telemetry_enabled():
+        # format_telemetry_notice() returns "" when HEADROOM_TELEMETRY_WARN=off
+        # suppresses the notice text itself — still say ON/OFF plainly rather
+        # than silently showing nothing in the one place an operator is most
+        # likely to be checking.
+        telemetry_line = "  Telemetry:    ON (notice suppressed via HEADROOM_TELEMETRY_WARN=off)"
     else:
         telemetry_line = (
-            "  Telemetry:    DISABLED (opt in: HEADROOM_TELEMETRY=on or headroom proxy --telemetry)"
+            "  Telemetry:    OFF (local stats: HEADROOM_TELEMETRY=on to enable | "
+            "beacon: HEADROOM_BEACON=on to enable)"
         )
 
     # Discover proxy extensions (third-party packages registered via the
@@ -1610,21 +1698,33 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
-    # Security posture line: inbound auth token + air-gap mode, and a loud
-    # flag for the open-bind case (non-loopback host with no token).
-    from headroom.proxy.loopback_guard import is_loopback_host
+    # Security posture line: inbound auth token + air-gap mode. An open bind
+    # (non-loopback host, no token) is refused here, before the banner, unless
+    # the operator acknowledged it explicitly; see headroom/proxy/bind_policy.py.
+    from headroom.proxy.bind_policy import OPEN_BIND_ACK_ENV, evaluate_bind_policy
 
-    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        raise click.ClickException(_bind.message())
+    _auth_on = _bind.token_configured
+    _open_bind_note = (
+        f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
+        if _bind.open_bind
+        else ""
+    )
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
-            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        # Offline masks nothing: an acknowledged open bind is still an open bind.
+        _security_status = (
+            "OFFLINE (all egress disabled)"
+            + (" · inbound token REQUIRED (non-loopback)" if _auth_on else "")
+            + _open_bind_note
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
-    elif not is_loopback_host(config.host):
+    elif _bind.open_bind:
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
-            "(set HEADROOM_PROXY_TOKEN)"
+            f"(acknowledged via {OPEN_BIND_ACK_ENV}=1; set HEADROOM_PROXY_TOKEN instead)"
         )
     else:
         _security_status = "loopback-only (no inbound token)"
@@ -1649,6 +1749,22 @@ Memory (Multi-Provider):
     else:
         tuning_section = ""
 
+    # A socket has no URL, and no per-agent recipe belongs here — see
+    # uds.socket_usage_lines() for why the banner stays transport-neutral.
+    if config.uds:
+        from headroom.proxy.uds import socket_usage_lines
+
+        listen_display = f"unix:{config.uds}"
+        usage_section = "\n".join(socket_usage_lines(config.uds))
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_section = "\n".join(
+            (
+                f"  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude",
+                f"  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app",
+            )
+        )
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -1657,7 +1773,7 @@ Memory (Multi-Provider):
 
 Starting proxy server...
 
-  URL:          http://{config.host}:{config.port}
+  URL:          {listen_display}
   Mode:         {config.mode}
   Optimization: {"ENABLED" if config.optimize else "DISABLED"}
   Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
@@ -1678,8 +1794,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}{factory_route_line}
 
 Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+{usage_section}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness

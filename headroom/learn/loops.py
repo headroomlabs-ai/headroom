@@ -24,10 +24,18 @@ weight at all.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
 from .models import Recommendation, SessionData, ToolCall
+
+# Upper bound on the signature body kept for fuzzy rule matching. Matches the
+# width that ``input_summary`` previously imposed, so the majority-overlap rule
+# in ``apply_loop_weighting`` keeps behaving exactly as it did before identity
+# stopped going through that truncation.
+_SIGNATURE_MATCH_LIMIT = 100
 
 # Minimum repetitions of one signature before it counts as a loop. Three is the
 # smallest count that distinguishes a loop ("again, and again") from a one-off
@@ -60,7 +68,6 @@ _PAGINATION_RE = re.compile("|".join(_PAGINATION_PATTERNS), re.IGNORECASE)
 # Collapse any remaining bare integers so e.g. line numbers / byte offsets in
 # otherwise identical commands do not split a loop into singletons.
 _INT_RE = re.compile(r"\b\d+\b")
-_WS_RE = re.compile(r"\s+")
 
 
 @dataclass
@@ -85,19 +92,106 @@ class LoopPattern:
         return "error-loop" if self.is_error_loop else "refetch-loop"
 
 
+# Input fields that identify a call, per tool. ``ToolCall.input_summary`` reads
+# the same fields but is a *display* helper — it cuts Bash commands at 100 chars
+# and renders any tool missing from this table as ``str(input_data)[:80]``. Two
+# distinct calls sharing a long prefix survive that truncation as equal strings,
+# so identity is taken from the untruncated input here instead.
+#
+# Because identity no longer reads ``input_summary``, a field that distinguishes
+# two calls has to be named here to count — adding one to the summary alone
+# changes the display and leaves the grouping merged.
+#
+# Adding a *second* field to a tool listed here also moves it to the structured
+# identity form in ``_identity_input``, which ``_PAGINATION_RE`` below is not
+# written against — so a second field on ``bash``/``shell`` would stop
+# re-fetch variants of one command collapsing.
+_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "bash": ("command",),
+    "shell": ("command",),
+    "read": ("file_path",),
+    # A search is identified by pattern *and* path: the same pattern swept
+    # across three service directories is three searches, not a loop. #3455
+    # pins this on the display side; identity has to agree or one undoes the
+    # other depending on merge order.
+    "grep": ("pattern", "path"),
+    "glob": ("pattern", "path"),
+    "edit": ("file_path",),
+    "write": ("file_path",),
+}
+
+
+def _identity_input(tc: ToolCall) -> str:
+    """Render a tool call's input in full, for identity comparison.
+
+    Falls back to the whole input mapping — key-sorted so ordering cannot split
+    a group — rather than to a truncated ``repr``. The fallback also covers a
+    tool that *is* in :data:`_IDENTITY_FIELDS` but carries none of its fields:
+    ``normalize_tool_name`` maps provider tools onto the builtin names without
+    normalizing their input schema, and an empty identity would collapse every
+    such call into one loop — the merge this function exists to prevent.
+    """
+    data = tc.input_data if isinstance(tc.input_data, dict) else {}
+    fields = _IDENTITY_FIELDS.get(tc.name.lower())
+    if fields is not None:
+        parts = [str(data.get(field, "")) for field in fields]
+        if any(parts):
+            # A lone field is already unambiguous, and leaving it bare is what
+            # the shell pagination normalization below matches against. Two or
+            # more have to carry their own boundaries: joined on a space,
+            # ("error in src", "logs") and ("error", "in src logs") are two
+            # different searches rendering one string — and so one phantom loop.
+            # Escaping stays off: ``\u00e9`` would reach _signature_tokens as a
+            # token no recommendation can contain, diluting the majority overlap
+            # apply_loop_weighting needs to credit the loop.
+            return parts[0] if len(parts) == 1 else json.dumps(parts, ensure_ascii=False)
+    try:
+        return json.dumps(tc.input_data, sort_keys=True, default=repr, ensure_ascii=False)
+    except TypeError:
+        # Unorderable keys — not reachable from parsed JSON, but identity is
+        # derived from files the user did not write, so it must not raise.
+        return str(tc.input_data)
+
+
 def _canonical_signature(tc: ToolCall) -> str:
     """Collapse a tool call to a signature stable across re-fetch variants.
 
     For shell commands this strips pagination/limit fragments and bare
     integers so output-limit variants of the same command map together.
-    For other tools the input summary is normalized on whitespace only.
+    For other tools the identity input is normalized on whitespace only.
     """
-    raw = tc.input_summary.strip()
+    raw = _identity_input(tc).strip()
     if tc.name.lower() in ("bash", "shell"):
         raw = _PAGINATION_RE.sub(" ", raw)
         raw = _INT_RE.sub("N", raw)
-    raw = _WS_RE.sub(" ", raw).strip().lower()
+    # ``" ".join(split())`` collapses whitespace runs and strips, identically to
+    # ``re.sub(r"\s+", " ", raw).strip()`` but without the regex engine walking the
+    # whole input — the dominant cost now that the signature is the untruncated one.
+    raw = " ".join(raw.split()).lower()
     return f"{tc.name.lower()}::{raw}"
+
+
+def _group_key(signature: str) -> str:
+    """Fixed-size grouping key for a canonical signature.
+
+    The signature is lossless, so it can be as large as the tool input itself.
+    Hashing keeps the grouping tables bounded regardless of input size; the
+    digest is never surfaced, only used to bucket identical signatures.
+    """
+    return hashlib.blake2b(signature.encode("utf-8", "replace"), digest_size=16).hexdigest()
+
+
+def _fuzzy_signature(signature: str) -> str:
+    """Bounded form of a canonical signature, for fuzzy rule matching.
+
+    ``LoopPattern.signature`` is consumed only by :func:`_signature_tokens`,
+    which requires a *majority* of its tokens to appear in a recommendation. An
+    unbounded signature would put that threshold out of reach for large inputs
+    and silently strip real loops of their measured-waste boost, so the stored
+    value is capped. Identity still comes from the full signature above.
+    """
+    name, sep, body = signature.partition("::")
+    return f"{name}{sep}{body[:_SIGNATURE_MATCH_LIMIT]}"
 
 
 def _tokens(tc: ToolCall) -> int:
@@ -158,22 +252,26 @@ def detect_loops(
     no conversation ran.
     """
     groups: dict[str, list[ToolCall]] = {}
+    signatures: dict[str, str] = {}
     seen_ids: dict[str, set[str]] = {}
     for session in sessions:
         per_session: dict[str, list[ToolCall]] = {}
         for tc in session.tool_calls:
-            per_session.setdefault(_canonical_signature(tc), []).append(tc)
+            sig = _canonical_signature(tc)
+            key = _group_key(sig)
+            signatures.setdefault(key, sig)
+            per_session.setdefault(key, []).append(tc)
         # Merge each session's qualifying groups into the global view keyed by
         # signature so cross-session recurrence of the SAME loop accumulates.
-        for sig, calls in per_session.items():
+        for key, calls in per_session.items():
             distinct = _without_replays(calls, set())
             if len(distinct) < min_occurrences:
                 continue
-            bucket = groups.setdefault(sig, [])
-            bucket.extend(_without_replays(distinct, seen_ids.setdefault(sig, set())))
+            bucket = groups.setdefault(key, [])
+            bucket.extend(_without_replays(distinct, seen_ids.setdefault(key, set())))
 
     loops: list[LoopPattern] = []
-    for sig, calls in groups.items():
+    for key, calls in groups.items():
         # No post-merge threshold re-check: every group here was seeded by a
         # session that cleared the bar on its own distinct calls, and merging
         # only ever adds.
@@ -191,7 +289,7 @@ def detect_loops(
         loops.append(
             LoopPattern(
                 tool=calls[0].name,
-                signature=sig,
+                signature=_fuzzy_signature(signatures[key]),
                 sample_input=calls[0].input_summary[:120],
                 count=count,
                 is_error_loop=is_error_loop,

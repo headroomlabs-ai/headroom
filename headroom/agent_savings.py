@@ -336,8 +336,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
         if profile.min_chars_for_block is not None:
             kwargs["min_chars_for_block_compression"] = profile.min_chars_for_block
 
-    if getattr(config, "compress_user_messages", False):
-        kwargs["compress_user_messages"] = True
+    compress_user_messages = getattr(config, "compress_user_messages", None)
+    if compress_user_messages is not None:
+        kwargs["compress_user_messages"] = bool(compress_user_messages)
 
     compress_system_messages = getattr(config, "compress_system_messages", None)
     if compress_system_messages is not None:
@@ -387,7 +388,9 @@ def proxy_pipeline_kwargs(config: object) -> dict[str, object]:
     return kwargs
 
 
-def seed_proxy_env_defaults(env: MutableMapping[str, str] | None = None) -> None:
+def seed_proxy_env_defaults(
+    env: MutableMapping[str, str] | None = None,
+) -> frozenset[str]:
     """Seed the process env with the savings-profile defaults (default: coding).
 
     Call at proxy EXECUTABLE entry points (the ``headroom proxy`` command and the
@@ -400,9 +403,11 @@ def seed_proxy_env_defaults(env: MutableMapping[str, str] | None = None) -> None
     keep clean (unseeded) defaults and test isolation is preserved.
     """
     target = os.environ if env is None else env
+    before = set(target)
     # apply_agent_savings_env_defaults honors an explicit HEADROOM_SAVINGS_PROFILE
     # already in the env and otherwise falls back to DEFAULT_PROFILE (coding).
     apply_agent_savings_env_defaults(target)
+    return frozenset(key for key in target if key not in before)
 
 
 def with_target_savings(

@@ -1,10 +1,11 @@
-"""Integration: Mechanism B (read maturation) no-bust invariant, through the
+"""Integration: Mechanism B (read maturation) cache behaviour, through the
 REAL Anthropic handler, across a multi-turn session.
 
-The design's central claim is that the verbatim Read is held *out* of the
-provider prefix cache until it matures, so "no cached byte is ever mutated."
-The unit tests in ``test_read_maturation.py`` call the manager in isolation
-with ``frozen_message_count=0``; the live test in ``test_live/`` does a
+The held Read is cached with its turn: the client's breakpoints are forwarded
+where the client put them, and the Read matures once its file quiesces even
+though the provider-confirmed prefix has moved past it by then. The unit
+tests in ``test_read_maturation.py`` call the manager in isolation with
+``frozen_message_count=0``; the live test in ``test_live/`` does a
 2-request hold->mature with no intermediate turns. Neither exercises the
 realistic path where a held Read sits across several turns while the prefix
 tracker advances ``frozen_message_count`` from the provider's reported cache
@@ -16,12 +17,10 @@ everything up to the breakpoint the handler chose, system blocks included),
 so the prefix tracker advances exactly as in production. It then asserts,
 directly on the FORWARDED bytes:
 
-1. no-bust: the verbatim Read is never forwarded inside the cached prefix
-   (at or before the last cache_control breakpoint) — if it were, maturing it
-   later would mutate a cached byte and bust the prefix;
-2. the mechanism actually engages: the Read is held verbatim (out of cache)
-   while the file is active, then matures into a CCR marker once it quiesces,
-   in that order.
+1. the client's breakpoint is forwarded where the client put it on every
+   turn, including the turns that hold the Read;
+2. the mechanism actually engages: the Read is held verbatim while the file
+   is active, then matures into a CCR marker once it quiesces, in that order.
 
 Note on cache-state isolation: the CCR store is persistent (SQLite at
 ~/.headroom/ccr_store.db by default) and shared across processes, so stale
@@ -32,6 +31,7 @@ store for deterministic results.
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -104,6 +104,35 @@ def _convo(nquiet: int) -> list[dict]:
     return msgs
 
 
+def _busy_convo(nquiet: int) -> list[dict]:
+    """``_convo`` with a large JSON Bash output before the Read and on every
+    quiet turn, as in a real coding session. The router compresses those, and
+    a compression run is what marks the held Read as locally replayable, so
+    the frozen count follows the provider's cache past it."""
+
+    def bash(tid: str) -> list[dict]:
+        out = json.dumps([{"path": f"src/{tid}_{j}.py", "size": j} for j in range(300)])
+        return [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash", "input": {"command": "ls"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tid, "content": out}],
+            },
+        ]
+
+    msgs: list[dict] = [{"role": "user", "content": [{"type": "text", "text": "Read /x/foo.py"}]}]
+    msgs += bash("toolu_b0") + _read_pair(tail=False)
+    for i in range(1, nquiet + 1):
+        msgs += bash(f"toolu_b{i}")
+    msgs[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    return msgs
+
+
 def _breakpoint_index(messages: list[dict]) -> int:
     """Index of the last message carrying a cache_control block (-1 if none).
     Anthropic caches everything up to AND INCLUDING this message."""
@@ -132,7 +161,7 @@ def _est_tokens(message: dict) -> int:
     return max(1, len(str(message.get("content", ""))) // 4)
 
 
-def test_verbatim_read_never_cache_written_before_maturation(monkeypatch):
+def test_held_read_keeps_client_breakpoint_then_matures(monkeypatch):
     # Isolate the CCR store: it is persistent (SQLite) and shared across
     # processes by default, so stale entries from other runs would perturb
     # maturation timing and make this test non-deterministic. The in-memory
@@ -216,31 +245,36 @@ def test_verbatim_read_never_cache_written_before_maturation(monkeypatch):
     assert forwarded, "no requests were forwarded"
 
     # Per-turn classification of the Read's forwarded form.
-    held_verbatim = []  # turns where the verbatim Read is OUTSIDE the cache prefix (correct hold)
-    cached_verbatim = []  # turns where the verbatim Read is INSIDE the cache prefix (bust risk)
+    held_verbatim = []  # turns where the Read is forwarded verbatim (held)
     matured = []  # turns where the Read has become a CCR marker
     for turn, msgs in enumerate(forwarded):
-        bp = _breakpoint_index(msgs)
-        for i, m in enumerate(msgs):
+        for m in msgs:
             content = _read_result_content(m)
             if content is None:
                 continue
             if content == BIG:
-                (cached_verbatim if i <= bp else held_verbatim).append(turn)
+                held_verbatim.append(turn)
             elif "Retrieve original: hash=" in content:
                 matured.append(turn)
 
-    # INVARIANT 1 (no-bust): the verbatim Read must never be forwarded inside
-    # the cached prefix. If it is, maturing it later mutates a cached byte.
-    assert not cached_verbatim, (
-        "no-bust invariant violated: verbatim Read was cache-written before "
-        f"maturation on turn(s) {cached_verbatim}. Maturing it later busts the cache."
-    )
+    # INVARIANT 1: the client's breakpoint is forwarded where the client put
+    # it. This used to be the opposite ("the verbatim Read is never
+    # cache-written"): the handler moved the breakpoint in front of the held
+    # Read, which dropped Claude Code's tail breakpoint for the whole hold and
+    # re-sent the Read and everything after it uncached on every held turn, to
+    # save one cache write of the Read. The held Read is now cached with its
+    # turn, and maturing it re-writes the cache from the Read onward once.
+    moved = [
+        turn
+        for turn, msgs in enumerate(forwarded)
+        if _breakpoint_index(msgs) != _breakpoint_index(_convo(turn))
+    ]
+    assert not moved, f"client cache breakpoint moved or dropped on turn(s) {moved}"
 
     # INVARIANT 2 (mechanism actually engages): the Read is held verbatim while
     # the file is active, then matures once it quiesces. Guards against a
     # vacuous pass where maturation silently no-ops.
-    assert held_verbatim, "expected the fresh Read to be held verbatim out of cache on early turns"
+    assert held_verbatim, "expected the fresh Read to be held verbatim on early turns"
     assert matured, "expected the Read to mature into a CCR marker after quiescing"
     # The matured marker only appears AFTER the verbatim hold (ordering).
     assert min(matured) > max(held_verbatim), (
@@ -253,10 +287,12 @@ def _drive_session(
     n_turns: int,
     session_id: str,
     saved_out: list[int] | None = None,
+    convo=_convo,
 ) -> list[list[dict]]:
-    """Drive ``n_turns`` cumulative turns through the real handler with a mocked
-    upstream; return the forwarded message arrays per turn. When ``saved_out``
-    is given, each turn's emitted ``x-headroom-tokens-saved`` is appended to it."""
+    """Drive ``n_turns`` cumulative turns of ``convo`` through the real handler
+    with a mocked upstream; return the forwarded message arrays per turn. When
+    ``saved_out`` is given, each turn's emitted ``x-headroom-tokens-saved`` is
+    appended to it."""
     app = create_app(config)
     forwarded: list[list[dict]] = []
     with TestClient(app) as client:
@@ -305,7 +341,7 @@ def _drive_session(
                         "max_tokens": 20,
                         "system": SYSTEM,
                         "tools": [READ_TOOL],
-                        "messages": _convo(n),
+                        "messages": convo(n),
                     },
                 )
                 assert r.status_code == 200, f"turn {n}: {r.text[:300]}"
@@ -324,6 +360,50 @@ def _first_matured_turn(forwarded: list[list[dict]]) -> int | None:
             if content and "Retrieve original: hash=" in content:
                 return turn
     return None
+
+
+def test_read_cached_with_its_turn_stays_verbatim(monkeypatch):
+    """In a session whose tool output compresses, the frozen count follows the
+    provider's cache past the held Read from the next request on. The Read is
+    then left verbatim for good: maturing it would re-write everything after it
+    at the cache-write rate, which costs more than the Read saves."""
+    from headroom.cache.compression_store import reset_compression_store
+    from headroom.transforms.read_maturation import ReadMaturationManager
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    reset_compression_store()
+
+    frozen_seen: list[int] = []
+    apply = ReadMaturationManager.apply
+
+    def _recording_apply(self, messages, frozen_message_count=0):
+        frozen_seen.append(frozen_message_count)
+        return apply(self, messages, frozen_message_count=frozen_message_count)
+
+    monkeypatch.setattr(ReadMaturationManager, "apply", _recording_apply)
+
+    config = ProxyConfig(
+        optimize=True,
+        read_maturation=True,
+        mode="token",
+        cache_enabled=True,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+    )
+    forwarded = _drive_session(config, n_turns=7, session_id="cached-read-1", convo=_busy_convo)
+
+    moved = [
+        turn
+        for turn, msgs in enumerate(forwarded)
+        if _breakpoint_index(msgs) != _breakpoint_index(_busy_convo(turn))
+    ]
+    assert not moved, f"client cache breakpoint moved or dropped on turn(s) {moved}"
+    read_at = 4  # the Read's tool_result message in _busy_convo
+    assert all(f > read_at for f in frozen_seen[1:]), (
+        f"fixture must cache the held Read: frozen counts {frozen_seen}"
+    )
+    assert _first_matured_turn(forwarded) is None, "a cached Read was matured"
 
 
 def test_quiesce_turns_config_is_honored(monkeypatch):
