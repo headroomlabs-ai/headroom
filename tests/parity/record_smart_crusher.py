@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from headroom._core import SmartCrusherConfig as NativeSmartCrusherConfig
 from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -62,7 +64,9 @@ def _record(
     result = crusher.crush(content, query=query, bias=bias)
 
     payload_input = {"content": content, "query": query, "bias": bias}
-    payload_config = asdict(cfg)
+    # Fixtures are replayed through PyO3, not the wrapper-only guard options.
+    native_parameters = inspect.signature(NativeSmartCrusherConfig).parameters
+    payload_config = {key: value for key, value in asdict(cfg).items() if key in native_parameters}
     payload_output = {
         "compressed": result.compressed,
         "original": result.original,
@@ -90,7 +94,7 @@ def _record(
 
     _FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
     target = _FIXTURES_DIR / f"{label}_{digest[:12]}.json"
-    target.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
+    target.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n", newline="\n")
     return target
 
 
@@ -123,11 +127,23 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     mixed_arr = ["start"] + list(range(20)) + ["middle"] + ["end"] * 5
     out.append(("mixed_array", json.dumps(mixed_arr), "", 1.0))
 
+    # Nested arrays whose analysis keeps every item must preserve their
+    # enclosing object's original bytes rather than reserialize it.
+    nested = {
+        "request_id": "req-1",
+        "events": [{"step": i, "kind": "trace", "msg": f"e{i}"} for i in range(20)],
+    }
+    out.append(("nested_object_with_array", json.dumps(nested), "", 1.0))
+
     # 9. Bias > 1 (keep more) on the 30-dict case.
     out.append(("dict_array_30_bias_high", json.dumps(items_30_dict), "", 1.5))
 
     # 10. Bias < 1 (keep fewer) on the 30-dict case.
     out.append(("dict_array_30_bias_low", json.dumps(items_30_dict), "", 0.7))
+
+    # Preserve escaped Unicode in unchanged input, including whitespace.
+    unicode_items = [{"id": i, "msg": f"hello 中文 русский {i}", "tag": "тест"} for i in range(20)]
+    out.append(("unicode_dict_array", json.dumps(unicode_items), "", 1.0))
 
     # 12. Larger dict array (100 items) with a strong sequential `id`
     # field — exercises top_n strategy via field stats.
@@ -137,12 +153,21 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     ]
     out.append(("dict_array_100_sequential", json.dumps(big_seq), "", 1.0))
 
+    # Time-series analysis may keep every point; its float spellings and
+    # original JSON formatting must then survive the Python/native bridge.
+    ts = [{"ts": 1000 + i, "metric": float(i * 1.5), "host": f"host-{i % 3}"} for i in range(50)]
+    out.append(("time_series_50", json.dumps(ts), "", 1.0))
+
     # 14. Many duplicate items — exercises dedup_identical_items.
     dups = [{"event": "heartbeat", "ok": True} for _ in range(40)]
     out.append(("duplicate_dicts_40", json.dumps(dups), "", 1.0))
 
     # 15. Empty array — boundary case, must round-trip cleanly.
     out.append(("empty_array", json.dumps([]), "", 1.0))
+
+    # Recursive no-op analysis must preserve bytes through every object level.
+    deep = {"a": {"b": {"events": [{"i": i, "kind": "deep", "v": f"x{i}"} for i in range(15)]}}}
+    out.append(("nested_3deep_with_array", json.dumps(deep), "", 1.0))
 
     return out
 
