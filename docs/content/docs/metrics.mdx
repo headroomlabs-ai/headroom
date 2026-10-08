@@ -372,6 +372,10 @@ headroom proxy --budget 10.00 --budget-estimated-basis count   # default
 
 Env: `HEADROOM_BUDGET_ESTIMATED_BASIS`. `headroom doctor` reports the estimated share alongside the budget check.
 
+### Price Provenance Is a Separate Dimension
+
+A cost record can carry provider-reported usage priced at a *guessed* price: when no price source (explicit config, LiteLLM, built-in table) knows a model, Headroom falls back to the GPT-4o-tier default rather than booking nothing. That guess is tracked independently of the usage basis above — it does **not** reuse `COST_BASIS_ESTIMATED`, so `estimated_pct` keeps meaning "the input count was estimated". Price-guessed spend is reported under `cost.budget_basis.price_estimated_usd` / `price_estimated_records`, the budget policy treats it as non-authoritative on all three values above, and cost displays label it an estimated price. Keeping the two provenances separable is deliberate: Headroom meters everything flowing through the proxy, and a meter that silently conflates a guessed price with a measured one — or drops the record under `ignore` without saying so — stops being trustworthy.
+
 ## Key Metrics to Monitor
 
 | Metric | What It Tells You | Target |
@@ -401,3 +405,5 @@ Example ad-hoc queries against the same metric family:
 | Lifetime Tokens Saved | `headroom_persistent_savings_tokens_saved_total` |
 | Mean Headroom Overhead | `rate(headroom_overhead_ms_sum[5m]) / rate(headroom_overhead_ms_count[5m])` |
 | Cache Hit Rate (by provider) | `sum by (provider) (rate(headroom_provider_cache_hit_requests_total[5m])) / sum by (provider) (rate(headroom_provider_cache_requests_total[5m]))` |
+
+Explicit OpenAI model pricing in `HEADROOM_MODEL_LIMITS` or `models.json` takes precedence over a successful catalog lookup when booking budget spend. These fixed input/output overrides use the provider's existing 50% cached-input convention, without charging inferred cache writes twice. Catalog-priced models retain LiteLLM's native cache discounts and context tiers. Usage and price provenance remain separate.

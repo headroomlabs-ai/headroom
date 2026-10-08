@@ -45,6 +45,11 @@ def test_budget_aggregate_preserves_basis_totals_and_policy() -> None:
         "estimated_pct": pytest.approx(87.0),
         "records": 2,
         "estimated_records": 1,
+        # Price provenance defaults to measured; the usage-estimated record is
+        # the only non-authoritative spend (#3732).
+        "price_estimated_usd": 0.0,
+        "price_estimated_records": 0,
+        "non_authoritative_usd": 20.0,
     }
     assert tracker.check_budget() == (True, 7.0)
 
