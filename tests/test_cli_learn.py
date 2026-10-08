@@ -731,7 +731,7 @@ def _apply_learned_level(
     proxy: _FakeProxy,
     *,
     level: int = 3,
-    pin_record: dict | None = None,
+    pin_record: dict | list | None = None,
     previous_level: int | None = None,
 ) -> str:
     """Run ``learn --verbosity --apply`` for one project that learns ``level``.
@@ -893,11 +893,23 @@ def test_verbosity_apply_re_pinning_the_same_level_does_not_warn_about_re_cachin
         {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 2},
         # a record from before start times were recorded
         {"port": _PROXY_PORT, "pid": 4242, "level": 3},
+        # a record that is valid JSON but not an object
+        [_PROXY_PORT, 4242, _STARTED_AT, 3],
     ],
-    ids=["no-record", "restarted-proxy", "reused-pid", "changed-since", "no-start-time"],
+    ids=[
+        "no-record",
+        "restarted-proxy",
+        "reused-pid",
+        "changed-since",
+        "no-start-time",
+        "not-an-object",
+    ],
 )
 def test_verbosity_apply_keeps_a_pin_it_cannot_prove_it_set(
-    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, pin_record: dict | None
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+    tmp_path: Path,
+    pin_record: dict | list | None,
 ) -> None:
     proxy = _FakeProxy(
         {"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}, "pid": 4242}
@@ -941,6 +953,20 @@ def test_verbosity_apply_reads_a_pin_the_way_the_proxy_clamps_it(
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
     assert "level 4 is live now." in output
     assert "stays at level" not in output
+
+
+def test_verbosity_apply_reads_an_unparseable_pin_as_the_default_level(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """The proxy steers a non-numeric pin at the default level, and so must the CLI."""
+    from headroom.proxy.output_shaper import DEFAULT_VERBOSITY_LEVEL
+
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "high"}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=3)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert f"it stays at level {DEFAULT_VERBOSITY_LEVEL}: HEADROOM_VERBOSITY_LEVEL" in output
 
 
 def test_verbosity_apply_does_not_claim_live_when_the_mode_is_unknown(
@@ -1008,3 +1034,47 @@ def test_verbosity_apply_does_not_record_a_pin_without_a_process_identity(
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
     assert not (tmp_path / "ws" / "verbosity_pin.json").exists()
     assert "pin could not be recorded" in output
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "healthy"},  # no config block (e.g. a non-loopback caller's view)
+        {"config": "unexpected"},
+    ],
+    ids=["no-config", "config-not-an-object"],
+)
+def test_query_proxy_verbosity_without_a_config_block(
+    monkeypatch: pytest.MonkeyPatch, payload: dict
+) -> None:
+    import io
+
+    from headroom.cli.learn import _query_proxy_verbosity
+
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda *a, **k: io.BytesIO(json.dumps(payload).encode())
+    )
+
+    assert _query_proxy_verbosity(_PROXY_PORT) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, (4242, _STARTED_AT)),
+        ({"uptime_seconds": 0.0}, None),  # the proxy has not recorded its start
+        ({"uptime_seconds": None}, None),
+        ({"timestamp": "not a time"}, None),
+        ({"timestamp": None}, None),
+    ],
+    ids=["identified", "zero-uptime", "no-uptime", "bad-timestamp", "no-timestamp"],
+)
+def test_proxy_process_needs_a_start_time(overrides: dict, expected: tuple | None) -> None:
+    from datetime import datetime
+
+    from headroom.cli.learn import _proxy_process
+
+    now = datetime.fromisoformat(_HEALTH_NOW.replace("Z", "+00:00")).timestamp()
+    payload = {"timestamp": _HEALTH_NOW, "uptime_seconds": now - _STARTED_AT, **overrides}
+
+    assert _proxy_process(payload, {"pid": 4242}) == expected
