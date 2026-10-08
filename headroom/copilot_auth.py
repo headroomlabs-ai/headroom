@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import functools
 import hashlib
 import json
 import logging
@@ -138,11 +139,42 @@ class CopilotSubscriptionTokenResolution:
     api_token_expires_at: float | None = None
 
 
-def token_fingerprint(token: str) -> str:
-    """Return a stable non-secret fingerprint for comparing token handoffs."""
+#: Fixed salt and work factor of :func:`token_fingerprint`. Both are part of
+#: the fingerprint, so changing either changes every fingerprint.
+_TOKEN_FINGERPRINT_SALT = b"headroom/token-fingerprint/v2"
+_TOKEN_FINGERPRINT_ITERATIONS = 1_000
 
-    digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()
-    return f"sha256:{digest[:12]}"
+
+def token_fingerprint(token: str) -> str:
+    """Return a stable non-secret fingerprint for comparing token handoffs.
+
+    PBKDF2-HMAC-SHA256 with a fixed salt, cut to 48 bits (prefix ``pbkdf2:``).
+    The truncation and the token's own entropy are what keep it non-secret. The
+    KDF is there because the value is derived from a credential and is printed
+    by ``headroom copilot-auth status`` and served on ``/health``, and code
+    scanning holds such values to password-hashing rules. Its work factor is
+    low on purpose, and results are memoised, because the proxy needs this on
+    every Copilot request (about half a millisecond uncached; the cache only
+    holds tokens this process already has). The salt is fixed so a wrap and a
+    running proxy compute the same value. A fingerprint from an older Headroom
+    (``sha256:`` prefix) never matches one from this version, which keeps the
+    isolating behaviour where the two are compared.
+    """
+
+    return _token_fingerprint(token)
+
+
+# Cached behind the typed wrapper above: ``lru_cache`` would otherwise widen the
+# public signature to any hashable argument.
+@functools.lru_cache(maxsize=32)
+def _token_fingerprint(token: str) -> str:
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        token.encode("utf-8", errors="ignore"),
+        _TOKEN_FINGERPRINT_SALT,
+        _TOKEN_FINGERPRINT_ITERATIONS,
+    ).hex()
+    return f"pbkdf2:{digest[:12]}"
 
 
 def _github_host() -> str:
