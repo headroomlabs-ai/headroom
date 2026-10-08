@@ -319,6 +319,27 @@ def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> st
     return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
+def _strip_codex_root_routing_orphans(content: str) -> str:
+    """Drop Headroom loopback routing keys left at the document root.
+
+    Only the root (everything before the first table header) is Headroom's to
+    clean: the same keys inside ``[profiles.*]`` tables are user-owned
+    per-profile overrides, even when they point at Headroom.
+    """
+    import re
+
+    first_table = re.search(r"(?m)^[ \t]*\[", content)
+    split = first_table.start() if first_table else len(content)
+    root, rest = content[:split], content[split:]
+    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
+    root = re.sub(
+        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+        "",
+        root,
+    )
+    return root + rest
+
+
 def _strip_codex_init_block(content: str) -> str:
     """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
     import re
@@ -338,12 +359,7 @@ def _strip_codex_init_block(content: str) -> str:
 
     # Strip any orphan top-level keys that a crashed or partial write may have
     # left outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
+    content = _strip_codex_root_routing_orphans(content)
 
     # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
     orphan_headroom_table = re.compile(
@@ -920,6 +936,12 @@ def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
     if os.name == "nt":
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
+        )
+        click.echo(
+            "Nothing starts the Headroom proxy for Codex on Windows, so Codex cannot connect "
+            "while it is down. Use `headroom install apply` for a supervised proxy. To remove "
+            "this routing, run `headroom unwrap codex` (user scope) or delete the Headroom init "
+            "provider block from the project's .codex/config.toml."
         )
     click.echo("Restart Codex to activate Headroom configuration.")
 
