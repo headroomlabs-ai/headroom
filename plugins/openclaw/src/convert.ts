@@ -488,6 +488,7 @@ function normalizeAssistantContent(content: unknown): any[] {
       ) {
         return [
           {
+            ...block,
             type: "toolCall",
             id: typeof block.id === "string" ? block.id : "unknown",
             name: block.name,

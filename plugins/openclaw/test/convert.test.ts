@@ -63,6 +63,26 @@ describe("normalizeAgentMessages", () => {
       isError: false,
     });
   });
+
+  it("preserves provider thought signatures on canonical tool calls", () => {
+    const result = normalizeAgentMessages([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "toolCall",
+            id: "call_signed",
+            name: "read",
+            arguments: { path: "file.ts" },
+            thoughtSignature: "provider-tool-call-signature",
+          },
+        ],
+      },
+    ]);
+
+    expect(result[0].content[0].thoughtSignature).toBe("provider-tool-call-signature");
+    expect(result[0].content[0].arguments).toEqual({ path: "file.ts" });
+  });
 });
 
 describe("agentToOpenAI", () => {
