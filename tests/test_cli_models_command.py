@@ -26,6 +26,9 @@ FIXTURE = Path(__file__).parent / "fixtures" / "copilot_models" / "models_list.j
 def _no_anthropic_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    # Offline, every provider is reported as refused before its credential is
+    # looked at (tests/test_offline_egress_chokepoint.py covers that).
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
 
 
 def _stub_copilot(monkeypatch: pytest.MonkeyPatch) -> None:

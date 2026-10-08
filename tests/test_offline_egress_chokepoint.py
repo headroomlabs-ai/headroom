@@ -1990,6 +1990,30 @@ class TestModelDiscoveryOffline:
         assert "not enumerated — anthropic: HEADROOM_OFFLINE is set" in text.output
         assert no_http == []
 
+    def test_models_command_names_the_switch_even_without_a_credential(
+        self,
+        offline: None,
+        no_sockets: None,
+        no_http: list[object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Offline, a missing key is not the reason: setting one would not help."""
+        import json
+
+        from click.testing import CliRunner
+
+        from headroom.cli.main import main
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+
+        result = CliRunner().invoke(main, ["models", "--provider", "anthropic", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (reason,) = json.loads(result.output)["unavailable"]
+        assert reason.startswith("anthropic: HEADROOM_OFFLINE is set")
+        assert no_http == []
+
     def test_launch_discovery_falls_back_without_a_request(
         self, offline: None, no_sockets: None, no_http: list[object]
     ) -> None:

@@ -123,6 +123,10 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
     """
     import os
 
+    # Before the credential check, so offline the reason given is the switch,
+    # not a key that could not enable the listing anyway.
+    base = (os.environ.get("ANTHROPIC_API_URL") or "https://api.anthropic.com").rstrip("/")
+    guard_egress("Anthropic model listing", f"{base}/v1/models")
     key = (
         os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN") or ""
     ).strip()
@@ -133,8 +137,6 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
             "cannot be read from here; inside a wrapped session Claude Code's own /model picker "
             "already lists what the subscription allows.)"
         )
-    base = (os.environ.get("ANTHROPIC_API_URL") or "https://api.anthropic.com").rstrip("/")
-    guard_egress("Anthropic model listing", f"{base}/v1/models")
     # `/v1/models` is paginated (`has_more` + `last_id`, continued with
     # `after_id`). Reading only the first page silently truncated the list for
     # accounts with more than one page of models. The page cap only guards
