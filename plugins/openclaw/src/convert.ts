@@ -486,9 +486,11 @@ function normalizeAssistantContent(content: unknown): any[] {
         (block.type === "toolCall" || block.type === "tool_use") &&
         typeof block.name === "string"
       ) {
+        // Legacy input becomes arguments; do not retain an alias that can go stale after compression.
+        const { input: _legacyInput, ...metadata } = block;
         return [
           {
-            ...block,
+            ...(block.type === "tool_use" ? metadata : block),
             type: "toolCall",
             id: typeof block.id === "string" ? block.id : "unknown",
             name: block.name,

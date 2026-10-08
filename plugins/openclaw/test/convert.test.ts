@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentToOpenAI, normalizeAgentMessages, openAIToAgent, type OpenAIMessage } from "../src/convert";
+import { agentToOpenAI, agentToOpenAIIndexed, normalizeAgentMessages, openAIToAgent, restoreAgentMessages, type OpenAIMessage } from "../src/convert";
 
 describe("openAIToAgent", () => {
   it("emits toolResult content as blocks so transports can safely filter", () => {
@@ -82,6 +82,88 @@ describe("normalizeAgentMessages", () => {
 
     expect(result[0].content[0].thoughtSignature).toBe("provider-tool-call-signature");
     expect(result[0].content[0].arguments).toEqual({ path: "file.ts" });
+  });
+
+  it("normalizes legacy tool inputs without retaining a duplicate alias", () => {
+    const block = {
+      type: "tool_use",
+      name: "read",
+      input: { path: "file.ts" },
+      thoughtSignature: "legacy-signature",
+      providerMetadata: { opaque: true },
+    };
+
+    const result = normalizeAgentMessages([{ role: "assistant", content: [block] }]);
+
+    expect(result[0].content[0]).toEqual({
+      type: "toolCall",
+      id: "unknown",
+      name: "read",
+      arguments: { path: "file.ts" },
+      thoughtSignature: "legacy-signature",
+      providerMetadata: { opaque: true },
+    });
+    expect(block.input).toEqual({ path: "file.ts" });
+    expect(block.type).toBe("tool_use");
+  });
+
+  it("keeps existing arguments precedence while removing the legacy alias", () => {
+    const result = normalizeAgentMessages([
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", name: "read", arguments: null, input: { path: "old.ts" } }],
+      },
+    ]);
+
+    expect(result[0].content[0].arguments).toBeNull();
+    expect(result[0].content[0]).not.toHaveProperty("input");
+  });
+
+  it("retains opaque extension fields on already canonical tool calls", () => {
+    const block = {
+      type: "toolCall",
+      id: "call_canonical",
+      name: "read",
+      arguments: { path: "file.ts" },
+      input: { extension: "opaque canonical metadata" },
+      thoughtSignature: "canonical-signature",
+      providerMetadata: { opaque: true },
+    };
+
+    const result = normalizeAgentMessages([{ role: "assistant", content: [block] }]);
+
+    expect(result[0].content[0]).toEqual(block);
+  });
+});
+
+describe("restoreAgentMessages", () => {
+  it("restores compressed legacy arguments without stale input and preserves metadata", () => {
+    const block = {
+      type: "tool_use",
+      id: "call_legacy",
+      name: "read",
+      input: { path: "file.ts", lines: ["long", "original", "payload"] },
+      thoughtSignature: "legacy-signature",
+      providerMetadata: { opaque: true },
+    };
+    const original = [{ role: "assistant", content: [block] }];
+    const sent = agentToOpenAIIndexed(original);
+    const returned = structuredClone(sent);
+    returned[0].tool_calls![0].function.arguments = '{"path":"file.ts","lines":["short"]}';
+
+    const result = restoreAgentMessages(original, sent, returned);
+
+    expect(result[0].content[0]).toEqual({
+      type: "toolCall",
+      id: "call_legacy",
+      name: "read",
+      arguments: { path: "file.ts", lines: ["short"] },
+      thoughtSignature: "legacy-signature",
+      providerMetadata: { opaque: true },
+    });
+    expect(block.input.lines).toEqual(["long", "original", "payload"]);
+    expect(agentToOpenAI(result)[0].tool_calls![0].function.arguments)
+      .toBe('{"path":"file.ts","lines":["short"]}');
   });
 });
 
