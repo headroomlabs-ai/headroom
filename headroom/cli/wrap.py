@@ -27,6 +27,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -113,7 +114,14 @@ from headroom.providers.claude import (
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    cleanup_codex_auth_helper,
+    codex_auth_helper_is_referenced,
+    codex_auth_helper_path,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
@@ -3355,6 +3363,24 @@ def _apply_project_header_env(env: dict[str, str]) -> None:
     )
 
 
+# Read by proxy's workspace_registry.resolve_registered_cwd() to look up
+# this session's registered cwd.
+_SESSION_TOKEN_HEADER_NAME = "X-Headroom-Session-Token"
+
+
+def _apply_session_token_header_env(env: dict[str, str], session_token: str) -> None:
+    """Inject X-Headroom-Session-Token into ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    Mirrors :func:`_apply_project_header_env`. No "user override wins" case
+    here -- the token is wrap-generated, not user-supplied.
+    """
+    if not session_token:
+        return
+    header_line = f"{_SESSION_TOKEN_HEADER_NAME}: {session_token}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}" if existing else header_line
+
+
 # Codex's own built-in providers plus Headroom's injected one — never treated
 # as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
 _CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
@@ -3516,6 +3542,10 @@ def _inject_codex_provider_config(port: int) -> str | None:
     requires_openai_auth = (
         "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
     )
+    try:
+        auth_config = build_codex_auth_config(config_dir / "auth.json", config_path=config_file)
+    except CodexAuthConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     # Per-project savings: Codex sends the X-Headroom-Project header only
     # when the mapped env var (HEADROOM_PROJECT, set by `headroom wrap
     # codex`) exists at Codex runtime. When a custom upstream was detected,
@@ -3531,6 +3561,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         # Inline table keeps the key inside this section so
         # _strip_codex_headroom_blocks removes it with the rest of the block.
@@ -3645,12 +3676,27 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
       content (created by wrap or init) and has been deleted.
     * ``"noop"``     — nothing to undo; no Headroom marker and no backup.
     """
-    from headroom.cli.init import _CODEX_PROVIDER_MARKER_START, _strip_codex_init_block
+    from headroom.cli.init import (
+        _CODEX_PROVIDER_MARKER_START,
+        _codex_init_provider_snapshot,
+        _strip_codex_init_block,
+    )
 
     config_file, backup_file = _codex_config_paths()
+    helper_auth_path = config_file.parent / "auth.json"
+    helper_path = codex_auth_helper_path(helper_auth_path, config_path=config_file)
 
     # Case 1: pre-wrap snapshot exists — restore it exactly.
     if backup_file.exists():
+        try:
+            helper_was_preexisting = (
+                codex_auth_helper_is_referenced(_read_text(backup_file), str(helper_path.resolve()))
+                is not False
+            )
+        except OSError:
+            # If the backup cannot be inspected, preserve the helper rather than
+            # risk deleting a file that predates this wrap.
+            helper_was_preexisting = True
         # A snapshot taken after `headroom init codex` still carries init's
         # routing block; restoring it verbatim would leave Codex pinned to the
         # proxy while unwrap reports success (#3749). The snapshot is deleted
@@ -3661,11 +3707,17 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
             if not cleaned.strip():
                 config_file.unlink(missing_ok=True)
                 backup_file.unlink()
+                cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
                 return "removed", config_file
             _write_text(config_file, cleaned)
+            # Init's helper may predate wrap but its only reference was just
+            # removed. Cleanup checks all retained providers before deleting it.
+            cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
         else:
             shutil.copy2(backup_file, config_file)
         backup_file.unlink()
+        if not helper_was_preexisting:
+            cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
         return "restored", config_file
 
     # Case 2: no backup, but config file exists and has markers — strip them.
@@ -3673,6 +3725,9 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
         original = _read_text(config_file)
         has_init_block = _CODEX_PROVIDER_MARKER_START in original
         if has_init_block or _codex_config_has_headroom_markers(original):
+            helper_was_referenced = codex_auth_helper_is_referenced(
+                original, str(helper_path.resolve())
+            )
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
             remove_named_mcp = any(
@@ -3686,18 +3741,29 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
             )
             # `headroom init codex` writes its own routing block, and nothing else
             # removes it (#3749). Strip it first so its markers go with its keys.
-            content = _strip_codex_init_block(original) if has_init_block else original
+            provider_snapshot = _codex_init_provider_snapshot(original) if has_init_block else None
+            content = (
+                _strip_codex_init_block(original, restore_provider=False)
+                if has_init_block
+                else original
+            )
             cleaned = _strip_codex_headroom_blocks(
                 content,
                 remove_mcp=True,
                 remove_named_mcp=remove_named_mcp,
             )
+            if provider_snapshot is not None:
+                cleaned = cleaned.rstrip() + "\n\n" + provider_snapshot
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
                 config_file.unlink()
+                if helper_was_referenced is True:
+                    cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
                 return "removed", config_file
             _write_text(config_file, cleaned)
+            if helper_was_referenced is True:
+                cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
             return "cleaned", config_file
 
     # Nothing to undo.
@@ -5232,11 +5298,19 @@ def _ensure_proxy(
 
 
 def _client_marker_path(port: int) -> Path:
-    """Path to this process's wrap-client marker for ``port``."""
+    """Path to this process's wrap-client marker for ``port``.
+
+    Mode 0700: markers carry ``cwd``/``session_token`` the proxy treats as
+    an authoritative binding, so only the invoking OS user may read them.
+    """
     from headroom import paths as _paths
 
     d = _paths.proxy_clients_dir(port)
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
     return d / f"{os.getpid()}.json"
 
 
@@ -5250,14 +5324,25 @@ def _proc_identity(pid: int) -> tuple[str, float] | None:
     return proc_identity(pid)
 
 
-def _register_proxy_client(port: int) -> None:
+def _register_proxy_client(port: int, *, session_token: str | None = None) -> None:
     """Register this wrap process as a live client of the shared proxy.
 
-    Best-effort: a failed write just means our marker is missing, and the
-    liveness pruning in :func:`_live_proxy_clients` is the real safety net.
+    Also records ``cwd`` (wrap is the coding-agent CLI's real blocking
+    parent, so this is authoritative) and, if given, ``session_token`` --
+    also injected into the wrapped CLI's headers so the proxy can resolve
+    which registered cwd a request belongs to.
+
+    Best-effort: a failed write just means our marker is missing, and
+    :func:`_live_proxy_clients`'s liveness pruning is the real safety net.
     """
     try:
-        payload: dict[str, Any] = {"pid": os.getpid(), "started_at": time.time()}
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "cwd": os.getcwd(),
+        }
+        if session_token:
+            payload["session_token"] = session_token
         ident = _proc_identity(os.getpid())
         if ident is not None:
             payload["start_src"], payload["start_time"] = ident
@@ -6050,7 +6135,10 @@ def claude(
 
         upstream_for_proxy = foundry_upstream or custom_upstream
 
-        _register_proxy_client(port)
+        # One token for the whole session -- written into the marker below
+        # and, further down, into the header the wrapped CLI sends.
+        _session_token = secrets.token_urlsafe(32)
+        _register_proxy_client(port, session_token=_session_token)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -6066,7 +6154,7 @@ def claude(
         )
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
@@ -6204,6 +6292,8 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+        # Same token written into the marker above.
+        _apply_session_token_header_env(env, _session_token)
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
@@ -8483,7 +8573,11 @@ def opencode(
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
     # shared proxy during the startup gap.
-    _register_proxy_client(port)
+    #
+    # Mirrors claude()'s token minting; only reaches OpenCode when the
+    # plugin layer is loaded (see build_launch_env).
+    _session_token = secrets.token_urlsafe(32)
+    _register_proxy_client(port, session_token=_session_token)
 
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
@@ -8516,7 +8610,7 @@ def opencode(
         # cleanup tracking stays accurate and update MCP config.
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
             if not no_mcp:
                 from headroom.mcp_registry import OpencodeRegistrar
 
@@ -8526,7 +8620,11 @@ def opencode(
         if subscription_resolution is not None:
             _scrub_copilot_subscription_launch_env(launch_environ)
         env, env_vars_display = _build_opencode_launch_env(
-            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+            actual_port,
+            launch_environ,
+            project=_project_name_from_cwd(),
+            include_mcp=not no_mcp,
+            session_token=_session_token,
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.

@@ -28,6 +28,15 @@ Use the distribution name `headroom-ai` for every install, including extras such
 `"headroom-ai[langchain]"`. The Python import and CLI command remain `headroom`;
 the PyPI distribution named `headroom` is a different project.
 
+On Intel macOS, ONNX Runtime wheels are available through Python 3.13, using
+the pre-1.24 runtime. Python 3.14 and newer omit optional ONNX backends from
+`proxy`, `voice`, `relevance`, and `image` extras because compatible wheels are
+unavailable. Core compression and the proxy remain available; ML content
+detection, local ONNX Kompress, embedding relevance, and ONNX OCR are unavailable
+on that combination. Use Python 3.13 if you need those Python ONNX features.
+Rust ML detection requires ONNX Runtime 1.24 or newer and therefore remains
+disabled on Intel macOS even with the older Python runtime.
+
 ### CLI install with uv
 
 For a host-level `headroom` command on macOS Apple Silicon or Linux, prefer
