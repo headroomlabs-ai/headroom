@@ -222,10 +222,33 @@ def dashboard(port: int, no_open: bool) -> None:
 
 @main.command()
 @click.option(
+    "--headroom-deployment-profile",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
+    "--headroom-deployment-runtime",
+    hidden=True,
+    expose_value=False,
+    help="Internal persistent-deployment identity marker.",
+)
+@click.option(
     "--host",
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
     help="Host to bind to (default: 127.0.0.1, env: HEADROOM_HOST)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    envvar="HEADROOM_UDS",
+    metavar="PATH",
+    help=(
+        "Serve on a Unix domain socket instead of --host/--port. POSIX only. "
+        "Lets a client keep a first-party base URL while its traffic still "
+        "reaches Headroom (env: HEADROOM_UDS)."
+    ),
 )
 @click.option(
     "--port",
@@ -747,9 +770,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1038,6 +1061,7 @@ def proxy(
     mode: str | None,
     target_ratio: float | None,
     host: str,
+    uds: str | None,
     port: int,
     workers: int,
     limit_concurrency: int,
@@ -1142,11 +1166,23 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     _reexec_with_malloc_tuning()
+
+    # Fail before any dependency loading or config work: an unusable --uds is a
+    # typo or an unsupported platform, and both are cheaper to report up front.
+    if uds:
+        from headroom.proxy.uds import UdsError, require_uds_support
+
+        try:
+            require_uds_support()
+        except UdsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
     from headroom.proxy.server import (
         ProxyConfig,
+        _get_env_optional_bool,
         _parse_csv_tools,
         _parse_exclude_tools,
         _parse_tool_profiles,
@@ -1331,6 +1367,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        uds=uds,
         rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
@@ -1346,7 +1383,8 @@ def proxy(
         rate_limit_enabled=not no_rate_limit,
         rate_limit_requests_per_minute=rpm if rpm is not None else 60,
         rate_limit_tokens_per_minute=tpm,
-        compress_user_messages=_get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
+        # Same parse as the server entry points: empty means unset (profile).
+        compress_user_messages=_get_env_optional_bool("HEADROOM_COMPRESS_USER_MESSAGES"),
         periodic_malloc_trim_enabled=_get_env_bool(
             "HEADROOM_MALLOC_TRIM", default_periodic_malloc_trim()
         ),
@@ -1638,21 +1676,33 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
-    # Security posture line: inbound auth token + air-gap mode, and a loud
-    # flag for the open-bind case (non-loopback host with no token).
-    from headroom.proxy.loopback_guard import is_loopback_host
+    # Security posture line: inbound auth token + air-gap mode. An open bind
+    # (non-loopback host, no token) is refused here, before the banner, unless
+    # the operator acknowledged it explicitly; see headroom/proxy/bind_policy.py.
+    from headroom.proxy.bind_policy import OPEN_BIND_ACK_ENV, evaluate_bind_policy
 
-    _auth_on = bool(config.proxy_token or os.environ.get("HEADROOM_PROXY_TOKEN"))
+    _bind = evaluate_bind_policy(config.host, config.proxy_token)
+    if _bind.refused:
+        raise click.ClickException(_bind.message())
+    _auth_on = _bind.token_configured
+    _open_bind_note = (
+        f" · WARNING open bind, /v1/* UNAUTHENTICATED (acknowledged via {OPEN_BIND_ACK_ENV}=1)"
+        if _bind.open_bind
+        else ""
+    )
     if config.offline:
-        _security_status = "OFFLINE (all egress disabled)" + (
-            " · inbound token REQUIRED (non-loopback)" if _auth_on else ""
+        # Offline masks nothing: an acknowledged open bind is still an open bind.
+        _security_status = (
+            "OFFLINE (all egress disabled)"
+            + (" · inbound token REQUIRED (non-loopback)" if _auth_on else "")
+            + _open_bind_note
         )
     elif _auth_on:
         _security_status = "inbound token REQUIRED for non-loopback callers"
-    elif not is_loopback_host(config.host):
+    elif _bind.open_bind:
         _security_status = (
             "WARNING non-loopback bind with NO token — /v1/* is UNAUTHENTICATED "
-            "(set HEADROOM_PROXY_TOKEN)"
+            f"(acknowledged via {OPEN_BIND_ACK_ENV}=1; set HEADROOM_PROXY_TOKEN instead)"
         )
     else:
         _security_status = "loopback-only (no inbound token)"
@@ -1677,6 +1727,22 @@ Memory (Multi-Provider):
     else:
         tuning_section = ""
 
+    # A socket has no URL, and no per-agent recipe belongs here — see
+    # uds.socket_usage_lines() for why the banner stays transport-neutral.
+    if config.uds:
+        from headroom.proxy.uds import socket_usage_lines
+
+        listen_display = f"unix:{config.uds}"
+        usage_section = "\n".join(socket_usage_lines(config.uds))
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_section = "\n".join(
+            (
+                f"  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude",
+                f"  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app",
+            )
+        )
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -1685,7 +1751,7 @@ Memory (Multi-Provider):
 
 Starting proxy server...
 
-  URL:          http://{config.host}:{config.port}
+  URL:          {listen_display}
   Mode:         {config.mode}
   Optimization: {"ENABLED" if config.optimize else "DISABLED"}
   Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
@@ -1706,8 +1772,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}
 
 Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+{usage_section}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness

@@ -480,6 +480,7 @@ Enable it with `HEADROOM_MODEL_ROUTER_ENABLED=1` and declare ordered rules in `H
 | `to_model` | string (required) | Model to route to when the rule matches. |
 | `max_input_tokens` | integer | Match only when the estimated input size is at or below this. |
 | `min_input_tokens` | integer | Match only when the estimated input size is at or above this. |
+| `max_output_tokens` | integer | Match only when the request's own `max_tokens` is at or below this. A request without `max_tokens` does not match. |
 | `require_no_tools` | boolean | Match only when the request declares no tools (a proxy for low-risk work). |
 | `from_models` | list of strings | Restrict the rule to these source models. Omit for any source model. |
 | `name` | string | Label surfaced in the decision log. |
@@ -494,6 +495,7 @@ export HEADROOM_MODEL_ROUTES='[
 
 Notes:
 
+- Combine `max_input_tokens` with `max_output_tokens` to downshift only turns that are cheap on both sides: a tiny prompt that asks for a long answer (a large `max_tokens`) stays on the original model.
 - Input size is a fast, tokenizer-free estimate over the messages, tools, and top-level `system` prompt, meant for tier selection rather than exact accounting.
 - A malformed rule fails open: it is skipped (never silently widened), and the rest of the rules still apply.
 - Routing is skipped for byte-faithful passthrough requests (`x-headroom-bypass: true` or `x-headroom-mode: passthrough`), so those are never model-rewritten.

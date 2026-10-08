@@ -45,6 +45,7 @@ from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -61,6 +62,16 @@ from headroom.providers.codex.threads import retag_to_headroom
 from .main import main
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep hook recovery gated by both readiness and runtime identity."""
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
 
 _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
@@ -308,6 +319,27 @@ def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> st
     return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
+def _strip_codex_root_routing_orphans(content: str) -> str:
+    """Drop Headroom loopback routing keys left at the document root.
+
+    Only the root (everything before the first table header) is Headroom's to
+    clean: the same keys inside ``[profiles.*]`` tables are user-owned
+    per-profile overrides, even when they point at Headroom.
+    """
+    import re
+
+    first_table = re.search(r"(?m)^[ \t]*\[", content)
+    split = first_table.start() if first_table else len(content)
+    root, rest = content[:split], content[split:]
+    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
+    root = re.sub(
+        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+        "",
+        root,
+    )
+    return root + rest
+
+
 def _strip_codex_init_block(content: str) -> str:
     """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
     import re
@@ -327,12 +359,7 @@ def _strip_codex_init_block(content: str) -> str:
 
     # Strip any orphan top-level keys that a crashed or partial write may have
     # left outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
+    content = _strip_codex_root_routing_orphans(content)
 
     # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
     orphan_headroom_table = re.compile(
@@ -363,7 +390,10 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'model_provider = "headroom"\n'
         f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
         "[model_providers.headroom]\n"
-        'name = "Headroom init proxy"\n'
+        # Codex derives remote-compaction support from the provider display
+        # name. Keep the proxy's provider id as ``headroom`` for routing, but
+        # use the built-in OpenAI name so the capability is preserved.
+        'name = "OpenAI"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
         f"{requires_openai_auth}"
@@ -781,25 +811,25 @@ def _ensure_profile_running(profile: str) -> None:
     if manifest is None:
         return
     with _suppress_hook_output():
-        if wait_ready(manifest, timeout_seconds=1):
+        if _wait_for_runtime_ready(manifest, timeout_seconds=1):
             return
         try:
             with acquire_runtime_start_lock(manifest.profile) as acquired:
                 if not acquired:
                     return
-                if wait_ready(manifest, timeout_seconds=1):
+                if _wait_for_runtime_ready(manifest, timeout_seconds=1):
                     return
                 if runtime_status(manifest) == "running":
-                    if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                    if _wait_for_runtime_ready(manifest, _STARTUP_READY_TIMEOUT_SECONDS):
                         return
                     stop_runtime(manifest)
-                if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                if runtime_ownership(manifest) == "docker-supervisor":
                     start_persistent_docker(manifest)
                 elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
                     start_supervisor(manifest)
                 else:
                     start_detached_agent(manifest.profile)
-                wait_ready(manifest, timeout_seconds=45)
+                _wait_for_runtime_ready(manifest, 45)
         except Exception:
             return
 
@@ -906,6 +936,12 @@ def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
     if os.name == "nt":
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
+        )
+        click.echo(
+            "Nothing starts the Headroom proxy for Codex on Windows, so Codex cannot connect "
+            "while it is down. Use `headroom install apply` for a supervised proxy. To remove "
+            "this routing, run `headroom unwrap codex` (user scope) or delete the Headroom init "
+            "provider block from the project's .codex/config.toml."
         )
     click.echo("Restart Codex to activate Headroom configuration.")
 

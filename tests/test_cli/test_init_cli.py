@@ -231,6 +231,7 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
     parsed = tomllib.loads(content)
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+    assert parsed["model_providers"]["headroom"]["name"] == "OpenAI"
     assert "codex_hooks" not in content
 
 
@@ -1367,6 +1368,8 @@ def test_init_codex_windows_warns_about_upstream_hook_limitation(monkeypatch) ->
     init_cli._init_codex(global_scope=True, profile="init-user", port=9000)
 
     assert any("disabled upstream on Windows" in message for message in messages)
+    # Routing to a proxy nothing restarts must come with a way out (#3749).
+    assert any("headroom unwrap codex" in message for message in messages)
 
 
 def test_init_openclaw_propagates_nonzero_exit(monkeypatch) -> None:

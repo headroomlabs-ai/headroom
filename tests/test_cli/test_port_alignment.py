@@ -565,7 +565,7 @@ class TestDoctorAdditions:
         monkeypatch.setattr(doctor_mod, "check_deployments", lambda manifests: None)
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: home / "settings.json")
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: home / "savings.json")
-        result = CliRunner().invoke(main, ["doctor", "--json"])
+        result = CliRunner().invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["exit_code"] == 2  # still a failure at the probed port
         proxy = next(c for c in payload["checks"] if c["name"] == "proxy")

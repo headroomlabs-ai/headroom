@@ -1223,7 +1223,9 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         log_requests=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         _record_request(client, model="gpt-4o", tokens_saved=40)
 
         stats = client.get("/stats")
@@ -1276,7 +1278,9 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
             stats_data["persistent_savings"]["display_session"] == history_data["display_session"]
         )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         history = client.get("/stats-history")
         assert history.status_code == 200
         assert history.json()["lifetime"]["tokens_saved"] == 40
@@ -1428,7 +1432,9 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
         log_requests=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         _record_request(client, model="gpt-4o", tokens_saved=40)
         _record_request(client, model="gpt-4o", tokens_saved=10)
 
@@ -1464,7 +1470,9 @@ def test_malformed_savings_state_is_ignored_safely(tmp_path, monkeypatch):
         log_requests=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         response = client.get("/stats-history")
         assert response.status_code == 200
         data = response.json()
@@ -1482,7 +1490,9 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         log_requests=False,
     )
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         response = client.get("/dashboard")
         assert response.status_code == 200
         html = response.text

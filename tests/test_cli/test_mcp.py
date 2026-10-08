@@ -199,6 +199,33 @@ class TestMCPUninstallCommand:
         assert result.exit_code == 0
         assert "not configured" in result.output.lower()
 
+    def test_uninstall_agent_filter_restricts_registrars(self):
+        """--agent limits uninstallation to the named registrars."""
+        antigravity = FakeRegistrar()
+        antigravity.name = "antigravity"
+        claude = FakeRegistrar()
+        claude.name = "claude"
+
+        runner = CliRunner()
+        with patch(
+            "headroom.mcp_registry.get_all_registrars",
+            return_value=[antigravity, claude],
+        ):
+            result = runner.invoke(main, ["mcp", "uninstall", "--agent", "antigravity"])
+
+        assert result.exit_code == 0
+        assert antigravity.removed == ["headroom"]
+        assert claude.removed == []
+
+    def test_uninstall_agent_filter_no_match_exits_nonzero(self):
+        """--agent with no matching registrar exits non-zero."""
+        runner = CliRunner()
+        with patch("headroom.mcp_registry.get_all_registrars", return_value=[FakeRegistrar()]):
+            result = runner.invoke(main, ["mcp", "uninstall", "--agent", "bogus"])
+
+        assert result.exit_code == 1
+        assert "no agents matched" in result.output.lower()
+
 
 class TestMCPStatusCommand:
     """Test 'headroom mcp status' command."""
