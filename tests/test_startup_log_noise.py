@@ -119,8 +119,10 @@ class TestLiteLLMLogSuppression:
         import os
 
         monkeypatch.delenv("LITELLM_SUPPRESS_DEBUG_INFO", raising=False)
-        sys.modules.pop("headroom.providers.litellm", None)
-        sys.modules.pop("litellm", None)
+        # Restore the original modules at teardown: pricing submodules retain
+        # references to that LiteLLM instance and must not see a second catalog.
+        monkeypatch.delitem(sys.modules, "headroom.providers.litellm", raising=False)
+        monkeypatch.delitem(sys.modules, "litellm", raising=False)
 
         original_import = builtins.__import__
         fake_litellm = ModuleType("litellm")
