@@ -777,3 +777,30 @@ def test_responses_codex_exec_whole_result_read_stays_verbatim(monkeypatch):
     new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
 
     assert new_payload["input"][1] == output
+
+
+def test_responses_codex_exec_read_output_forms_are_equivalent(monkeypatch):
+    """Printing `r.output` or the whole result protects the same file read."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    command = "nl -ba src/models.rs | sed -n '1,400p'"
+    plain_output = _codex_exec_output("call_plain", _RUST_NL)
+    whole_output = _codex_exec_output("call_whole", _exec_envelope(_RUST_NL))
+    whole_call = _codex_exec_call("call_whole", command)
+    whole_call["input"] = whole_call["input"].replace("text(r0.output)", "text(r0)")
+
+    plain_result, plain_modified, *_ = _run(
+        handler,
+        {
+            "model": "gpt-5",
+            "input": [_codex_exec_call("call_plain", command), plain_output],
+        },
+    )
+    whole_result, whole_modified, *_ = _run(
+        handler, {"model": "gpt-5", "input": [whole_call, whole_output]}
+    )
+
+    assert plain_modified is False
+    assert whole_modified is False
+    assert plain_result["input"][1] == plain_output
+    assert whole_result["input"][1] == whole_output

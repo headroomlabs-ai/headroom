@@ -7,11 +7,11 @@ const http2 = nodeRequire("node:http2") as typeof import("node:http2");
 const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
 const fs = nodeRequire("node:fs") as typeof import("node:fs");
 
-const BASE_URL_HEADER = "x-headroom-base-url";
-const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
-const PROJECT_HEADER = "x-headroom-project";
+export const BASE_URL_HEADER = "x-headroom-base-url";
+export const ORIGINAL_PATH_HEADER = "x-headroom-original-path";
+export const PROJECT_HEADER = "x-headroom-project";
 const PROXY_ENV = "HEADROOM_OPENCODE_TRANSPORT_PROXY_URL";
-const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
+export const EXCLUDE_HOSTS_ENV = "HEADROOM_OPENCODE_EXCLUDE_HOSTS";
 const STATE_KEY = Symbol.for("headroom.opencode.transport");
 
 type FetchArgs = Parameters<typeof fetch>;
@@ -69,7 +69,7 @@ function setState(state: TransportState | undefined): void {
 }
 
 // ponytail: the shim only exists next to the checkout build
-// (plugins/opencode/dist/). The wheel ships entry.opencode.js alone, so
+// (plugins/opencode/dist/). The wheel shipped the entry bundle alone, so
 // `--import=<missing file>` killed every Node child at startup — including
 // OpenCode's stdio MCP servers (issue #2798). No shim on disk, no injection:
 // children go direct instead of dying. Upgrade path is bundling the shim into
@@ -208,7 +208,7 @@ function isLoopback(hostname: string): boolean {
 // string is the comma-separated env form; plugin options arrive from untyped
 // JSON, so a lone string there is treated the same way instead of iterated
 // character by character.
-function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
+export function normalizeExcludeHosts(entries: string | Iterable<unknown>): string[] {
   const hosts = new Set<string>();
   for (const entry of typeof entries === "string" ? entries.split(",") : entries) {
     const host = String(entry).trim().toLowerCase().replace(/^(\*\.|\.)/, "");
@@ -243,7 +243,7 @@ function isLlmEndpointPath(pathname: string): boolean {
   );
 }
 
-function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+function isRoutableUpstream(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     return false;
   }
@@ -256,7 +256,28 @@ function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
   if (isExcludedHost(url.hostname, excludeHosts)) {
     return false;
   }
-  return isLlmEndpointPath(url.pathname);
+  return true;
+}
+
+function shouldRoute(url: URL, proxy: URL, excludeHosts: string[]): boolean {
+  return isRoutableUpstream(url, proxy, excludeHosts) && isLlmEndpointPath(url.pathname);
+}
+
+// OpenCode 2.x hands the plugin model base URLs (e.g.
+// https://opencode.ai/zen/go/v1), not inference endpoints: setup appends the
+// wire path when it rewrites the model, so the endpoint-suffix check cannot
+// apply. Eligibility is the shared host/protocol contract only — http(s),
+// not loopback, not the proxy itself, not an excluded host.
+export function modelBaseRoutesThroughProxy(
+  baseUrl: string,
+  proxyUrl: string,
+  excludeHosts: string[] = [],
+): boolean {
+  try {
+    return isRoutableUpstream(new URL(baseUrl), normalizeProxyUrl(proxyUrl), excludeHosts);
+  } catch {
+    return false;
+  }
 }
 
 function routedUrl(upstream: URL, proxy: URL): URL {

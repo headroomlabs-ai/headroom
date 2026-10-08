@@ -38,6 +38,7 @@
     }
   },
   "devDependencies": {
+    "@opencode/plugin": "^2.0.14",
     "@types/node": "^26.1.1",
     "@typescript/native": "npm:typescript@^7.0.2",
     "tsup": "^8.0.0",
