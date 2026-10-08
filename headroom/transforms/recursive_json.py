@@ -175,9 +175,10 @@ def json_document_spans(text: str) -> list[tuple[int, int]]:
 def scan_json_documents(text: str) -> tuple[list[tuple[int, int]], bool]:
     """``json_document_spans`` plus whether the scan covered all of ``text``.
 
-    ``complete`` is only ever False past the scan budget, i.e. on input built to
-    defeat the linear walk; a caller that must not miss a document treats that
-    as "may contain one".
+    ``complete`` is False when the bracket walk or cumulative JSON validation
+    exhausts its work budget, or the decoder reaches its recursion limit.
+    A caller that must not miss a document treats any incomplete result as
+    "may contain one" and declines lossy compression.
     """
     spans, complete = _scan_spans(text, include_nested=True)
     out: list[tuple[int, int]] = []
