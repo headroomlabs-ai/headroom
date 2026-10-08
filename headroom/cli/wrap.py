@@ -83,6 +83,7 @@ from headroom.copilot_auth import (
     resolve_subscription_bearer_token_details,
     token_fingerprint,
 )
+from headroom.offline import OfflineEgressBlocked, guard_egress, is_offline
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.antigravity import (
     render_setup_lines as _render_antigravity_setup_lines,
@@ -2333,46 +2334,62 @@ def _live_copilot_models_payload(api_url: str | None, token: str | None) -> dict
 
     Returns the payload rather than parsed cards because VS Code needs
     per-model capabilities (tool calling, vision) that ``ModelCard`` does not
-    carry, and that dataclass belongs to a separate change.
+    carry, and that dataclass belongs to a separate change. Under
+    ``HEADROOM_OFFLINE`` it returns ``{}`` without opening a connection.
     """
     if not api_url or not token:
         return {}
+    url = f"{api_url.rstrip('/')}/models"
     try:
+        guard_egress("Copilot model discovery for VS Code", url)
         import httpx
 
         from headroom.copilot_auth import _copilot_chat_header_defaults
 
         response = httpx.get(
-            f"{api_url.rstrip('/')}/models",
+            url,
             headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
             timeout=10,
         )
         if response.status_code != 200:
             return {}
         payload = response.json()
+    except OfflineEgressBlocked:
+        # Unreached from `wrap vscode-chat` today, whose credential lookup is
+        # refused first; kept so this fetch can never dial out on its own.
+        return {}
     except Exception:  # noqa: BLE001 — discovery is best-effort, never fatal
         return {}
     return payload if isinstance(payload, dict) else {}
 
 
 def _live_copilot_model_ids(api_url: str | None, token: str | None) -> list[str]:
-    """Selectable Copilot chat model IDs, live. Empty list on any failure."""
+    """Selectable Copilot chat model IDs, live. Empty list on any failure.
+
+    Under ``HEADROOM_OFFLINE`` it returns ``[]`` without opening a connection.
+    """
     if not api_url or not token:
         return []
+    url = f"{api_url.rstrip('/')}/models"
     try:
+        guard_egress("Copilot model discovery for the instructions file", url)
         import httpx
 
         from headroom.copilot_auth import _copilot_chat_header_defaults
         from headroom.models.copilot_catalog import parse_models_payload
 
         response = httpx.get(
-            f"{api_url.rstrip('/')}/models",
+            url,
             headers={"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()},
             timeout=8,
         )
         if response.status_code != 200:
             return []
         cards = parse_models_payload(response.json())
+    except OfflineEgressBlocked:
+        # Unreached from `wrap copilot` today, which skips the list offline;
+        # kept so this fetch can never dial out on its own.
+        return []
     except Exception:  # noqa: BLE001 — guidance is best-effort, never fatal
         return []
     return sorted(
@@ -7356,7 +7373,12 @@ def copilot(
             # Skipped with --no-model-list, and removed by `unwrap copilot`.
             from headroom.models.copilot_catalog import catalog_enabled
 
-            if not no_model_list and catalog_enabled():
+            if not no_model_list and catalog_enabled() and is_offline():
+                click.echo(
+                    "  Note: HEADROOM_OFFLINE is set, so the available-models list was not "
+                    "fetched or written. Pass --no-model-list to silence this."
+                )
+            elif not no_model_list and catalog_enabled():
                 # Best-effort, never fatal. origin/main never wrote this file, so a
                 # crash here would be a pure regression: `.github` existing as a file
                 # raises FileExistsError from mkdir, and a read-only target raises

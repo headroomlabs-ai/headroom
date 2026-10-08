@@ -1924,6 +1924,169 @@ class TestFastembedWeightsOffline:
         assert "HEADROOM_OFFLINE" in str(excinfo.value)
 
 
+class TestModelDiscoveryOffline:
+    """Copilot and Anthropic model discovery is optional, so offline it degrades.
+
+    `headroom models`, the launch wire-API lookup, the VS Code model list, the
+    instructions-file model list and the proxy's routing catalog each ask a
+    provider's `/models` for something Headroom can do without. Under
+    HEADROOM_OFFLINE none may open a connection, or even mint a token for one:
+    each falls back to the name heuristic or reports the provider as
+    unavailable, with the switch named. Placeholder credentials are set so a
+    missing credential cannot be what stops the call.
+    """
+
+    @pytest.fixture
+    def no_http(self, monkeypatch: pytest.MonkeyPatch) -> list[object]:
+        import httpx
+
+        calls: list[object] = []
+
+        def _get(*args: object, **kwargs: object) -> None:
+            calls.append(args)
+            raise AssertionError("model discovery opened a connection while offline")
+
+        monkeypatch.setattr(httpx, "get", _get)
+        monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN", "placeholder-copilot-token")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-anthropic-key")
+        monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "on")
+        return calls
+
+    def test_models_command_reports_each_provider_as_offline(
+        self,
+        offline: None,
+        no_sockets: None,
+        no_http: list[object],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+
+        from click.testing import CliRunner
+
+        from headroom.cli.main import main
+
+        def _resolve() -> None:
+            raise AssertionError("a Copilot credential was resolved while offline")
+
+        monkeypatch.setattr(
+            "headroom.copilot_auth.resolve_subscription_bearer_token_details", _resolve
+        )
+
+        result = CliRunner().invoke(main, ["models", "--provider", "all", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["models"] == []
+        assert [note.split(":", 1)[0] for note in payload["unavailable"]] == [
+            "copilot",
+            "anthropic",
+        ]
+        assert all("HEADROOM_OFFLINE is set" in note for note in payload["unavailable"])
+        assert no_http == []
+
+        text = CliRunner().invoke(main, ["models"])
+        assert text.exit_code == 0, text.output
+        assert "not enumerated — copilot: HEADROOM_OFFLINE is set" in text.output
+        assert "not enumerated — anthropic: HEADROOM_OFFLINE is set" in text.output
+        assert no_http == []
+
+    def test_launch_discovery_falls_back_without_a_request(
+        self, offline: None, no_sockets: None, no_http: list[object]
+    ) -> None:
+        from headroom.cli.wrap import _live_copilot_model_ids, _live_copilot_models_payload
+        from headroom.providers.copilot.wrap import (
+            default_wire_api_for_model,
+            resolve_wire_api_for_model,
+        )
+
+        api_url = "https://api.githubcopilot.com"
+        token = "placeholder-copilot-token"
+        assert _live_copilot_models_payload(api_url, token) == {}
+        assert _live_copilot_model_ids(api_url, token) == []
+        for model in ("mai-code-1-flash-picker", "gpt-5.4", "claude-sonnet-4.6"):
+            assert resolve_wire_api_for_model(
+                model, api_url=api_url, token=token
+            ) == default_wire_api_for_model(model)
+        assert no_http == []
+
+    def test_the_proxy_catalog_keeps_the_heuristic_without_a_request(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from headroom.proxy.handlers import openai as openai_handler
+
+        monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "on")
+
+        async def _auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
+            raise AssertionError("a Copilot token was minted for the catalog while offline")
+
+        monkeypatch.setattr(openai_handler, "apply_copilot_api_auth", _auth)
+
+        class _Client:
+            async def get(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("the catalog was fetched while offline")
+
+        handler = SimpleNamespace(
+            http_client=_Client(),
+            _resolve_openai_upstream=lambda _request: "https://api.githubcopilot.com",
+            _copilot_catalog_key=lambda _request: ("token", "vscode-chat", "api"),
+        )
+        cards = asyncio.run(
+            openai_handler.OpenAIHandlerMixin._ensure_copilot_catalog(
+                handler,  # type: ignore[arg-type]
+                SimpleNamespace(),  # type: ignore[arg-type]
+                {"Authorization": "Bearer placeholder-copilot-token"},
+            )
+        )
+        assert cards is None
+
+    def test_the_proxy_catalog_serves_what_it_already_holds(
+        self, offline: None, no_sockets: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale catalog fetched before the switch was set is still served, unrefreshed."""
+        import asyncio
+        import time
+
+        from headroom.models.copilot_catalog import (
+            CopilotModelCatalog,
+            ModelCard,
+            catalog_ttl_seconds,
+        )
+        from headroom.proxy.handlers import openai as openai_handler
+
+        monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "on")
+
+        async def _auth(headers: dict[str, str], *, url: str) -> dict[str, str]:
+            raise AssertionError("a Copilot token was minted for the catalog while offline")
+
+        monkeypatch.setattr(openai_handler, "apply_copilot_api_auth", _auth)
+
+        class _Client:
+            async def get(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("the catalog was fetched while offline")
+
+        key = ("token", "vscode-chat", "api")
+        held = {"gpt-5.4": ModelCard(id="gpt-5.4", endpoints=("/responses",))}
+        catalog = CopilotModelCatalog()
+        catalog.put(key, held, now=time.time() - catalog_ttl_seconds() - 60)
+        assert not catalog.is_fresh(key)
+        handler = SimpleNamespace(
+            http_client=_Client(),
+            _copilot_catalog=catalog,
+            _resolve_openai_upstream=lambda _request: "https://api.githubcopilot.com",
+            _copilot_catalog_key=lambda _request: key,
+        )
+        cards = asyncio.run(
+            openai_handler.OpenAIHandlerMixin._ensure_copilot_catalog(
+                handler,  # type: ignore[arg-type]
+                SimpleNamespace(),  # type: ignore[arg-type]
+                {},
+            )
+        )
+        assert cards == held
+
+
 class TestCliTranslatesTheRefusal:
     """The refusal has to arrive as a sentence, not a stack trace.
 

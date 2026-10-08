@@ -508,6 +508,30 @@ def test_native_skips_the_model_list_injection(monkeypatch: pytest.MonkeyPatch) 
     assert len(calls) == 1, "BYOK mode must still write it (proves the spy works)"
 
 
+def test_offline_skips_the_model_list_and_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under HEADROOM_OFFLINE the list is neither fetched nor written, and wrap says why."""
+    from headroom.cli import wrap as wrap_mod
+
+    monkeypatch.setenv("HEADROOM_MODEL_CATALOG", "true")
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        wrap_mod,
+        "_inject_copilot_models_instructions",
+        lambda *a, **k: calls.append(a) or True,
+    )
+
+    result, _captured = _invoke_copilot(
+        monkeypatch, ["--subscription", "--port", "8890", "--", "--model", "gpt-5.4"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+    assert "HEADROOM_OFFLINE is set, so the available-models list was not fetched" in (
+        result.output
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cross-contamination: a native proxy must never be reused by `wrap claude`
 #

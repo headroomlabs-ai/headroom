@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.offline import OfflineEgressBlocked, guard_egress, note_refusal
 from headroom.proxy.conversation_savings import savings_conversation_key
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
@@ -2464,7 +2465,9 @@ class OpenAIHandlerMixin:
 
         Awaited once per request on the Copilot path, before routing. Returns
         the cards or ``None``. Never raises and never propagates a failure: an
-        unreachable ``/models`` leaves the caller on today's heuristic.
+        unreachable ``/models`` leaves the caller on today's heuristic. Under
+        ``HEADROOM_OFFLINE`` it neither fetches nor mints a token for the fetch,
+        and keeps whatever it already holds.
         """
         from headroom.models.copilot_catalog import (
             CopilotModelCatalog,
@@ -2485,6 +2488,13 @@ class OpenAIHandlerMixin:
             return cached
         if self.http_client is None:
             return None
+        try:
+            guard_egress("Copilot model catalog", f"{base_url.rstrip('/')}/models")
+        except OfflineEgressBlocked as blocked:
+            # Optional discovery: routing keeps the name fallback, and the
+            # refusal is logged once instead of failing the request.
+            note_refusal(blocked, logger)
+            return cached
 
         # Single-flight per credential. Without this, an N-way subagent fan-out
         # on a cold cache issues N parallel `/models` GETs and every one of those

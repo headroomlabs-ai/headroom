@@ -29,6 +29,7 @@ from typing import Any
 import click
 
 from headroom.cli.main import main
+from headroom.offline import OfflineEgressBlocked, guard_egress
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,10 +49,15 @@ class _Row:
 
 
 def _copilot_rows() -> tuple[list[_Row], str | None]:
-    """Enumerate GitHub Copilot models. Returns (rows, unavailable_reason)."""
-    from headroom.copilot_auth import resolve_subscription_bearer_token_details
+    """Enumerate GitHub Copilot models. Returns (rows, unavailable_reason).
+
+    Raises :class:`OfflineEgressBlocked` under ``HEADROOM_OFFLINE`` before a
+    credential is resolved, since resolving one can exchange a token with GitHub.
+    """
+    from headroom.copilot_auth import copilot_api_url, resolve_subscription_bearer_token_details
     from headroom.models.copilot_catalog import parse_models_payload
 
+    guard_egress("Copilot model listing", f"{copilot_api_url().rstrip('/')}/models")
     resolution = resolve_subscription_bearer_token_details()
     if resolution is None:
         return [], (
@@ -112,7 +118,8 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
     "not enumerable" message rather than a guessed list.
 
     Returns ``(rows, note)``. With no rows the note says why Anthropic is
-    unavailable; with rows it says the list may be incomplete.
+    unavailable; with rows it says the list may be incomplete. Raises
+    :class:`OfflineEgressBlocked` under ``HEADROOM_OFFLINE`` before any request.
     """
     import os
 
@@ -127,6 +134,7 @@ def _anthropic_rows() -> tuple[list[_Row], str | None]:
             "already lists what the subscription allows.)"
         )
     base = (os.environ.get("ANTHROPIC_API_URL") or "https://api.anthropic.com").rstrip("/")
+    guard_egress("Anthropic model listing", f"{base}/v1/models")
     # `/v1/models` is paginated (`has_more` + `last_id`, continued with
     # `after_id`). Reading only the first page silently truncated the list for
     # accounts with more than one page of models. The page cap only guards
@@ -238,6 +246,8 @@ def models(provider: str, vendor: str | None, tier: str | None, as_json: bool) -
     IDs printed here are exactly what `--model` and a subagent's model field
     accept. Nothing is hardcoded: if a provider cannot be reached, it is
     reported as unavailable rather than replaced with a stale built-in list.
+    Under HEADROOM_OFFLINE no provider is asked, and each is reported as
+    unavailable for that reason.
     """
     wanted = ["copilot", "anthropic"] if provider in ("auto", "all") else [provider]
     rows: list[_Row] = []
@@ -246,7 +256,12 @@ def models(provider: str, vendor: str | None, tier: str | None, as_json: bool) -
     # early, which is not the same as being unavailable.
     incomplete: list[str] = []
     for name in wanted:
-        got, reason = _copilot_rows() if name == "copilot" else _anthropic_rows()
+        try:
+            got, reason = _copilot_rows() if name == "copilot" else _anthropic_rows()
+        except OfflineEgressBlocked as blocked:
+            # A listing is optional, so the air-gap refusal becomes the reason
+            # this provider is missing rather than an error for the command.
+            got, reason = [], f"{name}: {blocked}"
         rows.extend(got)
         if reason:
             (incomplete if got else notes).append(reason)

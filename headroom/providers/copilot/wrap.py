@@ -11,6 +11,7 @@ from typing import Any
 
 import click
 
+from headroom.offline import OfflineEgressBlocked, guard_egress
 from headroom.proxy.project_context import with_project_prefix
 
 
@@ -197,7 +198,8 @@ def resolve_wire_api_for_model(
     Asking the upstream which endpoints serve the model removes the guess. This
     runs once at launch, is bounded by ``timeout``, and falls back to
     :func:`default_wire_api_for_model` on any failure, so a slow or unreachable
-    ``/models`` only costs a few seconds and never blocks a launch.
+    ``/models`` only costs a few seconds and never blocks a launch. Under
+    ``HEADROOM_OFFLINE`` it uses that fallback without opening a connection.
     """
     fallback = default_wire_api_for_model(model)
     if not model or not api_url or not token:
@@ -212,11 +214,15 @@ def resolve_wire_api_for_model(
         if not catalog_enabled():
             return fallback
 
+        url = f"{api_url.rstrip('/')}/models"
+        guard_egress("Copilot model catalog for the launch wire API", url)
         headers = {"Authorization": f"Bearer {token}", **_copilot_chat_header_defaults()}
-        response = httpx.get(f"{api_url.rstrip('/')}/models", headers=headers, timeout=timeout)
+        response = httpx.get(url, headers=headers, timeout=timeout)
         if response.status_code != 200:
             return fallback
         card = parse_models_payload(response.json()).get(model)
+    except OfflineEgressBlocked:
+        return fallback
     except Exception:  # noqa: BLE001 — launch must never fail on discovery
         return fallback
 
