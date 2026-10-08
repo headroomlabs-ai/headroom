@@ -49,6 +49,45 @@ def _stream_outcome_status(status_code: int, completed_normally: bool) -> int:
     return status_code if completed_normally else STREAM_FAILURE_STATUS
 
 
+def _gemini_response_data(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    response = data.get("response")
+    return response if isinstance(response, dict) else data
+
+
+def _gemini_finished_candidates(data: Any) -> set[int]:
+    candidates = _gemini_response_data(data).get("candidates")
+    finished: set[int] = set()
+    if not isinstance(candidates, list):
+        return finished
+    for position, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        reason = candidate.get("finishReason")
+        index = candidate.get("index", position)
+        if (
+            isinstance(reason, str)
+            and reason.strip()
+            and reason != "FINISH_REASON_UNSPECIFIED"
+            and isinstance(index, int)
+            and not isinstance(index, bool)
+            and index >= 0
+        ):
+            finished.add(index)
+    return finished
+
+
+def _gemini_requested_candidates(body: dict[str, Any]) -> int:
+    request = body.get("request")
+    request = request if isinstance(request, dict) else body
+    config = request.get("generationConfig") or request.get("generation_config")
+    if not isinstance(config, dict):
+        return 1
+    count = config.get("candidateCount", config.get("candidate_count", 1))
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 1
+
+
 def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> tuple[bool, bool]:
     """Classify a complete protocol event, never text inside a model delta."""
     try:
@@ -64,7 +103,21 @@ def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> t
     }
     if isinstance(data, dict) and data.get("error") is not None:
         failed = True
-    if dialect == "anthropic":
+    if dialect == "gemini":
+        response = _gemini_response_data(data)
+        feedback = response.get("promptFeedback")
+        block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else None
+        failed = (
+            failed
+            or response.get("error") is not None
+            or (
+                isinstance(block_reason, str)
+                and bool(block_reason.strip())
+                and block_reason != "BLOCK_REASON_UNSPECIFIED"
+            )
+        )
+        terminal = bool(_gemini_finished_candidates(data))
+    elif dialect == "anthropic":
         terminal = event_name == "message_stop" or event_type == "message_stop"
     elif dialect == "responses":
         # Incomplete is a normal terminal result (e.g. the output-token limit),
@@ -384,7 +437,10 @@ class StreamingMixin:
             failed, terminal = _sse_event_outcome(
                 _event_name,
                 data_str,
-                stream_state.get("sse_dialect", "anthropic" if provider == "anthropic" else "chat"),
+                stream_state.get(
+                    "sse_dialect",
+                    provider if provider in {"anthropic", "gemini"} else "chat",
+                ),
             )
             stream_state["stream_failed"] = stream_state.get("stream_failed", False) or failed
             stream_state["stream_terminal"] = stream_state.get("stream_terminal", False) or terminal
@@ -395,6 +451,12 @@ class StreamingMixin:
                 data = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
+
+            if provider == "gemini":
+                finished = stream_state.setdefault("gemini_finished_candidates", set())
+                finished.update(_gemini_finished_candidates(data))
+                expected = stream_state.get("gemini_candidate_count", 1)
+                stream_state["stream_terminal"] = set(range(expected)).issubset(finished)
 
             if provider == "anthropic":
                 event_type = data.get("type", "")
@@ -1321,9 +1383,12 @@ class StreamingMixin:
             "ttfb_ms": None,  # Time to first byte from upstream
             "stream_failed": False,
             "stream_terminal": False,
+            "gemini_candidate_count": _gemini_requested_candidates(body),
             "sse_dialect": (
                 "anthropic"
                 if provider == "anthropic"
+                else "gemini"
+                if provider == "gemini"
                 else "responses"
                 if urlsplit(url).path.rstrip("/").endswith("/responses")
                 else "chat"

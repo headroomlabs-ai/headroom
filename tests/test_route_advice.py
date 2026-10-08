@@ -482,6 +482,45 @@ def test_malformed_event_type_is_not_interpreted_as_a_protocol_marker(event_type
     assert not _sse_contains_error_event(payload)
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("finish_reason", ["STOP", "MAX_TOKENS"])
+def test_gemini_finish_reason_is_a_terminal_event(wrapped, finish_reason):
+    import json
+
+    from headroom.proxy.handlers.streaming import _sse_event_outcome
+
+    payload = {"candidates": [{"index": 0, "finishReason": finish_reason}]}
+    if wrapped:
+        payload = {"response": payload}
+    assert _sse_event_outcome(None, json.dumps(payload), "gemini") == (False, True)
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_gemini_prompt_block_is_a_failed_outcome(wrapped):
+    import json
+
+    from headroom.proxy.handlers.streaming import _sse_event_outcome
+
+    payload = {"promptFeedback": {"blockReason": "SAFETY"}}
+    if wrapped:
+        payload = {"response": payload}
+    failed, _ = _sse_event_outcome(None, json.dumps(payload), "gemini")
+    assert failed
+
+
+def test_gemini_completion_requires_all_requested_candidates():
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    parser = StreamingMixin()
+    state = {"sse_buffer": bytearray(), "gemini_candidate_count": 2}
+    state["sse_buffer"].extend(b'data: {"candidates":[{"index":0,"finishReason":"STOP"}]}\n\n')
+    parser._parse_sse_usage_from_buffer(state, "gemini")
+    assert not state.get("stream_terminal", False)
+    state["sse_buffer"].extend(b'data: {"candidates":[{"index":1,"finishReason":"STOP"}]}\n\n')
+    parser._parse_sse_usage_from_buffer(state, "gemini")
+    assert state["stream_terminal"]
+
+
 def test_outcome_classification_runs_once_for_a_chunked_complete_event(monkeypatch):
     from headroom.proxy.handlers import streaming
 
