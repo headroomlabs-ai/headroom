@@ -1,4 +1,5 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
+import { Banner } from 'fumadocs-ui/components/banner';
 import './global.css';
 import { Inter } from 'next/font/google';
 import type { Metadata } from 'next';
@@ -10,10 +11,12 @@ const inter = Inter({
 // Canonical URL for the live docs. ``metadataBase`` resolves the og:url
 // and twitter:url for every page; pointing it at the actual live site
 // is what lets crawlers (search + LLM) follow the right canonical and
-// pick up ``/llms.txt`` / ``/sitemap.xml`` / og images. Override at
-// build time via ``NEXT_PUBLIC_SITE_URL`` (e.g. when promoting to a
-// custom domain).
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://headroom-docs.vercel.app';
+// pick up ``/llms.txt`` / ``/sitemap.xml`` / og images. The site now
+// serves from the custom domain below; the old *.vercel.app host is
+// kept out of here deliberately, because when this fell back to it the
+// live site advertised a sitemap and ``Host:`` on the wrong domain.
+// Override at build time via ``NEXT_PUBLIC_SITE_URL`` for previews.
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://docs.headroomlabs.ai';
 
 export const metadata: Metadata = {
   title: {
@@ -46,7 +49,18 @@ export default function Layout({ children }: LayoutProps<'/'>) {
   return (
     <html lang="en" className={inter.className} suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
-        <RootProvider>{children}</RootProvider>
+        <RootProvider>
+          {/* Dismissible; Fumadocs remembers the dismissal per id in localStorage. */}
+          <Banner id="teams-perk-2026">
+            <a
+              href="https://headroom-perks.vercel.app/?source=github&utm_source=docs&utm_medium=banner"
+              className="font-medium underline-offset-4 hover:underline"
+            >
+              Headroom for Teams: 3 months free with a 12-month plan →
+            </a>
+          </Banner>
+          {children}
+        </RootProvider>
       </body>
     </html>
   );

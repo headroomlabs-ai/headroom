@@ -237,7 +237,9 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         proxy = client.app.state.proxy
 
         set_current_project("ctx-project")
@@ -257,7 +259,7 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
         assert stats["persistent_savings"]["projects_limit"] == DEFAULT_MAX_PROJECTS
 
         history = client.get("/stats-history").json()
-        assert history["schema_version"] == 5
+        assert history["schema_version"] == 6
         assert history["projects"]["ctx-project"]["requests"] == 1
 
 
@@ -290,7 +292,9 @@ def test_stats_payload_keeps_legacy_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         proxy = client.app.state.proxy
         _emit_outcome(proxy)  # unattributed: no header, no context, no field
 
@@ -310,7 +314,9 @@ def test_metrics_record_request_works_without_project_kwarg(tmp_path, monkeypatc
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         proxy = client.app.state.proxy
         asyncio.run(
             proxy.metrics.record_request(
@@ -341,7 +347,9 @@ def test_middleware_binds_project_header_to_context(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server_module, "set_current_project", _capture)
 
-    with TestClient(create_app(config)) as client:
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         assert client.get("/health", headers={"X-Headroom-Project": " my repo "}).status_code == 200
         assert client.get("/health").status_code == 200
         # /p/<name> base-URL prefix (aider/copilot/cursor wraps): stripped

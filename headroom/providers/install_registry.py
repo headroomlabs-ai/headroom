@@ -6,6 +6,9 @@ from collections.abc import Callable
 
 from headroom.install.models import DeploymentManifest, ManagedMutation
 from headroom.providers.aider.install import build_install_env as _build_aider_install_env
+from headroom.providers.antigravity.install import (
+    build_install_env as _build_antigravity_install_env,
+)
 from headroom.providers.claude.install import (
     apply_provider_scope as _apply_claude_provider_scope,
 )
@@ -47,9 +50,10 @@ from headroom.providers.opencode.install import (
 
 _InstallEnvBuilder = Callable[..., dict[str, str]]
 _ProviderScopeApplier = Callable[[DeploymentManifest], ManagedMutation | None]
-_ProviderScopeReverter = Callable[[ManagedMutation, DeploymentManifest], None]
+_ProviderScopeReverter = Callable[..., None]
 
 _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
+    "antigravity": _build_antigravity_install_env,
     "claude": _build_claude_install_env,
     "copilot": _build_copilot_install_env,
     "codex": _build_codex_install_env,
@@ -85,19 +89,48 @@ def build_install_target_envs(
 def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
     """Apply provider-scope mutations owned by provider slices."""
     mutations: list[ManagedMutation] = []
-    for target in manifest.targets:
-        handlers = _PROVIDER_SCOPE_HANDLERS.get(target)
-        if handlers is None:
-            continue
-        mutation = handlers[0](manifest)
-        if mutation is not None:
-            mutations.append(mutation)
+    tracked = getattr(manifest, "mutations", None)
+    try:
+        for target in manifest.targets:
+            handlers = _PROVIDER_SCOPE_HANDLERS.get(target)
+            if handlers is None:
+                continue
+            mutation = handlers[0](manifest)
+            if mutation is not None:
+                mutations.append(mutation)
+                if tracked is not None and tracked is not mutations:
+                    tracked.append(mutation)
+    except Exception as exc:
+        rollback_errors: list[Exception] = []
+        for mutation in reversed(mutations):
+            try:
+                revert_provider_scope_mutation(manifest, mutation, restore_backup=False)
+
+            except Exception as rollback_exc:
+                rollback_errors.append(rollback_exc)
+            else:
+                if tracked is not None and mutation in tracked:
+                    tracked.remove(mutation)
+        if rollback_errors:
+            details = "; ".join(str(error) for error in rollback_errors)
+            raise RuntimeError(
+                f"provider mutation failed: {exc}; rollback failed: {details}"
+            ) from exc
+        raise
     return mutations
 
 
-def revert_provider_scope_mutation(manifest: DeploymentManifest, mutation: ManagedMutation) -> None:
+def revert_provider_scope_mutation(
+    manifest: DeploymentManifest,
+    mutation: ManagedMutation,
+    *,
+    restore_backup: bool = True,
+) -> None:
     """Revert a provider-scope mutation via the owning provider slice."""
     handlers = _PROVIDER_SCOPE_HANDLERS.get(mutation.target)
     if handlers is None:
         return
-    handlers[1](mutation, manifest)
+    if mutation.target == "opencode":
+        handlers[1](mutation, manifest, restore_backup=restore_backup)
+    else:
+        handlers[1](mutation, manifest)

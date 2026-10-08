@@ -46,6 +46,10 @@ CLIENT_UA_MAP: tuple[tuple[str, str], ...] = (
 
 
 CODEX_RESPONSES_PATH = "/v1/responses"
+CODEX_RESPONSES_PATHS: tuple[str, ...] = (
+    CODEX_RESPONSES_PATH,
+    "/v1/codex/responses",
+)
 
 
 @dataclass(frozen=True)
@@ -71,8 +75,15 @@ def classify_auth_signals(signals: AuthSignals) -> AuthMode:
             return AuthMode.SUBSCRIPTION
 
     auth = signals.authorization
-    if auth.startswith("Bearer "):
-        token = auth[len("Bearer ") :]
+    # The auth-scheme token ("Bearer") is case-insensitive per RFC 7235 §2.1,
+    # so a client sending `Authorization: bearer sk-...` must classify the same
+    # as `Bearer`. A case-sensitive `startswith("Bearer ")` sent such a request
+    # to the `elif auth:` (OAUTH) fallthrough, misclassifying a PAYG API key —
+    # which mis-routes compression policy and mislabels cost/TOIN auth_mode.
+    # Only the scheme is case-folded; the credential itself stays case-sensitive.
+    scheme, sep, credentials = auth.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        token = credentials
         if token.startswith("sk-ant-oat"):
             return AuthMode.OAUTH
         if token.startswith("sk-ant-api") or token.startswith("sk-"):
@@ -104,8 +115,8 @@ def classify_client_signals(signals: AuthSignals, *, default: str | None = None)
 
 
 def is_codex_responses_path(path: str) -> bool:
-    """Return True for the OpenAI Responses endpoint and its subpaths."""
-    return path == CODEX_RESPONSES_PATH or path.startswith(CODEX_RESPONSES_PATH + "/")
+    """Return True for OpenAI Responses endpoints and their subpaths."""
+    return any(root == path or path.startswith(root + "/") for root in CODEX_RESPONSES_PATHS)
 
 
 def should_stamp_codex_client_signals(path: str, signals: AuthSignals) -> bool:

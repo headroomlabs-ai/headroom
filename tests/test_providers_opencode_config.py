@@ -199,7 +199,10 @@ def test_inject_provider_config_creates_file(
     assert config["provider"]["headroom"]["npm"] == "@ai-sdk/openai-compatible"
     # Bare model ids: OpenCode resolves them as "headroom/<id>" (#1657).
     models = config["provider"]["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+    # The injected provider is OpenAI-compatible. Claude models must remain on
+    # OpenCode's native Anthropic provider so they are not sent to OpenAI.
+    assert not any(model_id.startswith("claude-") for model_id in models)
     assert all(not model_id.startswith("headroom/") for model_id in models)
     assert "mcp" not in config
     assert "model" not in config  # headroom provider is a transparent pass-through
@@ -213,6 +216,84 @@ def test_inject_provider_config_idempotent(tmp_path: Path, monkeypatch: pytest.M
     config_file = tmp_path / ".config" / "opencode" / "opencode.json"
     config = _parse_json_loose(config_file.read_text())
     assert config["provider"]["headroom"]["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
+
+
+def test_inject_provider_config_keeps_the_users_models_and_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A third-party upstream needs its own model ids and key under `headroom`.
+
+    OpenCode only resolves `headroom/<id>` for listed ids, so wiping the user's
+    entries made `wrap opencode --openai-api-url ...` unusable for DeepSeek.
+    """
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "npm": "something-else",
+                        "options": {
+                            "apiKey": "{env:DEEPSEEK_API_KEY}",
+                            "baseURL": "https://api.deepseek.com/v1",
+                        },
+                        "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                    },
+                    "anthropic": {"options": {"timeout": 5}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inject_opencode_provider_config(port=8787, keep_user_entries=True)
+    inject_opencode_provider_config(port=9999, keep_user_entries=True)
+
+    config = _parse_json_loose(config_file.read_text())
+    headroom = config["provider"]["headroom"]
+    # Headroom still owns how the provider reaches the proxy.
+    assert headroom["npm"] == "@ai-sdk/openai-compatible"
+    assert headroom["options"]["baseURL"] == "http://127.0.0.1:9999/v1"
+    # The user's key and model ids survive alongside Headroom's defaults.
+    assert headroom["options"]["apiKey"] == "{env:DEEPSEEK_API_KEY}"
+    assert set(headroom["models"]) == {"deepseek-chat", "gpt-4o", "gpt-4.1"}
+    assert headroom["models"]["deepseek-chat"] == {"name": "DeepSeek Chat"}
+    assert config["provider"]["anthropic"] == {"options": {"timeout": 5}}
+
+
+def test_inject_provider_config_drops_user_entries_without_an_explicit_upstream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a named upstream the proxy forwards to OpenAI, so a kept key would go there."""
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "npm": "something-else",
+                        "options": {
+                            "apiKey": "{env:DEEPSEEK_API_KEY}",
+                            "baseURL": "https://api.deepseek.com/v1",
+                        },
+                        "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                    },
+                    "anthropic": {"options": {"timeout": 5}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inject_opencode_provider_config(port=8787)
+
+    headroom = _parse_json_loose(config_file.read_text())["provider"]["headroom"]
+    assert "apiKey" not in headroom["options"]
+    assert set(headroom["models"]) == {"gpt-4o", "gpt-4.1"}
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +344,6 @@ def test_parse_json_loose_returns_empty_on_empty_string() -> None:
 def test_parse_json_loose_returns_empty_on_whitespace() -> None:
     """_parse_json_loose returns {} for whitespace-only input."""
     assert _parse_json_loose("   \n  \t  ") == {}
-
-
-def test_parse_json_loose_returns_empty_on_trailing_comma() -> None:
-    """_parse_json_loose returns {} for malformed JSON (trailing comma)."""
-    assert _parse_json_loose('{"model": "gpt-4o",}') == {}
 
 
 def test_parse_json_loose_returns_empty_on_unclosed_brace() -> None:
@@ -445,8 +521,9 @@ def test_build_opencode_config_content_without_mcp(
 ) -> None:
     from headroom.providers.opencode.runtime import build_opencode_config_content
 
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
+    plugin = tmp_path / "headroom-plugin"
+    plugin.mkdir()
+    (plugin / "index.js").write_text("export default {}", encoding="utf-8")
     monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     config = build_opencode_config_content(port=8787, include_mcp=False)
@@ -456,12 +533,14 @@ def test_build_opencode_config_content_without_mcp(
     providers = config["provider"]
     assert providers["anthropic"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     assert providers["openai"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
-    # The headroom provider exposes explicit models so "headroom/<id>" resolves (#1657).
+    # The headroom provider exposes only models supported by its
+    # OpenAI-compatible endpoint so "headroom/<id>" resolves safely (#1657).
     assert providers["headroom"]["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
     models = providers["headroom"]["models"]
-    assert "claude-sonnet-4-6" in models
+    assert set(models) == {"gpt-4o", "gpt-4.1"}
+    assert not any(model_id.startswith("claude-") for model_id in models)
     assert all(not model_id.startswith("headroom/") for model_id in models)
-    # The transport plugin is injected by absolute path (opencode loads it directly).
+    # The transport plugin directory is injected by absolute path (opencode loads it directly).
     assert config["plugin"] == [str(plugin)]
 
 
@@ -496,8 +575,9 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.delenv("HEADROOM_PROJECT", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    plugin = tmp_path / "entry.opencode.js"
-    plugin.write_text("export default () => {}", encoding="utf-8")
+    plugin = tmp_path / "headroom-plugin"
+    plugin.mkdir()
+    (plugin / "index.js").write_text("export default {}", encoding="utf-8")
     monkeypatch.setenv("HEADROOM_OPENCODE_PLUGIN_PATH", str(plugin))
 
     env, display = build_launch_env(
@@ -508,7 +588,9 @@ def test_build_launch_env_with_project(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert env["HEADROOM_PROJECT"] == "test-proj"
     # Plugin loaded → its proxy target is exported for self-configuration.
     assert env["HEADROOM_PROXY_URL"] == "http://127.0.0.1:8787"
-    assert str(plugin) in env["OPENCODE_CONFIG_CONTENT"]
+    # Compare the decoded entry: JSON escapes Windows backslashes, so the raw
+    # path is not a substring of the serialized text there.
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"])["plugin"] == [str(plugin)]
     assert f"plugin={HEADROOM_OPENCODE_PLUGIN}" in display
     assert "OPENAI_BASE_URL" not in env
     assert "ANTHROPIC_BASE_URL" not in env
@@ -553,3 +635,99 @@ def test_inject_provider_config_strips_existing_markers(
     second = config_file.read_text()
     assert "headroom" in second
     assert second.count("headroom") == first.count("headroom")
+
+
+# ---------------------------------------------------------------------------
+# OpenCode 2.x --standalone launch flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected"),
+    [
+        ("opencode v2.0.12\n", 0, 2),
+        ("1.18.32\n", 0, 1),
+        ("opencode v0.0.0-v2-202610061051\n", 0, 2),
+        ("0.0.0-dev-202610060234\n", 0, 0),
+        ("garbage\n", 0, None),
+        ("opencode v2.0.12\n", 1, None),
+    ],
+)
+def test_opencode_major_version_parses_both_cli_formats(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, expected: int | None
+) -> None:
+    import subprocess
+
+    import headroom.providers.opencode.runtime as oc_runtime
+
+    def fake_run(*args, **kwargs):  # noqa: ANN002, ANN003
+        return subprocess.CompletedProcess(args[0], returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(oc_runtime, "run", fake_run)
+    assert oc_runtime.opencode_major_version("opencode") == expected
+
+
+def test_opencode_major_version_missing_binary_is_unknown(tmp_path: Path) -> None:
+    from headroom.providers.opencode.runtime import opencode_major_version
+
+    assert opencode_major_version(str(tmp_path / "no-such-opencode")) is None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        ((), ("--standalone",)),
+        (("--continue",), ("--standalone", "--continue")),
+        (("run", "fix it"), ("run", "--standalone", "fix it")),
+        (("--print-logs", "mini"), ("--print-logs", "mini", "--standalone")),
+        (("models",), ("models",)),
+        (("auth", "list"), ("auth", "list")),
+        (("--session", "models"), ("--standalone", "--session", "models")),
+        (("--prompt", "models", "extra"), ("--standalone", "--prompt", "models", "extra")),
+        (("-s", "stats"), ("--standalone", "-s", "stats")),
+        (("run", "--agent", "models"), ("run", "--standalone", "--agent", "models")),
+        (("--standalone",), ("--standalone",)),
+        (
+            ("run", "--server", "http://127.0.0.1:4096", "x"),
+            ("run", "--server", "http://127.0.0.1:4096", "x"),
+        ),
+        (("--server=http://127.0.0.1:4096",), ("--server=http://127.0.0.1:4096",)),
+    ],
+)
+def test_with_opencode_standalone_on_v2(args: tuple[str, ...], expected: tuple[str, ...]) -> None:
+    from headroom.providers.opencode.runtime import with_opencode_standalone
+
+    assert with_opencode_standalone(args, 2) == expected
+
+
+@pytest.mark.parametrize("major", [1, None])
+def test_with_opencode_standalone_leaves_v1_and_unknown_alone(major: int | None) -> None:
+    from headroom.providers.opencode.runtime import with_opencode_standalone
+
+    assert with_opencode_standalone(("run", "fix it"), major) == ("run", "fix it")
+
+
+@pytest.mark.parametrize("conflict", ["canonical", "sibling"])
+def test_jsonc_migration_treats_dangling_conflict_as_ambiguous(
+    tmp_path: Path, conflict: str
+) -> None:
+    from headroom.providers.opencode.config import migrate_legacy_opencode_jsonc_backup
+
+    config = tmp_path / "opencode.jsonc"
+    canonical = config.with_name(config.name + ".headroom-backup")
+    legacy = config.with_suffix(".json.headroom-backup")
+    original = b'{"theme":"unrelated legacy"}\n'
+    legacy.write_bytes(original)
+    conflicting_path = canonical if conflict == "canonical" else config.with_suffix(".json")
+    try:
+        conflicting_path.symlink_to(tmp_path / "missing-target")
+    except OSError:
+        pytest.skip("creating symlinks requires platform permissions")
+
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert conflicting_path.is_symlink()
+    assert legacy.read_bytes() == original
+    conflicting_path.unlink()
+    migrate_legacy_opencode_jsonc_backup(config, canonical)
+    assert not canonical.exists()
+    assert legacy.read_bytes() == original

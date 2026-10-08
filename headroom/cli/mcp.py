@@ -139,9 +139,9 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
     \b
     By default this installs into every agent that has a registrar and is
-    detected on this system (Claude Code today; Cursor / Codex / Continue /
-    others added in subsequent releases). Pass ``--agent NAME`` one or more
-    times to restrict the installation.
+    detected on this system (Antigravity IDE, Claude Code, Codex, Grok CLI,
+    OpenCode today; Cursor / Continue / others added in subsequent releases).
+    Pass ``--agent NAME`` one or more times to restrict the installation.
 
     \b
     Examples:
@@ -188,18 +188,38 @@ def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
 
 
 @mcp.command("uninstall")
-def mcp_uninstall() -> None:
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    help="Restrict uninstallation to specific agents (default: every detected agent).",
+)
+def mcp_uninstall(agents: tuple[str, ...]) -> None:
     """Remove Headroom MCP server from detected agent configs.
 
     \b
     Removes headroom from every agent registrar known to Headroom. Other MCP
-    servers are preserved.
+    servers are preserved. Pass ``--agent NAME`` one or more times to restrict
+    the uninstallation.
+
+    \b
+    Examples:
+        headroom mcp uninstall                       # every detected agent
+        headroom mcp uninstall --agent antigravity   # Antigravity IDE only
     """
     from headroom.mcp_registry import get_all_registrars
 
+    registrars = get_all_registrars()
+    if agents:
+        wanted = {agent.strip().lower() for agent in agents if agent.strip()}
+        registrars = [registrar for registrar in registrars if registrar.name in wanted]
+        if not registrars:
+            click.echo("No agents matched the requested filter.")
+            raise SystemExit(1)
+
     removed = False
 
-    for registrar in get_all_registrars():
+    for registrar in registrars:
         if not registrar.detect():
             continue
         removed_names: list[str] = []
@@ -214,6 +234,64 @@ def mcp_uninstall() -> None:
 
     if not removed:
         click.echo("Headroom MCP is not configured. Nothing to uninstall.")
+
+
+@mcp.command("reconcile")
+@click.option("--adopt", is_flag=True, help="Replace only the Serena entry with Headroom's spec.")
+def mcp_reconcile(adopt: bool) -> None:
+    """Inspect or explicitly reconcile a user-managed Serena MCP entry."""
+    from headroom.mcp_registry import (
+        CLAUDE_SERENA_CONTEXT,
+        ClaudeConfigMutationError,
+        ClaudeRegistrar,
+        RegisterStatus,
+        build_serena_spec,
+    )
+    from headroom.mcp_registry.ledger import (
+        LedgerMutationError,
+        record_install,
+        validate_ledger_for_mutation,
+    )
+
+    registrar = ClaudeRegistrar()
+    if not registrar.detect():
+        raise click.ClickException("claude is not detected")
+    recommended = build_serena_spec(CLAUDE_SERENA_CONTEXT)
+    observed = registrar.get_server("serena")
+
+    if adopt:
+        try:
+            registrar.validate_configs_for_mutation()
+            validate_ledger_for_mutation()
+        except (ClaudeConfigMutationError, LedgerMutationError) as exc:
+            raise click.ClickException(str(exc)) from exc
+    if adopt:
+        result = registrar.register_server(recommended, force=True)
+        if result.status not in (RegisterStatus.REGISTERED, RegisterStatus.ALREADY):
+            raise click.ClickException(result.detail or "could not adopt Serena configuration")
+        record_install("claude", recommended)
+        click.echo(
+            "Adopted Headroom's Serena configuration for Claude; unrelated config preserved."
+        )
+        return
+
+    click.echo("Serena reconciliation for Claude")
+    click.echo(f"  observed: {'absent' if observed is None else 'present'}")
+    click.echo(f"  recommendation: {recommended.command} {' '.join(recommended.args)}")
+    if observed is not None and observed != recommended:
+        click.echo("  action: use --adopt to replace it")
+    # A Serena bundled by an enabled Claude Code plugin runs alongside the
+    # entry above (``claude mcp list`` shows it as ``plugin:serena:serena``)
+    # with none of Headroom's flags. It is a third-party plugin, so it is
+    # never removed here — point at the command that disables it (#3570).
+    for plugin_id, spec in registrar.get_plugin_servers("serena"):
+        click.echo(
+            f"  plugin: {plugin_id} also provides a Serena MCP server "
+            f"({spec.command} {' '.join(spec.args)})"
+        )
+        click.echo(
+            f"  action: disable it so only one Serena runs: claude plugin disable {plugin_id}"
+        )
 
 
 @mcp.command("status")

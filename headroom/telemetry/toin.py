@@ -97,31 +97,56 @@ DEFAULT_MODEL_FAMILY: Final[str] = "unknown"
 # environment; this is the production default the Rust proxy expects.
 DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH: Final[int] = 50
 
+# TOIN is a diagnostic learning store, not an archive. Keep its default
+# footprint bounded so a long-lived proxy cannot turn observations into an
+# unbounded memory/disk liability.
+DEFAULT_MAX_PATTERNS: Final[int] = 10_000
+DEFAULT_MAX_STORAGE_BYTES: Final[int] = 128 * 1024 * 1024
+MAX_QUERY_PATTERN_LENGTH: Final[int] = 512
+
 # Aggregation-key serialization separator. Used to encode the
-# `(auth_mode, model_family, sig_hash)` tuple as a string for JSON
-# storage (JSON object keys must be strings) and for cross-instance
-# pattern imports. Pipe is illegal in all three components by
-# construction (auth_mode ∈ {"unknown","payg","oauth","subscription"};
-# model_family is a registry name with no `|`; sig_hash is hex).
+# `(tenant_key, auth_mode, model_family, sig_hash)` tuple as a string
+# for JSON storage (JSON object keys must be strings) and for
+# cross-instance pattern imports. Pipe is illegal in all four
+# components by construction (tenant_key is sanitized to ASCII alphanum
+# + `-_` by `headroom.proxy.tenant_key`; auth_mode ∈
+# {"unknown","payg","oauth","subscription"}; model_family is a registry
+# name with no `|`; sig_hash is hex).
 _AGG_KEY_SEPARATOR: Final[str] = "|"
+
+# ── Tenant-key default (PR-F3) ──────────────────────────────────────────
+# When callers haven't plumbed real tenant-id detection (CLI / batch
+# jobs / unauthenticated dev) we land in the literal `"global"` slice.
+# Imported from `headroom.proxy.tenant_key` so there's a single source
+# of truth — but kept locally as a string default to avoid an
+# import-time cycle with the proxy package (TOIN ships in environments
+# without the proxy module). Using the same literal `"global"` string
+# both modules canonicalize on.
+DEFAULT_TENANT_KEY: Final[str] = "global"
 
 
 # ── Aggregation key helpers ─────────────────────────────────────────────
-PatternKey = tuple[str, str, str]
+PatternKey = tuple[str, str, str, str]
 
 
 def _make_pattern_key(
     auth_mode: str | None,
     model_family: str | None,
     sig_hash: str,
+    tenant_key: str | None = None,
 ) -> PatternKey:
-    """Build the canonical `(auth_mode, model_family, sig_hash)` key.
+    """Build the canonical `(tenant_key, auth_mode, model_family, sig_hash)` key.
 
-    Defaults populate to `DEFAULT_AUTH_MODE` / `DEFAULT_MODEL_FAMILY`
-    when callers haven't supplied a value — keeps callers terse during
-    the Phase B realignment while PR-F3 wires real detectors.
+    Defaults populate to `DEFAULT_TENANT_KEY` / `DEFAULT_AUTH_MODE` /
+    `DEFAULT_MODEL_FAMILY` when callers haven't supplied a value.
+    PR-F3 introduced the leading `tenant_key` slot so two distinct
+    tenants don't cross-pollinate compression patterns; pre-F3 callers
+    that pass no tenant_key land in the literal `"global"` namespace
+    (which is also where the pre-F3 patterns migrate to on first load
+    via the legacy 3-tuple fallback in `_deserialize_pattern_key`).
     """
     return (
+        tenant_key or DEFAULT_TENANT_KEY,
         auth_mode or DEFAULT_AUTH_MODE,
         model_family or DEFAULT_MODEL_FAMILY,
         sig_hash,
@@ -136,17 +161,26 @@ def _serialize_pattern_key(key: PatternKey) -> str:
 def _deserialize_pattern_key(serialized: str) -> PatternKey:
     """Parse a serialized aggregation key back to a tuple.
 
-    Backward-compatible with pre-B5 dumps that stored keys as bare
-    structure hashes (no separator): those parse as
-    `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)`. The realignment
-    plan permits wiping the on-disk store, but this fallback keeps reads
-    safe if a stale file appears in the wild.
+    Backward-compat tiers:
+
+    - 4 parts → PR-F3 native ``(tenant_key, auth_mode, model_family, sig_hash)``.
+    - 3 parts → pre-F3 ``(auth_mode, model_family, sig_hash)`` from PR-B5
+      dumps; promoted to the ``DEFAULT_TENANT_KEY`` (``"global"``) slice.
+    - Otherwise (1 part, no separator) → legacy pre-B5 bare ``sig_hash``;
+      promoted to ``(DEFAULT_TENANT_KEY, DEFAULT_AUTH_MODE,
+      DEFAULT_MODEL_FAMILY, sig_hash)``.
+
+    The realignment plan permits wiping the on-disk store, but these
+    fallbacks keep reads safe if a stale file appears in the wild.
     """
     parts = serialized.split(_AGG_KEY_SEPARATOR)
+    if len(parts) == 4:
+        return (parts[0], parts[1], parts[2], parts[3])
     if len(parts) == 3:
-        return (parts[0], parts[1], parts[2])
-    # Legacy format: bare sig_hash. Promote to default tenant slice.
-    return (DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, serialized)
+        # Pre-F3 format: prepend the global tenant slice.
+        return (DEFAULT_TENANT_KEY, parts[0], parts[1], parts[2])
+    # Legacy format: bare sig_hash. Promote to default tenant + default slice.
+    return (DEFAULT_TENANT_KEY, DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, serialized)
 
 
 def get_default_toin_storage_path() -> str:
@@ -177,6 +211,27 @@ def get_default_toin_storage_path() -> str:
 MetricsCallback = Callable[[str, dict[str, Any]], None]  # (event_name, event_data) -> None
 
 
+def _get_current_tenant_key_or_default() -> str:
+    """Read the request-scoped tenant_key, falling back to ``"global"``.
+
+    Imported lazily so the proxy package is not a hard dependency of
+    TOIN — when ``headroom.proxy.tenant_key`` is unavailable (CLI / batch
+    / stripped builds) we land in the ``DEFAULT_TENANT_KEY`` namespace,
+    which is the same place the proxy handler routes
+    no-signal-detected requests to. Either path is correctly aggregated
+    under ``"global"``; there is no silent fallback because the proxy's
+    resolver always emits a structured log on resolution.
+
+    See PR-F3 for the full threat model.
+    """
+    try:
+        from headroom.proxy.tenant_key import get_current_tenant_key
+
+        return get_current_tenant_key()
+    except ImportError:
+        return DEFAULT_TENANT_KEY
+
+
 @dataclass
 class ToolPattern:
     """Aggregated intelligence about a tool type across all users.
@@ -187,12 +242,17 @@ class ToolPattern:
 
     tool_signature_hash: str
 
-    # === Aggregation Key (PR-B5) ===
+    # === Aggregation Key (PR-B5 + PR-F3) ===
     # Per-tenant aggregation key extension. The Pattern is keyed inside
-    # the TOIN store by `(auth_mode, model_family, tool_signature_hash)` —
-    # these two fields carry the same values onto the dataclass so dumps,
-    # imports, and publish-CLI rows are self-describing without
-    # cross-referencing the dict key.
+    # the TOIN store by `(tenant_key, auth_mode, model_family,
+    # tool_signature_hash)` — these three fields carry the same values
+    # onto the dataclass so dumps, imports, and publish-CLI rows are
+    # self-describing without cross-referencing the dict key.
+    #
+    # PR-F3 added `tenant_key` so two tenants on the same proxy don't
+    # cross-pollinate compression patterns. Defaults to `"global"`
+    # (the literal namespace pre-F3 patterns live in after migration).
+    tenant_key: str = DEFAULT_TENANT_KEY
     auth_mode: str = DEFAULT_AUTH_MODE
     model_family: str = DEFAULT_MODEL_FAMILY
 
@@ -280,6 +340,7 @@ class ToolPattern:
         """Convert to dictionary for serialization."""
         return {
             "tool_signature_hash": self.tool_signature_hash,
+            "tenant_key": self.tenant_key,
             "auth_mode": self.auth_mode,
             "model_family": self.model_family,
             "total_compressions": self.total_compressions,
@@ -325,6 +386,7 @@ class ToolPattern:
         # Filter to only valid fields
         valid_fields = {
             "tool_signature_hash",
+            "tenant_key",
             "auth_mode",
             "model_family",
             "total_compressions",
@@ -391,6 +453,8 @@ class TOINConfig:
     # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
     storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
+    max_patterns: int = DEFAULT_MAX_PATTERNS
+    max_storage_bytes: int = DEFAULT_MAX_STORAGE_BYTES
 
     # Network learning thresholds
     min_samples_for_recommendation: int = 10
@@ -451,8 +515,18 @@ class ToolIntelligenceNetwork:
         # Storage backend
         if backend is not None:
             self._backend = backend
+        elif toin_backend_disabled():
+            # HEADROOM_TOIN_BACKEND=none means in-memory-only, so it has to win
+            # over storage_path. Deciding this from the factory's return value
+            # cannot work: it returns None both for "no backend configured" and
+            # for "explicitly disabled", and the default storage_path is never
+            # empty, so "none" silently reinstated the filesystem backend.
+            self._backend = None
         elif self._config.storage_path:
-            self._backend = FileSystemTOINBackend(self._config.storage_path)
+            self._backend = FileSystemTOINBackend(
+                self._config.storage_path,
+                max_load_bytes=self._config.max_storage_bytes,
+            )
         else:
             self._backend = None
 
@@ -530,11 +604,13 @@ class ToolIntelligenceNetwork:
         items: list[dict[str, Any]] | None = None,
         auth_mode: str | None = None,
         model_family: str | None = None,
+        tenant_key: str | None = None,
     ) -> None:
         """Record a compression event.
 
         Called after SmartCrusher compresses data. Updates the pattern
-        for this `(auth_mode, model_family, tool_signature)` slice.
+        for this `(tenant_key, auth_mode, model_family, tool_signature)`
+        slice.
 
         TOIN Evolution: When items are provided, we capture field statistics
         for learning semantic types (uniqueness, default values, etc.).
@@ -552,7 +628,29 @@ class ToolIntelligenceNetwork:
                 Defaults to `DEFAULT_AUTH_MODE` when not provided.
             model_family: Target model family (`claude-3-5`, `gpt-4o`, …).
                 Defaults to `DEFAULT_MODEL_FAMILY` when not provided.
+            tenant_key: PR-F3 per-tenant aggregation slice. When ``None``,
+                reads from the request-scoped ``ContextVar`` populated by
+                the proxy handler (see ``headroom.proxy.tenant_key``);
+                CLI / batch / test callers without a contextvar land in
+                the literal ``"global"`` namespace.
         """
+        # The beacon's copy of this event is taken BEFORE the enabled check.
+        # TOIN's own store is gated on HEADROOM_TELEMETRY, which is opt-in and
+        # therefore off across almost the whole fleet -- so recording after the
+        # gate would mean the network in "Tool Output Intelligence Network"
+        # only ever sees the installs that least need it.
+        #
+        # Costs nothing extra: `tool_signature` was already built by the
+        # caller, and `record_tool_shape` reads a handful of its integer
+        # attributes and no hash at all. Off by default and never raises, like
+        # every other beacon entry point.
+        try:
+            from headroom.telemetry.session import record_tool_shape
+
+            record_tool_shape(tool_signature, original_tokens, compressed_tokens)
+        except Exception:  # pragma: no cover - telemetry must never break a request
+            logger.debug("beacon: tool shape recording failed", exc_info=True)
+
         # HIGH FIX: Check enabled FIRST to avoid computing structure_hash if disabled
         # This saves CPU when TOIN is turned off
         if not self._config.enabled:
@@ -560,15 +658,22 @@ class ToolIntelligenceNetwork:
 
         # Computing structure_hash can be expensive for large structures
         sig_hash = tool_signature.structure_hash
-        key = _make_pattern_key(auth_mode, model_family, sig_hash)
+        # PR-F3: read tenant_key from the request-scoped ContextVar when
+        # the caller didn't pass one explicitly. Imported lazily so TOIN
+        # remains usable in environments where the proxy package is not
+        # installed (CLI batch jobs, tests).
+        if tenant_key is None:
+            tenant_key = _get_current_tenant_key_or_default()
+        key = _make_pattern_key(auth_mode, model_family, sig_hash, tenant_key)
 
         # LOW FIX #22: Emit compression metric
         self._emit_metric(
             "toin.compression",
             {
                 "signature_hash": sig_hash,
-                "auth_mode": key[0],
-                "model_family": key[1],
+                "tenant_key": key[0],
+                "auth_mode": key[1],
+                "model_family": key[2],
                 "original_count": original_count,
                 "compressed_count": compressed_count,
                 "original_tokens": original_tokens,
@@ -583,8 +688,9 @@ class ToolIntelligenceNetwork:
             if key not in self._patterns:
                 self._patterns[key] = ToolPattern(
                     tool_signature_hash=sig_hash,
-                    auth_mode=key[0],
-                    model_family=key[1],
+                    tenant_key=key[0],
+                    auth_mode=key[1],
+                    model_family=key[2],
                 )
 
             pattern = self._patterns[key]
@@ -696,6 +802,7 @@ class ToolIntelligenceNetwork:
             pattern.last_updated = time.time()
             pattern.confidence = self._calculate_confidence(pattern)
             self._dirty = True
+            self._prune_patterns_locked()
 
         # Auto-save if needed (outside lock)
         self._maybe_auto_save()
@@ -775,6 +882,59 @@ class ToolIntelligenceNetwork:
             )[:100]
             pattern.field_semantics = dict(sorted_fields)
 
+    def _prune_patterns_locked(self) -> None:
+        """Bound the pattern table, evicting least-useful observations first.
+
+        The lock must be held by the caller. Patterns below the publish
+        threshold are disposable learning noise; within each class, oldest
+        observations are evicted first. If every pattern is mature, oldest
+        wins, keeping the table bounded without silently preferring a tenant.
+        """
+        limit = max(1, self._config.max_patterns)
+        if len(self._patterns) <= limit:
+            return
+
+        excess = len(self._patterns) - limit
+        evict = sorted(
+            self._patterns,
+            key=lambda key: (
+                self._patterns[key].sample_size >= DEFAULT_MIN_OBSERVATIONS_TO_PUBLISH,
+                self._patterns[key].last_updated,
+            ),
+        )[:excess]
+        for key in evict:
+            del self._patterns[key]
+
+        logger.info(
+            "TOIN pattern table pruned",
+            extra={
+                "event": "toin_patterns_pruned",
+                "evicted": excess,
+                "remaining": len(self._patterns),
+            },
+        )
+
+    def _sanitize_loaded_pattern(self, pattern: ToolPattern) -> bool:
+        """Remove legacy raw query keys from a loaded pattern."""
+        import re
+
+        safe_pattern = re.compile(r"(?:\w+:\*)(?:\s+\w+:\*)*")
+        changed = False
+        frequencies: dict[str, int] = {}
+        for raw_key, count in pattern.query_pattern_frequency.items():
+            if safe_pattern.fullmatch(raw_key) and len(raw_key) <= MAX_QUERY_PATTERN_LENGTH:
+                frequencies[raw_key] = max(0, int(count))
+            else:
+                changed = True
+        if frequencies != pattern.query_pattern_frequency:
+            changed = True
+            pattern.query_pattern_frequency = frequencies
+        safe_common = [key for key in pattern.common_query_patterns if key in frequencies]
+        if safe_common != pattern.common_query_patterns:
+            changed = True
+            pattern.common_query_patterns = safe_common[: self._config.max_query_patterns]
+        return changed
+
     def record_retrieval(
         self,
         tool_signature_hash: str,
@@ -785,6 +945,7 @@ class ToolIntelligenceNetwork:
         retrieved_items: list[dict[str, Any]] | None = None,
         auth_mode: str | None = None,
         model_family: str | None = None,
+        tenant_key: str | None = None,
     ) -> None:
         """Record a retrieval event.
 
@@ -803,19 +964,25 @@ class ToolIntelligenceNetwork:
             retrieved_items: Optional list of retrieved items for field-level learning.
             auth_mode: Tenant auth slice. Defaults to `DEFAULT_AUTH_MODE`.
             model_family: Target model family. Defaults to `DEFAULT_MODEL_FAMILY`.
+            tenant_key: PR-F3 per-tenant aggregation slice. When ``None``,
+                reads from the request-scoped ``ContextVar`` populated by
+                the proxy handler.
         """
         if not self._config.enabled:
             return
 
-        key = _make_pattern_key(auth_mode, model_family, tool_signature_hash)
+        if tenant_key is None:
+            tenant_key = _get_current_tenant_key_or_default()
+        key = _make_pattern_key(auth_mode, model_family, tool_signature_hash, tenant_key)
 
         # LOW FIX #22: Emit retrieval metric
         self._emit_metric(
             "toin.retrieval",
             {
                 "signature_hash": tool_signature_hash,
-                "auth_mode": key[0],
-                "model_family": key[1],
+                "tenant_key": key[0],
+                "auth_mode": key[1],
+                "model_family": key[2],
                 "retrieval_type": retrieval_type,
                 "has_query": query is not None,
                 "query_fields_count": len(query_fields) if query_fields else 0,
@@ -828,8 +995,9 @@ class ToolIntelligenceNetwork:
                 # First time seeing this tool via retrieval
                 self._patterns[key] = ToolPattern(
                     tool_signature_hash=tool_signature_hash,
-                    auth_mode=key[0],
-                    model_family=key[1],
+                    tenant_key=key[0],
+                    auth_mode=key[1],
+                    model_family=key[2],
                 )
 
             pattern = self._patterns[key]
@@ -949,6 +1117,7 @@ class ToolIntelligenceNetwork:
 
             pattern.last_updated = time.time()
             self._dirty = True
+            self._prune_patterns_locked()
 
         self._maybe_auto_save()
 
@@ -1050,14 +1219,22 @@ class ToolIntelligenceNetwork:
         if not query:
             return None
 
-        # Simple pattern extraction: replace values after : or =
+        # Only retain structured field/value predicates. Returning an
+        # unchanged free-form prompt here would persist the prompt verbatim,
+        # violating TOIN's privacy contract (and can produce multi-MB keys).
         import re
 
         # Match field:value or field="value" patterns, but don't include spaces in unquoted values
-        pattern = re.sub(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', r"\1:*", query)
+        matches = re.findall(r'(\w+)[=:](?:"[^"]*"|\'[^\']*\'|\w+)', query)
+        if not matches:
+            return None
+
+        # Preserve useful field shape while dropping operators, values, and
+        # all unrelated text (which may contain arbitrary prompt data).
+        pattern = " ".join(f"{field}:*" for field in matches)
 
         # Remove if it's just generic
-        if pattern in ("*", ""):
+        if not pattern or len(pattern) > MAX_QUERY_PATTERN_LENGTH:
             return None
 
         return pattern
@@ -1144,18 +1321,23 @@ class ToolIntelligenceNetwork:
         signature_hash: str,
         auth_mode: str | None = None,
         model_family: str | None = None,
+        tenant_key: str | None = None,
     ) -> ToolPattern | None:
-        """Get pattern data for a specific `(auth_mode, model_family, sig_hash)` slice.
+        """Get pattern data for a specific
+        `(tenant_key, auth_mode, model_family, sig_hash)` slice.
 
-        Defaults to `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, signature_hash)`
-        when callers haven't supplied tenant info — preserves source-compat
-        with pre-B5 callers that look up by bare hash.
+        Defaults to `(DEFAULT_TENANT_KEY, DEFAULT_AUTH_MODE,
+        DEFAULT_MODEL_FAMILY, signature_hash)` when callers haven't
+        supplied tenant info — preserves source-compat with pre-B5
+        callers that look up by bare hash.
 
         HIGH FIX: Returns a deep copy to prevent external mutation of internal state.
         """
         import copy
 
-        key = _make_pattern_key(auth_mode, model_family, signature_hash)
+        if tenant_key is None:
+            tenant_key = _get_current_tenant_key_or_default()
+        key = _make_pattern_key(auth_mode, model_family, signature_hash, tenant_key)
 
         with self._lock:
             pattern = self._patterns.get(key)
@@ -1199,10 +1381,16 @@ class ToolIntelligenceNetwork:
         Used for federated learning: aggregate patterns from multiple
         Headroom instances without sharing actual data.
 
-        Backward-compatible with v1.0 dumps that keyed patterns by bare
-        structure_hash: those are promoted to the
-        `(DEFAULT_AUTH_MODE, DEFAULT_MODEL_FAMILY, sig_hash)` slice via
-        `_deserialize_pattern_key`.
+        Backward-compatible with two pre-F3 formats:
+
+        - v1.0 dumps that keyed patterns by bare ``sig_hash``: promoted
+          to ``(DEFAULT_TENANT_KEY, DEFAULT_AUTH_MODE,
+          DEFAULT_MODEL_FAMILY, sig_hash)``.
+        - v2.0 / pre-F3 dumps that used the 3-tuple
+          ``(auth_mode, model_family, sig_hash)`` key: promoted to the
+          ``DEFAULT_TENANT_KEY`` (``"global"``) slice.
+
+        See ``_deserialize_pattern_key`` for the parsing tiers.
 
         Args:
             data: Exported pattern data.
@@ -1217,11 +1405,14 @@ class ToolIntelligenceNetwork:
             for serialized_key, pattern_dict in patterns_data.items():
                 key = _deserialize_pattern_key(serialized_key)
                 imported = ToolPattern.from_dict(pattern_dict)
-                # Make sure dataclass fields agree with the dict key — pre-B5
-                # dumps don't carry auth_mode/model_family on the pattern;
-                # promote from the (possibly default) key.
-                imported.auth_mode = key[0]
-                imported.model_family = key[1]
+                self._sanitize_loaded_pattern(imported)
+                # Make sure dataclass fields agree with the dict key — pre-F3
+                # dumps don't carry tenant_key on the pattern, and pre-B5
+                # dumps don't carry auth_mode/model_family either; promote
+                # from the (possibly default) key.
+                imported.tenant_key = key[0]
+                imported.auth_mode = key[1]
+                imported.model_family = key[2]
 
                 if key in self._patterns:
                     # Merge with existing
@@ -1241,6 +1432,7 @@ class ToolIntelligenceNetwork:
                             # CRITICAL: Always increment user_count (even after cap)
                             pattern.user_count += 1
 
+            self._prune_patterns_locked()
             self._dirty = True
 
     def _merge_patterns(self, existing: ToolPattern, imported: ToolPattern) -> None:
@@ -1472,7 +1664,15 @@ class ToolIntelligenceNetwork:
             data = self._backend.load()
             if data:
                 self.import_patterns(data)
-                self._dirty = False
+                with self._lock:
+                    changed = any(
+                        self._sanitize_loaded_pattern(pattern)
+                        for pattern in self._patterns.values()
+                    )
+                    before = len(self._patterns)
+                    self._prune_patterns_locked()
+                    changed = changed or len(self._patterns) != before
+                    self._dirty = changed
         except Exception as e:
             logger.warning(
                 "TOIN storage load failed",
@@ -1520,6 +1720,17 @@ _toin_lock = threading.Lock()
 TOIN_BACKEND_ENV_VAR = "HEADROOM_TOIN_BACKEND"
 
 
+def toin_backend_disabled() -> bool:
+    """True when ``HEADROOM_TOIN_BACKEND=none`` asks for in-memory-only TOIN.
+
+    Kept separate from :func:`_create_default_toin_backend` because that
+    function communicates only through its return value, and ``None`` there
+    already means "no explicit backend, fall back to the default". The two
+    cases need to be distinguishable.
+    """
+    return (os.environ.get(TOIN_BACKEND_ENV_VAR) or "").strip().lower() == "none"
+
+
 def _create_default_toin_backend() -> Any:
     """Create a TOIN backend from env (e.g. HEADROOM_TOIN_BACKEND=redis).
 
@@ -1530,7 +1741,9 @@ def _create_default_toin_backend() -> Any:
     if not backend_type or backend_type == "filesystem":
         return None
     if backend_type == "none":
-        return None  # Explicit in-memory-only (e.g. --stateless mode)
+        # Handled by toin_backend_disabled() in ToolIntelligenceNetwork.__init__,
+        # which is the only place that can tell "disabled" from "use the default".
+        return None
     try:
         from importlib.metadata import entry_points
 
@@ -1547,9 +1760,9 @@ def _create_default_toin_backend() -> Any:
         # `tenant_prefix` is retained for storage-backend namespacing
         # (Redis key prefix, Postgres schema name, etc.) so multi-tenant
         # SaaS deployments can carve up shared infrastructure. PR-B5 made
-        # the in-memory aggregation key per-tenant via `auth_mode` /
-        # `model_family`, so `tenant_prefix` is now functionally redundant
-        # for *learning* — it only matters for storage layout. Keep it.
+        # the in-memory aggregation key per tenant via `tenant_key`, so
+        # `tenant_prefix` is now functionally redundant for *learning* —
+        # it only matters for storage layout. Keep it.
         kwargs = {
             "url": os.environ.get("HEADROOM_TOIN_URL", ""),
             "tenant_prefix": os.environ.get("HEADROOM_TOIN_TENANT_PREFIX", ""),

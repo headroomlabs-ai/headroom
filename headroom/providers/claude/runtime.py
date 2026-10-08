@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from urllib.parse import urlparse
@@ -15,8 +16,31 @@ DEFAULT_API_URL = "https://api.anthropic.com"
 # single source of truth shared by `wrap`, `init`, and `install`.
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 TOOL_SEARCH_DEFAULT = "true"
+TOOL_SEARCH_FOUNDRY_DEFAULT = "false"
 REMOTE_CONTROL_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 REMOTE_CONTROL_FEATURE = "Remote Control"
+CLAUDE_AUTH_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+# Claude Code requests the 1M context tier when its client-owned model setting
+# carries this suffix. Keep the selector in the Claude provider runtime so the
+# standalone wrapper and the VS Code settings path use identical fallback and
+# idempotence rules.
+CONTEXT_1M_SUFFIX = "[1m]"
+HEADROOM_1M_MODEL_ENV = "HEADROOM_1M_MODEL"
+DEFAULT_1M_MODEL = "claude-opus-5"
+
+
+def resolve_1m_model(current: str | None) -> str:
+    """Return the selected model with exactly one Claude 1M suffix.
+
+    An explicit model wins over the configurable fallback. Blank values use
+    ``HEADROOM_1M_MODEL`` and then the built-in default. Existing suffixes are
+    preserved so repeated setup is idempotent.
+    """
+    fallback = (os.environ.get(HEADROOM_1M_MODEL_ENV) or "").strip() or DEFAULT_1M_MODEL
+    base = (current or "").strip() or fallback
+    return base if base.endswith(CONTEXT_1M_SUFFIX) else f"{base}{CONTEXT_1M_SUFFIX}"
+
 
 # GH #1779: Claude Code v2.1.196 added a client-side eligibility check that
 # DISABLES first-party Remote Control (`/remote-control` / `/rc`, which mirrors a
@@ -135,6 +159,24 @@ def remote_control_gate_message(source: str, *, version: tuple[int, int, int] | 
     )
 
 
+def remote_control_gate_short_message(*, version: tuple[int, int, int] | None = None) -> str:
+    """One-line Remote Control notice for the default ``wrap claude`` banner (#3426).
+
+    Same accuracy rule as :func:`remote_control_gate_message` (issue #1779):
+    with a known gated version state the disable as fact; with an unknown
+    version name the threshold rather than assert the user's build.
+    """
+    scope = (
+        ""
+        if version is not None and version >= REMOTE_CONTROL_GATED_MIN_VERSION
+        else f" on Claude Code {_version_str(REMOTE_CONTROL_GATED_MIN_VERSION)}+"
+    )
+    return (
+        f"{REMOTE_CONTROL_FEATURE} (/rc) is disabled{scope} while routed through "
+        "Headroom — run `claude` directly (no wrap) for sessions that need it."
+    )
+
+
 def is_custom_anthropic_base_url(value: str | None) -> bool:
     """Return whether ANTHROPIC_BASE_URL is custom from Claude's Remote Control gate view.
 
@@ -182,6 +224,46 @@ def remote_control_applies_to_auth(environ: Mapping[str, object]) -> bool:
     """
     return not any(
         str(environ.get(key) or "").strip() for key in REMOTE_CONTROL_NON_SUBSCRIPTION_ENV
+    )
+
+
+def claude_auth_conflict_sources(
+    *layers: tuple[str, Mapping[str, object]],
+) -> dict[str, str] | None:
+    """Return source labels when both mutually exclusive Claude auth keys are effective.
+
+    Layers are ordered from lowest to highest precedence. Empty values clear an
+    inherited value, matching environment overlay semantics. Credential values
+    are deliberately never returned so callers cannot leak them in diagnostics.
+    """
+    effective: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for source, values in layers:
+        for key in CLAUDE_AUTH_KEYS:
+            if key not in values:
+                continue
+            value = str(values.get(key) or "").strip()
+            if value:
+                effective[key] = value
+                sources[key] = source
+            else:
+                effective.pop(key, None)
+                sources.pop(key, None)
+    if all(key in effective for key in CLAUDE_AUTH_KEYS):
+        return {key: sources[key] for key in CLAUDE_AUTH_KEYS}
+    return None
+
+
+def claude_auth_conflict_message(sources: Mapping[str, str]) -> str:
+    """Format a value-free remediation for contradictory Claude credentials."""
+    api_source = sources.get("ANTHROPIC_API_KEY", "effective configuration")
+    token_source = sources.get("ANTHROPIC_AUTH_TOKEN", "effective configuration")
+    return (
+        "Claude Code has both ANTHROPIC_API_KEY "
+        f"({api_source}) and ANTHROPIC_AUTH_TOKEN ({token_source}) set. "
+        "Claude rejects this ambiguous auth state before Headroom can proxy a request. "
+        "Keep ANTHROPIC_API_KEY for API-key billing, or keep ANTHROPIC_AUTH_TOKEN "
+        "for token/gateway auth; remove the other key from the named source and retry."
     )
 
 
