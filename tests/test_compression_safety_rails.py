@@ -389,7 +389,8 @@ def test_transform_failure_rendered_log_redacts_payload_and_correlates_request(
                 raise ValueError(secret)
             except ValueError as cause:
                 error = RuntimeError(secret)
-                error.add_note(secret)
+                if hasattr(error, "add_note"):
+                    error.add_note(secret)
                 raise error from cause
 
     monkeypatch.setenv("HEADROOM_PIPELINE_BREAKER_THRESHOLD", "1")
