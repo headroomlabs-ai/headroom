@@ -8,7 +8,7 @@ structured recommendations for CLAUDE.md / MEMORY.md.
 
 Supports any LLM provider via LiteLLM: Anthropic, OpenAI, Google, Bedrock,
 Ollama, and 100+ others. Auto-detects the best available model from env vars.
-Also supports CLI-based backends (claude, gemini, codex) for subscription
+Also supports CLI-based backends (claude, gemini, codex, agy) for subscription
 users without raw API keys.
 """
 
@@ -60,6 +60,18 @@ _MIN_DIGEST_TOKENS = 10_000
 # --include-partial-messages adds incremental "stream_event" ticks during the
 # assistant's response; without it claude only emits ~3 events total (system
 # init, one assistant message, result) — too sparse to report live progress.
+# --tools "" and --strict-mcp-config leave the analysis session with zero tools:
+# the digest is the whole input and the answer is one JSON object, but a
+# headless `claude -p` is otherwise a full agent (Bash, Edit, Task, every MCP
+# server) under the user's own permissions. A model that goes off to read or
+# verify things keeps streaming, so the idle cap never fires and the run dies
+# at the hard cap with nothing written. Both flags are needed: --tools "" alone
+# leaves the MCP servers' tools.
+# --settings '{"disableAllHooks":true}' turns off hooks from settings and
+# plugins alike. A blocking Stop hook otherwise forces a second turn whose reply
+# replaces the analysis as the final result, so learn finds no rules and reports
+# "No actionable patterns found" with no error. The user's own settings still
+# load (env routing, auth), which --bare would not do: it skips OAuth.
 _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
     (
         "claude",
@@ -71,11 +83,25 @@ _CLI_BACKENDS: list[tuple[str, str, list[str]]] = [
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--settings",
+            '{"disableAllHooks":true}',
         ],
     ),
     ("gemini", "gemini-cli", ["gemini", "-p"]),
     ("codex", "codex-cli", ["codex", "exec", "--skip-git-repo-check"]),
+    # agy's -p takes the prompt as an argument, so stdin is only read as a
+    # stream-json user event; the answer arrives in the final `result` event.
+    ("agy", "agy-cli", ["agy", "--input-format", "stream-json", "--output-format", "stream-json"]),
 ]
+
+# agy has no flag that starts a zero-tool session (--sandbox still writes
+# files, --mode plan still reads them), so transcript text could drive its
+# tools under the user's permissions. It is never auto-detected and only runs
+# when the user sets this env var to "1".
+_AGY_UNSAFE_OPT_IN_ENV = "HEADROOM_LEARN_ALLOW_UNSAFE_AGY"
 
 # Set of valid CLI model identifiers, derived from _CLI_BACKENDS.
 _CLI_MODEL_IDS: set[str] = {model for _, model, _ in _CLI_BACKENDS}
@@ -135,13 +161,23 @@ def _resolve_timeout_secs(env_var: str, default: int) -> int:
     return value
 
 
+def _require_agy_opt_in() -> None:
+    """Raise unless the user explicitly accepted agy's unsandboxed tool access."""
+    if os.environ.get(_AGY_UNSAFE_OPT_IN_ENV) != "1":
+        raise ValueError(
+            "The agy backend cannot run without tool access, so session text could "
+            "make it write files or run shell commands under your permissions. "
+            f"Set {_AGY_UNSAFE_OPT_IN_ENV}=1 to accept this risk and use it anyway."
+        )
+
+
 def _detect_default_model() -> str:
     """Pick the best available model based on API keys, env config, or CLI tools.
 
     Priority order:
       1. API key present → use corresponding LiteLLM model
       2. HEADROOM_LEARN_CLI env var → use specified CLI backend
-      3. Auto-detect installed CLI tools (claude > gemini > codex)
+      3. Auto-detect installed CLI tools (claude > gemini > codex; agy is opt-in only)
       4. Raise RuntimeError with setup instructions
     """
     # 1. API key detection (existing behavior)
@@ -154,6 +190,8 @@ def _detect_default_model() -> str:
     if cli_override:
         for cli_name, model, _cmd in _CLI_BACKENDS:
             if cli_name == cli_override:
+                if cli_name == "agy":
+                    _require_agy_opt_in()
                 logger.info("HEADROOM_LEARN_CLI=%s — using %s CLI backend", cli_override, cli_name)
                 return model
         valid = ", ".join(name for name, _, _ in _CLI_BACKENDS)
@@ -163,7 +201,7 @@ def _detect_default_model() -> str:
 
     # 3. Auto-detect installed CLI tools
     for cli_name, model, _cmd in _CLI_BACKENDS:
-        if shutil.which(cli_name):
+        if cli_name != "agy" and shutil.which(cli_name):
             logger.info("No API key found — auto-detected %s CLI as LLM backend", cli_name)
             return model
 
@@ -172,8 +210,9 @@ def _detect_default_model() -> str:
         "  export ANTHROPIC_API_KEY=sk-ant-...   → uses claude-sonnet-4-6\n"
         "  export OPENAI_API_KEY=sk-...          → uses gpt-4o\n"
         "  export GEMINI_API_KEY=...             → uses gemini-flash-latest\n"
-        "Or set HEADROOM_LEARN_CLI to a coding agent CLI (claude, gemini, codex).\n"
-        "Or install one of those CLIs for auto-detection.\n"
+        "Or set HEADROOM_LEARN_CLI to a coding agent CLI (claude, gemini, codex, agy).\n"
+        "  agy is never auto-detected and also needs HEADROOM_LEARN_ALLOW_UNSAFE_AGY=1.\n"
+        "Or install claude, gemini, or codex for auto-detection.\n"
         "Or specify a model directly: headroom learn --model <litellm-model-name>"
     )
 
@@ -625,7 +664,11 @@ def _output_snippet(text: str, limit: int = _MAX_SNIPPET_LEN) -> str:
 
 
 def _failure_detail(
-    stderr: str | None, stdout: str | None, *, result_text: str | None = None
+    stderr: str | None,
+    stdout: str | None,
+    *,
+    result_text: str | None = None,
+    prompt: str | None = None,
 ) -> str:
     """Build the operator-facing reason for a non-zero CLI exit.
 
@@ -639,17 +682,39 @@ def _failure_detail(
     than headed because CLI backends emit the error last (a streaming backend's
     whole event log precedes it).
 
+    A CLI that echoes its stdin prompt to stderr (``codex exec`` prints the whole
+    prompt ahead of its own error) would otherwise fill the head-of-stderr cut
+    with our system prompt and never reach the reason. The echo is replaced with
+    a marker and only the end of what follows it is kept, which also keeps the
+    session digest out of the message.
+
     Args:
         stderr: Captured stderr, if any.
         stdout: Captured stdout, if any.
         result_text: Pre-extracted reason (claude-cli's final ``result`` field),
             used in place of the raw stdout tail when available.
+        prompt: The prompt sent on stdin, dropped from stderr when echoed there.
 
     Returns:
         A non-empty snippet, or ``"(no output captured)"`` when both streams were
         empty, so the message is never a dangling colon.
     """
     parts: list[str] = []
+    # Text-mode pipes read the echo back with universal newlines.
+    echo = prompt.replace("\r\n", "\n").replace("\r", "\n").strip() if prompt else ""
+    if stderr and echo and echo in stderr:
+        head, _, after = stderr.strip().partition(echo)
+        marker = "[prompt omitted]\n"
+        after = after.strip()
+        # At least half the cap goes to what follows the echo, so a long
+        # banner ahead of it cannot push the CLI's verdict out.
+        room = max(_MAX_SNIPPET_LEN - len(head) - len(marker), _MAX_SNIPPET_LEN // 2)
+        head = head[: _MAX_SNIPPET_LEN - room - len(marker)] + marker
+        if len(after) > room:
+            # Keep whole lines where possible: the CLI's verdict is the last one.
+            cut = after[len(after) - room :]
+            after = cut.partition("\n")[2] or cut
+        stderr = head + after
     if stderr and stderr.strip():
         parts.append(stderr.strip()[:_MAX_SNIPPET_LEN])
     tail = result_text if result_text and result_text.strip() else stdout
@@ -672,6 +737,8 @@ def _call_cli_llm(
                    --include-partial-messages (idle-timeout)
       gemini-cli → gemini -p (wall-clock timeout)
       codex-cli  → codex exec (wall-clock timeout)
+      agy-cli    → agy --input-format stream-json --output-format stream-json
+                   (wall-clock timeout)
 
     The claude-cli path streams JSON events, letting the analyzer kill genuine
     hangs while letting long-but-active analyses run to completion.
@@ -686,7 +753,8 @@ def _call_cli_llm(
         Parsed JSON recommendations from the CLI tool.
 
     Raises:
-        ValueError: If *model* is not a known CLI backend.
+        ValueError: If *model* is not a known CLI backend, or is ``agy-cli``
+            without the unsafe opt-in.
         RuntimeError: If the CLI is not installed, exits non-zero, or times out.
     """
     cmd: list[str] | None = None
@@ -697,6 +765,13 @@ def _call_cli_llm(
     if cmd is None:
         raise ValueError(f"Unknown CLI model: {model}")
 
+    if model == "agy-cli":
+        _require_agy_opt_in()
+        logger.warning(
+            "agy-cli runs with tool access under your permissions; session text "
+            "could trigger file writes or shell commands during analysis"
+        )
+
     prompt = _SYSTEM_PROMPT + "\n\n" + _USER_PROMPT_PREFIX + digest
     hard_cap = _resolve_timeout_secs("HEADROOM_LEARN_CLI_TIMEOUT_SECS", _CLI_TIMEOUT)
 
@@ -706,10 +781,14 @@ def _call_cli_llm(
             cmd, prompt, hard_cap=hard_cap, idle_cap=idle_cap, on_progress=on_progress
         )
 
+    stdin = prompt
+    if model == "agy-cli":
+        stdin = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
     try:
         result = run(
             cmd,
-            input=prompt,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=hard_cap,
@@ -723,7 +802,7 @@ def _call_cli_llm(
             ) from None
         cmd = shim_cmd
         try:
-            result = run(cmd, input=prompt, capture_output=True, text=True, timeout=hard_cap)
+            result = run(cmd, input=stdin, capture_output=True, text=True, timeout=hard_cap)
         except FileNotFoundError:
             raise RuntimeError(
                 f"`{cmd[0]}` not found in PATH. Install it or use a different backend "
@@ -737,15 +816,19 @@ def _call_cli_llm(
         ) from None
 
     if result.returncode != 0:
-        detail = _failure_detail(result.stderr, result.stdout)
+        detail = _failure_detail(result.stderr, result.stdout, prompt=prompt)
         raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {result.returncode}):\n{detail}")
 
     # Log stderr warnings even on success (auth refreshes, deprecation notices).
     if result.stderr and result.stderr.strip():
         logger.debug("CLI stderr (exit 0): %s", result.stderr[:_MAX_SNIPPET_LEN])
 
+    output = result.stdout
+    if model == "agy-cli":
+        output = _agy_result_text(output)
+
     try:
-        return _strip_fenced_json(result.stdout)
+        return _strip_fenced_json(output)
     except json.JSONDecodeError as exc:
         stdout_snippet = _output_snippet(result.stdout or "")
         raise RuntimeError(
@@ -907,7 +990,7 @@ def _call_claude_cli_streaming(
         # the human-readable reason ("API Error: ...", "Not logged in", usage
         # limits).
         detail = _failure_detail(
-            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result
+            "".join(stderr_lines), "".join(stdout_lines), result_text=final_result, prompt=prompt
         )
         raise RuntimeError(f"`{' '.join(cmd)}` failed (exit {proc.returncode}):\n{detail}")
 
@@ -930,6 +1013,19 @@ def _call_claude_cli_streaming(
             f"`{' '.join(cmd)}` returned unparseable output. "
             f"Head and tail of the output:\n{snippet}"
         ) from exc
+
+
+def _agy_result_text(stdout: str) -> str:
+    """Return ``result.response`` from agy stream-json output, or "" if absent."""
+    # Split on "\n" only: splitlines() also breaks on U+2028/U+2029, which JSON
+    # allows unescaped inside strings, and would cut the result event apart.
+    for line in reversed(stdout.split("\n")):
+        event = _parse_stream_event(line)
+        if event is not None and event.get("event") == "result":
+            result = event.get("result")
+            response = result.get("response") if isinstance(result, dict) else None
+            return response if isinstance(response, str) else ""
+    return ""
 
 
 def _parse_stream_event(line: str) -> dict | None:

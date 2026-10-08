@@ -80,9 +80,12 @@ MODEL_TO_TOKENIZER: dict[str, str] = {
     "deepseek-r1": "deepseek-ai/DeepSeek-R1",
     "deepseek-r1-0528": "deepseek-ai/DeepSeek-R1-0528",
     "deepseek-reasoner": "deepseek-ai/DeepSeek-R1",
-    # DeepSeek V4 family (2025-2026)
+    # DeepSeek V4 family (2025-2026). The retired v4-flash ids are still
+    # accepted on the wire but served by V4.1-Flash, so they resolve there.
+    "deepseek-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
     "deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro",
-    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-v4-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-ai/DeepSeek-V4.1-Flash",
     # DeepSeek API aliases (routed through the proxy)
     "deepseek-chat": "deepseek-ai/DeepSeek-V3",
     "deepseek-r1-distill-qwen": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -223,6 +226,12 @@ def _load_tokenizer(tokenizer_name: str):
     # vetted, not a variant the caller chose.
     tokenizer_name = repo
 
+    from headroom.offline import apply_offline_env, guard_egress, is_offline
+
+    offline = is_offline()
+    if offline:
+        apply_offline_env()
+
     from transformers import AutoTokenizer
 
     try:
@@ -239,6 +248,13 @@ def _load_tokenizer(tokenizer_name: str):
     except Exception:
         pass  # Not in the local cache — try the network below, bounded.
 
+    if offline:
+        logger.warning(
+            f"Tokenizer {tokenizer_name} not in local HF cache and network "
+            f"loading is disabled (HEADROOM_OFFLINE); using estimation"
+        )
+        return None
+
     timeout = _load_timeout_secs()
     if timeout <= 0:
         logger.warning(
@@ -252,6 +268,10 @@ def _load_tokenizer(tokenizer_name: str):
 
     def _download() -> None:
         try:
+            # Defence in depth behind the is_offline() return above: the switch
+            # could flip between that check and this thread, and the guard is
+            # what the egress meta-test recognises as dominating the fetch.
+            guard_egress(f"HuggingFace tokenizer download ({tokenizer_name})", "huggingface.co")
             result.append(
                 AutoTokenizer.from_pretrained(
                     tokenizer_name,

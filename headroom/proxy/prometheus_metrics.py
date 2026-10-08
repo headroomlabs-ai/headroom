@@ -30,6 +30,15 @@ logger = logging.getLogger("headroom.proxy")
 # client-supplied model cardinality stays bounded (see record_request).
 _OTHER_MODEL = "other"
 
+# Same idea for inbound request paths (see record_inbound_request). ``path`` is
+# client-controlled and effectively unbounded — ID-bearing passthrough routes
+# such as ``/v1/files/{id}`` or ``/v1/responses/{id}`` mint a distinct key per
+# request. Past this many distinct paths, further paths collapse into
+# ``_OTHER_PATH`` so the counter (and its exported Prometheus series) can't grow
+# without bound. The cap sits well above a proxy's real route count.
+MAX_DISTINCT_PATHS = 256
+_OTHER_PATH = "other"
+
 # Closed label set for headroom_requests_rate_limited_total{source}. Two 429s
 # mean opposite things to an operator: "headroom" is OUR limiter refusing the
 # request (raise the cap), "upstream" is the provider refusing it (back off or
@@ -152,6 +161,7 @@ class PrometheusMetrics:
         self.inbound_requests_active = 0
         self.inbound_requests_by_method: dict[str, int] = defaultdict(int)
         self.inbound_requests_by_path: dict[str, int] = defaultdict(int)
+        self._path_cardinality_warned = False
         self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
@@ -334,6 +344,16 @@ class PrometheusMetrics:
         # Track per-model cache request count to distinguish cold starts from busts
         self._cache_requests_by_model: dict[str, int] = defaultdict(int)
 
+        # New-input basis. The cohort is every request that newly BILLED input
+        # (uncached or cache-write tokens), which is not the same set as the
+        # cache accumulators above: those are gated on cache activity, so they
+        # both admit cache-read-only requests (numerator, no denominator) and
+        # drop uncached-only ones (real new input, dropped entirely). The
+        # ledger pairs the same two figures over the same predicate; keeping
+        # one gate here is what stops /stats and `headroom savings` disagreeing.
+        self.new_input_tokens_total: int = 0
+        self.new_input_saved_tokens_total: int = 0
+
         # Prefix freeze stats (cache-aware compression)
         self.prefix_freeze_busts_avoided: int = 0
         self.prefix_freeze_tokens_preserved: int = 0
@@ -403,6 +423,7 @@ class PrometheusMetrics:
             self.inbound_requests_active = 0
             self.inbound_requests_by_method.clear()
             self.inbound_requests_by_path.clear()
+            self._path_cardinality_warned = False
             self.inbound_responses_by_status.clear()
 
             self.tokens_input_total = 0
@@ -763,7 +784,23 @@ class PrometheusMetrics:
         self.inbound_requests_total += 1
         self.inbound_requests_active += 1
         self.inbound_requests_by_method[method.upper()] += 1
-        self.inbound_requests_by_path[path] += 1
+        # Cap client-controlled path cardinality, mirroring the model cap in
+        # record_request. A membership test (never a defaultdict index) keeps an
+        # over-cap path from materializing a new key and defeating the bound.
+        if path in self.inbound_requests_by_path or (
+            len(self.inbound_requests_by_path) < MAX_DISTINCT_PATHS
+        ):
+            bounded_path = path
+        else:
+            bounded_path = _OTHER_PATH
+            if not self._path_cardinality_warned:
+                self._path_cardinality_warned = True
+                logger.warning(
+                    "metrics.record: inbound path cardinality cap (%d) reached; "
+                    'bucketing further paths into "other"',
+                    MAX_DISTINCT_PATHS,
+                )
+        self.inbound_requests_by_path[bounded_path] += 1
 
     def record_inbound_response(self, *, status_code: int | str) -> None:
         self.inbound_requests_completed += 1
@@ -921,6 +958,11 @@ class PrometheusMetrics:
             # denominator for the active-compression ratio.
             self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
 
+            # New-input cohort, on the same predicate the ledger uses below.
+            if uncached_input_tokens > 0 or cache_write_tokens > 0:
+                self.new_input_tokens_total += uncached_input_tokens + cache_write_tokens
+                self.new_input_saved_tokens_total += max(0, int(tokens_saved))
+
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:
                 pc = self.cache_by_provider[provider]
@@ -1030,6 +1072,7 @@ class PrometheusMetrics:
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
                 output_tokens_saved=output_tokens_saved,
+                output_tokens=output_tokens,
                 estimated_savings_usd=savings_usd,
             )
 
@@ -1060,7 +1103,13 @@ class PrometheusMetrics:
         # sessions and drops deferral-only turns from the ledger entirely (#2795).
         deferral_saved = max(0, int(tool_search_saved))
         ledger_saved = tokens_saved + deferral_saved
-        if ledger_saved > 0 and not self._stateless:
+        # A request that newly billed input is written even when it saved
+        # nothing: the ledger's new-input basis needs the denominator from
+        # every such request (see record_savings_event). Same predicate as the
+        # `new_input_*_total` accumulators above, so the two rates share a
+        # cohort — /stats and `headroom savings` are the same measurement.
+        has_new_input = uncached_input_tokens > 0 or cache_write_tokens > 0
+        if (ledger_saved > 0 or has_new_input) and not self._stateless:
             # `input_tokens` here is the optimized (post-compression) count
             # that was actually forwarded — see emit_request_outcome, which
             # passes `input_tokens=outcome.optimized_tokens`. The ledger's
@@ -1103,6 +1152,15 @@ class PrometheusMetrics:
                 uncached_input_tokens=uncached_input_tokens,
                 cache_inferred=cache_inferred,
                 provider=provider,
+                # Provider-billed new input (the /stats new_input denominator)
+                # and the deferral share of `saved`, so `headroom savings` can
+                # show the same new-input rate the dashboard headline does.
+                # Omitted when there is no cache breakdown (e.g. Bedrock), so
+                # the ledger never divides savings by themselves.
+                new_input_tokens=(
+                    int(uncached_input_tokens) + int(cache_write_tokens) if has_new_input else None
+                ),
+                deferred_tokens=deferral_saved,
             )
 
         otel_metrics = self._get_otel_metrics()

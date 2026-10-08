@@ -77,6 +77,10 @@ def _xls_cell(cell: object, datemode: int) -> object:
     so a whole number arrives as ``12.0``. Left alone, the two loaders disagree
     about the same workbook -- ``45292.0`` here against ``2024-01-01 00:00:00``
     there -- and the date is not recoverable from the text.
+
+    Sub-second precision is dropped: ``xldate_as_tuple`` returns whole seconds, so
+    ``datetime(2024, 1, 1, 12, 34, 56, 500000)`` renders as ``2024-01-01 12:34:56``
+    where openpyxl keeps the microseconds.
     """
     import xlrd
 
@@ -153,5 +157,5 @@ def load_spreadsheet(path: str | Path) -> dict[str, str]:
     if suffix == ".xlsx":
         return _load_xlsx(p)
     if suffix == ".xls":
-        return _load_xls(p)  # pragma: no cover - legacy .xls path, see _load_xls
+        return _load_xls(p)
     raise ValueError(f"Unsupported spreadsheet format '{suffix}'. Supported: .xlsx, .xls")
