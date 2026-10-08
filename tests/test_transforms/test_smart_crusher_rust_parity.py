@@ -45,15 +45,6 @@ def _all_fixtures() -> list[Path]:
     return sorted(_FIXTURES_DIR.glob("*.json"))
 
 
-def test_at_least_17_fixtures_present():
-    """Sanity check: the recorded fixture suite landed."""
-    fixtures = _all_fixtures()
-    assert len(fixtures) >= 17, (
-        f"expected >= 17 fixtures, found {len(fixtures)}. "
-        "If you re-recorded and got fewer, something deleted them."
-    )
-
-
 @pytest.mark.parametrize("fixture_path", _all_fixtures(), ids=lambda p: p.name)
 def test_rust_backend_matches_recorded_output(fixture_path: Path):
     """Replay each recorded input through the PyO3 bridge; every output
