@@ -141,7 +141,6 @@ def test_openai_compatible_base_url_respects_configured_openai_target() -> None:
     assert openai_compatible_base_url(proxy, {}) == "https://legacy.openai.test"
 
 
-
 def test_select_passthrough_base_url_factory_mode_wins_over_auth_modes() -> None:
     proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
     proxy.config = type("Config", (), {"factory_api_url": "https://api.factory.ai/"})()
