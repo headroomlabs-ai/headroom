@@ -269,6 +269,37 @@ def list_release_tags(root: Path) -> list[str]:
     return [tag.strip() for tag in result.stdout.splitlines() if tag.strip()]
 
 
+def candidate_source_version(root: Path, source_sha: str) -> ReleaseVersionInfo:
+    """Use the immutable source manifest, never mutable tags, for candidates.
+
+    A different desired candidate version requires a different source commit
+    recording that version. Reruns of one SHA retain the same assignment.
+    Reading the tree with git does not execute historical source code.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+        raise ValueError("Candidate source must be a lowercase full commit SHA")
+    result = run(
+        ["git", "show", f"{source_sha}^{{commit}}:pyproject.toml"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+        import tomli as tomllib
+    version, npm_version = package_versions(tomllib.loads(result.stdout)["project"]["version"])
+    return ReleaseVersionInfo(
+        version=version,
+        npm_version=npm_version,
+        canonical=version,
+        height="0",
+        bump="source-manifest",
+        previous_tag="",
+    )
+
+
 def list_release_commits(root: Path, previous_tag: str) -> list[CommitInfo]:
     """List commit subject/body pairs since the previous release tag."""
 
@@ -321,6 +352,15 @@ def write_github_outputs(info: ReleaseVersionInfo, output_path: str) -> None:
 
 def main() -> None:
     root = Path.cwd()
+    if "CANDIDATE_SOURCE_SHA" in os.environ:
+        info = candidate_source_version(root, os.environ["CANDIDATE_SOURCE_SHA"])
+        candidate_output_path = os.environ.get("GITHUB_OUTPUT", "").strip()
+        if candidate_output_path:
+            write_github_outputs(info, candidate_output_path)
+        else:
+            for key, value in info.as_outputs().items():
+                print(f"{key}={value}")
+        return
     manual_version = os.environ.get("MANUAL_VER", "").strip()
     manual_raw = os.environ.get("MANUAL_VER") or os.environ.get("LEVEL") or "patch"
     manual_value = manual_raw.strip().removeprefix("v")
