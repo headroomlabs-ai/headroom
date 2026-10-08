@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from headroom.providers.proxy_targets import (
     api_target,
+    openai_compatible_base_url,
     select_passthrough_base_url,
     vertex_target_for_location,
 )
@@ -78,3 +79,63 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+    # A configured OpenAI target outranks Grok wire signals (see
+    # ``test_openai_compatible_base_url_respects_configured_openai_target``).
+    assert (
+        select_passthrough_base_url(
+            proxy,
+            {
+                "x-xai-token-auth": "xai-grok-cli",
+                "user-agent": "grok-shell/0.2.117",
+            },
+        )
+        == "https://legacy.openai.test"
+    )
+
+
+def test_openai_compatible_base_url_routes_grok_to_xai_on_default_target() -> None:
+    """The shared-proxy case this routing exists for: OpenAI target untouched."""
+    proxy = _proxy(OPENAI_API_URL="https://api.openai.com")
+    grok_headers = {"user-agent": "grok-pager/0.2.117 grok-shell/0.2.117"}
+
+    assert openai_compatible_base_url(proxy, grok_headers) == "https://api.x.ai"
+    assert openai_compatible_base_url(proxy, {}) == "https://api.openai.com"
+    # Also via passthrough, which is the catch-all entry point Grok CLI hits.
+    assert select_passthrough_base_url(proxy, grok_headers) == "https://api.x.ai"
+
+
+def test_openai_compatible_base_url_routes_grok_build_to_xai_on_default_target() -> None:
+    """Grok Build + Antigravity manifest case: the OpenAI target stays default.
+
+    Antigravity needs api.openai.com, so the manifest cannot point the whole
+    proxy at xAI; Grok Build's ``grok/`` user agent must still route there per
+    request — for direct inference and for model-list/passthrough alike.
+    """
+    proxy = _proxy(OPENAI_API_URL="https://api.openai.com")
+    grok_build_headers = {"user-agent": "grok/1.2.3"}
+
+    assert openai_compatible_base_url(proxy, grok_build_headers) == "https://api.x.ai"
+    assert select_passthrough_base_url(proxy, grok_build_headers) == "https://api.x.ai"
+    # Antigravity traffic keeps the default OpenAI target.
+    assert (
+        openai_compatible_base_url(proxy, {"user-agent": "antigravity/1.0.0"})
+        == "https://api.openai.com"
+    )
+
+
+def test_openai_compatible_base_url_respects_configured_openai_target() -> None:
+    """An operator gateway is chosen for every OpenAI-compatible client.
+
+    A client User-Agent must not silently bypass it, nor carry the gateway's
+    ``OPENAI_TARGET_API_HEADERS`` to a different vendor.
+    """
+    proxy = _proxy(OPENAI_API_URL="https://legacy.openai.test")
+
+    assert (
+        openai_compatible_base_url(
+            proxy,
+            {"user-agent": "grok-pager/0.2.117 grok-shell/0.2.117"},
+        )
+        == "https://legacy.openai.test"
+    )
+    assert openai_compatible_base_url(proxy, {}) == "https://legacy.openai.test"

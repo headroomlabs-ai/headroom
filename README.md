@@ -16,6 +16,7 @@
 
 <p>
   <b><a href="https://docs.headroomlabs.ai/docs/quickstart">Quickstart</a></b> ·
+  <b><a href="#headroom-for-teams">Headroom for Teams</a></b> ·
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility">Agents</a> ·
@@ -36,6 +37,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG
 chunks, files, and conversation history — before it reaches the LLM. Same
 answers, fraction of the tokens. Compression runs on your machine; no prompt or
 file content is sent anywhere to be compressed.
+
+<p align="center">
+  <a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=banner"><img src=".github/assets/enterprise-perk.svg" alt="Headroom Enterprise for teams: 3 months free with a 12-month plan. Claim the perk." width="880"></a>
+</p>
 
 <div align="center">
   <img src="HeadroomDemo-Fast.gif" alt="Headroom compressing a 10,144 token log dump to 1,260 tokens while preserving the FATAL line" width="820">
@@ -121,9 +126,10 @@ print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
 Launch a wrapped agent session each time, so the setup runs. `headroom wrap`
 starts a local proxy, installs **[Serena](https://github.com/oraios/serena)** for
 semantic code navigation, and launches the agent configured to route through
-Headroom. Serena is registered at user scope (for Claude Code, in
-`~/.claude.json`), so it stays available in your other projects until you run
-`headroom unwrap`. Skip it with `--code-memory none`.
+Headroom. For Claude Code, Serena is registered for the wrapped project only
+(as a `local`-scope MCP server in `~/.claude.json`). Use
+`--code-memory-scope user` to make it available in every project, or
+`--code-memory none` to skip it. `headroom unwrap` removes either registration.
 
 The `headroom` CLI ships only in the PyPI package. The npm `headroom-ai` package
 is the TypeScript SDK — a library you import
@@ -235,7 +241,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Copilot CLI | ✅ | starts proxy + launches |
 | VS Code Copilot | ✅ | transparent proxy; keeps the selected model |
 | OpenClaw | ✅ | installs as a ContextEngine plugin |
-| OpenCode | ✅ | injects config · starts proxy + launches |
+| OpenCode | ✅ | injects config · starts proxy + launches [^third-party-upstream] |
 | Cline | ✅ | starts proxy + injects config |
 | Continue | ✅ | starts proxy + injects config |
 | Goose | ✅ | starts proxy + launches |
@@ -246,11 +252,15 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
 
+[^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](docs/content/docs/opencode-deepseek.mdx).
+
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
 (`claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
 `zcode`). Registry authors should use the canonical [`server.json`](server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
+
+For Anthropic `/v1/messages`, `--mode cache` skips automatic `--memory` context injection so the provider prefix remains stable. OpenAI chat/responses and Gemini append memory to the live-zone tail. Use `--mode token` when you need automatic memory context on the Anthropic path.
 
 <details>
 <summary><b>GitHub Copilot CLI subscription mode</b></summary>
@@ -322,6 +332,8 @@ project you will open in VS Code:
 ```bash
 pip install "headroom-ai[proxy]"
 headroom wrap vscode-claude
+# Optional: persist Claude Code's client-owned 1M model selector
+headroom wrap vscode-claude --1m
 ```
 
 Reload the VS Code window on first run. Keep the wrapper terminal running while
@@ -329,6 +341,16 @@ you use the Claude Code panel; the dashboard or proxy log printed at startup
 shows requests and savings. Your Anthropic authentication and selected model are
 preserved. `Ctrl+C` stops the proxy; `headroom unwrap vscode-claude` restores the
 settings that existed before setup.
+
+With `--1m`, Headroom writes the resolved `[1m]` model selector to Claude Code's
+top-level user setting and restores the exact prior model on
+`headroom unwrap vscode-claude` or when setup runs again without `--1m`. Use
+`headroom wrap vscode-claude --no-configure --1m` to print the setting without
+writing files.
+
+Claude Code and Anthropic own 1M model support and account eligibility. Local
+tests prove persisted settings and restoration, not a live entitled VS Code
+session or the resulting context window.
 [Full guide →](https://docs.headroomlabs.ai/docs/vscode-claude-code)
 
 </details>
@@ -371,7 +393,7 @@ reduction, and blocks under `min_input_words` come back byte-identical.
 <summary><b>What's inside</b></summary>
 
 - **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types. It keeps error items, values outside the normal statistical range, and first/last boundaries, selected from field-variance statistics rather than a keyword list.
-- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++ and Perl.
+- **CodeCompressor** — AST-aware for Python, JS/TS, Go, Rust, Java, C/C++, C#, PHP.
 - **Kompress-v2-base** — our HuggingFace model, trained on agentic traces.
 - **Image compression** — 40–90% reduction through a trained ML router.
 - **CacheAligner** — flags volatile content that would bust a provider KV-cache prefix; never rewrites prompts.
@@ -424,12 +446,6 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-v2-base), `[code]`,
 > `[all]` covers the core stack but not the framework adapters. Install those
 > separately: `pip install "headroom-ai[langchain]"`, and likewise `[agno]`,
 > `[strands]`, `[anyllm]`, `[bedrock]`.
-
-> **Pick Python 3.13 if you want the dollar figure.** The dashboard's *Proxy $
-> Saved* tile prices compression with [LiteLLM](https://github.com/BerriAI/litellm),
-> which cannot be installed on Python 3.14+. Token savings still track on 3.14,
-> but the dollar figure stays `$0.00`. To switch:
-> `pipx reinstall headroom-ai --python python3.13`, then restart the proxy.
 
 → [Installation guide](https://docs.headroomlabs.ai/docs/installation) — Docker
 tags, persistent service, PowerShell, devcontainers.
@@ -519,11 +535,19 @@ published for Windows (`win_amd64`), Linux (`x86_64` / `aarch64`) and macOS
 (Apple Silicon and Intel), so those platforms never need a local Rust toolchain —
 the Rust-first step above is only for the sdist fallback when no wheel matches.
 
-Two runtime assets are fetched over TLS. If they are blocked, trust your
-corporate CA through `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`:
+**At runtime** Headroom verifies upstream TLS against the operating system's
+certificate store — where IT installs the Zscaler / Netskope / Palo Alto root —
+plus certifi's public roots, so a managed machine normally needs no setup.
+`headroom doctor --network` shows who signed each upstream certificate, whether
+Headroom trusts it, and whether a gateway block page is in the way. If the root
+is not in the OS store, export it as PEM and set
+`HEADROOM_CA_BUNDLE=/path/to/root.pem` (`NODE_EXTRA_CA_CERTS` also works). Full
+guide and the domain list for IT: [Corporate networks](https://docs.headroomlabs.ai/docs/corporate-networks).
 
-- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core. Or pre-provide it with `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
-- **`huggingface.co`** — the `kompress-base` model. Pre-download it and run with `HF_HUB_OFFLINE=1`, or point `HF_ENDPOINT` at a trusted mirror.
+Two download hosts can still need attention:
+
+- **`cdn.pyke.io`** — the ONNX Runtime for the Rust core, fetched with Mozilla's roots only. Pre-provide it with `ORT_STRATEGY=system` and `ORT_LIB_LOCATION=/path/to/onnxruntime`.
+- **`huggingface.co`** — the `kompress-base` model (Python, OS store) and the Rust core's embedding model (Mozilla's roots only). If the domain is blocked, pre-download and run with `HF_HUB_OFFLINE=1`, or point `HF_ENDPOINT` at a trusted mirror.
 
 Running with compression disabled (pure gateway) needs neither asset.
 
@@ -546,8 +570,9 @@ export ORT_DYLIB_PATH="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
 `ORT_PREFER_DYNAMIC_LINK=1` is required — without it `ORT_STRATEGY=system` still
 attempts static linking, which the Homebrew keg does not provide.
 
-**"Basic Constraints of CA cert not marked critical"** is a different failure. If
-TLS fails with:
+**"Basic Constraints of CA cert not marked critical"** only occurs with
+`HEADROOM_CERT_STORE=bundled` (the OS store verifies these roots fine). If TLS
+fails with:
 
 ```
 [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
@@ -569,10 +594,9 @@ signature, expiry and hostname checks all stay on.
 HEADROOM_TLS_STRICT=0 headroom proxy --port 8787
 ```
 
-The Rust core's ONNX download uses a separate TLS stack (rustls / OS trust store)
-and is unaffected by `HEADROOM_TLS_STRICT`. On Windows the corporate root must be
-in the **machine** certificate store — browsers already trust it there — or
-pre-provision ONNX Runtime with `ORT_STRATEGY=system` to skip the download.
+The Rust core's downloads use rustls with Mozilla's roots and are unaffected by
+`HEADROOM_TLS_STRICT` and the CA variables; pre-provision ONNX Runtime with
+`ORT_STRATEGY=system` and models via `HF_ENDPOINT` as above.
 
 </details>
 
@@ -596,26 +620,30 @@ regresses a compression ratio across real workloads rather than only our own tes
 corpus.
 
 Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
-`--offline`. The full field list is in
+`HEADROOM_OFFLINE=1`. The full field list is in
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams
 
-Headroom OSS is built for individual developers: run `headroom proxy` or
-`headroom wrap` on your laptop and start cutting tokens in minutes, free and
-local-first.
+Headroom OSS is built for one developer on one laptop. Headroom Enterprise is built
+for the whole team.
 
-Running it across an engineering org is a different job — a shared always-on
-deployment, centralised config and version rollout, org-wide savings dashboards,
-SSO and access control, air-gapped and VPC installs, and someone to call. We help
-companies with that, self-hosted with support or fully managed.
+| | Open source | Enterprise |
+|---|---|---|
+| Savings | Compression, plus tool search on Anthropic requests (on by default) | Also: tool search for every model, harness tuning, extra compressors |
+| Model routing | Rule-based and opt-in: turn it on with `HEADROOM_MODEL_ROUTER_ENABLED=1` and write the rules in `HEADROOM_MODEL_ROUTES` | Automatic: a cheaper model per request when quality allows, with a shadow mode that shows the savings before you turn it on |
+| Security | — | Detect and strip prompt injection and risky tool calls |
+| Rollout | Per laptop | Managed or in your VPC, SSO, central config, org-wide savings |
+| Support | GitHub, Discord | Dedicated engineers, onboarding, priority response |
 
-If your team is spending real money on LLM tokens — Claude Code, Codex, Cursor,
-or agents running in CI — email **[hello@headroomlabs.ai](mailto:hello@headroomlabs.ai)**
-with your stack and rough monthly LLM spend.
+**3 months of Enterprise free.** Companies that sign a 12-month Enterprise plan get
+their first 3 months free. One perk per company.
 
-Everything in this repo stays open source under Apache 2.0. The managed offering
-is for teams that would rather have it deployed, supported and scaled for them.
+**[Claim 3 months free →](https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=teams)**
+· or email [hello@headroomlabs.ai](mailto:hello@headroomlabs.ai) with your stack and
+monthly LLM spend.
+
+Everything in this repo stays open source under Apache 2.0.
 
 ## Documentation
 

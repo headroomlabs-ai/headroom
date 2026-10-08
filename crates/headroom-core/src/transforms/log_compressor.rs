@@ -896,6 +896,219 @@ fn is_summary_line(line: &str) -> bool {
     false
 }
 
+/// What a scan of pytest's "short test summary info" sections found, keyed by
+/// line number.
+struct PytestShortSummary {
+    /// One-line `FAILED <nodeid>` / `ERROR <nodeid>` entries -> node id.
+    entries: BTreeMap<usize, String>,
+    /// The `===` line closing each section, i.e. pytest's run totals
+    /// (`=== 20 failed, 380 passed in 41.02s ===`).
+    totals_lines: BTreeSet<usize>,
+    /// The first section header, if any section was found.
+    first_header: Option<usize>,
+}
+
+/// Scan for pytest's "short test summary info" sections.
+///
+/// A section opens on a complete `=== ... short test summary info ... ===`
+/// separator (a trailing `\r` is ignored, so CRLF logs work) and closes at
+/// the next `===` line or EOF, so a diagnostic line that merely mentions the
+/// phrase does not open one. For `FAILED <nodeid> - <msg>` the id is the text
+/// before ` - `. `parse_lines`, `select_lines` and `format_output` all use it,
+/// so retention and omission naming agree on which lines are entries.
+fn scan_pytest_short_summary(lines: &[&str]) -> PytestShortSummary {
+    let mut scan = PytestShortSummary {
+        entries: BTreeMap::new(),
+        totals_lines: BTreeSet::new(),
+        first_header: None,
+    };
+    let mut in_short_summary = false;
+
+    for (line_number, line) in lines.iter().enumerate() {
+        let recognition_line = line.strip_suffix('\r').unwrap_or(line);
+        if recognition_line.starts_with("===") {
+            let opens = recognition_line.ends_with("===")
+                && recognition_line.contains("short test summary info");
+            if opens {
+                scan.first_header.get_or_insert(line_number);
+            } else if in_short_summary {
+                scan.totals_lines.insert(line_number);
+            }
+            in_short_summary = opens;
+            continue;
+        }
+        if !in_short_summary {
+            continue;
+        }
+
+        let node_id = line
+            .strip_prefix("FAILED ")
+            .or_else(|| line.strip_prefix("ERROR "))
+            .map(|rest| rest.split_once(" - ").map_or(rest, |(id, _)| id).trim());
+        if let Some(node_id) = node_id.filter(|id| !id.is_empty()) {
+            scan.entries.insert(line_number, node_id.to_string());
+        }
+    }
+
+    scan
+}
+
+/// Map line number -> node id for pytest's short-summary `FAILED` / `ERROR`
+/// entries; see [`scan_pytest_short_summary`].
+fn pytest_short_summary_entries(lines: &[&str]) -> BTreeMap<usize, String> {
+    scan_pytest_short_summary(lines).entries
+}
+
+/// Lines the global cap must keep while a pytest short summary competes for
+/// it: each section's totals line and the first `E ` assertion line before
+/// the summary. Short-summary entries win equal-score ties, so without this
+/// reserve a long summary crowds out the run totals and every error message.
+fn pytest_cap_reserve(log_lines: &[LogLine], scan: &PytestShortSummary) -> BTreeSet<usize> {
+    let mut reserved = scan.totals_lines.clone();
+    let first_error_detail = log_lines
+        .iter()
+        .take_while(|line| scan.first_header.is_none_or(|h| line.line_number < h))
+        .find(|line| line.content.starts_with("E "));
+    if let Some(line) = first_error_detail {
+        reserved.insert(line.line_number);
+    }
+    reserved
+}
+
+/// Extract an exception-type / error-code label from a single line, if the
+/// line looks like an exception header or error declaration. Conservative:
+/// returns `None` rather than guessing on ambiguous lines, so a generic log
+/// line like `ERROR: something failed` (all-caps `ERROR`, not a language
+/// exception name) is deliberately excluded — `ends_with("Error")` is a
+/// case-sensitive suffix check that `"ERROR"` fails.
+///
+/// Covers two shapes seen in practice:
+/// - Python: `KeyError: 'port'` / pytest's `E       KeyError: 'port'`
+/// - Rust/cargo: `error[E0425]: cannot find value ...`
+fn extract_error_label(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if let Some(rest) = trimmed.strip_prefix("error[") {
+        if let Some(end) = rest.find(']') {
+            let code = &rest[..end];
+            if !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Some(code.to_string());
+            }
+        }
+    }
+
+    let after_marker = trimmed
+        .strip_prefix("E ")
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let colon = after_marker.find(':')?;
+    let head = &after_marker[..colon];
+    let looks_like_exception_type = !head.is_empty()
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && (head.ends_with("Error") || head.ends_with("Exception") || head.ends_with("Warning"));
+    looks_like_exception_type.then(|| head.to_string())
+}
+
+/// Extract a source file name referenced by a single line, if any, via the
+/// common `File "..."` (Python) or `--> file:line:col` (Rust/cargo, also
+/// covers similar `at f (file:line:col)` shapes) patterns.
+fn extract_source_file(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    if let Some(rest) = trimmed.strip_prefix("File \"") {
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+
+    let arrow = trimmed.find("--> ")?;
+    let rest = &trimmed[arrow + 4..];
+    let file_part = rest.split(':').next().unwrap_or("");
+    (!file_part.is_empty() && file_part.contains('.')).then(|| file_part.to_string())
+}
+
+/// Summarize what got dropped: distinct exception-type/error-code labels
+/// and distinct source files referenced by the lines in `all_lines` that
+/// are NOT present (by `line_number`) in `selected`, excluding any label or
+/// file that is *also* extractable from a kept line — those are already
+/// visible in the surviving text, so restating them would describe nothing
+/// retrieval could add. `BTreeSet` keeps the output deterministic (same
+/// input -> same marker text, no `HashMap` iteration-order dependence).
+///
+/// Returns `""` when nothing extractable was found — callers append this
+/// directly after the lines-compressed count, so an empty descriptor
+/// leaves the marker exactly as it was before this was added.
+fn summarize_omitted(all_lines: &[LogLine], selected: &[LogLine]) -> String {
+    let kept: BTreeSet<usize> = selected.iter().map(|l| l.line_number).collect();
+
+    let mut kept_error_types: BTreeSet<String> = BTreeSet::new();
+    let mut kept_files: BTreeSet<String> = BTreeSet::new();
+    for line in selected {
+        if let Some(label) = extract_error_label(&line.content) {
+            kept_error_types.insert(label);
+        }
+        if let Some(file) = extract_source_file(&line.content) {
+            kept_files.insert(file);
+        }
+    }
+
+    let mut error_types: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for line in all_lines {
+        if kept.contains(&line.line_number) {
+            continue;
+        }
+        if let Some(label) = extract_error_label(&line.content) {
+            if !kept_error_types.contains(&label) {
+                error_types.insert(label);
+            }
+        }
+        if let Some(file) = extract_source_file(&line.content) {
+            if !kept_files.contains(&file) {
+                files.insert(file);
+            }
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !files.is_empty() {
+        parts.push(format!(
+            "{} file{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if !error_types.is_empty() {
+        const MAX_NAMES_SHOWN: usize = 5;
+        let names: Vec<&str> = error_types
+            .iter()
+            .take(MAX_NAMES_SHOWN)
+            .map(String::as_str)
+            .collect();
+        let overflow = if error_types.len() > MAX_NAMES_SHOWN {
+            ", ..."
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "{} exception type{} ({}{})",
+            error_types.len(),
+            if error_types.len() == 1 { "" } else { "s" },
+            names.join(", "),
+            overflow
+        ));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(", "))
+    }
+}
+
 // ─── Compressor ─────────────────────────────────────────────────────────
 
 pub struct LogCompressor {
@@ -966,10 +1179,15 @@ impl LogCompressor {
             } else if let Some(store) = store {
                 let key = md5_hex_24(content);
                 store.put(&key, content);
+                // Descriptive so the reader/agent can tell whether the
+                // dropped content is relevant before deciding whether to
+                // retrieve it (rather than just "how much" vanished).
+                let descriptor = summarize_omitted(&log_lines, &selected);
                 let marker = format!(
-                    "\n[{} lines compressed to {}. Retrieve more: hash={}]",
+                    "\n[{} lines compressed to {}{}. Retrieve more: hash={}]",
                     original_line_count,
                     selected.len(),
+                    descriptor,
                     key
                 );
                 compressed.push_str(&marker);
@@ -1005,11 +1223,12 @@ impl LogCompressor {
         let mut out: Vec<LogLine> = Vec::with_capacity(lines.len());
         let mut active: Option<TraceFlavor> = None;
         let mut trace_lines = 0usize;
+        let short_summary_entries = pytest_short_summary_entries(lines);
 
         for (i, line) in lines.iter().enumerate() {
             let mut entry = LogLine::new(i, *line);
             entry.level = self.levels.classify(line);
-            entry.is_summary = is_summary_line(line);
+            entry.is_summary = is_summary_line(line) || short_summary_entries.contains_key(&i);
 
             // Stack-trace state machine: open on a new flavor match, then
             // mark subsequent lines until the flavor terminates or we hit
@@ -1068,6 +1287,8 @@ impl LogCompressor {
         stats: &mut LogCompressorStats,
     ) -> Vec<LogLine> {
         let all_strings: Vec<&str> = log_lines.iter().map(|l| l.content.as_str()).collect();
+        let short_summary = scan_pytest_short_summary(&all_strings);
+        let short_summary_entries = &short_summary.entries;
         let adaptive_max =
             compute_optimal_k(&all_strings, bias, 10, Some(self.config.max_total_lines));
 
@@ -1182,12 +1403,43 @@ impl LogCompressor {
 
         let mut ordered: Vec<LogLine> = selected.into_iter().collect();
         if ordered.len() > adaptive_max {
+            let reserved = if self.config.keep_summary_lines && !short_summary_entries.is_empty() {
+                pytest_cap_reserve(log_lines, &short_summary)
+            } else {
+                BTreeSet::new()
+            };
+            for line in log_lines
+                .iter()
+                .filter(|l| reserved.contains(&l.line_number))
+            {
+                if !ordered
+                    .iter()
+                    .any(|kept| kept.line_number == line.line_number)
+                {
+                    ordered.push(line.clone());
+                }
+            }
             stats.lines_dropped_by_global_cap += ordered.len() - adaptive_max;
-            // Sort by score desc, take top adaptive_max, restore line order.
+            // Sort reserved lines first, then by score desc; take top adaptive_max,
+            // restore line order.
             ordered.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                reserved
+                    .contains(&b.line_number)
+                    .cmp(&reserved.contains(&a.line_number))
+                    .then_with(|| {
+                        b.score
+                            .partial_cmp(&a.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        if self.config.keep_summary_lines {
+                            short_summary_entries
+                                .contains_key(&b.line_number)
+                                .cmp(&short_summary_entries.contains_key(&a.line_number))
+                        } else {
+                            std::cmp::Ordering::Equal
+                        }
+                    })
                     .then_with(|| a.line_number.cmp(&b.line_number))
             });
             ordered.truncate(adaptive_max);
@@ -1259,6 +1511,15 @@ impl LogCompressor {
         selected: &[LogLine],
         all_lines: &[LogLine],
     ) -> (String, BTreeMap<String, u64>) {
+        let all_strings: Vec<&str> = all_lines.iter().map(|l| l.content.as_str()).collect();
+        let short_summary_entries = pytest_short_summary_entries(&all_strings);
+        let selected_numbers: BTreeSet<usize> =
+            selected.iter().map(|line| line.line_number).collect();
+        let omitted_short_summary_ids: Vec<&str> = short_summary_entries
+            .iter()
+            .filter(|(line_number, _)| !selected_numbers.contains(line_number))
+            .map(|(_, node_id)| node_id.as_str())
+            .collect();
         let mut stats: BTreeMap<String, u64> = BTreeMap::new();
         stats.insert("errors".into(), count_level(all_lines, LogLevel::Error));
         stats.insert("fails".into(), count_level(all_lines, LogLevel::Fail));
@@ -1284,10 +1545,27 @@ impl LogCompressor {
                 }
             }
             if !summary_parts.is_empty() {
+                let omitted_names = if omitted_short_summary_ids.is_empty() {
+                    String::new()
+                } else {
+                    let shown = omitted_short_summary_ids
+                        .iter()
+                        .take(5)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let overflow = omitted_short_summary_ids.len().saturating_sub(5);
+                    if overflow > 0 {
+                        format!("; omitted: {shown}, +{overflow} more")
+                    } else {
+                        format!("; omitted: {shown}")
+                    }
+                };
                 output.push(format!(
-                    "[{} lines omitted: {}]",
+                    "[{} lines omitted: {}{}]",
                     omitted,
-                    summary_parts.join(", ")
+                    summary_parts.join(", "),
+                    omitted_names
                 ));
             }
         }
@@ -1395,6 +1673,45 @@ mod tests {
         LogCompressor::new(LogCompressorConfig::default())
     }
 
+    fn pytest_failure_log(failure_count: usize, mixed: bool) -> Vec<String> {
+        let mut lines = (0..50)
+            .map(|i| format!("setup output line {i}"))
+            .collect::<Vec<_>>();
+        lines.push(
+            "=========================== short test summary info ==========================="
+                .into(),
+        );
+        for i in 0..failure_count {
+            let status = if mixed && i % 4 == 0 {
+                "ERROR"
+            } else {
+                "FAILED"
+            };
+            let suffix = if i % 3 == 0 {
+                " - AssertionError: expected value"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "{status} tests/test_generated.py::test_case{i}{suffix}"
+            ));
+        }
+        lines.push(format!(
+            "========================= {failure_count} failed in 1.00s ========================="
+        ));
+        lines
+    }
+
+    fn malformed_short_summary_diagnostic_log() -> Vec<String> {
+        let mut lines = (0..50)
+            .map(|i| format!("INFO setup output {i}"))
+            .collect::<Vec<_>>();
+        lines.push("=== diagnostic: short test summary info unavailable".into());
+        lines.extend((0..10).map(|i| format!("FAILED outside.py::test_{i}")));
+        lines.extend((10..20).map(|i| format!("ERROR outside.py::test_{i}")));
+        lines
+    }
+
     #[test]
     fn detects_pytest_format() {
         let c = cmp();
@@ -1461,6 +1778,323 @@ mod tests {
         assert_eq!(lines[0].level, LogLevel::Unknown);
         assert_eq!(lines[1].level, LogLevel::Unknown);
         assert_eq!(lines[2].level, LogLevel::Unknown);
+    }
+
+    #[test]
+    fn recognizes_pytest_short_summary_entries_by_section_and_line_number() {
+        let lines = [
+            "FAILED outside.py::test_lookalike",
+            "================ short test summary info ================",
+            "FAILED tests/test_a.py::test_short",
+            "ERROR tests/test_b.py::test_long - RuntimeError: boom",
+            "not a summary entry",
+            "================ 2 failed in 0.1s ================",
+            "FAILED outside.py::test_after",
+            "=== short test summary info ===",
+            "FAILED tests/test_c.py::test_eof - assertion failed",
+        ];
+
+        let entries = pytest_short_summary_entries(&lines);
+        assert_eq!(
+            entries,
+            BTreeMap::from([
+                (2, "tests/test_a.py::test_short".to_string()),
+                (3, "tests/test_b.py::test_long".to_string()),
+                (8, "tests/test_c.py::test_eof".to_string()),
+            ])
+        );
+
+        let parsed = cmp().parse_lines(&lines);
+        assert!(!parsed[0].is_summary);
+        assert!(parsed[2].is_summary);
+        assert!(parsed[3].is_summary);
+        assert!(!parsed[6].is_summary);
+        assert!(parsed[8].is_summary);
+    }
+
+    #[test]
+    fn recognizes_complete_crlf_short_summary_separators_and_preserves_content() {
+        let lines = [
+            "=== diagnostic: short test summary info unavailable\r",
+            "FAILED outside.py::test_before\r",
+            "=== short test summary info ===\r",
+            "FAILED tests/test_a.py::test_short\r",
+            "ERROR tests/test_b.py::test_long - RuntimeError: boom\r",
+            "=== 2 failed in 0.1s ===\r",
+            "FAILED outside.py::test_after\r",
+            "=== short test summary info ===\r",
+            "FAILED tests/test_c.py::test_eof - AssertionError\r",
+        ];
+
+        let entries = pytest_short_summary_entries(&lines);
+        assert_eq!(
+            entries,
+            BTreeMap::from([
+                (3, "tests/test_a.py::test_short".to_string()),
+                (4, "tests/test_b.py::test_long".to_string()),
+                (8, "tests/test_c.py::test_eof".to_string()),
+            ])
+        );
+
+        let parsed = cmp().parse_lines(&lines);
+        assert!(!parsed[1].is_summary);
+        assert!(parsed[3].is_summary);
+        assert!(parsed[4].is_summary);
+        assert!(!parsed[6].is_summary);
+        assert!(parsed[8].is_summary);
+        assert_eq!(parsed[3].content, lines[3]);
+    }
+
+    #[test]
+    fn keeps_all_crlf_short_summary_entries_with_non_binding_cap() {
+        let contents = pytest_failure_log(20, true)
+            .into_iter()
+            .map(|line| format!("{line}\r"))
+            .collect::<Vec<_>>();
+        let lines = contents.iter().map(String::as_str).collect::<Vec<_>>();
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_errors: 2,
+            error_context_lines: 0,
+            max_total_lines: 1_000,
+            min_lines_for_ccr: 50,
+            enable_ccr: false,
+            ..Default::default()
+        });
+
+        let parsed = c.parse_lines(&lines);
+        let mut selection_stats = LogCompressorStats::default();
+        let selected = c.select_lines(&parsed, 1_000.0, &mut selection_stats);
+        assert_eq!(selection_stats.lines_dropped_by_global_cap, 0);
+        for i in 0..20 {
+            let expected_id = format!("tests/test_generated.py::test_case{i}");
+            assert!(selected
+                .iter()
+                .any(|line| line.content.contains(&expected_id)));
+        }
+
+        let (result, compression_stats) = c.compress(&contents.join("\n"), 1_000.0);
+        assert_eq!(compression_stats.lines_dropped_by_global_cap, 0);
+        assert!(result.compressed_line_count < result.original_line_count);
+        for i in 0..20 {
+            let expected = format!("tests/test_generated.py::test_case{i}");
+            assert!(result
+                .compressed
+                .lines()
+                .any(|line| line.contains(&expected)));
+        }
+    }
+
+    #[test]
+    fn malformed_short_summary_diagnostic_does_not_recognize_protect_or_name_entries() {
+        let contents = malformed_short_summary_diagnostic_log();
+        let lines = contents.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(lines.len(), 71);
+        assert!(pytest_short_summary_entries(&lines).is_empty());
+
+        for keep_summary_lines in [false, true] {
+            let c = LogCompressor::new(LogCompressorConfig {
+                max_errors: 2,
+                error_context_lines: 0,
+                keep_summary_lines,
+                max_total_lines: 1_000,
+                enable_ccr: false,
+                ..Default::default()
+            });
+            let parsed = c.parse_lines(&lines);
+            assert!(parsed[51..].iter().all(|line| !line.is_summary));
+
+            let mut selection_stats = LogCompressorStats::default();
+            let selected = c.select_lines(&parsed, 1_000.0, &mut selection_stats);
+            assert_eq!(selection_stats.lines_dropped_by_global_cap, 0);
+            let selected_lookalikes = selected
+                .iter()
+                .filter(|line| matches!(line.level, LogLevel::Error | LogLevel::Fail))
+                .map(|line| line.line_number)
+                .collect::<Vec<_>>();
+            assert_eq!(selected_lookalikes, vec![51, 60, 61, 70]);
+
+            let (output, _) = c.format_output(&selected, &parsed);
+            assert!(!output.contains("; omitted: "));
+            if !keep_summary_lines {
+                assert_eq!(
+                    output,
+                    "FAILED outside.py::test_0\nFAILED outside.py::test_9\nERROR outside.py::test_10\nERROR outside.py::test_19\n[67 lines omitted: 10 ERROR, 10 FAIL, 51 INFO]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_all_short_summary_entries_with_non_binding_cap() {
+        for (failure_count, mixed) in [(15, false), (16, false), (20, true), (200, false)] {
+            let lines = pytest_failure_log(failure_count, mixed);
+            let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+            let c = LogCompressor::new(LogCompressorConfig {
+                max_errors: 10,
+                error_context_lines: 0,
+                max_total_lines: 1_000,
+                min_lines_for_ccr: 50,
+                enable_ccr: false,
+                ..Default::default()
+            });
+
+            let parsed = c.parse_lines(&refs);
+            let mut selection_stats = LogCompressorStats::default();
+            let selected = c.select_lines(&parsed, 1_000.0, &mut selection_stats);
+            assert_eq!(selection_stats.lines_dropped_by_global_cap, 0);
+            let selected_contents = selected
+                .iter()
+                .map(|line| line.content.as_str())
+                .collect::<BTreeSet<_>>();
+            for i in 0..failure_count {
+                let expected_id = format!("tests/test_generated.py::test_case{i}");
+                assert!(
+                    selected_contents.iter().any(|line| {
+                        line.strip_prefix("FAILED ")
+                            .or_else(|| line.strip_prefix("ERROR "))
+                            .map(|rest| rest.split_once(" - ").map_or(rest, |(id, _)| id))
+                            == Some(expected_id.as_str())
+                    }),
+                    "test_case{i} was not retained for {failure_count} failures"
+                );
+            }
+
+            let content = lines.join("\n");
+            let (result, compression_stats) = c.compress(&content, 1_000.0);
+            assert_eq!(compression_stats.lines_dropped_by_global_cap, 0);
+            assert!(result.compressed_line_count < result.original_line_count);
+            for i in 0..failure_count {
+                let expected_id = format!("tests/test_generated.py::test_case{i}");
+                assert!(
+                    result.compressed.lines().any(|line| {
+                        line.strip_prefix("FAILED ")
+                            .or_else(|| line.strip_prefix("ERROR "))
+                            .map(|rest| rest.split_once(" - ").map_or(rest, |(id, _)| id))
+                            == Some(expected_id.as_str())
+                    }),
+                    "test_case{i} was not in compressed output for {failure_count} failures"
+                );
+            }
+        }
+    }
+
+    /// The issue #3814 reproduction shape, with a distinct `E ` message per
+    /// failure so tests can tell which failure's detail survived.
+    fn pytest_issue_log(failure_count: usize) -> String {
+        let mut lines = vec![
+            "============================= test session starts ============================="
+                .to_string(),
+            "collected 400 items".to_string(),
+            String::new(),
+        ];
+        lines.extend(
+            (0..40).map(|i| {
+                format!("tests/test_module_{i:02}.py ..........................  [ {i:2}%]")
+            }),
+        );
+        lines.push(
+            "=================================== FAILURES =================================="
+                .into(),
+        );
+        for i in 1..=failure_count {
+            lines.extend([
+                format!("____________________ test_case{i:03} ____________________"),
+                String::new(),
+                ">       assert result == expected".to_string(),
+                format!("E       AssertionError: mismatch in test_case{i:03}"),
+                String::new(),
+                "tests/t.py:42: AssertionError".to_string(),
+            ]);
+        }
+        lines.push(
+            "=========================== short test summary info ==========================="
+                .into(),
+        );
+        lines.extend(
+            (1..=failure_count)
+                .map(|i| format!("FAILED tests/t.py::test_case{i:03} - AssertionError: mismatch")),
+        );
+        lines.push(format!(
+            "=============== {failure_count} failed, 380 passed in 41.02s =============="
+        ));
+        lines.join("\n")
+    }
+
+    #[test]
+    fn binding_cap_reserves_pytest_totals_and_first_error_line() {
+        for failure_count in [60, 200] {
+            let (result, stats) = cmp().compress(&pytest_issue_log(failure_count), 1.0);
+            assert!(stats.lines_dropped_by_global_cap > 0, "{failure_count}");
+            let out = &result.compressed;
+            assert!(
+                out.contains(&format!("{failure_count} failed, 380 passed")),
+                "totals line dropped at {failure_count}: {out}"
+            );
+            assert!(
+                out.contains("E       AssertionError: mismatch in test_case001"),
+                "first failure's E line dropped at {failure_count}: {out}"
+            );
+
+            // Every entry is still kept or named: kept + listed + K == total.
+            let kept = out
+                .lines()
+                .filter(|l| l.starts_with("FAILED tests/t.py::"))
+                .count();
+            let marker = out.lines().last().unwrap();
+            let named = marker
+                .split("; omitted: ")
+                .nth(1)
+                .expect("omitted entries must be named")
+                .trim_end_matches(']');
+            let listed = named.split(", ").filter(|p| !p.starts_with('+')).count();
+            let overflow = named
+                .rsplit(", +")
+                .next()
+                .and_then(|tail| tail.strip_suffix(" more"))
+                .map_or(0, |k| k.parse::<usize>().unwrap());
+            assert_eq!(kept + listed + overflow, failure_count, "{marker}");
+        }
+    }
+
+    #[test]
+    fn global_cap_precedence_is_flag_dependent_and_deterministic() {
+        let mut contents = (0..10)
+            .map(|i| format!("FAILED traceback.py::test_early_{i}\r"))
+            .collect::<Vec<_>>();
+        contents.push("================ short test summary info ================\r".into());
+        contents
+            .extend((0..10).map(|i| format!("FAILED tests/test_summary.py::test_summary_{i}\r")));
+        contents.push("================ 10 failed in 0.1s ================\r".into());
+        let lines = contents.iter().map(String::as_str).collect::<Vec<_>>();
+
+        // keep_summary_lines=true: the totals line (21) is reserved, and the
+        // short-summary entries win the remaining equal-score ties.
+        for (keep_summary_lines, expected) in [
+            (true, (11..20).chain([21]).collect::<Vec<_>>()),
+            (false, (0..10).collect::<Vec<_>>()),
+        ] {
+            let c = LogCompressor::new(LogCompressorConfig {
+                max_errors: 20,
+                error_context_lines: 0,
+                keep_summary_lines,
+                max_total_lines: 10,
+                ..Default::default()
+            });
+            let parsed = c.parse_lines(&lines);
+            let mut stats = LogCompressorStats::default();
+            let selected = c.select_lines(&parsed, 1.0, &mut stats);
+            assert!(
+                stats.lines_dropped_by_global_cap > 0,
+                "keep_summary_lines={keep_summary_lines}"
+            );
+            assert_eq!(
+                selected
+                    .iter()
+                    .map(|line| line.line_number)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1580,6 +2214,110 @@ mod tests {
     }
 
     #[test]
+    fn ccr_marker_includes_error_types_and_files_when_available() {
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_total_lines: 15,
+            max_errors: 2,
+            min_lines_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 0..10 {
+            content.push_str(&format!("INFO line {}\n", i));
+        }
+        // 15 distinct error codes across 15 distinct files -- well beyond
+        // max_total_lines=15 and max_errors=2, so most must be dropped and
+        // should surface in the marker's descriptor.
+        let codes = [
+            "E0425", "E0308", "E0599", "E0382", "E0502", "E0106", "E0433", "E0603", "E0507",
+            "E0716", "E0499", "E0658", "E0308", "E0596", "E0277",
+        ];
+        for (i, code) in codes.iter().enumerate() {
+            content.push_str(&format!(
+                "error[{code}]: real distinct compile error #{i}\n"
+            ));
+            content.push_str(&format!(" --> src/module_{i}.rs:{}:1\n", i + 1));
+        }
+
+        let store = InMemoryCcrStore::new();
+        let (result, stats) = c.compress_with_store(&content, 1.0, Some(&store));
+        assert!(stats.ccr_emitted, "expected a CCR marker to be emitted");
+        let compressed = &result.compressed;
+        assert!(
+            compressed.contains("exception type"),
+            "marker should describe dropped exception types: {compressed}"
+        );
+        assert!(
+            compressed.contains("file"),
+            "marker should describe dropped files: {compressed}"
+        );
+        // The retrieval contract must survive unchanged: downstream marker
+        // detection (Python `CCR_RETRIEVAL_MARKER_RE`, `tool_injection.py`)
+        // keys off this exact substring.
+        assert!(compressed.contains("Retrieve more: hash="));
+    }
+
+    #[test]
+    fn summarize_omitted_excludes_error_type_and_file_visible_in_kept_lines() {
+        // KeyError/foo.py appear in both a kept line and a dropped line;
+        // ValueError/bar.py appear only in a dropped line. The descriptor
+        // must describe only what retrieval would actually add, so the
+        // dropped-but-also-visible pair should not be repeated. File names
+        // themselves are never printed (the marker only counts distinct
+        // files), so this is checked via the file count, not file text.
+        let all_lines = vec![
+            LogLine::new(0, "KeyError: 'port'"),
+            LogLine::new(1, "File \"foo.py\", line 3"),
+            LogLine::new(2, "KeyError: 'port'"),
+            LogLine::new(3, "File \"foo.py\", line 9"),
+            LogLine::new(4, "ValueError: bad literal"),
+            LogLine::new(5, "File \"bar.py\", line 1"),
+        ];
+        // Lines 0 and 1 survive compression; 2-5 are dropped.
+        let selected = vec![all_lines[0].clone(), all_lines[1].clone()];
+
+        let descriptor = summarize_omitted(&all_lines, &selected);
+
+        assert!(
+            !descriptor.contains("KeyError"),
+            "KeyError is already visible in a kept line, should not repeat: {descriptor}"
+        );
+        assert!(
+            descriptor.contains("ValueError"),
+            "ValueError only appears in dropped lines, should be described: {descriptor}"
+        );
+        // Only bar.py should count: foo.py is excluded because it's also
+        // extractable from a kept line (line 1), so the dropped-file count
+        // must be 1, not 2.
+        assert_eq!(descriptor, ": 1 file, 1 exception type (ValueError)");
+    }
+
+    #[test]
+    fn ccr_marker_descriptor_empty_when_nothing_extractable() {
+        // Plain INFO/ERROR content with no exception-type or file-path
+        // shaped lines: the descriptor must stay empty rather than
+        // fabricate a label, and the pre-existing marker shape must be
+        // unchanged for content this feature has nothing to say about.
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_total_lines: 5,
+            min_lines_for_ccr: 5,
+            min_compression_ratio_for_ccr: 0.95,
+            ..Default::default()
+        });
+        let mut content = String::new();
+        for i in 0..50 {
+            content.push_str(&format!("INFO line {}\n", i));
+        }
+        content.push_str("ERROR boom\n");
+        let store = InMemoryCcrStore::new();
+        let (result, _stats) = c.compress_with_store(&content, 1.0, Some(&store));
+        assert!(result.compressed.contains("lines compressed to"));
+        assert!(!result.compressed.contains("exception type"));
+        assert!(!result.compressed.contains(" file"));
+    }
+
+    #[test]
     fn format_output_emits_summary_with_omitted_count() {
         let c = cmp();
         let all_lines = vec![
@@ -1605,6 +2343,115 @@ mod tests {
         assert!(output.contains("[3 lines omitted: 1 ERROR, 1 WARN, 2 INFO]"));
         assert_eq!(stats["errors"], 1);
         assert_eq!(stats["info"], 2);
+    }
+
+    #[test]
+    fn format_output_names_all_omitted_short_summary_entries_with_bounded_suffix() {
+        for count in [3, 5, 7] {
+            let mut contents = vec!["=== short test summary info ===\r".to_string()];
+            for i in 0..count {
+                contents.push(format!("FAILED tests/test_ids.py::test_{i}\r"));
+            }
+            contents.push("=== failures complete ===\r".to_string());
+            let refs = contents.iter().map(String::as_str).collect::<Vec<_>>();
+            let all_lines = cmp().parse_lines(&refs);
+            let selected = vec![all_lines[0].clone(), all_lines[count + 1].clone()];
+
+            let (output, _) = cmp().format_output(&selected, &all_lines);
+            let shown = (0..count.min(5))
+                .map(|i| format!("tests/test_ids.py::test_{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let overflow = if count > 5 {
+                format!(", +{} more", count - 5)
+            } else {
+                String::new()
+            };
+            assert!(
+                output.ends_with(&format!(
+                    "[{count} lines omitted: {count} FAIL, 1 INFO; omitted: {shown}{overflow}]"
+                )),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_output_omission_naming_tracks_identity_order_and_repeated_ids() {
+        let contents = [
+            "=== short test summary info ===",
+            "ERROR tests/test_ids.py::test_error - RuntimeError: boom",
+            "FAILED tests/test_ids.py::test_repeat",
+            "FAILED tests/test_ids.py::test_repeat - first failure",
+            "FAILED tests/test_ids.py::test_kept",
+            "=== failures complete ===",
+        ];
+        let all_lines = cmp().parse_lines(&contents);
+        let selected = vec![
+            all_lines[0].clone(),
+            all_lines[4].clone(),
+            all_lines[5].clone(),
+        ];
+
+        let (output, stats) = cmp().format_output(&selected, &all_lines);
+        assert!(
+            output.ends_with(
+                "[3 lines omitted: 1 ERROR, 3 FAIL, 1 INFO; omitted: tests/test_ids.py::test_error, tests/test_ids.py::test_repeat, tests/test_ids.py::test_repeat]"
+            ),
+            "{output}"
+        );
+        assert_eq!(stats["errors"], 1);
+        assert_eq!(stats["fails"], 3);
+    }
+
+    #[test]
+    fn keep_summary_lines_false_names_entries_omitted_by_category_selection() {
+        let contents = [
+            "=== short test summary info ===",
+            "FAILED tests/test_ids.py::test_0",
+            "FAILED tests/test_ids.py::test_1",
+            "FAILED tests/test_ids.py::test_2",
+            "FAILED tests/test_ids.py::test_3",
+            "=== failures complete ===",
+        ];
+        let c = LogCompressor::new(LogCompressorConfig {
+            max_errors: 2,
+            error_context_lines: 0,
+            keep_summary_lines: false,
+            max_total_lines: 100,
+            ..Default::default()
+        });
+        let all_lines = c.parse_lines(&contents);
+        let mut selection_stats = LogCompressorStats::default();
+        let selected = c.select_lines(&all_lines, 100.0, &mut selection_stats);
+        assert_eq!(selection_stats.lines_dropped_by_global_cap, 0);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|line| line.line_number)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+
+        let (output, _) = c.format_output(&selected, &all_lines);
+        assert!(
+            output.ends_with(
+                "[4 lines omitted: 4 FAIL, 1 INFO; omitted: tests/test_ids.py::test_1, tests/test_ids.py::test_2]"
+            ),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn format_output_marker_is_unchanged_without_omitted_short_summary_entries() {
+        let c = cmp();
+        let mut error = LogLine::new(0, "ERROR a");
+        error.level = LogLevel::Error;
+        let mut info = LogLine::new(1, "INFO b");
+        info.level = LogLevel::Info;
+
+        let (output, _) = c.format_output(&[error.clone()], &[error, info]);
+        assert_eq!(output, "ERROR a\n[1 lines omitted: 1 ERROR, 1 INFO]");
     }
 
     #[test]

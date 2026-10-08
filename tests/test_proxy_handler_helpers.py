@@ -141,6 +141,9 @@ class _VertexGeminiImageRequest:
         query="",
     )
 
+    async def stream(self):
+        yield await self.body()
+
     async def body(self) -> bytes:
         return json.dumps(
             {
@@ -402,6 +405,91 @@ def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> N
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
     assert system == [{"type": "text", "text": "mid-turn instruction"}]
+
+
+def test_relocate_system_messages_keeps_image_blocks_out_of_top_level_system() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "look at this"}]},
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "<system-reminder>image attached</system-reminder>"},
+                image_block,
+            ],
+        },
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+    ]
+    system = [{"type": "text", "text": "You are Claude Code."}]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is True
+    assert isinstance(new_system, list)
+    assert all(not isinstance(block, dict) or block.get("type") == "text" for block in new_system)
+    retained = [
+        message.get("content")
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert any(image_block in (content or []) for content in retained)
+
+
+def test_relocate_system_messages_hoists_only_text_from_mixed_sections() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "system",
+            "content": [
+                "plain string section",
+                {"type": "text", "text": "structured note"},
+                {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            ],
+        },
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, None, None)
+
+    assert changed is True
+    assert new_system == [
+        {"type": "text", "text": "plain string section"},
+        {"type": "text", "text": "structured note"},
+    ]
+    retained = [
+        message
+        for message in clean
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    assert retained == [
+        {
+            "role": "system",
+            "content": [{"type": "image", "source": {"type": "url", "url": "https://x/y.png"}}],
+        }
+    ]
+
+
+def test_relocate_system_messages_image_only_sections_pass_through_unchanged() -> None:
+    image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "system", "content": [image_block]},
+        {"role": "assistant", "content": "ok"},
+    ]
+    system = "base"
+
+    clean, new_system, changed = relocate_system_messages_to_top_level(messages, system, None)
+
+    assert changed is False
+    assert clean == messages
+    assert new_system == system
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
@@ -685,6 +773,85 @@ def test_stream_finalizer_records_vertex_provider_for_dashboard() -> None:
     assert outcome.cache_read_tokens == 2
 
 
+def _finalize_anthropic_stream(optimized_tokens, input_tokens):  # noqa: ANN001, ANN202
+    handler = object.__new__(HeadroomProxy)
+    handler.config = SimpleNamespace(log_full_messages=False)
+    outcomes = []
+
+    async def record(outcome):  # noqa: ANN001, ANN202
+        outcomes.append(outcome)
+
+    handler._record_request_outcome = record
+
+    asyncio.run(
+        handler._finalize_stream_response(
+            body={"messages": [{"role": "user", "content": "hello"}]},
+            provider="anthropic",
+            model="claude-opus-4-1",
+            request_id="req_anthropic_stream_final",
+            original_tokens=optimized_tokens + 5,
+            optimized_tokens=optimized_tokens,
+            tokens_saved=5,
+            transforms_applied=[],
+            optimization_latency=1.0,
+            stream_state={
+                "input_tokens": input_tokens,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 360_949,
+                "cache_creation_input_tokens": 840,
+                "cache_creation_ephemeral_5m_input_tokens": 0,
+                "cache_creation_ephemeral_1h_input_tokens": 840,
+                "total_bytes": 100,
+                "sse_buffer": bytearray(),
+                "ttfb_ms": 4.0,
+            },
+            start_time=0.0,
+        )
+    )
+    (outcome,) = outcomes
+    return outcome
+
+
+@pytest.mark.parametrize(
+    "optimized_tokens",
+    [
+        # Local count 50k over the provider's (a production turn reported
+        # input_tokens=2 while the old derivation logged 50,663 uncached).
+        412_452,
+        # Local count under the provider's: the old derivation clamped to 0.
+        300_000,
+    ],
+)
+def test_stream_finalizer_takes_anthropic_uncached_input_from_usage(optimized_tokens) -> None:  # noqa: ANN001
+    outcome = _finalize_anthropic_stream(optimized_tokens, input_tokens=2)
+
+    assert outcome.uncached_input_tokens == 2
+    assert outcome.cache_read_tokens == 360_949
+    assert outcome.cache_write_tokens == 840
+
+
+def test_stream_finalizer_derives_anthropic_uncached_input_without_usage() -> None:
+    # No message_start usage (an error before the stream began): keep the
+    # tokenizer-based derivation.
+    outcome = _finalize_anthropic_stream(400_000, input_tokens=None)
+
+    assert outcome.uncached_input_tokens == 400_000 - 360_949 - 840
+
+
+def test_sse_parser_leaves_absent_anthropic_input_tokens_absent() -> None:
+    # A message_start usage without input_tokens must not read as a provider
+    # count of 0, or the finalizer books 0 uncached instead of deriving it.
+    proxy = object.__new__(HeadroomProxy)
+    event = {"type": "message_start", "message": {"usage": {"cache_read_input_tokens": 9}}}
+    state = {"sse_buffer": bytearray(f"data: {json.dumps(event)}\n\n".encode())}
+
+    usage = proxy._parse_sse_usage_from_buffer(state, "anthropic")
+
+    assert usage is not None
+    assert "input_tokens" not in usage
+    assert usage["cache_read_input_tokens"] == 9
+
+
 def test_vertex_gemini_non_text_generate_records_dashboard_outcome() -> None:
     handler = object.__new__(HeadroomProxy)
     handler.memory_handler = None
@@ -857,6 +1024,50 @@ def test_anthropic_tool_sort_and_context_append_helpers() -> None:
     ) == [{"role": "user", "content": [{"type": "text", "text": "hello\n\nctx"}]}]
 
 
+def test_append_context_skips_trailing_system_message() -> None:
+    # Claude Code 2.1.x request shape: the user turn is followed by a
+    # role="system" message carrying the environment and the cache breakpoint.
+    trailing_system = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}
+        ],
+    }
+    user_turn = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "<system-reminder>ctx</system-reminder>"},
+            {"type": "text", "text": "question"},
+        ],
+    }
+    inject = AnthropicHandlerMixin._append_context_to_latest_non_frozen_user_turn
+
+    assert inject([user_turn, trailing_system], "memory", frozen_message_count=0) == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<system-reminder>ctx</system-reminder>\n\nmemory"},
+                {"type": "text", "text": "question"},
+            ],
+        },
+        trailing_system,
+    ]
+    # The user turn is still subject to the frozen prefix.
+    messages = [user_turn, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=1) is messages
+    # Skipping system messages never reaches past a non-user turn.
+    messages = [user_turn, {"role": "assistant", "content": "ok"}, trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    # Tool-result-only turns have no text block to extend.
+    messages = [
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]},
+        trailing_system,
+    ]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+    messages = [trailing_system]
+    assert inject(messages, "memory", frozen_message_count=0) is messages
+
+
 def test_anthropic_image_compression_helper_only_rewrites_latest_eligible_turn() -> None:
     image_message = {
         "role": "user",
@@ -1017,8 +1228,8 @@ def test_anthropic_assistant_message_helper_requires_assistant_role() -> None:
 # anthropic handler uses to scope the proactive-expansion cache by
 # project identity. The resolver shares its tier order with the memory
 # subsystem's ProjectResolver: x-headroom-project-id → x-headroom-cwd →
-# system-prompt `cwd:` line. Returns `("", None)` on no signal — the
-# fail-closed signal that callers gate on.
+# CLI override → system-prompt `cwd:` line. Returns `("", None)` on
+# no signal — the fail-closed signal that callers gate on.
 # ============================================================================
 
 
@@ -1031,7 +1242,7 @@ def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
     """x-headroom-project-id is the highest-priority signal."""
     request = _fake_request({"x-headroom-project-id": "my-cool-project"})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     assert key.startswith("my-cool-project-")
     assert len(key.split("-")[-1]) == 16
     assert label == "my-cool-project"
@@ -1041,29 +1252,73 @@ def test_resolve_ccr_workspace_cwd_header() -> None:
     """x-headroom-cwd produces a stable per-cwd key + basename label."""
     request = _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     # Key format: "{basename}-{sha256[:16]}" — stable per absolute cwd.
     assert key.startswith("daphni-rails-")
     assert len(key) >= len("daphni-rails-") + 16
     assert label == "daphni-rails"
 
 
+def test_resolve_ccr_workspace_uses_configured_project_root_override() -> None:
+    """The CLI project-root override reaches CCR workspace resolution."""
+    handler = AnthropicHandlerMixin()
+    handler.config = SimpleNamespace(memory_project_root_override="/home/user/code/project-c")
+
+    key, label = handler._resolve_ccr_workspace(_fake_request({}), {})
+
+    assert key.startswith("project-c-")
+    assert label == "project-c"
+
+
 def test_resolve_ccr_workspace_two_cwds_get_distinct_keys() -> None:
     """Two different cwds produce different workspace keys (cross-leak prevention)."""
-    key_a, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+    handler = AnthropicHandlerMixin()
+    key_a, _ = handler._resolve_ccr_workspace(
         _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"}), {}
     )
-    key_b, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+    key_b, _ = handler._resolve_ccr_workspace(
         _fake_request({"x-headroom-cwd": "/home/user/code/tamag0"}), {}
     )
     assert key_a != key_b, "different cwds must yield different workspace keys"
+
+
+def test_resolve_ccr_workspace_project_label_alone_fails_closed() -> None:
+    """The savings label must not become a memory/CCR identity."""
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request({"x-headroom-project": "api"}), {}
+    )
+    assert key == ""
+    assert label is None
+
+
+def test_resolve_ccr_workspace_project_label_does_not_collapse_cwds() -> None:
+    """A user-supplied label cannot merge two distinct cwd identities."""
+    key_a, _ = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request(
+            {
+                "x-headroom-project": "api",
+                "x-headroom-cwd": "/work/acme/api",
+            }
+        ),
+        {},
+    )
+    key_b, _ = AnthropicHandlerMixin()._resolve_ccr_workspace(
+        _fake_request(
+            {
+                "x-headroom-project": "api",
+                "x-headroom-cwd": "/work/other/api",
+            }
+        ),
+        {},
+    )
+    assert key_a != key_b
 
 
 def test_resolve_ccr_workspace_no_signal_returns_empty() -> None:
     """No project-id, no cwd header, no system prompt → fail-closed signal."""
     request = _fake_request({})
     body = {}
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
 
@@ -1074,7 +1329,7 @@ def test_resolve_ccr_workspace_system_prompt_cwd_fallback() -> None:
     body = {
         "system": [{"type": "text", "text": "You are helpful.\ncwd: /home/u/code/my-project\nGo."}]
     }
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     # The label is the basename of the cwd extracted from the prompt.
     assert label == "my-project"
     assert key.startswith("my-project-")
@@ -1092,7 +1347,7 @@ def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
     # The helper catches the exception, logs it, and returns the fail-
     # closed sentinel ("", None). Critically, it does NOT raise — the
     # proxy must continue serving the request even if CCR scoping fails.
-    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    key, label = AnthropicHandlerMixin()._resolve_ccr_workspace(request, body)
     assert key == ""
     assert label is None
 

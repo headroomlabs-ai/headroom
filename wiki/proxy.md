@@ -10,13 +10,13 @@ The Headroom proxy server is a production-ready HTTP server that applies context
 # Basic usage
 headroom proxy
 
-# Custom port
-headroom proxy --port 8080
+# Deliberate public access, with the existing token protocol
+HEADROOM_PROXY_TOKEN='replace-with-a-secret' headroom proxy --host 0.0.0.0 --port 8080
+# Send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret` from the caller.
 
-# With all options
+# With logging and budget
 headroom proxy \
-  --host 0.0.0.0 \
-  --port 8787 \
   --log-file /var/log/headroom.jsonl \
   --budget 100.0
 ```
@@ -348,7 +348,7 @@ Optionally relay the provider's usage for attribution with `POST /v1/usage` `{"s
 
 **Gateway mode (two-half turn contract).** Add a top-level `gateway` object (`{}` is enough) and one model turn becomes two calls, so a gateway that never lets Headroom see the provider response can still run transforms whose reload step needs it — the proxy's "no shrink without reload" rule at the API boundary. `gateway` fields: `can_redrive` (default `false`: the gateway can call the provider again with a request Headroom hands it; send `false` when streaming), `can_relay_response` (default `false`: the gateway will post status/usage after each turn), `session_affinity` (default `true`; `false` disables re-driving because pending turns are in-process), `plugin_version` (diagnostics). Every other top-level field (`system`, `tools`, `temperature`, …) passes through; `tools` is compacted deterministically (`tool_schema_compaction`; `tool_desc_compaction` with `HEADROOM_TOOL_DESC_MAX_CHARS`); extension turn hooks run, stream-safe-only unless `can_redrive` and `session_affinity` both hold. The response adds `body` (the complete provider request — forward it as-is; never contains `config`, `gateway`, `token_budget`), `turn_id`, `route` (`{model, provider, service_tier, reason}`, advisory; a routing extension's model is also written into `body.model`), `obligations` (`redrive` and/or `relay_usage`) and a `gateway` echo. Fail-open answers carry the same keys with originals and `obligations: []`. A turn is registered only when `obligations` is non-empty; with `relay_usage` the `/stats` record waits for the response half. Knobs: `HEADROOM_GATEWAY_TURN_TTL_SECONDS` (120), `HEADROOM_GATEWAY_MAX_PENDING_TURNS` (10000), `HEADROOM_GATEWAY_MAX_REDRIVES` (8). With `config.mode: "ccr"` and re-drive allowed, `headroom_retrieve` is injected into `body.tools` (`ccr_tool_injected`) and the response half answers the model's retrieval calls itself.
 
-`POST /v1/compress/response` (same exposure rules as `/v1/compress`) is the response half: `{"turn_id", "status": 200, "latency_ms", "usage": {...}, "response": {...}}`. `usage` accepts Anthropic, OpenAI chat (`prompt_tokens_details.cached_tokens`), OpenAI Responses (`input_tokens_details.cached_tokens`) and Kong's flat `cached_tokens` shapes, or the whole provider body (a nested `usage` key is descended into once); billed counters are summed across re-drive rounds. `response` is required when the turn carries `redrive`. Answers: `{"action": "done", "turn_id", "response": <replacement or null — forward what you hold>, "frozen_message_count", "usage_applied", "rounds"}` or `{"action": "redrive", "turn_id", "request": <full provider body to send>, "round"}` — post the provider's JSON back under the same `turn_id`; past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and `response: null`. Errors: 400 `invalid_request` / `missing_response`, 404 `unknown_turn` (unregistered, finished, or expired), 409 `turn_busy`.
+`POST /v1/compress/response` (same exposure rules as `/v1/compress`) is the response half: `{"turn_id", "status": 200, "latency_ms", "usage": {...}, "response": {...}}`. `usage` accepts Anthropic, OpenAI chat (`prompt_tokens_details.cached_tokens`), OpenAI Responses (`input_tokens_details.cached_tokens`) and Kong's flat `cached_tokens` shapes, or the whole provider body (a nested `usage` key is descended into once); billed counters are summed across re-drive rounds. `response` is required when the turn carries `redrive` and the provider call succeeded; a failed call closes the turn with its `status` alone. Answers: `{"action": "done", "turn_id", "response": <replacement, the latest provider response after a re-drive, or null — forward what you hold>, "frozen_message_count", "usage_applied", "rounds", "billed_usage"}` or `{"action": "redrive", "turn_id", "request": <full provider body to send>, "round"}` — post the provider's JSON back under the same `turn_id`; `billed_usage` sums every counter (cache reads and writes included) across rounds in Anthropic keys, and a re-driven turn's `response` is never null and reports that total as its `usage`; past `HEADROOM_GATEWAY_MAX_REDRIVES` the turn ends with `done` and the latest provider response. Errors: 400 `invalid_request` / `missing_response`, 404 `unknown_turn` (unregistered, finished, or expired), 409 `turn_busy`.
 
 **Kong plugin.** [kong-plugin-headroom](https://github.com/headroomlabs-ai/kong-plugin-headroom) (its own repo; `luarocks install kong-plugin-headroom`) implements both halves for Kong Gateway 3.9 (session id from a header, usage relay from the `log` phase, re-drive loop in `access`). The contract itself is installed in Headroom through the compress-turn seam (`headroom.proxy.compress_turn`, `HEADROOM_GATEWAY_CONTRACT`), the same seam a third-party contract would use.
 
@@ -427,7 +427,9 @@ headroom_latency_ms_sum
 ## Configuration via Environment
 
 ```bash
+# For deliberate public access, configure the existing token and send it from callers.
 export HEADROOM_HOST=0.0.0.0
+export HEADROOM_PROXY_TOKEN='replace-with-a-secret'
 export HEADROOM_PORT=8787
 export HEADROOM_BUDGET=100.0
 
@@ -455,6 +457,8 @@ gunicorn headroom.proxy.server:create_app \
   --bind 0.0.0.0:8787 \
   --worker-class uvicorn.workers.UvicornWorker \
   --factory
+# Callers must send `Authorization: Bearer replace-with-a-secret` or
+# `X-Headroom-Proxy-Token: replace-with-a-secret`.
 ```
 
 Or with Docker:
@@ -466,7 +470,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && apt-get purge -y build-essential && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 EXPOSE 8787
-CMD ["headroom", "proxy", "--host", "0.0.0.0"]
+CMD ["headroom", "proxy", "--host", "0.0.0.0", "--port", "8787"]
 ```
+
+Run this image with an explicit token and a deliberate publication choice:
+
+```bash
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -e HEADROOM_PROXY_TOKEN='replace-with-a-secret' \
+  headroom-proxy
+```
+
+Callers must send `Authorization: Bearer replace-with-a-secret` or
+`X-Headroom-Proxy-Token: replace-with-a-secret`. For network access, replace
+the host-side `127.0.0.1` with an intentional public address and keep the
+token configured.
 
 > **Note:** `build-essential` is required at install time because `headroom-ai` includes `hnswlib`, a C++ extension that must be compiled from source. It is removed after installation to keep the image slim.

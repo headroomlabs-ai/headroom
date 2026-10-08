@@ -204,9 +204,17 @@ name = "tokenizer"
 harness = false
 
 [[bench]]
+name = "live_zone_dispatch"
+harness = false
+
+[[bench]]
 name = "ccr_store"
 harness = false
 
 [[bench]]
 name = "auth_mode"
+harness = false
+
+[[bench]]
+name = "bm25_scoring"
 harness = false

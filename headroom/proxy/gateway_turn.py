@@ -49,6 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.gateway_responses import VIEW_MARKER as GATEWAY_RESPONSES_VIEW_MARKER
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.turn_hooks import (
     TurnContext,
@@ -61,7 +62,9 @@ from headroom.proxy.turn_hooks import (
 logger = logging.getLogger(__name__)
 
 # Keys that steer Headroom itself and must never reach the provider.
-BODY_CONTROL_KEYS: frozenset[str] = frozenset({"config", "gateway", "token_budget"})
+BODY_CONTROL_KEYS: frozenset[str] = frozenset(
+    {"config", "gateway", "token_budget", GATEWAY_RESPONSES_VIEW_MARKER}
+)
 
 OBLIGATION_REDRIVE = "redrive"
 OBLIGATION_RELAY_USAGE = "relay_usage"
@@ -228,6 +231,13 @@ class NormalizedUsage:
     output_tokens: int | None = None
     cache_read: int | None = None
     cache_write: int | None = None
+    # Whether ``input_tokens`` already counts the cached prompt. Anthropic's
+    # ``input_tokens`` is the uncached remainder (reads and writes are reported
+    # beside it); OpenAI's ``prompt_tokens`` is the whole prompt with
+    # ``cached_tokens`` as a subset of it. Billing the prompt correctly needs to
+    # know which of the two arrived, so normalize_usage records it rather than
+    # letting each consumer guess.
+    input_includes_cache: bool = False
 
     @property
     def has_cache_signal(self) -> bool:
@@ -263,6 +273,37 @@ class NormalizedUsage:
             cache_write=other.cache_write if other.has_cache_signal else self.cache_write,
         )
 
+    def summed_with(self, other: NormalizedUsage) -> NormalizedUsage:
+        """Sum every counter across re-drive rounds: what the provider billed
+        for the whole turn, cache reads and writes of every round included.
+        ``merged_with`` keeps the latest cache state for freeze decisions;
+        this is the bill."""
+
+        def _sum(a: int | None, b: int | None) -> int | None:
+            if a is None and b is None:
+                return None
+            return (a or 0) + (b or 0)
+
+        return NormalizedUsage(
+            input_tokens=_sum(self.input_tokens, other.input_tokens),
+            output_tokens=_sum(self.output_tokens, other.output_tokens),
+            cache_read=_sum(self.cache_read, other.cache_read),
+            cache_write=_sum(self.cache_write, other.cache_write),
+        )
+
+    def as_anthropic(self) -> dict[str, int]:
+        """Anthropic ``usage`` keys, only for the counters that were reported."""
+        out: dict[str, int] = {}
+        if self.input_tokens is not None:
+            out["input_tokens"] = self.input_tokens
+        if self.output_tokens is not None:
+            out["output_tokens"] = self.output_tokens
+        if self.cache_read is not None:
+            out["cache_read_input_tokens"] = self.cache_read
+        if self.cache_write is not None:
+            out["cache_creation_input_tokens"] = self.cache_write
+        return out
+
 
 def _usage_int(usage: dict[str, Any], name: str) -> int | None:
     if name not in usage:
@@ -293,6 +334,16 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
     input_tokens = _usage_int(usage, "input_tokens")
     if input_tokens is None:
         input_tokens = _usage_int(usage, "prompt_tokens")
+    # Anthropic alone reports the prompt split in two: ``input_tokens`` is the
+    # uncached remainder and the cached part sits in its own two counters.
+    # Everywhere else the reported prompt total already contains the cached
+    # prefix — including OpenAI's Responses API, which names its field
+    # ``input_tokens`` too, so the key name cannot be the discriminator. Keying
+    # off Anthropic's cache fields can misread only a relay that mixes the two
+    # vocabularies, and then it errs towards not inflating the prompt.
+    input_includes_cache = not (
+        "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage
+    )
     output_tokens = _usage_int(usage, "output_tokens")
     if output_tokens is None:
         output_tokens = _usage_int(usage, "completion_tokens")
@@ -317,6 +368,7 @@ def normalize_usage(usage: dict[str, Any]) -> NormalizedUsage:
         output_tokens=output_tokens,
         cache_read=cache_read,
         cache_write=cache_write,
+        input_includes_cache=input_includes_cache,
     )
 
 
@@ -475,14 +527,32 @@ class PendingTurn:
     runner: SuspendedHookRunner | None = None
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
-    # Billed usage accumulated across every response-half call for the turn.
+    # Usage accumulated across every response-half call for the turn: input
+    # and output summed, cache fields from the latest round (freeze state).
     usage: NormalizedUsage | None = None
+    # Every counter summed across rounds: the turn's bill.
+    billed: NormalizedUsage | None = None
     # A second response-half call while one is being driven would race the
     # parked coroutine; the handler answers 409 instead.
     in_flight: bool = False
     # config.mode="ccr" with markers inserted and re-drive allowed: the
     # response half answers headroom_retrieve calls itself (see arm_ccr_redrive).
     ccr_armed: bool = False
+    # The wire shape this turn arrived in, when it is not the one `provider`
+    # implies: "openai_responses" for a Codex body. Deliberately separate from
+    # `provider`, which picks pricing, tokenizer and the upstream the gateway
+    # is advised to call -- all three want "openai" for a Responses turn while
+    # the tool-call shape and the re-drive body want "openai_responses".
+    wire_shape: str | None = None
+
+    @property
+    def tool_call_provider(self) -> str:
+        """The shape the CCR helpers read and write tool calls in."""
+        return self.wire_shape or self.provider
+
+    @property
+    def responses_shape(self) -> bool:
+        return self.wire_shape == "openai_responses"
 
     @property
     def hooks_armed(self) -> bool:
@@ -895,6 +965,7 @@ def arm_ccr_redrive(
     caps: GatewayCapabilities,
     mode: str | None,
     ccr_hashes: list[str],
+    responses_shape: bool = False,
 ) -> bool:
     """``config.mode="ccr"`` on the gateway contract: inject ``headroom_retrieve``
     and make the response half answer it.
@@ -921,7 +992,9 @@ def arm_ccr_redrive(
         for t in tools
     )
     if not present:
-        tools.append(create_ccr_tool_definition(provider))
+        tools.append(
+            create_ccr_tool_definition("openai_responses" if responses_shape else provider)
+        )
         result.transforms.append("ccr_tool_injected")
     result.tools = tools
     if result.ctx is not None:
@@ -945,7 +1018,7 @@ def make_response_runner(proxy: Any, turn: PendingTurn) -> Callable[..., Any]:
         handler = getattr(proxy, "ccr_response_handler", None)
         if turn.ccr_armed and handler is not None:
             try:
-                if handler.has_ccr_tool_calls(current, turn.provider):
+                if handler.has_ccr_tool_calls(current, turn.tool_call_provider):
 
                     async def api_call_fn(messages: list[dict[str, Any]], tools: Any) -> Any:
                         # Mirrors the chat path's continuation closure: the
@@ -955,7 +1028,11 @@ def make_response_runner(proxy: Any, turn: PendingTurn) -> Callable[..., Any]:
                         return await call_model(messages)
 
                     current = await handler.handle_response(
-                        current, ctx.messages, ctx.tools, api_call_fn, provider=turn.provider
+                        current,
+                        ctx.messages,
+                        ctx.tools,
+                        api_call_fn,
+                        provider=turn.tool_call_provider,
                     )
             except asyncio.CancelledError:
                 raise
@@ -972,9 +1049,38 @@ def build_provider_body(
     tools: Any,
 ) -> dict[str, Any]:
     """The complete provider request: every pass-through field, final
-    ``messages`` and ``tools``; never the Headroom control keys."""
+    ``messages`` and ``tools``; never the Headroom control keys.
+
+    A Responses body (Codex) reached the handler as ``input`` and was given a
+    chat-shaped view under ``messages`` so the pipeline could work on it. Here
+    that goes back: the compressed text is written into ``input`` and the view
+    is dropped, so the gateway forwards the shape its client actually sent. If
+    the view cannot be mapped back confidently the original ``input`` is
+    forwarded uncompressed -- a smaller request is worth nothing next to a
+    transcript the provider will reject.
+    """
+    from headroom.proxy.gateway_responses import apply_view as apply_responses_view
+    from headroom.proxy.gateway_responses import carries_view, is_responses_body
+
     out = {k: v for k, v in body.items() if k not in BODY_CONTROL_KEYS}
-    out["messages"] = messages
+    if carries_view(body):
+        out, applied = apply_responses_view(out, messages)
+        out.pop("messages", None)
+        if not applied and messages:
+            # The transcript goes out as it arrived while the answer's
+            # `tokens_after` says otherwise, so say so once rather than let a
+            # gateway quietly report a saving that was not taken.
+            logger.warning(
+                "gateway turn: Responses view did not map back; forwarding the original input"
+            )
+    elif is_responses_body(out):
+        # A Responses body that never got a view: the bypass header returns
+        # before one is built. Adding `messages` here is a guaranteed 400
+        # ("Unsupported parameter: 'messages'"), so the safest path in the
+        # handler would have been the one that broke every Codex request.
+        pass
+    else:
+        out["messages"] = messages
     if tools is not None:
         out["tools"] = tools
     return out
@@ -1152,6 +1258,7 @@ def register_pending_turn(
     tags: dict[str, Any],
     client: str | None,
     ccr_armed: bool = False,
+    wire_shape: str | None = None,
 ) -> PendingTurn | None:
     """Register the turn when there is something to wait for; ``None`` otherwise."""
     registry = getattr(proxy, "gateway_turns", None)
@@ -1174,6 +1281,7 @@ def register_pending_turn(
         tags=tags,
         client=client,
         ccr_armed=ccr_armed,
+        wire_shape=wire_shape,
     )
     registry.register(turn)
     return turn
@@ -1268,14 +1376,33 @@ def complete_outcome(
     tokenizer scale), output and the two cache counters as reported, provider
     status so a 5xx is funnelled as a failure, and the gateway's provider
     latency added to the compress-side wall clock.
+
+    ``provider_input_tokens`` is the WHOLE billed prompt, cached part included,
+    matching what the direct Anthropic handler records. Anthropic's
+    ``input_tokens`` counts only the uncached remainder, so on that shape the
+    cache counters are added back; every other shape already contains them, so
+    the cached part is subtracted to get ``uncached_input_tokens``.
+    Recording only the uncached sliver here left every ratio built on the input
+    counter (notably ``/stats`` ``tokens.savings_percent``) dividing savings by
+    a denominator tens of times too small on cache-heavy agent traffic.
     """
     usage = usage or NormalizedUsage()
+    cache_read = usage.cache_read or 0
+    cache_write = usage.cache_write or 0
+    reported_input = usage.input_tokens or 0
+    if usage.input_includes_cache:
+        billed_input = reported_input
+        uncached_input = max(reported_input - cache_read - cache_write, 0)
+    else:
+        billed_input = reported_input + cache_read + cache_write
+        uncached_input = reported_input
     return dataclasses.replace(
         draft,
         output_tokens=usage.output_tokens or 0,
-        provider_input_tokens=usage.input_tokens or 0,
-        cache_read_tokens=usage.cache_read or 0,
-        cache_write_tokens=usage.cache_write or 0,
+        provider_input_tokens=billed_input,
+        uncached_input_tokens=uncached_input,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
         status_code=status,
         total_latency_ms=draft.total_latency_ms + float(latency_ms or 0.0),
     )
@@ -1314,7 +1441,23 @@ def _redrive_payload(turn: PendingTurn, step: Step) -> dict[str, Any]:
     its (possibly reloaded) tools, everything else exactly as the gateway sent.
     """
     redrive_body = dict(turn.body)
-    redrive_body["messages"] = step.messages
+    if turn.responses_shape:
+        # `turn.body` is the provider body: a Responses turn's transcript lives
+        # in `input`, and writing `messages` beside it -- even a null one --
+        # hands the gateway the shape the provider rejects. Fold the hook's
+        # messages back the way the request half did, and when a step carries
+        # none, leave the transcript exactly as it is.
+        if step.messages is not None:
+            from headroom.proxy.gateway_responses import apply_view as apply_responses_view
+
+            redrive_body, applied = apply_responses_view(redrive_body, step.messages)
+            if not applied and step.messages:
+                logger.warning(
+                    "gateway turn %s: re-drive view did not map back; sending the original input",
+                    turn.turn_id,
+                )
+    else:
+        redrive_body["messages"] = step.messages
     if step.tools is not None:
         redrive_body["tools"] = step.tools
     return {
@@ -1323,6 +1466,31 @@ def _redrive_payload(turn: PendingTurn, step: Step) -> dict[str, Any]:
         "request": redrive_body,
         "round": turn.rounds,
     }
+
+
+def _usage_in_shape(existing: dict[str, Any], billed: NormalizedUsage) -> dict[str, Any]:
+    """Overwrite ``existing`` usage counters with ``billed``, keeping its shape.
+
+    An OpenAI chat usage block (``prompt_tokens``) gets chat keys; anything
+    else gets Anthropic keys. Counters the provider never reported stay out.
+    """
+    out = dict(existing)
+    if "prompt_tokens" in existing or "completion_tokens" in existing:
+        if billed.input_tokens is not None:
+            out["prompt_tokens"] = billed.input_tokens
+        if billed.output_tokens is not None:
+            out["completion_tokens"] = billed.output_tokens
+        if billed.input_tokens is not None or billed.output_tokens is not None:
+            out["total_tokens"] = (billed.input_tokens or 0) + (billed.output_tokens or 0)
+        if billed.cache_read is not None:
+            details = existing.get("prompt_tokens_details")
+            out["prompt_tokens_details"] = {
+                **(details if isinstance(details, dict) else {}),
+                "cached_tokens": billed.cache_read,
+            }
+        return out
+    out.update(billed.as_anthropic())
+    return out
 
 
 async def handle_compress_response(proxy: Any, request: Any) -> Any:
@@ -1375,7 +1543,9 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
             "unknown_turn",
             f"No pending turn {turn_id!r} (never registered, already finished, or expired).",
         )
-    if OBLIGATION_REDRIVE in turn.obligations and response is None:
+    # A failed provider call has nothing to re-drive: its status (and usage,
+    # if any) closes the turn. Only a successful response must carry the body.
+    if OBLIGATION_REDRIVE in turn.obligations and response is None and 200 <= status < 300:
         return _error(
             400,
             "missing_response",
@@ -1416,6 +1586,7 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
     try:
         if usage is not None:
             turn.usage = usage if turn.usage is None else turn.usage.merged_with(usage)
+            turn.billed = usage if turn.billed is None else turn.billed.summed_with(usage)
 
         step: Step | None = None
         if turn.hooks_armed and turn.ctx is not None:
@@ -1461,7 +1632,10 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
         frozen, applied = await apply_session_usage(proxy, turn, turn.usage)
         if turn.outcome_draft is not None:
             outcome = complete_outcome(
-                turn.outcome_draft, turn.usage, status=status, latency_ms=latency_ms
+                turn.outcome_draft,
+                turn.billed or turn.usage,
+                status=status,
+                latency_ms=latency_ms,
             )
             turn.outcome_draft = None
             await proxy._record_request_outcome(outcome)
@@ -1470,6 +1644,25 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
         )
         if registry is not None:
             registry.pop(turn_id)
+        billed = turn.billed.as_anthropic() if turn.billed is not None else None
+        # After a re-drive the answer is either the hook's replacement or, when
+        # the hook handed back the latest provider response (``response: null``),
+        # the response the gateway posted on this call. Either way the client made
+        # one call, so its response reports what the provider billed for all of
+        # it, the way a server-side tool loop does, in the response's own usage
+        # shape. A turn with no re-drive keeps ``response: null``: the gateway's
+        # held response already carries the whole bill.
+        answer = final_response if final_response is not None else response
+        if (
+            turn.rounds > 0
+            and billed
+            and isinstance(answer, dict)
+            and isinstance(answer.get("usage"), dict)
+        ):
+            final_response = {
+                **answer,
+                "usage": _usage_in_shape(answer["usage"], turn.billed),
+            }
         return JSONResponse(
             {
                 "action": "done",
@@ -1478,6 +1671,8 @@ async def handle_compress_response(proxy: Any, request: Any) -> Any:
                 "frozen_message_count": frozen,
                 "usage_applied": applied,
                 "rounds": turn.rounds,
+                # Every counter summed across rounds, Anthropic keys.
+                "billed_usage": billed,
             }
         )
     finally:

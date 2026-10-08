@@ -32,6 +32,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from headroom.offline import guard_egress
+
 logger = logging.getLogger(__name__)
 
 
@@ -259,6 +261,7 @@ def compare_prompts(
             "or pass api_key parameter."
         )
 
+    guard_egress("OpenAI API for the prompt-comparison judge", "api.openai.com")
     client = OpenAI(api_key=resolved_api_key)
 
     # Build the judge prompt

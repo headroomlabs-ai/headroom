@@ -16,13 +16,19 @@ from tests._dotenv import (
     importorskip_no_env_leak,
     load_env_overrides,
 )
+from tests._pricing_models import anthropic_pricing_model
 
 _env_overrides = load_env_overrides()
 apply_dotenv = autouse_apply_env(_env_overrides)
 
 importorskip_no_env_leak("litellm")
 
-MODEL = "claude-sonnet-4-20250514"
+
+MODEL = anthropic_pricing_model(
+    "input_cost_per_token_above_200k_tokens",
+    "cache_creation_input_token_cost",
+    "cache_read_input_token_cost",
+)
 
 
 def _prices(model: str = MODEL) -> tuple[float, float, float]:

@@ -15,6 +15,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import socket
 from unittest.mock import AsyncMock
 
 import pytest
@@ -28,6 +29,21 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 MESSAGES = "/v1/messages"
 BODY = {"model": "glm-5.2", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.fixture(autouse=True)
+def _public_opencode_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep header forwarding independent of live DNS; retain SSRF validation."""
+    original = socket.getaddrinfo
+
+    def resolve(host, *args, **kwargs):
+        if host == "opencode.ai":
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443))
+            ]
+        return original(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
 
 
 def _make_config(**overrides) -> ProxyConfig:

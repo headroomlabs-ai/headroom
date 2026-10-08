@@ -3,6 +3,7 @@
 from .vscode import (
     configure_vscode_proxy_settings,
     remove_vscode_proxy_settings,
+    unrouted_vscode_profiles,
     vscode_proxy_url,
     vscode_settings_path,
     vscode_user_dir,
@@ -37,6 +38,7 @@ __all__ = [
     "validate_configuration",
     "configure_vscode_proxy_settings",
     "remove_vscode_proxy_settings",
+    "unrouted_vscode_profiles",
     "vscode_proxy_url",
     "vscode_settings_path",
     "vscode_user_dir",

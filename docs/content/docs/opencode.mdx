@@ -41,6 +41,7 @@ headroom wrap opencode \
   --no-serena \
   --code-graph \
   --no-proxy \
+  --openai-api-url https://api.deepseek.com/v1 \
   --learn \
   --memory \
   --backend anthropic \
@@ -48,6 +49,32 @@ headroom wrap opencode \
   --region ... \
   -- <opencode args>
 ```
+
+Pass `--openai-api-url` when OpenCode should route through a third-party
+OpenAI-compatible provider instead of OpenAI itself — DeepSeek, Together,
+OpenRouter, or a self-hosted gateway. Without it, OpenAI-compatible traffic is
+forwarded to the default upstream (`https://api.openai.com/v1`), so a
+non-OpenAI key is rejected with `401 Incorrect API key provided`. Setting
+`OPENAI_TARGET_API_URL` before wrapping has the same effect. See
+[OpenCode + DeepSeek](/docs/opencode-deepseek) for a full walkthrough.
+
+The flag means the same thing whether or not wrap starts the proxy:
+
+```bash
+# wrap starts the proxy and points it at DeepSeek
+headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
+
+# reuse a proxy you started yourself — it must already target that upstream
+headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1
+headroom wrap opencode --no-proxy --openai-api-url https://api.deepseek.com/v1
+```
+
+With `--no-proxy`, wrap never starts or re-points a proxy. It checks the one
+listening on `--port` and exits with an error — before it rewrites
+`opencode.json` — if nothing is listening, the listener is not a Headroom
+proxy, or it forwards OpenAI-compatible traffic to a different upstream. Start
+the proxy with the upstream you want, or drop `--no-proxy` and let wrap start
+it.
 
 ## Provider Model Mapping
 
@@ -69,6 +96,8 @@ The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` 
 |---|---|
 | `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
 | `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
+| `OPENAI_TARGET_API_URL` | Upstream for OpenAI-compatible traffic when `--openai-api-url` is not passed; defaults to `https://api.openai.com/v1` |
+| `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Comma-separated hosts (and their subdomains) the native plugin sends straight upstream instead of through the proxy, for example `opencode.ai,.corp.internal` |
 
 ## Failure Learning
 
@@ -94,21 +123,32 @@ The default user scope only writes shell environment configuration. For OpenCode
 
 ## Native OpenCode Plugin
 
-The `headroom-opencode` package exports `HeadroomPlugin` for direct OpenCode plugin registration. The plugin installs Headroom transport interception inside OpenCode, exposes the `headroom_retrieve` tool, and publishes Headroom metadata through the OpenCode plugin output env.
+The `headroom-opencode` package's default export is a native OpenCode plugin that works with both OpenCode 1.x and 2.x. It installs Headroom transport interception inside OpenCode, exposes the `headroom_retrieve` tool, and adds Headroom metadata (`HEADROOM_ACTIVE`, `HEADROOM_PROXY_URL`, `HEADROOM_PROJECT`) to the environment of shell commands OpenCode runs.
 
-Example:
+Register it in `opencode.json`:
 
-```ts
-import { HeadroomPlugin } from "headroom-opencode";
-
-export default async function plugin(input) {
-  return HeadroomPlugin(input, {
-    proxyUrl: process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787",
-  });
+```json
+{
+  "plugin": [
+    ["headroom-opencode", { "proxyUrl": "http://127.0.0.1:8787" }]
+  ]
 }
 ```
 
+OpenCode 2.x migrates the 1.x `plugin` key automatically. To configure it the 2.x way, use `"plugins": [{ "package": "headroom-opencode", "options": { "proxyUrl": "http://127.0.0.1:8787" } }]`. Without `proxyUrl`, the plugin reads `HEADROOM_PROXY_URL` and falls back to `http://127.0.0.1:8787`.
+
+The default export has `server` for OpenCode 1.x and `setup` for OpenCode 2.x. Each version ignores the other's field. `HeadroomPlugin` (1.x) and `headroomSetup` (2.x) are also exported by name for custom wrappers.
+
 Use this plugin when OpenCode should intercept provider traffic in-process. Use `headroom wrap opencode` when you want the CLI to manage the proxy, config injection, MCP registration, backups, and unwrap behavior.
+
+The plugin routes every external HTTP(S) request through the proxy. To keep a provider or gateway off the proxy while leaving the plugin loaded, pass `excludeHosts` in the plugin options or set `HEADROOM_OPENCODE_EXCLUDE_HOSTS` before launching OpenCode. An entry matches the host and all of its subdomains; excluded requests are sent as-is, with no compression or telemetry.
+
+```jsonc
+// opencode.json
+{
+  "plugin": [["/path/to/headroom/providers/opencode/_dist/entry.opencode.js", { "excludeHosts": ["opencode.ai"] }]]
+}
+```
 
 ## Programmatic Config Helpers
 
@@ -136,7 +176,7 @@ const retrieve = createHeadroomRetrieveTool({
 1. **Config injection**. The wrapper writes a `provider.headroom` block into `opencode.json`. The provider uses `@ai-sdk/openai-compatible`, which OpenCode supports natively. Model mappings route requests through `http://127.0.0.1:<port>/v1`.
 2. **Runtime config**. `OPENCODE_CONFIG_CONTENT` is set as an env var containing provider, plugin, and optional local MCP JSON. OpenCode reads it at startup and merges it with on-disk config.
 3. **MCP tools**. Headroom registers `headroom_compress`, `headroom_retrieve`, and `headroom_stats` through `headroom mcp serve` unless `--no-mcp` is set.
-4. **Native plugin path**. `HeadroomPlugin` installs Headroom transport interception and uses `HEADROOM_PROXY_URL` or `http://127.0.0.1:8787` to reach the proxy.
+4. **Native plugin path**. `wrap` loads the transport plugin from a local directory (`plugins/opencode/dist/` in a checkout, `headroom/providers/opencode/_dist/` in the wheel), because OpenCode 2.x only accepts local plugins as directories. The plugin uses `HEADROOM_PROXY_URL` or `http://127.0.0.1:8787` to reach the proxy.
 5. **Unwrap**. `headroom unwrap opencode` restores `opencode.json` from the pre-wrap backup when present, strips Headroom marker blocks when no backup exists, and unregisters Headroom MCP servers.
 
 ## Troubleshooting
@@ -145,9 +185,17 @@ const retrieve = createHeadroomRetrieveTool({
 
 Check that `OPENCODE_CONFIG_CONTENT` is set and contains the `provider.headroom` block. The wrap command prints the env vars it sets.
 
+**OpenCode 2.x traffic does not show up in Headroom.**
+
+OpenCode 2.x connects to a shared background service by default. A service that was already running when you wrapped never sees Headroom's config. `headroom wrap opencode` adds `--standalone` on 2.x so OpenCode runs a private server with that config instead. If you pass `--server <url>`, that server must be started with Headroom's config too. Check what OpenCode actually loaded with `opencode api plugin.list --param directory="$PWD"`, which should list `headroom`.
+
 **The native plugin cannot reach Headroom.**
 
 Set `HEADROOM_PROXY_URL` to the running proxy URL, for example `http://127.0.0.1:8787`.
+
+**One provider rejects requests only while the plugin is loaded.**
+
+Some gateways validate the client on the wire and reject the proxy hop. Exclude that host with `HEADROOM_OPENCODE_EXCLUDE_HOSTS=<host>` (or the `excludeHosts` plugin option); Headroom keeps routing every other provider.
 
 **Provider not found after unwrap.**
 

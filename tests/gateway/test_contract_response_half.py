@@ -29,7 +29,15 @@ from tests.gateway.conftest import compress, count_loop_tasks, registry_of
 from tests.gateway.samples import big_tool_history
 
 RESPONSE_HALF = "/v1/compress/response"
-DONE_KEYS = {"action", "turn_id", "response", "frozen_message_count", "usage_applied", "rounds"}
+DONE_KEYS = {
+    "action",
+    "turn_id",
+    "response",
+    "frozen_message_count",
+    "usage_applied",
+    "rounds",
+    "billed_usage",
+}
 
 
 def _open_turn(client, session_id: str | None = "resp-s", **gateway: Any) -> dict[str, Any]:
@@ -152,6 +160,7 @@ def test_done_with_null_response_and_turn_removed(headroom_client) -> None:
     assert data["response"] is None
     assert data["rounds"] == 0
     assert data["usage_applied"] is False  # no cache signal in that usage
+    assert data["billed_usage"] == {"input_tokens": 100, "output_tokens": 7}
     assert isinstance(data["frozen_message_count"], int)
     assert registry_of(headroom_client).get(turn["turn_id"]) is None
     again = _post(headroom_client, {"turn_id": turn["turn_id"]})
@@ -366,7 +375,10 @@ def test_outcome_anthropic_cache_fields(headroom_client, outcome_spy) -> None:
     assert o.output_tokens == 12
     assert o.cache_read_tokens == 2000
     assert o.cache_write_tokens == 500
-    assert o.provider_input_tokens == 300
+    # Anthropic's input_tokens is the uncached remainder; the billed prompt is
+    # that plus both cache buckets, as the direct handler has always recorded.
+    assert o.provider_input_tokens == 2800
+    assert o.uncached_input_tokens == 300
 
 
 def test_outcome_recorded_immediately_without_relay(headroom_client, outcome_spy) -> None:
