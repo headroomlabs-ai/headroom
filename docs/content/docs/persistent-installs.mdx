@@ -90,7 +90,7 @@ headroom install remove
 
 `apply` creates or updates a named deployment profile, stores its manifest under `~/.headroom/deploy/<profile>/manifest.json`, applies reversible configuration changes, and starts the selected runtime.
 
-`status` distinguishes the default backend from the Anthropic and OpenAI protocol targets. Each target is shown as `configured` or `default`; target URLs and credentials are not printed. An OpenAI-compatible deployment can therefore have `Default backend: anthropic` and `OpenAI target: configured` at the same time.
+`status` distinguishes the default backend from the Anthropic and OpenAI protocol targets. When the health response includes a target's configuration, that target is shown as `configured` or `default`. If configuration is unavailable or omits a target, that target is shown as `unknown`; this does not mean it is unset. For example, a Docker bridge peer may not pass the loopback health-config gate. Target URLs and credentials are not printed. An OpenAI-compatible deployment can therefore have `Default backend: anthropic` and `OpenAI target: configured` at the same time.
 
 ## Presets and runtime kinds
 

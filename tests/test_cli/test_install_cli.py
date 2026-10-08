@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 
 import click
@@ -13,6 +15,7 @@ from headroom.cli.main import main
 from headroom.install.models import DeploymentManifest, ManagedMutation
 from headroom.install.planner import build_tool_envs
 from headroom.install.state import load_manifest as load_state_manifest
+from headroom.install.state import save_manifest_strict
 
 
 def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
@@ -447,6 +450,167 @@ def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
     assert result.exit_code == 0, result.output
     # An explicit --env must win over the auto-captured value.
     assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
+
+
+@pytest.mark.parametrize(
+    ("anthropic_url", "openai_url", "anthropic_target", "openai_target"),
+    [
+        (None, None, "default", "default"),
+        ("", "", "default", "default"),
+        ("https://anthropic-user:fake-secret@anthropic.invalid/v1", None, "configured", "default"),
+        (None, "https://openai-user:fake-secret@openai.invalid/v1", "default", "configured"),
+        (
+            "https://anthropic-user:fake-secret@anthropic.invalid/v1",
+            "https://openai-user:fake-secret@openai.invalid/v1",
+            "configured",
+            "configured",
+        ),
+    ],
+)
+def test_install_status_includes_protocol_targets_from_health_probe(
+    monkeypatch, anthropic_url, openai_url, anthropic_target, openai_target
+) -> None:
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: _status_manifest(profile))
+    monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+    monkeypatch.setattr(
+        inst,
+        "probe_json",
+        lambda url: {
+            "config": {
+                "backend": "openai",
+                "anthropic_api_url": anthropic_url,
+                "openai_api_url": openai_url,
+            }
+        },
+    )
+
+    result = CliRunner().invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Status:     running" in result.output
+    assert "Healthy:    yes" in result.output
+    assert "Default backend:  openai" in result.output
+    assert f"Anthropic target: {anthropic_target}" in result.output
+    assert f"OpenAI target:    {openai_target}" in result.output
+    for secret in ("fake-secret", "anthropic-user", "openai-user", ".invalid"):
+        assert secret not in result.output
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "healthy"},
+        {"config": {}},
+        {"config": {"backend": "anthropic"}},
+        {"config": None},
+        {"config": "not-a-config"},
+        {"config": []},
+        {"config": 42},
+        {"config": {"anthropic_api_url": False, "openai_api_url": 0}},
+        {"config": {"anthropic_api_url": [], "openai_api_url": {}}},
+        {"config": {"anthropic_api_url": ["malformed"], "openai_api_url": {"url": "bad"}}},
+    ],
+)
+def test_install_status_survives_unavailable_config(monkeypatch, payload) -> None:
+    """Redacted or malformed config is unknown, not evidence of unset URLs."""
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: _status_manifest(profile))
+    monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+    monkeypatch.setattr(inst, "probe_json", lambda url: payload)
+
+    result = CliRunner().invoke(main, ["install", "status"])
+
+    assert result.exit_code == 0, result.output
+    assert "Default backend:  anthropic" in result.output
+    assert "Anthropic target: unknown" in result.output
+    assert "OpenAI target:    unknown" in result.output
+
+
+@pytest.mark.parametrize(
+    ("payload", "anthropic_target", "openai_target"),
+    [
+        ({"status": "healthy", "ready": True}, "unknown", "unknown"),
+        ({"config": {}}, "unknown", "unknown"),
+        (
+            {"config": {"anthropic_api_url": None, "openai_api_url": None}},
+            "default",
+            "default",
+        ),
+        (
+            {"config": {"openai_api_url": "https://user:fake-secret@openai.invalid/v1"}},
+            "unknown",
+            "configured",
+        ),
+        ({"config": {"anthropic_api_url": ""}}, "default", "unknown"),
+        ({"config": {"anthropic_api_url": False, "openai_api_url": None}}, "unknown", "default"),
+    ],
+)
+def test_install_status_probes_live_health_response(
+    tmp_path, monkeypatch, payload, anthropic_target, openai_target
+) -> None:
+    """Exercise manifest persistence, HTTP probes and CLI rendering together.
+
+    The redacted response is the shape returned to an untrusted Docker bridge
+    peer. This fixture is an HTTP server, not a Docker networking test.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    requests = []
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            body = json.dumps({"ready": True} if self.path == "/readyz" else payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            save_manifest_strict(
+                DeploymentManifest(
+                    profile="status-proof",
+                    preset="persistent-task",
+                    runtime_kind="python",
+                    supervisor_kind="none",
+                    scope="user",
+                    provider_mode="manual",
+                    targets=[],
+                    port=port,
+                    host="127.0.0.1",
+                    backend="anthropic",
+                    health_url=f"http://127.0.0.1:{port}/readyz",
+                    base_env={
+                        "OPENAI_TARGET_API_URL": "https://stale:fake-secret@stale.invalid/v1"
+                    },
+                )
+            )
+
+            result = CliRunner().invoke(main, ["install", "status", "--profile", "status-proof"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    assert result.exit_code == 0, result.output
+    assert requests == ["/health", "/readyz"]
+    assert "Status:     stopped" in result.output
+    assert "Healthy:    yes" in result.output
+    assert "Default backend:  anthropic" in result.output
+    assert f"Anthropic target: {anthropic_target}" in result.output
+    assert f"OpenAI target:    {openai_target}" in result.output
+    assert "fake-secret" not in result.output
+    assert ".invalid" not in result.output
 
 
 def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
