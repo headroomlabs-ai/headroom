@@ -118,6 +118,11 @@ class TestLiteLLMLogSuppression:
         """The env flag must exist before litellm itself is imported."""
         import os
 
+        import headroom.providers as providers
+
+        # Import also replaces the parent package attribute. Track it even when
+        # initially absent so teardown restores or removes the temporary module.
+        monkeypatch.setattr(providers, "litellm", None, raising=False)
         monkeypatch.delenv("LITELLM_SUPPRESS_DEBUG_INFO", raising=False)
         # Restore the original modules at teardown: pricing submodules retain
         # references to that LiteLLM instance and must not see a second catalog.
