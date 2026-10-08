@@ -45,6 +45,7 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
     monkeypatch, catalog_read
 ):
     import litellm
+    from litellm.utils import _invalidate_model_cost_lowercase_map
 
     from headroom.pricing.counterfactual import (
         BASIS_CATALOG,
@@ -73,6 +74,8 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
     if catalog_read is not None:
         row["cache_read_input_token_cost"] = catalog_read
     monkeypatch.setitem(litellm.model_cost, model, row)
+    # The same registered model is reused; LiteLLM also caches its pricing metadata.
+    _invalidate_model_cost_lowercase_map()
     resolve_rates.cache_clear()
     try:
         expected_read = catalog_read if catalog_read is not None else 0.16e-6
@@ -83,21 +86,19 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
 
         # A provider-wide counterfactual estimate is not a billed cache rate.
         # Use the real calculator for the same reported usage, as billing does.
-        if catalog_read is None:
-            canonical_input, _ = litellm.cost_per_token(
-                model=model,
-                prompt_tokens=10_000,
-                completion_tokens=0,
-                cache_read_input_tokens=10_000,
-            )
-        else:
-            canonical_input = 10_000 * catalog_read
+        canonical_input, _ = litellm.cost_per_token(
+            model=model,
+            prompt_tokens=10_000,
+            completion_tokens=0,
+            cache_read_input_tokens=10_000,
+        )
         tracker = CostTracker()
         tracker.record_tokens(model, tokens_saved=0, tokens_sent=10_000, cache_read_tokens=10_000)
         assert tracker.totals()[1] == pytest.approx(canonical_input)
         assert tracker.stats()["total_input_cost_usd"] == pytest.approx(canonical_input)
     finally:
         resolve_rates.cache_clear()
+        _invalidate_model_cost_lowercase_map()
 
 
 @pytest.mark.parametrize("user_agent", ["grok/1.2.3", "grok-shell/0.2.112"])
