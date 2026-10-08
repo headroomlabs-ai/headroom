@@ -676,6 +676,10 @@ def _no_local_proxy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
     raise urllib.error.URLError("no proxy in tests")
 
 
+# Where the stubbed local proxy listens; HEADROOM_PORT points the CLI at it.
+_PROXY_PORT = 18787
+
+
 class _FakeProxy:
     """A local proxy as ``urllib.request.urlopen`` sees it.
 
@@ -709,17 +713,22 @@ def _apply_learned_level(
     proxy: _FakeProxy,
     *,
     level: int = 3,
+    pin_record: dict | None = None,
     previous_level: int | None = None,
 ) -> str:
     """Run ``learn --verbosity --apply`` for one project that learns ``level``.
 
-    ``previous_level`` seeds verbosity.json as an earlier ``--apply`` left it.
+    ``pin_record`` seeds the record an earlier ``--apply`` leaves after pinning,
+    ``previous_level`` the verbosity.json it saved. The proxy listens on
+    ``_PROXY_PORT``.
     """
     from headroom.proxy.output_savings import BaselineModel
 
     workspace = tmp_path / "ws"
+    workspace.mkdir()
+    if pin_record is not None:
+        (workspace / "verbosity_pin.json").write_text(json.dumps(pin_record), newline="\n")
     if previous_level is not None:
-        workspace.mkdir()
         (workspace / "verbosity.json").write_text(
             json.dumps({"verbosity_level": previous_level}), newline="\n"
         )
@@ -750,6 +759,7 @@ def _apply_learned_level(
         lambda session_paths, project_path, llm_judge=None: (profile, baseline),
     )
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.setenv("HEADROOM_PORT", str(_PROXY_PORT))
     monkeypatch.setattr("urllib.request.urlopen", proxy.urlopen)
 
     result = runner.invoke(
@@ -772,6 +782,7 @@ def test_verbosity_apply_pins_the_level_on_a_cache_mode_proxy(
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
     assert "level 3 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
     assert "HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=3 before" in output
+    assert "re-cache their prompt once" in output
 
 
 def test_verbosity_apply_leaves_a_token_mode_proxy_reading_the_profile(
@@ -799,16 +810,98 @@ def test_verbosity_apply_does_not_override_an_explicit_level(
     assert "it stays at level 2: HEADROOM_VERBOSITY_LEVEL is set there" in output
 
 
+def test_verbosity_apply_records_the_pin_it_sets(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {}, "pid": 4242})
+
+    _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    record = json.loads((tmp_path / "ws" / "verbosity_pin.json").read_text())
+    assert record == {"port": _PROXY_PORT, "pid": 4242, "level": 3}
+
+
 def test_verbosity_apply_replaces_the_pin_an_earlier_apply_set(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
 ) -> None:
     """A re-learned level must not be shadowed by the previous run's own pin."""
-    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}})
+    proxy = _FakeProxy(
+        {"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}, "pid": 4242}
+    )
 
-    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=1, previous_level=3)
+    output = _apply_learned_level(
+        monkeypatch,
+        runner,
+        tmp_path,
+        proxy,
+        level=1,
+        pin_record={"port": _PROXY_PORT, "pid": 4242, "level": 3},
+    )
 
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "1"}]
     assert "level 1 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
+    record = json.loads((tmp_path / "ws" / "verbosity_pin.json").read_text())
+    assert record == {"port": _PROXY_PORT, "pid": 4242, "level": 1}
+
+
+def test_verbosity_apply_re_pinning_the_same_level_does_not_warn_about_re_caching(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy(
+        {"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}, "pid": 4242}
+    )
+
+    output = _apply_learned_level(
+        monkeypatch,
+        runner,
+        tmp_path,
+        proxy,
+        pin_record={"port": _PROXY_PORT, "pid": 4242, "level": 3},
+    )
+
+    assert "level 3 is live now" in output
+    assert "re-cache" not in output
+
+
+@pytest.mark.parametrize(
+    "pin_record",
+    [
+        None,  # the operator pinned the level that was learned before
+        {"port": _PROXY_PORT, "pid": 1111, "level": 3},  # pinned on a proxy since restarted
+        {"port": _PROXY_PORT, "pid": 4242, "level": 2},  # the operator re-pinned after us
+    ],
+    ids=["no-record", "restarted-proxy", "changed-since"],
+)
+def test_verbosity_apply_keeps_a_pin_it_cannot_prove_it_set(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, pin_record: dict | None
+) -> None:
+    proxy = _FakeProxy(
+        {"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}, "pid": 4242}
+    )
+
+    output = _apply_learned_level(
+        monkeypatch, runner, tmp_path, proxy, level=1, pin_record=pin_record, previous_level=3
+    )
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "it stays at level 3: HEADROOM_VERBOSITY_LEVEL is set there" in output
+
+
+@pytest.mark.windows_newline
+def test_verbosity_pin_record_is_written_with_lf(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    from headroom.cli import learn as learn_cli
+
+    calls: list[dict] = []
+    real_write_text = Path.write_text
+
+    def write_text(self, data, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        calls.append(kwargs)
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", write_text)
+    learn_cli._record_pin(tmp_path, _PROXY_PORT, 4242, 3)
+
+    assert [call.get("newline") for call in calls] == ["\n"]
 
 
 @pytest.mark.parametrize("raw", ["9", " 04 "])

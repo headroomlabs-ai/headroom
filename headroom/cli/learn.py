@@ -441,13 +441,13 @@ def _steered_level(raw: object) -> int | None:
     return max(0, min(4, level))
 
 
-def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | None]:
-    """Best-effort: read a running local proxy's mode and pinned verbosity level.
+def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | None, int | None]:
+    """Best-effort: read a running local proxy's mode, pinned level and pid.
 
-    Both come from the ``/health`` config block, which the proxy includes for
-    loopback callers. Returns ``(mode, level)``: ``mode`` is ``None`` when the
-    proxy is unreachable or does not report it, and ``level`` is the level its
-    ``HEADROOM_VERBOSITY_LEVEL`` pins, or ``None`` when that is unset.
+    All three come from the ``/health`` config block, which the proxy includes
+    for loopback callers. Returns ``(mode, level, pid)``, each ``None`` when the
+    proxy is unreachable or does not report it; ``level`` is the level its
+    ``HEADROOM_VERBOSITY_LEVEL`` pins, ``None`` when that is unset.
     """
     import json as _json
     import urllib.error
@@ -458,14 +458,49 @@ def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | N
         with urllib.request.urlopen(url, timeout=2) as response:
             payload = _json.loads(response.read() or b"{}")
     except (urllib.error.URLError, OSError, ValueError):
-        return None, None
+        return None, None, None
     config = payload.get("config") if isinstance(payload, dict) else None
     if not isinstance(config, dict):
-        return None, None
+        return None, None, None
     mode = config.get("mode")
     runtime = config.get("runtime_env")
     level = runtime.get("HEADROOM_VERBOSITY_LEVEL") if isinstance(runtime, dict) else None
-    return mode if isinstance(mode, str) else None, _steered_level(level)
+    pid = config.get("pid")
+    return (
+        mode if isinstance(mode, str) else None,
+        _steered_level(level),
+        pid if isinstance(pid, int) else None,
+    )
+
+
+#: Records the HEADROOM_VERBOSITY_LEVEL that ``--apply`` hot-pinned, and on
+#: which proxy process. Hot overrides die with the process, so a pin is ours to
+#: replace only while the same process (port + pid) still holds that value.
+_VERBOSITY_PIN_FILE = "verbosity_pin.json"
+
+
+def _pin_is_ours(ws: Path, port: int, pid: int | None, level: int | None) -> bool:
+    import json as _json
+
+    if pid is None or level is None:
+        return False
+    try:
+        record = _json.loads((ws / _VERBOSITY_PIN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record == {"port": port, "pid": pid, "level": level}
+
+
+def _record_pin(ws: Path, port: int, pid: int | None, level: int) -> None:
+    import json as _json
+
+    path = ws / _VERBOSITY_PIN_FILE
+    if pid is None:
+        # Without a pid the pin cannot be attributed later; leave no record.
+        path.unlink(missing_ok=True)
+        return
+    record = {"port": port, "pid": pid, "level": level}
+    path.write_text(_json.dumps(record), encoding="utf-8", newline="\n")
 
 
 def _activate_output_shaper(
@@ -632,9 +667,6 @@ def _run_verbosity(
         ws = ensure_workspace_dir()
         from datetime import datetime, timezone
 
-        from ..learn.verbosity import VerbosityProfile
-
-        previous = VerbosityProfile.load(ws / "verbosity.json")
         best_profile.learned_at = datetime.now(timezone.utc).isoformat()
         best_profile.save(ws / "verbosity.json")
         # Seed the savings baseline: replace baseline, preserve any live
@@ -652,19 +684,21 @@ def _run_verbosity(
         # Make --apply actually take effect: hot-enable a running proxy, and
         # otherwise tell the user exactly how to turn it on.
         level = best_profile.level
-        mode, pinned = _query_proxy_verbosity()
+        port = _local_proxy_port()
+        mode, pinned, pid = _query_proxy_verbosity(port)
         # Cache mode never reads verbosity.json: a level that can change while
         # conversations are open would bust their prefix cache, so the proxy
         # steers at its startup level unless HEADROOM_VERBOSITY_LEVEL pins one
         # (resolve_verbosity_level). Pin the learned level there; otherwise the
         # proxy would keep steering at its default while we report this level.
-        # A pin equal to the previously learned level is taken to be the one an
-        # earlier --apply set (the proxy cannot say where a value came from), so
-        # it is replaced rather than left to shadow the new level. Any other pin
-        # is the operator's and is left alone.
-        earlier_apply = pinned is not None and previous is not None and pinned == previous.level
-        pin = str(level) if mode == "cache" and (pinned is None or earlier_apply) else None
-        status, shaper_port = _activate_output_shaper(verbosity_level=pin)
+        # An existing pin is the operator's and is left alone, unless the record
+        # from an earlier --apply shows this same proxy process holds the value
+        # that run pinned.
+        ours = _pin_is_ours(ws, port, pid, pinned)
+        pin = str(level) if mode == "cache" and (pinned is None or ours) else None
+        status, shaper_port = _activate_output_shaper(port, verbosity_level=pin)
+        if pin is not None and status == "live":
+            _record_pin(ws, shaper_port, pid, level)
         cache_mode_hint = (
             f"in cache mode (the default) also set HEADROOM_VERBOSITY_LEVEL={level}, "
             "because cache mode does not read the learned level"
@@ -698,7 +732,7 @@ def _run_verbosity(
                 f"\n  ✓ Output shaper enabled on the running proxy (port {shaper_port}); "
                 f"level {level} is live now{how}."
             )
-            if pin:
+            if pin and pinned != level:
                 click.echo(
                     "    Conversations already open re-cache their prompt once, because "
                     "the steering text changed."

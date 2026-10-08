@@ -177,10 +177,11 @@ turns it on; it is available on every rollout channel). Running `--verbosity --a
 A proxy in cache mode (the default) does not read `verbosity.json`: a level that
 changes mid-conversation would bust the prompt cache, so it steers at its startup
 level. On a cache-mode proxy `--apply` therefore also pins
-`HEADROOM_VERBOSITY_LEVEL` to the learned level. A `HEADROOM_VERBOSITY_LEVEL`
-that is already set is left alone, and `--apply` says so, unless it equals the
-previously learned level. That one is taken to be an earlier `--apply`'s pin and
-is replaced.
+`HEADROOM_VERBOSITY_LEVEL` to the learned level, and records the pin (port,
+proxy pid, level) in `verbosity_pin.json`. A `HEADROOM_VERBOSITY_LEVEL` that is
+already set is left alone, and `--apply` says so. The one exception is a pin that
+record proves an earlier `--apply` set: the same proxy process still holding the
+same value. That pin is replaced.
 
 To keep the shaper on across proxy restarts, export `HEADROOM_OUTPUT_SHAPER=1` before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
 
