@@ -119,7 +119,7 @@ def _scan_from(text: str, start: int, known: dict[int, int | None]) -> tuple[int
     return None, n - start
 
 
-def _scan_spans(text: str) -> tuple[list[tuple[int, int]], bool]:
+def _scan_spans(text: str, *, include_nested: bool = False) -> tuple[list[tuple[int, int]], bool]:
     """``(spans, complete)``: the top-level balanced spans ``_spans`` returns, and
     whether the walk covered the whole text within its budget.
 
@@ -148,6 +148,14 @@ def _scan_spans(text: str) -> tuple[list[tuple[int, int]], bool]:
                 i = end
                 continue
         i += 1
+    if include_nested:
+        # The walk already records every nested bracket's verdict. Reuse it
+        # in source order without scanning any suffix again.
+        out = []
+        for start in range(n):
+            end = known.get(start)
+            if end is not None:
+                out.append((start, end))
     return out, True
 
 
@@ -171,15 +179,28 @@ def scan_json_documents(text: str) -> tuple[list[tuple[int, int]], bool]:
     defeat the linear walk; a caller that must not miss a document treats that
     as "may contain one".
     """
-    spans, complete = _scan_spans(text)
+    spans, complete = _scan_spans(text, include_nested=True)
     out: list[tuple[int, int]] = []
+    covered_until = 0
+    parsed_chars = 0
+    parse_budget = _SCAN_BUDGET_PER_CHAR * len(text) + _SCAN_BUDGET_FLOOR
     for a, b in spans:
+        if a < covered_until:
+            continue
+        # Invalid wrappers may contain valid JSON. Checking each nested
+        # candidate must not turn deeply nested malformed input quadratic.
+        if parsed_chars + b - a > parse_budget:
+            return out, False
+        parsed_chars += b - a
         try:
             parsed = json.loads(text[a:b])
-        except (ValueError, TypeError, RecursionError):
+        except RecursionError:
+            return out, False
+        except (ValueError, TypeError):
             continue
         if isinstance(parsed, dict | list):
             out.append((a, b))
+            covered_until = b
     return out, complete
 
 
