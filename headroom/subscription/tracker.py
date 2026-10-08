@@ -399,16 +399,31 @@ class SubscriptionTracker(QuotaTracker):
             is_active = self._state.is_active(active_window_s=self._active_window_s)
             token = self._current_token
 
-        if not is_active:
-            # Try background poll using credentials file token
-            from headroom.subscription.client import read_cached_oauth_token
+        # Always consult the credentials file: it is the source Claude Code
+        # refreshes in place, so it holds the *current* token. `self._current_token`
+        # is a snapshot of the last proxied Authorization header and goes stale
+        # as soon as Claude Code rotates its OAuth token — it is only replaced
+        # when a request flows through the proxy, which an idle client never
+        # does. Preferring it (`token or bg_token`) therefore pinned polling to
+        # an expired token and surfaced as permanent `poll_errors` /
+        # "fetch returned None" with a stale `polled_at` (issue #3913).
+        from headroom.subscription.client import read_cached_oauth_token
 
-            bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
-            token = token or bg_token
+        bg_token = read_cached_oauth_token()
+        if not is_active and not bg_token:
+            return
 
-        snapshot = await self._client.fetch(token)
+        snapshot = None
+        # Fresh credentials-file token first, so a normal poll costs one request.
+        if bg_token:
+            snapshot = await self._client.fetch(bg_token)
+        # Only spend a second request on the remembered header token when it is
+        # a *different* token that could still be the live one (no credentials
+        # file, e.g. CLAUDE_CODE_OAUTH_TOKEN absent and polling off a proxied
+        # header).
+        if snapshot is None and token and token != bg_token:
+            snapshot = await self._client.fetch(token)
+
         if snapshot is None:
             with self._lock:
                 self._state.mark_error("fetch returned None")

@@ -22,7 +22,7 @@ MODEL = "claude-haiku-4-5"
 
 
 def _key(cache: SemanticCache, **kw) -> str:
-    return cache._compute_key(MESSAGES, MODEL, **kw)
+    return cache._compute_key(MESSAGES, MODEL, partition="p_test", **kw)
 
 
 # --- too loose: different inputs must NOT collide (the bug) --------------------
@@ -145,8 +145,8 @@ def test_message_cache_control_breakpoint_move_same_key():
         }
     ]
     messages_without_cc = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
-    assert cache._compute_key(messages_with_cc, MODEL) == cache._compute_key(
-        messages_without_cc, MODEL
+    assert cache._compute_key(messages_with_cc, MODEL, partition="p_test") == cache._compute_key(
+        messages_without_cc, MODEL, partition="p_test"
     )
 
 
@@ -155,7 +155,9 @@ def test_message_content_change_still_distinct_key():
     cache = SemanticCache()
     a = [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
     b = [{"role": "user", "content": [{"type": "text", "text": "goodbye"}]}]
-    assert cache._compute_key(a, MODEL) != cache._compute_key(b, MODEL)
+    assert cache._compute_key(a, MODEL, partition="p_test") != cache._compute_key(
+        b, MODEL, partition="p_test"
+    )
 
 
 # --- behavioral get/set: collision prevented end to end -----------------------
@@ -165,11 +167,13 @@ async def test_get_set_collision_prevented():
     """Store under system A; fetching with system B is a MISS (no contamination),
     fetching with system A is a HIT."""
     cache = SemanticCache()
-    await cache.set(MESSAGES, MODEL, b"french-body", {}, system="Answer only in French.")
+    await cache.set(
+        MESSAGES, MODEL, b"french-body", {}, partition="p_test", system="Answer only in French."
+    )
 
-    miss = await cache.get(MESSAGES, MODEL, system="Answer only in English.")
+    miss = await cache.get(MESSAGES, MODEL, partition="p_test", system="Answer only in English.")
     assert miss is None
 
-    hit = await cache.get(MESSAGES, MODEL, system="Answer only in French.")
+    hit = await cache.get(MESSAGES, MODEL, partition="p_test", system="Answer only in French.")
     assert hit is not None
     assert hit.response_body == b"french-body"

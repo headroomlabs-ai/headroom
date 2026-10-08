@@ -55,6 +55,35 @@ jobs:
         with:
           inputs: requirements-prod.txt
 
+  # ---- SCA: Rust dependency advisories -----------------------------------
+  # `cargo audit` reads Cargo.lock only (no build, about a minute), so it runs
+  # unconditionally: every PR, every push to main, and the weekly schedule
+  # above. It used to live in rust.yml behind the `rust-changes` path filter;
+  # pushes that touched no Rust path reported it `skipped`, and rust.yml's own
+  # schedule stopped firing after 2026-09-08, so no advisory scan ran for three
+  # weeks. Blocking: an accepted advisory goes in .cargo/audit.toml with a
+  # written reason.
+  cargo-audit:
+    name: Rust advisories (cargo audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit (blocking; exceptions in .cargo/audit.toml)
+        run: cargo audit
+
+      # Licence allow-list from deny.toml. Advisory decisions stay with
+      # cargo-audit above, so there is one place that decides what is accepted.
+      - name: cargo deny check licenses
+        continue-on-error: true
+        run: cargo deny check licenses
+
   # Audit every maintained npm lock, including development dependencies.
   # Lockfile audits do not install packages or execute their lifecycle scripts.
   npm-audit:
