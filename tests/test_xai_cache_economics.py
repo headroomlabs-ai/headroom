@@ -1,4 +1,4 @@
-"""xAI cached input must have the same price in savings and cost totals."""
+"""xAI inferred writes and cache estimates honor billing provenance."""
 
 import pytest
 
@@ -17,6 +17,9 @@ def test_xai_inferred_writes_are_not_billed_twice(monkeypatch, inferred, expecte
         {
             "input_cost_per_token": 1e-6,
             "output_cost_per_token": 2e-6,
+            # Keep the double-charge regression about writes, with known rates.
+            "cache_read_input_token_cost": 0.16e-6,
+            "cache_creation_input_token_cost": 1e-6,
             "litellm_provider": "xai",
             "mode": "chat",
         },
@@ -38,10 +41,19 @@ def test_xai_inferred_writes_are_not_billed_twice(monkeypatch, inferred, expecte
 
 
 @pytest.mark.parametrize("catalog_read", [None, 0.05e-6])
-def test_xai_cache_read_pricing_matches_cost_totals(monkeypatch, catalog_read):
+def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
+    monkeypatch, catalog_read
+):
     import litellm
 
-    from headroom.pricing.counterfactual import CacheMix, Region, price_savings, resolve_rates
+    from headroom.pricing.counterfactual import (
+        BASIS_CATALOG,
+        BASIS_PROVIDER_RATIO,
+        CacheMix,
+        Region,
+        price_savings,
+        resolve_rates,
+    )
     from headroom.proxy.cost import CostTracker
 
     model = "xai/grok-review-fallback" if catalog_read is None else "xai/grok-review-catalog"
@@ -60,9 +72,22 @@ def test_xai_cache_read_pricing_matches_cost_totals(monkeypatch, catalog_read):
         mix = CacheMix.from_usage(cache_read_tokens=10_000)
         saving = price_savings(10_000, model=model, mix=mix, provider="xai", region=Region.PREFIX)
         assert saving.usd == pytest.approx(10_000 * expected_read)
+        assert saving.basis == (BASIS_PROVIDER_RATIO if catalog_read is None else BASIS_CATALOG)
+
+        # A provider-wide counterfactual estimate is not a billed cache rate.
+        # Use the real calculator for the same reported usage, as billing does.
+        canonical_input, _ = litellm.cost_per_token(
+            model=model,
+            prompt_tokens=10_000,
+            completion_tokens=0,
+            cache_read_input_tokens=10_000,
+        )
+        if catalog_read is not None:
+            assert canonical_input == pytest.approx(10_000 * catalog_read)
         tracker = CostTracker()
         tracker.record_tokens(model, tokens_saved=0, tokens_sent=10_000, cache_read_tokens=10_000)
-        assert tracker.stats()["total_input_cost_usd"] == pytest.approx(10_000 * expected_read)
+        assert tracker.totals()[1] == pytest.approx(canonical_input)
+        assert tracker.stats()["total_input_cost_usd"] == pytest.approx(canonical_input)
     finally:
         resolve_rates.cache_clear()
 
