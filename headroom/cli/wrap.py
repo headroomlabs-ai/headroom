@@ -11,6 +11,7 @@ Usage:
     headroom wrap vibe                      # Start proxy + Mistral Vibe
     headroom wrap grok                      # Start proxy + Grok CLI
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
+    headroom wrap antigravity               # Start proxy + print Antigravity config instructions
     headroom wrap grok-build                # Start proxy + configure Grok Build
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
     headroom wrap claude --port 9999        # Custom proxy port
@@ -81,6 +82,9 @@ from headroom.copilot_auth import (
     resolve_subscription_bearer_token_details,
 )
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
+from headroom.providers.antigravity import (
+    render_setup_lines as _render_antigravity_setup_lines,
+)
 from headroom.providers.claude import (
     CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
@@ -191,9 +195,14 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
+    migrate_legacy_opencode_jsonc_backup,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
+)
+from headroom.providers.opencode.runtime import (
+    opencode_major_version,
+    with_opencode_standalone,
 )
 from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
 from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
@@ -314,7 +323,15 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build", "opencode"}
+_AGENT_SAVINGS_TARGET_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+    "opencode",
+}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -330,7 +347,14 @@ _WRAP_PROXY_TIMEOUT_ML_MODULES = ("torch", "sentence_transformers", "spacy")
 _TOOL_SEARCH_ENV = TOOL_SEARCH_ENV
 _TOOL_SEARCH_DEFAULT = TOOL_SEARCH_DEFAULT
 _TOOL_SEARCH_FOUNDRY_DEFAULT = TOOL_SEARCH_FOUNDRY_DEFAULT
-_AGENT_SAVINGS_WRAP_AGENTS = {"claude", "codex", "cursor", "grok", "grok_build"}
+_AGENT_SAVINGS_WRAP_AGENTS = {
+    "antigravity",
+    "claude",
+    "codex",
+    "cursor",
+    "grok",
+    "grok_build",
+}
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -3085,13 +3109,11 @@ def _strip_codex_headroom_blocks(
         content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
-    # `wrap codex` may have written outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
+    # `wrap codex` may have written outside the marker block. Root only:
+    # [profiles.*] overrides are the user's.
+    from headroom.cli.init import _strip_codex_root_routing_orphans
+
+    content = _strip_codex_root_routing_orphans(content)
 
     # Remove an orphaned local-proxy provider structurally. Text-level table
     # matching cannot safely distinguish comments, multiline strings, and
@@ -3610,7 +3632,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
 
 
 def _restore_codex_provider_config() -> tuple[str, Path]:
-    """Undo ``_inject_codex_provider_config`` for the active Codex config file.
+    """Undo ``_inject_codex_provider_config`` (and ``headroom init codex``
+    routing) for the active Codex config file.
 
     Returns a tuple of ``(status, config_file)`` where status is one of:
 
@@ -3619,21 +3642,37 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     * ``"cleaned"``  — no backup existed, but the Headroom-managed block was
       found and stripped out (preserving surrounding user content).
     * ``"removed"``  — the config file only contained Headroom-managed
-      content (created by wrap) and has been deleted.
+      content (created by wrap or init) and has been deleted.
     * ``"noop"``     — nothing to undo; no Headroom marker and no backup.
     """
+    from headroom.cli.init import _CODEX_PROVIDER_MARKER_START, _strip_codex_init_block
+
     config_file, backup_file = _codex_config_paths()
 
     # Case 1: pre-wrap snapshot exists — restore it exactly.
     if backup_file.exists():
-        shutil.copy2(backup_file, config_file)
+        # A snapshot taken after `headroom init codex` still carries init's
+        # routing block; restoring it verbatim would leave Codex pinned to the
+        # proxy while unwrap reports success (#3749). The snapshot is deleted
+        # only once the config is written, so a failed write can be retried.
+        snapshot = _read_text(backup_file)
+        if _CODEX_PROVIDER_MARKER_START in snapshot:
+            cleaned = _strip_codex_init_block(snapshot)
+            if not cleaned.strip():
+                config_file.unlink(missing_ok=True)
+                backup_file.unlink()
+                return "removed", config_file
+            _write_text(config_file, cleaned)
+        else:
+            shutil.copy2(backup_file, config_file)
         backup_file.unlink()
         return "restored", config_file
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
         original = _read_text(config_file)
-        if _codex_config_has_headroom_markers(original):
+        has_init_block = _CODEX_PROVIDER_MARKER_START in original
+        if has_init_block or _codex_config_has_headroom_markers(original):
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
             remove_named_mcp = any(
@@ -3645,8 +3684,11 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                     _CODEX_MCP_END,
                 )
             )
+            # `headroom init codex` writes its own routing block, and nothing else
+            # removes it (#3749). Strip it first so its markers go with its keys.
+            content = _strip_codex_init_block(original) if has_init_block else original
             cleaned = _strip_codex_headroom_blocks(
-                original,
+                content,
                 remove_mcp=True,
                 remove_named_mcp=remove_named_mcp,
             )
@@ -5112,7 +5154,13 @@ def _ensure_proxy_unlocked(
             _warn_proxy_mode_mismatch(running_config)
         elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
+        elif (
+            vertex_api_url
+            or clear_vertex_api_url
+            or os.environ.get("HEADROOM_MODE")
+            or os.environ.get("HEADROOM_MIN_TOKENS") is not None
+            or os.environ.get("HEADROOM_EXCLUDE_TOOLS") is not None
+        ):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
@@ -5634,6 +5682,7 @@ def wrap(ctx: click.Context) -> None:
         headroom wrap vibe                # Mistral Vibe
         headroom wrap grok                # Grok CLI (xAI)
         headroom wrap cursor              # Cursor (prints config instructions)
+        headroom wrap antigravity         # Antigravity IDE (prints config instructions)
         headroom wrap grok-build          # Grok Build (updates ~/.grok/config.toml)
         headroom wrap cline               # Cline (VS Code; prints config instructions)
         headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
@@ -7663,6 +7712,62 @@ def cursor(
 
 
 # =============================================================================
+# Antigravity IDE
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def antigravity(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Antigravity IDE.
+
+    \b
+    Antigravity reads its model endpoints from its model-provider settings,
+    not from environment variables. This command starts the proxy and prints
+    the settings to add as a custom OpenAI-compatible model provider.
+
+    \b
+    After running this command, open Antigravity and add a custom model
+    provider with the printed base URL. Antigravity fetches the model list
+    from GET /v1/models automatically.
+
+    \b
+    Example:
+        headroom wrap antigravity                # Start proxy + Antigravity settings
+        headroom wrap antigravity --port 9999    # Custom proxy port
+    """
+    if prepare_only:
+        return
+
+    def _print_antigravity_setup(actual_port: int) -> None:
+        for line in _render_antigravity_setup_lines(actual_port, project=_project_name_from_cwd()):
+            click.echo(line)
+
+    _run_proxy_only_watcher(
+        agent_label="antigravity",
+        port=port,
+        no_proxy=no_proxy,
+        learn=learn,
+        memory=memory,
+        agent_type="antigravity",
+        print_setup_lines=_print_antigravity_setup,
+    )
+
+
+# =============================================================================
 # Grok Build
 # =============================================================================
 
@@ -8262,6 +8367,8 @@ def opencode(
     Sets OPENCODE_CONFIG_CONTENT to route all OpenCode API calls through
     Headroom. Configures a headroom provider via @ai-sdk/openai-compatible.
     Also sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL as fallbacks.
+    On OpenCode 2.x, adds --standalone (unless --server is given) so a private
+    server loads that config instead of a running background service.
 
     \b
     Examples:
@@ -8430,13 +8537,19 @@ def opencode(
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
             )
 
+        # OpenCode 2.x otherwise attaches to an already-running background
+        # service that never sees this launch's OPENCODE_CONFIG_CONTENT.
+        launch_args = with_opencode_standalone(opencode_args, opencode_major_version(opencode_bin))
+        if verbose and launch_args != tuple(opencode_args):
+            click.echo("  OpenCode 2.x: adding --standalone so it loads Headroom's config")
+
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
         launch_started = True
         try:
             _launch_tool(
                 binary=opencode_bin,
-                args=opencode_args,
+                args=launch_args,
                 env=env,
                 port=actual_port,
                 no_proxy=True,
@@ -8510,6 +8623,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
     config_file, backup_file = opencode_config_paths()
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
 
     if backup_file.exists():
         try:
@@ -8689,7 +8803,7 @@ def unwrap_grok_build(port: int, no_stop_proxy: bool) -> None:
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
-    """Undo ``headroom wrap codex`` edits to the active Codex config file.
+    """Undo ``headroom wrap codex`` and ``headroom init codex`` routing in the Codex config.
 
     Behaviour:
 
@@ -8965,12 +9079,49 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
 
 
 def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
-    """Warn when a reused proxy runs a different mode than this session asked for.
+    """Warn when reuse ignores this session's startup-only settings.
 
-    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
-    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
-    other clients may be attached to the running proxy.
+    Do not restart a shared proxy: other clients may be attached to it.
     """
+    config = running_config or {}
+    mismatches: list[str] = []
+    requested_min = os.environ.get("HEADROOM_MIN_TOKENS")
+    running_min = config.get("min_tokens_to_crush")
+    if requested_min is not None and isinstance(running_min, int):
+        try:
+            requested_min_value = int(requested_min)
+        except ValueError:
+            requested_min_value = None
+        if requested_min_value is not None and requested_min_value != running_min:
+            mismatches.append(f"HEADROOM_MIN_TOKENS={requested_min_value} (running: {running_min})")
+
+    requested_excludes = os.environ.get("HEADROOM_EXCLUDE_TOOLS")
+    running_excludes = config.get("exclude_tools")
+    if (
+        requested_excludes is not None
+        and isinstance(running_excludes, list)
+        and all(isinstance(name, str) for name in running_excludes)
+    ):
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        defaults = {name.lower() for name in DEFAULT_EXCLUDE_TOOLS}
+        requested_names = {
+            name.strip().lower() for name in requested_excludes.split(",") if name.strip()
+        }
+        running_names = {name.lower() for name in running_excludes}
+        if requested_names | defaults != running_names | defaults:
+            mismatches.append(
+                f"HEADROOM_EXCLUDE_TOOLS={sorted(requested_names)!r} "
+                f"(running: {sorted(running_names)!r})"
+            )
+
+    if mismatches:
+        click.echo(
+            "  Warning: this session requested "
+            + "; ".join(mismatches)
+            + ", but those settings are fixed at proxy startup. "
+            "Restart the proxy, or use --port for a separate one."
+        )
     requested = os.environ.get("HEADROOM_MODE")
     running = (running_config or {}).get("mode")
     if not requested or not isinstance(running, str):

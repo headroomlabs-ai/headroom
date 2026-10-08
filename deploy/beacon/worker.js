@@ -6,7 +6,8 @@
  * client sends AND exactly what happens to it on arrival. "Trust us" is not a
  * privacy policy.
  *
- * Deployed at otlp.headroomlabs.ai. Three jobs:
+ * Deployed at headroom-beacon.headroom-beacon.workers.dev (otlp.headroomlabs.ai
+ * is planned but not yet routed; see wrangler.toml). Three jobs:
  *
  *   1. Allowlist. Drop every field not on ALLOWED_KEYS before anything is
  *      written. This is the only privacy control that works retroactively —
@@ -25,7 +26,9 @@
  *
  * What this deliberately does NOT do: log, store, or forward the source IP.
  * Cloudflare offers it as cf-connecting-ip; it is the one field that would
- * deanonymise install_id, so it is never read.
+ * deanonymise install_id, so it is never read. Cloudflare's own per-request
+ * invocation logs would record it regardless of this code, which is why
+ * wrangler.toml turns them off (observability.logs.invocation_logs = false).
  */
 
 // Mostly mirrors the payload built by _Session.payload(); an extension may
