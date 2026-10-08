@@ -6134,7 +6134,7 @@ class OpenAIHandlerMixin:
             self._openai_extra_headers_for_upstream(
                 trusted_upstream_base_url or openai_upstream_base_url
             ),
-            upstream_url=custom_upstream_base_url,
+            upstream_url=trusted_upstream_base_url or custom_upstream_base_url,
             config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header

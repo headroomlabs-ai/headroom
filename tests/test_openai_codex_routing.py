@@ -1289,3 +1289,41 @@ def test_responses_savings_accept_a_session_header_as_identity(monkeypatch):
     _post_responses(handler, body, {"session_id": "sess-1"})
     _post_responses(handler, body, {"session_id": "sess-2"})
     assert _booked(handler) == [100, 0, 100]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_factory_responses_withholds_openai_gateway_credentials(monkeypatch, stream):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello", "stream": stream},
+        {"Authorization": "Bearer fk-test"},
+        path="/api/llm/o/v1/responses",
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.openai_extra_headers = {
+        "Authorization": "Bearer operator-openai-secret",
+        "X-Operator-Secret": "openai-secret",
+    }
+
+    async def capture_stream(url, headers, body, provider, *args, **kwargs):
+        handler.captured_request = ("POST", url, dict(headers), body)
+        return SimpleNamespace(status_code=200)
+
+    handler._stream_response = capture_stream
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    async def run():
+        return await handler.handle_openai_responses(
+            request,
+            trusted_upstream_base_url="https://api.factory.ai",
+            trusted_original_path="/api/llm/o/v1/responses",
+            trusted_provider_name="factory",
+        )
+
+    response = anyio.run(run)
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, url, headers, _ = handler.captured_request
+    assert url == "https://api.factory.ai/api/llm/o/v1/responses"
+    lowered = {key.lower(): value for key, value in headers.items()}
+    assert lowered["authorization"] == "Bearer fk-test"
+    assert "x-operator-secret" not in lowered
