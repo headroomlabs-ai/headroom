@@ -1089,6 +1089,7 @@ class CostTracker:
         tool_schema_saved: int = 0,
         price_basis: str = PRICE_BASIS_MEASURED,
         pricing: tuple[float, float] | None = None,
+        pricing_override: bool = False,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1122,11 +1123,14 @@ class CostTracker:
             pricing: Provider-resolved per-1M (input, output) USD for this
                 model, from the provider's own per-lookup resolution (explicit
                 config -> LiteLLM -> built-in table -> unknown default,
-                #3732). Used ONLY when ``estimate_cost`` (LiteLLM) can't price
+                #3732). Used when ``estimate_cost`` (LiteLLM) can't price
                 the model, so the request books a labelled fallback entry
                 instead of silently recording $0. When None, the generic
                 unknown-model default ($2.50/$10 per 1M) stands in and the
                 entry is stamped PRICE_BASIS_ESTIMATED.
+            pricing_override: Treat supplied rates as the operator-selected fixed price,
+                ahead of LiteLLM. Uses the provider's 50% cache-read convention;
+                catalog pricing otherwise retains native cache/context tiers.
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1269,13 +1273,22 @@ class CostTracker:
             input_tokens = tokens_sent
             basis = COST_BASIS_ESTIMATED
             _warn_estimated_basis_once(model)
-        cost = self.estimate_cost(
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cache_read_tokens=cache_read_tokens,
-            cache_write_tokens=effective_cache_write,
-        )
+        cost: float | None
+        if pricing_override and pricing is not None:
+            # Operator-selected fixed rates beat a successful catalog lookup.
+            # Use the provider's existing 50% cache-read convention for overrides;
+            # ordinary catalog pricing retains native cache and context tiers.
+            cost = _fallback_cost_usd(
+                input_tokens, output_tokens, cache_read_tokens, effective_cache_write, pricing
+            )
+        else:
+            cost = self.estimate_cost(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=effective_cache_write,
+            )
         entry_price_basis = price_basis
         if cost is None and not model.startswith("passthrough:"):
             # LiteLLM can't price this model (unknown to the catalog, or

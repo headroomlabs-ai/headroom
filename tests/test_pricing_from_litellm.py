@@ -61,13 +61,22 @@ def test_unwrapped_model_forms_drops_leading_segments() -> None:
     ],
 )
 def test_provider_prices_models_its_table_never_covered(
-    model: str, want_in: float, want_out: float
+    model: str, want_in: float, want_out: float, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The only test in this module that needs the live LiteLLM database --
-    # it asserts real catalog prices. Everything else here must also run on
-    # LiteLLM-free installs (including Python 3.14), so the skip lives on
-    # this test, not the module.
-    importorskip_no_env_leak("litellm")
+    # The catalog interface needs LiteLLM; other tests also run without it.
+    litellm = importorskip_no_env_leak("litellm")
+    # Pin the catalog input, not a mutable live-catalog version. This exercises
+    # real provider lookup for models outside its built-in table.
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            model: {
+                "input_cost_per_token": want_in / 1_000_000,
+                "output_cost_per_token": want_out / 1_000_000,
+            }
+        },
+    )
 
     got_in, got_out = OpenAIProvider()._get_pricing(model)
 

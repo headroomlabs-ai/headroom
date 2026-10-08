@@ -18,6 +18,7 @@ independent second dimension, not a repurposed usage flag.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -39,6 +40,84 @@ EXPECTED_USD = 200_000 / 1_000_000 * 2.50 + 1_000 / 1_000_000 * 10.00
 class _Metrics:
     async def record_request(self, **kwargs):
         pass
+
+
+@pytest.mark.parametrize(
+    "uncached,cache_read,inferred_write,expected",
+    [(200_000, 0, False, 20.20), (100_000, 100_000, False, 15.20), (100_000, 100_000, True, 15.20)],
+)
+def test_known_model_override_is_booked_and_enforces_budget(
+    monkeypatch, uncached, cache_read, inferred_write, expected
+):
+    from headroom.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv(
+        "HEADROOM_MODEL_LIMITS", json.dumps({"openai": {"pricing": {"gpt-4o": [100, 200]}}})
+    )
+    tracker = _tracker(budget_limit_usd=10.0)
+    handler = _Handler(tracker)
+    handler.openai_provider = OpenAIProvider()
+    assert handler.openai_provider.resolve_pricing_for_ledger("gpt-4o") == (
+        (100.0, 200.0),
+        PRICE_BASIS_MEASURED,
+    )
+    asyncio.run(
+        emit_request_outcome(
+            handler,
+            RequestOutcome(
+                request_id="override-3825",
+                tokens_saved=0,
+                attempted_input_tokens=200_000,
+                provider="openai",
+                model="gpt-4o",
+                original_tokens=200_000,
+                optimized_tokens=200_000,
+                provider_input_tokens=200_000,
+                uncached_input_tokens=uncached,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=uncached if inferred_write else 0,
+                cache_inferred=inferred_write,
+                output_tokens=1_000,
+            ),
+        )
+    )
+    basis = _budget_basis(tracker)
+    assert basis["total_usd"] == pytest.approx(expected)
+    assert basis["price_estimated_records"] == 0
+    assert basis["estimated_records"] == 0
+    assert tracker.check_budget() == (False, 0.0)
+
+
+@pytest.mark.parametrize("model", ["gpt-5", "gemini-2.5-pro"])
+def test_catalog_outcome_retains_native_cache_and_context_tiers(monkeypatch, model):
+    from headroom.providers.openai import OpenAIProvider
+
+    monkeypatch.setenv("HEADROOM_MODEL_LIMITS", "{}")
+    tracker = _tracker(budget_limit_usd=100.0)
+    handler = _Handler(tracker)
+    handler.openai_provider = OpenAIProvider()
+    expected = tracker.estimate_cost(model, 300_000, 1_000, cache_read_tokens=100_000)
+    assert expected is not None
+    asyncio.run(
+        emit_request_outcome(
+            handler,
+            RequestOutcome(
+                request_id="catalog-3825",
+                tokens_saved=0,
+                attempted_input_tokens=300_000,
+                provider="openai",
+                model=model,
+                original_tokens=300_000,
+                optimized_tokens=300_000,
+                provider_input_tokens=300_000,
+                uncached_input_tokens=200_000,
+                cache_read_tokens=100_000,
+                output_tokens=1_000,
+            ),
+        )
+    )
+    assert _budget_basis(tracker)["total_usd"] == pytest.approx(expected)
+    assert _budget_basis(tracker)["price_estimated_records"] == 0
 
 
 class _Handler:
