@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import tomllib
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
@@ -84,3 +85,42 @@ def test_all_extra_includes_proxy_and_voice() -> None:
         for raw_requirement in all_requirements
         if (requirement := Requirement(raw_requirement))
     )
+
+
+@pytest.mark.proxy_dependency_gate
+@pytest.mark.parametrize(
+    "python_version, sys_platform, platform_machine, optional",
+    [
+        ((3, 14), "darwin", "x86_64", True),
+        ((3, 15), "darwin", "x86_64", True),
+        ((3, 13), "darwin", "x86_64", False),
+        ((3, 14), "darwin", "arm64", False),
+        ((3, 14), "linux", "x86_64", False),
+    ],
+)
+def test_proxy_dependency_gate_matches_onnx_platform_markers(
+    monkeypatch, python_version, sys_platform, platform_machine, optional
+) -> None:
+    import platform
+
+    from headroom.cli import proxy
+
+    monkeypatch.setattr(proxy.sys, "version_info", python_version)
+    monkeypatch.setattr(proxy.sys, "platform", sys_platform)
+    monkeypatch.setattr(platform, "machine", lambda: platform_machine)
+    requested = []
+
+    def import_dependency(name):
+        requested.append(name)
+        if name in {"magika", "onnxruntime"}:
+            raise ImportError(f"No module named '{name}'")
+        return object()
+
+    monkeypatch.setattr(proxy, "import_module", import_dependency)
+    if optional:
+        proxy.ensure_proxy_dependencies()
+        assert not {"magika", "onnxruntime"} & set(requested)
+        assert {"fastapi", "uvicorn", "httpx", "mcp", "transformers"} <= set(requested)
+    else:
+        with pytest.raises(SystemExit, match="1"):
+            proxy.ensure_proxy_dependencies()
