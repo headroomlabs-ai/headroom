@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -28,6 +29,12 @@ def _mock_ensure_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
         return None, port
 
     monkeypatch.setattr(wrap_mod, "_ensure_proxy", fake_ensure_proxy)
+
+
+@pytest.fixture(autouse=True)
+def _unknown_opencode_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests use a fake `opencode` binary; never run whatever is on PATH."""
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: None)
 
 
 @pytest.fixture
@@ -422,6 +429,43 @@ def test_wrap_opencode_sets_config_content_env(
     assert captured["args"] == ("--model", "gpt-4o")
 
 
+@pytest.mark.parametrize(
+    ("major", "args", "expected"),
+    [
+        (2, (), ("--standalone",)),
+        (2, ("--model", "gpt-4o"), ("--standalone", "--model", "gpt-4o")),
+        (2, ("run", "fix it"), ("run", "--standalone", "fix it")),
+        (2, ("--server", "http://127.0.0.1:4096"), ("--server", "http://127.0.0.1:4096")),
+        (1, ("--model", "gpt-4o"), ("--model", "gpt-4o")),
+        (None, (), ()),
+    ],
+)
+def test_wrap_opencode_adds_standalone_on_v2(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    major: int | None,
+    args: tuple[str, ...],
+    expected: tuple[str, ...],
+) -> None:
+    """OpenCode 2.x must not attach to a background service that lacks Headroom's config."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(wrap_mod, "opencode_major_version", lambda binary: major)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            result = runner.invoke(main, ["wrap", "opencode", "--no-mcp", "--", *args])
+
+    assert result.exit_code == 0, result.output
+    assert captured["args"] == expected
+
+
 def test_wrap_opencode_does_not_add_base_url_env_vars(
     runner: CliRunner,
     tmp_path: Path,
@@ -623,27 +667,30 @@ def test_unwrap_opencode_restores_from_backup(
     assert config_file.read_text(encoding="utf-8") == original
 
 
+@pytest.mark.parametrize(
+    "backup_name", ["opencode.jsonc.headroom-backup", "opencode.json.headroom-backup"]
+)
 def test_unwrap_opencode_restores_from_backup_jsonc(
     runner: CliRunner,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    backup_name: str,
 ) -> None:
     """Unwrap restores the pre-wrap backup and removes it for jsonc files."""
     monkeypatch.chdir(tmp_path)
     _set_test_home(monkeypatch, tmp_path)
 
     config_file = tmp_path / ".config" / "opencode" / "opencode.jsonc"
-    backup_file = config_file.with_name("opencode.jsonc.headroom-backup")
+    backup_file = config_file.with_name(backup_name)
     config_file.parent.mkdir(parents=True, exist_ok=True)
     original = '{\n  // User comment\n  "model": "openai/gpt-4o"\n}'
-    config_file.write_text(original)
+    config_file.write_text('{"model":"headroom/claude-sonnet-4-6","theme":"edited"}')
     backup_file.write_text(original)
 
     with patch.object(wrap_mod, "_stop_local_proxy_for_unwrap", return_value="stopped"):
         result = runner.invoke(main, ["unwrap", "opencode"])
 
     assert result.exit_code == 0, result.output
-    assert "Restored prior" in result.output
     assert not backup_file.exists()
     assert config_file.read_text(encoding="utf-8") == original
 
@@ -1232,3 +1279,440 @@ def test_unwrap_opencode_preserves_utf8_user_content(
     assert "“smart quotes”" in content
     assert "—" in content
     assert wrap_mod._PROVIDER_MARKER_START not in content
+
+
+def _capture_ensure_proxy_kwargs(
+    runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv: list[str],
+) -> dict[str, object]:
+    """Run `wrap opencode` with a stubbed proxy/launch and return _ensure_proxy kwargs."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_ensure_proxy(port: int, no_proxy: bool, **kwargs):  # noqa: ANN003
+        captured.update(kwargs, no_proxy=no_proxy)
+        return None, port
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_ensure_proxy", side_effect=fake_ensure_proxy),
+        patch.object(wrap_mod, "_launch_tool"),
+    ):
+        result = runner.invoke(main, argv)
+
+    assert result.exit_code == 0, result.output
+    return captured
+
+
+def test_wrap_opencode_forwards_openai_api_url_to_proxy(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--openai-api-url points the proxy at a third-party OpenAI-compatible upstream (#3107)."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        [
+            "wrap",
+            "opencode",
+            "--port",
+            "9000",
+            "--no-mcp",
+            "--no-serena",
+            "--openai-api-url",
+            "https://api.deepseek.com/v1",
+        ],
+    )
+
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+
+
+def test_wrap_opencode_honors_openai_target_api_url_env(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPENAI_TARGET_API_URL is honored without the flag, matching `headroom proxy`."""
+    monkeypatch.setenv("OPENAI_TARGET_API_URL", "https://api.deepseek.com/v1")
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"],
+    )
+
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+
+
+def test_wrap_opencode_without_openai_api_url_leaves_upstream_unset(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No override means the proxy keeps its own default upstream resolution."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena"],
+    )
+
+    assert captured["openai_api_url"] is None
+
+
+def test_wrap_opencode_rejects_openai_api_url_with_copilot_subscription(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Copilot subscription resolves its own upstream; a manual override would fight it."""
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    _clear_copilot_route_config(monkeypatch)
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+
+    with patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("proxy launched")):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--copilot-subscription",
+                "--openai-api-url",
+                "https://api.deepseek.com/v1",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with --copilot-subscription" in result.output
+
+
+def _no_proxy_health(openai_api_url: str | None) -> dict[str, object]:
+    """A /health payload from a Headroom listener advertising ``openai_api_url``."""
+    return {
+        "version": wrap_mod._HEADROOM_VERSION,
+        "config": {
+            "pid": "12345",
+            "memory": False,
+            "learn": False,
+            "code_graph": False,
+            "openai_api_url": openai_api_url,
+        },
+    }
+
+
+def test_no_proxy_with_openai_api_url_rejects_absent_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-proxy cannot honor an upstream override when nothing is listening."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "No Headroom proxy" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_with_openai_api_url_rejects_non_headroom_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A port that accepts connections but exposes no Headroom config is not trusted."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: None)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "did not report a Headroom config" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_with_openai_api_url_reuses_matching_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running proxy already pointed at the requested upstream is reused as-is."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    # Trailing slash on the advertised URL: the comparison must be normalized.
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_health",
+        lambda _port: _no_proxy_health("https://api.deepseek.com/v1/"),
+    )
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_config",
+        lambda _port: pytest.fail("config must come from the /health payload"),
+    )
+
+    assert wrap_mod._ensure_proxy_unlocked(
+        8787,
+        True,
+        openai_api_url="https://api.deepseek.com/v1",
+        require_openai_api_url=True,
+    ) == (None, 8787)
+
+
+def test_no_proxy_with_openai_api_url_still_warns_about_a_mode_mismatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reusing a matching upstream keeps the mode warning every other reuse path gives."""
+    health = _no_proxy_health("https://api.deepseek.com/v1")
+    health["config"]["mode"] = "cache"  # type: ignore[index]
+    monkeypatch.setenv("HEADROOM_MODE", "token")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: health)
+
+    wrap_mod._ensure_proxy_unlocked(
+        8787,
+        True,
+        openai_api_url="https://api.deepseek.com/v1",
+        require_openai_api_url=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "requested 'token' mode but the running proxy is in 'cache' mode" in out
+
+
+def test_no_proxy_with_openai_api_url_rejects_mismatched_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy on the default OpenAI upstream must not receive a DeepSeek-bound key (#3107)."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: _no_proxy_health(None))
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda _port: None)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        wrap_mod._ensure_proxy_unlocked(
+            8787,
+            True,
+            openai_api_url="https://api.deepseek.com/v1",
+            require_openai_api_url=True,
+        )
+
+    message = str(excinfo.value)
+    assert "https://api.openai.com/v1" in message
+    assert "https://api.deepseek.com/v1" in message
+    assert "headroom proxy --port 8787 --openai-api-url https://api.deepseek.com/v1" in message
+
+
+def test_no_proxy_without_required_openai_api_url_keeps_lenient_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wrappers with a built-in upstream (grok, kimi, ...) keep the historical warn-and-reuse."""
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_health",
+        lambda _port: pytest.fail("no upstream check without require_openai_api_url"),
+    )
+
+    assert wrap_mod._ensure_proxy_unlocked(8787, True, openai_api_url="https://api.x.ai/v1") == (
+        None,
+        8787,
+    )
+
+
+def test_wrap_opencode_no_proxy_requires_openai_api_url_match(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-proxy with an upstream override asks _ensure_proxy to fail closed on a mismatch."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    # A listener that already matches, so the up-front check lets the wrap through.
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(
+        wrap_mod,
+        "_query_proxy_health",
+        lambda _port: _no_proxy_health("https://api.deepseek.com/v1"),
+    )
+    captured = _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        [
+            "wrap",
+            "opencode",
+            "--port",
+            "9000",
+            "--no-mcp",
+            "--no-serena",
+            "--no-proxy",
+            "--openai-api-url",
+            "https://api.deepseek.com/v1",
+        ],
+    )
+
+    assert captured["no_proxy"] is True
+    assert captured["openai_api_url"] == "https://api.deepseek.com/v1"
+    assert captured["require_openai_api_url"] is True
+
+
+def test_wrap_opencode_no_proxy_rejects_a_mismatched_upstream_before_editing_config(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused --no-proxy upstream leaves OpenCode's config and the client markers alone."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_health", lambda _port: _no_proxy_health(None))
+    registered: list[int] = []
+    monkeypatch.setattr(wrap_mod, "_register_proxy_client", registered.append)
+
+    with (
+        patch.object(wrap_mod.shutil, "which", return_value="opencode"),
+        patch.object(wrap_mod, "_ensure_proxy", side_effect=AssertionError("must not be reached")),
+        patch.object(wrap_mod, "_launch_tool"),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "opencode",
+                "--port",
+                "9000",
+                "--no-proxy",
+                "--openai-api-url",
+                "https://api.deepseek.com/v1",
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "not https://api.deepseek.com/v1" in result.output
+    assert not (tmp_path / ".config" / "opencode").exists()
+    assert registered == []
+
+
+def _write_user_headroom_provider(tmp_path: Path) -> Path:
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "options": {"apiKey": "{env:DEEPSEEK_API_KEY}"},
+                        "models": {"deepseek-chat": {"name": "DeepSeek Chat"}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_file
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "kept"),
+    [(["--openai-api-url", "https://api.deepseek.com/v1"], True), ([], False)],
+)
+def test_wrap_opencode_keeps_the_users_headroom_key_only_for_an_explicit_upstream(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_args: list[str],
+    kept: bool,
+) -> None:
+    """Without --openai-api-url the proxy forwards to OpenAI, so a third-party key must not be kept."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    config_file = _write_user_headroom_provider(tmp_path)
+
+    _capture_ensure_proxy_kwargs(
+        runner,
+        monkeypatch,
+        tmp_path,
+        ["wrap", "opencode", "--port", "9000", "--no-mcp", "--no-serena", *extra_args],
+    )
+
+    headroom = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]
+    assert ("apiKey" in headroom["options"]) is kept
+    assert ("deepseek-chat" in headroom["models"]) is kept
+    assert headroom["options"]["baseURL"] == "http://127.0.0.1:9000/v1"
+
+
+def test_wrap_opencode_prepare_only_does_not_need_the_no_proxy_listener(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--prepare-only never uses a proxy, so it must not insist one is already running."""
+    monkeypatch.delenv("OPENAI_TARGET_API_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = _write_user_headroom_provider(tmp_path)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
+
+    result = runner.invoke(
+        main,
+        [
+            "wrap",
+            "opencode",
+            "--port",
+            "9000",
+            "--no-mcp",
+            "--no-serena",
+            "--prepare-only",
+            "--no-proxy",
+            "--openai-api-url",
+            "https://api.deepseek.com/v1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    headroom = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]
+    assert headroom["options"]["apiKey"] == "{env:DEEPSEEK_API_KEY}"
+
+
+def _has_control_chars(text: str) -> list[str]:
+    return sorted({hex(ord(ch)) for ch in text if ord(ch) < 0x20 and ch not in "\n\t"})
+
+
+def test_opencode_help_keeps_its_unwrapped_examples(runner: CliRunner) -> None:
+    # Wide enough that a paragraph Click reflows would join these commands; at
+    # the default 80 columns the reflow can happen to break at the same places.
+    result = runner.invoke(
+        main, ["wrap", "opencode", "--help"], terminal_width=200, max_content_width=200
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _has_control_chars(result.output) == []
+    lines = [line.strip() for line in result.output.splitlines()]
+    # Click's no-rewrap marker must keep each example on its own line; without it
+    # the paragraph is reflowed and these commands are joined into prose.
+    assert "headroom wrap opencode --openai-api-url https://api.deepseek.com/v1" in lines
+    assert "OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode" in lines
+    assert "headroom wrap opencode --backend anyllm --anyllm-provider groq" in lines
+    assert 'provided". Point the proxy at the real upstream instead:' in lines
+
+
+def test_wrap_source_has_no_raw_control_bytes() -> None:
+    # In a normal docstring "\b" already becomes 0x08 at runtime, so --help cannot
+    # tell the escape from a raw 0x08 byte typed into the file. Check the bytes.
+    source = Path(wrap_mod.__file__).read_bytes().decode("utf-8")
+    assert _has_control_chars(source.replace("\r", "")) == []

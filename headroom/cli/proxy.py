@@ -771,9 +771,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(

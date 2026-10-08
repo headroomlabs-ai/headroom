@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
 
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
@@ -368,6 +369,27 @@ def sanitize_forwarded_response_headers(
     return {key: value for key, value in dict(headers).items() if key.lower() not in drop}
 
 
+def _path_for_log(path: str) -> str:
+    """Drop the query string, fragment and userinfo from an outbound URL.
+
+    Callers pass the full upstream URL, and Google routes put the API key in
+    the query (``?key=...``), so logging it verbatim writes the key to disk.
+    Scheme, host and path are enough to tell forwarder calls apart.
+    """
+    try:
+        parts = urlsplit(path)
+        port = parts.port
+    except ValueError:
+        return "<unparseable>"
+    host = parts.hostname or ""
+    # ``hostname`` drops the brackets around an IPv6 literal; put them back
+    # so the logged URL still names the upstream that was contacted.
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 def log_outbound_request(
     *,
     forwarder: str,
@@ -383,8 +405,8 @@ def log_outbound_request(
     """Structured log line for every outbound forwarder call.
 
     Per realignment build constraints: every cache-affecting decision is
-    logged. Never includes ``Authorization``/``x-api-key`` content or full
-    body bytes.
+    logged. Never includes ``Authorization``/``x-api-key`` content, the URL
+    query string (where Google puts ``key=``) or full body bytes.
 
     ``dropped_mutation_reasons`` records edits that byte-faithful passthrough
     discarded before the wire. That is a WARNING, not a detail: the line above
@@ -396,7 +418,7 @@ def log_outbound_request(
         "body_mutated=%s mutation_reasons=%s source=%s request_id=%s",
         forwarder,
         method,
-        path,
+        _path_for_log(path),
         body_bytes_count,
         "true" if body_mutated else "false",
         ",".join(mutation_reasons) if mutation_reasons else "",
@@ -1621,6 +1643,14 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
     exponential backoff. Anthropic sends integer seconds; the HTTP-date branch
     covers other upstreams. Fails open on any parse error.
     """
+    seconds = _retry_after_seconds(response)
+    if seconds is None:
+        return None
+    return min(seconds * 1000.0, float(max_ms))
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Uncapped, non-negative ``Retry-After`` in seconds, or ``None`` if absent/unparseable."""
     value = response.headers.get("retry-after")
     if not value:
         return None
@@ -1635,7 +1665,25 @@ def retry_after_ms(response: httpx.Response, max_ms: int) -> float | None:
             seconds = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
         except (TypeError, ValueError):
             return None
-    return min(max(seconds, 0.0) * 1000.0, float(max_ms))
+    return max(seconds, 0.0)
+
+
+def overload_retry_is_futile(response: httpx.Response, max_ms: int, retries_left: int = 1) -> bool:
+    """True when retrying a 429/529 cannot succeed within the proxy's backoff.
+
+    Upstream says so explicitly with ``x-should-retry: false``, or implicitly with a
+    ``Retry-After`` beyond every wait still available: each of the ``retries_left``
+    retries sleeps at most ``max_ms``, so a reset further out than
+    ``retries_left * max_ms`` is never reached and the retries only delay the same
+    error (an exhausted subscription window answers with a reset hours away).
+    Forwarding it at once lets the client, or a credential-rotating proxy in front,
+    act on it. A reset within that window stays retryable: later 429s carry a
+    shorter Retry-After as the reset approaches.
+    """
+    if response.headers.get("x-should-retry", "").strip().lower() == "false":
+        return True
+    seconds = _retry_after_seconds(response)
+    return seconds is not None and seconds * 1000.0 > max(retries_left, 0) * max_ms
 
 
 # Transient upstream statuses worth retrying with backoff: 429 (rate limit) and

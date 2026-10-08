@@ -229,6 +229,10 @@ DEFAULT_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "WebSearch",
         "WebFetch",
         "headroom_retrieve",
+        # Caveman's recovery tool: like headroom_retrieve, it returns the stored
+        # original of something Caveman compressed upstream of us. Compressing it
+        # again hands the model a lossy copy of the "complete original" (#4010).
+        "caveman_retrieve",
         # Copilot CLI's file-read tool (its `Read` equivalent): raw file bytes
         # the model byte-patches against.
         "view",
@@ -282,6 +286,9 @@ DEFAULT_VERBATIM_EXCLUDE_TOOLS: frozenset[str] = frozenset(
         "web_search",
         "web_fetch",
         "headroom_retrieve",
+        # A recovery tool's output must reach the model exactly as stored; even
+        # the lossless fold (e.g. JSON minify) changes it (#4010).
+        "caveman_retrieve",
         # `view` (Copilot CLI file read) must stay BYTE-EXACT: the model produces
         # line/byte-precise edits against it, and even "lossless" JSON rewrites
         # or cross-turn dedup folds break old_str matching and force re-reads.
@@ -652,13 +659,14 @@ class ReadMaturationConfig:
     roughly 13x its size. The only cache-safe moment to shrink it is
     BEFORE it is ever cache-written.
 
-    Mechanics: a fresh large Read is held out of the provider prefix
-    cache (the trailing cache breakpoint is relocated to just before it)
-    while its file is ACTIVE, stays verbatim the whole time the model is
-    working with it, and matures into a CCR-backed marker once the file
-    has been quiet for `quiesce_turns`. Only that final compressed form
-    ever enters the cache. No cached byte is ever mutated — there is
-    nothing to bust.
+    Mechanics: a fresh large Read is held verbatim while its file is
+    ACTIVE, so the model sees the full text the whole time it is working
+    with it, and matures into a CCR-backed marker once the file has been
+    quiet for `quiesce_turns`, if it is still outside the provider-cached
+    prefix. The held Read is cached with its turn (the client's
+    breakpoints stay in place), so in a warm session it usually stays
+    verbatim: re-writing everything after a cached Read costs more than
+    the Read saves.
 
     Activity-based (not a fixed hold window) because the audit-reads
     simulation showed touch gaps are fat-tailed: next-touch p50 is 4

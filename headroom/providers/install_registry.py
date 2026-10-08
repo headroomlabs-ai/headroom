@@ -6,6 +6,9 @@ from collections.abc import Callable
 
 from headroom.install.models import DeploymentManifest, ManagedMutation
 from headroom.providers.aider.install import build_install_env as _build_aider_install_env
+from headroom.providers.antigravity.install import (
+    build_install_env as _build_antigravity_install_env,
+)
 from headroom.providers.claude.install import (
     apply_provider_scope as _apply_claude_provider_scope,
 )
@@ -47,9 +50,10 @@ from headroom.providers.opencode.install import (
 
 _InstallEnvBuilder = Callable[..., dict[str, str]]
 _ProviderScopeApplier = Callable[[DeploymentManifest], ManagedMutation | None]
-_ProviderScopeReverter = Callable[[ManagedMutation, DeploymentManifest], None]
+_ProviderScopeReverter = Callable[..., None]
 
 _ENV_BUILDERS: dict[str, _InstallEnvBuilder] = {
+    "antigravity": _build_antigravity_install_env,
     "claude": _build_claude_install_env,
     "copilot": _build_copilot_install_env,
     "codex": _build_codex_install_env,
@@ -100,7 +104,8 @@ def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[Managed
         rollback_errors: list[Exception] = []
         for mutation in reversed(mutations):
             try:
-                revert_provider_scope_mutation(manifest, mutation)
+                revert_provider_scope_mutation(manifest, mutation, restore_backup=False)
+
             except Exception as rollback_exc:
                 rollback_errors.append(rollback_exc)
             else:
@@ -115,9 +120,17 @@ def apply_provider_scope_mutations(manifest: DeploymentManifest) -> list[Managed
     return mutations
 
 
-def revert_provider_scope_mutation(manifest: DeploymentManifest, mutation: ManagedMutation) -> None:
+def revert_provider_scope_mutation(
+    manifest: DeploymentManifest,
+    mutation: ManagedMutation,
+    *,
+    restore_backup: bool = True,
+) -> None:
     """Revert a provider-scope mutation via the owning provider slice."""
     handlers = _PROVIDER_SCOPE_HANDLERS.get(mutation.target)
     if handlers is None:
         return
-    handlers[1](mutation, manifest)
+    if mutation.target == "opencode":
+        handlers[1](mutation, manifest, restore_backup=restore_backup)
+    else:
+        handlers[1](mutation, manifest)
