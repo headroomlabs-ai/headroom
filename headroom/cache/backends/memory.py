@@ -14,7 +14,7 @@ import time
 from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
-from ..context_clock import ContextTurnSnapshot, advance_context_state
+from ..context_clock import ContextTurnSnapshot, advance_context_state, resolve_context_conversation
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -45,12 +45,12 @@ class InMemoryBackend:
         self._context_states: dict[str, tuple[dict[str, Any], float]] = {}
 
     def observe_context_turn(
-        self, conversation_key: str, hash_keys: Collection[str]
+        self, conversation_key: str, hash_keys: Collection[str], *, namespace_key: str | None = None
     ) -> ContextTurnSnapshot | None:
         with self._lock:
             now = time.time()
             events = {
-                key: (entry.created_at, entry.created_at + entry.ttl)
+                key: (entry.created_at, entry.created_at + entry.ttl, entry.event_identity)
                 for key in set(hash_keys)
                 if (entry := self._store.get(key)) is not None
                 and entry.created_at + entry.ttl >= now
@@ -60,8 +60,14 @@ class InMemoryBackend:
             self._context_states = {
                 key: value for key, value in self._context_states.items() if value[1] >= now
             }
-            prior = self._context_states.get(conversation_key)
             try:
+                conversation_key = resolve_context_conversation(
+                    conversation_key,
+                    namespace_key,
+                    {key: value[0] for key, value in self._context_states.items()},
+                    events,
+                )
+                prior = self._context_states.get(conversation_key)
                 state, snapshot, expires_at = advance_context_state(
                     None if prior is None else prior[0], events, self._store.keys(), now
                 )
@@ -70,6 +76,7 @@ class InMemoryBackend:
                     "CCR context clock invalid; proactive expansion skipped: %s", error
                 )
                 return None
+            state["namespace"] = namespace_key if namespace_key is not None else "explicit"
             self._context_states[conversation_key] = (state, expires_at)
             return snapshot
 
@@ -84,6 +91,17 @@ class InMemoryBackend:
         """
         with self._lock:
             return self._store.get(hash_key)
+
+    def record_retrieval(self, hash_key: str, entry: CompressionEntry, query: str | None) -> None:
+        """Update access metadata only if the retrieved event is still current."""
+        with self._lock:
+            current = self._store.get(hash_key)
+            if current is None or current.event_identity != entry.event_identity:
+                return
+            current.record_access(query)
+            entry.retrieval_count = current.retrieval_count
+            entry.last_accessed = current.last_accessed
+            entry.search_queries = current.search_queries.copy()
 
     def set_new(self, hash_key: str, entry: CompressionEntry) -> None:
         """Assign a fresh event timestamp under the shared backend lock."""

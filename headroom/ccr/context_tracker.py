@@ -90,6 +90,7 @@ class CompressedContext:
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
     compression_created_at: float | None = None
+    compression_event_id: str | None = None
 
 
 @dataclass
@@ -175,6 +176,7 @@ class ContextTracker:
         query_context: str = "",
         sample_content: str = "",
         compression_created_at: float | None = None,
+        compression_event_id: str | None = None,
         current_turn: int | None = None,
     ) -> None:
         """Track a compression event.
@@ -194,6 +196,8 @@ class ContextTracker:
             sample_content: Sample of the content for relevance matching.
             compression_created_at: Store event timestamp, allowing replayed
                 history markers to retain their original wall-clock age.
+            compression_event_id: Immutable store event identity, including
+                re-stores after eviction at the same creation timestamp.
             current_turn: When supplied, turn_number is the durable first turn
                 in this conversation. Reject stale events before tracking them.
         """
@@ -223,7 +227,11 @@ class ContextTracker:
             compression_created_at is not None
             and previous is not None
             and previous.workspace_key == workspace_key
-            and previous.compression_created_at == compression_created_at
+            and (
+                previous.compression_created_at == compression_created_at
+                if compression_event_id is None
+                else previous.compression_event_id == compression_event_id
+            )
         ):
             # A replay preserves the event's age. Only an eligible event may
             # gain eviction priority; otherwise stale history can crowd out
@@ -253,6 +261,7 @@ class ContextTracker:
             sample_content=sample_content[:2000],  # Limit sample size
             workspace_key=workspace_key,
             compression_created_at=compression_created_at,
+            compression_event_id=compression_event_id,
         )
 
         # Add or update context

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...fileperms import ensure_private_file
-from ..context_clock import ContextTurnSnapshot, advance_context_state
+from ..context_clock import ContextTurnSnapshot, advance_context_state, resolve_context_conversation
 
 if TYPE_CHECKING:
     from ..compression_store import CompressionEntry
@@ -221,7 +221,7 @@ class SQLiteBackend:
         self._purge_expired(now)
 
     def observe_context_turn(
-        self, conversation_key: str, hash_keys: Collection[str]
+        self, conversation_key: str, hash_keys: Collection[str], *, namespace_key: str | None = None
     ) -> ContextTurnSnapshot | None:
         """Persist the counter and event anchors in one cross-worker transaction."""
         if not hash_keys:
@@ -233,16 +233,28 @@ class SQLiteBackend:
                 events = {}
                 for hash_key in set(hash_keys):
                     row = self._conn.execute(
-                        "SELECT created_at, ttl FROM ccr_entries "
+                        "SELECT created_at, ttl, entry_json FROM ccr_entries "
                         "WHERE hash = ? AND created_at + ttl >= ?",
                         (hash_key, now),
                     ).fetchone()
                     if row is not None:
-                        events[hash_key] = (row[0], row[0] + row[1])
+                        entry = self._entry_from_json(row[2])
+                        if entry is not None:
+                            events[hash_key] = (row[0], row[0] + row[1], entry.event_identity)
                 if not events:
                     self._conn.rollback()
                     return None
                 self._conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
+                if namespace_key is not None:
+                    states = {
+                        key: json.loads(raw)
+                        for key, raw in self._conn.execute(
+                            "SELECT conversation_key, state_json FROM ccr_context_states"
+                        )
+                    }
+                    conversation_key = resolve_context_conversation(
+                        conversation_key, namespace_key, states, events
+                    )
                 row = self._conn.execute(
                     "SELECT state_json FROM ccr_context_states WHERE conversation_key = ?",
                     (conversation_key,),
@@ -256,6 +268,7 @@ class SQLiteBackend:
                 state, snapshot, expires_at = advance_context_state(
                     None if row is None else json.loads(row[0]), events, live_hashes, now
                 )
+                state["namespace"] = namespace_key if namespace_key is not None else "explicit"
                 self._conn.execute(
                     "INSERT INTO ccr_context_states(conversation_key, state_json, expires_at) "
                     "VALUES (?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
@@ -286,6 +299,31 @@ class SQLiteBackend:
         if row is None:
             return None
         return self._entry_from_json(row[0])
+
+    def record_retrieval(self, hash_key: str, entry: CompressionEntry, query: str | None) -> None:
+        """Compare event identity and merge access metadata in one transaction."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT entry_json FROM ccr_entries WHERE hash = ?", (hash_key,)
+                ).fetchone()
+                current = None if row is None else self._entry_from_json(row[0])
+                if current is None or current.event_identity != entry.event_identity:
+                    self._conn.rollback()
+                    return
+                current.record_access(query)
+                self._conn.execute(
+                    "UPDATE ccr_entries SET entry_json = ? WHERE hash = ?",
+                    (json.dumps(asdict(current), ensure_ascii=False), hash_key),
+                )
+                self._conn.commit()
+                entry.retrieval_count = current.retrieval_count
+                entry.last_accessed = current.last_accessed
+                entry.search_queries = current.search_queries.copy()
+            except sqlite3.DatabaseError as error:
+                self._conn.rollback()
+                self._handle_db_error(error, "record retrieval")
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
         self._set(hash_key, entry, fresh_event=False)

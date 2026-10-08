@@ -137,3 +137,64 @@ def test_same_hash_in_same_workspace_retains_each_sessions_age(tmp_path, stored_
         assert "SESSION_A_CONTEXT_SENTINEL" not in str(forwarded[-1])
         _request(client, tmp_path, key, "authentication middleware", "session-b")
         assert "SESSION_A_CONTEXT_SENTINEL" in str(forwarded[-1])
+
+
+@pytest.mark.parametrize("unrelated_turns, eligible", [(4, False), (1, True)])
+def test_trimmed_initial_user_message_does_not_revive_expired_fallback_context(
+    tmp_path, stored_events, unrelated_turns, eligible
+):
+    _, _, key, _, _ = stored_events
+    with _client() as (client, forwarded):
+
+        def request(query, *, keep_origin=True):
+            messages = [
+                {"role": "user", "content": f"Earlier tool result: <<ccr:{key},json,1KB>>"},
+                {"role": "user", "content": query},
+            ]
+            if keep_origin:
+                messages.insert(
+                    0, {"role": "user", "content": "Original conversation introduction"}
+                )
+            response = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 16,
+                    "system": f"cwd: {tmp_path}",
+                    "messages": messages,
+                },
+            )
+            assert response.status_code == 200, response.text
+
+        for _ in range(unrelated_turns):
+            request("Describe unrelated deployment work.")
+        request("authentication middleware")
+        assert ("SESSION_A_CONTEXT_SENTINEL" in str(forwarded[-1])) is eligible
+        request("authentication middleware", keep_origin=False)
+        assert ("SESSION_A_CONTEXT_SENTINEL" in str(forwarded[-1])) is eligible
+
+
+def test_same_timestamp_recreated_payload_is_fresh_through_proxy(
+    tmp_path, stored_events, monkeypatch
+):
+    _, store, key, _, original = stored_events
+    timestamp = store.get_metadata(key)["created_at"]
+    old_event = store.get_metadata(key)["event_id"]
+    monkeypatch.setattr("headroom.cache.compression_store.time.time", lambda: timestamp)
+    with _client() as (client, forwarded):
+        for _ in range(4):
+            _request(client, tmp_path, key, "Describe unrelated deployment work.", "session-a")
+        _request(client, tmp_path, key, "authentication middleware", "session-a")
+        assert "SESSION_A_CONTEXT_SENTINEL" not in str(forwarded[-1])
+        assert store._backend.delete(key)
+        assert (
+            store.store(
+                original, "authentication middleware", query_context="authentication middleware"
+            )
+            == key
+        )
+        assert store.get_metadata(key)["created_at"] == timestamp
+        assert store.get_metadata(key)["event_id"] != old_event
+        _request(client, tmp_path, key, "authentication middleware", "session-a")
+        assert "SESSION_A_CONTEXT_SENTINEL" in str(forwarded[-1])

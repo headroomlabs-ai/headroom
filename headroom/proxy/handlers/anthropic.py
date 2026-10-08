@@ -2731,7 +2731,10 @@ class AnthropicHandlerMixin:
                 if injector.has_compressed_content:
                     # Gated on the existing project identity; preserve fail-closed scoping.
                     if self.ccr_context_tracker and ccr_workspace_key:
-                        from headroom.cache.context_clock import context_conversation_key
+                        from headroom.cache.context_clock import (
+                            context_conversation_key,
+                            context_conversation_namespace,
+                        )
 
                         # Retain the process-wide count as telemetry only. Event age uses
                         # the original conversation's clock, retained by its store.
@@ -2744,7 +2747,13 @@ class AnthropicHandlerMixin:
                             explicit_session=bool(request.headers.get("x-headroom-session-id")),
                         )
                         turn_snapshot = store.observe_context_turn(
-                            conversation_key, injector.detected_hashes
+                            conversation_key,
+                            injector.detected_hashes,
+                            namespace_key=(
+                                None
+                                if request.headers.get("x-headroom-session-id")
+                                else context_conversation_namespace(session_id, ccr_workspace_key)
+                            ),
                         )
                         if turn_snapshot is not None:
                             ccr_conversation_turn = turn_snapshot.current_turn
@@ -2757,7 +2766,12 @@ class AnthropicHandlerMixin:
                                 if turn_snapshot is None
                                 else turn_snapshot.compression_turns.get(hash_key)
                             )
-                            if observed is None or observed[0] != entry.get("created_at"):
+                            if (
+                                observed is None
+                                or turn_snapshot is None
+                                or turn_snapshot.compression_event_ids.get(hash_key)
+                                != entry.get("event_id")
+                            ):
                                 # Unknown age or concurrent recompression: skip proactive
                                 # expansion; explicit retrieval remains available.
                                 continue
@@ -2782,6 +2796,7 @@ class AnthropicHandlerMixin:
                                 query_context=entry.get("query_context", ""),
                                 sample_content=entry.get("compressed_content", "")[:500],
                                 compression_created_at=entry.get("created_at"),
+                                compression_event_id=entry.get("event_id"),
                                 current_turn=ccr_conversation_turn,
                             )
                     elif self.ccr_context_tracker and not ccr_workspace_key:

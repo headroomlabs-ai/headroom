@@ -1,6 +1,7 @@
 """Conversation age must share the compression store's lifetime and durability."""
 
 import concurrent.futures
+import json
 import threading
 
 import pytest
@@ -153,3 +154,136 @@ def test_expired_clock_is_cleaned_and_fresh_payload_gets_new_anchor(backend, mon
     snapshot = _observe(backend, "A", [key])
     assert snapshot.current_turn == 1
     assert snapshot.compression_turns[key][1] == 1
+
+
+def test_recreated_evicted_hash_at_same_timestamp_has_fresh_event(backend, monkeypatch):
+    monkeypatch.setattr("headroom.cache.compression_store.time.time", lambda: 1000.0)
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    first = _observe(backend, "A", [key])
+    for _ in range(4):
+        _observe(backend, "A", [key])
+    assert backend.delete(key)
+    assert store.store("original", "fresh") == key
+    recreated = _observe(backend, "A", [key])
+    assert recreated.compression_event_ids[key] != first.compression_event_ids[key]
+    assert recreated.compression_turns[key][1] == recreated.current_turn
+
+
+def test_version_one_clock_upgrade_preserves_legacy_event_age(backend):
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    legacy = backend.get(key)
+    legacy.event_id = ""
+    legacy.created_at = int(legacy.created_at)
+    backend.set(key, legacy)
+    for _ in range(5):
+        _observe(backend, "A", [key])
+    if isinstance(backend, SQLiteBackend):
+        raw = backend._conn.execute(
+            "SELECT state_json FROM ccr_context_states WHERE conversation_key = 'A'"
+        ).fetchone()[0]
+        state = json.loads(raw)
+    else:
+        state, expiry = backend._context_states["A"]
+    state["version"] = 1
+    for anchor in state["events"].values():
+        anchor.pop("event_id")
+    if isinstance(backend, SQLiteBackend):
+        backend._conn.execute(
+            "UPDATE ccr_context_states SET state_json = ? WHERE conversation_key = 'A'",
+            (json.dumps(state),),
+        )
+        backend._conn.commit()
+    else:
+        backend._context_states["A"] = (state, expiry)
+    upgraded = _observe(backend, "A", [key])
+    assert upgraded.current_turn == 6
+    assert upgraded.compression_turns[key][1] == 1
+    assert upgraded.compression_event_ids[key] == legacy.event_identity
+
+
+def test_fallback_lineage_survives_origin_changes_and_keeps_other_workspace_independent(backend):
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    for _ in range(5):
+        backend.observe_context_turn("original-origin", [key], namespace_key="workspace-a")
+    trimmed = backend.observe_context_turn("trimmed-origin", [key], namespace_key="workspace-a")
+    assert trimmed.current_turn == 6
+    assert trimmed.compression_turns[key][1] == 1
+    restored = backend.observe_context_turn("original-origin", [key], namespace_key="workspace-a")
+    assert restored.current_turn == 7
+    assert restored.compression_turns[key][1] == 1
+    independent = backend.observe_context_turn("other-origin", [key], namespace_key="workspace-b")
+    assert independent.current_turn == 1
+    assert independent.compression_turns[key][1] == 1
+
+
+def test_ambiguous_fallback_lineage_skips_expansion_but_preserves_retrieval(backend):
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    # Seed independently known origins, as retained by an earlier deployment.
+    _observe(backend, "A", [key])
+    _observe(backend, "B", [key])
+    backend.observe_context_turn("A", [key], namespace_key="workspace")
+    backend.observe_context_turn("B", [key], namespace_key="workspace")
+    assert backend.observe_context_turn("unknown", [key], namespace_key="workspace") is None
+    assert backend.observe_context_turn("A", [key], namespace_key="workspace") is None
+    assert store.retrieve(key).original_content == "original"
+    known = backend.observe_context_turn("A", [key])
+    assert known.current_turn == 3
+    assert known.compression_turns[key][1] == 1
+
+
+def test_delayed_retrieval_cannot_overwrite_new_store_event_identity(backend, monkeypatch):
+    reader = CompressionStore(backend=backend)
+    writer = CompressionStore(backend=backend)
+    key = writer.store("original", "sample")
+    read_started = threading.Event()
+    fresh_written = threading.Event()
+    get = backend.get
+
+    def paused_get(hash_key):
+        entry = get(hash_key)
+        if threading.current_thread() is not threading.main_thread():
+            read_started.set()
+            assert fresh_written.wait(timeout=10)
+        return entry
+
+    monkeypatch.setattr(backend, "get", paused_get)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reader.retrieve, key)
+        assert read_started.wait(timeout=10)
+        try:
+            writer.store("original", "fresh")
+            fresh_id = writer.get_metadata(key)["event_id"]
+        finally:
+            fresh_written.set()
+        assert future.result().original_content == "original"
+    assert writer.get_metadata(key)["event_id"] == fresh_id
+
+
+def test_sqlite_concurrent_access_merges_metadata_without_lost_retrievals(tmp_path, monkeypatch):
+    path = tmp_path / "context.sqlite"
+    backends = [SQLiteBackend(db_path=path), SQLiteBackend(db_path=path)]
+    stores = [CompressionStore(backend=backend) for backend in backends]
+    key = stores[0].store("original", "sample")
+    barrier = threading.Barrier(2)
+    for backend in backends:
+        get = backend.get
+
+        def synchronized_get(hash_key, get=get):
+            entry = get(hash_key)
+            barrier.wait(timeout=10)
+            return entry
+
+        monkeypatch.setattr(backend, "get", synchronized_get)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(store.retrieve, key, query=query)
+            for store, query in zip(stores, ["alpha", "beta"], strict=True)
+        ]
+        assert all(future.result().original_content == "original" for future in futures)
+    current = SQLiteBackend(db_path=path).get(key)
+    assert current.retrieval_count == 2
+    assert set(current.search_queries) == {"alpha", "beta"}

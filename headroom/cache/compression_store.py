@@ -39,6 +39,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Collection
 from contextvars import ContextVar
@@ -183,6 +184,11 @@ class CompressionEntry:
     # This MUST match the hash used by SmartCrusher when recording compression
     tool_signature_hash: str | None = None
     compression_strategy: str | None = None  # Strategy used for compression
+    event_id: str = ""  # Empty only for payloads written before durable event IDs.
+
+    @property
+    def event_identity(self) -> str:
+        return self.event_id or f"legacy:{float(self.created_at)!r}"
 
     # Feedback tracking
     retrieval_count: int = 0
@@ -405,6 +411,7 @@ class CompressionStore:
             tool_call_id=tool_call_id,
             query_context=query_context,
             created_at=time.time(),
+            event_id=uuid.uuid4().hex,
             ttl=ttl if ttl is not None else self._default_ttl,
             tool_signature_hash=tool_signature_hash,
             compression_strategy=compression_strategy,
@@ -496,9 +503,12 @@ class CompressionStore:
                 return None
 
             # Track access for feedback
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
+            record_retrieval = getattr(self._backend, "record_retrieval", None)
+            if callable(record_retrieval):
+                record_retrieval(hash_key, entry, query)
+            else:
+                entry.record_access(query)
+                self._backend.set(hash_key, entry)
 
             # Log retrieval event
             if self._enable_feedback:
@@ -533,7 +543,7 @@ class CompressionStore:
         return result_entry
 
     def observe_context_turn(
-        self, conversation_key: str, hash_keys: Collection[str]
+        self, conversation_key: str, hash_keys: Collection[str], *, namespace_key: str | None = None
     ) -> ContextTurnSnapshot | None:
         """Observe one request using backend-scoped, durable event turns.
 
@@ -550,7 +560,17 @@ class CompressionStore:
                 self._warned_context_clock_backend = True
             return None
         with self._lock:
-            return self._backend.observe_context_turn(conversation_key, hash_keys)
+            if namespace_key is None:
+                return self._backend.observe_context_turn(conversation_key, hash_keys)
+            try:
+                return self._backend.observe_context_turn(
+                    conversation_key, hash_keys, namespace_key=namespace_key
+                )
+            except TypeError:
+                logger.warning(
+                    "CCR backend cannot verify fallback lineage; proactive expansion skipped"
+                )
+                return None
 
     def get_metadata(
         self,
@@ -587,6 +607,7 @@ class CompressionStore:
                 "compressed_content": entry.compressed_content,
                 "original_content_preview": entry.original_content[:2000],
                 "created_at": entry.created_at,
+                "event_id": entry.event_identity,
                 "ttl": entry.ttl,
             }
 
