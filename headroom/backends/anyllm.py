@@ -12,6 +12,9 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from headroom.proxy.public_errors import client_message
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -45,10 +48,10 @@ def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def _convert_tool_choice(choice: Any) -> Any:
     """Convert an Anthropic ``tool_choice`` to the OpenAI shape (mirrors LiteLLM).
 
-    Anthropic: ``{"type": "auto"}``, ``{"type": "any"}``, ``{"type": "tool",
-    "name": ...}``. OpenAI: ``"auto"``, ``"required"``, ``{"type": "function",
-    "function": {"name": ...}}``. Passing the raw Anthropic dict through makes
-    the provider reject or ignore it.
+    Anthropic: ``{"type": "auto"}``, ``{"type": "any"}``, ``{"type": "none"}``,
+    ``{"type": "tool", "name": ...}``. OpenAI: ``"auto"``, ``"required"``,
+    ``"none"``, ``{"type": "function", "function": {"name": ...}}``. Passing the
+    raw Anthropic dict through makes the provider reject or ignore it.
     """
     if isinstance(choice, str):
         return choice
@@ -58,6 +61,13 @@ def _convert_tool_choice(choice: Any) -> Any:
             return "auto"
         if choice_type == "any":
             return "required"
+        if choice_type == "none":
+            # Anthropic's {"type": "none"} means "do not use any tool this turn".
+            # Without this branch it fell through to the "auto" default below,
+            # inverting the instruction into "you may use tools" — the model
+            # could then call a tool the client explicitly forbade. OpenAI's
+            # equivalent is the string "none".
+            return "none"
         if choice_type == "tool":
             return {"type": "function", "function": {"name": choice.get("name", "")}}
     return "auto"
@@ -305,7 +315,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm error: {e}")
+            logger.error(f"any-llm error: {format_exception_message(e)}")
             return self._error_response(e)
 
     async def stream_message(
@@ -497,12 +507,13 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -590,7 +601,7 @@ class AnyLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI error: {e}")
+            logger.error(f"any-llm OpenAI error: {format_exception_message(e)}")
             return self._error_response(e, openai_format=True)
 
     def _error_response(self, e: Exception, openai_format: bool = False) -> BackendResponse:
@@ -598,6 +609,9 @@ class AnyLLMBackend(Backend):
         error_type = "api_error"
         status_code = 500
 
+        # Provider API errors keep their text; transport failures are reduced
+        # to the public vocabulary (see proxy/public_errors).
+        error_message = client_message(e, format_exception_message(e))
         error_str = str(e).lower()
         if "authentication" in error_str or "api_key" in error_str or "api key" in error_str:
             error_type = "invalid_api_key" if openai_format else "authentication_error"
@@ -611,11 +625,11 @@ class AnyLLMBackend(Backend):
 
         body: dict[str, Any]
         if openai_format:
-            body = {"error": {"message": str(e), "type": error_type, "code": error_type}}
+            body = {"error": {"message": error_message, "type": error_type, "code": error_type}}
         else:
-            body = {"type": "error", "error": {"type": error_type, "message": str(e)}}
+            body = {"type": "error", "error": {"type": error_type, "message": error_message}}
 
-        return BackendResponse(body=body, status_code=status_code, error=str(e))
+        return BackendResponse(body=body, status_code=status_code, error=error_message)
 
     async def stream_openai_message(
         self,
@@ -661,10 +675,11 @@ class AnyLLMBackend(Backend):
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"any-llm OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"any-llm OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }

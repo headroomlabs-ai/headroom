@@ -9,6 +9,7 @@ from collections.abc import Iterable
 import click
 
 from headroom import paths as _paths
+from headroom.mcp_registry.antigravity import AntigravityRegistrar
 from headroom.providers.grok.runtime import DEFAULT_API_URL as _GROK_DEFAULT_API_URL
 from headroom.providers.install_registry import build_install_target_envs
 from headroom.rollout import RolloutChannel
@@ -34,6 +35,7 @@ SUPPORTED_TARGETS = [
     ToolTarget.GROK,
     ToolTarget.OPENCLAW,
     ToolTarget.OPENCODE,
+    ToolTarget.ANTIGRAVITY,
 ]
 PROVIDER_SCOPE_TARGETS = [
     ToolTarget.CLAUDE,
@@ -63,7 +65,24 @@ def detect_targets() -> list[str]:
             continue
         if target == ToolTarget.GROK_BUILD and shutil.which("grok"):
             detected.append(target.value)
+        if target == ToolTarget.ANTIGRAVITY and _antigravity_detected():
+            detected.append(target.value)
     return detected
+
+
+def _antigravity_detected() -> bool:
+    """Detect an Antigravity IDE install via its own markers.
+
+    The bare ``~/.gemini`` home is not enough: Gemini CLI keeps its session
+    data there too, so a Gemini-CLI-only host must not count as Antigravity
+    (a false positive suppresses the auto-install defaults in
+    ``resolve_targets``). The MCP registrar owns the authoritative gate —
+    the ``~/.gemini/antigravity`` or ``~/.gemini/config`` directories, or an
+    existing MCP config file — so reuse it here instead of re-implementing
+    the check.
+    """
+
+    return AntigravityRegistrar().detect()
 
 
 def resolve_targets(
@@ -133,6 +152,7 @@ def build_manifest(
     memory_enabled: bool,
     telemetry_enabled: bool,
     image: str,
+    no_rate_limit: bool = False,
     no_http2: bool = False,
     code_aware: bool | None = None,
     intercept_tool_results: bool = False,
@@ -154,7 +174,11 @@ def build_manifest(
     if sys.platform.startswith("win") and preset == InstallPreset.PERSISTENT_SERVICE.value:
         effective_preset = InstallPreset.PERSISTENT_TASK.value
 
-    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+    if runtime_kind == RuntimeKind.DOCKER.value:
+        # Docker owns its container lifecycle; never install a native service
+        # or task alongside it when callers combine runtime and preset flags.
+        supervisor_kind = SupervisorKind.NONE.value
+    elif effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
         supervisor_kind = SupervisorKind.SERVICE.value
     elif effective_preset == InstallPreset.PERSISTENT_TASK.value:
         supervisor_kind = SupervisorKind.TASK.value
@@ -169,6 +193,10 @@ def build_manifest(
         "HEADROOM_MODE": proxy_mode,
         "HEADROOM_BACKEND": backend,
     }
+    if effective_preset == InstallPreset.PERSISTENT_SERVICE.value:
+        # Keep native services away from Metal-specific model backends by default.
+        base_env["HEADROOM_EMBEDDER_RUNTIME"] = "cpu"
+        base_env["HEADROOM_KOMPRESS_BACKEND"] = "onnx"
     if anyllm_provider:
         base_env["HEADROOM_ANYLLM_PROVIDER"] = anyllm_provider
     if region:
@@ -181,11 +209,15 @@ def build_manifest(
     # Grok / Grok Build need proxy upstream = xAI. Only auto-set when no other
     # OpenAI-compatible tools share this proxy (those may need api.openai.com /
     # Copilot). Explicit OPENAI_TARGET_API_URL in extra_env still wins below.
+    # Antigravity speaks the OpenAI protocol (custom OpenAI-compatible model
+    # provider), so it belongs in the exclusion set too: a Grok + Antigravity
+    # deployment must not send Antigravity's traffic to xAI.
     _openai_native = {
         ToolTarget.CODEX.value,
         ToolTarget.COPILOT.value,
         ToolTarget.AIDER.value,
         ToolTarget.OPENCODE.value,
+        ToolTarget.ANTIGRAVITY.value,
     }
     _grok_targets = {ToolTarget.GROK.value, ToolTarget.GROK_BUILD.value}
     target_set = set(resolved_targets)
@@ -221,12 +253,21 @@ def build_manifest(
         "127.0.0.1",
         "--port",
         str(port),
+        "--headroom-deployment-profile",
+        normalized_profile,
+        "--headroom-deployment-runtime",
+        runtime_kind,
         "--mode",
         proxy_mode,
         "--backend",
         backend,
     ]
     proxy_args.append("--telemetry" if telemetry_enabled else "--no-telemetry")
+    # Agentic CLI targets (Claude Code, Codex) burst well above 60 req/min.
+    # Persist the flag so reinstalls don't silently reintroduce throttling.
+    # (see: https://github.com/headroomlabs-ai/headroom/issues/1350)
+    if no_rate_limit:
+        proxy_args.append("--no-rate-limit")
     if memory_enabled:
         proxy_args.append("--memory")
         # `_paths.memory_db_path()` resolves against the HOST home. A container

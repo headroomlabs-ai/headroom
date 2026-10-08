@@ -19,7 +19,7 @@ The canonical, always-current documentation index lives at the docs site below. 
 
 - Python: `pip install headroom-ai` (add `[all]` for every optional extra)
 - TypeScript / Node: `npm install headroom-ai` (or `pnpm add headroom-ai`, `bun add headroom-ai`)
-- Docker: `docker run -p 8787:8787 ghcr.io/headroomlabs-ai/headroom:latest`
+- Docker local: `docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/headroomlabs-ai/headroom:latest --host 0.0.0.0`
 - Run the proxy: `headroom proxy --port 8787` then point any client at `http://127.0.0.1:8787`
 - Wrap an agent in one command: `headroom wrap claude` (also: `codex`, `copilot`, `cursor`, `aider`, `opencode`, `cline`, `continue`, `goose`, `openhands`, `openclaw`, `vibe`, `omp`)
 
@@ -62,6 +62,13 @@ The canonical, always-current documentation index lives at the docs site below. 
 - [Troubleshooting](https://docs.headroomlabs.ai/docs/troubleshooting): Common failure modes and fixes.
 - [Limitations](https://docs.headroomlabs.ai/docs/limitations): What Headroom won't do well today.
 
+## Headroom for Teams
+
+For teams and companies that want Headroom across every developer rather than one laptop: Headroom Enterprise adds more savings (tool search for every model, harness tuning, extra compressors), automatic model routing (open source has opt-in, rule-based routing), prompt-injection and risky-tool-call removal, SSO, managed or VPC deployment, an org-wide savings dashboard, and support. Companies that sign a 12-month Enterprise plan get the first 3 months free.
+
+- [Headroom for Teams](https://docs.headroomlabs.ai/docs/teams): Open source vs Enterprise, and the 3-months-free offer.
+- [Claim 3 months free](https://headroom-perks.vercel.app/?source=github&utm_source=llms-txt): Perk sign-up form. One perk per company.
+
 ## Licensing
 
-Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. Anonymous telemetry is **off by default** (opt-in); enable with `HEADROOM_TELEMETRY=on` or `headroom proxy --telemetry`.
+Apache 2.0. Use commercially, modify, redistribute. Data stays on the user's machine when running the library, proxy, or MCP server locally. An anonymous usage beacon is **on by default**: it reports compression ratios, counters, provider and model IDs, OS and architecture, and never prompts, completions, code or file paths. Turn it off with `HEADROOM_BEACON=off`, `DO_NOT_TRACK=1`, or `HEADROOM_OFFLINE=1`. See [Telemetry](https://github.com/headroomlabs-ai/headroom#telemetry).
