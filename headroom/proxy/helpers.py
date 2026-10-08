@@ -29,6 +29,7 @@ from urllib.parse import urlsplit, urlunsplit
 from headroom import fileperms as _fileperms
 from headroom import paths as _paths
 from headroom.cache.compression_cache import _is_tool_result_message
+from headroom.providers.registry import supports_sticky_ccr_tools, supports_sticky_memory_tools
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -2511,7 +2512,7 @@ def apply_session_sticky_memory_tools(
     fresh list (caller-safe). ``was_injected`` is True iff at least one
     memory tool was added to the list.
     """
-    if provider not in ("anthropic", "openai"):
+    if not supports_sticky_memory_tools(provider):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
@@ -2813,7 +2814,7 @@ def apply_session_sticky_ccr_tool(
     """
     from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
-    if provider not in ("anthropic", "openai", "google"):
+    if not supports_sticky_ccr_tools(provider):
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
