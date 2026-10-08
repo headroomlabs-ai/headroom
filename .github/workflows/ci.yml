@@ -393,7 +393,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev]" pytest-split
+          pip install "${WHEEL}[dev,langchain]" pytest-split
           # cwd's ./headroom source tree shadows the installed wheel; copy the
           # compiled extension in so tests import it (no second cargo build).
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
