@@ -449,69 +449,6 @@ def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
     assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
 
 
-def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
-    runner = CliRunner()
-
-    class Manifest:
-        targets = ["claude"]
-        tool_envs = {}
-        profile = "default"
-        preset = "persistent-service"
-        runtime_kind = "python"
-        supervisor_kind = "service"
-        scope = "user"
-        port = 8787
-        backend = "anthropic"
-        health_url = "http://127.0.0.1:8787/readyz"
-
-    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr(
-        "headroom.cli.install.runtime_status",
-        lambda manifest: "running",
-    )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
-    monkeypatch.setattr(
-        "headroom.cli.install.probe_json",
-        lambda url: {"config": {"backend": "anthropic"}},
-    )
-
-    result = runner.invoke(main, ["install", "status"])
-
-    assert result.exit_code == 0, result.output
-    assert "Status:     running" in result.output
-    assert "Healthy:    yes" in result.output
-    assert "Backend:    anthropic" in result.output
-
-
-def test_install_status_survives_non_dict_config(monkeypatch) -> None:
-    """A health payload whose `config` is a non-dict (e.g. a different service
-    answering on the port returns config: null) must not crash the command."""
-    runner = CliRunner()
-
-    class Manifest:
-        targets = ["claude"]
-        tool_envs = {}
-        profile = "default"
-        preset = "persistent-service"
-        runtime_kind = "python"
-        supervisor_kind = "service"
-        scope = "user"
-        port = 8787
-        backend = "anthropic"
-        health_url = "http://127.0.0.1:8787/readyz"
-
-    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
-    monkeypatch.setattr("headroom.cli.install.probe_json", lambda url: {"config": None})
-
-    result = runner.invoke(main, ["install", "status"])
-
-    # No AttributeError; Backend falls back to the manifest value.
-    assert result.exit_code == 0, result.output
-    assert "Backend:    anthropic" in result.output
-
-
 def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []

@@ -1180,7 +1180,13 @@ def install_status(profile: str) -> None:
         config = payload.get("config")
         if not isinstance(config, dict):
             config = {}
-        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
+        click.echo(f"Default backend:  {config.get('backend', manifest.backend)}")
+        click.echo(
+            f"Anthropic target: {'configured' if config.get('anthropic_api_url') else 'default'}"
+        )
+        click.echo(
+            f"OpenAI target:    {'configured' if config.get('openai_api_url') else 'default'}"
+        )
 
 
 @install.command("start")

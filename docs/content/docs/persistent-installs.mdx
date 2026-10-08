@@ -90,6 +90,8 @@ headroom install remove
 
 `apply` creates or updates a named deployment profile, stores its manifest under `~/.headroom/deploy/<profile>/manifest.json`, applies reversible configuration changes, and starts the selected runtime.
 
+`status` distinguishes the default backend from the Anthropic and OpenAI protocol targets. Each target is shown as `configured` or `default`; target URLs and credentials are not printed. An OpenAI-compatible deployment can therefore have `Default backend: anthropic` and `OpenAI target: configured` at the same time.
+
 ## Presets and runtime kinds
 
 ### Presets
