@@ -543,6 +543,72 @@ def test_relocate_system_messages_drops_all_non_text_leading_section() -> None:
     assert new_system == [{"type": "text", "text": "base"}]
 
 
+@pytest.mark.parametrize("block_type", ["text", "image", "tool_use", "tool_result", None])
+def test_leading_system_text_uses_only_anthropic_text_block_fields(block_type) -> None:
+    from copy import deepcopy
+
+    cache_control = {"type": "ephemeral", "ttl": "1h"}
+    citations = [
+        {
+            "type": "char_location",
+            "cited_text": "instruction",
+            "document_index": 0,
+            "document_title": "source",
+            "start_char_index": 0,
+            "end_char_index": 11,
+        }
+    ]
+    block = {
+        "type": block_type,
+        "text": "instruction",
+        "cache_control": cache_control,
+        "citations": citations,
+        "source": {"type": "url", "url": "https://example.invalid/image.png"},
+        "id": "tool1",
+        "name": "read",
+        "input": {"path": "file.txt"},
+        "tool_use_id": "tool1",
+        "is_error": False,
+    }
+    messages = [
+        {"role": "system", "content": [block]},
+        {"role": "user", "content": "hi"},
+    ]
+    original = deepcopy(messages)
+    clean, system, changed = relocate_system_messages_to_top_level(messages, None, None)
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {
+            "type": "text",
+            "text": "instruction",
+            "cache_control": cache_control,
+            "citations": citations,
+        }
+    ]
+    assert messages == original
+
+
+def test_all_contiguous_leading_system_sections_are_normalized() -> None:
+    image = {"type": "image", "source": {"type": "url", "url": "https://example.invalid/a"}}
+    clean, system, changed = relocate_system_messages_to_top_level(
+        [
+            {"role": "system", "content": "first instruction"},
+            {"role": "system", "content": [image]},
+            {"role": "system", "content": [{"type": "text", "text": "second instruction"}]},
+            {"role": "user", "content": "hi"},
+        ],
+        None,
+        None,
+    )
+    assert changed
+    assert clean == [{"role": "user", "content": "hi"}]
+    assert system == [
+        {"type": "text", "text": "first instruction"},
+        {"type": "text", "text": "second instruction"},
+    ]
+
+
 def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
     assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True

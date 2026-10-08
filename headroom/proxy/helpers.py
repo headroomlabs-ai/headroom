@@ -1052,9 +1052,15 @@ def _coerce_system_block(block: dict[str, Any]) -> dict[str, Any] | None:
     """Return a block representable by Anthropic's top-level ``system`` field."""
     text = block.get("text")
     if isinstance(text, str) and text:
-        if block.get("type") == _TEXT_BLOCK_TYPE:
-            return block
-        return {**block, "type": _TEXT_BLOCK_TYPE}
+        # Anthropic TextBlockParam accepts these fields only. Image sources
+        # and tool IDs/inputs remain invalid even after changing ``type``.
+        coerced = {
+            key: value
+            for key, value in block.items()
+            if key in {"type", "text", "cache_control", "citations"}
+        }
+        coerced["type"] = _TEXT_BLOCK_TYPE
+        return coerced
     return None
 
 
@@ -1156,6 +1162,11 @@ def relocate_system_messages_to_top_level(
 
     relocated_blocks: list[Any] = []
     retained: dict[int, dict[str, Any]] = {}
+    leading_system_indices: set[int] = set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            break
+        leading_system_indices.add(index)
     for i in sorted(system_indices):
         message = messages[i]
         content = message.get("content") if isinstance(message, dict) else None
@@ -1170,7 +1181,7 @@ def relocate_system_messages_to_top_level(
             leftovers: list[Any] = []
             for block in content:
                 if isinstance(block, dict):
-                    if i == 0:
+                    if i in leading_system_indices:
                         coerced = _coerce_system_block(block)
                         if coerced is not None:
                             hoisted_from_list.append(coerced)
@@ -1187,7 +1198,7 @@ def relocate_system_messages_to_top_level(
                 elif isinstance(block, str) and block:
                     hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
                 else:
-                    if i == 0:
+                    if i in leading_system_indices:
                         logger.warning(
                             "event=system_relocation_block_dropped block_type=%s "
                             "reason=not_representable_as_text",
@@ -1196,7 +1207,7 @@ def relocate_system_messages_to_top_level(
                     else:
                         leftovers.append(block)
             relocated_blocks.extend(hoisted_from_list)
-            if leftovers and i != 0:
+            if leftovers and i not in leading_system_indices:
                 retained[i] = {**message, "content": leftovers}
         else:
             # String (and other) content converts losslessly to text blocks.
