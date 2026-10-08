@@ -12,6 +12,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from headroom.proxy.auth_mode import classify_client, supports_mid_turn_coalescing
 from headroom.proxy.handlers._debug_dump import write_upstream_error_dump
@@ -48,20 +49,41 @@ def _stream_outcome_status(status_code: int, completed_normally: bool) -> int:
     return status_code if completed_normally else STREAM_FAILURE_STATUS
 
 
+def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> tuple[bool, bool]:
+    """Classify a complete protocol event, never text inside a model delta."""
+    try:
+        data = json.loads(data_str)
+    except (TypeError, ValueError):
+        data = None
+    event_type = data.get("type") if isinstance(data, dict) else None
+    failed = event_name in {"error", "response.failed"} or event_type in {
+        "error",
+        "response.failed",
+    }
+    if isinstance(data, dict) and data.get("error") is not None:
+        failed = True
+    if dialect == "anthropic":
+        terminal = event_name == "message_stop" or event_type == "message_stop"
+    elif dialect == "responses":
+        # Incomplete is a normal terminal result (e.g. the output-token limit),
+        # unlike response.failed. It still incurred a successful model request.
+        terminal = event_name in {"response.completed", "response.incomplete"} or event_type in {
+            "response.completed",
+            "response.incomplete",
+        }
+    else:
+        terminal = data_str.strip() == "[DONE]"
+    return failed, terminal
+
+
 def _sse_contains_error_event(payload: bytes) -> bool:
-    for event in payload.split(b"\n\n"):
-        if b"event: error" in event:
-            return True
-        for line in event.splitlines():
-            if not line.startswith(b"data: "):
-                continue
-            try:
-                data = json.loads(line[6:])
-            except (TypeError, ValueError):
-                continue
-            if isinstance(data, dict) and ("error" in data or data.get("type") == "error"):
-                return True
-    return False
+    from headroom.proxy.helpers import parse_sse_events_from_byte_buffer
+
+    return any(
+        _sse_event_outcome(event_name, data, "chat")[0]
+        for event_name, data in parse_sse_events_from_byte_buffer(bytearray(payload))
+    )
+
 
 _ROUND_USAGE_KEYS = (
     "input_tokens",
@@ -357,6 +379,13 @@ class StreamingMixin:
         # ``stream_state``, no reassignment is needed.
         events = parse_sse_events_from_byte_buffer(buffer)
         for _event_name, data_str in events:
+            failed, terminal = _sse_event_outcome(
+                _event_name,
+                data_str,
+                stream_state.get("sse_dialect", "anthropic" if provider == "anthropic" else "chat"),
+            )
+            stream_state["stream_failed"] = stream_state.get("stream_failed", False) or failed
+            stream_state["stream_terminal"] = stream_state.get("stream_terminal", False) or terminal
             if not data_str or data_str == "[DONE]":
                 continue
 
@@ -1289,6 +1318,14 @@ class StreamingMixin:
             "sse_buffer": bytearray(),
             "ttfb_ms": None,  # Time to first byte from upstream
             "stream_failed": False,
+            "stream_terminal": False,
+            "sse_dialect": (
+                "anthropic"
+                if provider == "anthropic"
+                else "responses"
+                if urlsplit(url).path.rstrip("/").endswith("/responses")
+                else "chat"
+            ),
         }
 
         # Track if we need to handle memory tools
@@ -1633,8 +1670,6 @@ class StreamingMixin:
                         # are located in bytes; decoding happens per
                         # complete event in the SSE splitter helper.
                         stream_state["sse_buffer"].extend(chunk)
-                        if _sse_contains_error_event(bytes(stream_state["sse_buffer"])):
-                            stream_state["stream_failed"] = True
 
                         # Safety: prevent unbounded buffer growth.
                         if len(stream_state["sse_buffer"]) > MAX_SSE_BUFFER_SIZE:
@@ -1854,7 +1889,9 @@ class StreamingMixin:
                         status_code=upstream_response.status_code,
                         metadata={"total_bytes": stream_state["total_bytes"]},
                     )
-                completed_normally = not stream_state["stream_failed"]
+                completed_normally = (
+                    stream_state["stream_terminal"] and not stream_state["stream_failed"]
+                )
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
@@ -2041,9 +2078,10 @@ class StreamingMixin:
         full_sse_bytes = bytearray()
         completed_normally = False
         stream_failed = False
+        stream_terminal = False
 
         async def generate():
-            nonlocal completed_normally, stream_failed
+            nonlocal completed_normally, stream_failed, stream_terminal
             try:
                 assert backend is not None
 
@@ -2118,11 +2156,15 @@ class StreamingMixin:
                             ]
 
                     # Handle errors
-                    if event.event_type == "error":
-                        stream_failed = True
+                    failed, terminal = _sse_event_outcome(
+                        event.event_type, json.dumps(event.data), "anthropic"
+                    )
+                    stream_failed = stream_failed or failed
+                    stream_terminal = stream_terminal or terminal
+                    if failed:
                         logger.error(f"[{request_id}] Bedrock stream error: {event.data}")
 
-                completed_normally = not stream_failed
+                completed_normally = stream_terminal and not stream_failed
 
             except Exception as e:
                 error_message = format_exception_message(e)
@@ -2143,7 +2185,7 @@ class StreamingMixin:
                 # and _stream_openai_via_backend (OpenAI-via-backend
                 # sibling). Run before the outcome funnel so prefix state
                 # is consistent regardless of metric path.
-                if prefix_tracker is not None:
+                if completed_normally and prefix_tracker is not None:
                     import copy as _copy
 
                     tracker_messages = (
@@ -2324,8 +2366,10 @@ class StreamingMixin:
                     if parsed is not None and not stream_state["output_tokens"]:
                         stream_state["output_tokens"] = parsed
                     yield chunk_bytes
-                stream_failed = _sse_contains_error_event(bytes(full_sse_bytes))
-                completed_normally = not stream_failed
+                stream_failed = stream_state.get("stream_failed", False)
+                completed_normally = (
+                    stream_state.get("stream_terminal", False) and not stream_failed
+                )
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
                 error_data = public_errors.openai_error_body(
@@ -2379,7 +2423,7 @@ class StreamingMixin:
                 # the non-streaming sibling. Done before outcome funnel
                 # so prefix state is consistent regardless of metric
                 # path.
-                if prefix_tracker is not None:
+                if completed_normally and prefix_tracker is not None:
                     tracker_messages = (
                         optimized_messages
                         if optimized_messages is not None

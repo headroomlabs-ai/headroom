@@ -343,6 +343,158 @@ def test_sse_error_detection_handles_native_and_split_events():
     assert not _sse_contains_error_event(b'data: {"type":"message"}\n\n')
 
 
+def test_sse_error_text_in_response_content_is_not_an_error():
+    from headroom.proxy.handlers.streaming import _sse_contains_error_event
+
+    assert not _sse_contains_error_event(b'data: {"text":"event: error"}\n\n')
+
+
+def test_responses_failed_envelope_is_an_error():
+    from headroom.proxy.handlers.streaming import _sse_contains_error_event
+
+    assert _sse_contains_error_event(
+        b'data: {"type":"response.failed","response":{"status":"failed",'
+        b'"error":{"code":"server_error"}}}\n\n'
+    )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_backend_clean_eof_requires_protocol_completion(provider, complete):
+    from types import MethodType
+
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    class Backend(_Backend):
+        async def stream_message(self, body, headers):
+            yield SimpleNamespace(
+                event_type="message_start", raw_sse="event: message_start\ndata: {}\n\n", data={}
+            )
+            if complete:
+                yield SimpleNamespace(
+                    event_type="message_stop",
+                    raw_sse='event: message_stop\ndata: {"type":"message_stop"}\n\n',
+                    data={"type": "message_stop"},
+                )
+
+        async def stream_openai_message(self, body, headers):
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            if complete:
+                yield "data: [DONE]\n\n"
+
+    outcomes = []
+
+    async def record(outcome):
+        outcomes.append(outcome)
+
+    handler = _handler(Backend(provider))
+    handler._record_request_outcome = record
+    handler._extract_anthropic_cache_ttl_metrics = lambda usage: (0, 0)
+    handler._parse_sse_usage_from_buffer = MethodType(
+        StreamingMixin._parse_sse_usage_from_buffer, handler
+    )
+    drive = _drive_with_outcome if provider == "anthropic" else _drive_openai_with_outcome
+    asyncio.run(drive(handler, handler.anthropic_backend))
+    assert len(outcomes) == 1
+    assert outcomes[0].status_code == (200 if complete else 502)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+@pytest.mark.parametrize("complete", [False, True])
+def test_backend_prefix_tracker_advances_only_after_completion(provider, complete):
+    from types import MethodType
+    from unittest.mock import MagicMock
+
+    from headroom.proxy.handlers.streaming import StreamingMixin
+
+    class Backend(_Backend):
+        async def stream_message(self, body, headers):
+            yield SimpleNamespace(event_type="message_start", raw_sse="", data={})
+            if complete:
+                yield SimpleNamespace(event_type="message_stop", raw_sse="", data={})
+
+        async def stream_openai_message(self, body, headers):
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            if complete:
+                yield "data: [DONE]\n\n"
+
+    backend = Backend(provider)
+    handler = _handler(backend)
+    handler._extract_anthropic_cache_ttl_metrics = lambda usage: (0, 0)
+    handler._parse_sse_usage_from_buffer = MethodType(
+        StreamingMixin._parse_sse_usage_from_buffer, handler
+    )
+    handler._parse_sse_to_response = lambda *args: None
+    handler._assistant_message_from_response_json = lambda response: None
+    tracker = MagicMock()
+    tracker.classify_cache_miss.return_value = SimpleNamespace(is_miss=False)
+
+    async def drive():
+        arguments = {
+            "body": {"messages": []},
+            "headers": {},
+            "model": "m",
+            "request_id": "rid",
+            "original_tokens": 0,
+            "optimized_tokens": 0,
+            "tokens_saved": 0,
+            "transforms_applied": [],
+            "tags": {},
+            "optimization_latency": 0.0,
+            "backend": backend,
+            "prefix_tracker": tracker,
+        }
+        if provider == "anthropic":
+            response = await StreamingMixin._stream_response_bedrock(
+                handler, provider=provider, **arguments
+            )
+        else:
+            response = await StreamingMixin._stream_openai_via_backend(
+                handler, start_time=0.0, **arguments
+            )
+        async for _ in response.body_iterator:
+            pass
+
+    asyncio.run(drive())
+    assert tracker.update_from_response.call_count == int(complete)
+
+
+@pytest.mark.parametrize(
+    "event, data, expected_failed, expected_terminal",
+    [
+        ("response.completed", '{"type":"response.completed"}', False, True),
+        ("response.incomplete", '{"type":"response.incomplete"}', False, True),
+        ("response.failed", '{"type":"response.failed"}', True, False),
+        (None, "[DONE]", False, False),
+    ],
+)
+def test_responses_terminal_semantics(event, data, expected_failed, expected_terminal):
+    from headroom.proxy.handlers.streaming import _sse_event_outcome
+
+    assert _sse_event_outcome(event, data, "responses") == (expected_failed, expected_terminal)
+
+
+def test_outcome_classification_runs_once_for_a_chunked_complete_event(monkeypatch):
+    from headroom.proxy.handlers import streaming
+
+    seen = []
+    classify = streaming._sse_event_outcome
+
+    def record(*args):
+        seen.append(args)
+        return classify(*args)
+
+    monkeypatch.setattr(streaming, "_sse_event_outcome", record)
+    state = {"sse_buffer": bytearray()}
+    parser = streaming.StreamingMixin()
+    payload = b'data: {"text":"' + b"x" * 10_000 + b'"}\n\n'
+    for offset in range(0, len(payload), 101):
+        state["sse_buffer"].extend(payload[offset : offset + 101])
+        parser._parse_sse_usage_from_buffer(state, "openai")
+    assert len(seen) == 1
+    assert not state["sse_buffer"]
+
+
 def test_backend_error_event_is_not_counted_as_completed():
     backend = _ErrorEventBackend("anthropic")
     outcomes = []
