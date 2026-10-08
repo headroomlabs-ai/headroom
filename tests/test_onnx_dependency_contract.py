@@ -110,13 +110,13 @@ def test_proxy_dependency_gate_matches_onnx_platform_markers(
     monkeypatch.setattr(platform, "machine", lambda: platform_machine)
     requested = []
 
-    def import_dependency(name):
+    def find_dependency(name):
         requested.append(name)
         if name in {"magika", "onnxruntime"}:
-            raise ImportError(f"No module named '{name}'")
+            return None
         return object()
 
-    monkeypatch.setattr(proxy, "import_module", import_dependency)
+    monkeypatch.setattr(proxy, "find_spec", find_dependency)
     if optional:
         proxy.ensure_proxy_dependencies()
         assert not {"magika", "onnxruntime"} & set(requested)
