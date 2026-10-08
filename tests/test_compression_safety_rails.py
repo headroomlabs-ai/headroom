@@ -362,5 +362,48 @@ def test_transform_failure_logs_name_and_traceback(
         if record.name == "headroom.transforms.pipeline" and "always_fails" in record.getMessage()
     ]
     assert len(failure_records) == 1
-    assert failure_records[0].exc_info is not None
-    assert failure_records[0].exc_info[0] is RuntimeError
+    rendered = logging.Formatter().format(failure_records[0])
+    assert "Traceback (most recent call last)" in rendered
+    assert "RuntimeError: exception message redacted" in rendered
+    assert "test_compression_safety_rails.py" in rendered
+
+
+@pytest.mark.parametrize("phase", ["should_apply", "apply"])
+def test_transform_failure_rendered_log_redacts_payload_and_correlates_request(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    secret = "private-request-payload-3974"
+
+    class _Tokenizer:
+        def count_messages(self, messages: list[dict[str, Any]]) -> int:
+            return len(messages)
+
+    class _SensitiveFailure(_FailingTransform):
+        def should_apply(self, *args: Any, **kwargs: Any) -> bool:
+            if phase == "should_apply":
+                raise ValueError("private-request-payload-3974")
+            return True
+
+        def apply(self, *args: Any, **kwargs: Any) -> TransformResult:
+            try:
+                raise ValueError(secret)
+            except ValueError as cause:
+                error = RuntimeError(secret)
+                error.add_note(secret)
+                raise error from cause
+
+    monkeypatch.setenv("HEADROOM_PIPELINE_BREAKER_THRESHOLD", "1")
+    pipeline = TransformPipeline(HeadroomConfig(), transforms=[_SensitiveFailure()])
+    monkeypatch.setattr(pipeline, "_get_tokenizer", lambda model: _Tokenizer())
+    caplog.set_level(logging.ERROR, logger="headroom.transforms.pipeline")
+    with pytest.raises((ValueError, RuntimeError), match=secret):
+        pipeline.apply(_MESSAGES, model="gpt-4o", model_limit=1024, request_id="request-3974")
+    rendered = "\n".join(logging.Formatter().format(record) for record in caplog.records)
+    assert "request-3974" in rendered
+    assert "always_fails" in rendered
+    assert "Traceback (most recent call last)" in rendered
+    assert "test_compression_safety_rails.py" in rendered
+    assert secret not in rendered
+    # Eligibility and application failures both open the existing breaker.
+    result = pipeline.apply(_MESSAGES, model="gpt-4o", model_limit=1024)
+    assert result.messages == _MESSAGES
