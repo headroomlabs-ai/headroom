@@ -330,6 +330,8 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
     monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
     monkeypatch.setattr("headroom.learn.verbosity.analyze", fake_analyze)
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+    # --apply talks to a local proxy; keep it off whatever is listening on 8787.
+    monkeypatch.setattr("urllib.request.urlopen", _no_local_proxy)
 
     result = runner.invoke(
         main,
@@ -663,3 +665,126 @@ def test_activate_output_shaper_handles_malformed_response(
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
 
     assert _activate_output_shaper(9876) == ("error", 9876)
+
+
+def _no_local_proxy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+    import urllib.error
+
+    raise urllib.error.URLError("no proxy in tests")
+
+
+class _FakeProxy:
+    """A local proxy as ``urllib.request.urlopen`` sees it.
+
+    ``health_config`` is the ``/health`` config block (``None`` = unreachable);
+    POSTs to ``/admin/runtime-env`` are recorded and accepted.
+    """
+
+    def __init__(self, health_config: dict | None) -> None:
+        self.health_config = health_config
+        self.posted: list[dict] = []
+
+    def urlopen(self, request, timeout=None):  # noqa: ANN001, ANN201
+        import io
+        import urllib.error
+
+        url = request if isinstance(request, str) else request.full_url
+        if url.endswith("/health"):
+            if self.health_config is None:
+                raise urllib.error.URLError("unreachable")
+            return io.BytesIO(json.dumps({"config": self.health_config}).encode())
+        self.posted.append(json.loads(request.data))
+        rollout = {"features": [{"name": "proxy_output_shaper", "enabled": True}]}
+        return io.BytesIO(json.dumps({"applied": self.posted[-1], "rollout": rollout}).encode())
+
+
+def _apply_learned_level(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, proxy: _FakeProxy
+) -> str:
+    """Run ``learn --verbosity --apply`` for one project that learns level 3."""
+    from headroom.proxy.output_savings import BaselineModel
+
+    data_dir = tmp_path / "sessions"
+    data_dir.mkdir()
+    (data_dir / "s.jsonl").write_text("{}")
+    project = SimpleNamespace(
+        name="p", project_path=tmp_path / "src", data_path=data_dir, extra_data_paths=[]
+    )
+    baseline = BaselineModel()
+    baseline.observe("opus|new_user_ask|s|tools", 100)
+    profile = SimpleNamespace(
+        level=3,
+        confidence="high",
+        source="heuristic",
+        rationale="test",
+        signals={},
+        learned_at=None,
+        save=lambda path: Path(str(path)).write_text(json.dumps({"verbosity_level": 3})),
+    )
+    monkeypatch.setattr(
+        "headroom.learn.registry.get_plugin", lambda name: FakePlugin(name, "Claude", [project])
+    )
+    monkeypatch.setattr(
+        "headroom.learn.verbosity.analyze",
+        lambda session_paths, project_path, llm_judge=None: (profile, baseline),
+    )
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+    monkeypatch.setattr("urllib.request.urlopen", proxy.urlopen)
+
+    result = runner.invoke(
+        main,
+        ["learn", "--agent", "claude", "--verbosity", "--all", "--apply"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_verbosity_apply_pins_the_level_on_a_cache_mode_proxy(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """Cache mode never reads verbosity.json, so "live" needs the level pinned."""
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": None}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
+    assert "level 3 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
+    assert "HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL=3 before" in output
+
+
+def test_verbosity_apply_leaves_a_token_mode_proxy_reading_the_profile(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """Token mode reads verbosity.json per request; a pin would only shadow it."""
+    proxy = _FakeProxy({"mode": "token", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": None}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "level 3 is live now." in output
+    assert "export HEADROOM_OUTPUT_SHAPER=1 before" in output
+
+
+def test_verbosity_apply_does_not_override_an_explicit_level(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "2"}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "is live now" not in output
+    assert "it stays at level 2: HEADROOM_VERBOSITY_LEVEL=2 is set" in output
+
+
+def test_verbosity_apply_does_not_claim_live_when_the_mode_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy(None)
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "is live now" not in output
+    assert "its mode could not be read" in output

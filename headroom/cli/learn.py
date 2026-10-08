@@ -418,7 +418,45 @@ def _make_llm_judge(model: str) -> Any:
     return judge
 
 
-def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
+def _local_proxy_port(port: int | None = None) -> int:
+    import os as _os
+
+    return port if port is not None else int(_os.environ.get("HEADROOM_PORT", "8787"))
+
+
+def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, str | None]:
+    """Best-effort: read a running local proxy's mode and pinned verbosity level.
+
+    Both come from the ``/health`` config block, which the proxy includes for
+    loopback callers. Returns ``(mode, level)``: ``mode`` is ``None`` when the
+    proxy is unreachable or does not report it, and ``level`` is the proxy's
+    ``HEADROOM_VERBOSITY_LEVEL``, or ``None`` when that is unset.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{_local_proxy_port(port)}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = _json.loads(response.read() or b"{}")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, None
+    config = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(config, dict):
+        return None, None
+    mode = config.get("mode")
+    runtime = config.get("runtime_env")
+    level = runtime.get("HEADROOM_VERBOSITY_LEVEL") if isinstance(runtime, dict) else None
+    return (
+        mode if isinstance(mode, str) else None,
+        str(level).strip() if level not in (None, "") else None,
+    )
+
+
+def _activate_output_shaper(
+    port: int | None = None, *, verbosity_level: str | None = None
+) -> tuple[str, int]:
     """Best-effort: turn the output shaper ON for a running local proxy.
 
     Writing ``verbosity.json`` is inert on its own — the shaper is a live,
@@ -426,20 +464,23 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     ``HEADROOM_OUTPUT_SHAPER`` is enabled in the proxy that serves traffic.
     When a proxy is already running locally we hot-enable it via
     ``/admin/runtime-env`` (no restart, the same channel ``wrap`` uses), so
-    ``--apply`` actually takes effect. Returns ``(status, port)`` where status is
-    ``"live"`` (enabled on a running proxy), ``"blocked"`` (the proxy's
-    rollout channel rejected it), ``"absent"`` (no reachable proxy), or
+    ``--apply`` actually takes effect. ``verbosity_level`` also pins
+    ``HEADROOM_VERBOSITY_LEVEL`` in the same request. Returns ``(status, port)``
+    where status is ``"live"`` (enabled on a running proxy), ``"blocked"`` (the
+    proxy's rollout channel rejected it), ``"absent"`` (no reachable proxy), or
     ``"error"``.
     """
     import json as _json
-    import os as _os
     import urllib.error
     import urllib.request
 
-    resolved_port = port if port is not None else int(_os.environ.get("HEADROOM_PORT", "8787"))
+    resolved_port = _local_proxy_port(port)
+    overrides = {"HEADROOM_OUTPUT_SHAPER": "1"}
+    if verbosity_level is not None:
+        overrides["HEADROOM_VERBOSITY_LEVEL"] = verbosity_level
     request = urllib.request.Request(
         f"http://127.0.0.1:{resolved_port}/admin/runtime-env",
-        data=_json.dumps({"HEADROOM_OUTPUT_SHAPER": "1"}).encode("utf-8"),
+        data=_json.dumps(overrides).encode("utf-8"),
         method="POST",
         headers={"Content-Type": "application/json"},
     )
@@ -593,15 +634,59 @@ def _run_verbosity(
         # Writing the level is not enough — the shaper is off by default.
         # Make --apply actually take effect: hot-enable a running proxy, and
         # otherwise tell the user exactly how to turn it on.
-        status, shaper_port = _activate_output_shaper()
-        if status == "live":
+        level = str(best_profile.level)
+        mode, pinned = _query_proxy_verbosity()
+        # Cache mode never reads verbosity.json: a level that can change while
+        # conversations are open would bust their prefix cache, so the proxy
+        # steers at its startup level unless HEADROOM_VERBOSITY_LEVEL pins one
+        # (resolve_verbosity_level). Pin the learned level there; otherwise the
+        # proxy would keep steering at its default while we report this level.
+        pin = level if mode == "cache" and pinned is None else None
+        status, shaper_port = _activate_output_shaper(verbosity_level=pin)
+        cache_mode_hint = (
+            f"in cache mode (the default) also set HEADROOM_VERBOSITY_LEVEL={level}, "
+            "because cache mode does not read the learned level"
+        )
+        if status == "live" and pinned is not None and pinned != level:
             click.echo(
-                f"\n  ✓ Output shaper enabled on the running proxy (port {shaper_port}); "
-                f"level {best_profile.level} is live now (while HEADROOM_VERBOSITY_LEVEL is unset)."
+                f"\n  ⚠ Output shaper enabled on the running proxy (port {shaper_port}), "
+                f"but it stays at level {pinned}: HEADROOM_VERBOSITY_LEVEL={pinned} is set "
+                "there and outranks the learned level."
             )
             click.echo(
-                "    To keep it on across restarts: export HEADROOM_ROLLOUT_CHANNEL=beta "
-                "and HEADROOM_OUTPUT_SHAPER=1 before `headroom wrap ...`."
+                f"    To use level {level}, restart the proxy with HEADROOM_VERBOSITY_LEVEL={level}."
+            )
+        elif status == "live" and mode is None:
+            click.echo(
+                f"\n  ⚠ Output shaper enabled on the running proxy (port {shaper_port}), but "
+                f"its mode could not be read, so level {level} may not be in use."
+            )
+            click.echo(
+                f"    A proxy in cache mode (the default) keeps its startup level; restart it "
+                f"with HEADROOM_OUTPUT_SHAPER=1 HEADROOM_VERBOSITY_LEVEL={level} to be sure."
+            )
+        elif status == "live":
+            how = (
+                " (pinned with HEADROOM_VERBOSITY_LEVEL: cache mode does not read the "
+                "learned level)"
+                if pin
+                else ""
+            )
+            click.echo(
+                f"\n  ✓ Output shaper enabled on the running proxy (port {shaper_port}); "
+                f"level {level} is live now{how}."
+            )
+            if pin:
+                click.echo(
+                    "    Conversations already open re-cache their prompt once, because "
+                    "the steering text changed."
+                )
+            restart_env = "HEADROOM_OUTPUT_SHAPER=1" + (
+                f" HEADROOM_VERBOSITY_LEVEL={level}" if mode == "cache" else ""
+            )
+            click.echo(
+                f"    To keep it on across restarts: export {restart_env} "
+                "before `headroom wrap ...` or `headroom proxy`."
             )
         elif status == "blocked":
             click.echo(
@@ -610,7 +695,7 @@ def _run_verbosity(
             )
             click.echo(
                 "    Restart it with HEADROOM_ROLLOUT_CHANNEL=beta and "
-                "HEADROOM_OUTPUT_SHAPER=1; the learned level will be used automatically."
+                f"HEADROOM_OUTPUT_SHAPER=1; {cache_mode_hint}."
             )
         else:
             click.echo(
@@ -620,8 +705,8 @@ def _run_verbosity(
             click.echo(
                 "    Enable it: export HEADROOM_ROLLOUT_CHANNEL=beta and "
                 "HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` (or restart "
-                "`headroom proxy`). The learned level is then used automatically while "
-                "HEADROOM_VERBOSITY_LEVEL is unset."
+                "`headroom proxy`). A token-mode proxy then uses the learned level; "
+                f"{cache_mode_hint}."
             )
     else:
         click.echo("\n  Dry run — use --apply to persist the level and baseline.")
