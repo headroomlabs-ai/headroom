@@ -642,7 +642,7 @@ def test_activate_output_shaper_reports_effective_rollout_decision(
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
 
-    status, port = _activate_output_shaper(9876)
+    status, port, _ = _activate_output_shaper(9876)
 
     assert status == expected
     assert port == 9876
@@ -667,7 +667,7 @@ def test_activate_output_shaper_handles_malformed_response(
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
 
-    assert _activate_output_shaper(9876) == ("error", 9876)
+    assert _activate_output_shaper(9876) == ("error", 9876, {})
 
 
 def _no_local_proxy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
@@ -678,6 +678,9 @@ def _no_local_proxy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN201
 
 # Where the stubbed local proxy listens; HEADROOM_PORT points the CLI at it.
 _PROXY_PORT = 18787
+# The fake proxy's start time and the wall clock it answers /health at.
+_STARTED_AT = 1_791_400_000.0
+_HEALTH_NOW = "2026-10-08T10:00:00Z"
 
 
 class _FakeProxy:
@@ -687,9 +690,16 @@ class _FakeProxy:
     POSTs to ``/admin/runtime-env`` are recorded and accepted.
     """
 
-    def __init__(self, health_config: dict | None, *, shaper_allowed: bool = True) -> None:
+    def __init__(
+        self,
+        health_config: dict | None,
+        *,
+        shaper_allowed: bool = True,
+        started_at: float = _STARTED_AT,
+    ) -> None:
         self.health_config = health_config
         self.shaper_allowed = shaper_allowed
+        self.started_at = started_at
         self.posted: list[dict] = []
 
     def urlopen(self, request, timeout=None):  # noqa: ANN001, ANN201
@@ -700,7 +710,15 @@ class _FakeProxy:
         if url.endswith("/health"):
             if self.health_config is None:
                 raise urllib.error.URLError("unreachable")
-            return io.BytesIO(json.dumps({"config": self.health_config}).encode())
+            from datetime import datetime
+
+            now = datetime.fromisoformat(_HEALTH_NOW.replace("Z", "+00:00")).timestamp()
+            payload = {
+                "timestamp": _HEALTH_NOW,
+                "uptime_seconds": round(now - self.started_at, 3),
+                "config": self.health_config,
+            }
+            return io.BytesIO(json.dumps(payload).encode())
         self.posted.append(json.loads(request.data))
         rollout = {"features": [{"name": "proxy_output_shaper", "enabled": self.shaper_allowed}]}
         return io.BytesIO(json.dumps({"applied": self.posted[-1], "rollout": rollout}).encode())
@@ -725,7 +743,7 @@ def _apply_learned_level(
     from headroom.proxy.output_savings import BaselineModel
 
     workspace = tmp_path / "ws"
-    workspace.mkdir()
+    workspace.mkdir(exist_ok=True)
     if pin_record is not None:
         (workspace / "verbosity_pin.json").write_text(json.dumps(pin_record), newline="\n")
     if previous_level is not None:
@@ -818,7 +836,7 @@ def test_verbosity_apply_records_the_pin_it_sets(
     _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
 
     record = json.loads((tmp_path / "ws" / "verbosity_pin.json").read_text())
-    assert record == {"port": _PROXY_PORT, "pid": 4242, "level": 3}
+    assert record == {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 3}
 
 
 def test_verbosity_apply_replaces_the_pin_an_earlier_apply_set(
@@ -835,13 +853,13 @@ def test_verbosity_apply_replaces_the_pin_an_earlier_apply_set(
         tmp_path,
         proxy,
         level=1,
-        pin_record={"port": _PROXY_PORT, "pid": 4242, "level": 3},
+        pin_record={"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 3},
     )
 
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "1"}]
     assert "level 1 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
     record = json.loads((tmp_path / "ws" / "verbosity_pin.json").read_text())
-    assert record == {"port": _PROXY_PORT, "pid": 4242, "level": 1}
+    assert record == {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 1}
 
 
 def test_verbosity_apply_re_pinning_the_same_level_does_not_warn_about_re_caching(
@@ -856,7 +874,7 @@ def test_verbosity_apply_re_pinning_the_same_level_does_not_warn_about_re_cachin
         runner,
         tmp_path,
         proxy,
-        pin_record={"port": _PROXY_PORT, "pid": 4242, "level": 3},
+        pin_record={"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 3},
     )
 
     assert "level 3 is live now" in output
@@ -867,10 +885,16 @@ def test_verbosity_apply_re_pinning_the_same_level_does_not_warn_about_re_cachin
     "pin_record",
     [
         None,  # the operator pinned the level that was learned before
-        {"port": _PROXY_PORT, "pid": 1111, "level": 3},  # pinned on a proxy since restarted
-        {"port": _PROXY_PORT, "pid": 4242, "level": 2},  # the operator re-pinned after us
+        # pinned on a proxy since restarted
+        {"port": _PROXY_PORT, "pid": 1111, "started_at": _STARTED_AT, "level": 3},
+        # a new process that reused the old one's pid on the same port
+        {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT - 3600, "level": 3},
+        # the operator re-pinned after us
+        {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 2},
+        # a record from before start times were recorded
+        {"port": _PROXY_PORT, "pid": 4242, "level": 3},
     ],
-    ids=["no-record", "restarted-proxy", "changed-since"],
+    ids=["no-record", "restarted-proxy", "reused-pid", "changed-since", "no-start-time"],
 )
 def test_verbosity_apply_keeps_a_pin_it_cannot_prove_it_set(
     monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, pin_record: dict | None
@@ -899,7 +923,8 @@ def test_verbosity_pin_record_is_written_with_lf(tmp_path: Path, monkeypatch) ->
         return real_write_text(self, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", write_text)
-    learn_cli._record_pin(tmp_path, _PROXY_PORT, 4242, 3)
+    process = learn_cli._ProxyProcess(4242, _STARTED_AT)
+    assert learn_cli._record_pin(tmp_path, _PROXY_PORT, process, 3) is True
 
     assert [call.get("newline") for call in calls] == ["\n"]
 
@@ -941,3 +966,45 @@ def test_verbosity_apply_on_a_proxy_that_disables_the_shaper(
     assert "HEADROOM_DISABLE_FEATURES" in output
     assert "HEADROOM_VERBOSITY_LEVEL=3" in output
     assert "HEADROOM_ROLLOUT_CHANNEL" not in output
+
+
+def test_verbosity_apply_records_a_pin_the_proxy_applied_while_the_shaper_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """The proxy stores the pin even when it reports the shaper blocked; own it."""
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {}, "pid": 4242}, shaper_allowed=False)
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
+    assert "rollout config disables the output shaper" in output
+    record = json.loads((tmp_path / "ws" / "verbosity_pin.json").read_text())
+    assert record == {"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 3}
+
+
+def test_verbosity_apply_reports_activation_when_the_pin_cannot_be_recorded(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {}, "pid": 4242})
+    # A directory where the record file should go makes the write fail.
+    (tmp_path / "ws" / "verbosity_pin.json").mkdir(parents=True)
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
+    assert "level 3 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
+    assert "To keep it on across restarts" in output
+    assert "pin could not be recorded" in output
+
+
+def test_verbosity_apply_does_not_record_a_pin_without_a_process_identity(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """No pid means the pin cannot be attributed later, so leave no record."""
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "3"}]
+    assert not (tmp_path / "ws" / "verbosity_pin.json").exists()
+    assert "pin could not be recorded" in output

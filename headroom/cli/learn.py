@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import click
 
@@ -441,11 +441,44 @@ def _steered_level(raw: object) -> int | None:
     return max(0, min(4, level))
 
 
-def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | None, int | None]:
-    """Best-effort: read a running local proxy's mode, pinned level and pid.
+class _ProxyProcess(NamedTuple):
+    """Identifies one proxy process: pids are reused, (pid, start time) is not."""
 
-    All three come from the ``/health`` config block, which the proxy includes
-    for loopback callers. Returns ``(mode, level, pid)``, each ``None`` when the
+    pid: int
+    started_at: float
+
+
+def _proxy_process(payload: dict[str, Any], config: dict[str, Any]) -> _ProxyProcess | None:
+    """The proxy process behind a ``/health`` payload, or ``None`` if unknown.
+
+    The start time is ``timestamp - uptime_seconds``: the proxy computes both
+    from ``time.time()`` while building the payload, so the difference is its
+    start time to the millisecond, the same on every call.
+    """
+    from datetime import datetime
+
+    pid = config.get("pid")
+    timestamp = payload.get("timestamp")
+    uptime = payload.get("uptime_seconds")
+    if not isinstance(pid, int) or not isinstance(timestamp, str):
+        return None
+    # A proxy that has not recorded its start reports 0.0; that is not an identity.
+    if not isinstance(uptime, int | float) or uptime <= 0:
+        return None
+    try:
+        now = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+    return _ProxyProcess(pid, round(now - float(uptime), 3))
+
+
+def _query_proxy_verbosity(
+    port: int | None = None,
+) -> tuple[str | None, int | None, _ProxyProcess | None]:
+    """Best-effort: read a running local proxy's mode, pinned level and process.
+
+    All three come from ``/health``, whose config block the proxy includes for
+    loopback callers. Returns ``(mode, level, process)``, each ``None`` when the
     proxy is unreachable or does not report it; ``level`` is the level its
     ``HEADROOM_VERBOSITY_LEVEL`` pins, ``None`` when that is unset.
     """
@@ -465,47 +498,81 @@ def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | N
     mode = config.get("mode")
     runtime = config.get("runtime_env")
     level = runtime.get("HEADROOM_VERBOSITY_LEVEL") if isinstance(runtime, dict) else None
-    pid = config.get("pid")
     return (
         mode if isinstance(mode, str) else None,
         _steered_level(level),
-        pid if isinstance(pid, int) else None,
+        _proxy_process(payload, config),
     )
 
 
 #: Records the HEADROOM_VERBOSITY_LEVEL that ``--apply`` hot-pinned, and on
 #: which proxy process. Hot overrides die with the process, so a pin is ours to
-#: replace only while the same process (port + pid) still holds that value.
+#: replace only while that same process still holds that value.
 _VERBOSITY_PIN_FILE = "verbosity_pin.json"
 
+#: Slack when comparing recorded and current start times, which agree to the
+#: millisecond for one process; a different process started this close to the
+#: old one would also need its pid, port and level to match.
+_START_TIME_TOLERANCE_S = 1.0
 
-def _pin_is_ours(ws: Path, port: int, pid: int | None, level: int | None) -> bool:
+
+def _pin_is_ours(ws: Path, port: int, process: _ProxyProcess | None, level: int | None) -> bool:
     import json as _json
 
-    if pid is None or level is None:
+    if process is None or level is None:
         return False
     try:
         record = _json.loads((ws / _VERBOSITY_PIN_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return isinstance(record, dict) and record == {"port": port, "pid": pid, "level": level}
+    if not isinstance(record, dict):
+        return False
+    started_at = record.get("started_at")
+    return (
+        record.get("port") == port
+        and record.get("pid") == process.pid
+        and record.get("level") == level
+        and isinstance(started_at, int | float)
+        and abs(started_at - process.started_at) <= _START_TIME_TOLERANCE_S
+    )
 
 
-def _record_pin(ws: Path, port: int, pid: int | None, level: int) -> None:
+def _record_pin(ws: Path, port: int, process: _ProxyProcess | None, level: int) -> bool:
+    """Record a pin ``--apply`` set. Returns False when it could not be recorded.
+
+    Best-effort: the pin is already live on the proxy, so a failed record only
+    means a later ``--apply`` treats it as the operator's and leaves it alone.
+    """
     import json as _json
 
     path = ws / _VERBOSITY_PIN_FILE
-    if pid is None:
-        # Without a pid the pin cannot be attributed later; leave no record.
-        path.unlink(missing_ok=True)
-        return
-    record = {"port": port, "pid": pid, "level": level}
-    path.write_text(_json.dumps(record), encoding="utf-8", newline="\n")
+    try:
+        if process is None:
+            # Without a process identity the pin cannot be attributed later.
+            path.unlink(missing_ok=True)
+            return False
+        record = {
+            "port": port,
+            "pid": process.pid,
+            "started_at": process.started_at,
+            "level": level,
+        }
+        path.write_text(_json.dumps(record), encoding="utf-8", newline="\n")
+    except OSError:
+        return False
+    return True
+
+
+class _ShaperActivation(NamedTuple):
+    status: str
+    port: int
+    #: The overrides the proxy reports it applied (empty if it did not answer).
+    applied: dict[str, str]
 
 
 def _activate_output_shaper(
     port: int | None = None, *, verbosity_level: str | None = None
-) -> tuple[str, int]:
+) -> _ShaperActivation:
     """Best-effort: turn the output shaper ON for a running local proxy.
 
     Writing ``verbosity.json`` is inert on its own — the shaper is a live,
@@ -514,9 +581,10 @@ def _activate_output_shaper(
     When a proxy is already running locally we hot-enable it via
     ``/admin/runtime-env`` (no restart, the same channel ``wrap`` uses), so
     ``--apply`` actually takes effect. ``verbosity_level`` also pins
-    ``HEADROOM_VERBOSITY_LEVEL`` in the same request. Returns ``(status, port)``
-    where status is ``"live"`` (enabled on a running proxy), ``"blocked"`` (the
-    proxy's rollout channel rejected it), ``"absent"`` (no reachable proxy), or
+    ``HEADROOM_VERBOSITY_LEVEL`` in the same request. Returns ``(status, port,
+    applied)`` where status is ``"live"`` (enabled on a running proxy),
+    ``"blocked"`` (the proxy's rollout config disables the shaper; the proxy
+    still applies the overrides), ``"absent"`` (no reachable proxy), or
     ``"error"``.
     """
     import json as _json
@@ -537,6 +605,12 @@ def _activate_output_shaper(
         with urllib.request.urlopen(request, timeout=2) as response:
             raw_response = response.read()
         payload = _json.loads(raw_response) if raw_response else {}
+        applied_raw = payload.get("applied") if isinstance(payload, dict) else None
+        applied = (
+            {k: v for k, v in applied_raw.items() if isinstance(v, str)}
+            if isinstance(applied_raw, dict)
+            else {}
+        )
         rollout = payload.get("rollout") if isinstance(payload, dict) else None
         if isinstance(rollout, dict):
             decisions = rollout.get("features")
@@ -550,13 +624,13 @@ def _activate_output_shaper(
                     None,
                 )
                 if isinstance(output_shaper, dict) and not output_shaper.get("enabled", False):
-                    return "blocked", resolved_port
-        return "live", resolved_port
+                    return _ShaperActivation("blocked", resolved_port, applied)
+        return _ShaperActivation("live", resolved_port, applied)
     except (urllib.error.URLError, OSError):
         # ConnectionRefused (no proxy) or 404 (proxy predates the endpoint).
-        return "absent", resolved_port
+        return _ShaperActivation("absent", resolved_port, {})
     except ValueError:
-        return "error", resolved_port
+        return _ShaperActivation("error", resolved_port, {})
 
 
 def _run_verbosity(
@@ -685,7 +759,7 @@ def _run_verbosity(
         # otherwise tell the user exactly how to turn it on.
         level = best_profile.level
         port = _local_proxy_port()
-        mode, pinned, pid = _query_proxy_verbosity(port)
+        mode, pinned, process = _query_proxy_verbosity(port)
         # Cache mode never reads verbosity.json: a level that can change while
         # conversations are open would bust their prefix cache, so the proxy
         # steers at its startup level unless HEADROOM_VERBOSITY_LEVEL pins one
@@ -694,11 +768,13 @@ def _run_verbosity(
         # An existing pin is the operator's and is left alone, unless the record
         # from an earlier --apply shows this same proxy process holds the value
         # that run pinned.
-        ours = _pin_is_ours(ws, port, pid, pinned)
+        ours = _pin_is_ours(ws, port, process, pinned)
         pin = str(level) if mode == "cache" and (pinned is None or ours) else None
-        status, shaper_port = _activate_output_shaper(port, verbosity_level=pin)
-        if pin is not None and status == "live":
-            _record_pin(ws, shaper_port, pid, level)
+        status, shaper_port, applied = _activate_output_shaper(port, verbosity_level=pin)
+        # Record the pin whenever the proxy applied it: it stores overrides even
+        # when its rollout config disables the shaper ("blocked").
+        pin_applied = pin is not None and applied.get("HEADROOM_VERBOSITY_LEVEL") == pin
+        pin_recorded = pin_applied and _record_pin(ws, shaper_port, process, level)
         cache_mode_hint = (
             f"in cache mode (the default) also set HEADROOM_VERBOSITY_LEVEL={level}, "
             "because cache mode does not read the learned level"
@@ -764,6 +840,12 @@ def _run_verbosity(
                 "    Enable it: export HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` "
                 "(or restart `headroom proxy`). A token-mode proxy then uses the learned "
                 f"level; {cache_mode_hint}."
+            )
+        if pin_applied and not pin_recorded:
+            click.echo(
+                f"    Note: the HEADROOM_VERBOSITY_LEVEL={level} pin could not be recorded in "
+                f"{ws / _VERBOSITY_PIN_FILE}, so a later --apply will leave it in place as "
+                "if you had set it."
             )
     else:
         click.echo("\n  Dry run — use --apply to persist the level and baseline.")
