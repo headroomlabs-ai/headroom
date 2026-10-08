@@ -92,6 +92,18 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
+
+def _proxy_auth_headers() -> dict[str, str] | None:
+    """Proxy credential for /v1/retrieve and /stats on a token-gated remote proxy.
+
+    Sent as ``x-headroom-proxy-token``, never ``Authorization``, matching what
+    the proxy's gate reads first. Read per client so the env set by the MCP
+    host at launch applies; ``None`` keeps loopback proxies header-free.
+    """
+    token = os.environ.get("HEADROOM_PROXY_TOKEN", "").strip()
+    return {"x-headroom-proxy-token": token} if token else None
+
+
 # How often the parent-death watchdog polls os.getppid() (seconds). When the
 # launching MCP client is SIGKILLed, stdin EOF may never arrive and the SDK's
 # blocking stdin-reader thread wedges server.run() forever, orphaning this
@@ -569,7 +581,7 @@ class HeadroomMCPServer:
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=15.0)
+            self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
 
         url = f"{self.proxy_url}/v1/retrieve"
         payload: dict[str, str] = {"hash": hash_key}
@@ -940,7 +952,7 @@ class HeadroomMCPServer:
         """Fetch full stats from the proxy (includes summary)."""
         try:
             if self._http_client is None:
-                self._http_client = httpx.AsyncClient(timeout=15.0)
+                self._http_client = httpx.AsyncClient(timeout=15.0, headers=_proxy_auth_headers())
             response = await self._http_client.get(f"{self.proxy_url}/stats")
             if response.status_code != 200:
                 return None

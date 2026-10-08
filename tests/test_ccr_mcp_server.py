@@ -537,3 +537,45 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+@pytest.mark.parametrize("token", ["s3cret", ""])
+def test_mcp_proxy_client_sends_proxy_token_header(
+    monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    """A token-gated remote proxy needs x-headroom-proxy-token on /v1/retrieve and /stats."""
+    seen: list[dict[str, str] | None] = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {}
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+    class RecordingClient:
+        def __init__(self, *, timeout: float, headers: dict[str, str] | None = None) -> None:
+            seen.append(headers)
+
+        async def post(self, url: str, json: object) -> Response:
+            return Response()
+
+        async def get(self, url: str) -> Response:
+            return Response()
+
+    monkeypatch.setenv("HEADROOM_PROXY_TOKEN", token)
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", RecordingClient)
+
+    for call in ("retrieve", "stats"):
+        server = mcp_server.HeadroomMCPServer(proxy_url="https://proxy.example", check_proxy=False)
+        if call == "retrieve":
+            asyncio.run(server._retrieve_via_proxy("abc"))
+        else:
+            asyncio.run(server._fetch_full_proxy_stats())
+
+    expected = {"x-headroom-proxy-token": token} if token else None
+    assert seen == [expected, expected]

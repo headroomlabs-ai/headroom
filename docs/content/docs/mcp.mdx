@@ -157,6 +157,8 @@ For multiple proxy instances, register one stdio MCP server per proxy URL:
 }
 ```
 
+If the proxy is remote and enforces `HEADROOM_PROXY_TOKEN`, set `HEADROOM_PROXY_TOKEN` in the MCP server's `env` to the same value. `headroom mcp serve` then sends it as `x-headroom-proxy-token` on `/v1/retrieve` and `/stats`. Without it those calls get `401`.
+
 If you need Streamable HTTP instead of stdio, run `headroom mcp serve --transport http` and point your MCP host at that endpoint. The default path is `/mcp`, and the default port is `8788`.
 
 Do not assume that a running proxy exposes an HTTP MCP endpoint at `/mcp`. The proxy serves its own API; it does not automatically provide the MCP HTTP transport.
