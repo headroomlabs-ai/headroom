@@ -19,6 +19,10 @@ def test_shipping_ort_dependencies_match_supported_platforms() -> None:
     cases = [
         ("3.11", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
         ("3.13", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
+        ("3.14", "darwin", "x86_64", None),
+        ("3.15", "darwin", "x86_64", None),
+        ("3.14", "darwin", "arm64", SpecifierSet(">=1.24.0")),
+        ("3.14", "linux", "x86_64", SpecifierSet(">=1.24.0")),
         ("3.11", "darwin", "arm64", SpecifierSet(">=1.24.0")),
         ("3.11", "linux", "x86_64", SpecifierSet(">=1.24.0")),
         ("3.10", "darwin", "x86_64", SpecifierSet(">=1.16.0,<1.24.0")),
@@ -44,8 +48,31 @@ def test_shipping_ort_dependencies_match_supported_platforms() -> None:
             selected = [
                 req for req in requirements if req.marker and req.marker.evaluate(environment)
             ]
-            assert len(selected) == 1
-            assert selected[0].specifier == expected
+            if expected is None:
+                assert not selected
+            else:
+                assert len(selected) == 1
+                assert selected[0].specifier == expected
+
+
+def test_intel_macos_python314_omits_ort_dependent_optional_backends() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    environment = default_environment()
+    environment.update(
+        python_version="3.14",
+        python_full_version="3.14.0",
+        sys_platform="darwin",
+        platform_machine="x86_64",
+        extra="",
+    )
+    ort_backends = {"onnxruntime", "magika", "fastembed", "rapidocr", "rapidocr-onnxruntime"}
+    for extra in ("proxy", "voice", "relevance", "image"):
+        selected = {
+            req.name
+            for raw in project["optional-dependencies"][extra]
+            if (req := Requirement(raw)).marker is None or req.marker.evaluate(environment)
+        }
+        assert not selected & ort_backends, (extra, selected & ort_backends)
 
 
 def test_all_extra_includes_proxy_and_voice() -> None:
