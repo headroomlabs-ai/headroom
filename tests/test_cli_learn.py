@@ -346,6 +346,9 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
     assert "opus|new_user_ask|s|tools" in ledger.baseline.strata
     assert "sonnet|unknown|m|notools" in ledger.baseline.strata
     assert "across 2 project(s)" in result.output
+    # The shaper is available on every channel; the hint must not ask for beta.
+    assert "HEADROOM_OUTPUT_SHAPER=1" in result.output
+    assert "HEADROOM_ROLLOUT_CHANNEL" not in result.output
     # The applied level comes from the project with the most samples (A → 1).
     verbosity = _json.loads((tmp_path / "ws" / "verbosity.json").read_text())
     assert verbosity["level"] == 1
@@ -680,8 +683,9 @@ class _FakeProxy:
     POSTs to ``/admin/runtime-env`` are recorded and accepted.
     """
 
-    def __init__(self, health_config: dict | None) -> None:
+    def __init__(self, health_config: dict | None, *, shaper_allowed: bool = True) -> None:
         self.health_config = health_config
+        self.shaper_allowed = shaper_allowed
         self.posted: list[dict] = []
 
     def urlopen(self, request, timeout=None):  # noqa: ANN001, ANN201
@@ -694,16 +698,31 @@ class _FakeProxy:
                 raise urllib.error.URLError("unreachable")
             return io.BytesIO(json.dumps({"config": self.health_config}).encode())
         self.posted.append(json.loads(request.data))
-        rollout = {"features": [{"name": "proxy_output_shaper", "enabled": True}]}
+        rollout = {"features": [{"name": "proxy_output_shaper", "enabled": self.shaper_allowed}]}
         return io.BytesIO(json.dumps({"applied": self.posted[-1], "rollout": rollout}).encode())
 
 
 def _apply_learned_level(
-    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, proxy: _FakeProxy
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+    tmp_path: Path,
+    proxy: _FakeProxy,
+    *,
+    level: int = 3,
+    previous_level: int | None = None,
 ) -> str:
-    """Run ``learn --verbosity --apply`` for one project that learns level 3."""
+    """Run ``learn --verbosity --apply`` for one project that learns ``level``.
+
+    ``previous_level`` seeds verbosity.json as an earlier ``--apply`` left it.
+    """
     from headroom.proxy.output_savings import BaselineModel
 
+    workspace = tmp_path / "ws"
+    if previous_level is not None:
+        workspace.mkdir()
+        (workspace / "verbosity.json").write_text(
+            json.dumps({"verbosity_level": previous_level}), newline="\n"
+        )
     data_dir = tmp_path / "sessions"
     data_dir.mkdir()
     (data_dir / "s.jsonl").write_text("{}")
@@ -713,13 +732,15 @@ def _apply_learned_level(
     baseline = BaselineModel()
     baseline.observe("opus|new_user_ask|s|tools", 100)
     profile = SimpleNamespace(
-        level=3,
+        level=level,
         confidence="high",
         source="heuristic",
         rationale="test",
         signals={},
         learned_at=None,
-        save=lambda path: Path(str(path)).write_text(json.dumps({"verbosity_level": 3})),
+        save=lambda path: Path(str(path)).write_text(
+            json.dumps({"verbosity_level": level}), newline="\n"
+        ),
     )
     monkeypatch.setattr(
         "headroom.learn.registry.get_plugin", lambda name: FakePlugin(name, "Claude", [project])
@@ -728,7 +749,7 @@ def _apply_learned_level(
         "headroom.learn.verbosity.analyze",
         lambda session_paths, project_path, llm_judge=None: (profile, baseline),
     )
-    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "ws"))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
     monkeypatch.setattr("urllib.request.urlopen", proxy.urlopen)
 
     result = runner.invoke(
@@ -775,7 +796,33 @@ def test_verbosity_apply_does_not_override_an_explicit_level(
 
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
     assert "is live now" not in output
-    assert "it stays at level 2: HEADROOM_VERBOSITY_LEVEL=2 is set" in output
+    assert "it stays at level 2: HEADROOM_VERBOSITY_LEVEL is set there" in output
+
+
+def test_verbosity_apply_replaces_the_pin_an_earlier_apply_set(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    """A re-learned level must not be shadowed by the previous run's own pin."""
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "3"}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=1, previous_level=3)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1", "HEADROOM_VERBOSITY_LEVEL": "1"}]
+    assert "level 1 is live now (pinned with HEADROOM_VERBOSITY_LEVEL" in output
+
+
+@pytest.mark.parametrize("raw", ["9", " 04 "])
+def test_verbosity_apply_reads_a_pin_the_way_the_proxy_clamps_it(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, raw: str
+) -> None:
+    """The proxy steers a pin of 9 (or " 04 ") at level 4, so it matches a learned 4."""
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": raw}})
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy, level=4)
+
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "level 4 is live now." in output
+    assert "stays at level" not in output
 
 
 def test_verbosity_apply_does_not_claim_live_when_the_mode_is_unknown(
@@ -788,3 +835,16 @@ def test_verbosity_apply_does_not_claim_live_when_the_mode_is_unknown(
     assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
     assert "is live now" not in output
     assert "its mode could not be read" in output
+
+
+def test_verbosity_apply_on_a_proxy_that_disables_the_shaper(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy({"mode": "cache", "runtime_env": {}}, shaper_allowed=False)
+
+    output = _apply_learned_level(monkeypatch, runner, tmp_path, proxy)
+
+    assert "rollout config disables the output shaper" in output
+    assert "HEADROOM_DISABLE_FEATURES" in output
+    assert "HEADROOM_VERBOSITY_LEVEL=3" in output
+    assert "HEADROOM_ROLLOUT_CHANNEL" not in output

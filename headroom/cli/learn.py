@@ -424,13 +424,30 @@ def _local_proxy_port(port: int | None = None) -> int:
     return port if port is not None else int(_os.environ.get("HEADROOM_PORT", "8787"))
 
 
-def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, str | None]:
+def _steered_level(raw: object) -> int | None:
+    """The level a proxy steers at for a raw ``HEADROOM_VERBOSITY_LEVEL``.
+
+    Mirrors ``OutputShaperSettings.from_env``: unparseable text falls back to
+    the default level, anything else is clamped to 0-4. ``None`` when unset.
+    """
+    from ..proxy.output_shaper import DEFAULT_VERBOSITY_LEVEL
+
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        level = int(str(raw).strip())
+    except ValueError:
+        level = DEFAULT_VERBOSITY_LEVEL
+    return max(0, min(4, level))
+
+
+def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, int | None]:
     """Best-effort: read a running local proxy's mode and pinned verbosity level.
 
     Both come from the ``/health`` config block, which the proxy includes for
     loopback callers. Returns ``(mode, level)``: ``mode`` is ``None`` when the
-    proxy is unreachable or does not report it, and ``level`` is the proxy's
-    ``HEADROOM_VERBOSITY_LEVEL``, or ``None`` when that is unset.
+    proxy is unreachable or does not report it, and ``level`` is the level its
+    ``HEADROOM_VERBOSITY_LEVEL`` pins, or ``None`` when that is unset.
     """
     import json as _json
     import urllib.error
@@ -448,10 +465,7 @@ def _query_proxy_verbosity(port: int | None = None) -> tuple[str | None, str | N
     mode = config.get("mode")
     runtime = config.get("runtime_env")
     level = runtime.get("HEADROOM_VERBOSITY_LEVEL") if isinstance(runtime, dict) else None
-    return (
-        mode if isinstance(mode, str) else None,
-        str(level).strip() if level not in (None, "") else None,
-    )
+    return mode if isinstance(mode, str) else None, _steered_level(level)
 
 
 def _activate_output_shaper(
@@ -618,6 +632,9 @@ def _run_verbosity(
         ws = ensure_workspace_dir()
         from datetime import datetime, timezone
 
+        from ..learn.verbosity import VerbosityProfile
+
+        previous = VerbosityProfile.load(ws / "verbosity.json")
         best_profile.learned_at = datetime.now(timezone.utc).isoformat()
         best_profile.save(ws / "verbosity.json")
         # Seed the savings baseline: replace baseline, preserve any live
@@ -634,24 +651,29 @@ def _run_verbosity(
         # Writing the level is not enough — the shaper is off by default.
         # Make --apply actually take effect: hot-enable a running proxy, and
         # otherwise tell the user exactly how to turn it on.
-        level = str(best_profile.level)
+        level = best_profile.level
         mode, pinned = _query_proxy_verbosity()
         # Cache mode never reads verbosity.json: a level that can change while
         # conversations are open would bust their prefix cache, so the proxy
         # steers at its startup level unless HEADROOM_VERBOSITY_LEVEL pins one
         # (resolve_verbosity_level). Pin the learned level there; otherwise the
         # proxy would keep steering at its default while we report this level.
-        pin = level if mode == "cache" and pinned is None else None
+        # A pin equal to the previously learned level is taken to be the one an
+        # earlier --apply set (the proxy cannot say where a value came from), so
+        # it is replaced rather than left to shadow the new level. Any other pin
+        # is the operator's and is left alone.
+        earlier_apply = pinned is not None and previous is not None and pinned == previous.level
+        pin = str(level) if mode == "cache" and (pinned is None or earlier_apply) else None
         status, shaper_port = _activate_output_shaper(verbosity_level=pin)
         cache_mode_hint = (
             f"in cache mode (the default) also set HEADROOM_VERBOSITY_LEVEL={level}, "
             "because cache mode does not read the learned level"
         )
-        if status == "live" and pinned is not None and pinned != level:
+        if status == "live" and pinned is not None and pin is None and pinned != level:
             click.echo(
                 f"\n  ⚠ Output shaper enabled on the running proxy (port {shaper_port}), "
-                f"but it stays at level {pinned}: HEADROOM_VERBOSITY_LEVEL={pinned} is set "
-                "there and outranks the learned level."
+                f"but it stays at level {pinned}: HEADROOM_VERBOSITY_LEVEL is set there "
+                "and outranks the learned level."
             )
             click.echo(
                 f"    To use level {level}, restart the proxy with HEADROOM_VERBOSITY_LEVEL={level}."
@@ -689,13 +711,15 @@ def _run_verbosity(
                 "before `headroom wrap ...` or `headroom proxy`."
             )
         elif status == "blocked":
+            # proxy_output_shaper is available on every channel, so only an
+            # explicit disable (HEADROOM_DISABLE_FEATURES) refuses the hot enable.
             click.echo(
-                "\n  ⚠ Level written, but the running proxy's rollout channel blocks the "
-                "beta output shaper."
+                "\n  ⚠ Level written, but the running proxy's rollout config disables the "
+                "output shaper."
             )
             click.echo(
-                "    Restart it with HEADROOM_ROLLOUT_CHANNEL=beta and "
-                f"HEADROOM_OUTPUT_SHAPER=1; {cache_mode_hint}."
+                "    Restart it without proxy_output_shaper in HEADROOM_DISABLE_FEATURES "
+                f"and with HEADROOM_OUTPUT_SHAPER=1; {cache_mode_hint}."
             )
         else:
             click.echo(
@@ -703,10 +727,9 @@ def _run_verbosity(
                 "NOT shaping output yet."
             )
             click.echo(
-                "    Enable it: export HEADROOM_ROLLOUT_CHANNEL=beta and "
-                "HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` (or restart "
-                "`headroom proxy`). A token-mode proxy then uses the learned level; "
-                f"{cache_mode_hint}."
+                "    Enable it: export HEADROOM_OUTPUT_SHAPER=1, then run `headroom wrap ...` "
+                "(or restart `headroom proxy`). A token-mode proxy then uses the learned "
+                f"level; {cache_mode_hint}."
             )
     else:
         click.echo("\n  Dry run — use --apply to persist the level and baseline.")

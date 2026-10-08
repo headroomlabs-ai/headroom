@@ -169,18 +169,20 @@ Options:
 
 `headroom learn --verbosity` analyzes past sessions to infer the ideal output verbosity level for your project and writes a `verbosity.json` profile.
 
-**Important**: the output shaper is **off by default** and requires the `beta`
-runtime rollout channel. Running `--verbosity --apply` will either:
+**Important**: the output shaper is **off by default** (`HEADROOM_OUTPUT_SHAPER=1`
+turns it on; it is available on every rollout channel). Running `--verbosity --apply` will either:
 - Hot-enable the output shaper on an eligible running proxy (`POST /admin/runtime-env`), OR
-- Print instructions to set `HEADROOM_ROLLOUT_CHANNEL=beta` and `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
+- Print instructions to set `HEADROOM_OUTPUT_SHAPER=1` before `headroom wrap ...`
 
 A proxy in cache mode (the default) does not read `verbosity.json`: a level that
 changes mid-conversation would bust the prompt cache, so it steers at its startup
 level. On a cache-mode proxy `--apply` therefore also pins
-`HEADROOM_VERBOSITY_LEVEL` to the learned level. It never overrides a
-`HEADROOM_VERBOSITY_LEVEL` that is already set, and says so instead.
+`HEADROOM_VERBOSITY_LEVEL` to the learned level. A `HEADROOM_VERBOSITY_LEVEL`
+that is already set is left alone, and `--apply` says so, unless it equals the
+previously learned level. That one is taken to be an earlier `--apply`'s pin and
+is replaced.
 
-To keep the shaper on across proxy restarts, export both variables before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
+To keep the shaper on across proxy restarts, export `HEADROOM_OUTPUT_SHAPER=1` before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
 
 **Flag interactions**:
 - `--all` and `--project` are mutually exclusive
