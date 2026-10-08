@@ -940,7 +940,7 @@ class TestDoctorCommand:
 
     def test_json_output_parses(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
-        result = runner.invoke(main, ["doctor", "--json"])
+        result = runner.invoke(main, ["doctor", "--json", "--port", "8787"])
         payload = json.loads(result.output)
         assert payload["port"] == 8787
         assert {c["name"] for c in payload["checks"]} >= {"proxy", "version", "budget"}

@@ -432,11 +432,12 @@ def _activate_output_shaper(port: int | None = None) -> tuple[str, int]:
     ``"error"``.
     """
     import json as _json
-    import os as _os
     import urllib.error
     import urllib.request
 
-    resolved_port = port if port is not None else int(_os.environ.get("HEADROOM_PORT", "8787"))
+    from headroom.cli.port_discovery import resolve_read_port
+
+    resolved_port, _origin = resolve_read_port(port)
     request = urllib.request.Request(
         f"http://127.0.0.1:{resolved_port}/admin/runtime-env",
         data=_json.dumps({"HEADROOM_OUTPUT_SHAPER": "1"}).encode("utf-8"),

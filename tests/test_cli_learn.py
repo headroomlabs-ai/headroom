@@ -663,3 +663,34 @@ def test_activate_output_shaper_handles_malformed_response(
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: Response())
 
     assert _activate_output_shaper(9876) == ("error", 9876)
+
+
+def test_activate_output_shaper_uses_resolved_proxy_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    from headroom.cli import port_discovery
+    from headroom.cli.learn import _activate_output_shaper
+
+    requested_urls: list[str] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def urlopen(request, **kwargs):
+        requested_urls.append(request.full_url)
+        return Response()
+
+    monkeypatch.setattr(port_discovery, "resolve_read_port", lambda port: (8788, "discovered"))
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    assert _activate_output_shaper() == ("live", 8788)
+    assert requested_urls == ["http://127.0.0.1:8788/admin/runtime-env"]

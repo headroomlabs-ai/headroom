@@ -9,8 +9,9 @@ other ports Headroom itself recorded, so the CLI can warn -- or, on a TTY, ask
 -- instead of guessing.
 
 Discovery is deliberately bounded: loopback only, a handful of candidate ports
-(the requested/default port, ``HEADROOM_PORT``, 8787, deployment-manifest ports
-and the project's wrap marker), probed concurrently with a sub-second timeout.
+(the requested/default port, ``HEADROOM_PORT``, 8787, live wrap-client markers,
+deployment-manifest ports and the project's wrap marker), probed concurrently
+with a sub-second timeout.
 It never scans port ranges. ``HEADROOM_PORT_DISCOVERY=0`` disables it.
 """
 
@@ -26,11 +27,15 @@ from typing import Any
 
 import click
 
+from headroom import fsutil, paths
+from headroom._subprocess import identity_mismatch, pid_alive, proc_identity
+
 DEFAULT_PROXY_PORT = 8787
 PORT_ENV = "HEADROOM_PORT"
 DISCOVERY_ENV = "HEADROOM_PORT_DISCOVERY"
 _PROBE_TIMEOUT_SECONDS = 0.5
 _MAX_CANDIDATES = 8
+_MAX_CLIENT_MARKER_CANDIDATES = 3
 _HEADROOM_SERVICE = "headroom-proxy"
 _LOOPBACK_PORT_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)")
 
@@ -96,6 +101,75 @@ def _wrap_marker_ports(cwd: Path | None) -> list[int]:
     return [port] if port is not None else []
 
 
+def _marker_pid_reused(marker: Path, pid: int) -> bool:
+    try:
+        payload = json.loads(fsutil.read_text(marker))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return identity_mismatch(
+        payload.get("start_src"),
+        payload.get("start_time"),
+        pid,
+        identity_fn=proc_identity,
+    )
+
+
+def live_client_pids(port: int) -> list[int]:
+    """Live wrap-client PIDs for ``port``, pruning dead and recycled markers."""
+    clients_dir = paths.proxy_clients_dir(port)
+    if not clients_dir.exists():
+        return []
+    live: list[int] = []
+    for marker in clients_dir.glob("*.json"):
+        try:
+            pid = int(marker.stem)
+        except ValueError:
+            continue
+        if not pid_alive(pid) or _marker_pid_reused(marker, pid):
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        live.append(pid)
+    return live
+
+
+def _marker_started_at(port: int, pid: int) -> float:
+    marker = paths.proxy_clients_dir(port) / f"{pid}.json"
+    try:
+        payload = json.loads(fsutil.read_text(marker))
+    except (OSError, ValueError):
+        return 0.0
+    if not isinstance(payload, dict):
+        return 0.0
+    started_at = payload.get("started_at")
+    return float(started_at) if isinstance(started_at, int | float) else 0.0
+
+
+def live_client_proxy_ports() -> list[tuple[int, float]]:
+    """Return live-client ports, newest marker first as ``(port, started_at)``."""
+    clients_dir = paths.workspace_dir() / "clients"
+    try:
+        entries = list(clients_dir.iterdir())
+    except OSError:
+        return []
+    candidates: list[tuple[int, float]] = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        port = _valid_port(entry.name)
+        if port is None:
+            continue
+        pids = live_client_pids(port)
+        if pids:
+            candidates.append((port, max(_marker_started_at(port, pid) for pid in pids)))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates
+
+
 def candidate_ports(
     requested: int,
     *,
@@ -113,6 +187,8 @@ def candidate_ports(
     ordered.extend(extra)
     ordered.extend(_manifest_ports(manifests))
     ordered.extend(_wrap_marker_ports(cwd))
+    # Bounded and last so stale wrap sessions can't evict recorded deployments.
+    ordered.extend(port for port, _ in live_client_proxy_ports()[:_MAX_CLIENT_MARKER_CANDIDATES])
     seen: list[int] = []
     for port in ordered:
         if port not in seen:
@@ -181,6 +257,52 @@ def find_live_proxy_elsewhere(
     if requested in alive:
         return None
     return next((port for port in alive if port != requested), None)
+
+
+def resolve_read_port(
+    explicit: int | None, *, default: int = DEFAULT_PROXY_PORT
+) -> tuple[int, str]:
+    """Resolve a read-only command's proxy port, preferring the latest live wrap."""
+    if explicit is not None:
+        return explicit, "explicit"
+
+    raw_env_port = (os.environ.get(PORT_ENV) or "").strip()
+    if raw_env_port:
+        try:
+            parsed = int(raw_env_port)
+        except ValueError:
+            raise click.ClickException(
+                f"{PORT_ENV} must be an integer, got {raw_env_port!r}"
+            ) from None
+        if not 1 <= parsed <= 65535:
+            raise click.ClickException(f"{PORT_ENV} must be between 1 and 65535, got {parsed}")
+        return parsed, "env"
+
+    if not discovery_enabled():
+        return default, "default"
+
+    marker_ports = [port for port, _ in live_client_proxy_ports()[:_MAX_CLIENT_MARKER_CANDIDATES]]
+    healthy_markers = live_ports(marker_ports, probe=proxy_is_healthy)
+    if healthy_markers:
+        return healthy_markers[0], "discovered"
+
+    already_probed = set(marker_ports)
+
+    def _probe_unchecked(port: int) -> bool:
+        return port not in already_probed and proxy_is_healthy(port)
+
+    live_port = find_live_proxy_elsewhere(default, probe=_probe_unchecked)
+    if live_port is not None:
+        return live_port, "discovered"
+    return default, "default"
+
+
+def proxy_is_healthy(port: int, timeout: float = 1.0) -> bool:
+    """True if ``/health`` identifies a live Headroom proxy on ``port``."""
+    from headroom.install.health import probe_json
+
+    payload = probe_json(f"http://127.0.0.1:{port}/health", timeout=timeout)
+    return payload is not None and payload.get("service") == _HEADROOM_SERVICE
 
 
 def _is_interactive() -> bool:

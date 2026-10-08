@@ -11,10 +11,12 @@ including subcommand registration — is exercised, not just the command object.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
+from headroom import paths as paths_mod
 from headroom.cli.inspect import _extract_text, _role
 
 
@@ -103,3 +105,31 @@ def test_json_format_emits_raw_feed() -> None:
     assert result.exit_code == 0
     parsed = json.loads(result.output)
     assert parsed[0]["request_id"] == "req-1"
+
+
+def test_inspect_uses_the_live_wrap_marker_port(tmp_path: Path, monkeypatch) -> None:
+    from headroom.cli import port_discovery
+
+    workspace = tmp_path / "workspace"
+    marker = workspace / "clients" / "8788" / "4242.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"pid": 4242, "started_at": 100.0}), encoding="utf-8")
+    monkeypatch.setattr(paths_mod, "workspace_dir", lambda: workspace)
+    monkeypatch.setattr(port_discovery, "pid_alive", lambda pid: pid == 4242)
+    monkeypatch.delenv("HEADROOM_PORT", raising=False)
+    monkeypatch.delenv("HEADROOM_PORT_DISCOVERY", raising=False)
+
+    requested_urls: list[str] = []
+
+    def probe(url: str, timeout: float = 1.0):
+        requested_urls.append(url)
+        if url.endswith("/health"):
+            return {"service": "headroom-proxy"}
+        return _feed_payload()
+
+    with patch("headroom.install.health.probe_json", side_effect=probe):
+        result = _run([])
+
+    assert result.exit_code == 0, result.output
+    assert "http://127.0.0.1:8788/health" in requested_urls
+    assert "http://127.0.0.1:8788/transformations/feed?limit=1" in requested_urls
