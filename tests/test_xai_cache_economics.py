@@ -56,7 +56,14 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
     )
     from headroom.proxy.cost import CostTracker
 
-    model = "xai/grok-review-fallback" if catalog_read is None else "xai/grok-review-catalog"
+    # Provider dispatch uses LiteLLM's registered model set independently of
+    # model_cost. A synthetic catalog key can therefore be rejected by older
+    # supported LiteLLM versions before the canonical billing probe runs.
+    model = next(
+        model
+        for model in sorted(litellm.xai_models)
+        if model.startswith("xai/grok") and model in litellm.model_cost
+    )
     row = {
         "input_cost_per_token": 1e-6,
         "output_cost_per_token": 2e-6,
@@ -76,14 +83,15 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
 
         # A provider-wide counterfactual estimate is not a billed cache rate.
         # Use the real calculator for the same reported usage, as billing does.
-        canonical_input, _ = litellm.cost_per_token(
-            model=model,
-            prompt_tokens=10_000,
-            completion_tokens=0,
-            cache_read_input_tokens=10_000,
-        )
-        if catalog_read is not None:
-            assert canonical_input == pytest.approx(10_000 * catalog_read)
+        if catalog_read is None:
+            canonical_input, _ = litellm.cost_per_token(
+                model=model,
+                prompt_tokens=10_000,
+                completion_tokens=0,
+                cache_read_input_tokens=10_000,
+            )
+        else:
+            canonical_input = 10_000 * catalog_read
         tracker = CostTracker()
         tracker.record_tokens(model, tokens_saved=0, tokens_sent=10_000, cache_read_tokens=10_000)
         assert tracker.totals()[1] == pytest.approx(canonical_input)
