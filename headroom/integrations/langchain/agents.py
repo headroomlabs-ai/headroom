@@ -49,7 +49,7 @@ def _check_langchain_available() -> None:
     if not LANGCHAIN_AVAILABLE:
         raise ImportError(
             "LangChain is required for this integration. "
-            "Install with: pip install headroom[langchain] "
+            'Install with: pip install "headroom-ai[langchain]" '
             "or: pip install langchain-core"
         )
 

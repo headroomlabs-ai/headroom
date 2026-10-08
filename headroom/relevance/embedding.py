@@ -13,7 +13,7 @@ Key features:
 - ~2-3x faster than sentence-transformers' all-MiniLM-L6-v2
 - Outranks all-MiniLM-L6-v2 by ~6 MTEB points
 
-Install with: pip install headroom[relevance]
+Install with: pip install "headroom-ai[relevance]"
 
 History: this module previously wrapped `sentence-transformers`
 (PyTorch). Switched to fastembed in Stage 3c.1 of the Rust port to:
@@ -49,7 +49,7 @@ def _get_numpy():
         except ImportError as e:
             raise ImportError(
                 "numpy is required for EmbeddingScorer. "
-                "Install with: pip install headroom[relevance]"
+                'Install with: pip install "headroom-ai[relevance]"'
             ) from e
     return _numpy
 
@@ -172,7 +172,7 @@ class EmbeddingScorer(RelevanceScorer):
         # score.score > 0.5 (semantic match between "failed"/"error" and "errors")
 
     Note:
-        Requires fastembed: pip install headroom[relevance]
+        Requires fastembed: pip install "headroom-ai[relevance]"
     """
 
     def __init__(
@@ -218,7 +218,8 @@ class EmbeddingScorer(RelevanceScorer):
         """
         if not self.is_available():
             raise RuntimeError(
-                "EmbeddingScorer requires fastembed. Install with: pip install headroom[relevance]"
+                "EmbeddingScorer requires fastembed. "
+                'Install with: pip install "headroom-ai[relevance]"'
             )
 
         if self._model is None:

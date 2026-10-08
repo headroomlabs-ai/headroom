@@ -23,7 +23,8 @@ def _get_jinja2_template(template_str: str):
         return Template(template_str, autoescape=True)
     except ImportError as e:
         raise ImportError(
-            "jinja2 is required for report generation. Install with: pip install headroom[reports]"
+            "jinja2 is required for report generation. "
+            'Install with: pip install "headroom-ai[reports]"'
         ) from e
 
 

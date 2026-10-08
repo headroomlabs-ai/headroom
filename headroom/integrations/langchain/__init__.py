@@ -20,7 +20,7 @@ Example:
     # Use like normal - optimization happens automatically
     response = llm.invoke("Hello!")
 
-Install: pip install headroom[langchain]
+Install: pip install "headroom-ai[langchain]"
 """
 
 # Agent tool wrapping

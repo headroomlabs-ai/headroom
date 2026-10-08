@@ -24,6 +24,10 @@ dependencies may impose their own Python/platform limits. Platforms outside
 that matrix fall back to the source distribution and need a Rust/native
 toolchain.
 
+Use the distribution name `headroom-ai` for every install, including extras such as
+`"headroom-ai[langchain]"`. The Python import and CLI command remain `headroom`;
+the PyPI distribution named `headroom` is a different project.
+
 ### CLI install with uv
 
 For a host-level `headroom` command on macOS Apple Silicon or Linux, prefer
