@@ -474,6 +474,14 @@ def test_responses_terminal_semantics(event, data, expected_failed, expected_ter
     assert _sse_event_outcome(event, data, "responses") == (expected_failed, expected_terminal)
 
 
+@pytest.mark.parametrize("event_type", ['["error"]', '{"unexpected":true}', "7", "true"])
+def test_malformed_event_type_is_not_interpreted_as_a_protocol_marker(event_type):
+    from headroom.proxy.handlers.streaming import _sse_contains_error_event
+
+    payload = ('data: {"type":' + event_type + "}\n\ndata: [DONE]\n\n").encode()
+    assert not _sse_contains_error_event(payload)
+
+
 def test_outcome_classification_runs_once_for_a_chunked_complete_event(monkeypatch):
     from headroom.proxy.handlers import streaming
 

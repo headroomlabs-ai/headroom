@@ -56,6 +56,8 @@ def _sse_event_outcome(event_name: str | None, data_str: str, dialect: str) -> t
     except (TypeError, ValueError):
         data = None
     event_type = data.get("type") if isinstance(data, dict) else None
+    if not isinstance(event_type, str):
+        event_type = None
     failed = event_name in {"error", "response.failed"} or event_type in {
         "error",
         "response.failed",
