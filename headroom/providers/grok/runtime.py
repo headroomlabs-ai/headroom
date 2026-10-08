@@ -15,9 +15,11 @@ PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 # process-wide OPENAI target is still api.openai.com (Claude/Codex-started).
 _XAI_TOKEN_AUTH_HEADER = "x-xai-token-auth"
 _XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
-# UA product tokens emitted by Grok CLI 0.2.x. Matched against whitespace-split
-# tokens so unrelated clients ("litellm-grok/1.0") cannot collide.
-_GROK_UA_PREFIXES = ("grok-pager/", "grok-shell/")
+# UA product tokens emitted by Grok clients. Matched against whitespace-split
+# tokens so unrelated clients ("litellm-grok/1.0") cannot collide: "grok/" is
+# how Grok Build (xAI's IDE) identifies itself, and the codebase's own client
+# classification (auth_policy CLIENT_UA_MAP) already reads it that way.
+_GROK_UA_PREFIXES = ("grok-pager/", "grok-shell/", "grok/")
 
 
 def _header_value(headers: Mapping[str, str], name: str) -> str | None:
@@ -30,13 +32,14 @@ def _header_value(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
-    """Return True when inbound headers identify the official Grok CLI.
+    """Return True when inbound headers identify a Grok client (CLI or Build).
 
     Grok cannot stamp ``x-headroom-base-url`` (no custom attribution headers),
-    so shared-proxy routing must recognize the CLI from wire signals instead.
+    so shared-proxy routing must recognize it from wire signals instead.
     Detection is intentionally narrow: only the official token-auth marker and
-    known Grok UA product tokens (prefix match on whitespace-split tokens) —
-    never model-id heuristics.
+    known Grok UA product tokens — ``grok-pager/`` / ``grok-shell/`` for the
+    CLI, ``grok/`` for Grok Build — prefix-matched against whitespace-split
+    tokens, never model-id heuristics.
     """
     token_auth = _header_value(headers, _XAI_TOKEN_AUTH_HEADER)
     if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:

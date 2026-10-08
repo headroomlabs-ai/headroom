@@ -104,6 +104,25 @@ def test_openai_compatible_base_url_routes_grok_to_xai_on_default_target() -> No
     assert select_passthrough_base_url(proxy, grok_headers) == "https://api.x.ai"
 
 
+def test_openai_compatible_base_url_routes_grok_build_to_xai_on_default_target() -> None:
+    """Grok Build + Antigravity manifest case: the OpenAI target stays default.
+
+    Antigravity needs api.openai.com, so the manifest cannot point the whole
+    proxy at xAI; Grok Build's ``grok/`` user agent must still route there per
+    request — for direct inference and for model-list/passthrough alike.
+    """
+    proxy = _proxy(OPENAI_API_URL="https://api.openai.com")
+    grok_build_headers = {"user-agent": "grok/1.2.3"}
+
+    assert openai_compatible_base_url(proxy, grok_build_headers) == "https://api.x.ai"
+    assert select_passthrough_base_url(proxy, grok_build_headers) == "https://api.x.ai"
+    # Antigravity traffic keeps the default OpenAI target.
+    assert (
+        openai_compatible_base_url(proxy, {"user-agent": "antigravity/1.0.0"})
+        == "https://api.openai.com"
+    )
+
+
 def test_openai_compatible_base_url_respects_configured_openai_target() -> None:
     """An operator gateway is chosen for every OpenAI-compatible client.
 

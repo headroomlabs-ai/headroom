@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -51,7 +52,6 @@ from headroom.proxy.buffered_ccr_response import (
     buffered_ccr_asgi_call,
 )
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
 from headroom.proxy.helpers import (
     extract_tags,
@@ -62,10 +62,12 @@ from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
-from headroom.proxy.model_router import estimate_input_tokens
+from headroom.proxy.model_router import estimate_input_tokens, request_max_tokens
 from headroom.proxy.nonstream_sse_policy import should_recover_sse_reply
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
+from headroom.proxy.rate_limit_identity import rate_limit_identity
+from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.tenant_key import resolve_tenant_key, set_request_tenant_key
 from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_tokens
 from headroom.utils import format_exception_message
@@ -284,6 +286,57 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
         return True
     head = response.content[:64].lstrip()
     return head.startswith(b"event:") or head.startswith(b"data:")
+
+
+def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> None:
+    """Debug aid (HEADROOM_DEBUG_PREFIX_MISMATCH=<dir>): log where the client's
+    history stopped matching the last turn, and dump both sides for diffing.
+
+    The dump holds the full conversation, user content included. It is for local
+    debugging only: never set this on a shared or production proxy.
+    """
+    from headroom.cache.prefix_tracker import (
+        _canonicalize_for_prefix_compare,
+        classify_history_relation,
+    )
+
+    rel = classify_history_relation(current, previous)
+    first = next(
+        (
+            i
+            for i in range(min(len(current), len(previous)))
+            if _canonicalize_for_prefix_compare(current[i])
+            != _canonicalize_for_prefix_compare(previous[i])
+        ),
+        None,
+    )
+    logger.info(
+        "[%s] prefix_mismatch_debug relation=%s first_diff_index=%s current_len=%d previous_len=%d",
+        request_id,
+        rel.kind,
+        first,
+        len(current),
+        len(previous),
+    )
+    try:
+        out = Path(os.environ["HEADROOM_DEBUG_PREFIX_MISMATCH"]) / f"{request_id}.json"
+        out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-only: the dump holds the full conversation. The mode passed to
+        # os.open applies only when the file is created, so tighten an existing
+        # file too before writing into it.
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # The context manager owns the descriptor from here, so it is closed
+        # even if tightening the mode fails.
+        with os.fdopen(fd, "w") as fh:
+            if hasattr(os, "fchmod"):  # POSIX; Windows has no POSIX modes to fix
+                os.fchmod(fh.fileno(), 0o600)
+            json.dump(
+                {"first_diff_index": first, "current": current, "previous": previous},
+                fh,
+                default=str,
+            )
+    except Exception:  # noqa: BLE001 - debug aid only
+        pass
 
 
 class AnthropicHandlerMixin:
@@ -909,6 +962,7 @@ class AnthropicHandlerMixin:
             model=model,
             input_tokens=estimate_input_tokens(messages, body.get("tools"), body.get("system")),
             has_tools=bool(body.get("tools")),
+            max_tokens=request_max_tokens(body),
         )
         logger.info("model routing decision: %s", decision.reason)
         if not decision.changed:
@@ -1318,18 +1372,10 @@ class AnthropicHandlerMixin:
 
             # Rate limiting
             if self.rate_limiter:
-                api_key = headers.get("x-api-key", "")
-                if not api_key:
-                    auth = headers.get("authorization", "")
-                    if auth.startswith("Bearer "):
-                        api_key = auth[7:]
-                # Phase F PR-F4: trust ``X-Forwarded-For`` for the rate-limit
-                # key only when the connecting peer is in
-                # ``HEADROOM_PROXY_TRUSTED_GATEWAY_CIDRS``; otherwise we use
-                # the direct peer IP and a malicious client cannot rotate
-                # rate-limit buckets by forging headers.
-                client_ip = resolve_client_ip(request) or "unknown"
-                rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
+                # One identity rule for every provider: peer-owned, and
+                # credential-scoped only for proxy-token / direct loopback
+                # callers (headroom/proxy/rate_limit_identity.py).
+                rate_key = rate_limit_identity(request, headers)
                 allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
                 if not allowed:
                     await self.metrics.record_rate_limited(
@@ -1438,10 +1484,21 @@ class AnthropicHandlerMixin:
             # unreachable entries. Reuse this raw snapshot verbatim at cache.set
             # (the same reason cache_key_fields is snapshotted here, #327).
             cache_lookup_messages = messages
+            # Response-cache partition: a cached response is only ever replayed to a
+            # caller presenting the same provider credentials and principal (01-F15).
+            # Snapshotted with the key fields so lookup and store agree. None means
+            # the principal could not be established: skip the cache entirely.
+            # Only resolved when the cache can be used, so streaming and
+            # cache-disabled requests never pay for identity resolution.
+            cache_partition = (
+                compute_request_cache_partition(request) if self.cache and not stream else None
+            )
             # Check cache (non-streaming only)
             cache_hit = False
-            if self.cache and not stream:
-                cached = await self.cache.get(messages, model, **cache_key_fields)
+            if self.cache and not stream and cache_partition is not None:
+                cached = await self.cache.get(
+                    messages, model, partition=cache_partition, **cache_key_fields
+                )
                 if cached:
                     cache_hit = True
                     self.pipeline_extensions.emit(
@@ -1647,6 +1704,11 @@ class AnthropicHandlerMixin:
                     "output_config": body.get("output_config"),
                 }
             )
+            # Resolve the request's actual provider TTL before tracker lookup:
+            # get_or_create may sweep expired sessions on this request.
+            from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+
+            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             # Resolve the tracker by conversation lineage within the session id
             # (#2085): one model + system prompt spans a Claude Code session and
             # all its parallel subagents, so concurrent conversations share this
@@ -1658,6 +1720,7 @@ class AnthropicHandlerMixin:
                 "anthropic",
                 messages=session_messages,
                 cache_affinity=cache_affinity,
+                cache_ttl_seconds=_cc_ttl,
             )
             # Snapshot lineage state once.  Reusing the same pair for delta
             # extraction, byte-stable replay, and breakpoint placement keeps
@@ -1691,14 +1754,8 @@ class AnthropicHandlerMixin:
             # lossless whole-prefix recompaction instead of the byte-identical splice
             # (the splice preserves a dead cache) and skips the overlay replay. Both are
             # deterministic → the recompacted prefix re-caches byte-stable on warm turns.
-            from headroom.transforms.cold_prefix import (
-                anthropic_cache_ttl_seconds,
-                is_cold_prefix,
-            )
+            from headroom.transforms.cold_prefix import is_cold_prefix
 
-            # Resolve the authoritative request-level prompt-cache tier once.
-            # The same value drives cold-prefix handling and net-cost pricing.
-            _cc_ttl = anthropic_cache_ttl_seconds(model, original_client_messages, system_prompt)
             _cold_recompact_active = False
             if os.environ.get("HEADROOM_COLD_RECOMPACT", "").strip().lower() in (
                 "1",
@@ -1853,6 +1910,24 @@ class AnthropicHandlerMixin:
                     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
                     context_limit = self.anthropic_provider.get_context_limit(model)
+                    # Context pressure must be computed against the window the
+                    # request is really subject to: raised to 1M when the
+                    # client sent a context-1m beta (a 1M session is NOT 5x
+                    # over budget), capped by a limit learned from an actual
+                    # prompt-too-long error. See headroom/proxy/context_guard.py.
+                    from headroom.proxy.context_guard import (
+                        context_guard_enabled,
+                        credential_scope_from_headers,
+                        effective_context_limit,
+                    )
+
+                    if context_guard_enabled():
+                        context_limit = effective_context_limit(
+                            model,
+                            context_limit,
+                            headers.get("anthropic-beta"),
+                            scope=credential_scope_from_headers(headers),
+                        )
                     result = None
                     biases = (
                         self.config.hooks.compute_biases(messages, _hook_ctx)
@@ -2215,6 +2290,11 @@ class AnthropicHandlerMixin:
                                         model_limit=context_limit,
                                         context=extract_user_query(compression_input),
                                         frozen_message_count=prefix_n,
+                                        # The compressed delta is replayed
+                                        # verbatim next turn, so the router
+                                        # keeps the newest user prompt intact
+                                        # here as on every other path (#1174).
+                                        prefix_replay_guaranteed=True,
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         protect=protect,
@@ -2248,6 +2328,10 @@ class AnthropicHandlerMixin:
                                 "[%s] Compression skipped: reason=cache_mode_prefix_mismatch",
                                 request_id,
                             )
+                            if os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"):
+                                _dump_prefix_mismatch(
+                                    request_id, original_client_messages, previous_original_messages
+                                )
                             optimized_messages = messages
                             optimized_tokens = original_tokens
                         elif tracker_frozen_count > 0:
@@ -2421,11 +2505,11 @@ class AnthropicHandlerMixin:
 
             # Mechanism B: activity-based read maturation (flag-gated,
             # default off). Runs after compression so read_lifecycle
-            # markers are respected, and before body assembly so the
-            # held-Read breakpoint relocation lands in the forwarded
-            # request. Session state (matured markers) rides on the
-            # prefix tracker — same affinity and TTL cleanup as the
-            # freeze state. Advisory: must never fail the request.
+            # markers are respected, and before body assembly so a
+            # matured marker lands in the forwarded request. Session
+            # state (matured markers) rides on the prefix tracker — same
+            # affinity and TTL cleanup as the freeze state. Advisory:
+            # must never fail the request.
             # Bound when maturation runs, so the final accounting step below
             # can charge this request's replayed-marker debt. Every earlier
             # `tokens_saved` assignment is overwritten by that recount, so the
@@ -2434,10 +2518,7 @@ class AnthropicHandlerMixin:
             if self.config.read_maturation and not _bypass:
                 try:
                     from headroom.config import ReadMaturationConfig
-                    from headroom.transforms.read_maturation import (
-                        ReadMaturationManager,
-                        relocate_cache_breakpoint,
-                    )
+                    from headroom.transforms.read_maturation import ReadMaturationManager
 
                     maturation_mgr = prefix_tracker.read_maturation_manager
                     if maturation_mgr is None:
@@ -2457,10 +2538,7 @@ class AnthropicHandlerMixin:
                         frozen_message_count=frozen_message_count,
                     )
                     if maturation.replacements_applied or maturation.holding_msg_indices:
-                        optimized_messages = relocate_cache_breakpoint(
-                            maturation.messages,
-                            maturation.holding_msg_indices,
-                        )
+                        optimized_messages = maturation.messages
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
                         tokens_saved = max(0, original_tokens - optimized_tokens)
                         if maturation.newly_matured:
@@ -4113,6 +4191,7 @@ class AnthropicHandlerMixin:
                         outcome_provider=provider_name,
                         session_key=session_key,
                         server_memory_tool_names=server_memory_tool_names,
+                        client_beta=client_anthropic_beta or "",
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
@@ -4241,6 +4320,30 @@ class AnthropicHandlerMixin:
                                     else str(response.text[:500])
                                 )
                                 err_type = "parse_error"
+
+                            if response.status_code == 400:
+                                # Diagnostic only, and outside the parse above:
+                                # `err_msg` is whatever upstream put in that slot
+                                # (null, an object, a list have all been seen), and
+                                # the client is still waiting for the real error
+                                # body below.
+                                try:
+                                    from headroom.proxy.context_guard import (
+                                        credential_scope_from_headers,
+                                        note_prompt_too_long,
+                                    )
+
+                                    note_prompt_too_long(
+                                        model,
+                                        headers.get("anthropic-beta"),
+                                        err_msg,
+                                        scope=credential_scope_from_headers(headers),
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        f"[{request_id}] context_guard: limit learning skipped",
+                                        exc_info=True,
+                                    )
 
                             logger.warning(
                                 f"[{request_id}] UPSTREAM_ERROR "
@@ -4622,18 +4725,62 @@ class AnthropicHandlerMixin:
                                     request_context=memory_request_ctx,
                                 )
 
-                                if tool_results:
+                                turn_content = resp_json.get("content") or []
+                                answered = {result.get("tool_use_id") for result in tool_results}
+                                unanswered = [
+                                    block
+                                    for block in turn_content
+                                    if isinstance(block, dict)
+                                    and block.get("type") == "tool_use"
+                                    and block.get("id") not in answered
+                                ]
+                                if tool_results and unanswered:
+                                    # The continuation replays this whole turn, and
+                                    # Anthropic rejects any tool_use without a result
+                                    # (#4009). Only the client can answer its own
+                                    # tools, so the turn goes back to it, minus the
+                                    # memory calls it never declared and that already
+                                    # ran here (same rule as the streaming path, #3947).
+                                    logger.info(
+                                        f"[{request_id}] Memory: Turn also called a client "
+                                        "tool; returning the turn to the client"
+                                    )
+                                    resp_json = {
+                                        **resp_json,
+                                        "content": [
+                                            block
+                                            for block in turn_content
+                                            if not (
+                                                isinstance(block, dict)
+                                                and block.get("type") == "tool_use"
+                                                and block.get("name") in server_memory_tool_names
+                                            )
+                                        ],
+                                    }
+                                    response = httpx.Response(
+                                        status_code=200,
+                                        content=json.dumps(resp_json).encode(),
+                                        headers={
+                                            key: value
+                                            for key, value in response.headers.items()
+                                            if key.lower()
+                                            not in ("content-encoding", "content-length")
+                                        },
+                                    )
+                                elif tool_results:
                                     # Create continuation messages
                                     assistant_msg = {
                                         "role": "assistant",
-                                        "content": resp_json.get("content", []),
+                                        "content": turn_content,
                                     }
                                     user_msg = {
                                         "role": "user",
                                         "content": tool_results,
                                     }
 
-                                    continuation_messages = optimized_messages + [
+                                    # body["messages"], not optimized_messages: it is
+                                    # what this turn actually sent upstream.
+                                    continuation_messages = body["messages"] + [
                                         assistant_msg,
                                         user_msg,
                                     ]
@@ -4654,9 +4801,16 @@ class AnthropicHandlerMixin:
                                     # Update response with continuation
                                     resp_json = cont_response.json()
                                     response = cont_response
-                                    logger.info(
-                                        f"[{request_id}] Memory: Tool calls handled, continuation complete"
-                                    )
+                                    if cont_response.status_code >= 400:
+                                        logger.warning(
+                                            f"[{request_id}] Memory: Continuation failed with "
+                                            f"upstream status {cont_response.status_code}"
+                                        )
+                                    else:
+                                        logger.info(
+                                            f"[{request_id}] Memory: Tool calls handled, "
+                                            "continuation complete"
+                                        )
 
                             except Exception as e:
                                 logger.warning(
@@ -4838,6 +4992,7 @@ class AnthropicHandlerMixin:
                         if (
                             self.cache
                             and not stream
+                            and cache_partition is not None
                             and response.status_code == 200
                             and resp_json is not None
                         ):
@@ -4847,6 +5002,7 @@ class AnthropicHandlerMixin:
                                 response.content,
                                 dict(response.headers),
                                 tokens_saved=tokens_saved,
+                                partition=cache_partition,
                                 **cache_key_fields,
                             )
 
@@ -5011,7 +5167,14 @@ class AnthropicHandlerMixin:
                                 )
                                 if not buffered_stream_ccr:
                                     return Response(
-                                        content=response.content,
+                                        content=self._context_guard_nudge_body(
+                                            response.content,
+                                            status_code=response.status_code,
+                                            model=model,
+                                            headers=headers,
+                                            request_id=request_id,
+                                            client_beta=client_anthropic_beta or "",
+                                        ),
                                         status_code=response.status_code,
                                         headers=response_headers,
                                     )
@@ -5133,6 +5296,15 @@ class AnthropicHandlerMixin:
                                     status_code=502,
                                 )
 
+                            # This stream is resynthesized from the parsed message,
+                            # so the streaming guard never sees it: nudge here.
+                            self._context_guard_nudge_message(
+                                resp_json,
+                                model=model,
+                                headers=headers,
+                                request_id=request_id,
+                                client_beta=client_anthropic_beta or "",
+                            )
                             try:
                                 sse_events = self._response_to_sse(resp_json, "anthropic")
                             except ValueError as sse_err:
@@ -5164,7 +5336,14 @@ class AnthropicHandlerMixin:
                             )
 
                         return Response(
-                            content=response.content,
+                            content=self._context_guard_nudge_body(
+                                response.content,
+                                status_code=response.status_code,
+                                model=model,
+                                headers=headers,
+                                request_id=request_id,
+                                client_beta=client_anthropic_beta or "",
+                            ),
                             status_code=response.status_code,
                             headers=response_headers,
                         )
@@ -5294,6 +5473,96 @@ class AnthropicHandlerMixin:
             # deep-copy) would otherwise leak the pre-upstream semaphore
             # permanently. The emit function is idempotent.
             await _finalize_pre_upstream()
+
+    def _context_guard_nudge_body(
+        self,
+        content: bytes,
+        *,
+        status_code: int,
+        model: str,
+        headers: dict[str, str],
+        request_id: str,
+        client_beta: str | None = None,
+    ) -> bytes:
+        """Apply the context guard to a buffered (non-streaming) message body.
+
+        The buffered path raises the compression budget through
+        ``effective_context_limit`` exactly like the streaming path, so it has
+        to move the client's gauge exactly like the streaming path too. Without
+        this, a non-streaming client got the larger forwarded request and none
+        of the warning, and walked into the prompt-too-long wall the guard
+        exists to keep it away from.
+
+        Returns ``content`` unchanged unless the usage genuinely needed
+        nudging, so byte-faithful forwarding still holds for every response
+        that is not near the wall.
+        """
+        if status_code != 200 or not content:
+            return content
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return content
+        if not self._context_guard_nudge_message(
+            payload,
+            model=model,
+            headers=headers,
+            request_id=request_id,
+            client_beta=client_beta,
+        ):
+            return content
+        return json.dumps(payload).encode()
+
+    def _context_guard_nudge_message(
+        self,
+        payload: Any,
+        *,
+        model: str,
+        headers: dict[str, str],
+        request_id: str,
+        client_beta: str | None = None,
+    ) -> bool:
+        """Nudge a parsed message's usage in place; True when it changed.
+
+        Shared by the buffered body above and the buffered-CCR stream, which
+        resynthesizes SSE from the parsed message and so never passes through
+        the streaming guard. ``client_beta`` is the beta the client itself
+        sent (its gauge follows it; session-sticky merging can add context-1m
+        to the outbound header); None falls back to the outbound header.
+        """
+        try:
+            from headroom.proxy.context_guard import (
+                believed_context_limit,
+                context_guard_enabled,
+                credential_scope_from_headers,
+                effective_context_limit,
+                nudge_response_usage,
+            )
+
+            if not context_guard_enabled():
+                return False
+            if not isinstance(payload, dict) or payload.get("type") != "message":
+                return False
+            model_limit = self.anthropic_provider.get_context_limit(model)
+            beta_header = headers.get("anthropic-beta")
+            return bool(
+                nudge_response_usage(
+                    payload,
+                    believed_limit=believed_context_limit(
+                        model_limit, beta_header if client_beta is None else client_beta
+                    ),
+                    effective_limit=effective_context_limit(
+                        model,
+                        model_limit,
+                        beta_header,
+                        scope=credential_scope_from_headers(headers),
+                    ),
+                    request_id=request_id,
+                )
+            )
+        except Exception:
+            logger.debug(f"[{request_id}] context_guard: buffered nudge skipped", exc_info=True)
+            return False
 
     def _anthropic_batch_capability_error(self) -> Response | None:
         """Return the stable client error for a Copilot batch target."""
@@ -5467,6 +5736,23 @@ class AnthropicHandlerMixin:
             original_tokens = 0  # Initialize before try to prevent UnboundLocalError
             try:
                 context_limit = self.anthropic_provider.get_context_limit(model)
+                # Same window the streaming path computes: a batch item for a
+                # 1M-beta model was otherwise compressed against the registry
+                # limit, so identical requests got two different budgets
+                # depending on which endpoint they arrived through.
+                from headroom.proxy.context_guard import (
+                    context_guard_enabled,
+                    credential_scope_from_headers,
+                    effective_context_limit,
+                )
+
+                if context_guard_enabled():
+                    context_limit = effective_context_limit(
+                        model,
+                        context_limit,
+                        headers.get("anthropic-beta"),
+                        scope=credential_scope_from_headers(headers),
+                    )
                 frozen_message_count = (
                     self._strict_previous_turn_frozen_count(original_messages, 0)
                     if is_cache_mode(self.config.mode)
