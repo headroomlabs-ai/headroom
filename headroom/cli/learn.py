@@ -442,10 +442,11 @@ def _steered_level(raw: object) -> int | None:
 
 
 class _ProxyProcess(NamedTuple):
-    """Identifies one proxy process: pids are reused, (pid, start time) is not."""
+    """Process identity and its raw verbosity pin from the same health snapshot."""
 
     pid: int
     started_at: float
+    verbosity_pin: str | None = None
 
 
 def _proxy_process(payload: dict[str, Any], config: dict[str, Any]) -> _ProxyProcess | None:
@@ -469,7 +470,11 @@ def _proxy_process(payload: dict[str, Any], config: dict[str, Any]) -> _ProxyPro
         now = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
-    return _ProxyProcess(pid, round(now - float(uptime), 3))
+    runtime = config.get("runtime_env")
+    raw_pin = runtime.get("HEADROOM_VERBOSITY_LEVEL") if isinstance(runtime, dict) else None
+    return _ProxyProcess(
+        pid, round(now - float(uptime), 3), raw_pin if isinstance(raw_pin, str) else None
+    )
 
 
 def _query_proxy_verbosity(
@@ -532,6 +537,7 @@ def _pin_is_ours(ws: Path, port: int, process: _ProxyProcess | None, level: int 
         record.get("port") == port
         and record.get("pid") == process.pid
         and record.get("level") == level
+        and process.verbosity_pin == str(level)
         and isinstance(started_at, int | float)
         and abs(started_at - process.started_at) <= _START_TIME_TOLERANCE_S
     )

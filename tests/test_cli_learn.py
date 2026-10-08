@@ -1036,6 +1036,24 @@ def test_verbosity_apply_does_not_record_a_pin_without_a_process_identity(
     assert "pin could not be recorded" in output
 
 
+def test_verbosity_apply_preserves_a_changed_raw_pin_with_the_same_clamped_level(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path
+) -> None:
+    proxy = _FakeProxy(
+        {"mode": "cache", "pid": 4242, "runtime_env": {"HEADROOM_VERBOSITY_LEVEL": "8"}}
+    )
+    output = _apply_learned_level(
+        monkeypatch,
+        runner,
+        tmp_path,
+        proxy,
+        level=3,
+        pin_record={"port": _PROXY_PORT, "pid": 4242, "started_at": _STARTED_AT, "level": 4},
+    )
+    assert proxy.posted == [{"HEADROOM_OUTPUT_SHAPER": "1"}]
+    assert "level 4" in output
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1061,7 +1079,7 @@ def test_query_proxy_verbosity_without_a_config_block(
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
-        ({}, (4242, _STARTED_AT)),
+        ({}, (4242, _STARTED_AT, None)),
         ({"uptime_seconds": 0.0}, None),  # the proxy has not recorded its start
         ({"uptime_seconds": None}, None),
         ({"timestamp": "not a time"}, None),

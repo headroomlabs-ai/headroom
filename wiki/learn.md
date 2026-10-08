@@ -181,7 +181,8 @@ level. On a cache-mode proxy `--apply` therefore also pins
 proxy pid, level) in `verbosity_pin.json`. A `HEADROOM_VERBOSITY_LEVEL` that is
 already set is left alone, and `--apply` says so. The one exception is a pin that
 record proves an earlier `--apply` set: the same proxy process still holding the
-same value. That pin is replaced.
+same raw value. That pin is replaced. A changed raw pin remains operator-owned
+even if it clamps to the same effective level as the previous CLI pin.
 
 To keep the shaper on across proxy restarts, export `HEADROOM_OUTPUT_SHAPER=1` before starting the proxy, plus `HEADROOM_VERBOSITY_LEVEL=<level>` in cache mode.
 
