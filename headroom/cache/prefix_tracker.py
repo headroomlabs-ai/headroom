@@ -66,8 +66,9 @@ _CACHE_TTL_CLEANUP_MARGIN_SECONDS = 60
 
 # Recent request snapshots kept per lineage. A Claude Code fork (the subagent
 # progress summary, the parent's side query) re-sends the history plus one
-# prompt, so the next real turn extends the snapshot BEFORE the fork. Three
-# covers a fork or two between consecutive turns.
+# prompt, so the next real turn extends the snapshot BEFORE the fork. A
+# request that resumes an older snapshot keeps it next-newest, so any number
+# of forks off one turn leaves that turn resumable.
 _LINEAGE_HISTORY = 3
 
 # (tracker, turn, resumed state) the current request resolved to. Each proxied
@@ -1351,7 +1352,8 @@ class PrefixCacheTracker:
         if idle_seconds is None:
             idle_seconds = self.seconds_since_activity()
         ttl = self.resolved_cache_ttl_seconds()
-        expected = self._cached_token_count
+        # The turn this request resumed, not whichever sibling answered last.
+        expected = self._request_turn_state()[1]
 
         # Nothing was cached last turn → cold start, not a miss.
         if expected <= 0:
@@ -1406,7 +1408,7 @@ class PrefixCacheTracker:
         content. Anything else (a frozen message rewritten, the prefix
         reordered, the list now shorter) counts as a prefix change.
         """
-        prev = self._last_forwarded_messages
+        prev: list[dict[str, Any]] = self._request_turn_state()[4]
         if not prev:
             # No recorded prefix to compare — can't claim it changed.
             return True
@@ -1883,6 +1885,13 @@ class SessionTrackerStore:
             tracker._resume_turn(best_turn if best_turn is not None else latest_turn(best_key))
             turn = next(self._turn_counter)
             history = self._lineage_history.setdefault(best_key, deque(maxlen=_LINEAGE_HISTORY))
+            branch = next((entry for entry in history if entry[1] == best_turn), None)
+            if branch is not None and branch is not history[0]:
+                # A fork off an older turn: that turn stays the branch point the
+                # next main turn extends, so keep it behind this request rather
+                # than let successive forks push it out.
+                history.remove(branch)
+                history.appendleft(branch)
             history.appendleft((snap, turn))
             live = {t for _, t in history}
             tracker._turn_states = {t: s for t, s in tracker._turn_states.items() if t in live}

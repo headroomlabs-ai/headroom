@@ -283,3 +283,61 @@ def test_fork_does_not_replace_the_lineage_it_branched_from(fork_responds_first)
     assert resumed is main_tracker
     assert resumed.get_frozen_message_count() == len(main_k)
     assert resumed.get_last_original_messages() == main_k
+
+
+@pytest.mark.parametrize("forks", [1, 3, 5])
+def test_successive_forks_keep_the_turn_they_branch_from(forks) -> None:  # noqa: ANN001
+    """Several forks off one main turn (progress summaries, side queries) must
+    not push that turn out of the lineage history: the next main turn still
+    extends it, so it must resume its frozen prefix rather than start cold."""
+    store = SessionTrackerStore()
+    base = _strip(_main(3))
+    main_tracker = contextvars.Context().run(_send, store, base)
+    for i in range(forks):
+        side = base + [
+            {"role": "assistant", "content": [{"type": "text", "text": f"Done {i}."}]},
+            {"role": "user", "content": [{"type": "text", "text": f"Side query {i}."}]},
+        ]
+        contextvars.Context().run(_send, store, side)
+
+    main_next = _strip(_main(4))
+    resumed = contextvars.Context().run(
+        store.resolve_tracker, "sid", "anthropic", messages=main_next
+    )
+
+    assert resumed is main_tracker
+    assert resumed.get_frozen_message_count() == len(base)
+    assert resumed.get_last_original_messages() == base
+
+
+def _send(store: SessionTrackerStore, messages: list[dict[str, Any]]) -> PrefixCacheTracker:
+    tracker = store.resolve_tracker("sid", "anthropic", messages=messages)
+    _record(tracker, messages, cached=1000 * len(messages))
+    return tracker
+
+
+@pytest.mark.parametrize("fork_responds_first", [True, False], ids=["fork-first", "main-first"])
+def test_cache_miss_is_classified_against_the_resumed_turn(fork_responds_first) -> None:  # noqa: ANN001
+    """A sibling request answering while this one is in flight must not change
+    what this request's cache outcome is measured against."""
+    store = SessionTrackerStore()
+    base = _strip(_main(3))
+    contextvars.Context().run(_send, store, base)
+
+    main_next, fork = _strip(_main(4)), _strip(_summary_fork(3))
+    main_ctx, fork_ctx = contextvars.Context(), contextvars.Context()
+    main_tracker = main_ctx.run(store.resolve_tracker, "sid", "anthropic", messages=main_next)
+    fork_tracker = fork_ctx.run(store.resolve_tracker, "sid", "anthropic", messages=fork)
+    assert fork_tracker is main_tracker
+    if fork_responds_first:
+        # The fork read nothing: the shared tracker now expects no cache.
+        fork_ctx.run(_record, fork_tracker, fork, cached=0)
+
+    # The main turn misses on a prefix its parent cached.
+    attribution = main_ctx.run(main_tracker.classify_cache_miss, 0, main_next, 0.0)
+
+    assert attribution.is_miss
+    assert attribution.expected_cached_tokens == 1000 * len(base)
+    assert not attribution.prefix_changed
+    if not fork_responds_first:
+        fork_ctx.run(_record, fork_tracker, fork, cached=0)
