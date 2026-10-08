@@ -353,7 +353,11 @@ def build_prefix_cache_stats(
                 _w_cost = _w5 * _cw5_price + _w1h * _cw1h_price
                 _blended_write = (_w_cost / _w_all) if _w_all > 0 else _cw5_price
                 write_mult = _blended_write / _uncached_price
-                pricing_source = "catalog"
+                pricing_source = (
+                    "provider_resolved"
+                    if model_name in getattr(cost_tracker, "_fixed_pricing_by_model", {})
+                    else "catalog"
+                )
 
         # Calculate savings:
         # Cache reads save (1.0 - read_mult) per token vs uncached input price.
@@ -929,6 +933,9 @@ class CostTracker:
 
         # Token savings per model (exact, no dollar estimation)
         self._tokens_saved_by_model: dict[str, int] = {}
+        self._fixed_pricing_by_model: dict[str, tuple[float, float]] = {}
+        self._input_spend_by_model: dict[str, float] = {}
+        self._output_spend_by_model: dict[str, float] = {}
         # Cache-aware counterfactual buckets for compressed-away message tokens,
         # the same treatment the deferred tool schemas get below. Floats: shares
         # of a request's removed tokens, not whole tokens. Keyed by
@@ -1274,6 +1281,7 @@ class CostTracker:
             basis = COST_BASIS_ESTIMATED
             _warn_estimated_basis_once(model)
         cost: float | None
+        fixed_pricing: tuple[float, float] | None = None
         if pricing_override and pricing is not None:
             # Operator-selected fixed rates beat a successful catalog lookup.
             # Use the provider's existing 50% cache-read convention for overrides;
@@ -1281,6 +1289,7 @@ class CostTracker:
             cost = _fallback_cost_usd(
                 input_tokens, output_tokens, cache_read_tokens, effective_cache_write, pricing
             )
+            fixed_pricing = pricing
         else:
             cost = self.estimate_cost(
                 model=model,
@@ -1298,6 +1307,7 @@ class CostTracker:
             # it (#3825 review). ``passthrough:`` models genuinely have no
             # price and keep the old no-entry behaviour.
             fallback = pricing if pricing is not None else _UNKNOWN_MODEL_DEFAULT_PRICING_PER_1M
+            fixed_pricing = fallback
             if pricing is None:
                 # Generic path: LiteLLM already failed, so this is the
                 # unknown-model default guess, not a lookup.
@@ -1322,6 +1332,33 @@ class CostTracker:
             self._costs.append(entry)
             self._record_budget_cost(entry)
             self._prune_old_costs()
+
+        # Capture spend at request time so catalog/override changes cannot
+        # reprice historical traffic. Totals remain bounded by model count.
+        if fixed_pricing is not None:
+            self._fixed_pricing_by_model[model] = fixed_pricing
+        else:
+            self._fixed_pricing_by_model.pop(model, None)
+        rates = self._get_cache_prices(model, long_context=long_context)
+        if rates is not None:
+            read_price, write_5m_price, write_1h_price, input_price = rates
+            if cache_read_tokens or write_eff or uncached_tokens:
+                input_spend = (
+                    max(0, cache_read_tokens) * read_price
+                    + write_5m_eff * write_5m_price
+                    + write_1h_eff * write_1h_price
+                    + max(0, uncached_tokens) * input_price
+                )
+            else:
+                input_spend = max(0, tokens_sent) * input_price
+            self._input_spend_by_model[model] = (
+                self._input_spend_by_model.get(model, 0.0) + input_spend
+            )
+        output_price = self._get_output_price(model, long_context=long_context)
+        if output_price is not None:
+            self._output_spend_by_model[model] = (
+                self._output_spend_by_model.get(model, 0.0) + max(0, output_tokens) * output_price
+            )
 
     def _period_cutoff(self, now: datetime | None = None) -> datetime:
         """Start of the current budget period."""
@@ -1524,6 +1561,8 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        if model in self._fixed_pricing_by_model:
+            return self._fixed_pricing_by_model[model][0]
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1543,6 +1582,8 @@ class CostTracker:
         ``long_context`` selects the catalog's above-200k completion rate where
         the model publishes one (Anthropic charges 1.5x there).
         """
+        if model in self._fixed_pricing_by_model:
+            return self._fixed_pricing_by_model[model][1] / 1_000_000
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -1601,6 +1642,10 @@ class CostTracker:
         Imported at call time: ``headroom.pricing`` eagerly imports litellm
         (~4s) and this module is on the proxy's startup path.
         """
+        if model in self._fixed_pricing_by_model:
+            input_price = self._fixed_pricing_by_model[model][0] / 1_000_000
+            return (0.5 * input_price, input_price, input_price, input_price)
+
         try:
             from headroom.pricing.counterfactual import resolve_rates
 
@@ -1634,6 +1679,10 @@ class CostTracker:
             cw = self._api_cache_write_by_model.get(model, 0)
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
+
+            if model in self._input_spend_by_model:
+                cost_with_headroom += self._input_spend_by_model[model]
+                continue
 
             prices = self._get_cache_prices(model)
             if prices:
@@ -1704,6 +1753,11 @@ class CostTracker:
             uncached = self._api_uncached_by_model.get(model, 0)
             total_input_tokens += sent
 
+            if model in self._input_spend_by_model:
+                cost_with_headroom += self._input_spend_by_model[model]
+                total_billed_input_tokens += cr + cw + uncached or sent
+                continue
+
             prices = self._get_cache_prices(model)
             if prices:
                 cr_price, cw5_price, cw1h_price, uncached_price = prices
@@ -1743,8 +1797,14 @@ class CostTracker:
         # Completion spend. The input-only figure above is what a budget and the
         # per-model table want; a card that says "$X spent" has to include the
         # tokens the model emitted, or the spend it shows isn't the bill.
-        output_cost_usd = 0.0
+        output_cost_usd = sum(
+            cost
+            for model, cost in self._output_spend_by_model.items()
+            if not model.startswith("passthrough:")
+        )
         for (model, long_context), out_tokens in self._output_tokens_by_tier.items():
+            if model in self._output_spend_by_model:
+                continue
             price = self._get_output_price(model, long_context=long_context)
             if price:
                 output_cost_usd += out_tokens * price

@@ -86,6 +86,11 @@ def test_known_model_override_is_booked_and_enforces_budget(
     assert basis["price_estimated_records"] == 0
     assert basis["estimated_records"] == 0
     assert tracker.check_budget() == (False, 0.0)
+    displayed = tracker.stats()
+    assert displayed["total_input_cost_usd"] == pytest.approx(expected - 0.20)
+    assert displayed["output_cost_usd"] == pytest.approx(0.20)
+    assert displayed["total_cost_usd"] == pytest.approx(expected)
+    assert tracker.totals()[1] == pytest.approx(expected - 0.20)
 
 
 @pytest.mark.parametrize("model", ["gpt-5", "gemini-2.5-pro"])
@@ -118,6 +123,7 @@ def test_catalog_outcome_retains_native_cache_and_context_tiers(monkeypatch, mod
     )
     assert _budget_basis(tracker)["total_usd"] == pytest.approx(expected)
     assert _budget_basis(tracker)["price_estimated_records"] == 0
+    assert tracker.stats()["total_cost_usd"] == pytest.approx(expected)
 
 
 class _Handler:
@@ -127,6 +133,26 @@ class _Handler:
         self.metrics = _Metrics()
         self.cost_tracker = cost_tracker
         self.logger = None
+
+
+def test_display_retains_each_requests_selected_price():
+    tracker = _tracker(budget_limit_usd=100.0)
+    for pricing in [(100.0, 200.0), (50.0, 100.0)]:
+        tracker.record_tokens(
+            "gpt-4o",
+            0,
+            200_000,
+            uncached_tokens=200_000,
+            output_tokens=1_000,
+            pricing=pricing,
+            pricing_override=True,
+        )
+    displayed = tracker.stats()
+    assert displayed["total_input_cost_usd"] == pytest.approx(30.0)
+    assert displayed["output_cost_usd"] == pytest.approx(0.30)
+    assert displayed["total_cost_usd"] == pytest.approx(30.30)
+    assert displayed["budget_basis"]["total_usd"] == pytest.approx(30.30)
+    assert tracker.totals() == (400_000, 30.0)
 
 
 @pytest.fixture
@@ -182,6 +208,8 @@ def test_unknown_model_books_estimated_entry_and_denies_under_count(no_litellm):
     assert basis["price_estimated_records"] == 1
     assert basis["price_estimated_usd"] == pytest.approx(EXPECTED_USD)
     assert basis["total_usd"] == pytest.approx(EXPECTED_USD)
+    assert ct.stats()["total_cost_usd"] == pytest.approx(EXPECTED_USD)
+    assert ct.totals()[1] == pytest.approx(0.50)
     # Usage was provider-reported: estimated_pct keeps its "input count was
     # estimated" meaning and is untouched by the price guess.
     assert basis["estimated_pct"] == 0.0
