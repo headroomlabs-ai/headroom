@@ -155,6 +155,53 @@ def test_display_retains_each_requests_selected_price():
     assert tracker.totals() == (400_000, 30.0)
 
 
+@pytest.mark.parametrize("write_5m,write_1h", [(0, 0), (20_000, 30_000), (0, 200_000)])
+def test_unsplit_or_partial_cache_writes_remain_in_displayed_spend(write_5m, write_1h):
+    tracker = _tracker()
+    tracker.record_tokens(
+        "gpt-4o",
+        0,
+        100_000,
+        cache_write_tokens=100_000,
+        cache_write_5m_tokens=write_5m,
+        cache_write_1h_tokens=write_1h,
+        pricing=(100.0, 200.0),
+        pricing_override=True,
+    )
+    assert tracker.stats()["total_cost_usd"] == pytest.approx(10.0)
+    assert tracker.stats()["budget_basis"]["total_usd"] == pytest.approx(10.0)
+    assert tracker.totals() == (100_000, 10.0)
+
+
+def test_runtime_reset_clears_selected_prices_and_spend():
+    tracker = _tracker()
+    tracker.record_tokens(
+        "gpt-4o",
+        0,
+        100_000,
+        uncached_tokens=100_000,
+        output_tokens=1_000,
+        pricing=(100.0, 200.0),
+        pricing_override=True,
+    )
+    tracker.reset_runtime()
+    assert tracker.stats()["total_cost_usd"] == 0.0
+    assert tracker.totals() == (0, 0.0)
+    assert tracker._fixed_pricing_by_model == {}
+    tracker.record_tokens(
+        "gpt-4o",
+        0,
+        100_000,
+        uncached_tokens=100_000,
+        output_tokens=1_000,
+        pricing=(50.0, 100.0),
+        pricing_override=True,
+    )
+    assert tracker.stats()["total_cost_usd"] == pytest.approx(5.10)
+    assert tracker.stats()["budget_basis"]["total_usd"] == pytest.approx(5.10)
+    assert tracker.totals() == (100_000, 5.0)
+
+
 @pytest.fixture
 def no_litellm(monkeypatch: pytest.MonkeyPatch):
     """Simulate LiteLLM being unable to price: estimate_cost returns None."""
