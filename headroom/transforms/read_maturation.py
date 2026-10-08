@@ -1,24 +1,32 @@
-"""Mechanism B: hold-back Read maturation — compress before cache entry.
+"""Mechanism B: hold-back Read maturation — compress a Read once it is done.
 
-The prefix cache bills you for everything *after* the first changed byte,
-so mutating an already-cached Read is ruinously expensive — but bytes that
-have never been cache-written have no cache entry to bust. This module
-exploits the one safe window: a fresh Read is deliberately held *out* of
-the provider cache (the trailing cache breakpoint is relocated to just
-before it) while its file is active. The model sees the verbatim content
-the whole time it is working with the file. Once the file has been quiet
-for `quiesce_turns`, the content is replaced with a CCR-backed marker —
-and only that final, small form ever enters the cache.
+A fresh Read is held verbatim while its file is active, so the model sees
+the full content the whole time it is working with the file. Once the
+file has been quiet for `quiesce_turns`, the content is replaced with a
+CCR-backed marker, if the Read is still outside the provider-cached
+(frozen) prefix.
+
+The held Read is cached like any other message: the client's cache
+breakpoints are forwarded where the client put them. The prefix cache
+bills everything *after* the first changed byte, so a Read the frozen
+prefix already covers stays verbatim: maturing it would re-write the
+whole tail after it at the cache-write rate to save a cache read of the
+Read. An earlier version kept the verbatim Read out of the cache instead,
+by moving the trailing breakpoint in front of it for the whole hold.
+Claude Code marks the last two messages, so that dropped its tail
+breakpoint, and every held turn re-sent the Read and everything after it
+at the full input rate (one 13-request hold grew its uncached tail from
+~3.9K to ~14.6K tokens per request) to save a single cache write.
 
 Timeline for a Read of file F (quiesce_turns=5):
 
-    turn T:      model reads F — verbatim, NOT cached
-    T+1..T+k:    model edits / re-reads F — read stays verbatim and
-                 uncached (every touch resets the quiet clock)
-    T+k+5:       F has been quiet 5 turns → read matures into a marker;
-                 the breakpoint returns to the tail; the marker form is
-                 cache-written once
-    later turns: marker form read from cache at the provider discount
+    turn T:      model reads F — verbatim, cached with the turn
+    T+1..T+k:    model edits / re-reads F — read stays verbatim (every
+                 touch resets the quiet clock)
+    T+k+5:       F has been quiet 5 turns → read matures into a marker
+                 if it is still outside the frozen prefix, else it stays
+                 verbatim for good
+    later turns: the forwarded form is read from cache
 
 Why activity-based instead of a fixed hold window: the audit-reads
 simulation over real traffic showed touch gaps are fat-tailed (next-touch
@@ -31,8 +39,8 @@ still in context. The recovery path is the model's existing behavior.
 
 Two invariants:
 
-1. **No cached byte is ever mutated.** The verbatim form is never
-   cache-written, so maturation invalidates nothing.
+1. **The frozen prefix is never mutated.** A Read only matures while it
+   is outside the provider-confirmed prefix.
 2. **Replay is deterministic.** Once matured, the same marker is applied
    on every subsequent request (state is session-scoped), so the cached
    prefix stays byte-stable for the rest of the session.
@@ -94,8 +102,8 @@ class MaturationResult:
     """Output of one per-request maturation pass."""
 
     messages: list[dict[str, Any]]
-    # Message indices that contain still-holding Reads (must stay out of
-    # the provider cache this request — feed to relocate_cache_breakpoint).
+    # Message indices that contain still-holding Reads (forwarded verbatim
+    # this request).
     holding_msg_indices: list[int] = field(default_factory=list)
     holding_reads: int = 0
     newly_matured: int = 0
@@ -158,9 +166,9 @@ class ReadMaturationManager:
             messages: Conversation messages (Anthropic content-block or
                 OpenAI role="tool" formats).
             frozen_message_count: Provider-cached message count. Reads
-                inside the frozen prefix were cache-written verbatim
-                before this mechanism saw them (e.g. it was just
-                enabled, or state was lost) — they are never touched.
+                inside the frozen prefix are already cache-written
+                verbatim (held Reads are cached with their turn) — they
+                are never touched.
         """
         result = MaturationResult(messages=messages)
         if not self.config.enabled:
@@ -305,9 +313,8 @@ class ReadMaturationManager:
         # NOTE: blocks carrying a client cache_control are NOT skipped —
         # Claude Code parks its tail breakpoint on the newest content
         # block, which right after a Read is the Read's tool_result
-        # itself. Under this mechanism the proxy owns breakpoint
-        # placement: relocate_cache_breakpoint() strips/moves breakpoints
-        # in the held region after this pass.
+        # itself. The breakpoint stays where the client put it; a
+        # replaced block keeps its cache_control.
         if isinstance(content, list):
             new_blocks: list[Any] = []
             changed = False
@@ -394,71 +401,3 @@ class ReadMaturationManager:
         result.replacements_applied += 1
         result.bytes_saved += max(0, len(content) - len(marker))
         return marker, False
-
-
-def relocate_cache_breakpoint(
-    messages: list[dict[str, Any]],
-    holding_msg_indices: list[int],
-) -> list[dict[str, Any]]:
-    """Park the trailing message-level cache breakpoint before held Reads.
-
-    Strips ``cache_control`` from every block at or after the earliest
-    holding message, and places one ephemeral breakpoint on the last
-    block of the latest *eligible* message before it — so the provider
-    caches everything up to (not including) the held Reads. System- and
-    tools-level breakpoints are untouched (they live outside messages).
-
-    Total breakpoints never increase: at most one is added after one or
-    more are removed. Returns the original list unchanged when there is
-    nothing to do.
-    """
-    if not holding_msg_indices:
-        return messages
-
-    earliest = min(holding_msg_indices)
-    out: list[dict[str, Any]] = list(messages)
-    stripped_any = False
-
-    # 1. Strip breakpoints from the held region [earliest:].
-    held_marker: dict[str, Any] | None = None
-    for i in range(earliest, len(out)):
-        msg = out[i]
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        if any(isinstance(b, dict) and "cache_control" in b for b in content):
-            for b in content:
-                # Carry the TTL forward: re-anchoring with a bare ephemeral marker
-                # would silently downgrade a 1h breakpoint to the 5m default.
-                if isinstance(b, dict) and isinstance(b.get("cache_control"), dict):
-                    held_marker = b["cache_control"]
-            out[i] = {
-                **msg,
-                "content": [
-                    {k: v for k, v in b.items() if k != "cache_control"}
-                    if isinstance(b, dict)
-                    else b
-                    for b in content
-                ],
-            }
-            stripped_any = True
-
-    if not stripped_any:
-        # No client breakpoint in the held region — nothing was going to
-        # cache the held Reads this request; leave placement alone.
-        return out
-
-    # 2. Re-anchor: ephemeral breakpoint on the last block of the latest
-    #    block-style message before the held region.
-    for i in range(earliest - 1, -1, -1):
-        content = out[i].get("content")
-        if isinstance(content, list) and content and isinstance(content[-1], dict):
-            new_content = list(content)
-            new_content[-1] = {
-                **new_content[-1],
-                "cache_control": dict(held_marker) if held_marker else {"type": "ephemeral"},
-            }
-            out[i] = {**out[i], "content": new_content}
-            break
-
-    return out
