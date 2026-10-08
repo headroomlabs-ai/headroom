@@ -992,6 +992,9 @@ class CostTracker:
         self._budget_price_estimated_records = 0
         self._budget_non_authoritative_usd = 0.0
         self._tokens_saved_by_model.clear()
+        self._fixed_pricing_by_model.clear()
+        self._input_spend_by_model.clear()
+        self._output_spend_by_model.clear()
         self._saved_write_5m_by_tier.clear()
         self._saved_write_1h_by_tier.clear()
         self._saved_list_by_tier.clear()
@@ -1343,10 +1346,12 @@ class CostTracker:
         if rates is not None:
             read_price, write_5m_price, write_1h_price, input_price = rates
             if cache_read_tokens or write_eff or uncached_tokens:
+                billed_write_1h = min(write_1h_eff, write_eff)
+                billed_write_5m = write_eff - billed_write_1h
                 input_spend = (
                     max(0, cache_read_tokens) * read_price
-                    + write_5m_eff * write_5m_price
-                    + write_1h_eff * write_1h_price
+                    + billed_write_5m * write_5m_price
+                    + billed_write_1h * write_1h_price
                     + max(0, uncached_tokens) * input_price
                 )
             else:
