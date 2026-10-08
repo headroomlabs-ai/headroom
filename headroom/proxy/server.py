@@ -3847,6 +3847,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
                 ),
+                "exclude_tools": sorted(
+                    {
+                        *DEFAULT_EXCLUDE_TOOLS,
+                        *(config.exclude_tools or ()),
+                        *(config.protect_tool_results or ()),
+                    }
+                ),
                 "max_items_after_crush": profile_kwargs.get(
                     "max_items_after_crush",
                     config.max_items_after_crush,
@@ -4537,11 +4544,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # published on host loopback, whose peer is the bridge gateway, still loads.
     _dashboard_gate = [Depends(_require_operator_read_client)]
 
+    # Effective licence state of THIS proxy, resolved once: an explicit
+    # ProxyConfig.license_key, else HEADROOM_LICENSE or its deprecated alias.
+    from headroom.license_env import resolve_license_token
+
+    _dashboard_licensed = bool(config.license_key) or bool(resolve_license_token())
+
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
-        return get_dashboard_html()
+        return get_dashboard_html(licensed=_dashboard_licensed)
 
     # --- Dashboard settings API (loopback-gated, registry-validated) ---------
     # Read/write the curated HEADROOM_* knobs the settings GUI manages. Writes
@@ -5929,7 +5942,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             limit: Maximum number of patterns to return (default 20)
 
         Response includes for each pattern:
-        - hash: Truncated tool signature hash (12 chars)
+        - hash: Full aggregation key identifying one scoped tool pattern
         - compressions: Total compression events
         - retrievals: Total retrieval events
         - retrieval_rate: Percentage of compressions that triggered retrieval
@@ -5953,7 +5966,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": sig_hash,
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -5973,36 +5986,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}", dependencies=[Depends(_require_loopback)])
+    @app.get("/v1/toin/pattern/{hash_prefix:path}", dependencies=[Depends(_require_loopback)])
     async def toin_pattern_detail(hash_prefix: str):
-        """Get detailed TOIN pattern info by hash prefix.
+        """Get detailed TOIN pattern info by the listed identifier or a unique prefix.
 
-        Searches for a pattern where the tool signature hash starts with
-        the provided prefix. Returns full pattern details if found.
+        Pass the ``hash`` returned by ``/v1/toin/patterns`` for an exact
+        lookup. A shorter aggregation-key prefix is accepted only when it
+        identifies one pattern; ambiguous prefixes return 409.
 
-        Path params:
-            hash_prefix: Beginning of the tool signature hash (min 4 chars recommended)
-
-        Response: Full pattern.to_dict() with all learned statistics and recommendations.
+        Response: Learned statistics without query text or field semantics.
         """
         toin = get_toin()
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
-        for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
-                # Keep this response aligned with /v1/toin/patterns while
-                # excluding query text, field semantics, and other internal
-                # learning state from the detail endpoint.
-                return {
-                    "compressions": pattern_dict.get("total_compressions", 0),
-                    "retrievals": pattern_dict.get("total_retrievals", 0),
-                    "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
-                    "confidence": pattern_dict.get("confidence", 0.0),
-                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
-                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
-                }
+        pattern_dict = patterns_data.get(hash_prefix)
+        if pattern_dict is None:
+            matches = (
+                pattern for key, pattern in patterns_data.items() if key.startswith(hash_prefix)
+            )
+            pattern_dict = next(matches, None)
+            if next(matches, None) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ambiguous TOIN pattern prefix; use a full hash from /v1/toin/patterns",
+                )
+        if pattern_dict is not None:
+            # Keep query text, field semantics, and internal learning state private.
+            return {
+                "compressions": pattern_dict.get("total_compressions", 0),
+                "retrievals": pattern_dict.get("total_retrievals", 0),
+                "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
+                "confidence": pattern_dict.get("confidence", 0.0),
+                "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+            }
 
         raise HTTPException(
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"

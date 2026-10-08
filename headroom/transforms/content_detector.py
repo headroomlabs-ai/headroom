@@ -215,17 +215,23 @@ def detect_content_type(content: str) -> DetectionResult:
     if html_result and html_result.confidence >= 0.7:
         return html_result
 
-    # 4. Check for search results (file:line: format)
+    # Git's human-readable status is structured state, not prose. Recognize it
+    # before the lossy search/log/plain-text routes.
+    git_status_result = _try_detect_git_status(content)
+    if git_status_result:
+        return git_status_result
+
+    # 5. Check for search results (file:line: format)
     search_result = _try_detect_search(content)
     if search_result and search_result.confidence >= 0.6:
         return search_result
 
-    # 5. Check for build/log output
+    # 6. Check for build/log output
     log_result = _try_detect_log(content)
     if log_result and log_result.confidence >= 0.5:
         return log_result
 
-    # 6. Check for tabular data (CSV/TSV, markdown tables). Runs after
+    # 7. Check for tabular data (CSV/TSV, markdown tables). Runs after
     #    search/log so colon-delimited search output and freeform logs claim
     #    their content first; tabular requires a consistent multi-column
     #    delimiter or a markdown header+separator pair.
@@ -233,26 +239,73 @@ def detect_content_type(content: str) -> DetectionResult:
     if tabular_result and tabular_result.confidence >= 0.6:
         return tabular_result
 
-    # 7. Check for structured config (YAML/TOML/INI). Runs after tabular so
+    # 8. Check for structured config (YAML/TOML/INI). Runs after tabular so
     #    delimited data keeps its claim, and before code so config files with
     #    code-ish lines route to the structure-aware config compressor.
     config_result = _try_detect_structured_config(content)
     if config_result and config_result.confidence >= 0.6:
         return config_result
 
-    # 8. Check for source code
+    # 9. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 9. Space-aligned command output (`ls -l`, `ps aux`, `docker ps`). Last,
-    #    so it only claims content that would otherwise be plain text.
+    # 10. Space-aligned command output is last, only claims what would
+    #     otherwise be plain text.
     fixed_width_result = _try_detect_fixed_width(content)
     if fixed_width_result:
         return fixed_width_result
 
-    # 10. Fallback to plain text
+    # 11. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
+
+
+_GIT_STATUS_HEADERS = frozenset(
+    {
+        "Changes to be committed:",
+        "Changes not staged for commit:",
+        "Untracked files:",
+        "Unmerged paths:",
+    }
+)
+_GIT_STATUS_ENTRY_RE = re.compile(
+    r"^\s+(?:new file|modified|deleted|renamed|copied|typechange|"
+    r"both modified|both added|both deleted|added by us|deleted by us|"
+    r"added by them|deleted by them):\s+\S"
+)
+
+
+def _try_detect_git_status(content: str) -> DetectionResult | None:
+    """Recognize standard ``git status`` headings and path entries narrowly."""
+    first = content.partition("\n")[0]
+    if not first.startswith(("On branch ", "HEAD detached at ", "HEAD detached from ")):
+        return None
+    lines = content.splitlines()
+
+    has_heading = False
+    has_path = False
+    section: str | None = None
+    for line in lines[1:]:
+        if line in _GIT_STATUS_HEADERS:
+            has_heading = True
+            section = line
+        elif line in {"", "Changes not staged for commit:", "nothing to commit"}:
+            continue
+        elif line.startswith("Your branch ") or line.startswith("  (use "):
+            continue
+        elif section == "Untracked files:" and line.startswith("\t") and line[1:].strip():
+            has_path = True
+        elif section in {
+            "Changes to be committed:",
+            "Changes not staged for commit:",
+            "Unmerged paths:",
+        } and _GIT_STATUS_ENTRY_RE.match(line):
+            has_path = True
+
+    if not (has_heading and has_path):
+        return None
+    return DetectionResult(ContentType.TABULAR, 1.0, {"format": "git_status"})
 
 
 _JSON_DECODER = json.JSONDecoder()
