@@ -19,6 +19,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
     extract_tags,
+    invalid_request_body_message,
 )
 from headroom.proxy.outcome import RequestOutcome
 
@@ -86,7 +87,7 @@ class BatchHandlerMixin:
                 content={
                     "error": {
                         "code": 400,
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "status": "INVALID_ARGUMENT",
                     }
                 },
@@ -397,7 +398,7 @@ class BatchHandlerMixin:
                 content={
                     "error": {
                         "code": 500,
-                        "message": f"Failed to forward batch request: {e!s}",
+                        "message": "Failed to forward batch request",
                         "status": "INTERNAL",
                     }
                 },
@@ -853,7 +854,7 @@ class BatchHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "type": "invalid_request_error",
                         "code": "invalid_json",
                     }

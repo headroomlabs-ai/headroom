@@ -363,6 +363,7 @@ _AGENT_SAVINGS_WRAP_AGENTS = {
     "grok",
     "grok_build",
 }
+_CLAUDE_PROJECT_SETTINGS_ENV = "HEADROOM_CLAUDE_PROJECT_SETTINGS"
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -1311,6 +1312,16 @@ def _foundry_proxy_url(proxy_url: str) -> str:
     return proxy_url.rstrip("/") + "/anthropic"
 
 
+def _claude_project_settings_enabled(project_settings: bool) -> bool:
+    """Return whether wrap claude should write project-local Claude settings."""
+    env_enabled = _env_bool_value(os.environ.get(_CLAUDE_PROJECT_SETTINGS_ENV, ""))
+    return project_settings or env_enabled
+
+
+def _claude_project_settings_skip_reason() -> str:
+    return f"use --project-settings or {_CLAUDE_PROJECT_SETTINGS_ENV}=1 to persist proxy routing"
+
+
 def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     """Return the Vertex upstream that the proxy should use for Claude Code."""
     explicit_target = os.environ.get("VERTEX_TARGET_API_URL", "").strip()
@@ -1397,9 +1408,9 @@ def _locked_file(lock_file: Any) -> Any:
             import msvcrt
 
             # msvcrt.locking operates on bytes from the current file position.
-            lock_file.seek(0)
-            if lock_file.read(1) == b"":
-                lock_file.seek(0)
+            # Reading the locked byte fails on Windows before a competing
+            # writer can enter the retry loop. Check metadata instead.
+            if os.fstat(lock_file.fileno()).st_size == 0:
                 lock_file.write(b"0")
                 lock_file.flush()
             lock_file.seek(0)
@@ -1725,16 +1736,41 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
     Called before writing a fresh base_url entry so a crashed wrap session's
     leftover doesn't get treated as this session's own state to restore later.
     """
+    # Preserve the default no-marker path without creating lock artifacts.
     marker = _read_wrap_marker(settings_path)
     if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
         return None
-    previous = marker.get("previous")
-    click.echo(
-        f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
-        err=True,
-    )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
-    return previous
+    with _wrap_settings_lock(settings_path):
+        marker = _read_wrap_marker(settings_path)
+        if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
+            return None
+        port = marker.get("port")
+        if not isinstance(port, int) or isinstance(port, bool):
+            return None
+        expected_url = f"http://127.0.0.1:{port}"
+        if key == "ANTHROPIC_FOUNDRY_BASE_URL":
+            expected_url = _foundry_proxy_url(expected_url)
+        try:
+            settings = json.loads(_read_text(settings_path))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        env_settings = settings.get("env") if isinstance(settings, dict) else None
+        current_url = env_settings.get(key) if isinstance(env_settings, dict) else None
+        if current_url != expected_url:
+            # The user (or a newer session) has replaced the crashed writer's URL.
+            # Retire its stale marker without changing the current settings.
+            if _read_wrap_marker(settings_path) == marker:
+                _clear_wrap_marker(settings_path, key=key)
+            return None
+        previous = marker.get("previous")
+        click.echo(
+            f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
+            err=True,
+        )
+        _restore_claude_wrap_base_url(
+            previous, settings_path=settings_path, _key_override=key, _lock_held=True
+        )
+        return previous
 
 
 def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str | None:
@@ -2038,6 +2074,7 @@ def _restore_claude_wrap_base_url(
     _key_override: str | None = None,
     force: bool = False,
     dead_ports: frozenset[int] = frozenset(),
+    _lock_held: bool = False,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -2053,11 +2090,13 @@ def _restore_claude_wrap_base_url(
     (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
     holders that outlived their proxy stop counting as live.
     """
+    from contextlib import nullcontext
+
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    with _wrap_settings_lock(path):
+    with nullcontext() if _lock_held else _wrap_settings_lock(path):
         # Another live wrap session in this project may still be using the key.
         # Restoring underneath it silently unroutes a running session -- traffic
         # bypasses the proxy with no error anywhere (#3205).
@@ -5933,6 +5972,16 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--project-settings",
+    "--project-settings-injection",
+    "project_settings",
+    is_flag=True,
+    help=(
+        "Write .claude/settings.local.json so daemon-spawned Claude workers inherit "
+        "Headroom routing. Env: HEADROOM_CLAUDE_PROJECT_SETTINGS=1."
+    ),
+)
+@click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -5983,6 +6032,7 @@ def claude(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    project_settings: bool,
     learn: bool,
     memory: bool,
     tool_search: str | None,
@@ -6006,6 +6056,7 @@ def claude(
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
+        headroom wrap claude --project-settings # Persist proxy routing in .claude/settings.local.json
         headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
@@ -6028,6 +6079,7 @@ def claude(
     _tool_search_not_written = object()
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
+    _wrote_project_settings: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
@@ -6255,39 +6307,42 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
-        # Issue #951: write to settings.json so daemon-spawned conversation
-        # workers (which read settings.json fresh rather than inheriting the
-        # daemon's environment) also route through Headroom.
+        # Recover an older crashed wrap even when new project settings writes
+        # are disabled. The marker records the prior value to restore; without
+        # one, default wraps leave project settings untouched (#1599).
         _settings_vertex[0] = bool(use_vertex)
         _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
-        # _wrap_settings_path is bound before the try (above) so the finally is
-        # always safe; the value is unchanged here.
         _check_and_clear_stale_wrap_marker(
             _wrap_settings_path,
             key=_claude_wrap_base_url_env_key(
                 foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
             ),
         )
-        _saved_base_url[0] = _write_claude_wrap_base_url(
-            (
-                _foundry_proxy_url(proxy_url)
-                if _settings_foundry[0]
-                else env["ANTHROPIC_VERTEX_BASE_URL"]
-                if _settings_vertex[0]
-                else proxy_url
-            ),
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-            # The URL above is built from actual_port; stamping the requested
-            # port here made the marker/owner claim point at the wrong port
-            # whenever _ensure_proxy fell back to another one.
-            port=actual_port,
-        )
-        # Issue #2221: pair the marker just written with a reader. wrap installs
-        # no hook of its own, so a session that only ran `wrap` (never `init`)
-        # had nothing to clear a dead-proxy base_url. SessionStart-only.
-        _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        if _claude_project_settings_enabled(project_settings):
+            _saved_base_url[0] = _write_claude_wrap_base_url(
+                (
+                    _foundry_proxy_url(proxy_url)
+                    if _settings_foundry[0]
+                    else env["ANTHROPIC_VERTEX_BASE_URL"]
+                    if _settings_vertex[0]
+                    else proxy_url
+                ),
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+                port=actual_port,
+            )
+            # Issue #2221: pair the marker just written with a reader. wrap installs
+            # no hook of its own, so a session that only ran `wrap` (never `init`)
+            # had nothing to clear a dead-proxy base_url. SessionStart-only.
+            _wrote_project_settings[0] = True
+            _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        elif verbose:
+            skip_reason = _claude_project_settings_skip_reason()
+            click.echo(
+                "  Skipping project-local Claude settings "
+                f"({skip_reason}); daemon-spawned workers may not inherit Headroom."
+            )
 
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
@@ -6298,11 +6353,12 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
-        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
-        _saved_tool_search[0] = _write_claude_wrap_tool_search(
-            _resolved_tool_search_value,
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+            _saved_tool_search[0] = _write_claude_wrap_tool_search(
+                _resolved_tool_search_value,
+                settings_path=_wrap_settings_path,
+            )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -6362,12 +6418,13 @@ def claude(
                 cast(str | None, _saved_tool_search[0]),
                 settings_path=_wrap_settings_path,
             )
-        _restore_claude_wrap_base_url(
-            _saved_base_url[0],
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _restore_claude_wrap_base_url(
+                _saved_base_url[0],
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+            )
         cleanup()
 
 

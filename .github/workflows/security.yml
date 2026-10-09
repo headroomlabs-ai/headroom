@@ -120,7 +120,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        language: [python, javascript-typescript, actions]
     steps:
       - uses: actions/checkout@v7
 
@@ -129,6 +129,12 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
+          # Test code never ships. Its alerts were all test idioms (asserting a
+          # URL appears in output, a fake server binding 0.0.0.0), so scanning
+          # it only buried the real findings.
+          config: |
+            paths-ignore:
+              - tests
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4
