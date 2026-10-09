@@ -30,6 +30,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
     extract_tags,
+    invalid_request_body_message,
     jitter_delay_ms,
     sanitize_forwarded_response_headers,
 )
@@ -39,6 +40,7 @@ from headroom.proxy.modes import is_cache_mode
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
+from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -3620,7 +3622,7 @@ class OpenAIHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "type": "invalid_request_error",
                         "code": "invalid_json",
                     }
@@ -4833,7 +4835,9 @@ class OpenAIHandlerMixin:
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
-                tokenizer.count_text(json.dumps(_th_tools_before, default=str))
+                tokenizer.count_text(
+                    json.dumps(without_deferral_flags(_th_tools_before), default=str)
+                )
                 if _th_tools_before
                 else 0
             )
@@ -4882,7 +4886,9 @@ class OpenAIHandlerMixin:
             except Exception:
                 logger.debug("turn-hook token re-count skipped", exc_info=True)
             _th_tok_after = (
-                tokenizer.count_text(json.dumps(_th_ctx.tools, default=str)) if _th_ctx.tools else 0
+                tokenizer.count_text(json.dumps(without_deferral_flags(_th_ctx.tools), default=str))
+                if _th_ctx.tools
+                else 0
             )
             _th_saved = max(0, _th_tok_before - _th_tok_after)
             if _th_saved > 0:
@@ -6026,7 +6032,7 @@ class OpenAIHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "type": "invalid_request_error",
                         "code": "invalid_json",
                     }
@@ -10647,7 +10653,7 @@ class OpenAIHandlerMixin:
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": f"Invalid request body: {e!s}"},
+                    content={"error": invalid_request_body_message(e)},
                 )
             messages = body.get("messages", [])
             _bypass_payload = {
