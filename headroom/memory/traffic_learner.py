@@ -125,17 +125,6 @@ class PatternCategory(str, Enum):
     ARCHITECTURE = "architecture"  # File structure, dependencies, conventions
 
 
-class AgentType(str, Enum):
-    """Supported coding agent types."""
-
-    CLAUDE = "claude"
-    CURSOR = "cursor"
-    CODEX = "codex"
-    AIDER = "aider"
-    GEMINI = "gemini"
-    UNKNOWN = "unknown"
-
-
 # =============================================================================
 # Extracted Pattern Model
 # =============================================================================
@@ -258,11 +247,6 @@ def _is_error(content: str) -> bool:
 # Tool Call Extractors
 # =============================================================================
 
-# Extract command from Bash tool calls
-_COMMAND_RE = re.compile(r"^(?:source\s+\S+\s*&&\s*)?(.+)", re.I)
-
-# Extract file paths
-_FILE_PATH_RE = re.compile(r"(?:/[\w./-]+(?:\.\w+)?)")
 
 # Extract package/module names from errors
 _MODULE_RE = re.compile(r"No module named ['\"]?(\w[\w.]*)['\"]?")
@@ -757,14 +741,6 @@ class TrafficLearner:
                 )
 
         return list(by_hash.values())
-
-    def get_learned_patterns(self) -> list[ExtractedPattern]:
-        """Return patterns from the in-memory accumulator.
-
-        Retained for backwards compatibility. Reads only the accumulator;
-        does not consult persisted rows. Use flush_to_file() for full data.
-        """
-        return [pattern for pattern, count in self._pattern_counts.values() if count >= 1]
 
     async def on_tool_result(
         self,
