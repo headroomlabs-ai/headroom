@@ -1616,7 +1616,8 @@ def store_kompress_in_ccr(original: str, compressed: str, original_tokens: int) 
                 strategy="kompress",
             )
         return cache_key
-    except Exception:
+    except Exception as e:
+        logger.warning("Kompress CCR store write failed; output is not retrievable: %s", e)
         return None
 
 

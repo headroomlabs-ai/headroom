@@ -200,6 +200,39 @@ def test_compact_lossless_never_raises_on_empty() -> None:
         assert compact_lossless("", kind) == ""
 
 
+def test_compact_lossless_logs_a_fold_that_raises(monkeypatch) -> None:
+    import logging
+
+    import headroom.transforms.lossless_compaction as lc
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    lc.logger.addHandler(handler)
+    try:
+        log = "worker 7 retrying connection to upstream\n" * 5
+        # A fold that works logs nothing.
+        assert compact_lossless(log, "log") != log
+        assert records == []
+
+        def _boom(_content: str) -> str:
+            raise RuntimeError("fold bug")
+
+        monkeypatch.setattr(lc, "collapse_runs", _boom)
+        assert compact_lossless(log, "log") == log
+    finally:
+        lc.logger.removeHandler(handler)
+
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "Lossless compaction (log) failed" in message
+    assert "fold bug" in message
+
+
 # --------------------------------------------------------------------------
 # End-to-end: ContentRouter(lossless=True) invariant
 # --------------------------------------------------------------------------

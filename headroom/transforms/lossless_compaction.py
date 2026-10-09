@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 
@@ -31,6 +32,8 @@ __all__ = [
     "diff_strip_index",
     "compact_lossless",
 ]
+
+logger = logging.getLogger(__name__)
 
 # ANSI CSI SGR (color/style) escape sequences: ESC [ ... m. Color is
 # non-semantic, so stripping it is a safe (one-way) lossless-of-meaning op.
@@ -533,6 +536,12 @@ def compact_lossless(content: str, kind: str) -> str:
             if expand_runs(unfold_repeated_blocks(candidate)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Lossless compaction (%s) failed on %d chars; leaving content as-is: %s",
+            kind,
+            len(content),
+            e,
+        )
         return content
     return content

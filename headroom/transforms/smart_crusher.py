@@ -1197,7 +1197,7 @@ class SmartCrusher(Transform):
                 ccr_hash,
             )
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug("CCR mirror: store.store() raised (%s)", e)
+            logger.warning("CCR mirror: store write failed for hash %s: %s", ccr_hash, e)
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent

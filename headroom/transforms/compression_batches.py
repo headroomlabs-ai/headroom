@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 
@@ -18,6 +19,8 @@ from .compression_units import (
 )
 from .content_router import RouterCompressionResult
 from .tag_protector import protect_tags, restore_tags
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_BATCH_BYTES = 2048
 DEFAULT_MAX_BATCH_UNITS = 16
@@ -254,7 +257,12 @@ def compress_batch_with_router(
             question=batch.entries[0].routed.unit.question,
             bias=batch.entries[0].routed.unit.bias,
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Batch compression failed; passing %d units through uncompressed: %s",
+            len(batch.entries),
+            e,
+        )
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
