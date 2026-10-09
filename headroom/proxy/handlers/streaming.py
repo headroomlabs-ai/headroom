@@ -2220,7 +2220,18 @@ class StreamingMixin:
                     # already reported by the backend is preserved untouched.
                     if event.event_type == "message_start" and not event.raw_sse:
                         msg_usage = event.data.setdefault("message", {}).setdefault("usage", {})
-                        if not msg_usage.get("input_tokens") and optimized_tokens > 0:
+                        # A zero with cache usage beside it is a real count: a
+                        # fully cached prompt bills only the cache buckets. Only
+                        # a bare zero is LiteLLM's unknown placeholder.
+                        _cached = any(
+                            isinstance(msg_usage.get(k), int) and msg_usage.get(k) > 0
+                            for k in ("cache_read_input_tokens", "cache_creation_input_tokens")
+                        )
+                        if (
+                            not msg_usage.get("input_tokens")
+                            and not _cached
+                            and optimized_tokens > 0
+                        ):
                             msg_usage["input_tokens"] = optimized_tokens
                             # The client-bound backfill is Headroom's estimate,
                             # not backend usage: never report it as billed.
