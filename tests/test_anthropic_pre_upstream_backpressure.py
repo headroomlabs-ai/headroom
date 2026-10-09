@@ -326,6 +326,34 @@ def _build_request(body: dict | bytes, headers: dict[str, str]) -> Request:
     return Request(scope, receive)
 
 
+def _build_disconnected_request(headers: dict[str, str]) -> Request:
+    """A request whose first ``receive()`` is ``http.disconnect``.
+
+    Starlette's ``Request.body()`` raises ``ClientDisconnect`` on that
+    message, which is the exact shape of a client aborting mid-body.
+    """
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/v1/messages",
+        "raw_path": b"/v1/messages",
+        "query_string": b"",
+        "headers": [
+            (key.lower().encode("utf-8"), value.encode("utf-8")) for key, value in headers.items()
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 443),
+    }
+    return Request(scope, receive)
+
+
 class _CapturingHandler(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.INFO)
@@ -403,6 +431,35 @@ def test_happy_path_single_request_negligible_wait(stage_log_capture):
     assert stages["pre_upstream_wait"] < 25.0, stages
     # Sanity: semaphore was released cleanly.
     assert sem._value == 2
+
+
+# --------------------------------------------------------------------------- #
+# Client aborts during the request-body read                                 #
+# --------------------------------------------------------------------------- #
+
+
+def test_client_disconnect_during_body_read_returns_499():
+    """A client abort mid-body is a 499, not an escaping ASGI exception.
+
+    Deleting the ``except ClientDisconnect`` branch makes this fail: the
+    exception propagates out of ``handle_anthropic_messages`` (no except
+    clause in the handler matches it) and reaches the ASGI server.
+    """
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        request = _build_disconnected_request({"authorization": "Bearer sk-ant-api-test"})
+
+        with _tokenizer_patch():
+            response = await handler.handle_anthropic_messages(request)
+
+        assert response.status_code == 499
+        payload = json.loads(response.body)
+        assert payload["error"]["type"] == "client_disconnected"
+        assert sem._value == 1
+
+    anyio.run(_run)
 
 
 # --------------------------------------------------------------------------- #

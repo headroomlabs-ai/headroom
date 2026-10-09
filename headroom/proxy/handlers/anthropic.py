@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from headroom.proxy.cost import CostTracker
 
 import httpx
+from starlette.requests import ClientDisconnect
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
@@ -1160,6 +1161,31 @@ class AnthropicHandlerMixin:
             try:
                 async with stage_timer.measure("read_request_json"):
                     body, original_body_bytes = await read_request_json_with_bytes(request)
+            except ClientDisconnect:
+                # The client hung up while we were still reading its body.
+                # Starlette raises ClientDisconnect from ``Request.body()``,
+                # and nothing in this handler's except ladder matches it, so
+                # it escapes all the way to the ASGI server and is logged as
+                # "Exception in ASGI application" with a traceback — a client
+                # abort reported as a proxy fault. Answer 499 (client closed
+                # request) instead so the abort is visible as what it is.
+                # (The pre-upstream semaphore is already released by the
+                # outer finally; this path only fixes the misclassification.)
+                logger.info(
+                    "[%s] client disconnected before Anthropic request body was read session_id=%s",
+                    request_id,
+                    trace_session_id,
+                )
+                return JSONResponse(
+                    status_code=499,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "client_disconnected",
+                            "message": "Client disconnected before request body was read.",
+                        },
+                    },
+                )
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
