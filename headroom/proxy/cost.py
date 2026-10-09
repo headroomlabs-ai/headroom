@@ -900,6 +900,12 @@ class CostTracker:
         self._tool_saved_write_1h_by_model: dict[str, float] = {}
         self._tool_saved_list_by_model: dict[str, float] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
+        # Of _tokens_sent_by_model: the part that is the provider's own billed
+        # count (the rest is Headroom's tokenizer estimate), and how many
+        # requests it came from. The licence usage report sends both so the
+        # cloud side can tell a billed figure from an estimate.
+        self._provider_tokens_sent_by_model: dict[str, int] = {}
+        self._provider_requests_by_model: dict[str, int] = {}
         # Completion tokens keyed by ``(model, long_context)`` — same reason as
         # the savings buckets: the >200k completion rate is a different number.
         self._output_tokens_by_tier: dict[tuple[str, bool], int] = {}
@@ -930,6 +936,8 @@ class CostTracker:
         self._tool_saved_write_1h_by_model.clear()
         self._tool_saved_list_by_model.clear()
         self._tokens_sent_by_model.clear()
+        self._provider_tokens_sent_by_model.clear()
+        self._provider_requests_by_model.clear()
         self._output_tokens_by_tier.clear()
         self._requests_by_model.clear()
         self._api_cache_read_by_model.clear()
@@ -1023,13 +1031,15 @@ class CostTracker:
         output_tokens: int = 0,
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
+        provider_reported: bool = False,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
         Args:
             model: Model name.
             tokens_saved: Tokens removed by compression (Headroom's count).
-            tokens_sent: Compressed message tokens sent (Headroom's count).
+            tokens_sent: Input tokens sent: the provider's billed count when
+                ``provider_reported``, else Headroom's local estimate.
             cache_read_tokens: Cache read tokens from API response usage.
             cache_write_tokens: Cache write tokens from API response usage.
             uncached_tokens: Non-cached input tokens from API response usage.
@@ -1047,6 +1057,8 @@ class CostTracker:
                 attributed. The dashboard's per-model "Tokens Saved" column
                 therefore showed compression only, while the headline above it
                 counted both.
+            provider_reported: True when ``tokens_sent`` is the provider's own
+                billed input (uncached + cache read + cache write).
         """
         # Post-guard invariant (all providers): Headroom never forwards a request
         # larger than the original (handlers revert any inflation before sending),
@@ -1134,6 +1146,13 @@ class CostTracker:
                 self._tool_saved_list_by_model.get(model, 0.0) + list_part
             )
         self._tokens_sent_by_model[model] = self._tokens_sent_by_model.get(model, 0) + tokens_sent
+        if provider_reported:
+            self._provider_tokens_sent_by_model[model] = (
+                self._provider_tokens_sent_by_model.get(model, 0) + tokens_sent
+            )
+            self._provider_requests_by_model[model] = (
+                self._provider_requests_by_model.get(model, 0) + 1
+            )
         okey = (model, long_context)
         self._output_tokens_by_tier[okey] = self._output_tokens_by_tier.get(okey, 0) + max(
             0, output_tokens
