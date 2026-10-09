@@ -421,3 +421,46 @@ def test_opencode_headroom_dependency_is_preserved_for_registry_installability(
     opencode_pkg = json.loads(temp_project["opencode_pkg"].read_text())
     assert opencode_pkg["version"] == "0.28.0"
     assert opencode_pkg["dependencies"]["headroom-ai"] == "^0.22.3"
+
+
+@pytest.mark.parametrize("plugin_only", [False, True])
+def test_version_sync_preserves_locked_dependencies_and_syncs_editable_root(
+    temp_project: dict[str, Path], plugin_only: bool
+) -> None:
+    root = temp_project["root"]
+    lock = root / "uv.lock"
+    before = """version = 1
+
+[[package]]
+name = "dependency"
+version = "0.5.25"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "headroom-ai"
+version = "0.5.25"
+source = { editable = "." }
+dependencies = [{ name = "dependency" }]
+"""
+    lock.write_text(before, encoding="utf-8", newline="\n")
+    args = [
+        sys.executable,
+        str(Path(__file__).parent.parent / "version-sync.py"),
+        "--root",
+        str(root),
+        "--version",
+        "0.7.0",
+    ]
+    if plugin_only:
+        args.append("--plugin-manifests-only")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    expected = (
+        before
+        if plugin_only
+        else before.replace(
+            'name = "headroom-ai"\nversion = "0.5.25"',
+            'name = "headroom-ai"\nversion = "0.7.0"',
+        )
+    )
+    assert lock.read_bytes() == expected.encode()

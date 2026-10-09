@@ -30,6 +30,7 @@ from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
     extract_tags,
+    invalid_request_body_message,
     jitter_delay_ms,
     sanitize_forwarded_response_headers,
 )
@@ -3624,7 +3625,7 @@ class OpenAIHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "type": "invalid_request_error",
                         "code": "invalid_json",
                     }
@@ -6049,7 +6050,7 @@ class OpenAIHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "type": "invalid_request_error",
                         "code": "invalid_json",
                     }
@@ -10670,7 +10671,7 @@ class OpenAIHandlerMixin:
             except (json.JSONDecodeError, ValueError) as e:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": f"Invalid request body: {e!s}"},
+                    content={"error": invalid_request_body_message(e)},
                 )
             messages = body.get("messages", [])
             _bypass_payload = {

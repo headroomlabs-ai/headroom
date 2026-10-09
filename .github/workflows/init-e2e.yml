@@ -31,6 +31,9 @@ concurrency:
   group: init-e2e-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 jobs:
   docker-init-e2e:
     runs-on: ubuntu-latest
