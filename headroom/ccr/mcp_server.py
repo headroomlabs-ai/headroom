@@ -32,7 +32,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 from headroom import paths as _paths
 from headroom import savings_ledger
@@ -111,13 +110,28 @@ def _proxy_auth_headers() -> dict[str, str] | None:
 _PROXY_RETRIEVAL_LOOPBACK_ONLY = "proxy_retrieval_loopback_only"
 
 
+def _is_hidden_route_404(response: Any) -> bool:
+    """True for the loopback guard's bare 404, not a store miss.
+
+    A miss carries the store's reason ("Entry not found ...", "Entry expired
+    ..."); the guard answers FastAPI's default ``Not Found`` so the route looks
+    absent. The proxy URL can't tell them apart: a reverse proxy or
+    port-forward may reach the proxy over loopback behind a public URL.
+    """
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return False
+    return bool(detail == "Not Found")
+
+
 def _proxy_retrieval_loopback_only_payload(proxy_url: str, hash_key: str) -> dict[str, Any]:
-    """A remote proxy's 404 on /v1/retrieve, which hides the route from non-loopback peers."""
+    """The proxy hid /v1/retrieve from this caller, which only loopback peers may use."""
     return {
         "error": (
-            f"Not found in proxy store at {proxy_url}. The proxy serves /v1/retrieve "
-            "to loopback callers only and answers 404 to any other caller, with or "
-            "without HEADROOM_PROXY_TOKEN."
+            f"The proxy at {proxy_url} did not serve /v1/retrieve to this caller. It "
+            "serves retrieval to loopback callers only and answers 404 to any other "
+            "caller, with or without HEADROOM_PROXY_TOKEN."
         ),
         "hash": hash_key,
         "status": _PROXY_RETRIEVAL_LOOPBACK_ONLY,
@@ -619,19 +633,13 @@ class HeadroomMCPServer:
         response = await self._http_client.post(url, json=payload)
 
         if response.status_code == 404:
-            if not self._proxy_is_loopback():
+            if _is_hidden_route_404(response):
                 return _proxy_retrieval_loopback_only_payload(self.proxy_url, hash_key)
             return {"error": "Not found in proxy store", "hash": hash_key}
 
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
-
-    def _proxy_is_loopback(self) -> bool:
-        # Imported here: the guard pulls in FastAPI, which only this miss path needs.
-        from headroom.proxy.loopback_guard import is_loopback_host
-
-        return is_loopback_host(urlparse(self.proxy_url).hostname)
 
     async def _probe_proxy_unreachable(self) -> dict[str, Any] | None:
         """Return explicit proxy-unreachable state when the configured proxy is down."""
