@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
-from headroom.proxy.project_context import with_project_prefix
 
 
 @dataclass(frozen=True)
@@ -24,6 +23,8 @@ def build_proxy_targets(port: int, project: str | None = None) -> CursorProxyTar
     base-URL prefix because Cursor cannot send custom headers; the proxy
     strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     return CursorProxyTargets(
         openai_base_url=with_project_prefix(codex_proxy_base_url(port), project),
         anthropic_base_url=with_project_prefix(claude_proxy_base_url(port), project),

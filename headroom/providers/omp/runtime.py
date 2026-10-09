@@ -23,7 +23,6 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from headroom.providers.claude import proxy_base_url as claude_proxy_base_url
-from headroom.proxy.project_context import with_project_prefix
 
 MANAGED_MARKER = "# managed by `headroom wrap omp`"
 _MANAGED_HEADER = (
@@ -59,6 +58,8 @@ def proxy_anthropic_base_url(port: int, project: str | None = None) -> str:
     (its docs show path-carrying Anthropic base URLs, e.g. the Cloudflare AI
     Gateway example), and the proxy strips the prefix on arrival.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     return with_project_prefix(claude_proxy_base_url(port), project)
 
 

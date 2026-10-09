@@ -7,7 +7,6 @@ import os
 from collections.abc import Mapping
 
 from headroom.providers.codex import proxy_base_url as codex_proxy_base_url
-from headroom.proxy.project_context import with_project_prefix
 
 
 def build_launch_env(
@@ -27,6 +26,8 @@ def build_launch_env(
     base-URL prefix because Vibe cannot send custom headers; the proxy
     strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     env = dict(environ or os.environ)
     # NOTE: With a persistent Headroom deployment (`headroom install`), the proxy
     # process captures its environment at startup. Vibe reads `MISTRAL_API_KEY`

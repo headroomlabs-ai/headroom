@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib.util
 import json
+import sys
+import types
 from dataclasses import dataclass
 
 import pytest
 from click.testing import CliRunner
 
 import headroom.cli.doctor as doctor_mod
+from headroom.cli import _diagnostics
 from headroom.cli.doctor import (
     DEFAULT_PROXY_PORT,
     FAIL,
@@ -945,6 +950,45 @@ class TestDoctorCommand:
         assert payload["port"] == 8787
         assert {c["name"] for c in payload["checks"]} >= {"proxy", "version", "budget"}
         assert all(c["status"] in ("pass", "warn", "fail", "skip") for c in payload["checks"])
+        assert {"runtime", "native", "capabilities", "capability_summary"} <= payload.keys()
+
+    def test_json_reports_missing_capability_with_install_hint(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        original_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name: str, *args, **kwargs):
+            if name == "fastapi":
+                return None
+            return original_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+        result = runner.invoke(main, ["doctor", "--json"])
+        payload = json.loads(result.output)
+        proxy = next(cap for cap in payload["capabilities"] if cap["feature"] == "proxy")
+        assert proxy["available"] is False
+        assert proxy["install"] == "pip install 'headroom-ai[proxy]'"
+
+    def test_human_report_shows_full_install_command(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        original_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name: str, *args, **kwargs):
+            if name == "fastapi":
+                return None
+            return original_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+        result = runner.invoke(main, ["doctor"])
+        assert "pip install 'headroom-ai[proxy]'" in result.output
+
+    def test_doctor_does_not_import_heavy_optional_modules(self, runner, isolated, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
+        monkeypatch.delitem(sys.modules, "fastapi", raising=False)
+        monkeypatch.delitem(sys.modules, "torch", raising=False)
+        result = runner.invoke(main, ["doctor", "--json"])
+        assert result.output
+        assert "fastapi" not in sys.modules
+        assert "torch" not in sys.modules
 
     def test_port_option_changes_probe_url(self, runner, isolated, monkeypatch):
         seen: list[str] = []
@@ -999,3 +1043,124 @@ class TestCostTrackerBudgetKeys:
         from headroom.proxy.cost import CostTracker
 
         assert CostTracker().stats()["budget_limit_usd"] is None
+
+
+def test_python_runtime_reports_unsupported_versions(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "version_info", (3, 9, 20))
+
+    result = _diagnostics.python_runtime()
+
+    assert result["supported"] is False
+    assert result["note"] == "Python 3.10+ is required"
+
+
+def test_native_core_reports_missing_when_spec_absent(monkeypatch) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    result = _diagnostics.native_core()
+
+    assert result["present"] is False
+    assert "reinstall the built wheel" in str(result["detail"])
+
+
+def test_native_core_reports_missing_when_find_spec_raises(monkeypatch) -> None:
+    def fail_find_spec(name: str):
+        raise ValueError(f"bad spec for {name}")
+
+    monkeypatch.setattr(importlib.util, "find_spec", fail_find_spec)
+
+    result = _diagnostics.native_core()
+
+    assert result["present"] is False
+    assert "missing: ValueError: bad spec for headroom._core" in str(result["detail"])
+
+
+def test_native_core_reports_broken_when_marker_missing(monkeypatch) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    fake_core = types.SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "headroom._core", fake_core)
+
+    result = _diagnostics.native_core()
+
+    assert result == {"present": False, "detail": "broken: headroom._core.hello() is missing"}
+
+
+def test_native_core_reports_broken_when_marker_raises(monkeypatch) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+
+    def fail_hello():
+        raise RuntimeError("marker failed")
+
+    fake_core = types.SimpleNamespace(hello=fail_hello)
+    monkeypatch.setitem(sys.modules, "headroom._core", fake_core)
+
+    result = _diagnostics.native_core()
+
+    assert result["present"] is False
+    assert "broken: RuntimeError: marker failed" in str(result["detail"])
+
+
+def test_native_core_reports_unexpected_marker(monkeypatch) -> None:
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object())
+    fake_core = types.SimpleNamespace(hello=lambda: "surprise")
+    monkeypatch.setitem(sys.modules, "headroom._core", fake_core)
+
+    result = _diagnostics.native_core()
+
+    assert result["present"] is False
+    assert "unexpected marker 'surprise'" in str(result["detail"])
+
+
+def test_capabilities_treats_probe_exceptions_as_missing(monkeypatch) -> None:
+    original_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args, **kwargs):
+        if name == "mcp":
+            raise ValueError("broken optional module spec")
+        return original_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    result = _diagnostics.capabilities()
+
+    mcp = next(cap for cap in result if cap["feature"] == "mcp")
+    assert mcp["available"] is False
+    assert mcp["probe_modules"] == ["mcp"]
+
+
+def test_headroom_version_falls_back_to_generated_version(monkeypatch) -> None:
+    original_import = builtins.__import__
+    fake_version = types.SimpleNamespace(__version__="1.2.3-test")
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "headroom.cli.main" and fromlist == ("get_version",):
+            raise ImportError("main unavailable")
+        if name == "headroom._version" and fromlist == ("__version__",):
+            return fake_version
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert _diagnostics.headroom_version() == "1.2.3-test"
+
+
+def test_headroom_version_returns_unknown_when_fallback_missing(monkeypatch) -> None:
+    original_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name in {"headroom.cli.main", "headroom._version"}:
+            raise ImportError(f"{name} unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert _diagnostics.headroom_version() == "unknown"
+
+
+def test_capability_summary_reports_runnable_surfaces() -> None:
+    caps = [
+        {"feature": "proxy", "available": True},
+        {"feature": "mcp", "available": True},
+    ]
+
+    assert _diagnostics.capability_summary(caps) == ["library", "wrap", "proxy", "mcp"]

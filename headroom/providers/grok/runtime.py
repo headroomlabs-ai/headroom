@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from headroom.proxy.project_context import with_project_prefix
-
 DEFAULT_API_URL = "https://api.x.ai"
 PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 
@@ -71,6 +69,8 @@ def build_launch_env(
     base-URL prefix because Grok cannot send custom attribution headers;
     the proxy strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     env = dict(environ or os.environ)
     base_url = with_project_prefix(proxy_base_url(port), project)
     env[PROXY_ENV_KEY] = base_url

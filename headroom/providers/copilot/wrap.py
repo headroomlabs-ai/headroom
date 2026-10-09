@@ -237,6 +237,8 @@ def build_launch_env(
     base-URL prefix because the Copilot CLI cannot send custom headers; the
     proxy strips it and attributes savings per project.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
     # charge of which keys to seed). The previous `environ or os.environ`

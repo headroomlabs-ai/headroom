@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from headroom.proxy.project_context import with_project_prefix
-
 SNOWFLAKE_ACCOUNT_ENV = "SNOWFLAKE_ACCOUNT"
 SNOWFLAKE_HOST_ENV = "SNOWFLAKE_HOST"
 _FALLBACK_API_URL = "https://app.snowflake.com"
@@ -46,6 +44,8 @@ def build_launch_env(
     *environ* with ``OPENAI_BASE_URL`` set to the local proxy endpoint.
     ``printed_lines`` is the ``KEY=VALUE`` form shown to the user on launch.
     """
+    from headroom.proxy.project_context import with_project_prefix
+
     env = dict(environ or os.environ)
     base_url = with_project_prefix(proxy_base_url(port), project)
     env["OPENAI_BASE_URL"] = base_url

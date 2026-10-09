@@ -223,7 +223,6 @@ from headroom.providers.zcode import (
 from headroom.providers.zcode import (
     upstream_to_proxy_urls as _zcode_upstream_to_urls,
 )
-from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
 
@@ -244,6 +243,12 @@ _COPILOT_SUBSCRIPTION_LAUNCH_SECRET_ENV_VARS = (
 def _scrub_copilot_proxy_seed_env(env: dict[str, str]) -> None:
     for key in _COPILOT_PROXY_SEED_ENV_VARS:
         env.pop(key, None)
+
+
+def _with_project_prefix(base_url: str, project: str | None) -> str:
+    from headroom.proxy.project_context import with_project_prefix
+
+    return with_project_prefix(base_url, project)
 
 
 def _scrub_copilot_subscription_launch_env(env: dict[str, str]) -> None:
