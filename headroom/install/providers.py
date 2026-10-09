@@ -192,7 +192,8 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
     except Exception as exc:
         if mutations:
             try:
-                revert_mutations(manifest)
+                revert_mutations(manifest, restore_backup=False)
+
             except Exception as rollback_exc:
                 raise RuntimeError(
                     f"mutation application failed: {exc}; rollback failed: {rollback_exc}"
@@ -202,7 +203,11 @@ def apply_mutations(manifest: DeploymentManifest) -> list[ManagedMutation]:
         raise
 
 
-def revert_mutations(manifest: DeploymentManifest) -> None:
+def revert_mutations(
+    manifest: DeploymentManifest,
+    *,
+    restore_backup: bool = True,
+) -> None:
     """Undo the stored mutations for a deployment."""
 
     if manifest.scope in {ConfigScope.USER.value, ConfigScope.SYSTEM.value}:
@@ -213,4 +218,4 @@ def revert_mutations(manifest: DeploymentManifest) -> None:
             _remove_unix_env_scope(shell_mutations)
 
     for mutation in manifest.mutations:
-        revert_provider_scope_mutation(manifest, mutation)
+        revert_provider_scope_mutation(manifest, mutation, restore_backup=restore_backup)

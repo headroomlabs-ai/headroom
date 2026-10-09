@@ -117,7 +117,7 @@ FEATURES: dict[str, FeatureSpec] = {
         name="read_maturation",
         available_in=RolloutChannel.BETA,
         legacy_env=("HEADROOM_READ_MATURATION",),
-        description="Hold-back Read maturation before provider cache entry.",
+        description="Hold-back Read maturation: compress a Read once its file quiesces.",
     ),
     "copilot_model_catalog": FeatureSpec(
         name="copilot_model_catalog",

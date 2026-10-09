@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -116,7 +117,14 @@ from headroom.providers.claude import (
 )
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    cleanup_codex_auth_helper,
+    codex_auth_helper_is_referenced,
+    codex_auth_helper_path,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom, retag_to_native
 from headroom.providers.copilot import (
     build_launch_env as _build_copilot_launch_env,
@@ -198,9 +206,14 @@ from headroom.providers.opencode.config import (
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
     inject_opencode_provider_config,
+    migrate_legacy_opencode_jsonc_backup,
     opencode_config_paths,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
+)
+from headroom.providers.opencode.runtime import (
+    opencode_major_version,
+    with_opencode_standalone,
 )
 from headroom.providers.wrap_registry import WRAP_TARGETS, WrapTarget
 from headroom.providers.wrap_registry import build_launch_env as _build_registry_launch_env
@@ -353,6 +366,7 @@ _AGENT_SAVINGS_WRAP_AGENTS = {
     "grok",
     "grok_build",
 }
+_CLAUDE_PROJECT_SETTINGS_ENV = "HEADROOM_CLAUDE_PROJECT_SETTINGS"
 
 # 1M context window for `wrap claude` (#1158). Claude Code only sends the
 # `context-1m` beta header — unlocking the 1M window for entitled subscription
@@ -1301,6 +1315,16 @@ def _foundry_proxy_url(proxy_url: str) -> str:
     return proxy_url.rstrip("/") + "/anthropic"
 
 
+def _claude_project_settings_enabled(project_settings: bool) -> bool:
+    """Return whether wrap claude should write project-local Claude settings."""
+    env_enabled = _env_bool_value(os.environ.get(_CLAUDE_PROJECT_SETTINGS_ENV, ""))
+    return project_settings or env_enabled
+
+
+def _claude_project_settings_skip_reason() -> str:
+    return f"use --project-settings or {_CLAUDE_PROJECT_SETTINGS_ENV}=1 to persist proxy routing"
+
+
 def _vertex_target_api_url_from_claude_env(proxy_url: str) -> str | None:
     """Return the Vertex upstream that the proxy should use for Claude Code."""
     explicit_target = os.environ.get("VERTEX_TARGET_API_URL", "").strip()
@@ -1387,9 +1411,9 @@ def _locked_file(lock_file: Any) -> Any:
             import msvcrt
 
             # msvcrt.locking operates on bytes from the current file position.
-            lock_file.seek(0)
-            if lock_file.read(1) == b"":
-                lock_file.seek(0)
+            # Reading the locked byte fails on Windows before a competing
+            # writer can enter the retry loop. Check metadata instead.
+            if os.fstat(lock_file.fileno()).st_size == 0:
                 lock_file.write(b"0")
                 lock_file.flush()
             lock_file.seek(0)
@@ -1715,16 +1739,41 @@ def _check_and_clear_stale_wrap_marker(settings_path: Path, *, key: str) -> str 
     Called before writing a fresh base_url entry so a crashed wrap session's
     leftover doesn't get treated as this session's own state to restore later.
     """
+    # Preserve the default no-marker path without creating lock artifacts.
     marker = _read_wrap_marker(settings_path)
     if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
         return None
-    previous = marker.get("previous")
-    click.echo(
-        f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
-        err=True,
-    )
-    _restore_claude_wrap_base_url(previous, settings_path=settings_path, _key_override=key)
-    return previous
+    with _wrap_settings_lock(settings_path):
+        marker = _read_wrap_marker(settings_path)
+        if marker is None or marker.get("key") != key or not _wrap_marker_is_stale(marker):
+            return None
+        port = marker.get("port")
+        if not isinstance(port, int) or isinstance(port, bool):
+            return None
+        expected_url = f"http://127.0.0.1:{port}"
+        if key == "ANTHROPIC_FOUNDRY_BASE_URL":
+            expected_url = _foundry_proxy_url(expected_url)
+        try:
+            settings = json.loads(_read_text(settings_path))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        env_settings = settings.get("env") if isinstance(settings, dict) else None
+        current_url = env_settings.get(key) if isinstance(env_settings, dict) else None
+        if current_url != expected_url:
+            # The user (or a newer session) has replaced the crashed writer's URL.
+            # Retire its stale marker without changing the current settings.
+            if _read_wrap_marker(settings_path) == marker:
+                _clear_wrap_marker(settings_path, key=key)
+            return None
+        previous = marker.get("previous")
+        click.echo(
+            f"headroom: clearing stale {key} left by crashed wrap session (pid {marker.get('pid')})",
+            err=True,
+        )
+        _restore_claude_wrap_base_url(
+            previous, settings_path=settings_path, _key_override=key, _lock_held=True
+        )
+        return previous
 
 
 def _check_and_clear_dead_wrap_marker(settings_path: Path, *, key: str) -> str | None:
@@ -2028,6 +2077,7 @@ def _restore_claude_wrap_base_url(
     _key_override: str | None = None,
     force: bool = False,
     dead_ports: frozenset[int] = frozenset(),
+    _lock_held: bool = False,
 ) -> None:
     """Restore (or remove) the env key written by _write_claude_wrap_base_url.
 
@@ -2043,11 +2093,13 @@ def _restore_claude_wrap_base_url(
     (``unwrap``), and ``dead_ports`` to name proxy ports already proven dead so
     holders that outlived their proxy stop counting as live.
     """
+    from contextlib import nullcontext
+
     path = settings_path or (Path.cwd() / ".claude" / "settings.local.json")
     key = _key_override or _claude_wrap_base_url_env_key(
         foundry_mode=foundry_mode, vertex_mode=vertex_mode
     )
-    with _wrap_settings_lock(path):
+    with nullcontext() if _lock_held else _wrap_settings_lock(path):
         # Another live wrap session in this project may still be using the key.
         # Restoring underneath it silently unroutes a running session -- traffic
         # bypasses the proxy with no error anywhere (#3205).
@@ -3532,13 +3584,11 @@ def _strip_codex_headroom_blocks(
         content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
-    # `wrap codex` may have written outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
+    # `wrap codex` may have written outside the marker block. Root only:
+    # [profiles.*] overrides are the user's.
+    from headroom.cli.init import _strip_codex_root_routing_orphans
+
+    content = _strip_codex_root_routing_orphans(content)
 
     # Remove an orphaned local-proxy provider structurally. Text-level table
     # matching cannot safely distinguish comments, multiline strings, and
@@ -3840,6 +3890,24 @@ def _apply_anthropic_upstream_pin_env(
     return target
 
 
+# Read by proxy's workspace_registry.resolve_registered_cwd() to look up
+# this session's registered cwd.
+_SESSION_TOKEN_HEADER_NAME = "X-Headroom-Session-Token"
+
+
+def _apply_session_token_header_env(env: dict[str, str], session_token: str) -> None:
+    """Inject X-Headroom-Session-Token into ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    Mirrors :func:`_apply_project_header_env`. No "user override wins" case
+    here -- the token is wrap-generated, not user-supplied.
+    """
+    if not session_token:
+        return
+    header_line = f"{_SESSION_TOKEN_HEADER_NAME}: {session_token}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}" if existing else header_line
+
+
 # Codex's own built-in providers plus Headroom's injected one — never treated
 # as a "custom upstream to preserve" by _detect_custom_codex_upstream_base_url.
 _CODEX_BUILTIN_PROVIDER_NAMES = frozenset({"openai", "anthropic", "azure", "headroom"})
@@ -4001,6 +4069,10 @@ def _inject_codex_provider_config(port: int) -> str | None:
     requires_openai_auth = (
         "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(config_dir / "auth.json") else ""
     )
+    try:
+        auth_config = build_codex_auth_config(config_dir / "auth.json", config_path=config_file)
+    except CodexAuthConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     # Per-project savings: Codex sends the X-Headroom-Project header only
     # when the mapped env var (HEADROOM_PROJECT, set by `headroom wrap
     # codex`) exists at Codex runtime. When a custom upstream was detected,
@@ -4016,6 +4088,7 @@ def _inject_codex_provider_config(port: int) -> str | None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         # Inline table keeps the key inside this section so
         # _strip_codex_headroom_blocks removes it with the rest of the block.
@@ -4117,7 +4190,8 @@ def _inject_codex_provider_config(port: int) -> str | None:
 
 
 def _restore_codex_provider_config() -> tuple[str, Path]:
-    """Undo ``_inject_codex_provider_config`` for the active Codex config file.
+    """Undo ``_inject_codex_provider_config`` (and ``headroom init codex``
+    routing) for the active Codex config file.
 
     Returns a tuple of ``(status, config_file)`` where status is one of:
 
@@ -4126,21 +4200,61 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     * ``"cleaned"``  — no backup existed, but the Headroom-managed block was
       found and stripped out (preserving surrounding user content).
     * ``"removed"``  — the config file only contained Headroom-managed
-      content (created by wrap) and has been deleted.
+      content (created by wrap or init) and has been deleted.
     * ``"noop"``     — nothing to undo; no Headroom marker and no backup.
     """
+    from headroom.cli.init import (
+        _CODEX_PROVIDER_MARKER_START,
+        _codex_init_provider_snapshot,
+        _strip_codex_init_block,
+    )
+
     config_file, backup_file = _codex_config_paths()
+    helper_auth_path = config_file.parent / "auth.json"
+    helper_path = codex_auth_helper_path(helper_auth_path, config_path=config_file)
 
     # Case 1: pre-wrap snapshot exists — restore it exactly.
     if backup_file.exists():
-        shutil.copy2(backup_file, config_file)
+        try:
+            helper_was_preexisting = (
+                codex_auth_helper_is_referenced(_read_text(backup_file), str(helper_path.resolve()))
+                is not False
+            )
+        except OSError:
+            # If the backup cannot be inspected, preserve the helper rather than
+            # risk deleting a file that predates this wrap.
+            helper_was_preexisting = True
+        # A snapshot taken after `headroom init codex` still carries init's
+        # routing block; restoring it verbatim would leave Codex pinned to the
+        # proxy while unwrap reports success (#3749). The snapshot is deleted
+        # only once the config is written, so a failed write can be retried.
+        snapshot = _read_text(backup_file)
+        if _CODEX_PROVIDER_MARKER_START in snapshot:
+            cleaned = _strip_codex_init_block(snapshot)
+            if not cleaned.strip():
+                config_file.unlink(missing_ok=True)
+                backup_file.unlink()
+                cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
+                return "removed", config_file
+            _write_text(config_file, cleaned)
+            # Init's helper may predate wrap but its only reference was just
+            # removed. Cleanup checks all retained providers before deleting it.
+            cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
+        else:
+            shutil.copy2(backup_file, config_file)
         backup_file.unlink()
+        if not helper_was_preexisting:
+            cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
         return "restored", config_file
 
     # Case 2: no backup, but config file exists and has markers — strip them.
     if config_file.exists():
         original = _read_text(config_file)
-        if _codex_config_has_headroom_markers(original):
+        has_init_block = _CODEX_PROVIDER_MARKER_START in original
+        if has_init_block or _codex_config_has_headroom_markers(original):
+            helper_was_referenced = codex_auth_helper_is_referenced(
+                original, str(helper_path.resolve())
+            )
             # Without a backup, only remove named MCP blocks when this file
             # also carries wrap-owned provider markers from a full wrap.
             remove_named_mcp = any(
@@ -4152,17 +4266,31 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
                     _CODEX_MCP_END,
                 )
             )
+            # `headroom init codex` writes its own routing block, and nothing else
+            # removes it (#3749). Strip it first so its markers go with its keys.
+            provider_snapshot = _codex_init_provider_snapshot(original) if has_init_block else None
+            content = (
+                _strip_codex_init_block(original, restore_provider=False)
+                if has_init_block
+                else original
+            )
             cleaned = _strip_codex_headroom_blocks(
-                original,
+                content,
                 remove_mcp=True,
                 remove_named_mcp=remove_named_mcp,
             )
+            if provider_snapshot is not None:
+                cleaned = cleaned.rstrip() + "\n\n" + provider_snapshot
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
                 config_file.unlink()
+                if helper_was_referenced is True:
+                    cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
                 return "removed", config_file
             _write_text(config_file, cleaned)
+            if helper_was_referenced is True:
+                cleanup_codex_auth_helper(helper_auth_path, config_path=config_file)
             return "cleaned", config_file
 
     # Nothing to undo.
@@ -5723,7 +5851,13 @@ def _ensure_proxy_unlocked(
             _warn_proxy_mode_mismatch(running_config)
         elif not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
-        elif vertex_api_url or clear_vertex_api_url or os.environ.get("HEADROOM_MODE"):
+        elif (
+            vertex_api_url
+            or clear_vertex_api_url
+            or os.environ.get("HEADROOM_MODE")
+            or os.environ.get("HEADROOM_MIN_TOKENS") is not None
+            or os.environ.get("HEADROOM_EXCLUDE_TOOLS") is not None
+        ):
             health_payload = helpers._query_proxy_health(port)
             running_config = helpers._proxy_health_config(health_payload)
             if running_config is None:
@@ -5795,11 +5929,19 @@ def _ensure_proxy(
 
 
 def _client_marker_path(port: int) -> Path:
-    """Path to this process's wrap-client marker for ``port``."""
+    """Path to this process's wrap-client marker for ``port``.
+
+    Mode 0700: markers carry ``cwd``/``session_token`` the proxy treats as
+    an authoritative binding, so only the invoking OS user may read them.
+    """
     from headroom import paths as _paths
 
     d = _paths.proxy_clients_dir(port)
     d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
     return d / f"{os.getpid()}.json"
 
 
@@ -5813,14 +5955,25 @@ def _proc_identity(pid: int) -> tuple[str, float] | None:
     return proc_identity(pid)
 
 
-def _register_proxy_client(port: int) -> None:
+def _register_proxy_client(port: int, *, session_token: str | None = None) -> None:
     """Register this wrap process as a live client of the shared proxy.
 
-    Best-effort: a failed write just means our marker is missing, and the
-    liveness pruning in :func:`_live_proxy_clients` is the real safety net.
+    Also records ``cwd`` (wrap is the coding-agent CLI's real blocking
+    parent, so this is authoritative) and, if given, ``session_token`` --
+    also injected into the wrapped CLI's headers so the proxy can resolve
+    which registered cwd a request belongs to.
+
+    Best-effort: a failed write just means our marker is missing, and
+    :func:`_live_proxy_clients`'s liveness pruning is the real safety net.
     """
     try:
-        payload: dict[str, Any] = {"pid": os.getpid(), "started_at": time.time()}
+        payload: dict[str, Any] = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+            "cwd": os.getcwd(),
+        }
+        if session_token:
+            payload["session_token"] = session_token
         ident = _proc_identity(os.getpid())
         if ident is not None:
             payload["start_src"], payload["start_time"] = ident
@@ -6416,6 +6569,16 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
+    "--project-settings",
+    "--project-settings-injection",
+    "project_settings",
+    is_flag=True,
+    help=(
+        "Write .claude/settings.local.json so daemon-spawned Claude workers inherit "
+        "Headroom routing. Env: HEADROOM_CLAUDE_PROJECT_SETTINGS=1."
+    ),
+)
+@click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
 )
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
@@ -6466,6 +6629,7 @@ def claude(
     no_serena: bool,
     code_graph: bool,
     no_proxy: bool,
+    project_settings: bool,
     learn: bool,
     memory: bool,
     tool_search: str | None,
@@ -6489,6 +6653,7 @@ def claude(
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
+        headroom wrap claude --project-settings # Persist proxy routing in .claude/settings.local.json
         headroom wrap claude --code-memory none # No code-memory MCP
         headroom wrap claude --code-memory-scope user  # Serena in every session, not just here
         headroom wrap claude --1m               # Preserve the 1M context window
@@ -6511,6 +6676,7 @@ def claude(
     _tool_search_not_written = object()
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
+    _wrote_project_settings: list[bool] = [False]
     port_holder: list[int] = [port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
@@ -6618,7 +6784,10 @@ def claude(
 
         upstream_for_proxy = foundry_upstream or custom_upstream
 
-        _register_proxy_client(port)
+        # One token for the whole session -- written into the marker below
+        # and, further down, into the header the wrapped CLI sends.
+        _session_token = secrets.token_urlsafe(32)
+        _register_proxy_client(port, session_token=_session_token)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
             no_proxy,
@@ -6634,7 +6803,7 @@ def claude(
         )
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
 
@@ -6735,43 +6904,48 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
-        # Issue #951: write to settings.json so daemon-spawned conversation
-        # workers (which read settings.json fresh rather than inheriting the
-        # daemon's environment) also route through Headroom.
+        # Recover an older crashed wrap even when new project settings writes
+        # are disabled. The marker records the prior value to restore; without
+        # one, default wraps leave project settings untouched (#1599).
         _settings_vertex[0] = bool(use_vertex)
         _settings_foundry[0] = bool(foundry_upstream) and not _settings_vertex[0]
-        # _wrap_settings_path is bound before the try (above) so the finally is
-        # always safe; the value is unchanged here.
         _check_and_clear_stale_wrap_marker(
             _wrap_settings_path,
             key=_claude_wrap_base_url_env_key(
                 foundry_mode=_settings_foundry[0], vertex_mode=_settings_vertex[0]
             ),
         )
-        _saved_base_url[0] = _write_claude_wrap_base_url(
-            (
-                _foundry_proxy_url(proxy_url)
-                if _settings_foundry[0]
-                else env["ANTHROPIC_VERTEX_BASE_URL"]
-                if _settings_vertex[0]
-                else proxy_url
-            ),
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-            # The URL above is built from actual_port; stamping the requested
-            # port here made the marker/owner claim point at the wrong port
-            # whenever _ensure_proxy fell back to another one.
-            port=actual_port,
-        )
-        # Issue #2221: pair the marker just written with a reader. wrap installs
-        # no hook of its own, so a session that only ran `wrap` (never `init`)
-        # had nothing to clear a dead-proxy base_url. SessionStart-only.
-        _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        if _claude_project_settings_enabled(project_settings):
+            _saved_base_url[0] = _write_claude_wrap_base_url(
+                (
+                    _foundry_proxy_url(proxy_url)
+                    if _settings_foundry[0]
+                    else env["ANTHROPIC_VERTEX_BASE_URL"]
+                    if _settings_vertex[0]
+                    else proxy_url
+                ),
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+                port=actual_port,
+            )
+            # Issue #2221: pair the marker just written with a reader. wrap installs
+            # no hook of its own, so a session that only ran `wrap` (never `init`)
+            # had nothing to clear a dead-proxy base_url. SessionStart-only.
+            _wrote_project_settings[0] = True
+            _ensure_claude_wrap_selfheal_hook(_wrap_settings_path)
+        elif verbose:
+            skip_reason = _claude_project_settings_skip_reason()
+            click.echo(
+                "  Skipping project-local Claude settings "
+                f"({skip_reason}); daemon-spawned workers may not inherit Headroom."
+            )
 
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+        # Same token written into the marker above.
+        _apply_session_token_header_env(env, _session_token)
 
         # Sharing a Copilot-pinned proxy (the CLI + VS Code central proxy) is
         # only safe once this client's own upstream is pinned per request.
@@ -6789,11 +6963,12 @@ def claude(
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
-        _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
-        _saved_tool_search[0] = _write_claude_wrap_tool_search(
-            _resolved_tool_search_value,
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _resolved_tool_search_value = env.get(_TOOL_SEARCH_ENV, "")
+            _saved_tool_search[0] = _write_claude_wrap_tool_search(
+                _resolved_tool_search_value,
+                settings_path=_wrap_settings_path,
+            )
         if _tool_search_value is not None:
             # Describe what the written value actually does: --tool-search
             # false/0/no/off turns deferral OFF, and the banner must say so
@@ -6853,12 +7028,13 @@ def claude(
                 cast(str | None, _saved_tool_search[0]),
                 settings_path=_wrap_settings_path,
             )
-        _restore_claude_wrap_base_url(
-            _saved_base_url[0],
-            foundry_mode=_settings_foundry[0],
-            vertex_mode=_settings_vertex[0],
-            settings_path=_wrap_settings_path,
-        )
+        if _wrote_project_settings[0]:
+            _restore_claude_wrap_base_url(
+                _saved_base_url[0],
+                foundry_mode=_settings_foundry[0],
+                vertex_mode=_settings_vertex[0],
+                settings_path=_wrap_settings_path,
+            )
         cleanup()
 
 
@@ -9373,6 +9549,8 @@ def opencode(
     Sets OPENCODE_CONFIG_CONTENT to route all OpenCode API calls through
     Headroom. Configures a headroom provider via @ai-sdk/openai-compatible.
     Also sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL as fallbacks.
+    On OpenCode 2.x, adds --standalone (unless --server is given) so a private
+    server loads that config instead of a running background service.
 
     \b
     Examples:
@@ -9487,7 +9665,11 @@ def opencode(
     # Register our proxy client marker BEFORE _ensure_proxy so that another
     # wrapper's cleanup sees us as an active client and doesn't terminate a
     # shared proxy during the startup gap.
-    _register_proxy_client(port)
+    #
+    # Mirrors claude()'s token minting; only reaches OpenCode when the
+    # plugin layer is loaded (see build_launch_env).
+    _session_token = secrets.token_urlsafe(32)
+    _register_proxy_client(port, session_token=_session_token)
 
     # Resolve port before config injection so the provider block and MCP
     # URL both point at the port the proxy will actually be on.
@@ -9520,7 +9702,7 @@ def opencode(
         # cleanup tracking stays accurate and update MCP config.
         if actual_port != port:
             _unregister_proxy_client(port)
-            _register_proxy_client(actual_port)
+            _register_proxy_client(actual_port, session_token=_session_token)
             if not no_mcp:
                 from headroom.mcp_registry import OpencodeRegistrar
 
@@ -9530,7 +9712,11 @@ def opencode(
         if subscription_resolution is not None:
             _scrub_copilot_subscription_launch_env(launch_environ)
         env, env_vars_display = _build_opencode_launch_env(
-            actual_port, launch_environ, project=_project_name_from_cwd(), include_mcp=not no_mcp
+            actual_port,
+            launch_environ,
+            project=_project_name_from_cwd(),
+            include_mcp=not no_mcp,
+            session_token=_session_token,
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.
@@ -9541,13 +9727,19 @@ def opencode(
                 os.environ.get("USER", os.environ.get("USERNAME", "default")),
             )
 
+        # OpenCode 2.x otherwise attaches to an already-running background
+        # service that never sees this launch's OPENCODE_CONFIG_CONTENT.
+        launch_args = with_opencode_standalone(opencode_args, opencode_major_version(opencode_bin))
+        if verbose and launch_args != tuple(opencode_args):
+            click.echo("  OpenCode 2.x: adding --standalone so it loads Headroom's config")
+
         # Proxy already started by _ensure_proxy above; tell _launch_tool to
         # skip duplicate startup.
         launch_started = True
         try:
             _launch_tool(
                 binary=opencode_bin,
-                args=opencode_args,
+                args=launch_args,
                 env=env,
                 port=actual_port,
                 no_proxy=True,
@@ -9621,6 +9813,7 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
     click.echo()
 
     config_file, backup_file = opencode_config_paths()
+    migrate_legacy_opencode_jsonc_backup(config_file, backup_file)
 
     if backup_file.exists():
         try:
@@ -9800,7 +9993,7 @@ def unwrap_grok_build(port: int, no_stop_proxy: bool) -> None:
 )
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
-    """Undo ``headroom wrap codex`` edits to the active Codex config file.
+    """Undo ``headroom wrap codex`` and ``headroom init codex`` routing in the Codex config.
 
     Behaviour:
 
@@ -10076,12 +10269,49 @@ def unwrap_zcode(port: int, no_stop_proxy: bool) -> None:
 
 
 def _warn_proxy_mode_mismatch(running_config: dict[str, Any] | None) -> None:
-    """Warn when a reused proxy runs a different mode than this session asked for.
+    """Warn when reuse ignores this session's startup-only settings.
 
-    Mode is fixed at proxy startup, so a requested HEADROOM_MODE (explicit, or
-    a wrap target's default_mode) is silently ignored on reuse. Warning-only:
-    other clients may be attached to the running proxy.
+    Do not restart a shared proxy: other clients may be attached to it.
     """
+    config = running_config or {}
+    mismatches: list[str] = []
+    requested_min = os.environ.get("HEADROOM_MIN_TOKENS")
+    running_min = config.get("min_tokens_to_crush")
+    if requested_min is not None and isinstance(running_min, int):
+        try:
+            requested_min_value = int(requested_min)
+        except ValueError:
+            requested_min_value = None
+        if requested_min_value is not None and requested_min_value != running_min:
+            mismatches.append(f"HEADROOM_MIN_TOKENS={requested_min_value} (running: {running_min})")
+
+    requested_excludes = os.environ.get("HEADROOM_EXCLUDE_TOOLS")
+    running_excludes = config.get("exclude_tools")
+    if (
+        requested_excludes is not None
+        and isinstance(running_excludes, list)
+        and all(isinstance(name, str) for name in running_excludes)
+    ):
+        from headroom.config import DEFAULT_EXCLUDE_TOOLS
+
+        defaults = {name.lower() for name in DEFAULT_EXCLUDE_TOOLS}
+        requested_names = {
+            name.strip().lower() for name in requested_excludes.split(",") if name.strip()
+        }
+        running_names = {name.lower() for name in running_excludes}
+        if requested_names | defaults != running_names | defaults:
+            mismatches.append(
+                f"HEADROOM_EXCLUDE_TOOLS={sorted(requested_names)!r} "
+                f"(running: {sorted(running_names)!r})"
+            )
+
+    if mismatches:
+        click.echo(
+            "  Warning: this session requested "
+            + "; ".join(mismatches)
+            + ", but those settings are fixed at proxy startup. "
+            "Restart the proxy, or use --port for a separate one."
+        )
     requested = os.environ.get("HEADROOM_MODE")
     running = (running_config or {}).get("mode")
     if not requested or not isinstance(running, str):
