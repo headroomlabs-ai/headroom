@@ -630,7 +630,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # together off the event loop (#18) so a slow flush can't stall it.
             output_tokens_saved_est = await asyncio.to_thread(_record_and_estimate)
         except Exception:  # pragma: no cover - defensive
-            pass
+            logger.debug(
+                "Output savings record/estimate failed for request %s; booking 0",
+                outcome.request_id,
+                exc_info=True,
+            )
 
     # Project attribution: explicit outcome field wins, else the value the
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.

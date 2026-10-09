@@ -3201,12 +3201,22 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # that construct the app without going through the `headroom` CLI entrypoint
     # (which already applies them before Click parsing). setdefault keeps
     # explicit env exports authoritative; fail-open so it never blocks startup.
+    # settings_store.load() already reports an unreadable or corrupt file; this
+    # catches anything else that goes wrong while applying it.
+    settings_file: object = "the saved settings file"
     try:
+        from headroom import paths as _hr_paths
         from headroom import settings_store
 
+        settings_file = _hr_paths.settings_path()
         settings_store.apply_to_environ(settings_store.load())
     except Exception:  # noqa: BLE001 — settings load must never break startup
-        pass
+        logger.warning(
+            "Could not apply saved settings from %s; continuing with env and defaults. "
+            "Fix or remove that file and restart the proxy.",
+            settings_file,
+            exc_info=True,
+        )
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -4221,7 +4231,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     status_code=response.status_code,
                 )
         except Exception:
-            logger.debug("admin audit emission failed", exc_info=True)
+            logger.warning(
+                "Admin audit record not written for %s %s; this request is missing from "
+                "the headroom.audit trail. Report this with the traceback.",
+                request.method,
+                request.url.path,
+                exc_info=True,
+            )
         return response
 
     # The gate above is http-only (BaseHTTPMiddleware ignores every other
@@ -5067,7 +5083,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _oest = get_recorder().estimate(_olevel)
             output_reduction = _output_reduction_payload(_shaper_active, _oest)
         except Exception:  # pragma: no cover - defensive
-            pass
+            logger.debug("/stats output_reduction section failed", exc_info=True)
 
         # Model-routing section: populated only when an extension registered a
         # routing-stats provider (headroom.proxy.routing_stats); None otherwise.

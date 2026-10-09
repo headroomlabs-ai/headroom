@@ -26,7 +26,14 @@ name to :data:`TOOL_SCHEMA_SAVINGS_TAGS` and every surface picks it up.
 from __future__ import annotations
 
 import copy
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# True once a reconcile failure has been warned about; later ones go to debug
+# so a failure that repeats on every request does not flood the log.
+_reconcile_failure_warned = False
 
 
 def without_deferral_flags(tools: object) -> object:
@@ -129,6 +136,17 @@ def reconcile_deferred_tokens(
         if isinstance(entry, dict):
             entry["tokens"] = max(0, int(entry.get("tokens") or 0) - released)
     except Exception:  # accounting must never break a request
+        global _reconcile_failure_warned
+        level = logging.DEBUG if _reconcile_failure_warned else logging.WARNING
+        _reconcile_failure_warned = True
+        logger.log(
+            level,
+            "tool-schema deferral reconcile failed; credit left at %d booked tokens, so "
+            "/stats over-reports tool-search savings for this request. Report this with "
+            "the traceback.",
+            booked,
+            exc_info=True,
+        )
         return
 
 

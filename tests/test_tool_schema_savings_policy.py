@@ -140,3 +140,43 @@ def test_tool_schema_compaction_saves_real_tokens_not_just_bytes() -> None:
     assert tokens_saved == tool_before - tool_after
     assert original_tokens - optimized_tokens == tokens_saved
     assert headline_tokens_saved(tokens_saved, {}) == tokens_saved
+
+
+def test_reconcile_failure_is_logged_warning_once_then_debug() -> None:
+    import logging
+
+    from headroom.proxy import tool_schema_savings_policy as policy
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    def _broken_count(tools: object) -> int:
+        raise RuntimeError("tokenizer exploded")
+
+    tool = {"name": "Read", "defer_loading": True, "description": "x"}
+    tags = {"tool_search_deferred_tokens": 100}
+    booking = (100, {"Read": dict(tool)}, None)
+
+    handler = _Capture(level=logging.DEBUG)
+    policy.logger.addHandler(handler)
+    old_level = policy.logger.level
+    policy.logger.setLevel(logging.DEBUG)
+    policy._reconcile_failure_warned = False
+    try:
+        # A healthy reconcile logs nothing.
+        policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], lambda t: 10)
+        assert records == []
+
+        policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], _broken_count)
+        policy.reconcile_deferred_tokens(dict(tags), booking, [dict(tool)], _broken_count)
+    finally:
+        policy.logger.removeHandler(handler)
+        policy.logger.setLevel(old_level)
+        policy._reconcile_failure_warned = False
+
+    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
+    assert "100 booked tokens" in records[0].getMessage()
+    assert records[0].exc_info is not None
