@@ -22,7 +22,11 @@ from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.compression_decision import CompressionDecision
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    extract_tags,
+    invalid_request_body_message,
+)
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.rate_limit_identity import rate_limit_identity
@@ -367,7 +371,7 @@ class GeminiHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
@@ -1144,7 +1148,7 @@ class GeminiHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
@@ -1372,7 +1376,7 @@ class GeminiHandlerMixin:
                 status_code=400,
                 content={
                     "error": {
-                        "message": f"Invalid request body: {e!s}",
+                        "message": invalid_request_body_message(e),
                         "code": 400,
                     }
                 },
