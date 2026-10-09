@@ -450,6 +450,34 @@ def test_outcome_recorded_with_bedrock_provider():
     assert outcome.tokens_saved == 750
 
 
+@pytest.mark.parametrize("upstream_status", [400, 403, 429, 500, 503])
+def test_outcome_carries_real_upstream_status_on_error(upstream_status):
+    """Regression: handle_bedrock_invoke built RequestOutcome without a
+    status_code kwarg, so an upstream throttle/auth/model error recorded as
+    the dataclass default of 200 — the failed turn then fed the success
+    funnel (savings/cost/request-log) in emit_request_outcome instead of
+    being short-circuited by its `status_code >= 400` guard."""
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_fake_client(
+            proxy, _FakeUpstream(status_code=upstream_status, chunks=(b'{"error":true}',))
+        )
+        proxy._record_request_outcome = AsyncMock()
+        proxy.anthropic_pipeline.apply = MagicMock(
+            return_value=_FakeResult([{"role": "user", "content": "c"}], 1000, 250)
+        )
+        resp = client.post(
+            INVOKE,
+            json={"messages": [{"role": "user", "content": "q" * 3000}], "max_tokens": 8},
+        )
+
+    assert resp.status_code == upstream_status
+    assert proxy._record_request_outcome.await_count == 1
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert outcome.status_code == upstream_status
+
+
 # ── env config path ───────────────────────────────────────────────────
 
 

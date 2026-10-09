@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.39.1"
+version = "0.40.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -84,14 +84,16 @@ proxy = [
     # The server still uses the v1 low-level Server decorator API. Keep this
     # cap until the SDK 2.x port lands (GH #2658 / regression GH #2977).
     "mcp>=1.28.1,<2.0.0",         # MCP server (headroom_compress, retrieve, stats)
-    "magika>=0.6.0",              # ML content detection for ContentRouter
+    "magika>=0.6.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'", # ML detection needs ORT wheels
     "zstandard>=0.20.0",          # Decompress zstd request bodies (Codex, etc.)
     "websockets>=13.0",           # WebSocket proxy for /v1/responses (Codex gpt-5.4+)
-    # Rust fastembed enables ORT C API 24. ORT <1.24 deadlocks instead of
-    # returning an initialization error; 1.24+ no longer ships Python 3.10
-    # wheels, so 3.10 keeps Python-only ORT and bypasses native detection.
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    # ORT <1.24 deadlocks in Rust fastembed instead of returning an init error.
+    # Python 3.10 keeps Python-only ORT and bypasses native detection. Intel
+    # macOS also needs older ORT because newer releases have no x86_64 wheels.
+    # No ORT wheel exists for Intel macOS Python 3.14+; optional ML detection
+    # falls back to heuristics there. Transitive ORT backends use the same gate.
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (python_version<'3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",   # Tokenizer only (for Kompress)
     # File watcher for live code graph reindexing (--code-graph). watchdog 6.0.0
     # publishes no macOS wheel for Python 3.14, so installing it there needs a C
@@ -167,7 +169,7 @@ pytorch-mps = [
 # Stage 3c.1 — fastembed is faster (~2-3x), smaller (no torch
 # dependency), and outranks all-MiniLM-L6-v2 on MTEB by ~6 points.
 relevance = [
-    "fastembed>=0.4.0",
+    "fastembed>=0.4.0; python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
@@ -193,8 +195,8 @@ image = [
     # declare requires-python<3.13). Use the successor `rapidocr` 3.x
     # core + `onnxruntime` engine; same ORT backend, just split into
     # two packages. Total install size and inference speed unchanged.
-    "rapidocr>=3.0,<4; python_version>='3.13'",
-    "onnxruntime>=1.7,<2; python_version>='3.13'",
+    "rapidocr>=3.0,<4; python_version>='3.13' and (python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.7,<2; python_version>='3.13' and (python_version<'3.14' or sys_platform != 'darwin' or platform_machine != 'x86_64')",
 ]
 # Report generation
 reports = [
@@ -252,8 +254,8 @@ mcp = [
 ]
 # Voice filler detection
 voice = [
-    "onnxruntime>=1.24.0; python_version>='3.11'",
-    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11'",
+    "onnxruntime>=1.24.0; python_version>='3.11' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
+    "onnxruntime>=1.16.0,<1.24.0; python_version<'3.11' or (python_version<'3.14' and sys_platform == 'darwin' and platform_machine == 'x86_64')",
     "transformers>=5.5.0,<6.0",
     "torch>=2.12.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
 ]

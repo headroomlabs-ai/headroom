@@ -370,6 +370,14 @@ class BedrockHandlerMixin:
         # contract treats 0 as "not measured") — Bedrock responses are forwarded
         # byte-faithfully and never parsed. The valuable figure, request-side
         # compression, is recorded in full.
+        #
+        # status_code=response.status_code: unlike streaming.py's SDK-based
+        # _stream_response_bedrock (which never holds an HTTP response object
+        # and so keeps the dataclass default of 200 — see PR #2682), this
+        # handler forwards via raw httpx and always has the real upstream
+        # status on the returned Response/StreamingResponse. Leaving it out
+        # here made every upstream 4xx/5xx (throttling, auth failure, model
+        # not found) record as a 200 success in the savings/cost funnel.
         try:
             from headroom.proxy.outcome import RequestOutcome
 
@@ -388,6 +396,7 @@ class BedrockHandlerMixin:
                     pipeline_timing=pipeline_timing,
                     tags=tags,
                     client=client,
+                    status_code=response.status_code,
                 )
             )
         except Exception:

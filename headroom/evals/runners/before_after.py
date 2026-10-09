@@ -25,6 +25,7 @@ from headroom.evals.core import (
     EvalSuiteResult,
 )
 from headroom.evals.metrics import compute_semantic_similarity
+from headroom.offline import guard_egress
 from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
 from headroom.transforms.smart_crusher import SmartCrusherConfig
 
@@ -95,8 +96,13 @@ class BeforeAfterRunner:
         self._judge_fn: Any = None
 
     def _init_llm_client(self) -> Any:
-        """Initialize the appropriate LLM client."""
+        """Initialize the appropriate LLM client.
+
+        Ollama is not guarded: like the Ollama embedder it is an
+        operator-configured endpoint that defaults to localhost.
+        """
         if self.llm_config.provider == "anthropic":
+            guard_egress("anthropic API for the before/after eval runner")
             try:
                 import anthropic
 
@@ -106,6 +112,7 @@ class BeforeAfterRunner:
                     "anthropic package required. Install with: pip install anthropic"
                 ) from e
         elif self.llm_config.provider == "openai":
+            guard_egress("openai API for the before/after eval runner")
             try:
                 import openai
 
@@ -128,6 +135,10 @@ class BeforeAfterRunner:
 
     def _init_proxy_client(self) -> Any:
         """Initialize an OpenAI client pointing at the Headroom proxy."""
+        guard_egress(
+            "LLM calls through the Headroom proxy for the before/after eval runner",
+            self.llm_config.headroom_proxy_url,
+        )
         import openai
 
         return openai.OpenAI(

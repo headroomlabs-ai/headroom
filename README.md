@@ -16,6 +16,7 @@
 
 <p>
   <b><a href="https://docs.headroomlabs.ai/docs/quickstart">Quickstart</a></b> ·
+  <b><a href="#headroom-for-teams">Headroom for Teams</a></b> ·
   <a href="#get-started-60-seconds">Install</a> ·
   <a href="#proof">Proof</a> ·
   <a href="#agent-compatibility">Agents</a> ·
@@ -36,6 +37,10 @@ Headroom compresses everything your AI agent reads — tool outputs, logs, RAG
 chunks, files, and conversation history — before it reaches the LLM. Same
 answers, fraction of the tokens. Compression runs on your machine; no prompt or
 file content is sent anywhere to be compressed.
+
+<p align="center">
+  <a href="https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=banner"><img src=".github/assets/enterprise-perk.svg" alt="Headroom Enterprise for teams: 3 months free with a 12-month plan. Claim the perk." width="880"></a>
+</p>
 
 <div align="center">
   <img src="HeadroomDemo-Fast.gif" alt="Headroom compressing a 10,144 token log dump to 1,260 tokens while preserving the FATAL line" width="820">
@@ -206,8 +211,13 @@ picks the level:
 
 ```bash
 headroom learn --verbosity            # dry run — preview what it found
-headroom learn --verbosity --apply    # save it; the proxy picks it up
+headroom learn --verbosity --apply    # save it and apply it to the running proxy
 ```
+
+A proxy in cache mode (the default) never re-reads the learned level, because a
+level that changes mid-conversation would bust the prompt cache. There `--apply`
+pins it with `HEADROOM_VERBOSITY_LEVEL`; set that variable yourself to keep it
+after a restart.
 
 **Measuring it.** Output savings are counterfactual — we never see what the model
 *would* have written — so Headroom reports an estimate with a confidence range
@@ -236,7 +246,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Copilot CLI | ✅ | starts proxy + launches |
 | VS Code Copilot | ✅ | transparent proxy; keeps the selected model |
 | OpenClaw | ✅ | installs as a ContextEngine plugin |
-| OpenCode | ✅ | injects config · starts proxy + launches |
+| OpenCode | ✅ | injects config · starts proxy + launches [^third-party-upstream] |
 | Cline | ✅ | starts proxy + injects config |
 | Continue | ✅ | starts proxy + injects config |
 | Goose | ✅ | starts proxy + launches |
@@ -246,6 +256,8 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
+
+[^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](docs/content/docs/opencode-deepseek.mdx).
 
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
@@ -613,26 +625,30 @@ regresses a compression ratio across real workloads rather than only our own tes
 corpus.
 
 Turn it off with `HEADROOM_BEACON=off`, the `DO_NOT_TRACK=1` convention, or
-`--offline`. The full field list is in
+`HEADROOM_OFFLINE=1`. The full field list is in
 [the proxy docs](https://docs.headroomlabs.ai/docs/proxy).
 
 ## Headroom for teams
 
-Headroom OSS is built for individual developers: run `headroom proxy` or
-`headroom wrap` on your laptop and start cutting tokens in minutes, free and
-local-first.
+Headroom OSS is built for one developer on one laptop. Headroom Enterprise is built
+for the whole team.
 
-Running it across an engineering org is a different job — a shared always-on
-deployment, centralised config and version rollout, org-wide savings dashboards,
-SSO and access control, air-gapped and VPC installs, and someone to call. We help
-companies with that, self-hosted with support or fully managed.
+| | Open source | Enterprise |
+|---|---|---|
+| Savings | Compression, plus tool search on Anthropic requests (on by default) | Also: tool search for every model, harness tuning, extra compressors |
+| Model routing | Rule-based and opt-in: turn it on with `HEADROOM_MODEL_ROUTER_ENABLED=1` and write the rules in `HEADROOM_MODEL_ROUTES` | Automatic: a cheaper model per request when quality allows, with a shadow mode that shows the savings before you turn it on |
+| Security | — | Detect and strip prompt injection and risky tool calls |
+| Rollout | Per laptop | Managed or in your VPC, SSO, central config, org-wide savings |
+| Support | GitHub, Discord | Dedicated engineers, onboarding, priority response |
 
-If your team is spending real money on LLM tokens — Claude Code, Codex, Cursor,
-or agents running in CI — email **[hello@headroomlabs.ai](mailto:hello@headroomlabs.ai)**
-with your stack and rough monthly LLM spend.
+**3 months of Enterprise free.** Companies that sign a 12-month Enterprise plan get
+their first 3 months free. One perk per company.
 
-Everything in this repo stays open source under Apache 2.0. The managed offering
-is for teams that would rather have it deployed, supported and scaled for them.
+**[Claim 3 months free →](https://headroom-perks.vercel.app/?source=github&utm_source=github&utm_medium=readme&utm_content=teams)**
+· or email [hello@headroomlabs.ai](mailto:hello@headroomlabs.ai) with your stack and
+monthly LLM spend.
+
+Everything in this repo stays open source under Apache 2.0.
 
 ## Documentation
 

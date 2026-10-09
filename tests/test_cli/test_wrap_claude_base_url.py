@@ -4,11 +4,55 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import click
 import pytest
+from click.testing import CliRunner
 
+from headroom import proxy_client_liveness
 from headroom.cli import wrap as wrap_cli
+from headroom.cli.main import main
+
+
+def test_project_settings_are_restored_when_selfheal_install_fails(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        settings_path = Path(".claude/settings.local.json")
+        settings_path.parent.mkdir()
+        original = {
+            "env": {"ANTHROPIC_BASE_URL": "https://user.example", "KEEP": "1"},
+            "permissions": {"allow": ["Read"]},
+        }
+        settings_path.write_text(json.dumps(original), encoding="utf-8")
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp"),
+            patch("headroom.cli.wrap._setup_coding_compressor"),
+            patch(
+                "headroom.cli.wrap._ensure_claude_wrap_selfheal_hook",
+                side_effect=RuntimeError("selfheal install failed"),
+            ),
+            patch("headroom.cli.wrap.subprocess.run") as run_mock,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "claude",
+                    "--project-settings",
+                    "--no-mcp",
+                    "--no-tokensave",
+                    "--no-serena",
+                ],
+            )
+        assert result.exit_code != 0
+        assert "selfheal install failed" in str(result.exception) + result.output
+        assert all(call.args[0] == ["claude", "--version"] for call in run_mock.call_args_list)
+        assert json.loads(settings_path.read_text(encoding="utf-8")) == original
+        assert not settings_path.with_name(".headroom_wrap_settings.json").exists()
 
 
 def _settings(tmp_path: Path) -> Path:
@@ -247,6 +291,123 @@ def test_write_restore_roundtrip(tmp_path: Path) -> None:
     assert payload["model"] == "opus"
 
 
+def test_claude_project_settings_enabled_respects_flag_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", raising=False)
+    assert wrap_cli._claude_project_settings_enabled(False) is False
+    assert wrap_cli._claude_project_settings_enabled(True) is True
+
+    monkeypatch.setenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", "1")
+    assert wrap_cli._claude_project_settings_enabled(False) is True
+
+
+def test_wrap_claude_skips_project_settings_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    completed = SimpleNamespace(returncode=0)
+    monkeypatch.delenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", raising=False)
+
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        settings_path = Path(".claude") / "settings.local.json"
+        settings_path.parent.mkdir()
+        original = {
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://direct.example",
+                "KEEP": "1",
+            }
+        }
+        settings_path.write_text(json.dumps(original, indent=2) + "\n", encoding="utf-8")
+
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp", return_value=None),
+            patch("headroom.cli.wrap._setup_coding_compressor", return_value=None),
+            patch("headroom.cli.wrap._write_claude_wrap_base_url") as write_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_base_url") as restore_mock,
+            patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as selfheal_mock,
+            patch("headroom.cli.wrap.subprocess.run", return_value=completed) as run_mock,
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "claude",
+                    "--no-mcp",
+                    "--no-tokensave",
+                    "--no-serena",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(settings_path.read_text(encoding="utf-8")) == original
+        write_mock.assert_not_called()
+        restore_mock.assert_not_called()
+        selfheal_mock.assert_not_called()
+        launched_env = run_mock.call_args.kwargs["env"]
+        assert launched_env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_wrap_claude_project_settings_flag_writes_and_restores(tmp_path: Path) -> None:
+    runner = CliRunner()
+    completed = SimpleNamespace(returncode=0)
+
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp", return_value=None),
+            patch("headroom.cli.wrap._setup_coding_compressor", return_value=None),
+            patch(
+                "headroom.cli.wrap._write_claude_wrap_base_url", return_value="old"
+            ) as write_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_base_url") as restore_mock,
+            patch(
+                "headroom.cli.wrap._write_claude_wrap_tool_search", return_value="old-tool-search"
+            ) as write_tool_search_mock,
+            patch("headroom.cli.wrap._restore_claude_wrap_tool_search") as restore_tool_search_mock,
+            patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as selfheal_mock,
+            patch("headroom.cli.wrap.subprocess.run", return_value=completed),
+        ):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "claude",
+                    "--project-settings",
+                    "--no-mcp",
+                    "--no-tokensave",
+                    "--no-serena",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        write_mock.assert_called_once()
+        write_args, write_kwargs = write_mock.call_args
+        assert write_args == ("http://127.0.0.1:8787",)
+        assert write_kwargs["foundry_mode"] is False
+        assert write_kwargs["vertex_mode"] is False
+        assert write_kwargs["port"] == 8787
+        assert write_kwargs["settings_path"].name == "settings.local.json"
+        assert write_kwargs["settings_path"].parent.name == ".claude"
+        selfheal_mock.assert_called_once_with(write_kwargs["settings_path"])
+        write_tool_search_mock.assert_called_once_with(
+            "true", settings_path=write_kwargs["settings_path"]
+        )
+        restore_tool_search_mock.assert_called_once_with(
+            "old-tool-search", settings_path=write_kwargs["settings_path"]
+        )
+        restore_mock.assert_called_once_with(
+            "old",
+            foundry_mode=False,
+            vertex_mode=False,
+            bedrock_mode=False,
+            settings_path=write_kwargs["settings_path"],
+        )
+
+
 # --- stale wrap marker (issue #1768) --------------------------------------
 
 
@@ -300,10 +461,16 @@ def test_wrap_marker_is_not_stale_for_live_pid(tmp_path: Path) -> None:
 def test_wrap_marker_is_stale_when_pid_reused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Inject a deterministic PID identity: _proc_identity returns None on
+    # Inject a deterministic PID identity: proc_identity returns None on
     # macOS without psutil, where reuse detection is deliberately best-effort
-    # and this scenario would be undetectable.
-    monkeypatch.setattr(wrap_cli, "_proc_identity", lambda pid: ("test", 50_000.0))
+    # and this scenario would be undetectable. Two targets needed: the write
+    # path (_write_wrap_marker) calls wrap_cli's own _proc_identity name
+    # directly; the later staleness check (_wrap_marker_is_stale ->
+    # _identity_mismatch) resolves proc_identity from proxy_client_liveness's
+    # own globals -- patching only one leaves the other on the real impl.
+    identity = lambda pid: ("test", 50_000.0)  # noqa: E731
+    monkeypatch.setattr(wrap_cli, "_proc_identity", identity)
+    monkeypatch.setattr(proxy_client_liveness, "proc_identity", identity)
     path = _settings(tmp_path)
     wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
     marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
@@ -317,9 +484,7 @@ def test_check_and_clear_stale_wrap_marker_restores_previous(tmp_path: Path) -> 
     path.write_text(
         json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://old.proxy:9000"}}), encoding="utf-8"
     )
-    wrap_cli._write_wrap_marker(
-        path, port=8787, key="ANTHROPIC_BASE_URL", previous="http://old.proxy:9000"
-    )
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
     marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
     marker["pid"] = 999_999_999
     _marker(tmp_path).write_text(json.dumps(marker), encoding="utf-8")
@@ -342,3 +507,122 @@ def test_check_and_clear_stale_wrap_marker_leaves_live_marker(tmp_path: Path) ->
 def test_check_and_clear_stale_wrap_marker_noop_when_no_marker(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     assert wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL") is None
+
+
+def test_default_wrap_recovers_settings_from_old_crashed_wrap(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_CLAUDE_PROJECT_SETTINGS", raising=False)
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=str(tmp_path)):
+        path = Path(".claude/settings.local.json")
+        path.parent.mkdir()
+        original = {"env": {"ANTHROPIC_BASE_URL": "https://direct.example", "KEEP": "1"}}
+        path.write_text(json.dumps(original), encoding="utf-8")
+        wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:9200", settings_path=path, port=9200)
+        marker_path = wrap_cli._wrap_marker_path(path)
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["pid"] = 999_999_999
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        with (
+            patch("headroom.cli.wrap.shutil.which", return_value="claude"),
+            patch("headroom.cli.wrap._ensure_proxy", return_value=(None, 8787)),
+            patch("headroom.cli.wrap._setup_headroom_mcp", return_value=None),
+            patch("headroom.cli.wrap._setup_coding_compressor", return_value=None),
+            patch("headroom.cli.wrap._ensure_claude_wrap_selfheal_hook") as install_hook,
+            patch("headroom.cli.wrap.subprocess.run", return_value=SimpleNamespace(returncode=0)),
+        ):
+            result = runner.invoke(
+                main, ["wrap", "claude", "--no-mcp", "--no-tokensave", "--no-serena"]
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(path.read_text(encoding="utf-8")) == original
+        assert not marker_path.exists()
+        install_hook.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "foundry_mode, vertex_mode", [(False, False), (True, False), (False, True)]
+)
+def test_stale_marker_preserves_manually_repaired_url(tmp_path, foundry_mode, vertex_mode):
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    key = wrap_cli._claude_wrap_base_url_env_key(foundry_mode=foundry_mode, vertex_mode=vertex_mode)
+    path.write_text(
+        json.dumps({"env": {key: "https://old.example", "KEEP": "1"}}), encoding="utf-8"
+    )
+    proxy = "http://127.0.0.1:9200/anthropic" if foundry_mode else "http://127.0.0.1:9200"
+    wrap_cli._write_claude_wrap_base_url(
+        proxy, settings_path=path, port=9200, foundry_mode=foundry_mode, vertex_mode=vertex_mode
+    )
+    marker_path = wrap_cli._wrap_marker_path(path)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["pid"] = 999_999_999
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    repaired = json.dumps({"env": {key: "https://new.example", "KEEP": "1"}}, indent=2) + "\n"
+    path.write_text(repaired, encoding="utf-8")
+    before = path.read_bytes()
+    wrap_cli._check_and_clear_stale_wrap_marker(path, key=key)
+    assert path.read_bytes() == before
+    assert not marker_path.exists()
+
+
+def test_stale_recovery_serializes_with_new_wrap_writer(tmp_path, monkeypatch):
+    import threading
+
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:9200", settings_path=path, port=9200)
+    marker_path = wrap_cli._wrap_marker_path(path)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["pid"] = 999_999_999
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    path.write_text('{"env":{"ANTHROPIC_BASE_URL":"https://repaired.example"}}', encoding="utf-8")
+    compared = threading.Event()
+    resume = threading.Event()
+    writer_done = threading.Event()
+    errors = []
+    read_text = wrap_cli._read_text
+
+    def paused_read(target):
+        content = read_text(target)
+        if threading.current_thread().name == "stale-recovery" and target == path:
+            compared.set()
+            assert resume.wait(5)
+        return content
+
+    def recover():
+        try:
+            wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def write_new():
+        try:
+            wrap_cli._write_claude_wrap_base_url(
+                "http://127.0.0.1:9300", settings_path=path, port=9300
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            writer_done.set()
+
+    monkeypatch.setattr(wrap_cli, "_read_text", paused_read)
+    recovery = threading.Thread(target=recover, name="stale-recovery")
+    writer = threading.Thread(target=write_new, name="new-writer")
+    recovery.start()
+    try:
+        assert compared.wait(5)
+        writer.start()
+        # Give the competing actual writer the opportunity to commit its marker.
+        writer_done.wait(0.2)
+    finally:
+        resume.set()
+        recovery.join(5)
+        if writer.ident is not None:
+            writer.join(5)
+    assert not recovery.is_alive() and not writer.is_alive()
+    assert not errors, errors
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["port"] == 9300
+    assert (
+        json.loads(path.read_text(encoding="utf-8"))["env"]["ANTHROPIC_BASE_URL"]
+        == "http://127.0.0.1:9300"
+    )

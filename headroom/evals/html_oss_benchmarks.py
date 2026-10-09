@@ -142,11 +142,14 @@ def evaluate_scrapinghub_benchmark(
         print(f"F1: {result.avg_f1:.3f} (baseline: {result.baseline_f1})")
     """
     try:
-        from datasets import load_dataset
+        import datasets  # noqa: F401
     except ImportError:
         raise ImportError(
             "HuggingFace datasets required. Install with: pip install datasets"
         ) from None
+
+    # Cache first under HEADROOM_OFFLINE, guard_egress before any download.
+    from headroom.evals.datasets import load_hf_dataset
 
     if extractor is None:
         from headroom.transforms.html_extractor import HTMLExtractor
@@ -155,7 +158,7 @@ def evaluate_scrapinghub_benchmark(
 
     # Load the benchmark dataset
     logger.info("Loading Scrapinghub article extraction benchmark...")
-    dataset = load_dataset("allenai/scrapinghub-article-extraction-benchmark")
+    dataset = load_hf_dataset("allenai/scrapinghub-article-extraction-benchmark")
     samples = dataset["train"]
 
     if max_samples:
@@ -274,9 +277,12 @@ def evaluate_qa_accuracy_preservation(
         QAAccuracyResult showing whether accuracy is preserved
     """
     try:
-        from datasets import load_dataset
+        import datasets  # noqa: F401
     except ImportError:
         raise ImportError("HuggingFace datasets required") from None
+
+    # Cache first under HEADROOM_OFFLINE, guard_egress before any download.
+    from headroom.evals.datasets import load_hf_dataset
 
     if extractor is None:
         from headroom.transforms.html_extractor import HTMLExtractor
@@ -287,9 +293,9 @@ def evaluate_qa_accuracy_preservation(
     logger.info(f"Loading {dataset_name} dataset...")
 
     if dataset_name == "squad":
-        dataset = load_dataset("rajpurkar/squad_v2", split="validation")
+        dataset = load_hf_dataset("rajpurkar/squad_v2", split="validation")
     elif dataset_name == "hotpotqa":
-        dataset = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation")
+        dataset = load_hf_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation")
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
