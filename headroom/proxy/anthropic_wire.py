@@ -42,7 +42,9 @@ _DELTA_FIELDS: dict[str, frozenset[str]] = {
     "signature_delta": frozenset({"type", "signature"}),
     "citations_delta": frozenset({"type", "citation"}),
 }
-_MESSAGE_DELTA_FIELDS = ("stop_reason", "stop_sequence", "stop_details")
+# Claude Code reads auto-mode classifier verdicts from message_delta.delta.safeguard_results;
+# a resynthesized stream without them falls back to billed client-side classification.
+_MESSAGE_DELTA_FIELDS = ("stop_reason", "stop_sequence", "stop_details", "safeguard_results")
 # The payload member each known delta type must carry, and its JSON type.
 _DELTA_PAYLOADS: dict[str, tuple[str, type]] = {
     "text_delta": ("text", str),

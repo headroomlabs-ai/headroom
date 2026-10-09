@@ -3,6 +3,7 @@ import base64
 import json
 import sys
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -279,7 +280,7 @@ class _MemoryToolsOnlyHandler:
         self.config = SimpleNamespace(
             inject_context=False,
             inject_tools=True,
-            project_root_override="",
+            project_root_override=str(Path(__file__).resolve().parent),
         )
         self.compute_calls = 0
 

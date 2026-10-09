@@ -18,7 +18,9 @@ def _get_jinja2_template(template_str: str):
     try:
         from jinja2 import Template
 
-        return Template(template_str)
+        # Request fields such as ``model`` come from clients; escape them so a
+        # crafted value cannot inject script into the report.
+        return Template(template_str, autoescape=True)
     except ImportError as e:
         raise ImportError(
             "jinja2 is required for report generation. Install with: pip install headroom[reports]"

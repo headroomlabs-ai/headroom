@@ -119,6 +119,23 @@ describe("HeadroomClient", () => {
     expect(url).toBe("http://localhost:8787/v1/compress");
   });
 
+  it("handles long runs of slashes in baseUrl in linear time", async () => {
+    // The previous /\/+$/ regex backtracked quadratically on a long run of
+    // "/" that is not at the end of the string (CodeQL js/polynomial-redos).
+    const slashes = "/".repeat(100_000);
+    mockFetch.mockResolvedValueOnce(okResponse(sampleProxyResponse));
+
+    const start = performance.now();
+    const client = new HeadroomClient({
+      baseUrl: `http://localhost:8787${slashes}x${slashes}`,
+    });
+    expect(performance.now() - start).toBeLessThan(1000);
+
+    await client.compress(sampleMessages, { model: "gpt-4o" });
+    const [url] = mockFetch.mock.calls[0];
+    expect(url).toBe(`http://localhost:8787${slashes}x/v1/compress`);
+  });
+
   it("throws HeadroomAuthError on 401 (always, even with fallback)", async () => {
     mockFetch.mockResolvedValueOnce(
       errorResponse(401, {

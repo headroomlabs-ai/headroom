@@ -545,6 +545,25 @@ def _caller_key_travels_to(model: str, key: str) -> bool:
     return provider not in _REJECTS_ANTHROPIC_KEY
 
 
+def _caller_key_from_headers(headers: dict[str, str]) -> str:
+    """Extract the caller's API key from inbound request headers.
+
+    The ``Authorization`` auth-scheme token is case-insensitive per RFC 7235
+    §2.1, so ``Authorization: bearer <key>`` must be read the same as
+    ``Bearer <key>``. A case-sensitive ``startswith("Bearer ")`` dropped the
+    credential for a lowercase (or otherwise differently-cased) scheme, and the
+    request then fell back to the target provider's env key — which may not
+    exist, yielding a spurious upstream 401. Only the scheme is case-folded; the
+    credential itself is returned verbatim. Falls back to ``x-api-key`` when the
+    header carries no bearer credential (matching the prior behavior).
+    """
+    auth_header = headers.get("authorization", headers.get("Authorization", ""))
+    scheme, sep, credentials = auth_header.partition(" ")
+    if sep and scheme.lower() == "bearer":
+        return credentials
+    return headers.get("x-api-key", "")
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -556,6 +575,44 @@ def get_provider_config(provider: str) -> ProviderConfig:
         model_map={},
         pass_through=True,
     )
+
+
+_ANTHROPIC_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    422: "invalid_request_error",
+    429: "rate_limit_error",
+}
+
+_OPENAI_ERROR_TYPES = {
+    400: "invalid_request_error",
+    401: "invalid_api_key",
+    403: "permission_error",
+    404: "model_not_found",
+    413: "invalid_request_error",
+    422: "invalid_request_error",
+    429: "rate_limit_exceeded",
+}
+
+
+def _upstream_client_error(exc: Exception, error_types: dict[int, str]) -> tuple[int, str] | None:
+    """Map a LiteLLM exception's own 4xx ``status_code`` to ``(status, error type)``.
+
+    A 4xx status outside ``error_types`` keeps its status with the generic
+    ``invalid_request_error`` type. Returns None when the exception carries no
+    4xx status, so the caller falls back to matching on the message.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    if status in error_types:
+        return status, error_types[status]
+    if 400 <= status <= 499:
+        return status, "invalid_request_error"
+    return None
 
 
 def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
@@ -1254,12 +1311,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1293,7 +1345,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _ANTHROPIC_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "authentication_error"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
@@ -1377,12 +1432,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1785,12 +1835,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key
@@ -1927,7 +1972,10 @@ class LiteLLMBackend(Backend):
             status_code = 500
 
             error_str = str(e).lower()
-            if "authentication" in error_str or "credentials" in error_str:
+            upstream = _upstream_client_error(e, _OPENAI_ERROR_TYPES)
+            if upstream is not None:
+                status_code, error_type = upstream
+            elif "authentication" in error_str or "credentials" in error_str:
                 error_type = "invalid_api_key"
                 status_code = 401
             elif "rate" in error_str or "limit" in error_str:
@@ -1997,12 +2045,7 @@ class LiteLLMBackend(Backend):
             # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
-                auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                _caller_key = (
-                    auth_header[7:]
-                    if auth_header.startswith("Bearer ")
-                    else headers.get("x-api-key", "")
-                )
+                _caller_key = _caller_key_from_headers(headers)
                 # Only forward it if it can actually authenticate the TARGET.
                 if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
                     kwargs["api_key"] = _caller_key

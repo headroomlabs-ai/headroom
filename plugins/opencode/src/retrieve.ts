@@ -15,8 +15,18 @@ export interface RetrieveToolConfig {
   proxyBaseUrl: string;
 }
 
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 export function createHeadroomRetrieveTool(config: RetrieveToolConfig) {
-  const origin = config.proxyBaseUrl.replace(/\/+$/, "");
+  const origin = trimTrailingSlashes(config.proxyBaseUrl);
 
   return {
     name: "headroom_retrieve",

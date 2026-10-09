@@ -251,6 +251,10 @@ class TestWorkerConfiguration:
         from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, run_server
 
         captured = {}
+        # A non-loopback bind needs an inbound token (or an explicit
+        # acknowledgement) since the bind policy landed; this test is about
+        # the multi-worker plumbing, so give it the token.
+        monkeypatch.setenv("HEADROOM_PROXY_TOKEN", "multi-worker-test-token")
         config = ProxyConfig(
             host="0.0.0.0",
             port=8787,
