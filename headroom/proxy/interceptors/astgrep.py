@@ -10,19 +10,23 @@ than three definitions to outline.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from headroom import binaries
 from headroom._subprocess import run
 from headroom.proxy import runtime_env
+from headroom.proxy.project_context import get_registered_cwd
 
 from . import base
 
@@ -129,6 +133,182 @@ def _detect_truncation(source: str) -> tuple[int, int] | None:
     return None
 
 
+class ReadVerificationResult(Enum):
+    """Client-independent fallback for `_detect_truncation`'s banner regex:
+    compares tool_output against the real file on disk instead of parsing
+    client-specific prose. Only used when the banner regex finds nothing.
+
+    Always UNKNOWN on Windows (no O_NOFOLLOW/dir_fd) -- never falls back to
+    a less-safe read."""
+
+    COMPLETE = "complete"
+    TRUNCATED = "truncated"
+    # Unresolvable path, unreadable file, or mismatched content — never guess.
+    UNKNOWN = "unknown"
+
+
+def _verify_truncation_on_disk_enabled() -> bool:
+    # Live read (not a module constant), matching _min_chars_to_rewrite()'s
+    # hot-reload behavior.
+    return runtime_env.getenv("HEADROOM_VERIFY_TRUNCATION_ON_DISK", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _max_disk_verify_bytes() -> int:
+    # Live read, same hot-reload pattern as _min_chars_to_rewrite(). 5 MB
+    # comfortably covers real source files while bounding worst-case read
+    # time/memory for the disk-verify fallback.
+    try:
+        return int(runtime_env.getenv("HEADROOM_VERIFY_TRUNCATION_MAX_BYTES", "5000000"))
+    except (TypeError, ValueError):
+        return 5_000_000
+
+
+def _dir_fd_walk_supported() -> bool:
+    # hasattr, not bare os.O_NOFOLLOW/os.O_DIRECTORY refs -- missing on
+    # Windows, would AttributeError at import time otherwise.
+    return (
+        hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
+    )
+
+
+def _on_event_loop_thread() -> bool:
+    """True only on a thread with a running asyncio loop (the request
+    coroutine) -- false on a plain ThreadPoolExecutor worker. Lets the
+    blocking read refuse itself if ever reached directly from the loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _open_regular_file_under_root(
+    file_path: str, resolved_root: Path, max_bytes: int
+) -> str | None:
+    """Race-safe read of `file_path` confined under `resolved_root`.
+
+    Walks from an fd opened on `resolved_root` using dir_fd-relative,
+    O_NOFOLLOW opens at every hop -- no full path is ever resolved then
+    reopened, so there's no TOCTOU window for a symlink swap to exploit.
+    Refuses if called on the event-loop thread or if this platform lacks
+    dir_fd support (notably Windows) -- no less-safe fallback either way.
+    """
+    if _on_event_loop_thread() or not _dir_fd_walk_supported():
+        return None
+
+    # Pure string math -- no I/O, can't itself be raced.
+    candidate = (
+        file_path if os.path.isabs(file_path) else os.path.join(str(resolved_root), file_path)
+    )
+    rel = os.path.relpath(os.path.normpath(candidate), str(resolved_root))
+    if rel == os.curdir:
+        return None  # the root itself, not a file within it
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+        return None  # escapes resolved_root
+    segments = [s for s in rel.split(os.sep) if s]
+    if not segments or any(s in (os.curdir, os.pardir) for s in segments):
+        return None
+
+    try:
+        # resolved_root already went through resolve(strict=True) in the
+        # caller, so it's symlink-free at that instant -- O_NOFOLLOW here
+        # closes the residual window where the anchor itself gets swapped
+        # for a symlink between that resolve() and this open().
+        current_fd = os.open(str(resolved_root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+
+    file_fd = -1
+    try:
+        for segment in segments[:-1]:
+            try:
+                next_fd = os.open(
+                    segment, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current_fd
+                )
+            except OSError:
+                return None
+            os.close(current_fd)
+            current_fd = next_fd
+
+        final = segments[-1]
+        try:
+            # O_NONBLOCK: a FIFO with no writer returns immediately instead
+            # of blocking -- no effect once fstat confirms a regular file.
+            file_fd = os.open(
+                final,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+        except OSError:
+            return None
+
+        try:
+            st = os.fstat(file_fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+                return None
+            with os.fdopen(file_fd, "rb") as f:
+                file_fd = -1  # ownership transferred to the file object
+                data = f.read(max_bytes + 1)
+            # fstat can go stale by read time -- a regular file can grow
+            # between the two. Bound the read itself rather than trust the
+            # earlier size check; one byte past the cap is enough to detect
+            # an overflow without ever reading an unbounded amount.
+            if len(data) > max_bytes:
+                return None
+            return data.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
+def _verify_read_against_disk(
+    file_path: str | None,
+    received_content: str,
+    registered_cwd: str | None,
+) -> tuple[ReadVerificationResult, tuple[int, int] | None]:
+    """Compare `received_content` against the real file at `file_path`.
+
+    `registered_cwd` is `project_context.get_registered_cwd()`, not a raw
+    header -- non-None only when a session token matched a workspace root
+    `wrap` itself registered (see workspace_registry.py). Its presence is
+    the trust signal; there's no separate boolean to check.
+
+    TRUNCATED requires an exact-prefix match with strictly more on disk —
+    a weaker match means the file diverged since the client read it, not
+    a provable truncation, so it's UNKNOWN. Returns `(visible_lines,
+    total_lines)` alongside TRUNCATED so the header can cite real numbers
+    without a second, potentially racy, read.
+    """
+    if not file_path:
+        return ReadVerificationResult.UNKNOWN, None
+    if not registered_cwd or not os.path.isabs(registered_cwd):
+        return ReadVerificationResult.UNKNOWN, None
+    try:
+        resolved_root = Path(registered_cwd).resolve(strict=True)
+    except OSError:
+        return ReadVerificationResult.UNKNOWN, None
+    if not resolved_root.is_dir():
+        return ReadVerificationResult.UNKNOWN, None
+    disk_content = _open_regular_file_under_root(file_path, resolved_root, _max_disk_verify_bytes())
+    if disk_content is None:
+        return ReadVerificationResult.UNKNOWN, None
+    if disk_content == received_content:
+        return ReadVerificationResult.COMPLETE, None
+    if disk_content.startswith(received_content) and len(disk_content) > len(received_content):
+        visible_lines = len(received_content.splitlines())
+        total_lines = len(disk_content.splitlines())
+        return ReadVerificationResult.TRUNCATED, (visible_lines, total_lines)
+    return ReadVerificationResult.UNKNOWN, None
+
+
 class AstGrepReadOutline:
     """Interceptor that outlines verbose code-file Read outputs."""
 
@@ -171,7 +351,16 @@ class AstGrepReadOutline:
         if not matches:
             return None
 
+        # Banner (cheap, no I/O) wins; disk verification is the opt-in fallback.
         truncation = _detect_truncation(tool_output)
+        if truncation is None and _verify_truncation_on_disk_enabled():
+            verdict, disk_truncation = _verify_read_against_disk(
+                _path_from_input(tool_input),
+                tool_output,
+                get_registered_cwd(),
+            )
+            if verdict is ReadVerificationResult.TRUNCATED:
+                truncation = disk_truncation
         outline = _build_outline(matches, tool_output, truncation)
         return outline if outline else None
 

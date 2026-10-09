@@ -150,6 +150,7 @@ from headroom.proxy.helpers import (
     _setup_file_logging,  # noqa: F401
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
+    overload_retry_is_futile,
     resolve_display_provider,
     retry_after_ms,
 )
@@ -182,6 +183,7 @@ from headroom.proxy.probe_recorder import probe_recorder_from_env
 from headroom.proxy.project_context import (
     classify_project,
     set_current_project,
+    set_registered_cwd,
     strip_project_path_prefix,
 )
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
@@ -199,6 +201,7 @@ from headroom.proxy.tcp_keepalive import install_tcp_keepalive
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
 from headroom.proxy.upstream_pinning import install_upstream_pinning
 from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.workspace_registry import resolve_registered_cwd
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
@@ -1790,7 +1793,12 @@ class HeadroomProxy(
                         remaining,
                     )
 
-        future = loop.run_in_executor(self._compression_executor, _wrapped)
+        # run_in_executor doesn't copy contextvars into the worker thread
+        # (unlike asyncio.to_thread) -- without this, get_registered_cwd()
+        # etc. would silently see the ContextVar default, not what the
+        # request middleware bound.
+        ctx = contextvars.copy_context()
+        future = loop.run_in_executor(self._compression_executor, ctx.run, _wrapped)
         try:
             return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
@@ -1815,7 +1823,9 @@ class HeadroomProxy(
         Runs on the dedicated single-thread background executor.
         """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._background_compression_executor, fn)
+        # Same context-propagation fix as _run_compression_in_executor above.
+        ctx = contextvars.copy_context()
+        return await loop.run_in_executor(self._background_compression_executor, ctx.run, fn)
 
     # How often the lazy TTL sweep in `_get_compression_cache` may run.
     _COMPRESSION_CACHE_CLEANUP_INTERVAL_SECONDS = 60.0
@@ -2658,6 +2668,11 @@ class HeadroomProxy(
                         if (
                             not self.config.retry_enabled
                             or attempt >= self.config.retry_max_attempts - 1
+                            or overload_retry_is_futile(
+                                response,
+                                self.config.retry_max_delay_ms,
+                                retries_left=self.config.retry_max_attempts - attempt - 1,
+                            )
                         ):
                             return response
                         delay_ms = retry_after_ms(
@@ -3174,11 +3189,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy log. Multi-worker processes add their PID so
-    # same-port workers never share a RotatingFileHandler target.
-    _setup_file_logging(
-        config.port,
-        process_id=os.getpid() if config.worker_processes > 1 else None,
-    )
+    # same-port workers never share a RotatingFileHandler target. Stateless
+    # mode must not create a log directory or file.
+    if not config.stateless:
+        _setup_file_logging(
+            config.port,
+            process_id=os.getpid() if config.worker_processes > 1 else None,
+        )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
@@ -3841,6 +3858,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "min_tokens_to_compress",
                     config.min_tokens_to_crush,
                 ),
+                "exclude_tools": sorted(
+                    {
+                        *DEFAULT_EXCLUDE_TOOLS,
+                        *(config.exclude_tools or ()),
+                        *(config.protect_tool_results or ()),
+                    }
+                ),
                 "max_items_after_crush": profile_kwargs.get(
                     "max_items_after_crush",
                     config.max_items_after_crush,
@@ -3970,6 +3994,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         query = request.url.query
         headers = dict(request.headers.items())
         set_current_project(classify_project(headers) or prefix_project)
+        # Non-None only if a live wrap session registered this exact token
+        # (workspace_registry.py) -- the caller-supplied x-headroom-cwd
+        # header is never itself sufficient authority.
+        set_registered_cwd(
+            resolve_registered_cwd(config.port, headers.get("x-headroom-session-token"))
+        )
         # Path-based Codex identification: stamp X-Client: codex on the
         # Responses endpoint for callers that don't otherwise classify (e.g.
         # Codex Desktop, whose User-Agent isn't a known codex UA). Without it
@@ -4531,11 +4561,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # published on host loopback, whose peer is the bridge gateway, still loads.
     _dashboard_gate = [Depends(_require_operator_read_client)]
 
+    # Effective licence state of THIS proxy, resolved once: an explicit
+    # ProxyConfig.license_key, else HEADROOM_LICENSE or its deprecated alias.
+    from headroom.license_env import resolve_license_token
+
+    _dashboard_licensed = bool(config.license_key) or bool(resolve_license_token())
+
     @app.get("/dashboard", response_class=HTMLResponse)
     @app.get("/dashboard/", response_class=HTMLResponse, include_in_schema=False)
     async def dashboard():
         """Serve the Headroom dashboard UI."""
-        return get_dashboard_html()
+        return get_dashboard_html(licensed=_dashboard_licensed)
 
     # --- Dashboard settings API (loopback-gated, registry-validated) ---------
     # Read/write the curated HEADROOM_* knobs the settings GUI manages. Writes
@@ -5923,7 +5959,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             limit: Maximum number of patterns to return (default 20)
 
         Response includes for each pattern:
-        - hash: Truncated tool signature hash (12 chars)
+        - hash: Full aggregation key identifying one scoped tool pattern
         - compressions: Total compression events
         - retrievals: Total retrieval events
         - retrieval_rate: Percentage of compressions that triggered retrieval
@@ -5947,7 +5983,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
             patterns_list.append(
                 {
-                    "hash": sig_hash[:12],
+                    "hash": sig_hash,
                     "compressions": total_compressions,
                     "retrievals": total_retrievals,
                     "retrieval_rate": f"{retrieval_rate:.1%}",
@@ -5967,36 +6003,41 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         return patterns_list[:limit]
 
-    @app.get("/v1/toin/pattern/{hash_prefix}", dependencies=[Depends(_require_loopback)])
+    @app.get("/v1/toin/pattern/{hash_prefix:path}", dependencies=[Depends(_require_loopback)])
     async def toin_pattern_detail(hash_prefix: str):
-        """Get detailed TOIN pattern info by hash prefix.
+        """Get detailed TOIN pattern info by the listed identifier or a unique prefix.
 
-        Searches for a pattern where the tool signature hash starts with
-        the provided prefix. Returns full pattern details if found.
+        Pass the ``hash`` returned by ``/v1/toin/patterns`` for an exact
+        lookup. A shorter aggregation-key prefix is accepted only when it
+        identifies one pattern; ambiguous prefixes return 409.
 
-        Path params:
-            hash_prefix: Beginning of the tool signature hash (min 4 chars recommended)
-
-        Response: Full pattern.to_dict() with all learned statistics and recommendations.
+        Response: Learned statistics without query text or field semantics.
         """
         toin = get_toin()
         exported = toin.export_patterns()
         patterns_data = exported.get("patterns", {})
 
-        # Search for pattern with matching hash prefix
-        for sig_hash, pattern_dict in patterns_data.items():
-            if sig_hash.startswith(hash_prefix):
-                # Keep this response aligned with /v1/toin/patterns while
-                # excluding query text, field semantics, and other internal
-                # learning state from the detail endpoint.
-                return {
-                    "compressions": pattern_dict.get("total_compressions", 0),
-                    "retrievals": pattern_dict.get("total_retrievals", 0),
-                    "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
-                    "confidence": pattern_dict.get("confidence", 0.0),
-                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
-                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
-                }
+        pattern_dict = patterns_data.get(hash_prefix)
+        if pattern_dict is None:
+            matches = (
+                pattern for key, pattern in patterns_data.items() if key.startswith(hash_prefix)
+            )
+            pattern_dict = next(matches, None)
+            if next(matches, None) is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Ambiguous TOIN pattern prefix; use a full hash from /v1/toin/patterns",
+                )
+        if pattern_dict is not None:
+            # Keep query text, field semantics, and internal learning state private.
+            return {
+                "compressions": pattern_dict.get("total_compressions", 0),
+                "retrievals": pattern_dict.get("total_retrievals", 0),
+                "retrieval_rate": pattern_dict.get("retrieval_rate", 0.0),
+                "confidence": pattern_dict.get("confidence", 0.0),
+                "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+            }
 
         raise HTTPException(
             status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"

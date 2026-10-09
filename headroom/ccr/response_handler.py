@@ -24,8 +24,10 @@ from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_calls import (
     CCRToolCall,
+    drop_tool_calls,
     extract_tool_calls,
     has_ccr_tool_calls,
+    is_ccr_tool_call,
     parse_ccr_tool_calls,
 )
 from .tool_injection import CCR_TOOL_NAME
@@ -476,18 +478,41 @@ class CCRResponseHandler:
                 # No CCR tool calls, we're done
                 break
 
-            # If the model called CCR alongside non-CCR tools, we cannot build
-            # a valid continuation — every tool_use in the assistant message
-            # requires a matching tool_result, but we only have CCR results.
-            # Skip CCR handling and let the client resolve all tool calls.
+            # The model called CCR alongside client tools. The client has no
+            # headroom_retrieve (Claude Code answers "No such tool available:
+            # headroom_retrieve", so the model never gets the content), and a
+            # continuation needs a tool_result for every tool_use. The client
+            # calls have not run yet, so drop them and serve the retrieval now;
+            # the model decides again, content in hand, in the continuation.
+            # That continuation replaces this turn whatever it does: re-issue
+            # the calls, change them or drop them. Only a failed continuation
+            # hands this turn back (below), since the model made no newer
+            # decision. A CCR-named call without a valid hash, or a provider
+            # where dropping a sibling is not safe (see drop_tool_calls), keeps
+            # the turn as it is for the client to resolve.
+            mixed_turn: dict[str, Any] | None = None
             if other_calls:
-                logger.warning(
-                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
-                    "alongside headroom_retrieve. Cannot create a valid continuation "
-                    "without results for the other tools. Client must handle all tool calls.",
+                trimmed = (
+                    current_response
+                    if any(is_ccr_tool_call(c) for c in other_calls)
+                    else drop_tool_calls(current_response, provider, other_calls)
+                )
+                if trimmed is current_response:
+                    logger.warning(
+                        "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                        "alongside headroom_retrieve. Cannot create a valid continuation "
+                        "without results for the other tools. Client must handle all tool calls.",
+                        len(other_calls),
+                    )
+                    break
+                logger.info(
+                    "CCR: model called headroom_retrieve alongside %d client tool(s); "
+                    "serving the retrieval and dropping the unrun client call(s) "
+                    "for the model to re-issue",
                     len(other_calls),
                 )
-                break
+                mixed_turn = current_response
+                current_response = trimmed
 
             rounds += 1
             with self._retrieval_count_lock:
@@ -540,7 +565,11 @@ class CCRResponseHandler:
                 # entirely (#3129).
                 logger.error("CCR: Continuation API call failed: %s: %r", type(e).__name__, e)
                 # Return the response we had (with unhandled CCR calls)
-                # The client will see the tool_use and might handle it differently
+                # The client will see the tool_use and might handle it differently.
+                # For a mixed turn that is the model's own turn, client calls
+                # included (#839), never the trimmed one that lost them.
+                if mixed_turn is not None:
+                    current_response = mixed_turn
                 break
 
         if rounds >= self.config.max_retrieval_rounds:

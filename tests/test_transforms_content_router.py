@@ -2009,6 +2009,51 @@ def _block_out(router: ContentRouter, content: str, model_limit: int) -> str:
     return result.messages[0]["content"][0]["content"]
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    ["", '\n```python\nprint("hello")\n```\n', '\n{"records":[{"name":"extra","value":1}]}\n'],
+    ids=["status", "fenced-code", "json"],
+)
+def test_git_status_output_stays_byte_exact_on_direct_and_tool_routes(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    status = """On branch feature/status
+Changes to be committed:
+  (use "git restore --staged <file>..." to unstage)
+\tnew file:   staged path with spaces.txt
+\tmodified:   another staged path.txt
+	new file:   staged path with several spaces and a longer filename.txt
+	modified:   additional staged file.txt
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+\tmodified:   edited path with spaces.txt
+\tdeleted:    removed path.txt
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+\tnew untracked path.txt
+"""
+    status += suffix
+    router = ContentRouter(ContentRouterConfig())
+
+    class LossyProseCompressor:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            compressed = "\n".join(content.splitlines()[::2])
+            return SimpleNamespace(compressed=compressed, compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: LossyProseCompressor())
+
+    direct = router.compress(status)
+    tool_result = _block_out(router, status, model_limit=100_000)
+
+    assert direct.compressed == status
+    assert tool_result == status
+
+
 def test_block_freeze_off_is_byte_identical_flapping_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

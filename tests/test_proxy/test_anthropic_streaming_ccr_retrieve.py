@@ -84,8 +84,9 @@ def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> 
 
 
 class _ContinuationClient:
-    def __init__(self, response_json: dict) -> None:
+    def __init__(self, response_json: dict, status_code: int = 200) -> None:
         self.response_json = response_json
+        self.status_code = status_code
         self.post_calls: list[dict] = []
 
     async def post(self, url, *, content=None, headers=None, timeout=None):  # noqa: ANN001
@@ -97,7 +98,7 @@ class _ContinuationClient:
                 "timeout": timeout,
             }
         )
-        return httpx.Response(200, json=self.response_json)
+        return httpx.Response(self.status_code, json=self.response_json)
 
     async def aclose(self) -> None:
         return None
@@ -257,20 +258,26 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     proxy._stream_response.assert_not_awaited()
 
 
-def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
-    """LEGAL mixed turn (#839, #2089): headroom_retrieve emitted alongside a
-    client tool. The proxy cannot synthesize the client tool_result, so it must
-    hand the turn back for the client to resolve — a 200 SSE stream preserving
-    BOTH tool_use blocks, matching the non-streaming path. It must NOT 502 and
-    must NOT issue a continuation request."""
+def test_mixed_ccr_and_client_tool_serves_retrieval_then_streams_reissued_tool() -> None:
+    """headroom_retrieve emitted alongside a client tool (#839, #2089). The
+    client has no headroom_retrieve (Claude Code answers "No such tool
+    available"), so the proxy serves the retrieval in a continuation without
+    the unrun client call, and streams the continuation, where the model
+    re-issues it. No headroom_retrieve reaches the client and nothing 502s."""
     config = _make_config()
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"secret": "retrieved answer"}),
+        compressed="{}",
+        original_item_count=1,
+    )
     initial_response = _message_response(
         [
             {
                 "type": "tool_use",
                 "id": "toolu_ccr",
                 "name": "headroom_retrieve",
-                "input": {"hash": "abc123"},
+                "input": {"hash": hash_key},
             },
             {
                 "type": "tool_use",
@@ -278,6 +285,17 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
                 "name": "client_tool",
                 "input": {"value": 1},
             },
+        ],
+        stop_reason="tool_use",
+    )
+    reissued = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_client_2",
+                "name": "client_tool",
+                "input": {"value": 1},
+            }
         ],
         stop_reason="tool_use",
     )
@@ -289,7 +307,7 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
             proxy._stream_response = AsyncMock(
                 side_effect=AssertionError("live streaming path should not be used")
             )
-            continuation_client = _ContinuationClient(_message_response([]))
+            continuation_client = _ContinuationClient(reissued)
             proxy.http_client = continuation_client
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -319,14 +337,97 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
 
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    # Both tool_use blocks are preserved for the client to resolve.
-    assert "headroom_retrieve" in resp.text
-    assert "client_tool" in resp.text
-    assert "toolu_ccr" in resp.text
-    assert "toolu_client" in resp.text
+    assert "toolu_client_2" in resp.text
+    assert "headroom_retrieve" not in resp.text
+    assert 'toolu_client"' not in resp.text
     assert "Unable to safely complete streamed CCR retrieval" not in resp.text
-    # No continuation is issued — the client resolves all tool calls.
-    assert continuation_client.post_calls == []
+    assert len(continuation_client.post_calls) == 1
+    body = json.loads(continuation_client.post_calls[0]["content"].decode())
+    assistant, tool_result = body["messages"][-2:]
+    assert [b["id"] for b in assistant["content"]] == ["toolu_ccr"]
+    assert tool_result["content"][0]["tool_use_id"] == "toolu_ccr"
+    assert "retrieved answer" in json.dumps(tool_result)
+
+
+@pytest.mark.parametrize("status_code", [200, 500], ids=["withdrawn", "failed"])
+def test_mixed_turn_streams_the_continuation_or_the_turn_on_failure(status_code: int) -> None:
+    """LEGAL mixed turn (#839, #2089). A continuation that withdraws the client
+    tool is what the client gets: the dropped call never reaches it. If the
+    continuation fails, the model made no newer decision, so the client gets
+    the model's own turn as a 200 SSE stream with BOTH tool_use blocks. No 502."""
+    config = _make_config()
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"secret": "retrieved answer"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+    initial_response = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_ccr",
+                "name": "headroom_retrieve",
+                "input": {"hash": hash_key},
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_client",
+                "name": "client_tool",
+                "input": {"value": 1},
+            },
+        ],
+        stop_reason="tool_use",
+    )
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
+            continuation_client = _ContinuationClient(
+                _message_response([{"type": "text", "text": "all done"}]), status_code
+            )
+            proxy.http_client = continuation_client
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                assert body["stream"] is False
+                return httpx.Response(200, json=initial_response)
+
+            proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+            resp = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [
+                        create_ccr_tool_definition("anthropic"),
+                        {
+                            "name": "client_tool",
+                            "description": "Client-owned tool",
+                            "input_schema": {"type": "object", "properties": {}},
+                        },
+                    ],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
+                },
+            )
+
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers["content-type"]
+    if status_code == 200:
+        assert "all done" in resp.text
+        assert "toolu_client" not in resp.text
+        assert "headroom_retrieve" not in resp.text
+    else:
+        assert "toolu_ccr" in resp.text
+        assert "toolu_client" in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" not in resp.text
+    assert len(continuation_client.post_calls) == 1
 
 
 def test_unresolved_ccr_only_streams_through_as_200() -> None:
