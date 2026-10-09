@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from datetime import datetime, timedelta
@@ -44,9 +45,6 @@ def _make_snapshot(
 
 def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
-    # PR-G2: keep the unit test deterministic — do not let
-    # ``update_contribution`` call out to ``rtk gain`` via the proxy helper.
-    monkeypatch.setattr(SubscriptionTracker, "_poll_rtk_delta", lambda self: 0)
     tracker = SubscriptionTracker(enabled=False)
 
     assert tracker.is_available() is False
@@ -59,7 +57,7 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     tracker.notify_active("Bearer sk-ant-api-key")
     assert tracker._current_token is None
 
-    tracker.notify_active("Bearer oauth-token-123")
+    tracker.notify_active("Bearer oauth-token-123", from_local_operator=True)
     assert tracker._current_token == "oauth-token-123"
     assert tracker._full_tokens["oauth-to"] == 1
     assert tracker.is_active() is True
@@ -67,7 +65,6 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     tracker.update_contribution(
         tokens_submitted=10,
         tokens_saved_compression=5,
-        tokens_saved_cli_filtering=-1,
         tokens_saved_cache_reads=3,
         compression_savings_usd=1.25,
         cache_savings_usd=-2.0,
@@ -75,13 +72,9 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     contribution = tracker._state.contribution
     assert contribution.tokens_submitted == 10
     assert contribution.tokens_saved_compression == 5
-    assert contribution.tokens_saved_cli_filtering == 0
-    assert contribution.tokens_saved_rtk == 0
     assert contribution.tokens_saved_cache_reads == 3
     assert contribution.to_dict()["tokens_saved"]["compression"] == 5
     assert contribution.to_dict()["tokens_saved"]["proxy_compression"] == 5
-    assert contribution.to_dict()["tokens_saved"]["cli_filtering"] == 0
-    assert contribution.to_dict()["tokens_saved"]["rtk"] == 0
     assert contribution.compression_savings_usd == 1.25
     assert contribution.cache_savings_usd == 0.0
 
@@ -182,12 +175,115 @@ async def test_maybe_poll_handles_inactive_and_none_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_maybe_poll_prefers_refreshed_credentials_token_over_stale_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (#3913): the credentials file is where Claude Code writes the
+    *refreshed* OAuth token. Polling the remembered Authorization-header token
+    first pinned every poll to an expired credential, so `/stats` reported
+    permanent `poll_errors` and a `polled_at` that never advanced."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    # Token captured from a proxied local-operator request, before Claude Code rotated it.
+    tracker.notify_active("Bearer stale-header-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "refreshed-file-token"
+    )
+
+    snapshot = _make_snapshot()
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        # The stale header token is what Anthropic rejects with 401 -> None.
+        if token == "stale-header-token":
+            return None
+        return snapshot
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["refreshed-file-token"]
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.poll_errors == 0
+    assert tracker._state.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_falls_back_to_header_token_when_file_token_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The remembered header token is still the only credential when no
+    credentials file exists, so a rejection of the file token must fall back to
+    it rather than mark the tracker errored."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer header-only-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "revoked-file-token"
+    )
+
+    snapshot = _make_snapshot()
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        if token == "revoked-file-token":
+            return None
+        return snapshot
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["revoked-file-token", "header-only-token"]
+    assert tracker.latest_snapshot is snapshot
+    assert tracker._state.poll_errors == 0
+
+
+@pytest.mark.asyncio
+async def test_maybe_poll_single_request_when_file_token_matches_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical tokens must not be spent twice — the common case for a proxy
+    session whose credentials file holds the same token as the header."""
+    monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    tracker = SubscriptionTracker()
+    tracker.notify_active("Bearer shared-token", from_local_operator=True)
+
+    monkeypatch.setattr(
+        "headroom.subscription.client.read_cached_oauth_token", lambda: "shared-token"
+    )
+
+    attempted: list[str | None] = []
+
+    async def fetch_snapshot(token: str | None):
+        attempted.append(token)
+        return _make_snapshot()
+
+    tracker._client = SimpleNamespace(fetch=fetch_snapshot)
+    monkeypatch.setattr(tracker, "_persist_state", lambda: None)
+
+    await tracker._maybe_poll()
+
+    assert attempted == ["shared-token"]
+
+
+@pytest.mark.asyncio
 async def test_maybe_poll_success_updates_state_and_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    # Pin the credentials-file/env source so this exercises the adopted
+    # local-operator header path, not whatever token the host happens to hold.
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
     discrepancies = [WindowDiscrepancy(kind="cache_miss", description="miss", severity="warning")]
@@ -233,7 +329,8 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
     multi-second ~/.claude/projects scan wedges the proxy every poll interval."""
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
     tracker = SubscriptionTracker()
-    tracker.notify_active("Bearer live-oauth-token")
+    tracker.notify_active("Bearer live-oauth-token", from_local_operator=True)
+    monkeypatch.setattr("headroom.subscription.client.read_cached_oauth_token", lambda: None)
 
     snapshot = _make_snapshot()
 
@@ -267,46 +364,24 @@ async def test_maybe_poll_runs_transcript_scan_off_event_loop(
 
 
 def test_persist_and_load_state_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # PR-G2: ``update_contribution`` polls RTK by default; pin the helper to
-    # 0 so the round-trip is deterministic.
-    monkeypatch.setattr(SubscriptionTracker, "_poll_rtk_delta", lambda self: 0)
-
     persist_path = tmp_path / "tracker-state.json"
     tracker = SubscriptionTracker(persist_path=persist_path)
     tracker.update_contribution(
         tokens_submitted=11,
         tokens_saved_compression=2,
-        tokens_saved_cli_filtering=3,
         tokens_saved_cache_reads=4,
         compression_savings_usd=1.5,
         cache_savings_usd=2.5,
     )
-    # PR-G2: also write a raw RTK delta directly to assert the persisted
-    # ``rtk_raw`` field round-trips independently of cli_filtering.
-    tracker.update_contribution(tokens_saved_rtk=9)
     tracker._state.poll_count = 7
     tracker._persist_state()
 
     loader = SubscriptionTracker(persist_path=persist_path)
     assert loader._state.contribution.tokens_submitted == 11
     assert loader._state.contribution.tokens_saved_compression == 2
-    # PR-G2: the raw counters now round-trip independently of the legacy
-    # dashboard alias.
-    assert loader._state.contribution.tokens_saved_cli_filtering == 3
-    assert loader._state.contribution.tokens_saved_rtk == 9
     assert loader._state.contribution.tokens_saved_cache_reads == 4
-    # ``compression`` is ``proxy_compression + cli_filtering_saved()`` =
-    # ``2 + max(3, 9)`` = 11 after PR-G2 (was 5 when rtk mirrored
-    # cli_filtering).
-    assert loader._state.contribution.to_dict()["tokens_saved"]["compression"] == 11
+    assert loader._state.contribution.to_dict()["tokens_saved"]["compression"] == 2
     assert loader._state.contribution.to_dict()["tokens_saved"]["proxy_compression"] == 2
-    # Dashboard ``cli_filtering`` / ``rtk`` keys remain ``max(cli, rtk)``
-    # for legacy display — 9 wins. Raw counters expose the un-aliased
-    # values for the tracker's own round-trip.
-    assert loader._state.contribution.to_dict()["tokens_saved"]["cli_filtering"] == 9
-    assert loader._state.contribution.to_dict()["tokens_saved"]["rtk"] == 9
-    assert loader._state.contribution.to_dict()["tokens_saved"]["cli_filtering_raw"] == 3
-    assert loader._state.contribution.to_dict()["tokens_saved"]["rtk_raw"] == 9
     assert loader._state.contribution.compression_savings_usd == 1.5
     assert loader._state.contribution.cache_savings_usd == 2.5
     assert loader._state.poll_count == 7
@@ -317,3 +392,52 @@ def test_persist_and_load_state_round_trip(tmp_path: Path, monkeypatch: pytest.M
 
     missing = SubscriptionTracker(persist_path=tmp_path / "missing.json")
     assert missing._state.poll_count == 0
+
+
+def test_load_state_written_before_cli_context_tools_were_removed(tmp_path: Path) -> None:
+    """A pre-removal state file must still load; the retired keys are ignored.
+
+    Older releases persisted ``cli_filtering`` / ``cli_filtering_raw`` / ``rtk``
+    / ``rtk_raw`` counters, and wrote the dashboard-facing ``compression`` as
+    proxy-compression *plus* CLI filtering. Those files are still on users'
+    disks, so the loader must neither raise on the extra keys nor double-count
+    the inflated ``compression`` value — it prefers ``proxy_compression``.
+    """
+    persist_path = tmp_path / "tracker-state.json"
+    persist_path.write_text(
+        json.dumps(
+            {
+                "poll_count": 7,
+                "contribution": {
+                    "tokens_submitted": 11,
+                    "tokens_saved": {
+                        # 2 (proxy) + 9 (retired CLI layer) as older code wrote it.
+                        "compression": 11,
+                        "proxy_compression": 2,
+                        "cli_filtering": 9,
+                        "cli_filtering_raw": 3,
+                        "rtk": 9,
+                        "rtk_raw": 9,
+                        "cache_reads": 4,
+                        "total": 15,
+                    },
+                    "savings_usd": {"compression": 1.5, "cache": 2.5},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loader = SubscriptionTracker(persist_path=persist_path)
+
+    assert loader._state.poll_count == 7
+    assert loader._state.contribution.tokens_submitted == 11
+    # The raw proxy field wins, so the retired layer's tokens are not counted.
+    assert loader._state.contribution.tokens_saved_compression == 2
+    assert loader._state.contribution.tokens_saved_cache_reads == 4
+    assert loader._state.contribution.compression_savings_usd == 1.5
+    assert loader._state.contribution.cache_savings_usd == 2.5
+    # The retired keys are gone from what the tracker now emits.
+    emitted = loader._state.contribution.to_dict()["tokens_saved"]
+    assert "cli_filtering" not in emitted
+    assert "rtk" not in emitted

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from headroom.providers.grok.runtime import DEFAULT_API_URL
+
 
 def proxy_base_url(port: int) -> str:
     """Return the local proxy base URL for OpenAI-compatible Grok traffic."""
@@ -40,6 +42,8 @@ def render_setup_lines(port: int, project: str | None = None) -> list[str]:
         "  ~/.grok/config.toml has been updated with:",
         "    [model.grok-build]",
         f'    base_url = "{target.base_url}"',
+        "",
+        f"  Proxy upstream (OpenAI-compatible): {DEFAULT_API_URL}",
         "",
         "  Start Grok Build in this project directory:",
         "    grok",

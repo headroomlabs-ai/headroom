@@ -36,8 +36,13 @@ def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
         return True
     if isinstance(system, list):
         for block in system:
-            if isinstance(block, dict) and block.get("text", "").startswith(_STEERING_SENTINEL):
-                if block["text"] == text:
+            # Guard the text is a string before ``startswith``: a malformed
+            # client block (``{"type": "text", "text": null}``) would otherwise
+            # raise ``AttributeError`` here and 500 the request. The OpenAI chat
+            # sibling below already guards this exact case.
+            block_text = block.get("text") if isinstance(block, dict) else None
+            if isinstance(block_text, str) and block_text.startswith(_STEERING_SENTINEL):
+                if block_text == text:
                     return False
                 block["text"] = text
                 return True

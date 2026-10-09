@@ -2,7 +2,9 @@
 
 # CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
 # The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
+import logging
 import os
+import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -17,17 +19,115 @@ import pytest
 from tests._skip_helpers import external_model_skip_reason
 
 
+@pytest.fixture(autouse=True)
+def _undo_process_trust_injection():
+    """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
+
+    Invoking the CLI (``CliRunner`` on ``main``) or starting the proxy calls
+    ``ensure_process_trust()``, which swaps ``ssl.SSLContext`` process-wide.
+    Left in place it leaks into later tests (server-side test contexts, OpenSSL
+    store stats), so restore the stdlib class after each test.
+    """
+    yield
+    try:
+        from headroom.proxy import ssl_context
+    except Exception:
+        return
+    os.environ.pop(ssl_context.PROCESS_TRUST_ENV, None)
+    ssl_context._system_ctx_cache.clear()
+    if ssl_context._process_trust_injected:
+        import truststore
+
+        truststore.extract_from_ssl()
+        ssl_context._process_trust_injected = False
+
+
 # A live `headroom` dev session exports HEADROOM_* into the shell (and the
 # Claude wrap adds ANTHROPIC_CUSTOM_HEADERS). Click `envvar=` options pick
 # those up inside CliRunner, so assertions would see the developer's proxy
 # config instead of the test's. Scrub them so local runs match CI; tests
 # that need a value set it explicitly via monkeypatch or CliRunner env.
 @pytest.fixture(autouse=True)
-def _scrub_developer_headroom_env(monkeypatch):
+def _skip_proxy_dependency_gate_unless_exercised(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Most CLI tests run without headroom-ai[proxy] extras installed."""
+    if request.node.get_closest_marker("proxy_dependency_gate") is not None:
+        return
+    try:
+        from headroom.cli import proxy
+    except ModuleNotFoundError:
+        # Native-wrapper jobs intentionally install only pytest and exercise the
+        # installer scripts without importing Headroom's runtime dependencies.
+        return
+    monkeypatch.setattr(proxy, "ensure_proxy_dependencies", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _scrub_developer_headroom_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("HEADROOM_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    # Clearing HEADROOM_* alone leaves file-backed settings active. Give every
+    # test its own store so proxy/CLI startup cannot load developer settings and
+    # saves cannot rewrite them. Tests of path precedence can override this.
+    monkeypatch.setenv("HEADROOM_SETTINGS_PATH", str(tmp_path / "headroom-settings.json"))
+    # The scrub also deletes the HEADROOM_HARD_WATCHDOG_SECS=0 opt-out CI sets
+    # (#3845), so every test that enters the proxy lifespan armed the 90s
+    # production watchdog inside pytest; it hard-exits the process with code 1
+    # and no summary. Tests of the watchdog set the variable themselves.
+    monkeypatch.setenv("HEADROOM_HARD_WATCHDOG_SECS", "0")
+
+
+# The scrub above deletes every HEADROOM_* var — which includes HEADROOM_BEACON,
+# and the beacon defaults to ON. So scrubbing for hermeticity is precisely what
+# switches it on, and with HEADROOM_TELEMETRY_ENDPOINT scrubbed too it falls back
+# to the real production endpoint. Every test that reaches the outcome funnel
+# then POSTs a session event for real: observed writing into the live corpus
+# during a local run, and CI would do the same on every push.
+#
+# Depends on the scrub fixture so it is guaranteed to run after it rather than
+# relying on declaration order. A test that wants the beacon on just sets the
+# var itself — monkeypatch inside the test wins over this.
+@pytest.fixture(autouse=True)
+def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
+# `wrap`/`init`/`doctor` probe loopback ports (and read deployment manifests)
+# to find a live Headroom proxy when --port is left at its default. A
+# developer's running proxy would make CLI tests non-deterministic, so
+# discovery is off unless a test turns it back on. A developer's CODEX_HOME
+# would likewise redirect every Codex path helper away from the test's tmp home.
+@pytest.fixture(autouse=True)
+def _disable_live_proxy_discovery(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "0")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+
+# The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
+# test that registers a server (directly or through `wrap`) writes into the
+# developer's REAL ledger — observed adding a live `claude/serena` entry during a
+# local run. Since the scrub above deletes HEADROOM_WORKSPACE_DIR, the default is
+# always the real home. Redirect the ledger per-test instead: every writer
+# (`record_install` / `clear_install` / `headroom_installed_matching`) resolves it
+# through this module-global, so one patch covers them all. Patched here rather
+# than pointing workspace_dir() at a tmp path, which would break the tests that
+# assert the default workspace layout.
+@pytest.fixture(autouse=True)
+def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
+    # Same guard as _reset_copilot_routing_flag below: the macos/windows-native-
+    # wrapper CI jobs install only pytest and drive the installer shell scripts
+    # via subprocess, so headroom isn't importable and there is no ledger to
+    # redirect. Skip there instead of erroring at setup.
+    try:
+        from headroom.mcp_registry import ledger
+    except ModuleNotFoundError:
+        return
+
+    ledger_file = tmp_path_factory.mktemp("mcp-ledger") / "mcp_installs.json"
+    monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
 
 
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
@@ -50,6 +150,29 @@ def _reset_copilot_routing_flag():
     reset_request_routed_to_copilot()
     yield
     reset_request_routed_to_copilot()
+
+
+# `savings_tracker._resolve_litellm_model` is an `lru_cache`d, module-global,
+# process-lifetime cache keyed by model name (bounded — see #2860). Many test
+# files monkeypatch `savings_tracker.litellm` to a fake with different
+# `model_cost`/`cost_per_token` behavior per test, but reuse common model
+# names like "gpt-4o" across them. Without a reset, whichever test resolves
+# "gpt-4o" first "wins" the cache entry for the rest of the run, and later
+# tests silently stop exercising their own fake — a real-not-hypothetical
+# order-dependence bug once the cache is process-lifetime instead of per-call.
+# Clear before AND after so a test's own within-test resolutions never leak
+# in from, or leak out to, a neighboring test either.
+@pytest.fixture(autouse=True)
+def _reset_litellm_model_resolution_cache():
+    try:
+        from headroom.proxy.savings_tracker import _resolve_litellm_model
+    except ModuleNotFoundError:
+        yield
+        return
+
+    _resolve_litellm_model.cache_clear()
+    yield
+    _resolve_litellm_model.cache_clear()
 
 
 # =============================================================================
@@ -77,16 +200,61 @@ def pytest_runtest_call(item):
 
 
 @pytest.fixture(autouse=True)
+def _null_binary_pins():
+    """Null the tools.json SHA-256 pins during tests.
+
+    Installer tests fetch small mock archives, whose digests can't match the
+    real published pins. Nulling the pins lets those download/extract mechanics
+    tests run; the tests that specifically exercise verification set their own
+    pin explicitly. Production keeps the real pins (this fixture is test-only)
+    and the tools-hash-refresh CI gate guarantees they stay correct.
+
+    Nulling a pin used to mean "fall back to HTTPS trust". It now means
+    "refuse", so the escape hatch has to be set alongside it or every test that
+    reaches a real download fails closed -- which is what happened to
+    test_bundled_tools_savings.py on a cold CI cache, while passing locally
+    against an already-populated one. Setting both together keeps this fixture
+    saying one thing: "verification is not what these tests are about."
+    Verification tests delenv it in their own fixture.
+    """
+    try:
+        from headroom import binaries
+    except Exception:
+        # Lean CI environments (e.g. the native-installer jobs) omit heavy deps
+        # such as opentelemetry that importing `binaries` pulls in. There are no
+        # tool pins to null there, so skip cleanly rather than erroring at setup.
+        yield
+        return
+
+    saved = [
+        (asset, asset.get("sha256"))
+        for tool in binaries._registry().get("tools", {}).values()
+        for asset in tool.get("assets", {}).values()
+    ]
+    for asset, _original in saved:
+        asset["sha256"] = None
+    previous = os.environ.get("HEADROOM_BINARIES_ALLOW_UNVERIFIED")
+    os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("HEADROOM_BINARIES_ALLOW_UNVERIFIED", None)
+        else:
+            os.environ["HEADROOM_BINARIES_ALLOW_UNVERIFIED"] = previous
+        for asset, original in saved:
+            asset["sha256"] = original
+
+
+@pytest.fixture(autouse=True)
 def _reset_headroom_logger_propagation():
     """Keep `headroom.*` log records flowing to pytest's caplog handler.
 
-    Two sources disable propagation on the headroom logger tree and never
-    restore it, which then makes later `caplog`-based assertions flaky in
+    A benchmark helper disables propagation on the headroom logger tree and
+    never restores it, which then makes later `caplog`-based assertions flaky in
     full-suite runs (caplog attaches to root, so a `propagate=False` anywhere
     on the chain silently drops the records):
 
-    - ``headroom.proxy.helpers._setup_file_logging`` sets
-      ``getLogger("headroom").propagate = False`` on proxy startup.
     - ``benchmarks.claude_session_mode_benchmark._disable_headroom_benchmark_logging``
       (exercised by ``test_claude_session_mode_benchmark``) sets
       ``propagate = False`` + ``CRITICAL`` on ``headroom``, ``headroom.proxy``,
@@ -312,3 +480,84 @@ def sample_request_metrics():
         turns_dropped=0,
         messages_hash="def456",
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kompress_model_cache():
+    """Keep one test's loaded Kompress model out of every later test's ``/readyz``.
+
+    ``KompressCompressor.preload()`` stores the loaded handle in a MODULE-LEVEL
+    dict keyed by model id (``kompress_compressor._kompress_cache``). Tests that
+    exercise preload patch the *loader* to return a fake model, but the fake is
+    still written to that real dict under the real ``HF_MODEL_ID`` -- and
+    nothing ever removed it.
+
+    The proxy health endpoint then found it. ``_reconcile_kompress_health``
+    asks each pipeline's ContentRouter for an already-instantiated compressor
+    and calls ``is_ready()`` / ``ready_backend()``, both of which are reads of
+    that same module dict, so a *brand-new* proxy in a later test reported
+    ``kompress: {ready: true, backend: "onnx", status: "healthy"}`` when nothing
+    had been loaded. Four ``tests/test_proxy_health.py`` cases failed in a full
+    run and passed in isolation, which is the signature of exactly this.
+
+    Snapshot/restore rather than an unconditional clear: a test that installs
+    its own cache (several ``monkeypatch.setattr(kc, "_kompress_cache", ...)``
+    do) must keep it for its own duration.
+
+    Costs nothing for the ~13k tests that never touch ML: the module is only
+    consulted through ``sys.modules``, so this never imports it.
+    """
+    module_name = "headroom.transforms.kompress_compressor"
+    before = sys.modules.get(module_name)
+    # None when the module has not been imported yet, so anything found at
+    # teardown was put there by this test.
+    snapshot = dict(getattr(before, "_kompress_cache", {})) if before is not None else None
+
+    yield
+
+    after = sys.modules.get(module_name)
+    if after is None:
+        return
+    cache = getattr(after, "_kompress_cache", None)
+    if cache is None:
+        return
+    cache.clear()
+    if snapshot:
+        cache.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _detach_leaked_proxy_log_handler():
+    """Stop one test's proxy file logger from following the whole session around.
+
+    ``_setup_file_logging`` attaches a named handler to the ``headroom`` logger
+    and nothing detaches it, so any test that builds a proxy app leaves it in
+    place for every later test. That broke
+    ``test_runtime_log_refuses_a_symlinked_path``, which asserts no such handler
+    is attached after a refused setup: the handler it found was a LEFTOVER from
+    ``tests/gateway/test_compress_turn_seam.py``, not one the refused call
+    created, so the test reported a security regression that had not happened.
+
+    The leaked handler also pointed at ``~/.headroom/logs/proxy-8787.log`` --
+    the developer's real home directory, not a tmp_path -- so the leak was
+    writing outside the test sandbox as well. That part is worth fixing at the
+    source; this only stops it leaking forward.
+
+    Detach rather than close-and-keep: a handler attached during a test belongs
+    to that test's app, and its file may live in a ``tmp_path`` that is about to
+    disappear underneath it.
+    """
+    yield
+
+    helpers = sys.modules.get("headroom.proxy.helpers")
+    handler_name = getattr(helpers, "_PROXY_LOG_HANDLER_NAME", None)
+    if handler_name is None:
+        return
+    logger = logging.getLogger("headroom")
+    for handler in list(logger.handlers):
+        if getattr(handler, "name", None) == handler_name:
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:  # pragma: no cover - a closed/rotated file is fine
+                pass

@@ -2,6 +2,8 @@
 
 Context compression plugin for [OpenClaw](https://github.com/openclaw/openclaw). Compresses tool outputs, code, logs, and structured data — 70-90% token savings with zero LLM calls.
 
+Tool-call normalization preserves provider metadata, including thought signatures, when restoring assistant turns after compression.
+
 ## Install
 
 Recommended one-command setup:
@@ -205,15 +207,19 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
 | `autoStart` | `false` | Opt-in auto-start for a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies). Keep `false` when systemd owns the proxy. |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
+| `requestTimeoutMs` | `30000` | Maximum milliseconds to wait for a single `compress()` call. If the proxy hangs or is slow, the call is cancelled after this deadline and the original uncompressed messages are used as a fallback. |
+| `circuitBreakerThreshold` | `3` | Number of consecutive `assemble()` errors before the circuit breaker opens and all requests bypass the proxy. Prevents cascading failures when the proxy is unhealthy. |
+| `circuitBreakerCooldownMs` | `60000` | How long (ms) the circuit breaker stays open after the threshold is reached. After the cool-down the breaker resets automatically and the next request re-probes the proxy via `/health`. |
 | `routeCodexViaProxy` | `true` | Rewrite OpenClaw's built-in `openai-codex` provider to use the active Headroom proxy in memory so upstream Codex requests pass through Headroom. |
 | `gatewayProviderIds` | `[]` | Optional explicit list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases `codex`, `claude`, `copilot`, and `gemini` are also accepted. When set, this overrides the default `openai-codex` routing list. |
+| `announceCompression` | `true` | Adds a static, cache-stable notice to the system prompt the first time a session compresses more than 100 tokens, then keeps it unchanged for the rest of the session. Set to `false` to guarantee Headroom never modifies the system prompt. |
 
 ## Comparison with lossless-claw
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | Content-aware compression (zero LLM) |
-| Cost of compaction | Tokens (LLM calls) | Zero |
+| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
+| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
 

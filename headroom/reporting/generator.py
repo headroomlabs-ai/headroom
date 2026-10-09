@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..storage import create_storage
-from ..utils import estimate_cost, format_cost
+from ..utils import format_cost
 
 if TYPE_CHECKING:
     pass
@@ -18,7 +18,9 @@ def _get_jinja2_template(template_str: str):
     try:
         from jinja2 import Template
 
-        return Template(template_str)
+        # Request fields such as ``model`` come from clients; escape them so a
+        # crafted value cannot inject script into the report.
+        return Template(template_str, autoescape=True)
     except ImportError as e:
         raise ImportError(
             "jinja2 is required for report generation. Install with: pip install headroom[reports]"
@@ -337,9 +339,16 @@ def generate_report(
             tpm_multiplier = 1.0
 
         # Estimate cost savings (using gpt-4o pricing)
-        cost_before = estimate_cost(stats["total_tokens_before"], 0, "gpt-4o") or 0.0
-        cost_after = estimate_cost(stats["total_tokens_after"], 0, "gpt-4o") or 0.0
-        estimated_savings = format_cost(cost_before - cost_after)
+        # Imported here: the LiteLLM-backed pricer costs ~1.2s of import time.
+        from ..models.registry import ModelRegistry
+
+        cost_before = ModelRegistry.estimate_cost("gpt-4o", stats["total_tokens_before"], 0)
+        cost_after = ModelRegistry.estimate_cost("gpt-4o", stats["total_tokens_after"], 0)
+        # "Cannot price this" is not "$0 saved", so an unpriced report says so.
+        if cost_before is None or cost_after is None:
+            estimated_savings = "unavailable"
+        else:
+            estimated_savings = format_cost(cost_before - cost_after)
 
         stats["tpm_multiplier"] = tpm_multiplier
         stats["estimated_savings"] = estimated_savings

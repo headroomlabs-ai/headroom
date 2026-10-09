@@ -22,7 +22,7 @@ def default_api_url(environ: Mapping[str, str] | None = None) -> str:
     if host:
         if host.startswith("https://"):
             return host
-        if ".snowflakecomputing.com" in host:
+        if host.endswith(".snowflakecomputing.com"):
             return f"https://{host}"
         return f"https://{host}.snowflakecomputing.com"
     return _FALLBACK_API_URL

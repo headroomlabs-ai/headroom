@@ -38,6 +38,9 @@ scripts/*
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
+!scripts/refresh_tool_hashes.py
+!scripts/record_kompress_fixtures.py
+!scripts/record_code_compressor_fixtures.py
 
 # Rust / Cargo build artifacts
 /target/
@@ -203,12 +206,15 @@ temp/
 .benchmarks/
 benchmark_results.json
 benchmark_results/
+examples/vertex_gemini_benchmark/results.json
 
 # DeepEval cache
 .deepeval/
 
 # Headroom specific
 .headroom/
+.claude/.headroom_wrap_*.json
+.claude/.headroom_wrap_settings.lock
 headroom.db
 headroom_*.db
 *.jsonl

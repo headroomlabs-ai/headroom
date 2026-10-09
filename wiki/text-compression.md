@@ -136,9 +136,13 @@ elif detection.content_type == ContentType.PLAIN_TEXT:
 
 ```python
 from headroom.transforms import (
-    detect_content_type, ContentType,
-    SearchCompressor, LogCompressor, TextCompressor
+    detect_content_type,
+    ContentType,
+    SearchCompressor,
+    LogCompressor,
+    TextCompressor,
 )
+
 
 def compress_tool_output(content: str, context: str = "") -> str:
     """Application-level compression with explicit control."""
@@ -166,7 +170,7 @@ Each compressor accepts configuration options:
 from headroom.transforms import SearchCompressor, SearchCompressorConfig
 
 config = SearchCompressorConfig(
-    max_results=50,           # Keep up to 50 matches
+    max_results=50,  # Keep up to 50 matches
     preserve_file_diversity=True,  # Ensure different files represented
     relevance_threshold=0.3,  # Minimum relevance score to keep
 )
