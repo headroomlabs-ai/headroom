@@ -2,11 +2,45 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 from ..config import TransformResult
 from ..tokenizer import Tokenizer
+
+logger = logging.getLogger(__name__)
+
+
+def persist_rust_ccr_entry(original: str, compressed: str, cache_key: str, *, source: str) -> None:
+    """Store a Rust-emitted CCR entry in the production ``CompressionStore``.
+
+    The Rust search/diff/log compressors emit a retrieval marker but keep the
+    original only in their in-memory test store. This writes it through to the
+    long-lived Python store so the marker resolves. Failures are logged at
+    warning level with ``source`` (the compressor name): a store hiccup must not
+    break the response, just degrade retrieval.
+    """
+    try:
+        from ..cache.compression_store import get_compression_store
+    except ImportError as e:
+        logger.warning(
+            "CCR store import failed (%s); cache_key %s won't persist: %s", source, cache_key, e
+        )
+        return
+    try:
+        store: Any = get_compression_store()
+        # The Rust-emitted marker embeds MD5(original)[:24], but store() has
+        # defaulted to SHA-256(original)[:24] since PR #395. Pass the marker's
+        # key explicitly so retrieving the marker hash finds the entry (#816).
+        store.store(original, compressed, explicit_hash=cache_key)
+    except Exception as e:
+        logger.warning(
+            "CCR store write failed (%s); cache_key %s remains in-marker only: %s",
+            source,
+            cache_key,
+            e,
+        )
 
 
 def split_frozen(

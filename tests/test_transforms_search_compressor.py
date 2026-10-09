@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.transforms.base import persist_rust_ccr_entry
 from headroom.transforms.search_compressor import (
     FileMatches,
     SearchCompressionResult,
@@ -98,12 +99,9 @@ def test_search_compressor_compress_paths_and_ccr() -> None:
     assert len(result.summaries) >= 1
 
 
-def test_search_compressor_persist_to_python_ccr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Phase 3e.2: CCR persistence is now in `_persist_to_python_ccr`,
-    which delegates to the production `CompressionStore`. Failures are
-    logged (not silently swallowed) — this pins both paths."""
-    compressor = SearchCompressor()
-
+def test_persist_rust_ccr_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CCR write-through delegates to the production `CompressionStore`.
+    Failures are logged (not silently swallowed) — this pins both paths."""
     seen: dict[str, tuple[str, str, str | None]] = {}
     monkeypatch.setitem(
         __import__("sys").modules,
@@ -116,7 +114,7 @@ def test_search_compressor_persist_to_python_ccr(monkeypatch: pytest.MonkeyPatch
             )
         ),
     )
-    compressor._persist_to_python_ccr("orig", "comp", "abc123")
+    persist_rust_ccr_entry("orig", "comp", "abc123", source="search")
     # explicit_hash carries the Rust marker key so retrieval of the
     # marker hash finds the entry (issue #816).
     assert seen["call"] == ("orig", "comp", "abc123")
@@ -131,7 +129,7 @@ def test_search_compressor_persist_to_python_ccr(monkeypatch: pytest.MonkeyPatch
         "headroom.cache.compression_store",
         SimpleNamespace(get_compression_store=broken_store),
     )
-    compressor._persist_to_python_ccr("orig", "comp", "abc123")  # must not raise
+    persist_rust_ccr_entry("orig", "comp", "abc123", source="search")  # must not raise
 
 
 def test_search_compression_result_properties() -> None:

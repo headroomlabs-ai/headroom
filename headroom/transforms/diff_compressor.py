@@ -20,11 +20,10 @@ fallback. Build it locally with `scripts/build_rust_extension.sh`
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from .base import persist_rust_ccr_entry
 
 
 @dataclass
@@ -113,7 +112,7 @@ class DiffCompressor:
             # call. Without this, every diff CCR marker emitted in
             # production is dangling — the regression fixed in the
             # audit-cleanup PR.
-            self._persist_to_python_ccr(content, r.compressed, cache_key)
+            persist_rust_ccr_entry(content, r.compressed, cache_key, source="diff")
         return DiffCompressionResult(
             compressed=r.compressed,
             original_line_count=r.original_line_count,
@@ -125,31 +124,6 @@ class DiffCompressor:
             hunks_removed=r.hunks_removed,
             cache_key=cache_key,
         )
-
-    def _persist_to_python_ccr(self, original: str, compressed: str, cache_key: str) -> None:
-        """Promote a Rust-emitted cache_key into the production Python
-        CompressionStore. Failures are logged at warning level — a
-        store hiccup must not break the response, just degrade
-        retrieval. Mirrors the same helper on log_compressor.py and
-        search_compressor.py."""
-        try:
-            from ..cache.compression_store import get_compression_store
-        except ImportError as e:
-            logger.warning("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
-            return
-        try:
-            store: Any = get_compression_store()
-            # The Rust-emitted marker embeds MD5(original)[:24], but
-            # store() has defaulted to SHA-256(original)[:24] since
-            # PR #395. Pass the marker's key explicitly so retrieving
-            # the marker hash actually finds the entry (issue #816).
-            store.store(original, compressed, explicit_hash=cache_key)
-        except Exception as e:
-            logger.warning(
-                "CCR store write failed; cache_key %s remains in-marker only: %s",
-                cache_key,
-                e,
-            )
 
     def compress_with_stats(
         self, content: str, context: str = ""

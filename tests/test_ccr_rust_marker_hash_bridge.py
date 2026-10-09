@@ -4,13 +4,14 @@ The Rust side embeds ``MD5(original)[:24]`` in the emitted
 ``Retrieve more: hash=...`` marker, but since PR #395
 ``CompressionStore.store()`` defaults to ``SHA-256(original)[:24]``.
 PR #395 fixed the SmartCrusher path by passing ``explicit_hash``
-(see ``test_ccr_row_drop_store_bridge.py``); the three
-``_persist_to_python_ccr`` shims on the Rust-accelerated transforms
-were never migrated, so every marker they emitted dangled —
-retrieval returned "Entry not found or expired" inside any TTL.
+(see ``test_ccr_row_drop_store_bridge.py``); the CCR write-through
+used by the Rust-accelerated transforms was never migrated, so every
+marker they emitted dangled — retrieval returned "Entry not found or
+expired" inside any TTL.
 
-These tests pin the cross-language contract at the shim layer: the
-store entry must be keyed by the exact hash the marker embeds.
+These tests pin the cross-language contract at the shared
+``persist_rust_ccr_entry`` helper: the store entry must be keyed by the
+exact hash the marker embeds.
 """
 
 from __future__ import annotations
@@ -23,9 +24,7 @@ from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
 )
-from headroom.transforms.diff_compressor import DiffCompressor
-from headroom.transforms.log_compressor import LogCompressor
-from headroom.transforms.search_compressor import SearchCompressor
+from headroom.transforms.base import persist_rust_ccr_entry
 
 pytest.importorskip("headroom._core", reason="Rust extension required")
 
@@ -61,25 +60,16 @@ def _assert_round_trip(original: str) -> None:
     )
 
 
-def test_search_compressor_shim_stores_under_marker_key() -> None:
-    original = "src/app.py:12: def handle_request(payload):\n" * 40
-    SearchCompressor()._persist_to_python_ccr(
-        original, "compressed search output", _rust_marker_key(original)
-    )
-    _assert_round_trip(original)
-
-
-def test_diff_compressor_shim_stores_under_marker_key() -> None:
-    original = "+added line of code\n-removed line of code\n" * 40
-    DiffCompressor()._persist_to_python_ccr(
-        original, "compressed diff output", _rust_marker_key(original)
-    )
-    _assert_round_trip(original)
-
-
-def test_log_compressor_shim_stores_under_marker_key() -> None:
-    original = "2026-06-11T09:00:00Z INFO worker heartbeat ok seq=1\n" * 40
-    LogCompressor()._persist_to_python_ccr(
-        original, "compressed log output", _rust_marker_key(original)
+@pytest.mark.parametrize(
+    ("source", "original"),
+    [
+        ("search", "src/app.py:12: def handle_request(payload):\n" * 40),
+        ("diff", "+added line of code\n-removed line of code\n" * 40),
+        ("log", "2026-06-11T09:00:00Z INFO worker heartbeat ok seq=1\n" * 40),
+    ],
+)
+def test_persist_stores_under_marker_key(source: str, original: str) -> None:
+    persist_rust_ccr_entry(
+        original, f"compressed {source} output", _rust_marker_key(original), source=source
     )
     _assert_round_trip(original)

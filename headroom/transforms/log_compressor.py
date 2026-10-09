@@ -47,6 +47,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, cast
 
+from .base import persist_rust_ccr_entry
+
 logger = logging.getLogger(__name__)
 
 
@@ -291,7 +293,7 @@ class LogCompressor:
         rust_result = self._rust.compress(content, bias)
         cache_key: str | None = rust_result.cache_key
         if cache_key is not None:
-            self._persist_to_python_ccr(content, rust_result.compressed, cache_key)
+            persist_rust_ccr_entry(content, rust_result.compressed, cache_key, source="log")
 
         stats_dict = {k: int(v) for k, v in cast("dict[str, int]", rust_result.stats).items()}
         return LogCompressionResult(
@@ -612,9 +614,8 @@ class LogCompressor:
         return "\n".join(output_lines), stats
 
     def _store_in_ccr(self, original: str, compressed: str, original_count: int) -> str | None:
-        """Backwards-compat shim — the legacy callsite name. Now
-        delegates to `_persist_to_python_ccr`. Returns the stored
-        cache_key if persistence succeeded, else None.
+        """Backwards-compat shim — the legacy callsite name. Returns the
+        stored cache_key if persistence succeeded, else None.
         """
         # Compute the same cache key the Rust path would (MD5 of
         # original truncated to 24 hex chars).
@@ -635,28 +636,6 @@ class LogCompressor:
         except Exception as e:
             logger.warning("CCR store write failed; cache_key %s not persisted: %s", cache_key, e)
             return None
-
-    def _persist_to_python_ccr(self, original: str, compressed: str, cache_key: str) -> None:
-        """Promote a Rust-emitted cache_key into the production Python
-        CompressionStore. Failures are logged at warning level."""
-        try:
-            from ..cache.compression_store import get_compression_store
-        except ImportError as e:
-            logger.warning("CCR store import failed; cache_key %s won't persist: %s", cache_key, e)
-            return
-        try:
-            store: Any = get_compression_store()
-            # The Rust-emitted marker embeds MD5(original)[:24], but
-            # store() has defaulted to SHA-256(original)[:24] since
-            # PR #395. Pass the marker's key explicitly so retrieving
-            # the marker hash actually finds the entry (issue #816).
-            store.store(original, compressed, explicit_hash=cache_key)
-        except Exception as e:
-            logger.warning(
-                "CCR store write failed; cache_key %s remains in-marker only: %s",
-                cache_key,
-                e,
-            )
 
 
 __all__ = [
