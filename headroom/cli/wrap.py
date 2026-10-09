@@ -87,7 +87,6 @@ from headroom.providers.antigravity import (
     render_setup_lines as _render_antigravity_setup_lines,
 )
 from headroom.providers.claude import (
-    CONTEXT_1M_SUFFIX,
     DEFAULT_1M_MODEL,
     HEADROOM_1M_MODEL_ENV,
     REMOTE_CONTROL_BASE_URL_ENV,
@@ -192,9 +191,6 @@ from headroom.providers.openclaw import (
 )
 from headroom.providers.openclaw import (
     decode_entry_json as _decode_openclaw_entry_json_impl,
-)
-from headroom.providers.openclaw import (
-    normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
 from headroom.providers.opencode import build_launch_env as _build_opencode_launch_env
 from headroom.providers.opencode.config import (
@@ -331,15 +327,6 @@ def _append_text(path: Path, content: str) -> None:
     fsutil.append_text(path, content)
 
 
-_AGENT_SAVINGS_TARGET_AGENTS = {
-    "antigravity",
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "grok_build",
-    "opencode",
-}
 _WRAP_PROXY_TIMEOUT_ENV = "HEADROOM_WRAP_PROXY_TIMEOUT"
 _WRAP_PROXY_TIMEOUT_DEFAULT_SECONDS = 45
 _WRAP_PROXY_TIMEOUT_ML_DEFAULT_SECONDS = 90
@@ -373,10 +360,8 @@ _CLAUDE_PROJECT_SETTINGS_ENV = "HEADROOM_CLAUDE_PROJECT_SETTINGS"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 # Private aliases preserve the standalone wrapper's existing test and import
 # surface while the provider runtime owns the 1M selection contract.
-_CONTEXT_1M_SUFFIX = CONTEXT_1M_SUFFIX
 _1M_MODEL_ENV = HEADROOM_1M_MODEL_ENV
 _DEFAULT_1M_MODEL = DEFAULT_1M_MODEL
-_OPENCLAUDE_INSTRUCTIONS_FILE = "CONVENTIONS.md"
 
 
 _resolve_1m_model = resolve_1m_model
@@ -1701,25 +1686,6 @@ def _wrap_proxy_alive(port: int, *, attempts: int = 3, delay: float = 0.25) -> b
         if attempt < attempts - 1:
             time.sleep(delay)
     return False
-
-
-def _wrap_marker_proxy_is_dead(marker: dict[str, Any]) -> bool:
-    """True if ``marker`` records a proxy ``port`` that no longer accepts
-    connections.
-
-    Port liveness is the authoritative signal for a wrap session that vanished
-    without running its cleanup (hard reboot / SIGKILL, issue #2221): the
-    recorded PID is unreliable because a reboot can recycle it onto an
-    unrelated live process, so a PID that still looks alive does not prove the
-    proxy is up. A marker with no recorded port returns False here (fall back
-    to PID-based staleness); a marker whose port IS responding is a live
-    session and must never be treated as dead. Uses the retry-hardened
-    ``_wrap_proxy_alive`` so a momentary blip never reads as dead.
-    """
-    port = marker.get("port")
-    if not isinstance(port, int):
-        return False
-    return not _wrap_proxy_alive(port)
 
 
 def _clear_wrap_marker(settings_path: Path, *, key: str) -> None:
@@ -4069,76 +4035,6 @@ def _env_bool_value(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _agent_savings_config_mismatches(
-    running_config: dict[str, Any],
-    agent_type: str,
-) -> list[str]:
-    """Return restart reasons when a running proxy lacks target agent savings."""
-
-    if agent_type not in _AGENT_SAVINGS_TARGET_AGENTS:
-        return []
-
-    if _wrap_agent_savings_profile(agent_type) is None:
-        return []
-
-    desired_env = os.environ.copy()
-    apply_agent_savings_env_defaults(desired_env)
-    checks: tuple[tuple[str, str, str, str], ...] = (
-        ("HEADROOM_SAVINGS_PROFILE", "savings_profile", "savings-profile", "str"),
-        ("HEADROOM_TARGET_RATIO", "target_ratio", "target-ratio", "float"),
-        (
-            "HEADROOM_COMPRESS_USER_MESSAGES",
-            "compress_user_messages",
-            "compress-user-messages",
-            "bool",
-        ),
-        (
-            "HEADROOM_COMPRESS_SYSTEM_MESSAGES",
-            "compress_system_messages",
-            "compress-system-messages",
-            "bool",
-        ),
-        ("HEADROOM_PROTECT_RECENT", "protect_recent", "protect-recent", "int"),
-        (
-            "HEADROOM_PROTECT_ANALYSIS_CONTEXT",
-            "protect_analysis_context",
-            "protect-analysis-context",
-            "bool",
-        ),
-        ("HEADROOM_MIN_TOKENS", "min_tokens_to_crush", "min-tokens", "int"),
-        ("HEADROOM_MAX_ITEMS", "max_items_after_crush", "max-items", "int"),
-        (
-            "HEADROOM_SMART_CRUSHER_COMPACTION",
-            "smart_crusher_with_compaction",
-            "smart-crusher-compaction",
-            "bool",
-        ),
-        ("HEADROOM_ACCURACY_GUARD", "accuracy_guard", "accuracy-guard", "str"),
-    )
-
-    mismatches: list[str] = []
-    for env_key, config_key, label, value_type in checks:
-        expected = desired_env.get(env_key)
-        if expected is None:
-            continue
-        actual = running_config.get(config_key)
-        try:
-            if value_type == "float":
-                matches = actual is not None and abs(float(actual) - float(expected)) < 1e-9
-            elif value_type == "int":
-                matches = actual is not None and int(actual) == int(expected)
-            elif value_type == "bool":
-                matches = actual is not None and bool(actual) is _env_bool_value(expected)
-            else:
-                matches = str(actual or "").strip().lower() == expected.strip().lower()
-        except (TypeError, ValueError):
-            matches = False
-        if not matches:
-            mismatches.append(label)
-
-    return mismatches
-
-
 def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     """Return active session count from /health runtime metadata."""
     if payload is None:
@@ -5640,11 +5536,6 @@ def _resolve_openclaw_extensions_dir(openclaw_bin: str) -> Path:
         )
     config_path = Path(config_path_str).expanduser()
     return config_path.parent / "extensions"
-
-
-def _normalize_openclaw_gateway_provider_ids(provider_ids: tuple[str, ...] | None) -> list[str]:
-    """Normalize configured OpenClaw provider ids, defaulting to openai-codex."""
-    return _normalize_openclaw_gateway_provider_ids_impl(provider_ids)
 
 
 def _read_openclaw_config_value(openclaw_bin: str, path: str) -> Any | None:
@@ -8736,14 +8627,6 @@ def opencode(
                     _opencode_proxy.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     _opencode_proxy.kill()
-
-
-def _opencode_home_dir() -> Path:
-    """Return the OpenCode home/config directory."""
-    env_path = os.environ.get("OPENCODE_HOME", "").strip()
-    if env_path:
-        return Path(env_path).expanduser()
-    return Path.home() / ".config" / "opencode"
 
 
 # =============================================================================

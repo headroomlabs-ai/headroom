@@ -341,12 +341,6 @@ def test_wrap_agent_savings_profile_is_opt_in(monkeypatch) -> None:
     assert wrap_module._wrap_agent_savings_profile("codex") == AGENT_90_PROFILE
 
 
-def test_agent_savings_config_mismatches_requires_explicit_profile(monkeypatch) -> None:
-    monkeypatch.delenv("HEADROOM_SAVINGS_PROFILE", raising=False)
-
-    assert wrap_module._agent_savings_config_mismatches({}, "claude") == []
-
-
 def test_start_proxy_does_not_inject_agent_savings_by_default(monkeypatch, tmp_path) -> None:
     captured_env: dict[str, str] = {}
 
@@ -395,77 +389,6 @@ def test_start_proxy_injects_explicit_agent_savings_profile(monkeypatch, tmp_pat
 
     assert captured_env["HEADROOM_SAVINGS_PROFILE"] == AGENT_90_PROFILE
     assert captured_env["HEADROOM_TARGET_RATIO"] == "0.10"
-
-
-def test_agent_savings_config_mismatches_returns_specific_labels(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    profile = get_agent_savings_profile(AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": profile.name,
-        "target_ratio": 0.20,
-        "compress_user_messages": profile.compress_user_messages,
-        "compress_system_messages": profile.compress_system_messages,
-        "protect_recent": profile.protect_recent,
-        "protect_analysis_context": profile.protect_analysis_context,
-        "min_tokens_to_crush": profile.min_tokens_to_compress,
-        "max_items_after_crush": profile.max_items_after_crush,
-        "smart_crusher_with_compaction": profile.smart_crusher_with_compaction,
-        "accuracy_guard": profile.accuracy_guard,
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "codex") == ["target-ratio"]
-
-
-def test_agent_savings_config_mismatches_ignores_non_target_agents() -> None:
-    assert wrap_module._agent_savings_config_mismatches({}, "openhands") == []
-
-
-def test_agent_savings_config_mismatches_accepts_matching_runtime_config(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    profile = get_agent_savings_profile(AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": profile.name,
-        "target_ratio": "0.10",
-        "compress_user_messages": True,
-        "compress_system_messages": True,
-        "protect_recent": "2",
-        "protect_analysis_context": True,
-        "min_tokens_to_crush": "120",
-        "max_items_after_crush": "8",
-        "smart_crusher_with_compaction": False,
-        "accuracy_guard": "strict",
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "cursor") == []
-
-
-def test_agent_savings_config_mismatches_reports_unparseable_values(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_SAVINGS_PROFILE", AGENT_90_PROFILE)
-    running_config = {
-        "savings_profile": None,
-        "target_ratio": "not-a-float",
-        "compress_user_messages": None,
-        "compress_system_messages": None,
-        "protect_recent": "not-an-int",
-        "protect_analysis_context": None,
-        "min_tokens_to_crush": object(),
-        "max_items_after_crush": object(),
-        "smart_crusher_with_compaction": None,
-        "accuracy_guard": None,
-    }
-
-    assert wrap_module._agent_savings_config_mismatches(running_config, "claude") == [
-        "savings-profile",
-        "target-ratio",
-        "compress-user-messages",
-        "compress-system-messages",
-        "protect-recent",
-        "protect-analysis-context",
-        "min-tokens",
-        "max-items",
-        "smart-crusher-compaction",
-        "accuracy-guard",
-    ]
 
 
 def test_agent_90_profile_applies_to_proxy_config_runtime_kwargs() -> None:
