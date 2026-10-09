@@ -6,6 +6,7 @@ from collections.abc import Iterable
 
 from headroom.install.runtime import resolve_headroom_command
 
+from .agy import AgyRegistrar
 from .antigravity import AntigravityRegistrar
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
@@ -27,6 +28,7 @@ def get_all_registrars() -> list[MCPRegistrar]:
         AntigravityRegistrar(),
         ClaudeRegistrar(),
         CodexRegistrar(),
+        AgyRegistrar(),
         GrokRegistrar(),
         OpencodeRegistrar(),
     ]

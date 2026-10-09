@@ -78,6 +78,30 @@ COMPRESS_TOOL_NAME = "headroom_compress"
 STATS_TOOL_NAME = "headroom_stats"
 READ_TOOL_NAME = "headroom_read"
 
+# Canonical schema for the retrieve tool. Single source of truth: the live
+# ``list_tools()`` handler builds its ``Tool`` from these, and ``wrap agy``
+# serialises them into agy's per-tool cache so the tool is exposed on the first
+# run (see ``_setup_headroom_retrieve_mcp_agy``). Keeping both off one
+# definition stops the primed cache from drifting from what the server offers.
+CCR_RETRIEVE_TOOL_DESCRIPTION = (
+    "Retrieve original uncompressed content by hash. This is the ONLY "
+    "tool that expands Headroom compression markers — use it (not any "
+    "other retrieve/expand tool) whenever you see a marker containing "
+    "'hash=', including '[N items compressed... hash=abc123]' and "
+    "'[functionResponse compressed. Call headroom_retrieve to expand. "
+    "Retrieve more: hash=...]'. The hash is the value after 'hash='."
+)
+CCR_RETRIEVE_TOOL_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "hash": {
+            "type": "string",
+            "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
+        },
+    },
+    "required": ["hash"],
+}
+
 logger = logging.getLogger("headroom.ccr.mcp")
 
 # Feature flag: enable headroom_read tool (file read caching via CCR)
@@ -527,7 +551,11 @@ class HeadroomMCPServer:
             try:
                 result = await self._retrieve_via_proxy(hash_key)
                 if "error" not in result:
-                    result["source"] = "proxy"
+                    # headroom-8tm WU-2b: `source` as the LEADING key (before the
+                    # large `original_content`) so the agy FR compressor's
+                    # content-based envelope exemption anchors survive truncation.
+                    # Key-order only -- same keys/values.
+                    result = {"source": "proxy", **result}
                     self._stats.record_retrieval(hash_key)
                     return result
             except Exception:
@@ -666,22 +694,8 @@ class HeadroomMCPServer:
                 ),
                 Tool(
                     name=CCR_TOOL_NAME,
-                    description=(
-                        "Retrieve original uncompressed content by hash. "
-                        "Use this when you need full details from previously compressed content. "
-                        "The hash comes from headroom_compress results or from compression "
-                        "markers like [N items compressed... hash=abc123]."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "hash": {
-                                "type": "string",
-                                "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
-                            },
-                        },
-                        "required": ["hash"],
-                    },
+                    description=CCR_RETRIEVE_TOOL_DESCRIPTION,
+                    inputSchema=CCR_RETRIEVE_TOOL_INPUT_SCHEMA,
                 ),
                 Tool(
                     name=STATS_TOOL_NAME,

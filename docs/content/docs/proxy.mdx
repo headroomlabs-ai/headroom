@@ -519,6 +519,24 @@ Google Cloud Code Assist / Antigravity compatibility endpoint used by Pi-style `
 The proxy also accepts:
 - `POST /v1/v1internal:streamGenerateContent`
 
+**agy / Google Antigravity CLI:** `agy` cannot use this endpoint via a base-URL redirect
+because it has no base-URL override knob.  Headroom wraps `agy` via a selective TLS-MITM
+transport instead:
+
+- `HTTPS_PROXY` and `HTTP_PROXY` are set to the Headroom in-process CONNECT terminator
+  (loopback, bound to `127.0.0.1`).
+- Three CA trust-bundle variables are set to a combined PEM bundle
+  (`SSL_CERT_FILE`, `CACERT_PATH`, `NODE_EXTRA_CA_CERTS`).
+- Only `daily-cloudcode-pa.googleapis.com` (and `cloudcode-pa.googleapis.com`) are
+  TLS-terminated.  All other CONNECT tunnels are byte-spliced unchanged.
+- HTTP/2 and SSE are negotiated natively via an in-process hypercorn HTTPS server;
+  decrypted requests are routed to the existing `handle_google_cloudcode_stream` handler.
+- The process-local CA is stored under `~/.headroom/ca/` and is **never** added to the
+  OS trust store.
+
+Usage: `headroom wrap agy` (also `headroom unwrap agy`, `--no-intercept`).
+See the [agy section in README.md](../../../README.md#using-headroom-with-agy) for full details.
+
 ### Antigravity IDE
 
 Google's Antigravity IDE can route its model traffic through the proxy:
@@ -884,6 +902,11 @@ headroom wrap cursor
 
 # Grok Build (updates ~/.grok/config.toml and starts the proxy)
 headroom wrap grok-build
+
+# Google Antigravity CLI (agy) — TLS-MITM transport, not a base-URL redirect
+headroom wrap agy
+headroom wrap agy --no-intercept   # passthrough, no compression
+headroom unwrap agy                # revert GEMINI.md and MCP config changes
 ```
 
 Wrapping can reuse an existing proxy instead of starting a new process. Its

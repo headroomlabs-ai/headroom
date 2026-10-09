@@ -250,6 +250,8 @@ def port_option_callback(ctx: click.Context, param: click.Parameter, value: Any)
         return value
     if ctx.resilient_parsing:
         return value
+    if ctx.command.name == "agy" and ctx.params.get("no_intercept"):
+        return value
     if ctx.get_parameter_source(param.name) is not ParameterSource.DEFAULT:
         return value
     option_name = next((opt for opt in param.opts if opt.startswith("--")), "--port")

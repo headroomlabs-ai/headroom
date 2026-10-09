@@ -459,6 +459,79 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {}) == "https://legacy.anthropic.test"
 
 
+def test_cloudcode_host_base_allowlists_exact_hosts_only() -> None:
+    proxy_targets = importlib.import_module("headroom.providers.proxy_targets")
+
+    # Every allowlisted host maps to its own https URL (guards against an
+    # all-None regression where the helper rejects legitimate hosts too).
+    assert proxy_targets.DEFAULT_ALLOWLIST, "allowlist must be non-empty"
+    for host in proxy_targets.DEFAULT_ALLOWLIST:
+        assert proxy_targets.cloudcode_host_base(host) == f"https://{host}"
+
+    # SSRF guard: a suffix-collision host that the old endswith() check accepted
+    # is now rejected, as are empty / unrelated hosts.
+    assert proxy_targets.cloudcode_host_base("evilcloudcode-pa.googleapis.com") is None
+    assert proxy_targets.cloudcode_host_base("cloudcode-pa.googleapis.com.evil.test") is None
+    assert proxy_targets.cloudcode_host_base("") is None
+
+    # The catch-all base selection honours the allowlist forward, so an
+    # allowlisted Host on an unrecognised path routes back to that host
+    # instead of falling through to the provider-heuristic default.
+    class _Runtime:
+        @staticmethod
+        def model_metadata_provider(_headers: dict[str, str]) -> str:
+            return "anthropic"
+
+    class _Proxy:
+        provider_runtime = _Runtime()
+        ANTHROPIC_API_URL = "https://legacy.anthropic.test"
+
+    allowlisted = next(iter(proxy_targets.DEFAULT_ALLOWLIST))
+    assert (
+        proxy_targets.select_passthrough_base_url(
+            _Proxy(), {"host": allowlisted}, allow_cloudcode_host=True
+        )
+        == f"https://{allowlisted}"
+    )
+
+
+def test_select_passthrough_rejects_forged_cloudcode_host() -> None:
+    proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
+    proxy = type(
+        "Proxy",
+        (),
+        {
+            "ANTHROPIC_API_URL": "https://legacy.anthropic.test",
+            "GEMINI_API_URL": "https://legacy.gemini.test",
+            "provider_runtime": type(
+                "Runtime",
+                (),
+                {
+                    "api_target": staticmethod(lambda provider: f"https://runtime.{provider}.test"),
+                    "model_metadata_provider": staticmethod(lambda headers: "anthropic"),
+                },
+            )(),
+        },
+    )()
+
+    # Positive: an allowlisted host is forwarded back to itself via the same path.
+    assert (
+        proxy_routes._select_passthrough_base_url(
+            proxy, {"host": "daily-cloudcode-pa.googleapis.com"}, allow_cloudcode_host=True
+        )
+        == "https://daily-cloudcode-pa.googleapis.com"
+    )
+
+    # SSRF fallthrough: a forged suffix-collision host is NOT echoed back; it
+    # falls through to the configured default selection instead.
+    forged = "evilcloudcode-pa.googleapis.com"
+    base = proxy_routes._select_passthrough_base_url(
+        proxy, {"host": forged}, allow_cloudcode_host=True
+    )
+    assert base != f"https://{forged}"
+    assert base == "https://legacy.anthropic.test"
+
+
 def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatch) -> None:
     delegated: list[tuple[str, str, tuple[str, ...]]] = []
 

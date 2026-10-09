@@ -130,6 +130,53 @@ def _isolate_mcp_ledger(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(ledger, "ledger_path", lambda: ledger_file)
 
 
+# Any test that builds the proxy app (`create_app()`) runs its lifespan startup,
+# which calls `registry.start_all()` and starts the subscription tracker. That
+# tracker polls `https://api.anthropic.com/api/oauth/usage` for real — observed
+# on every local run of tests/test_agy_dispatch.py as
+# `httpx - INFO - HTTP Request: GET https://api.anthropic.com/api/oauth/usage`.
+# Same class of bug as the beacon and MCP-ledger fixtures above: a unit test
+# reaching a live external service.
+#
+# There is no env knob that reaches this from a test: `ProxyConfig.
+# subscription_tracking_enabled` defaults to True and HEADROOM_NO_SUBSCRIPTION_
+# TRACKING is wired only through the `headroom proxy` CLI, so `create_app()`
+# always starts the poller. Force `enabled=False` at the tracker factory
+# instead, which is the single seam every caller funnels through.
+#
+# Beyond hygiene this is a determinism fix: the poll made first-request latency
+# depend on live network egress, which timed out the 10s guard in
+# test_dispatch_server_tls_and_route on the Windows CI lane (no offline env
+# there, unlike the Linux shards' HF_HUB_OFFLINE) while passing on Linux.
+@pytest.fixture(autouse=True)
+def _disable_subscription_polling(monkeypatch):
+    # Same guard as the sibling fixtures: the macos/windows-native-wrapper CI
+    # jobs install only pytest and drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there is no tracker to
+    # disable.
+    try:
+        from headroom.subscription import tracker as _tracker
+    except ModuleNotFoundError:
+        return
+
+    real_configure = _tracker.configure_subscription_tracker
+
+    def _configure_disabled(*args, **kwargs):
+        kwargs["enabled"] = False
+        return real_configure(*args, **kwargs)
+
+    monkeypatch.setattr(_tracker, "configure_subscription_tracker", _configure_disabled)
+    # server.py imports the symbol directly (`from ... import
+    # configure_subscription_tracker`), so patching only the defining module
+    # would leave that already-bound reference pointing at the real one.
+    try:
+        from headroom.proxy import server as _server
+    except ModuleNotFoundError:
+        return
+    if hasattr(_server, "configure_subscription_tracker"):
+        monkeypatch.setattr(_server, "configure_subscription_tracker", _configure_disabled)
+
+
 # The Copilot "routed to Copilot" flag is a module-global ContextVar that
 # build_copilot_upstream_url() sets as a side effect. Unit tests that call that
 # builder directly (or otherwise run in the shared root context) would leave it

@@ -273,3 +273,9 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+
+# Embedded-database sidecars written into the repo root by local issue-tracker
+# tooling (Dolt-backed). Regenerated on demand; never part of a change set.
+/embeddeddolt/
+/backup/
+/.local_version

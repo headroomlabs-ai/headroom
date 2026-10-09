@@ -35,13 +35,14 @@ from pathlib import Path
 from typing import Any
 
 from headroom.learn.scanner import is_error_content
+from headroom.parser import CCR_MARKER_ALTERNATION
 
 DIMENSIONS = ("numerics", "artifacts", "errors")
 
-# Mirrors the marker shapes matched by
-# headroom.transforms.compression_units._CCR_MARKER_RE (kept local so the
-# evals layer does not depend on a private transforms symbol).
-_CCR_MARKER_RE = re.compile(r"Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>")
+# Canonical CCR retrieval-marker alternation, shared with
+# headroom.parser.CCR_RETRIEVAL_MARKER_RE and
+# headroom.transforms.compression_units._CCR_MARKER_RE.
+_CCR_MARKER_RE = re.compile(CCR_MARKER_ALTERNATION)
 
 # A number with its immediate key context ("retry_limit: 3", "port=8787",
 # JSON's '"latency_ms": 12'). Bare numbers are skipped: without context they

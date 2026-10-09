@@ -320,6 +320,22 @@ class StreamingMixin:
             int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
         )
 
+    @staticmethod
+    def _gemini_usage_meta(data: dict) -> dict | None:
+        """Return a Gemini chunk's ``usageMetadata`` dict, or ``None``.
+
+        Native Gemini puts it top-level; Cloud Code Assist (agy) wraps chunks in
+        a ``response`` envelope (``{"response": {"usageMetadata": {...}}}``),
+        mirroring the request-side wrap (gemini.py ``body["request"]``). A
+        non-dict/absent metadata yields ``None`` so callers skip cleanly — a
+        malformed upstream value can never reach ``.get()`` and crash the parser.
+        """
+        meta = data.get("usageMetadata")
+        if not isinstance(meta, dict):
+            response = data.get("response")
+            meta = response.get("usageMetadata") if isinstance(response, dict) else None
+        return meta if isinstance(meta, dict) else None
+
     def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
         """Parse usage information from SSE chunk.
 
@@ -393,9 +409,7 @@ class StreamingMixin:
                         usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
 
                 elif provider == "gemini":
-                    # Gemini sends usageMetadata in each streaming chunk
-                    # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
-                    usage_meta = _sse_dict(data.get("usageMetadata"))
+                    usage_meta = self._gemini_usage_meta(data)
                     if usage_meta:
                         usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                         usage["output_tokens"] = gemini_output_tokens(usage_meta)
@@ -533,7 +547,7 @@ class StreamingMixin:
                         )
 
             elif provider == "gemini":
-                usage_meta = _sse_dict(data.get("usageMetadata"))
+                usage_meta = self._gemini_usage_meta(data)
                 if usage_meta:
                     usage_found["input_tokens"] = usage_meta.get("promptTokenCount", 0)
                     usage_found["output_tokens"] = gemini_output_tokens(usage_meta)

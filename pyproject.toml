@@ -100,6 +100,8 @@ proxy = [
     # compiler. The watcher is optional and skips itself when watchdog is absent.
     "watchdog>=4.0.0; sys_platform != 'darwin' or python_version < '3.14'",
     "sqlite-vec>=0.1.6",          # Vector index for memory (--memory). Lightweight, no torch.
+    "cryptography>=42.0.0",       # Root CA + leaf minting for agy TLS-MITM wrap (headroom wrap agy)
+    "hypercorn>=0.16",            # In-process HTTPS dispatch server for agy MITM transport
 ]
 # Production ASGI/WSGI server — Unix-only (gunicorn does not support Windows).
 # Kept separate from [proxy] so that dev, CI, and Windows users are not forced
@@ -323,6 +325,7 @@ dev = [
     # The floor in the security-pins block below is a *version* constraint on a
     # transitive dep, not a guarantee it is installed -- CI had neither.
     "cryptography>=50.0.0",
+    "hypercorn>=0.16",  # agy in-process HTTPS dispatch server
     "respx>=0.20.0",    # HTTP mock transport for passthrough handler tests
 ]
 # All optional dependencies (everything you need).

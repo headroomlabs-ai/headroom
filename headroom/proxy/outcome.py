@@ -1,11 +1,10 @@
 """``RequestOutcome``: the canonical value type for "what happened during
 one completed proxy request."
 
-Per the P0 audit (``docs/superpowers/specs/P0-proxy-pipeline-audit.md``),
-18 ``metrics.record_request`` call sites across four handler files
-disagreed on argument shape — 9 of 18 omitted ``cached=``, 7 of 18
-omitted ``attempted_input_tokens=``, only 4 sites emitted a structured
-PERF log at all. This module is the structural fix: every handler
+An earlier audit found that 18 ``metrics.record_request`` call sites across
+four handler files disagreed on argument shape — 9 of 18 omitted ``cached=``,
+7 of 18 omitted ``attempted_input_tokens=``, only 4 sites emitted a
+structured PERF log at all. This module is the structural fix: every handler
 converges on building a :class:`RequestOutcome` at end-of-request and
 hands it to :func:`emit_request_outcome` (also exposed as
 :meth:`HeadroomProxy._record_request_outcome`), which owns the four
@@ -682,38 +681,53 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         _warn_estimated_input(outcome.provider, outcome.model)
 
     # 1. Prometheus / SavingsTracker.
-    await handler.metrics.record_request(
-        provider=outcome.provider,
-        model=outcome.model,
-        input_tokens=billed_input_tokens,
-        output_tokens=outcome.output_tokens,
-        tokens_saved=novel_tokens_saved,
-        latency_ms=outcome.total_latency_ms,
-        cached=outcome.cache_hit,
-        overhead_ms=outcome.overhead_ms,
-        ttfb_ms=outcome.ttfb_ms,
-        pipeline_timing=pipeline_timing,
-        waste_signals=outcome.waste_signals,
-        cache_read_tokens=outcome.cache_read_tokens,
-        cache_write_tokens=outcome.cache_write_tokens,
-        cache_write_5m_tokens=outcome.cache_write_5m_tokens,
-        cache_write_1h_tokens=outcome.cache_write_1h_tokens,
-        uncached_input_tokens=outcome.uncached_input_tokens,
-        attempted_input_tokens=outcome.attempted_input_tokens,
-        output_tokens_saved=output_tokens_saved_est,
-        project=project,
-        client=outcome.client,
-        tool_search_saved=tool_search_saved,
-        local_input_tokens=outcome.optimized_tokens,
-        savings_attribution=savings_breakdown,
+    metrics_kwargs: dict[str, Any] = {
+        "provider": outcome.provider,
+        "model": outcome.model,
+        "input_tokens": billed_input_tokens,
+        "output_tokens": outcome.output_tokens,
+        "tokens_saved": novel_tokens_saved,
+        "latency_ms": outcome.total_latency_ms,
+        "cached": outcome.cache_hit,
+        "overhead_ms": outcome.overhead_ms,
+        "ttfb_ms": outcome.ttfb_ms,
+        "pipeline_timing": pipeline_timing,
+        "waste_signals": outcome.waste_signals,
+        "cache_read_tokens": outcome.cache_read_tokens,
+        "cache_write_tokens": outcome.cache_write_tokens,
+        "cache_write_5m_tokens": outcome.cache_write_5m_tokens,
+        "cache_write_1h_tokens": outcome.cache_write_1h_tokens,
+        "uncached_input_tokens": outcome.uncached_input_tokens,
+        "attempted_input_tokens": outcome.attempted_input_tokens,
+        "output_tokens_saved": output_tokens_saved_est,
+        "project": project,
+        "client": outcome.client,
+        "tool_search_saved": tool_search_saved,
+        "local_input_tokens": outcome.optimized_tokens,
+        "savings_attribution": savings_breakdown,
         # Already handed to the cost tracker below; the metrics path needs it
         # too now that it prices savings cache-aware. An inferred write is the
         # same tokens as `uncached_input_tokens` and carries no write premium,
         # so counting it as a write would both double it and apply a premium
         # OpenAI never charges.
-        cache_inferred=outcome.cache_inferred,
-        input_provider_reported=input_provider_reported,
-    )
+        "cache_inferred": outcome.cache_inferred,
+        "input_provider_reported": input_provider_reported,
+    }
+    await handler.metrics.record_request(**metrics_kwargs)
+
+    # 1b. agy cross-process emit (best-effort, agy process only). When agy runs
+    #     as a separate process from the shared proxy, this drops one inbox
+    #     event carrying the SAME funnel kwargs; the shared proxy drains and
+    #     replays it through its own record_request so the savings land on the
+    #     shared dashboard, counted once. Gated by a marker env var the shared
+    #     proxy never sets, so it never emits. Never raises into the request.
+    from headroom.proxy import agy_savings_inbox
+
+    if agy_savings_inbox.agy_emit_enabled():
+        try:
+            agy_savings_inbox.emit_event(**metrics_kwargs)
+        except Exception:  # noqa: BLE001 - best-effort, never break the response
+            pass
 
     # 2. Cost tracker (optional).
     cost_tracker = getattr(handler, "cost_tracker", None)

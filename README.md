@@ -256,6 +256,7 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
+| agy | ✅ | Google Antigravity CLI via selective TLS-MITM; see [Using headroom with agy](#using-headroom-with-agy) |
 
 [^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](docs/content/docs/opencode-deepseek.mdx).
 
@@ -359,6 +360,157 @@ session or the resulting context window.
 [Full guide →](https://docs.headroomlabs.ai/docs/vscode-claude-code)
 
 </details>
+
+### Using headroom with agy
+
+`agy` (Google Antigravity CLI) has no base-URL override, so Headroom wraps it via a selective
+TLS-MITM transport rather than a base-URL redirect.
+
+#### Quickstart
+
+```bash
+headroom wrap agy               # start with MITM transport
+headroom wrap agy -- --help     # pass args to agy
+headroom wrap agy -- --print "ping"
+```
+
+#### TLS interception disclosure
+
+Headroom intercepts TLS only for the Cloud Code backend hosts
+`daily-cloudcode-pa.googleapis.com` and `cloudcode-pa.googleapis.com`.
+All other CONNECT tunnels are byte-spliced unchanged — no certificate, no inspection.
+
+At launch, `headroom wrap agy` prints (one line per intercepted host):
+
+```
+  ┌─ TLS INTERCEPTION DISCLOSURE ──────────────────
+  │  Headroom terminates TLS for: cloudcode-pa.googleapis.com
+  │  Headroom terminates TLS for: daily-cloudcode-pa.googleapis.com
+  │  A process-local CA mints leaf certificates for those hosts.
+  │  This CA is NEVER added to the OS trust store.
+  │  Compression and context injection are applied on the decrypted stream.
+  │
+  │  To opt out of interception:  headroom wrap agy --no-intercept
+  │  To revert all changes:        headroom unwrap agy
+  └────────────────────────────────────────────────
+```
+
+The process-local CA is stored under `~/.headroom/ca/` (directory mode `0700`, key mode `0600`).
+It is injected into the child `agy` process only via three environment variables:
+
+```
+SSL_CERT_FILE=~/.headroom/combined-ca-bundle.pem
+CACERT_PATH=~/.headroom/combined-ca-bundle.pem
+NODE_EXTRA_CA_CERTS=~/.headroom/combined-ca-bundle.pem
+```
+
+The combined bundle is the system CA bundle plus the Headroom root CA certificate.
+No OS trust store is modified.
+
+#### Compression value and mechanism
+
+The compression value — reduced token count on requests to the Cloud Code backend — is
+identical to other supported agents.  The mechanism differs: instead of a base-URL redirect,
+Headroom uses an in-process HTTP CONNECT terminator that splices the accepted connection to a
+loopback hypercorn server, which terminates TLS, negotiates HTTP/2 and SSE natively, and
+routes decrypted requests through the existing `handle_google_cloudcode_stream` handler.  The
+request is re-originated to the host `agy` opened the tunnel to, not to a fixed default.
+
+A measured session: `agy` reading a 753 KB log file through the transport compressed 21 tool
+results from 23,392 to 567 tokens, with the model's answer unchanged and no fail-open requests.
+
+**Compression of tool output needs the retrieve MCP.**  Gemini carries tool results as
+`functionResponse` parts, which Headroom compresses into `[Retrieve more: hash=…]` markers.
+Those markers are only recoverable when the `headroom` MCP server is registered, so
+`--no-mcp` (and any run where registration fails) downgrades tool-output compression to a
+lossless mode that saves close to nothing rather than shipping a marker nothing can resolve.
+`headroom wrap agy` prints a warning naming the cause whenever that downgrade happens.
+
+Auth headers (`Authorization`, `x-goog-api-key`) are visible to the Headroom process after
+TLS termination.  They pass through the existing `redact_for_wire_debug` redactor and are not
+persisted in the semantic cache.
+
+`agy` is classified as `Subscription` auth mode (UA prefix `antigravity/`).  See
+[docs/auth-modes.md](docs/auth-modes.md) for the full auth-mode policy table.
+
+#### Opt-out: `--no-intercept`
+
+```bash
+headroom wrap agy --no-intercept
+```
+
+Launches `agy` with no environment modifications and no TLS interception.
+Headroom does not compress traffic in this mode.
+
+#### Reverting: `headroom unwrap agy`
+
+```bash
+headroom unwrap agy
+```
+
+Removes all Headroom-added persistent configuration: any leftover `GEMINI.md` block from an
+older install (markers `<!-- headroom:agy-instructions -->` /
+`<!-- /headroom:agy-instructions -->`; current versions write none),
+the Headroom MCP retrieve-tool entry from `~/.gemini/config/mcp_config.json` (agy 1.1.x
+read-path, shared with the Antigravity IDE; if registered via `headroom mcp install`), and
+any Headroom-installed Serena MCP entry. User-managed and IDE `mcp_config.json` entries are preserved.
+
+#### Enterprise / Zero-Trust environments
+
+If `HTTPS_PROXY` is set in the parent environment before running `headroom wrap agy`,
+non-allowlisted CONNECT tunnels are chained through that corporate proxy.  The terminator
+reads the parent's `HTTPS_PROXY` directly; only the child `agy` process receives the
+overridden value pointing at the Headroom terminator.  Corporate CA certificates (from
+`SSL_CERT_FILE` or `NODE_EXTRA_CA_CERTS`) are merged into the combined bundle so the
+real internet continues to validate.  Only PEM objects with `basicConstraints CA:TRUE`
+are merged. The launch banner redacts proxy credentials before printing: it shows only
+`scheme://host:port`, never the `user:pass@` userinfo.
+
+If `HTTPS_PROXY` carries `user:pass@` userinfo, it is percent-decoded and sent to the
+corporate proxy as an HTTP Basic `Proxy-Authorization` header on every chained CONNECT —
+only when the proxy scheme is `http`/`https` (never to a `socks5://` proxy). The
+URL-derived credential takes precedence over any `Proxy-Authorization` header the child
+sends inbound; the inbound header is used only when the URL carries no userinfo. This is
+sent in cleartext when the upstream scheme is `http://`, matching curl, Go and requests
+behavior against a plain-HTTP proxy — the credential already lives in an env var every
+tool on the box can read, and refusing to send it would break most corporate proxies.
+
+Chaining is not pre-flighted: a broken upstream proxy surfaces per connection, as a `403`
+(the upstream proxy is a loopback address — refused, so the terminator cannot chain into
+itself) or a `502` (the upstream proxy could not be reached), logged as
+`event=self_loop_blocked_proxy` / `event=tunnel_connect_failed`.
+
+An `https://` upstream proxy is dialled over TLS — `ssl.create_default_context()` with
+default certificate validation, SNI set to the proxy's own hostname, and ALPN pinned to
+`http/1.1` — instead of plaintext on `:443`. There is no bypass knob. An operator whose
+corporate TLS proxy presents a certificate from an internal/private CA (not merged via
+`SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS` above) will see chaining fail closed with a `502`
+instead of the prior silent-plaintext behavior; add that CA to the merged bundle to fix it.
+
+#### Fail-open and known limits
+
+On compression or dispatch errors, the Headroom terminator fails open (forwards original
+bytes) so `agy` continues working.  A session-level fail-open warning (first occurrence) and
+an end-of-session compression summary are shipped — see the "Compression fail-open
+observability" row in [docs/agy-parity-matrix.md](docs/agy-parity-matrix.md).
+
+The Headroom MCP retrieve tool (persistent, ledger-recorded, resolves markers from the on-disk
+store) and Serena code memory are wired via `AgyRegistrar`.  `--no-mcp` skips the retrieve
+server and `--no-serena` skips Serena, matching `wrap claude` and `wrap opencode`; both leave
+MCP entries that Headroom did not install untouched.  `--code-graph` starts the proxy's live
+code-graph watcher, exactly as it does for every other wrapped agent. MCP registration in
+`--print`/`-p`/`--prompt` mode requires agy `>= 1.0.16`; older or undetectable agy versions
+skip registration and remove only ledger-owned entries. Remaining MCP entries or malformed
+config block the print run with upgrade/interactive guidance — see
+[docs/agy-parity-matrix.md](docs/agy-parity-matrix.md) for the full parity table.
+
+The following features available on other agents have no agy equivalent in v1:
+
+- `--memory` — no equivalent persistent memory API in agy
+- `--learn` — requires a stable dispatch endpoint (headroom-2i0)
+
+The Rust proxy backend is not supported for `agy`; `headroom wrap agy` hard-fails
+with a clear message if `HEADROOM_BACKEND=rust` is set.
 
 ## When to use · when to skip
 

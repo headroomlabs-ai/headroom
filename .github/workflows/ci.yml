@@ -709,6 +709,42 @@ jobs:
       - name: Run native installer wrapper tests
         run: pytest tests/test_install/test_native_installers.py -q
 
+  agy-windows:
+    # agy's TLS-MITM transport is selective-host MITM with a process-scoped CA;
+    # it must run on Windows (a supported developer platform). The main test
+    # shards run on Linux, so this lane is the only Windows coverage for the
+    # agy CA / dispatch / terminator / retrieve slice and the wrap command.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: astral-sh/setup-uv@v5
+      - name: Run agy suite on Windows
+        shell: bash
+        # This lane has no prefetch-model dependency and no HuggingFace cache
+        # restore, unlike the Linux `test` shards. Without the offline flags
+        # those shards already set, building the proxy app here lazily fetches
+        # the embedding model from the Hub mid-test: the run log showed
+        # `huggingface_hub/file_download.py ... xet_get(` attributed to
+        # test_dispatch_server_tls_and_route, whose 10s guard then tripped
+        # while the same test passed on Linux. None of the agy tests need the
+        # model — verified with a cold HF_HOME plus these flags, 38 passed.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          uv run --extra proxy --with pytest --with pytest-asyncio python -m pytest \
+            tests/test_agy_ca.py tests/test_agy_ca_concurrency.py \
+            tests/test_agy_dispatch.py tests/test_agy_terminator.py tests/test_agy_routing_boundary.py \
+            tests/test_agy_retrieve.py tests/test_agy_stats.py tests/test_agy_registrar.py \
+            tests/test_proxy_google_cloudcode_route_aliases.py tests/test_wrap_agy.py -q
+
   # Runtime coverage for pure-Python proxy logic on Windows, kept separate
   # from windows-native-wrapper (above), which is deliberately
   # dependency-minimal and gated on native-installer changes only. Installs
