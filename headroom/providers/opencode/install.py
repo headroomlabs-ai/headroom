@@ -13,11 +13,12 @@ from headroom.install.paths import opencode_config_path
 from .config import (
     _inject_key_into_json,
     _parse_json_loose,
+    extra_models_from_env,
+    headroom_provider_entry,
     migrate_legacy_opencode_jsonc_backup,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
-from .runtime import proxy_base_url
 
 
 def build_install_env(*, port: int, backend: str) -> dict[str, str]:
@@ -44,13 +45,11 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     else:
         data = {}
 
-    provider = {
-        "headroom": {
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Headroom Proxy",
-            "options": {"baseURL": proxy_base_url(manifest.port)},
-        }
-    }
+    # Extra models come from the manifest, not the file: every re-apply first
+    # reverts (restoring the pre-install backup) and then replaces the whole
+    # `headroom` entry, so ids hand-added there do not survive.
+    extra_models = extra_models_from_env(manifest.base_env)
+    provider = {"headroom": headroom_provider_entry(manifest.port, extra_models)}
     data = _inject_key_into_json(data, "provider", provider)
 
     config_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")

@@ -202,9 +202,11 @@ from headroom.providers.opencode.config import (
     _MCP_MARKER_START,
     _PROVIDER_MARKER_END,  # noqa: F401
     _PROVIDER_MARKER_START,
+    extra_models_from_env,
     inject_opencode_provider_config,
     migrate_legacy_opencode_jsonc_backup,
     opencode_config_paths,
+    parse_extra_model_spec,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -8488,6 +8490,16 @@ def openclaw(
 )
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
 @click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option(
+    "--extra-model",
+    "extra_model_specs",
+    multiple=True,
+    help=(
+        "Extra model for the headroom provider, format "
+        "id[=name[=context_window[=output_limit]]] (repeatable; "
+        "env: HEADROOM_OPENCODE_EXTRA_MODELS, comma-separated)"
+    ),
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
@@ -8504,6 +8516,7 @@ def opencode(
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
+    extra_model_specs: tuple,
     verbose: bool,
     prepare_only: bool,
     opencode_args: tuple,
@@ -8526,6 +8539,7 @@ def opencode(
         headroom wrap opencode --port 9999             # Custom proxy port
         headroom wrap opencode --backend anyllm --anyllm-provider groq
         headroom wrap opencode --copilot-subscription # Use a GitHub Copilot subscription
+        headroom wrap opencode --extra-model "qwen2.5-coder:7b=Qwen Coder=32768"
         headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
 
     \b
@@ -8538,6 +8552,15 @@ def opencode(
         headroom wrap opencode --openai-api-url https://api.deepseek.com/v1
         OPENAI_TARGET_API_URL=https://api.deepseek.com/v1 headroom wrap opencode
     """
+    # Env-provided extras persist across re-wraps; flag specs win on id collision.
+    try:
+        extra_models = extra_models_from_env()
+        for spec in extra_model_specs:
+            model_id, entry = parse_extra_model_spec(spec)
+            extra_models[model_id] = entry
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--extra-model") from exc
+
     subscription_resolution = None
     if copilot_subscription:
         if openai_api_url:
@@ -8620,7 +8643,7 @@ def opencode(
         _inject_memory_agents_md(agents_md)
 
     if prepare_only:
-        inject_opencode_provider_config(port, keep_user_entries=bool(openai_api_url))
+        inject_opencode_provider_config(port, extra_models, keep_user_entries=bool(openai_api_url))
         return
 
     # Past the prepare-only return the launch path always ran the binary check
@@ -8681,11 +8704,14 @@ def opencode(
             launch_environ,
             project=_project_name_from_cwd(),
             include_mcp=not no_mcp,
+            extra_models=extra_models,
             session_token=_session_token,
         )
 
         # Inject Headroom provider into OpenCode config so traffic routes through proxy.
-        inject_opencode_provider_config(actual_port, keep_user_entries=bool(openai_api_url))
+        inject_opencode_provider_config(
+            actual_port, extra_models, keep_user_entries=bool(openai_api_url)
+        )
         if memory:
             mem_dir = Path.cwd() / ".headroom"
             _inject_memory_mcp_config(

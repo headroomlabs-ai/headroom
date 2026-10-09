@@ -55,6 +55,7 @@ from headroom.install.supervisors import (
     start_supervisor,
     stop_supervisor,
 )
+from headroom.providers.opencode.config import extra_models_from_env
 from headroom.providers.opencode.install import restore_opencode_backup
 
 from .main import main
@@ -991,6 +992,12 @@ def install_apply(
     # supervised runner forwards to the same gateway the interactive proxy would
     # (#2240). Explicit --env wins, so merge the captured vars underneath.
     combined_env = {**_capture_passthrough_env(os.environ), **parsed_env}
+    # Extra OpenCode model specs are parsed when provider config is applied,
+    # which runs after the new runtime starts, so reject a bad one up front.
+    try:
+        extra_models_from_env(combined_env)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--env") from exc
 
     manifest = _build_deployment_manifest(
         profile=profile,

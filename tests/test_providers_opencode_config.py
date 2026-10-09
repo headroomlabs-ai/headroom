@@ -8,12 +8,16 @@ from pathlib import Path
 import pytest
 
 from headroom.providers.opencode.config import (
+    HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
     HEADROOM_OPENCODE_PLUGIN,
     _inject_key_into_json,
     _parse_json_loose,
     append_headroom_plugin,
+    extra_models_from_env,
+    headroom_provider_entry,
     inject_opencode_provider_config,
     opencode_config_paths,
+    parse_extra_model_spec,
     snapshot_opencode_config_if_unwrapped,
     strip_opencode_headroom_blocks,
 )
@@ -294,6 +298,121 @@ def test_inject_provider_config_drops_user_entries_without_an_explicit_upstream(
     headroom = _parse_json_loose(config_file.read_text())["provider"]["headroom"]
     assert "apiKey" not in headroom["options"]
     assert set(headroom["models"]) == {"gpt-4o", "gpt-4.1"}
+
+
+# ---------------------------------------------------------------------------
+# Extra models
+# ---------------------------------------------------------------------------
+
+
+def test_parse_extra_model_spec_full() -> None:
+    """Full id=name=context=output spec parses into a provider models entry."""
+    model_id, entry = parse_extra_model_spec("deepseek-v4-pro=DeepSeek V4=1000000=384000")
+    assert model_id == "deepseek-v4-pro"
+    assert entry == {"name": "DeepSeek V4", "limit": {"context": 1000000, "output": 384000}}
+
+
+def test_parse_extra_model_spec_defaults() -> None:
+    """Name defaults to the id, context to 200000, output to min(16384, context)."""
+    model_id, entry = parse_extra_model_spec("deepseek-chat")
+    assert model_id == "deepseek-chat"
+    assert entry == {"name": "deepseek-chat", "limit": {"context": 200000, "output": 16384}}
+
+    _, named = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    assert named == {"name": "DeepSeek Chat", "limit": {"context": 65536, "output": 16384}}
+
+    # A context window below the default output caps the output, and an empty
+    # name field still falls back to the id.
+    _, small = parse_extra_model_spec("small-model==8192")
+    assert small == {"name": "small-model", "limit": {"context": 8192, "output": 8192}}
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected_id", "expected_name"),
+    [
+        ("qwen2.5-coder:7b", "qwen2.5-coder:7b", "qwen2.5-coder:7b"),
+        (
+            "deepseek/deepseek-chat:free=DeepSeek Free",
+            "deepseek/deepseek-chat:free",
+            "DeepSeek Free",
+        ),
+        ("deepseek-r1:14b=DeepSeek R1: 14B=65536", "deepseek-r1:14b", "DeepSeek R1: 14B"),
+    ],
+)
+def test_parse_extra_model_spec_keeps_colons_in_ids(
+    spec: str, expected_id: str, expected_name: str
+) -> None:
+    """Ollama (`name:tag`) and OpenRouter (`:free`) ids keep their colons."""
+    model_id, entry = parse_extra_model_spec(spec)
+    assert model_id == expected_id
+    assert entry["name"] == expected_name
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "",
+        "=name=1000",
+        "id=name=abc",
+        "id=name=0",
+        "id=name=1000=abc",
+        "id=name=1000=-1",
+        "id=n=1=2=3",
+    ],
+)
+def test_parse_extra_model_spec_invalid(spec: str) -> None:
+    """Empty id or a bad context window / output limit raises ValueError."""
+    with pytest.raises(ValueError):
+        parse_extra_model_spec(spec)
+
+
+def test_extra_models_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HEADROOM_OPENCODE_EXTRA_MODELS parses comma-separated specs."""
+    monkeypatch.setenv(
+        HEADROOM_OPENCODE_EXTRA_MODELS_ENV,
+        "deepseek-chat=DeepSeek Chat=65536, qwen2.5-coder:7b",
+    )
+    models = extra_models_from_env()
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert models["qwen2.5-coder:7b"]["name"] == "qwen2.5-coder:7b"
+
+    monkeypatch.delenv(HEADROOM_OPENCODE_EXTRA_MODELS_ENV)
+    assert extra_models_from_env() == {}
+
+
+def test_headroom_provider_entry_merges_extra_models() -> None:
+    """Extra models are merged alongside the built-in model list."""
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    provider = headroom_provider_entry(8787, {"deepseek-chat": entry})
+    assert "gpt-4o" in provider["models"]
+    assert provider["models"]["deepseek-chat"]["name"] == "DeepSeek Chat"
+
+
+def test_inject_provider_config_with_extra_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """inject_opencode_provider_config writes extra models into the config."""
+    _set_test_home(monkeypatch, tmp_path)
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    inject_opencode_provider_config(port=8787, extra_models={"deepseek-chat": entry})
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config = _parse_json_loose(config_file.read_text())
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["limit"]["context"] == 65536
+    assert "gpt-4o" in models
+
+
+def test_build_opencode_config_content_with_extra_models() -> None:
+    """build_opencode_config_content threads extra models into the headroom provider."""
+    from headroom.providers.opencode.runtime import build_opencode_config_content
+
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    config = build_opencode_config_content(
+        port=8787, include_mcp=False, include_plugin=False, extra_models={"deepseek-chat": entry}
+    )
+    models = config["provider"]["headroom"]["models"]
+    assert models["deepseek-chat"]["name"] == "DeepSeek Chat"
+    assert "gpt-4o" in models
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +790,45 @@ def test_inject_provider_config_strips_existing_markers(
     second = config_file.read_text()
     assert "headroom" in second
     assert second.count("headroom") == first.count("headroom")
+
+
+@pytest.mark.parametrize("keep_user_entries", [False, True])
+def test_extra_models_override_persisted_collision_with_upstream_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_user_entries: bool
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".config" / "opencode" / "opencode.json"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "provider": {
+                    "headroom": {
+                        "options": {
+                            "apiKey": "third-party-secret",
+                            "baseURL": "https://old.invalid",
+                        },
+                        "models": {
+                            "deepseek-chat": {"name": "Old model"},
+                            "private-model": {"name": "Private"},
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, entry = parse_extra_model_spec("deepseek-chat=DeepSeek Chat=65536")
+    inject_opencode_provider_config(
+        port=8787, extra_models={"deepseek-chat": entry}, keep_user_entries=keep_user_entries
+    )
+    provider = json.loads(config_file.read_text(encoding="utf-8"))["provider"]["headroom"]
+    assert provider["models"]["deepseek-chat"] == entry
+    assert provider["options"]["baseURL"] == "http://127.0.0.1:8787/v1"
+    assert ("private-model" in provider["models"]) is keep_user_entries
+    assert ("apiKey" in provider["options"]) is keep_user_entries
+    if keep_user_entries:
+        assert provider["options"]["apiKey"] == "third-party-secret"
 
 
 # ---------------------------------------------------------------------------
