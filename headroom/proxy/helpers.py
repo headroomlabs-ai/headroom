@@ -3015,6 +3015,30 @@ class RequestBodyTooLarge(ValueError):
     """
 
 
+class RequestBodyNotObject(ValueError):
+    """The request body parsed as JSON but is not an object (e.g. a list)."""
+
+
+def invalid_request_body_message(exc: Exception) -> str:
+    """Client-facing text for a request body that failed to read or parse.
+
+    Fixed strings only, chosen by exception type. The exception's own text can
+    carry decoder internals and request metadata, and echoing it back is what
+    CodeQL's ``py/stack-trace-exposure`` flags. The type is logged so a 400 can
+    still be diagnosed from the proxy side.
+    """
+    logger.info("rejected request body (%s)", type(exc).__name__)
+    if isinstance(exc, RequestBodyTooLarge):
+        return "Invalid request body: too large"
+    if isinstance(exc, RequestBodyNotObject):
+        return "Invalid request body: must be a JSON object"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Invalid request body: malformed JSON"
+    if isinstance(exc.__cause__, UnicodeDecodeError):
+        return "Invalid request body: not valid UTF-8 (possibly compressed?)"
+    return "Invalid request body"
+
+
 def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
     """Incrementally inflate ``raw``, stopping the instant output passes the cap.
 
@@ -3347,7 +3371,9 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
 
     result = json.loads(text)
     if not isinstance(result, dict):
-        raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+        raise RequestBodyNotObject(
+            "Request body must be a JSON object, not " + type(result).__name__
+        )
 
     # Drop output-only blocks the request schema rejects (see
     # ``strip_output_only_request_blocks``). Callers of this bytes-less reader
@@ -3387,7 +3413,9 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
 
     result = json.loads(text)
     if not isinstance(result, dict):
-        raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+        raise RequestBodyNotObject(
+            "Request body must be a JSON object, not " + type(result).__name__
+        )
 
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared
