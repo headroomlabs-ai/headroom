@@ -23,10 +23,13 @@ class ProviderHandlerRoute:
     path: str
     handler_name: str
     path_param: str | None = None
+    supports_custom_base_url: bool = False
 
 
 ANTHROPIC_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     ProviderPassthroughRoute("POST", "/v1/messages/count_tokens", "anthropic", "count_tokens"),
+    ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+    ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
 )
 
 
@@ -141,18 +144,21 @@ GEMINI_HANDLER_ROUTES: tuple[ProviderHandlerRoute, ...] = (
         "/v1beta/models/{model}:generateContent",
         "handle_gemini_generate_content",
         "model",
+        True,
     ),
     ProviderHandlerRoute(
         "POST",
         "/v1beta/models/{model}:streamGenerateContent",
         "handle_gemini_stream_generate_content",
         "model",
+        True,
     ),
     ProviderHandlerRoute(
         "POST",
         "/v1beta/models/{model}:countTokens",
         "handle_gemini_count_tokens",
         "model",
+        True,
     ),
 )
 

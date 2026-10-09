@@ -136,6 +136,10 @@ def parse_tabular(
         return None
 
     fmt = detection.metadata.get("format", "csv")
+    if fmt == "git_status":
+        # Status headings and state/path entries are structured control data,
+        # but not a rectangular table; never reinterpret them as CSV rows.
+        return None
     if fmt == "markdown":
         headers, rows = parse_markdown_table(content)
     elif fmt == "fixed_width":

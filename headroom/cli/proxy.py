@@ -2,9 +2,10 @@
 
 import logging
 import os
+import platform
 import sys
 import warnings
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -21,6 +22,15 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
+def _proxy_requires_onnx_backends() -> bool:
+    """Match extras that omit unavailable Intel macOS Python 3.14+ wheels."""
+    return not (
+        sys.platform == "darwin"
+        and platform.machine() == "x86_64"
+        and sys.version_info[:2] >= (3, 14)
+    )
+
+
 def ensure_proxy_dependencies() -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
@@ -29,18 +39,19 @@ def ensure_proxy_dependencies() -> None:
         "httpx",
         "openai",
         "mcp",
-        "magika",
         "zstandard",
         "websockets",
-        "onnxruntime",
         "transformers",
     ]
+    if _proxy_requires_onnx_backends():
+        required_modules.extend(["magika", "onnxruntime"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
     try:
-        for module in required_modules:
-            import_module(module)
+        missing = next((module for module in required_modules if find_spec(module) is None), None)
+        if missing is not None:
+            raise ImportError(f"No module named '{missing}'")
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
@@ -238,6 +249,17 @@ def dashboard(port: int, no_open: bool) -> None:
     default="127.0.0.1",
     envvar="HEADROOM_HOST",
     help="Host to bind to (default: 127.0.0.1, env: HEADROOM_HOST)",
+)
+@click.option(
+    "--uds",
+    default=None,
+    envvar="HEADROOM_UDS",
+    metavar="PATH",
+    help=(
+        "Serve on a Unix domain socket instead of --host/--port. POSIX only. "
+        "Lets a client keep a first-party base URL while its traffic still "
+        "reaches Headroom (env: HEADROOM_UDS)."
+    ),
 )
 @click.option(
     "--port",
@@ -759,9 +781,9 @@ def dashboard(port: int, no_open: bool) -> None:
     envvar="HEADROOM_READ_MATURATION",
     help=(
         "EXPERIMENTAL: activity-based read maturation — hold fresh Reads "
-        "out of the provider prefix cache and compress them once their "
-        "file quiesces. Requires HEADROOM_ROLLOUT_CHANNEL=beta (or dev); "
-        "env: HEADROOM_READ_MATURATION=1."
+        "verbatim and compress them once their file quiesces, unless the "
+        "provider cache already holds them. Requires "
+        "HEADROOM_ROLLOUT_CHANNEL=beta (or dev); env: HEADROOM_READ_MATURATION=1."
     ),
 )
 @click.option(
@@ -1050,6 +1072,7 @@ def proxy(
     mode: str | None,
     target_ratio: float | None,
     host: str,
+    uds: str | None,
     port: int,
     workers: int,
     limit_concurrency: int,
@@ -1154,6 +1177,17 @@ def proxy(
         OPENAI_BASE_URL=http://localhost:8787/v1 your-app
     """
     _reexec_with_malloc_tuning()
+
+    # Fail before any dependency loading or config work: an unusable --uds is a
+    # typo or an unsupported platform, and both are cheaper to report up front.
+    if uds:
+        from headroom.proxy.uds import UdsError, require_uds_support
+
+        try:
+            require_uds_support()
+        except UdsError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     ensure_proxy_dependencies()
 
     # Import here to avoid slow startup
@@ -1344,6 +1378,7 @@ def proxy(
     config = ProxyConfig(
         host=host,
         port=port,
+        uds=uds,
         rollout=rollout_snapshot,
         anthropic_api_url=provider_api_overrides.anthropic,
         anthropic_extra_headers=resolved_anthropic_extra_headers,
@@ -1703,6 +1738,22 @@ Memory (Multi-Provider):
     else:
         tuning_section = ""
 
+    # A socket has no URL, and no per-agent recipe belongs here — see
+    # uds.socket_usage_lines() for why the banner stays transport-neutral.
+    if config.uds:
+        from headroom.proxy.uds import socket_usage_lines
+
+        listen_display = f"unix:{config.uds}"
+        usage_section = "\n".join(socket_usage_lines(config.uds))
+    else:
+        listen_display = f"http://{config.host}:{config.port}"
+        usage_section = "\n".join(
+            (
+                f"  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude",
+                f"  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app",
+            )
+        )
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -1711,7 +1762,7 @@ Memory (Multi-Provider):
 
 Starting proxy server...
 
-  URL:          http://{config.host}:{config.port}
+  URL:          {listen_display}
   Mode:         {config.mode}
   Optimization: {"ENABLED" if config.optimize else "DISABLED"}
   Caching:      {"ENABLED" if config.cache_enabled else "DISABLED"}
@@ -1732,8 +1783,7 @@ Routing:
   /v1/projects/.../publishers/... → {vertex_url}
 
 Usage:
-  Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
-  Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
+{usage_section}
 {memory_section}
 Endpoints:
   GET  /livez      Process liveness

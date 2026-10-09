@@ -932,6 +932,104 @@ def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
         assert "User" in out and "Process" in out, out
 
 
+# AST-extract the two functions Start-PersistentDockerInstall uses to build the
+# dashboard allowlist env and run them in the same order: the passthrough
+# enumerates Env: before Add-DashboardGatewayEnv checks for an explicit value.
+# Both live in the generated wrapper, i.e. inside install.ps1's single-quoted
+# here-string template, so that template is parsed in turn. `docker` is stubbed
+# so no real daemon is queried. Prints one docker arg per line.
+_DASHBOARD_GATEWAY_HARNESS = r"""
+param([string]$InstallScript)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$template = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+    $n.StringConstantType -eq 'SingleQuotedHereString' -and
+    $n.Value.Contains('function Add-DashboardGatewayEnv')
+}, $true) | Select-Object -First 1
+if (-not $template) { Write-Output 'NOTEMPLATE'; exit 3 }
+$ast = [System.Management.Automation.Language.Parser]::ParseInput(
+    $template.Value, [ref]$null, [ref]$null)
+$functions = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true)
+foreach ($name in 'Get-PassthroughEnvArgs', 'Add-DashboardGatewayEnv') {
+    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $fn) { Write-Output "NOFUNC:$name"; exit 3 }
+    Invoke-Expression $fn.Extent.Text
+}
+function docker { $global:LASTEXITCODE = 0; '172.17.0.1' }
+$dockerArgs = New-Object System.Collections.Generic.List[string]
+$dockerArgs.AddRange([string[]](Get-PassthroughEnvArgs))
+Add-DashboardGatewayEnv -ArgsList $dockerArgs
+$dockerArgs | ForEach-Object { Write-Output $_ }
+"""
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows PowerShell coverage runs on Windows hosts only"
+)
+@pytest.mark.parametrize(
+    "shell",
+    [
+        # Windows PowerShell 5.1 ships with every Windows install and is what a
+        # plain `powershell` resolves to; pwsh is PowerShell 7+.
+        pytest.param("powershell", id="windows-powershell"),
+        pytest.param("pwsh", id="pwsh"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("configured", "expect_gateway_default"),
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param("10.20.0.0/16", False, id="configured"),
+        pytest.param("", False, id="explicitly-empty"),
+    ],
+)
+def test_powershell_dashboard_gateway_default_respects_explicit_allowlist(
+    tmp_path: Path, shell: str, configured: str | None, expect_gateway_default: bool
+) -> None:
+    """An explicit allowlist, even an empty one, must suppress the gateway default.
+
+    Windows PowerShell 5.1 stops reporting an empty variable through
+    ``Test-Path Env:`` once ``Env:`` has been enumerated, so the explicit opt-out
+    was forwarded by name *and* overridden by the trusted bridge gateway.
+    """
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+
+    trusted_cidrs = "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"
+    env = {key: value for key, value in os.environ.items() if key.upper() != trusted_cidrs}
+    if configured is not None:
+        env[trusted_cidrs] = configured
+
+    harness = tmp_path / "dashboard_gateway_harness.ps1"
+    harness.write_text(_DASHBOARD_GATEWAY_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            executable,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+        ],
+        env=env,
+    )
+    docker_args = result.stdout.splitlines()
+
+    gateway_default = f"{trusted_cidrs}=172.17.0.1/32"
+    assert (gateway_default in docker_args) is expect_gateway_default, docker_args
+    # Docker's name-only --env form forwards the caller's value unchanged.
+    assert (trusted_cidrs in docker_args) is (configured is not None), docker_args
+
+
 @pytest.mark.skipif(
     os.name != "nt" or _powershell_executable() is None,
     reason="Windows PowerShell coverage runs on Windows hosts only",

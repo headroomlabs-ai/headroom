@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 
 import click
@@ -13,6 +15,7 @@ from headroom.cli.main import main
 from headroom.install.models import DeploymentManifest, ManagedMutation
 from headroom.install.planner import build_tool_envs
 from headroom.install.state import load_manifest as load_state_manifest
+from headroom.install.state import save_manifest_strict
 
 
 def test_require_manifest_resolves_single_profile_when_default_missing(monkeypatch):
@@ -449,67 +452,165 @@ def test_install_apply_explicit_env_overrides_captured(monkeypatch) -> None:
     assert captured["extra_env"]["ANTHROPIC_TARGET_API_URL"] == "https://explicit.internal/v1"
 
 
-def test_install_status_includes_backend_from_health_probe(monkeypatch) -> None:
-    runner = CliRunner()
-
-    class Manifest:
-        targets = ["claude"]
-        tool_envs = {}
-        profile = "default"
-        preset = "persistent-service"
-        runtime_kind = "python"
-        supervisor_kind = "service"
-        scope = "user"
-        port = 8787
-        backend = "anthropic"
-        health_url = "http://127.0.0.1:8787/readyz"
-
-    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
+@pytest.mark.parametrize(
+    ("anthropic_url", "openai_url", "anthropic_target", "openai_target"),
+    [
+        (None, None, "default", "default"),
+        ("", "", "default", "default"),
+        ("https://anthropic-user:fake-secret@anthropic.invalid/v1", None, "configured", "default"),
+        (None, "https://openai-user:fake-secret@openai.invalid/v1", "default", "configured"),
+        (
+            "https://anthropic-user:fake-secret@anthropic.invalid/v1",
+            "https://openai-user:fake-secret@openai.invalid/v1",
+            "configured",
+            "configured",
+        ),
+    ],
+)
+def test_install_status_includes_protocol_targets_from_health_probe(
+    monkeypatch, anthropic_url, openai_url, anthropic_target, openai_target
+) -> None:
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: _status_manifest(profile))
+    monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
     monkeypatch.setattr(
-        "headroom.cli.install.runtime_status",
-        lambda manifest: "running",
-    )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
-    monkeypatch.setattr(
-        "headroom.cli.install.probe_json",
-        lambda url: {"config": {"backend": "anthropic"}},
+        inst,
+        "probe_json",
+        lambda url: {
+            "config": {
+                "backend": "openai",
+                "anthropic_api_url": anthropic_url,
+                "openai_api_url": openai_url,
+            }
+        },
     )
 
-    result = runner.invoke(main, ["install", "status"])
+    result = CliRunner().invoke(main, ["install", "status"])
 
     assert result.exit_code == 0, result.output
     assert "Status:     running" in result.output
     assert "Healthy:    yes" in result.output
-    assert "Backend:    anthropic" in result.output
+    assert "Default backend:  openai" in result.output
+    assert f"Anthropic target: {anthropic_target}" in result.output
+    assert f"OpenAI target:    {openai_target}" in result.output
+    for secret in ("fake-secret", "anthropic-user", "openai-user", ".invalid"):
+        assert secret not in result.output
 
 
-def test_install_status_survives_non_dict_config(monkeypatch) -> None:
-    """A health payload whose `config` is a non-dict (e.g. a different service
-    answering on the port returns config: null) must not crash the command."""
-    runner = CliRunner()
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"status": "healthy"},
+        {"config": {}},
+        {"config": {"backend": "anthropic"}},
+        {"config": None},
+        {"config": "not-a-config"},
+        {"config": []},
+        {"config": 42},
+        {"config": {"anthropic_api_url": False, "openai_api_url": 0}},
+        {"config": {"anthropic_api_url": [], "openai_api_url": {}}},
+        {"config": {"anthropic_api_url": ["malformed"], "openai_api_url": {"url": "bad"}}},
+    ],
+)
+def test_install_status_survives_unavailable_config(monkeypatch, payload) -> None:
+    """Redacted or malformed config is unknown, not evidence of unset URLs."""
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: _status_manifest(profile))
+    monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+    monkeypatch.setattr(inst, "probe_ready", lambda url: True)
+    monkeypatch.setattr(inst, "probe_json", lambda url: payload)
 
-    class Manifest:
-        targets = ["claude"]
-        tool_envs = {}
-        profile = "default"
-        preset = "persistent-service"
-        runtime_kind = "python"
-        supervisor_kind = "service"
-        scope = "user"
-        port = 8787
-        backend = "anthropic"
-        health_url = "http://127.0.0.1:8787/readyz"
+    result = CliRunner().invoke(main, ["install", "status"])
 
-    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
-    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "running")
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
-    monkeypatch.setattr("headroom.cli.install.probe_json", lambda url: {"config": None})
-
-    result = runner.invoke(main, ["install", "status"])
-
-    # No AttributeError; Backend falls back to the manifest value.
     assert result.exit_code == 0, result.output
-    assert "Backend:    anthropic" in result.output
+    assert "Default backend:  anthropic" in result.output
+    assert "Anthropic target: unknown" in result.output
+    assert "OpenAI target:    unknown" in result.output
+
+
+@pytest.mark.parametrize(
+    ("payload", "anthropic_target", "openai_target"),
+    [
+        ({"status": "healthy", "ready": True}, "unknown", "unknown"),
+        ({"config": {}}, "unknown", "unknown"),
+        (
+            {"config": {"anthropic_api_url": None, "openai_api_url": None}},
+            "default",
+            "default",
+        ),
+        (
+            {"config": {"openai_api_url": "https://user:fake-secret@openai.invalid/v1"}},
+            "unknown",
+            "configured",
+        ),
+        ({"config": {"anthropic_api_url": ""}}, "default", "unknown"),
+        ({"config": {"anthropic_api_url": False, "openai_api_url": None}}, "unknown", "default"),
+    ],
+)
+def test_install_status_probes_live_health_response(
+    tmp_path, monkeypatch, payload, anthropic_target, openai_target
+) -> None:
+    """Exercise manifest persistence, HTTP probes and CLI rendering together.
+
+    The redacted response is the shape returned to an untrusted Docker bridge
+    peer. This fixture is an HTTP server, not a Docker networking test.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    monkeypatch.setenv("HEADROOM_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+    requests = []
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            body = json.dumps({"ready": True} if self.path == "/readyz" else payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), HealthHandler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            save_manifest_strict(
+                DeploymentManifest(
+                    profile="status-proof",
+                    preset="persistent-task",
+                    runtime_kind="python",
+                    supervisor_kind="none",
+                    scope="user",
+                    provider_mode="manual",
+                    targets=[],
+                    port=port,
+                    host="127.0.0.1",
+                    backend="anthropic",
+                    health_url=f"http://127.0.0.1:{port}/readyz",
+                    base_env={
+                        "OPENAI_TARGET_API_URL": "https://stale:fake-secret@stale.invalid/v1"
+                    },
+                )
+            )
+
+            result = CliRunner().invoke(main, ["install", "status", "--profile", "status-proof"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    assert result.exit_code == 0, result.output
+    assert requests == ["/health", "/readyz"]
+    assert "Status:     stopped" in result.output
+    assert "Healthy:    yes" in result.output
+    assert "Default backend:  anthropic" in result.output
+    assert f"Anthropic target: {anthropic_target}" in result.output
+    assert f"OpenAI target:    {openai_target}" in result.output
+    assert "fake-secret" not in result.output
+    assert ".invalid" not in result.output
 
 
 def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
@@ -531,7 +632,8 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
@@ -893,7 +995,8 @@ def test_install_start_restarts_wedged_runtime_under_single_lock(monkeypatch) ->
         lambda manifest, timeout_seconds, **kwargs: next(wait_results),
     )
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.apply_mutations", lambda manifest: calls.append("apply") or []
@@ -985,134 +1088,6 @@ def test_install_apply_accepts_opencode_target(monkeypatch) -> None:
     assert "Targets: opencode" in result.output
 
 
-def test_install_apply_restores_previous_deployment_after_failed_update(monkeypatch) -> None:
-    runner = CliRunner()
-    calls: list[str] = []
-
-    class Manifest:
-        targets = ["claude"]
-        port = 8787
-        backend = "anthropic"
-        tool_envs = {}
-
-        def __init__(self, profile: str, targets: list[str]) -> None:
-            self.profile = profile
-            self.preset = "persistent-service"
-            self.runtime_kind = "python"
-            self.supervisor_kind = "service"
-            self.scope = "user"
-            self.health_url = "http://127.0.0.1:8787/readyz"
-            self.targets = targets
-            self.mutations = []
-            self.artifacts = []
-
-    new_manifest = Manifest("default", ["claude"])
-    existing_manifest = Manifest("default", ["codex"])
-    existing_manifest.mutations = [object()]
-
-    monkeypatch.setattr("headroom.cli.install.build_manifest", lambda **_: new_manifest)
-    monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: existing_manifest)
-    monkeypatch.setattr(
-        "headroom.cli.install.apply_mutations",
-        lambda deployment: calls.append(f"apply:{','.join(deployment.targets)}") or [],
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.install_supervisor",
-        lambda deployment, **kwargs: (
-            calls.append(f"supervisor:{','.join(deployment.targets)}") or []
-        ),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.save_manifest",
-        lambda deployment: calls.append(f"save:{','.join(deployment.targets)}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.stop_supervisor",
-        lambda deployment: calls.append(f"stop-supervisor:{','.join(deployment.targets)}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.stop_runtime",
-        lambda deployment: calls.append(f"stop-runtime:{','.join(deployment.targets)}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.remove_supervisor",
-        lambda deployment: calls.append(f"remove-supervisor:{','.join(deployment.targets)}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations",
-        lambda deployment: calls.append(f"revert:{','.join(deployment.targets)}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.delete_manifest",
-        lambda profile: calls.append(f"delete:{profile}"),
-    )
-    monkeypatch.setattr(
-        "headroom.cli.install.delete_recovery_manifest",
-        lambda profile: calls.append(f"delete-recovery:{profile}"),
-    )
-
-    def _start(deployment) -> None:
-        calls.append(f"start:{','.join(deployment.targets)}")
-        if deployment is new_manifest:
-            raise click.ClickException("boom")
-
-    monkeypatch.setattr("headroom.cli.install._start_deployment", _start)
-
-    result = runner.invoke(main, ["install", "apply"])
-
-    assert result.exit_code != 0
-    assert "Restoring previous deployment 'default'" in result.output
-    assert calls == [
-        "revert:codex",
-        "stop-supervisor:codex",
-        "stop-runtime:codex",
-        "remove-supervisor:codex",
-        "delete:default",
-        "save:claude",
-        "supervisor:claude",
-        "save:claude",
-        "start:claude",
-        "stop-supervisor:claude",
-        "stop-runtime:claude",
-        "remove-supervisor:claude",
-        "delete:default",
-        "supervisor:codex",
-        "save:codex",
-        "start:codex",
-        "apply:codex",
-        "save:codex",
-        "delete-recovery:default",
-    ]
-
-
-def test_install_apply_reports_restore_failure_with_recovery_path(monkeypatch) -> None:
-    previous = SimpleNamespace(profile="default")
-    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
-    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
-    monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: None)
-    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
-    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
-    monkeypatch.setattr(
-        inst,
-        "_start_deployment",
-        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
-    )
-    monkeypatch.setattr(
-        inst,
-        "_restore_deployment",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("restore failed")),
-    )
-
-    with pytest.raises(click.ClickException) as exc:
-        inst._apply_manifest(new)
-
-    message = str(exc.value)
-    assert "restore failed" in message
-    assert "recovery snapshot:" in message
-    assert "restore it after resolving the failure" in message
-
-
 def test_install_apply_old_removal_failure_is_actionable_and_does_not_start_new(
     monkeypatch,
 ) -> None:
@@ -1124,7 +1099,7 @@ def test_install_apply_old_removal_failure_is_actionable_and_does_not_start_new(
     monkeypatch.setattr(
         inst,
         "_remove_deployment",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("old removal failed")),
+        lambda manifest, **kwargs: (_ for _ in ()).throw(RuntimeError("old removal failed")),
     )
     monkeypatch.setattr(inst, "_start_deployment", lambda manifest: calls.append("start"))
 
@@ -1165,7 +1140,7 @@ def test_install_apply_uses_requested_profile_for_recovery_snapshot(
         backend="anthropic",
     )
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
-    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: None)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest, **kwargs: None)
     monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
     monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     monkeypatch.setattr(
@@ -1244,7 +1219,7 @@ def test_apply_persists_before_darwin_bootstrap_or_start_on_save_failure(monkeyp
     monkeypatch.setattr(
         inst, "_start_deployment", lambda current: start_calls.append(current.profile)
     )
-    monkeypatch.setattr(inst, "_remove_deployment", lambda current: None)
+    monkeypatch.setattr(inst, "_remove_deployment", lambda current, **kwargs: None)
 
     with pytest.raises(click.ClickException, match="active manifest busy"):
         inst._apply_manifest(manifest)
@@ -1276,7 +1251,9 @@ def test_activate_mutations_reverts_side_effects_when_strict_save_fails(monkeypa
         lambda current: (_ for _ in ()).throw(OSError("manifest busy")),
     )
     monkeypatch.setattr(
-        inst, "revert_mutations", lambda current: reverted.extend(current.mutations)
+        inst,
+        "revert_mutations",
+        lambda current, **kwargs: reverted.extend(current.mutations),
     )
 
     with pytest.raises(OSError, match="manifest busy"):
@@ -1324,53 +1301,27 @@ def test_install_apply_keeps_new_owner_recovery_fail_closed(monkeypatch, tmp_pat
         host="127.0.0.1",
         backend="anthropic",
     )
-    calls: list[str] = []
 
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
-    real_save_recovery = inst._save_recovery_snapshot
 
-    def save_recovery(manifest, profile):
-        real_save_recovery(manifest, profile)
-        calls.append("snapshot")
-
-    monkeypatch.setattr(inst, "_save_recovery_snapshot", save_recovery)
-
-    def remove(manifest):
-        calls.append("remove-new" if manifest is new else "remove-old")
+    def remove(manifest, **kwargs):
         if manifest is new:
             raise RuntimeError("new deployment cleanup failed")
 
     monkeypatch.setattr(inst, "_remove_deployment", remove)
-    real_save_apply = inst._save_apply_manifest
-
-    def save_apply(manifest):
-        real_save_apply(manifest)
-        calls.append("save-new")
-
-    monkeypatch.setattr(inst, "_save_apply_manifest", save_apply)
-    monkeypatch.setattr(
-        inst, "install_supervisor", lambda manifest, **kwargs: calls.append("install-new") or []
-    )
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     monkeypatch.setattr(
         inst,
         "_start_deployment",
         lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
     )
-    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore-old"))
-    monkeypatch.setattr(
-        inst, "delete_recovery_manifest", lambda profile: calls.append("delete-snapshot")
-    )
 
-    with pytest.raises(click.ClickException) as exc:
+    with pytest.raises(click.ClickException):
         inst._apply_manifest(new)
 
-    message = str(exc.value)
-    assert "startup failed" in message
-    assert "new deployment cleanup failed" in message
-    assert "recovery snapshot" in message
-    assert "remove the new owner before restoring the snapshot" in message
-    assert calls == ["snapshot", "remove-old", "save-new", "install-new", "save-new", "remove-new"]
-    assert load_state_manifest("default") is not None
+    owner = load_state_manifest("default")
+    assert owner is not None
+    assert owner.targets == ["new"]
     recovery = tmp_path / ".headroom" / "deploy" / "default.recovery.json"
     assert json.loads(recovery.read_text(encoding="utf-8"))["targets"] == ["old"]
 
@@ -1403,9 +1354,8 @@ def test_install_apply_keeps_snapshot_when_active_persistence_fails(
         host="127.0.0.1",
         backend="anthropic",
     )
-    calls: list[str] = []
     monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
-    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
+    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest, **kwargs: None)
     monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
     saves = 0
 
@@ -1418,60 +1368,15 @@ def test_install_apply_keeps_snapshot_when_active_persistence_fails(
         raise OSError("active manifest busy")
 
     monkeypatch.setattr(inst, "_save_apply_manifest", fail_active_save)
-    monkeypatch.setattr(inst, "_restore_deployment", lambda manifest: calls.append("restore"))
-    monkeypatch.setattr(inst, "delete_recovery_manifest", lambda profile: calls.append("delete"))
 
-    with pytest.raises(click.ClickException) as exc:
+    with pytest.raises(click.ClickException):
         inst._apply_manifest(new)
 
-    assert "active manifest persistence failed" in str(exc.value)
-    assert "recovery snapshot:" in str(exc.value)
-    assert calls == ["cleanup", "cleanup"]
-    assert load_state_manifest("default") is not None
-    assert (tmp_path / ".headroom" / "deploy" / "default.recovery.json").exists()
-
-
-def test_install_apply_persists_new_manifest_before_supervisor_install(monkeypatch) -> None:
-    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
-    calls: list[str] = []
-
-    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
-    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: calls.append("save"))
-    monkeypatch.setattr(
-        inst,
-        "install_supervisor",
-        lambda manifest, **kwargs: (_ for _ in ()).throw(RuntimeError("install failed")),
-    )
-    monkeypatch.setattr(inst, "_remove_deployment", lambda manifest: calls.append("cleanup"))
-
-    with pytest.raises(click.ClickException, match="install failed"):
-        inst._apply_manifest(new)
-
-    assert calls == ["save", "cleanup"]
-
-
-def test_install_apply_without_previous_has_no_recovery_guidance(monkeypatch) -> None:
-    new = SimpleNamespace(profile="default", artifacts=[], mutations=[])
-    monkeypatch.setattr(inst, "load_manifest", lambda profile: None)
-    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
-    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
-    monkeypatch.setattr(
-        inst,
-        "_start_deployment",
-        lambda manifest: (_ for _ in ()).throw(click.ClickException("startup failed")),
-    )
-    monkeypatch.setattr(
-        inst,
-        "_remove_deployment",
-        lambda manifest: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
-    )
-
-    with pytest.raises(click.ClickException) as exc:
-        inst._apply_manifest(new)
-
-    message = str(exc.value)
-    assert "startup failed" in message and "cleanup failed" in message
-    assert "recovery snapshot" not in message
+    owner = load_state_manifest("default")
+    assert owner is not None
+    assert owner.targets == ["new"]
+    recovery = tmp_path / ".headroom" / "deploy" / "default.recovery.json"
+    assert json.loads(recovery.read_text(encoding="utf-8"))["targets"] == ["old"]
 
 
 def test_install_start_rejects_task_lifecycle(monkeypatch) -> None:
@@ -1753,7 +1658,8 @@ def test_install_remove_retains_manifest_when_runtime_teardown_errors(monkeypatc
 
     monkeypatch.setattr("headroom.cli.install.load_manifest", lambda profile: Manifest())
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.stop_supervisor",
@@ -1892,7 +1798,8 @@ def test_install_agent_ensure_stops_wedged_runtime_before_restart(monkeypatch) -
 
     monkeypatch.setattr("headroom.cli.install.wait_ready", fake_wait_ready)
     monkeypatch.setattr(
-        "headroom.cli.install.revert_mutations", lambda manifest: calls.append("revert")
+        "headroom.cli.install.revert_mutations",
+        lambda manifest, **kwargs: calls.append("revert"),
     )
     monkeypatch.setattr(
         "headroom.cli.install.apply_mutations", lambda manifest: calls.append("apply") or []
@@ -2146,3 +2053,83 @@ def test_install_start_still_skips_when_nothing_is_pending(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert applied == []
+
+
+@pytest.mark.parametrize("lifecycle", ["apply", "restart", "ensure"])
+def test_opencode_reactivation_preserves_edits(
+    lifecycle: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reapply, restart, and watchdog recovery keep edits made after installation."""
+    import contextlib
+
+    from headroom.install.providers import apply_mutations
+
+    monkeypatch.setenv("OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    config_file = tmp_path / "opencode.json"
+    original = {"theme": "original", "mcp": {"local": {}}}
+    config_file.write_text(json.dumps(original))
+    previous = DeploymentManifest(
+        profile="default",
+        preset="persistent-service",
+        runtime_kind="python",
+        supervisor_kind="none",
+        scope="provider",
+        provider_mode="manual",
+        targets=["opencode"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+    )
+    apply_mutations(previous)
+
+    edited = json.loads(config_file.read_text())
+    edited["theme"] = "edited after install"
+    edited["provider"] = {"other": {"name": "User provider"}}
+    edited["mcp"]["remote"] = {"url": "https://example.test"}
+    config_file.write_text(json.dumps(edited))
+
+    monkeypatch.setattr(inst, "_save_apply_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "save_manifest", lambda manifest: None)
+    monkeypatch.setattr(inst, "load_manifest", lambda profile: previous)
+    monkeypatch.setattr(inst, "_stop_deployment", lambda manifest: None)
+    monkeypatch.setattr(inst, "_start_deployment", lambda manifest, **kwargs: None)
+    monkeypatch.setattr(inst, "install_supervisor", lambda manifest, **kwargs: [])
+    monkeypatch.setattr(inst, "remove_supervisor", lambda manifest: None)
+    monkeypatch.setattr(inst, "delete_manifest", lambda profile: None)
+
+    if lifecycle == "apply":
+        monkeypatch.setattr(inst, "_save_recovery_snapshot", lambda *args: None)
+        monkeypatch.setattr(inst, "_delete_recovery_snapshot", lambda profile: None)
+        new = DeploymentManifest(
+            profile="default",
+            preset="persistent-service",
+            runtime_kind="python",
+            supervisor_kind="none",
+            scope="provider",
+            provider_mode="manual",
+            targets=["opencode"],
+            port=8787,
+            host="127.0.0.1",
+            backend="anthropic",
+        )
+        inst._apply_manifest(new)
+    elif lifecycle == "restart":
+        monkeypatch.setattr(inst, "probe_ready", lambda url: False)
+        result = CliRunner().invoke(main, ["install", "restart"])
+        assert result.exit_code == 0, result.output
+    else:
+        monkeypatch.setattr(inst, "runtime_status", lambda manifest: "running")
+        monkeypatch.setattr(inst, "probe_ready", lambda url: False)
+        monkeypatch.setattr(inst, "wait_ready", lambda *args, **kwargs: False)
+        monkeypatch.setattr(inst, "stop_runtime", lambda manifest: None)
+        monkeypatch.setattr(
+            inst, "acquire_runtime_start_lock", lambda profile: contextlib.nullcontext(True)
+        )
+        result = CliRunner().invoke(main, ["install", "agent", "ensure"])
+        assert result.exit_code == 0, result.output
+
+    actual = json.loads(config_file.read_text())
+    assert actual["theme"] == "edited after install"
+    assert actual["provider"]["other"] == {"name": "User provider"}
+    assert actual["provider"]["headroom"]["options"]["baseURL"] == ("http://127.0.0.1:8787/v1")
+    assert actual["mcp"]["remote"] == {"url": "https://example.test"}

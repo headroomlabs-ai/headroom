@@ -39,7 +39,12 @@ def parse_headers(s: str | None) -> dict[str, str]:
         if not k:
             continue
         if _ctrl(k) or _ctrl(v) or " " in k or ":" in k:
-            log.warning("headroom-oauth2: dropping malformed static header: %r", k)
+            # Don't echo the key: a pair like "Authorization: Bearer x=y" lands
+            # here whole, so the "key" can carry the credential itself.
+            log.warning(
+                "headroom-oauth2: dropping malformed static header "
+                "(name has a space, colon or control character)"
+            )
             continue
         out[k] = v
     return out
