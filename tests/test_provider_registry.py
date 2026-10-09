@@ -160,6 +160,8 @@ def test_proxy_provider_runtime_routes_model_metadata_and_passthrough() -> None:
     assert runtime.select_passthrough_base_url({"api-key": "azure", "x-headroom-base-url": ""}) == (
         runtime.api_targets.openai
     )
+    assert runtime.select_passthrough_base_url({}, "/api/hello") == runtime.api_targets.anthropic
+    assert runtime.select_passthrough_base_url({}, "/other/path") == runtime.api_targets.openai
 
 
 def test_create_proxy_backend_handles_missing_litellm_backend(caplog) -> None:
