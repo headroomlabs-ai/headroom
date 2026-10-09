@@ -64,6 +64,12 @@ ANTHROPIC_SEARCH_BM25: dict[str, Any] = {
 THIRD_PARTY_URL = "https://kong.internal/anthropic"
 
 
+@pytest.fixture(autouse=True)
+def _enable_openai_tool_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These contract tests exercise explicitly enabled server-side deferral."""
+    monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH", "1")
+
+
 def _mcp(n: int) -> list[dict[str, Any]]:
     return [
         {"name": f"mcp__srv{i}__do", "description": "x" * 400, "input_schema": {"type": "object"}}
