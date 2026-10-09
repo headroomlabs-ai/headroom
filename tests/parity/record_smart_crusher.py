@@ -108,6 +108,12 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
     # unchanged; trivially byte-equal.
     out.append(("non_json_passthrough", "this is not json at all", "", 1.0))
 
+    # 2. An object without crushable arrays retains its whitespace.
+    out.append(("small_object_passthrough", json.dumps({"a": 1, "b": 2, "c": "hello"}), "", 1.0))
+
+    # 3. An array below the analysis threshold is byte-identical.
+    out.append(("short_array_passthrough", json.dumps([1, 2, 3]), "", 1.0))
+
     # 4. Dict array with 30 items, varied integer status field.
     # Exercises crush_array's adaptive_k → smart_sample / top_n path.
     items_30_dict = [
@@ -164,6 +170,11 @@ def _scenarios() -> list[tuple[str, str, str, float]]:
 
     # 15. Empty array — boundary case, must round-trip cleanly.
     out.append(("empty_array", json.dumps([]), "", 1.0))
+
+    # 16. Non-crushable null/bool mixtures retain their original separators.
+    out.append(
+        ("nulls_and_bools", json.dumps([None, True, False, None, True, False, None]), "", 1.0)
+    )
 
     # Recursive no-op analysis must preserve bytes through every object level.
     deep = {"a": {"b": {"events": [{"i": i, "kind": "deep", "v": f"x{i}"} for i in range(15)]}}}

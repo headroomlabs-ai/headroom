@@ -42,7 +42,32 @@ _FIXTURES_DIR = Path(__file__).parent.parent / "parity" / "fixtures" / "smart_cr
 
 
 def _all_fixtures() -> list[Path]:
-    return sorted(_FIXTURES_DIR.glob("*.json"))
+    fixtures = sorted(_FIXTURES_DIR.glob("*.json"))
+    labels = {p.stem.rsplit("_", 1)[0] for p in fixtures}
+    # Require each native boundary and transformed-value scenario in the matrix;
+    # an arbitrary fixture count can hide a deleted scenario behind duplicates.
+    for label in (
+        "non_json_passthrough",
+        "dict_array_30",
+        "string_array_25",
+        "number_array_40_changepoint",
+        "mixed_array",
+        "dict_array_30_bias_high",
+        "dict_array_30_bias_low",
+        "dict_array_100_sequential",
+        "duplicate_dicts_40",
+        "empty_array",
+        "small_object_passthrough",
+        "short_array_passthrough",
+        "nulls_and_bools",
+        "unicode_dict_array",
+        "time_series_50",
+        "nested_object_with_array",
+        "nested_3deep_with_array",
+    ):
+        if label not in labels:
+            raise FileNotFoundError(f"Missing native parity scenario: {label}")
+    return fixtures
 
 
 @pytest.mark.parametrize("fixture_path", _all_fixtures(), ids=lambda p: p.name)
