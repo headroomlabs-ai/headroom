@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -528,3 +529,67 @@ def test_zero_saving_request_keeps_its_place_in_the_new_input_denominator(monkey
     assert window["new_input_tokens"] == 10_100
     assert window["new_input_savings_percent"] == pytest.approx(1.0, abs=0.05)
     assert window["savings_percent"] == pytest.approx(50.0)
+
+
+# --------------------------------------------------------------------------- #
+# failures are logged, not swallowed
+# --------------------------------------------------------------------------- #
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def ledger_records():
+    # Attach directly: caplog misses `headroom.*` loggers once the proxy has
+    # configured logging earlier in the session.
+    logger = logging.getLogger("headroom.savings_ledger")
+    handler = _ListHandler()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    yield handler.records
+    logger.removeHandler(handler)
+    logger.setLevel(previous)
+
+
+def _warnings(records: list[logging.LogRecord]) -> list[str]:
+    return [r.getMessage() for r in records if r.levelno == logging.WARNING]
+
+
+def test_unreadable_ledger_warns_instead_of_reporting_zero_silently(tmp_path, ledger_records):
+    readable = tmp_path / "savings_events.jsonl"
+    assert L.record_savings_event(
+        tokens_before=1000, tokens_after=400, model=None, client="c", path=readable
+    )
+    assert L.aggregate_savings(path=readable).lifetime["tokens_saved"] == 600
+    assert _warnings(ledger_records) == []
+
+    # A directory where the ledger file should be: unreadable.
+    report = L.aggregate_savings(path=tmp_path)
+
+    assert report.lifetime["tokens_saved"] == 0
+    warnings = _warnings(ledger_records)
+    assert len(warnings) == 1
+    assert "could not read" in warnings[0]
+    assert str(tmp_path) in warnings[0]
+
+
+def test_first_failed_append_warns_once_per_process(monkeypatch, tmp_path, ledger_records):
+    monkeypatch.setattr(L, "_append_failure_warned", False, raising=False)
+
+    # A directory where the ledger file should be: every append fails.
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=tmp_path)
+    assert not L.record_savings_event(tokens_before=1000, tokens_after=400, path=tmp_path)
+
+    warnings = _warnings(ledger_records)
+    assert len(warnings) == 1  # one WARNING; the second failure goes to DEBUG
+    assert "append to" in warnings[0]
+    assert str(tmp_path) in warnings[0]
+    assert any(r.levelno == logging.DEBUG and "append to" in r.getMessage() for r in ledger_records)

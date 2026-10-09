@@ -41,6 +41,7 @@ blending two meanings.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -67,6 +68,12 @@ try:
     _HAS_FCNTL = True
 except ImportError:
     _HAS_FCNTL = False
+
+logger = logging.getLogger(__name__)
+
+# The first failed append per process is a WARNING so an unwritable ledger is
+# visible; later ones drop to DEBUG so a persistent failure cannot flood logs.
+_append_failure_warned = False
 
 SCHEMA_VERSION = 2
 UNKNOWN = "unknown"
@@ -202,6 +209,7 @@ def _price_event(
     try:
         from headroom.pricing.counterfactual import CacheMix, Region, price_savings
     except Exception:  # pragma: no cover - defensive
+        logger.debug("savings ledger: pricing module failed to import", exc_info=True)
         return None
 
     cache = event.get("cache") or {}
@@ -245,6 +253,7 @@ def _price_event(
             total_list += priced.usd_list
             bases.append(priced.basis)
     except Exception:  # pragma: no cover - defensive
+        logger.debug("savings ledger: pricing failed for model=%s", model, exc_info=True)
         return None
 
     if not bases:
@@ -412,7 +421,18 @@ def record_savings_event(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        global _append_failure_warned
+        if not _append_failure_warned:
+            _append_failure_warned = True
+            logger.warning(
+                "savings ledger: append to %s failed: %s; savings will not be recorded. "
+                "Make the directory writable or set HEADROOM_SAVINGS_EVENTS_PATH.",
+                target,
+                exc,
+            )
+        else:
+            logger.debug("savings ledger: append to %s failed", target, exc_info=True)
         return False
 
     _maybe_compact(target)
@@ -454,7 +474,13 @@ def _read_events(
             finally:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "savings ledger: could not read %s: %s. Check that it is a readable file, "
+            "or set HEADROOM_SAVINGS_EVENTS_PATH.",
+            target,
+            exc,
+        )
         return []
     return events
 
@@ -554,6 +580,7 @@ def _weakest(existing: str | None, incoming: str | None) -> str | None:
 
         return weakest_basis(existing, incoming)
     except Exception:  # pragma: no cover - defensive
+        logger.debug("savings ledger: could not compare pricing bases", exc_info=True)
         return existing
 
 
@@ -759,6 +786,7 @@ def _maybe_compact(target: Path) -> None:
                 if _HAS_FCNTL and fcntl is not None:
                     fcntl.flock(handle, fcntl.LOCK_UN)
     except Exception:
+        logger.debug("savings ledger: compaction of %s failed", target, exc_info=True)
         return
 
 

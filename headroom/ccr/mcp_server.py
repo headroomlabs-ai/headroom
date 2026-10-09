@@ -227,7 +227,8 @@ def _append_shared_event(event: dict[str, Any]) -> None:
             if _HAS_FCNTL:
                 fcntl.flock(f, fcntl.LOCK_UN)
     except Exception:
-        pass  # Never break compression because of stats
+        # Never break compression because of stats
+        logger.debug("MCP session stats: append to %s failed", SHARED_STATS_FILE, exc_info=True)
 
 
 def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[dict[str, Any]]:
@@ -266,9 +267,11 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
                     if _HAS_FCNTL:
                         fcntl.flock(f, fcntl.LOCK_UN)
             except Exception:
-                pass
+                logger.debug(
+                    "MCP session stats: pruning %s failed", SHARED_STATS_FILE, exc_info=True
+                )
     except Exception:
-        pass
+        logger.debug("MCP session stats: reading %s failed", SHARED_STATS_FILE, exc_info=True)
     return events
 
 
@@ -531,7 +534,13 @@ class HeadroomMCPServer:
                     self._stats.record_retrieval(hash_key)
                     return result
             except Exception:
-                pass  # Proxy unavailable, that's fine
+                # Proxy unavailable is expected; log so a bug here is not silent.
+                logger.debug(
+                    "MCP retrieve: proxy fallback failed for hash=%s via %s",
+                    hash_key,
+                    self.proxy_url,
+                    exc_info=True,
+                )
 
         if expired_entry_status:
             ttl_seconds = expired_entry_status.get(
@@ -846,8 +855,9 @@ class HeadroomMCPServer:
             name = getattr(info, "name", None)
             if name:
                 return str(name)
-        except Exception:
-            pass
+        except (LookupError, AttributeError):
+            # Outside a request there is no request context; fall back to "unknown".
+            logger.debug("MCP client name unavailable; reporting 'unknown'", exc_info=True)
         return "unknown"
 
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
@@ -947,6 +957,9 @@ class HeadroomMCPServer:
             result: dict[str, Any] = response.json()
             return result
         except Exception:
+            logger.debug(
+                "MCP stats: proxy /stats fetch failed via %s", self.proxy_url, exc_info=True
+            )
             return None
 
     @staticmethod
