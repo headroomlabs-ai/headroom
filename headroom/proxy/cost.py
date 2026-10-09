@@ -275,7 +275,11 @@ def build_prefix_cache_stats(
                             from headroom.pricing.counterfactual import resolve_rates
 
                             cache_prices = resolve_rates(model_name)
-                        except Exception:
+                        except Exception as e:
+                            _warn_pricing_once(
+                                f"__cache_rates__:{model_name}",
+                                f"Failed to resolve cache rates for model {model_name}: {e}",
+                            )
                             cache_prices = None
                         best_tokens = tokens_sent
 
@@ -1369,7 +1373,10 @@ class CostTracker:
             info = litellm.model_cost.get(resolved, {})
             cost_per_token = info.get("input_cost_per_token")
             return cost_per_token * 1_000_000 if cost_per_token else None
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once(
+                f"__list_price__:{model}", f"Failed to get list price for model {model}: {e}"
+            )
             return None
 
     def _get_output_price(self, model: str, *, long_context: bool = False) -> float | None:
@@ -1390,7 +1397,10 @@ class CostTracker:
             if long_context:
                 return info.get("output_cost_per_token_above_200k_tokens") or base or None
             return base or None
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once(
+                f"__output_price__:{model}", f"Failed to get output price for model {model}: {e}"
+            )
             return None
 
     def _write_cost_usd(self, model: str, w5m_price: float, w1h_price: float) -> float:
@@ -1444,7 +1454,10 @@ class CostTracker:
             from headroom.pricing.counterfactual import resolve_rates
 
             rates = resolve_rates(model, long_context=long_context, for_billing=for_billing)
-        except Exception:
+        except Exception as e:
+            _warn_pricing_once(
+                f"__cache_rates__:{model}", f"Failed to resolve cache rates for model {model}: {e}"
+            )
             return None
         if rates is None or not rates.uncached:
             return None

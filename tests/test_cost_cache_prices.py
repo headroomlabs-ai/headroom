@@ -9,6 +9,7 @@ and inferred writes cannot double-charge the uncached input bucket.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -358,3 +359,41 @@ class TestGetCachePrices:
         rates = resolve_rates("m", provider="anthropic")
         assert rates.read == rates.write_5m == 1e-6
         assert rates.read_is_catalog and rates.write_is_catalog
+
+
+class _Capture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def test_cache_rate_failure_warns_once_per_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising rate resolver used to read as 'unpriced' ($0) with no trace."""
+    from headroom.proxy import cost
+
+    monkeypatch.setattr(cost, "_warned_pricing_models", set())
+    _patch_litellm(
+        monkeypatch,
+        {"m": {"input_cost_per_token": 1e-6, "litellm_provider": "anthropic"}},
+    )
+    capture = _Capture()
+    cost.logger.addHandler(capture)
+    try:
+        assert CostTracker()._get_cache_prices("m") is not None
+        assert not capture.records  # a resolvable model is silent
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("pricing table corrupt")
+
+        monkeypatch.setattr("headroom.pricing.counterfactual.resolve_rates", broken)
+        assert CostTracker()._get_cache_prices("m") is None
+        assert CostTracker()._get_cache_prices("m") is None
+    finally:
+        cost.logger.removeHandler(capture)
+
+    warnings = [r.getMessage() for r in capture.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "for model m:" in warnings[0] and "pricing table corrupt" in warnings[0]

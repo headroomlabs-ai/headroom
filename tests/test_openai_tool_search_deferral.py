@@ -9,6 +9,7 @@ searched. Gated to gpt-5.4+ (older models 400 on the fields).
 from __future__ import annotations
 
 import copy
+import logging
 
 import pytest
 
@@ -53,6 +54,39 @@ def test_env_override_wins_then_falls_back(monkeypatch):
     # a malformed regex must not crash — fall back to the version gate.
     monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
     assert _model_supports_openai_tool_search("gpt-5.4") is True
+
+
+class _Capture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def test_malformed_override_warns_once_not_per_request(monkeypatch):
+    """A bad regex used to be ignored on every request without a word."""
+    from headroom.proxy import helpers
+
+    monkeypatch.setattr(helpers, "_openai_tool_search_bad_pattern", None)
+    capture = _Capture()
+    proxy_logger = logging.getLogger("headroom.proxy")
+    proxy_logger.addHandler(capture)
+    try:
+        monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", r"^gpt-5\.4")
+        assert _model_supports_openai_tool_search("gpt-5.4") is True
+        assert not capture.records  # a valid override is silent
+
+        monkeypatch.setenv("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "[unclosed")
+        for _ in range(5):
+            assert _model_supports_openai_tool_search("gpt-5.4") is True
+    finally:
+        proxy_logger.removeHandler(capture)
+
+    warnings = [r for r in capture.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "[unclosed" in warnings[0].getMessage()
 
 
 # --- deferral behavior -------------------------------------------------------

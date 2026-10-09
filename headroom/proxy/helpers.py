@@ -1463,6 +1463,12 @@ def parse_sse_events_from_byte_buffer(
 # Maximum message array length (prevents DoS from deeply nested payloads)
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 
+
+def _warn_invalid_env_number(name: str, default: float) -> None:
+    """Say which numeric knob was ignored, so a typo does not silently revert it."""
+    logger.warning("Ignoring invalid %s=%r; using %s", name, os.environ.get(name), default)
+
+
 # Compression pipeline timeout in seconds. Override via the
 # HEADROOM_COMPRESSION_TIMEOUT_SECONDS env var for slow CPUs or long Claude Code
 # conversations (GH #946). Falls back to 30 on an unparseable value.
@@ -1472,6 +1478,7 @@ try:
     )
 except ValueError:
     COMPRESSION_TIMEOUT_SECONDS = 30.0
+    _warn_invalid_env_number("HEADROOM_COMPRESSION_TIMEOUT_SECONDS", COMPRESSION_TIMEOUT_SECONDS)
 
 # Cold-start fast-pass timeout in seconds. When background compression defers
 # a cold-start-large request, the handler still runs the pipeline synchronously
@@ -1486,6 +1493,9 @@ try:
     )
 except ValueError:
     COLD_START_FAST_PASS_TIMEOUT_SECONDS = 10.0
+    _warn_invalid_env_number(
+        "HEADROOM_COLD_START_FAST_PASS_TIMEOUT_SECONDS", COLD_START_FAST_PASS_TIMEOUT_SECONDS
+    )
 
 # Eager startup preload timeout in seconds. The preload (compressor/parser models,
 # cache-only, allow_download=False) runs off the event loop during startup; this
@@ -1498,6 +1508,9 @@ try:
     )
 except ValueError:
     EAGER_PRELOAD_TIMEOUT_SECONDS = 120.0
+    _warn_invalid_env_number(
+        "HEADROOM_EAGER_PRELOAD_TIMEOUT_SECONDS", EAGER_PRELOAD_TIMEOUT_SECONDS
+    )
 
 # Maximum compression cache sessions (prevents unbounded memory growth).
 # Overridable via HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS for gateway
@@ -1509,6 +1522,9 @@ try:
     )
 except ValueError:
     MAX_COMPRESSION_CACHE_SESSIONS = 500
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_MAX_SESSIONS", MAX_COMPRESSION_CACHE_SESSIONS
+    )
 
 # Idle TTL for per-session compression caches. Eviction is bust-free only
 # once the provider's own prompt cache has lapsed, so this must exceed the
@@ -1533,6 +1549,9 @@ try:
     COMPRESSION_CACHE_TTL_SECONDS = max(600.0, _ttl_env)
 except ValueError:
     COMPRESSION_CACHE_TTL_SECONDS = 3900.0
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_TTL_SECONDS", COMPRESSION_CACHE_TTL_SECONDS
+    )
 
 # Entries per session compression cache. 10k covers a single conversation with
 # ~2x headroom even at a 1M-token context (a compressible tool_result is at
@@ -1547,6 +1566,9 @@ try:
     )
 except ValueError:
     COMPRESSION_CACHE_MAX_ENTRIES = 10000
+    _warn_invalid_env_number(
+        "HEADROOM_COMPRESSION_CACHE_MAX_ENTRIES", COMPRESSION_CACHE_MAX_ENTRIES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1980,9 +2002,14 @@ def _setup_file_logging(
             headroom_logger.removeHandler(stale)
             stale.close()
         headroom_logger.addHandler(handler)
-    except OSError:
-        # Non-fatal: can't write logs (read-only fs, permissions, etc.)
-        pass
+    except OSError as exc:
+        # Non-fatal: can't write logs (read-only fs, permissions, etc.). Say so,
+        # or the missing proxy.log is the only clue. The OSError names the path.
+        logger.warning(
+            "Headroom runtime log disabled: cannot write the log file: %s. "
+            "Point HEADROOM_WORKSPACE_DIR at a writable directory to restore proxy.log.",
+            exc,
+        )
 
 
 def is_anthropic_auth(headers: dict[str, str]) -> bool:
@@ -4616,6 +4643,9 @@ _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex", "opencode"})
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
 # model families can be enabled without a code edit + release.
 _OPENAI_TOOL_SEARCH_MIN_VERSION = (5, 4)
+# Last malformed override pattern warned about, so a bad regex is reported once
+# instead of on every request.
+_openai_tool_search_bad_pattern: str | None = None
 
 
 def _model_supports_openai_tool_search(model: str | None) -> bool:
@@ -4626,14 +4656,23 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     when set; a malformed pattern falls back to the version gate rather than
     crashing.
     """
+    global _openai_tool_search_bad_pattern
     if not model:
         return False
     override = os.environ.get("HEADROOM_OPENAI_TOOL_SEARCH_MODELS", "").strip()
     if override:
         try:
             return re.search(override, model) is not None
-        except re.error:
-            pass  # malformed override → fall back to the version gate
+        except re.error as exc:
+            # Malformed override → fall back to the version gate.
+            if override != _openai_tool_search_bad_pattern:
+                _openai_tool_search_bad_pattern = override
+                logger.warning(
+                    "Ignoring invalid HEADROOM_OPENAI_TOOL_SEARCH_MODELS regex %r (%s); "
+                    "using the gpt-5.4+ version gate",
+                    override,
+                    exc,
+                )
     match = re.match(r"gpt-(\d+)(?:\.(\d+))?", model.strip().lower())
     if not match:
         return False
