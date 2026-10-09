@@ -173,6 +173,29 @@ def test_trailing_newline_beyond_declared_count_is_trimmed() -> None:
     assert expand_compacted("[2]{k:string?}\na\nb\n\n") == [{"k": "a"}, {"k": "b"}]
 
 
+def test_json_column_string_literals_stay_strings_and_values_keep_their_type() -> None:
+    # In a `json` column the native encoder writes a string that looks like a
+    # JSON literal as a quoted JSON string (`"""null"""` is the string `null`),
+    # while real values stay bare. The decoder must tell the two apart.
+    block = (
+        "[9]{id:int,v:json?}\n"
+        '1,"""null"""\n'
+        "2,null\n"
+        '3,"""true"""\n'
+        "4,true\n"
+        '5,"""1"""\n'
+        "6,1\n"
+        '7,"""NaN"""\n'
+        '8,"""[1]"""\n'
+        "9,hello\n"
+    )
+    decoded = expand_compacted(block)
+    assert decoded is not None
+    values = [row["v"] for row in decoded]
+    assert values == ["null", None, "true", True, "1", 1, "NaN", "[1]", "hello"]
+    assert [type(v) for v in values] == [str, type(None), str, bool, str, int, str, str, str]
+
+
 def test_single_column_null_survives_value_factoring() -> None:
     block = "[3]{k:string?}\nx\ny\nnull\n"
     factored = factor_values(block)

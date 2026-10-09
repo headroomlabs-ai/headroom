@@ -2,6 +2,8 @@
 
 Context compression plugin for [OpenClaw](https://github.com/openclaw/openclaw). Compresses tool outputs, code, logs, and structured data — 70-90% token savings with zero LLM calls.
 
+Tool-call normalization preserves provider metadata, including thought signatures, when restoring assistant turns after compression.
+
 ## Install
 
 Recommended one-command setup:

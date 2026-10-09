@@ -45,6 +45,9 @@ def main() -> None:
         "plugins/headroom-agent-hooks/.claude-plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.claude-plugin/plugin.json"
         ),
+        "plugins/headroom-snip/.claude-plugin/plugin.json": _read_json_version(
+            ROOT / "plugins/headroom-snip/.claude-plugin/plugin.json"
+        ),
         "plugins/headroom-agent-hooks/.github/plugin/plugin.json": _read_json_version(
             ROOT / "plugins/headroom-agent-hooks/.github/plugin/plugin.json"
         ),
