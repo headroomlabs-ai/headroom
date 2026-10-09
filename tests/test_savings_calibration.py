@@ -526,3 +526,102 @@ def test_licence_report_provider_savings_are_net() -> None:
     assert payload["tokens_saved_novel_provider"] == 380
     assert payload["tokens_saved_novel_provider_gross"] == 500
     assert payload["tokens_added_novel_provider"] == 120
+
+
+def _stats_after(*outcomes: RequestOutcome) -> dict:
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.savings_calibration import reset_savings_calibrator
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    reset_savings_calibrator()
+    app = create_app(
+        ProxyConfig(
+            optimize=False, cache_enabled=False, rate_limit_enabled=False, log_requests=False
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+    for outcome in outcomes:
+        asyncio.run(emit_request_outcome(app.state.proxy, outcome))
+    with TestClient(app) as client:
+        resp = client.get("/stats")
+    reset_savings_calibrator()
+    assert resp.status_code == 200, resp.text[:300]
+    return resp.json()["tokens"]
+
+
+def _mixed_outcome(**overrides: object) -> RequestOutcome:
+    from headroom.proxy.savings_calibration import (
+        CLIENT_REQUEST_TOKENS_TAG,
+        CLIENT_TOOL_TOKENS_TAG,
+    )
+
+    fields: dict = {
+        "request_id": "r",
+        "provider": "openai",
+        "model": "gpt-4o",
+        "original_tokens": 1_000,
+        "optimized_tokens": 1_000,
+        "output_tokens": 5,
+        "tokens_saved": 0,
+        "attempted_input_tokens": 1_000,
+        "local_forwarded_tokens": 1_000,
+        "local_counts_full_request": True,
+        "tags": {CLIENT_REQUEST_TOKENS_TAG: 1_000, CLIENT_TOOL_TOKENS_TAG: 0},
+    }
+    fields.update(overrides)
+    return RequestOutcome(**fields)  # type: ignore[arg-type]
+
+
+def test_stats_survive_negative_savings_on_estimated_input_requests() -> None:
+    """Reviewer repro: one provider-reported request saving nothing, then an
+    estimated-input request where Headroom added 1,000 tool tokens. The old
+    ratio mixed populations (all savings over reported input only) and hit a
+    zero denominator in GET /stats."""
+    from headroom.proxy.savings_calibration import CLIENT_REQUEST_TOKENS_TAG, CLIENT_TOOL_TOKENS_TAG
+
+    reported = _mixed_outcome(request_id="a", provider_input_tokens=1_000)
+    estimated = _mixed_outcome(
+        request_id="b",
+        optimized_tokens=2_000,
+        attempted_input_tokens=2_000,
+        local_forwarded_tokens=2_000,
+        local_forwarded_tool_tokens=1_000,
+        tags={CLIENT_REQUEST_TOKENS_TAG: 1_000, CLIENT_TOOL_TOKENS_TAG: 0},
+    )
+    tokens = _stats_after(reported, estimated)
+    assert tokens["input_provider_reported"] == 1_000
+    assert tokens["input_estimated"] > 0
+    assert tokens["saved_provider"] < 0  # the estimated request's addition
+    # The percentage covers the reported request only: it saved nothing.
+    assert tokens["saved_provider_reported"] == 0
+    assert tokens["saved_provider_percent"] == 0
+
+
+def test_saved_percent_pairs_reported_savings_with_reported_input() -> None:
+    from headroom.proxy.savings_calibration import CLIENT_REQUEST_TOKENS_TAG, CLIENT_TOOL_TOKENS_TAG
+
+    # Reported: client 1,500 -> forwarded 1,000 (500 saved, native tokenizer).
+    reported = _mixed_outcome(
+        request_id="a",
+        provider_input_tokens=1_000,
+        tags={CLIENT_REQUEST_TOKENS_TAG: 1_500, CLIENT_TOOL_TOKENS_TAG: 0},
+    )
+    # Estimated-input request that saved a lot must not move the percentage.
+    estimated = _mixed_outcome(
+        request_id="b",
+        tags={CLIENT_REQUEST_TOKENS_TAG: 9_000, CLIENT_TOOL_TOKENS_TAG: 0},
+    )
+    tokens = _stats_after(reported, estimated)
+    assert tokens["saved_provider_reported"] == 500
+    assert tokens["saved_provider_percent"] == round(500 / 1_500 * 100, 2)
+
+
+def test_provider_saved_percent_handles_a_nonpositive_baseline() -> None:
+    from headroom.proxy.server import _provider_saved_percent
+
+    assert _provider_saved_percent(-1_000, 1_000) == 0.0
+    assert _provider_saved_percent(-1_500, 1_000) == 0.0
+    assert _provider_saved_percent(0, 0) == 0.0
+    assert _provider_saved_percent(-100, 1_000) == round(-100 / 900 * 100, 2)

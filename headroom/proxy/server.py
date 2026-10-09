@@ -3165,6 +3165,17 @@ class ActivityMiddleware:
             self.proxy._activity_generation += 1
 
 
+def _provider_saved_percent(saved: int, billed_input: int) -> float:
+    """Savings as a share of what the requests would have billed without
+    Headroom (billed input + net saving). 0 when that baseline is not
+    positive: net-negative savings can cancel it, and a percentage of
+    nothing is not meaningful."""
+    baseline = billed_input + saved
+    if billed_input <= 0 or baseline <= 0:
+        return 0.0
+    return round(saved / baseline * 100, 2)
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -5191,15 +5202,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "saved_provider_carried": m.tokens_saved_provider_carried_total,
                 "added_provider": m.tokens_added_provider_total,
                 "saved_provider_usd": round(m.savings_usd_provider_total, 4),
-                "saved_provider_percent": round(
-                    (
-                        m.tokens_saved_provider_total
-                        / (m.tokens_input_provider_reported_total + m.tokens_saved_provider_total)
-                        * 100
-                    )
-                    if m.tokens_input_provider_reported_total > 0
-                    else 0,
-                    2,
+                # Same population on both sides: savings and billed input of
+                # the requests whose input the provider reported. Estimated-
+                # input requests are in saved_provider but not in this ratio.
+                "saved_provider_reported": m.tokens_saved_provider_reported_total,
+                "saved_provider_percent": _provider_saved_percent(
+                    m.tokens_saved_provider_reported_total,
+                    m.tokens_input_provider_reported_total,
                 ),
                 "calibration_by_source": dict(m.calibration_requests_by_source),
                 "output": m.tokens_output_total,

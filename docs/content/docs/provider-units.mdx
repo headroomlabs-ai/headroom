@@ -25,6 +25,8 @@ To fix that, every request also reports its saving **in the provider's units**. 
 
 These fields appear on `/stats` → `recent_requests`, on the dashboard's expanded request row, in the request log, and on the `PERF` log line (`billed_in=`, `saved_provider=`, `saved_novel=`, `saved_carried=`, `saved_tools=`, `cal=`, `saved_usd=`). Totals are under `/stats` → `tokens.saved_provider*` and in the usage report.
 
+`tokens.saved_provider_percent` is `saved_provider_reported / (input_provider_reported + saved_provider_reported)`: savings and billed input of the **same** requests, the ones whose input the provider reported. Requests with estimated input count in `saved_provider` but not in the percentage. It is 0 when that baseline is not positive.
+
 ## How the conversion works
 
 1. **Exchange rate.** The provider's billed input for this request ÷ Headroom's local count of the same forwarded request (system prompt, billed tools and messages).
