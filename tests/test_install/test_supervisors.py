@@ -161,11 +161,13 @@ def test_parse_windows_task_xml_accepts_declared_multibyte_encoding() -> None:
     xml = (
         '<?xml version="1.0" encoding="shift_jis"?>\n'
         '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        "<Name>\u30c6\u30b9\u30c8</Name>"
         "<Principals><Principal><LogonType>S4U</LogonType></Principal></Principals>"
         "</Task>"
     )
     task = _parse_windows_task_xml(xml.encode("shift_jis"))
     assert task is not None
+    assert task.find(".//{*}Name").text == "\u30c6\u30b9\u30c8"
     assert task.find(".//{*}LogonType").text == "S4U"
 
 
