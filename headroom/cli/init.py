@@ -36,6 +36,7 @@ from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, Sup
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
+    codex_home_dir,
     codex_hooks_path,
     codex_project_config_path,
     validate_profile_name,
@@ -45,6 +46,7 @@ from headroom.install.providers import _apply_unix_env_scope, _apply_windows_env
 from headroom.install.runtime import (
     acquire_runtime_start_lock,
     resolve_headroom_command,
+    runtime_ownership,
     runtime_status,
     start_detached_agent,
     start_persistent_docker,
@@ -55,12 +57,26 @@ from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_runtime_ready(manifest: Any, timeout_seconds: int) -> bool:
+    """Keep hook recovery gated by both readiness and runtime identity."""
+    try:
+        return wait_ready(manifest, timeout_seconds=timeout_seconds, require_identity=True)
+    except TypeError:
+        # Compatibility for test doubles that predate the keyword-only guard.
+        return wait_ready(manifest, timeout_seconds=timeout_seconds)
+
 
 _VERBOSE_HANDLER_ATTR = "_headroom_init_verbose_handler"
 
@@ -308,9 +324,46 @@ def _remove_marker_block(content: str, marker_start: str, marker_end: str) -> st
     return content[:start].rstrip() + "\n\n" + content[end:].lstrip()
 
 
-def _strip_codex_init_block(content: str) -> str:
+def _strip_codex_root_routing_orphans(content: str) -> str:
+    """Drop Headroom loopback routing keys left at the document root.
+
+    Only the root (everything before the first table header) is Headroom's to
+    clean: the same keys inside ``[profiles.*]`` tables are user-owned
+    per-profile overrides, even when they point at Headroom.
+    """
+    import re
+
+    first_table = re.search(r"(?m)^[ \t]*\[", content)
+    split = first_table.start() if first_table else len(content)
+    root, rest = content[:split], content[split:]
+    root = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", root)
+    root = re.sub(
+        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+        "",
+        root,
+    )
+    return root + rest
+
+
+_CODEX_PROVIDER_SNAPSHOT_PREFIX = "# Headroom init previous provider: "
+
+
+def _codex_init_provider_snapshot(content: str) -> str | None:
+    match = re.search(r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"([^\n]*)", content)
+    if match is None:
+        return None
+    snapshot = json.loads(match.group(1))
+    if not isinstance(snapshot, str):
+        raise ValueError("Invalid Headroom init provider snapshot")
+    tomllib.loads(snapshot)
+    return snapshot
+
+
+def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> str:
     """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
     import re
+
+    provider_snapshot = _codex_init_provider_snapshot(content)
 
     # Remove any provider marker → end marker span, possibly repeated.
     while _CODEX_PROVIDER_MARKER_START in content and _CODEX_PROVIDER_MARKER_END in content:
@@ -327,12 +380,7 @@ def _strip_codex_init_block(content: str) -> str:
 
     # Strip any orphan top-level keys that a crashed or partial write may have
     # left outside the marker block.
-    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
-    content = re.sub(
-        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
-        "",
-        content,
-    )
+    content = _strip_codex_root_routing_orphans(content)
 
     # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
     orphan_headroom_table = re.compile(
@@ -341,6 +389,8 @@ def _strip_codex_init_block(content: str) -> str:
         r"(?=^\[|\Z)"
     )
     content = orphan_headroom_table.sub("", content)
+    if restore_provider and provider_snapshot is not None:
+        content = content.rstrip() + "\n\n" + provider_snapshot
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -350,26 +400,78 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
     warn_codex_provider_port_change(path, port)
+    auth_path = codex_home_dir() / "auth.json"
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
     requires_openai_auth = (
-        "requires_openai_auth = true\n"
-        if codex_uses_chatgpt_auth(path.parent / "auth.json")
-        else ""
+        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(auth_path) else ""
     )
+    try:
+        auth_config = build_codex_auth_config(auth_path, config_path=path)
+    except CodexAuthConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
         f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
         "[model_providers.headroom]\n"
-        'name = "Headroom init proxy"\n'
+        # Codex derives remote-compaction support from the provider display
+        # name. Keep the proxy's provider id as ``headroom`` for routing, but
+        # use the built-in OpenAI name so the capability is preserved.
+        'name = "OpenAI"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Adopt an existing unmarked provider table instead of declaring it twice.
+    # Keep user options that are not owned by the generated provider block.
+    provider_snapshot = _codex_init_provider_snapshot(content)
+    provider_table = re.search(
+        r"(?m)^[ \t]*\[model_providers\.headroom\][ \t]*(?:#[^\n]*)?\r?\n", content
+    )
+    if provider_table:
+        next_table = re.search(r"(?m)^[ \t]*\[", content[provider_table.end() :])
+        table_end = provider_table.end() + next_table.start() if next_table else len(content)
+        if provider_snapshot is None and _CODEX_PROVIDER_MARKER_START not in content:
+            provider_snapshot = content[provider_table.start() : table_end]
+        existing_options = content[provider_table.end() : table_end]
+        existing_options = re.sub(
+            r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"[^\n]*(?:\n|$)",
+            "",
+            existing_options,
+        )
+        existing_options = existing_options.replace(_CODEX_PROVIDER_MARKER_END, "")
+        generated_keys = set(re.findall(r"(?m)^([A-Za-z_][A-Za-z_0-9]*)[ \t]*=", block))
+        generated_keys.update(
+            {"auth", "env_key", "requires_openai_auth", "experimental_bearer_token"}
+        )
+        for key in generated_keys:
+            existing_options = re.sub(
+                rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=[^\n]*(?:\n|$)",
+                "",
+                existing_options,
+            )
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            existing_options + _CODEX_PROVIDER_MARKER_END,
+        )
+        if _CODEX_PROVIDER_MARKER_START not in content:
+            content = content[: provider_table.start()] + content[table_end:]
+    content = _replace_marker_block(
+        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, "", at_root=True
+    )
+    if provider_snapshot is not None:
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            _CODEX_PROVIDER_SNAPSHOT_PREFIX
+            + json.dumps(provider_snapshot)
+            + "\n"
+            + _CODEX_PROVIDER_MARKER_END,
+        )
     # init owns the ROOT-level model_provider/openai_base_url: drop any prior
     # root assignment so we replace it instead of emitting a duplicate top-level
     # key (#260). Scope the strip to the document root (everything before the
@@ -388,6 +490,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    tomllib.loads(content)
     path.write_text(content, encoding="utf-8")
     # Codex filters its history menu by the active model_provider, so existing
     # native threads vanish once we switch to "headroom". Retag them to match the
@@ -781,25 +884,25 @@ def _ensure_profile_running(profile: str) -> None:
     if manifest is None:
         return
     with _suppress_hook_output():
-        if wait_ready(manifest, timeout_seconds=1):
+        if _wait_for_runtime_ready(manifest, timeout_seconds=1):
             return
         try:
             with acquire_runtime_start_lock(manifest.profile) as acquired:
                 if not acquired:
                     return
-                if wait_ready(manifest, timeout_seconds=1):
+                if _wait_for_runtime_ready(manifest, timeout_seconds=1):
                     return
                 if runtime_status(manifest) == "running":
-                    if wait_ready(manifest, timeout_seconds=_STARTUP_READY_TIMEOUT_SECONDS):
+                    if _wait_for_runtime_ready(manifest, _STARTUP_READY_TIMEOUT_SECONDS):
                         return
                     stop_runtime(manifest)
-                if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+                if runtime_ownership(manifest) == "docker-supervisor":
                     start_persistent_docker(manifest)
                 elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
                     start_supervisor(manifest)
                 else:
                     start_detached_agent(manifest.profile)
-                wait_ready(manifest, timeout_seconds=45)
+                _wait_for_runtime_ready(manifest, 45)
         except Exception:
             return
 
@@ -906,6 +1009,12 @@ def _init_codex(*, global_scope: bool, profile: str, port: int) -> None:
     if os.name == "nt":
         click.echo(
             "Codex hooks are currently disabled upstream on Windows; provider routing was still installed."
+        )
+        click.echo(
+            "Nothing starts the Headroom proxy for Codex on Windows, so Codex cannot connect "
+            "while it is down. Use `headroom install apply` for a supervised proxy. To remove "
+            "this routing, run `headroom unwrap codex` (user scope) or delete the Headroom init "
+            "provider block from the project's .codex/config.toml."
         )
     click.echo("Restart Codex to activate Headroom configuration.")
 

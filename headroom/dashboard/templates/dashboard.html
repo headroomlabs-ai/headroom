@@ -102,6 +102,8 @@
         html:not(.dark) .ring-white\/5 { --tw-ring-color: rgba(0,0,0,0.08); }
         html:not(.dark) .border-red-900\/30 { border-color: rgba(239,68,68,0.25); }
         html:not(.dark) .border-emerald-900\/30 { border-color: rgba(16,185,129,0.25); }
+        /* Light mode: keep the active savings-profile badge readable */
+        html:not(.dark) .text-cyan-100 { color: #155e75; }
         /* Light mode: TTL card color adjustments */
         html:not(.dark) .text-cyan-50 { color: #164e63; }
         html:not(.dark) .text-violet-50 { color: #4c1d95; }
@@ -209,8 +211,28 @@
     </header>
 
     <main class="p-6 max-w-7xl mx-auto">
+        <!-- teams-perk:start — removed server-side when HEADROOM_LICENSE is set
+             (see headroom.dashboard.get_dashboard_html). A plain link: nothing
+             is fetched or reported, and dismissal stays in this browser. -->
+        <aside data-testid="teams-perk" x-show="!teamsPerkDismissed"
+               class="mb-6 flex flex-col gap-3 rounded-lg border border-accent/40 bg-surface p-4 md:flex-row md:items-center md:justify-between">
+            <p class="text-sm text-gray-300">
+                <span class="font-medium text-accent">Headroom for Teams</span>
+                <span x-text="(stats.summary?.cost?.total_saved_usd || 0) >= 1
+                    ? ' · You have saved $' + formatCurrency(stats.summary.cost.total_saved_usd) + ' on this machine. Get the same savings across your team, with 3 months free on a 12-month plan.'
+                    : ' · Bring these savings to your whole team, with 3 months free on a 12-month plan.'"></span>
+            </p>
+            <div class="flex items-center gap-3 shrink-0">
+                <a href="https://headroom-perks.vercel.app/?source=github&utm_source=headroom&utm_medium=dashboard&utm_content=banner"
+                   target="_blank" rel="noopener noreferrer"
+                   class="px-3 py-1.5 text-sm font-medium rounded-md bg-accent text-black hover:opacity-90">Claim 3 months free →</a>
+                <button type="button" @click="dismissTeamsPerk()" aria-label="Dismiss Headroom for Teams offer"
+                        class="text-sm text-gray-500 hover:text-gray-200">✕</button>
+            </div>
+        </aside>
+        <!-- teams-perk:end -->
         <template x-if="viewMode === 'session'">
-            <div>
+            <div data-testid="session-view">
                 <p class="mb-4 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
 
                 <!-- Runtime Overview -->
@@ -226,7 +248,7 @@
                 </div>
 
                 <!-- Session Optimization -->
-                <div class="grid grid-cols-1 gap-4 mb-6 md:grid-cols-2 lg:grid-cols-3">
+                <div data-testid="session-optimization" class="grid grid-cols-1 gap-4 mb-6 md:grid-cols-2 lg:grid-cols-3">
                     <!-- Token Savings (%) -->
                     <div class="bg-surface rounded-lg p-4 border border-border">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
@@ -242,11 +264,11 @@
                                  higher on long sessions and must not take this slot. -->
                             <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                         </div>
-                        <div class="mt-1 text-xs text-gray-500 leading-relaxed">
-                            <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
-                        </div>
                         <div class="mt-1 text-xs text-gray-600 leading-relaxed" x-show="(stats.tokens?.new_input_tokens || 0) > 0">
                             <span x-text="'Of new input: ' + (stats.tokens?.new_input_savings_percent || 0).toFixed(2) + '%'" title="Savings as a fraction of the tokens that newly entered context (uncached + cache write), which is what compression can touch. The headline above recounts the session's cached history on every turn, so it reads low on a long session even when compression is working."></span>
+                        </div>
+                        <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                            <span x-text="'Cost-weighted: ' + (stats.tokens?.cost_weighted_savings_percent || 0).toFixed(1) + '%'" title="The same saving in money. Lower than the token share because most removed tokens would have been cheap prefix-cache reads."></span>
                         </div>
                         <div class="mt-2 h-8">
                             <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none" role="img"
@@ -452,7 +474,7 @@
                 <!-- Optimization Breakdown -->
                 <div class="grid grid-cols-1 gap-4 mb-6 lg:grid-cols-3">
                     <!-- Token Usage -->
-                    <div class="bg-surface rounded-lg p-4 border border-border">
+                    <div data-testid="token-usage" class="bg-surface rounded-lg p-4 border border-border">
                         <div class="text-sm font-medium mb-4 text-gray-300">Token Usage</div>
                         <div class="space-y-3">
                             <div class="flex justify-between items-center">
@@ -463,6 +485,8 @@
                                 <span class="text-sm text-gray-400">Proxy Removed</span>
                                 <span class="font-mono text-sm text-accent" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0)"></span>
                             </div>
+                            <div class="text-right text-xs text-gray-500" data-testid="proxy-share-of-total"
+                                 x-text="proxyShareOfTotal.toFixed(1) + '% of before-compression tokens'"></div>
                             <div class="flex justify-between items-center">
                                 <span class="text-sm text-gray-400">After Compression (sent)</span>
                                 <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.input || 0)"></span>
@@ -506,7 +530,6 @@
                     <div class="bg-surface rounded-lg p-4 border border-border">
                         <div class="flex justify-between items-center mb-4">
                             <span class="text-sm font-medium text-gray-300">Savings Over Time</span>
-                            <span class="text-xs text-gray-500 font-mono" x-text="formatNumber(stats.tokens?.saved || 0) + ' tokens total'"></span>
                         </div>
                         <template x-if="(stats.savings_history || []).length >= 2">
                             <div class="h-32">
@@ -629,7 +652,7 @@
                             </div>
                         </div>
                         <template x-if="hasObservedTtlBuckets">
-                            <div class="mt-5 border-t border-border pt-4">
+                            <div data-testid="ttl-metrics" class="mt-5 border-t border-border pt-4">
                                 <div class="flex items-center justify-between mb-3">
                                     <div>
                                         <div class="text-xs text-gray-500 uppercase tracking-[0.22em]">Observed TTL Buckets</div>
@@ -670,13 +693,13 @@
                                     <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-1 gap-3">
                                         <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                             <div class="text-[11px] uppercase tracking-[0.18em] text-cyan-300/75">1h Cache Writes</div>
-                                            <div data-testid="ttl-bucket-1h-value" class="mt-2 text-3xl font-light text-cyan-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.tokens || 0)"></div>
-                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.requests || 0) + ' requests observed'"></div>
+                                            <div data-testid="ttl-bucket-1h-requests" class="mt-2 text-3xl font-light text-cyan-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['1h']?.requests || 0)"></div>
+                                            <div class="mt-1 text-xs text-gray-500">requests observed</div>
                                         </div>
                                         <div class="rounded-2xl border border-white/8 bg-black/20 p-4">
                                             <div class="text-[11px] uppercase tracking-[0.18em] text-violet-300/75">5m Cache Writes</div>
-                                            <div data-testid="ttl-bucket-5m-value" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.tokens || 0)"></div>
-                                            <div class="mt-1 text-xs text-gray-500" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.requests || 0) + ' requests observed'"></div>
+                                            <div data-testid="ttl-bucket-5m-requests" class="mt-2 text-3xl font-light text-violet-50" x-text="formatNumber(stats.prefix_cache?.totals?.observed_ttl_buckets?.['5m']?.requests || 0)"></div>
+                                            <div class="mt-1 text-xs text-gray-500">requests observed</div>
                                         </div>
                                     </div>
                                 </div>
@@ -1627,7 +1650,7 @@
                     </div>
                 </div>
 
-                <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4 mb-6">
+                <div data-testid="history-summary" class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4 mb-6">
                     <div class="bg-surface rounded-lg p-4 border border-border">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Lifetime Compression Savings</div>
                         <div class="flex items-baseline gap-2">
@@ -1642,7 +1665,7 @@
                     <div class="bg-surface rounded-lg p-4 border border-border">
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Lifetime Tokens Saved</div>
                         <div class="flex items-baseline gap-2">
-                            <span class="text-3xl font-light tabular-nums text-accent"
+                            <span data-testid="history-total-value" class="text-3xl font-light tabular-nums text-accent"
                                   x-text="formatNumber(historyStats.lifetime?.tokens_saved || 0)"></span>
                         </div>
                         <div class="mt-2 text-xs text-gray-500"
@@ -1912,14 +1935,9 @@
                                 </template>
                             </div>
 
-                            <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div data-testid="historical-summary-card" class="bg-surface rounded-lg p-4 border border-border">
                                 <div class="text-sm font-medium mb-4 text-gray-300">Historical Summary</div>
                                 <div class="space-y-3">
-                                    <div class="flex justify-between items-center">
-                                        <span class="text-sm text-gray-400">Latest total</span>
-                                        <span class="font-mono text-sm"
-                                              x-text="formatNumber(historyStats.lifetime?.tokens_saved || 0) + ' tokens'"></span>
-                                    </div>
                                     <div class="flex justify-between items-center">
                                         <span class="text-sm text-gray-400">Selected series</span>
                                         <span class="font-mono text-sm"
@@ -2037,6 +2055,14 @@
         function dashboard() {
             return {
                 stats: {},
+                teamsPerkDismissed: (() => {
+                    try { return localStorage.getItem('headroom-teams-perk-dismissed') === '1'; }
+                    catch (e) { return false; }
+                })(),
+                dismissTeamsPerk() {
+                    this.teamsPerkDismissed = true;
+                    try { localStorage.setItem('headroom-teams-perk-dismissed', '1'); } catch (e) {}
+                },
                 lifetimeStats: {},
                 historyStats: {},
                 healthy: true,
@@ -2794,7 +2820,7 @@
 
                 get hasObservedTtlBuckets() {
                     const buckets = this.stats.prefix_cache?.totals?.observed_ttl_buckets || {};
-                    return ((buckets['5m']?.tokens || 0) + (buckets['1h']?.tokens || 0)) > 0;
+                    return ['5m', '1h'].some((ttl) => (buckets[ttl]?.requests || 0) > 0);
                 },
 
                 get observedTtlHeadline() {
