@@ -9,6 +9,7 @@ import sys
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 
 import click
 from click.core import ParameterSource
@@ -16,6 +17,7 @@ from click.core import ParameterSource
 from headroom._subprocess import run
 from headroom.install.health import probe_json, probe_ready
 from headroom.install.models import (
+    ArtifactRecord,
     ConfigScope,
     DeploymentManifest,
     InstallPreset,
@@ -23,7 +25,7 @@ from headroom.install.models import (
     RuntimeKind,
     SupervisorKind,
 )
-from headroom.install.paths import recovery_manifest_path
+from headroom.install.paths import opencode_config_path, recovery_manifest_path
 from headroom.install.planner import build_manifest, build_tool_envs
 from headroom.install.providers import apply_mutations, revert_mutations
 from headroom.install.runtime import (
@@ -53,6 +55,7 @@ from headroom.install.supervisors import (
     start_supervisor,
     stop_supervisor,
 )
+from headroom.providers.opencode.install import restore_opencode_backup
 
 from .main import main
 
@@ -234,11 +237,15 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
 
 
 def _deactivate_deployment_mutations(
-    manifest: DeploymentManifest, *, persist_manifest: bool = True
+    manifest: DeploymentManifest,
+    *,
+    persist_manifest: bool = True,
+    restore_backup: bool = False,
 ) -> None:
     if not manifest.mutations:
         return
-    revert_mutations(manifest)
+    revert_mutations(manifest, restore_backup=restore_backup)
+
     manifest.mutations = []
     if persist_manifest:
         save_manifest(manifest)
@@ -312,16 +319,52 @@ def pending_tool_envs(manifest: DeploymentManifest) -> dict[str, dict[str, str]]
     return pending
 
 
+def _track_opencode_backup(manifest: DeploymentManifest, *, activating: bool = False) -> None:
+    if getattr(manifest, "scope", None) != ConfigScope.PROVIDER.value or "opencode" not in getattr(
+        manifest, "targets", []
+    ):
+        return
+    artifacts = getattr(manifest, "artifacts", None)
+    if artifacts is None:
+        return
+    paths = {
+        mutation.path
+        for mutation in getattr(manifest, "mutations", [])
+        if mutation.target == "opencode" and mutation.path
+    }
+    if activating:
+        paths.add(str(opencode_config_path()))
+    changed = False
+    for path in sorted(paths):
+        if any(item.kind == "opencode-config-backup" and item.path == path for item in artifacts):
+            continue
+        config_path = Path(path)
+        backup_path = config_path.with_name(config_path.name + ".headroom-backup")
+        artifacts.append(
+            ArtifactRecord(
+                kind="opencode-config-backup",
+                path=path,
+                metadata={"backup_path": str(backup_path)},
+            )
+        )
+        changed = True
+    if changed:
+        # Persist ownership before provider mutation or snapshot creation.
+        _save_apply_manifest(manifest)
+
+
 def _activate_deployment_mutations(manifest: DeploymentManifest) -> None:
     for target, names in sorted(_reconcile_tool_envs(manifest).items()):
         click.echo(f"Applying newer managed settings for {target}: {', '.join(names)}")
     try:
+        _track_opencode_backup(manifest, activating=True)
         manifest.mutations = apply_mutations(manifest)
         _save_apply_manifest(manifest)
     except Exception as exc:
         if manifest.mutations:
             try:
-                revert_mutations(manifest)
+                revert_mutations(manifest, restore_backup=False)
+
             except Exception as rollback_exc:
                 raise RuntimeError(
                     f"mutation activation failed: {exc}; rollback failed: {rollback_exc}"
@@ -358,10 +401,42 @@ def _delete_recovery_snapshot(profile: str) -> None:
         ) from None
 
 
-def _remove_deployment(manifest: DeploymentManifest) -> None:
+def _restore_owned_opencode_backup(
+    manifest: DeploymentManifest, *, preserve_paths: set[str] | None = None
+) -> None:
+    artifacts = getattr(manifest, "artifacts", None)
+    if artifacts is None:
+        return
+    for artifact in artifacts:
+        if artifact.kind != "opencode-config-backup" or (
+            preserve_paths is not None and artifact.path in preserve_paths
+        ):
+            continue
+        backup_path = artifact.metadata.get("backup_path")
+        if isinstance(backup_path, str):
+            restore_opencode_backup(artifact.path, backup_path)
+    manifest.artifacts = [
+        artifact
+        for artifact in artifacts
+        if artifact.kind != "opencode-config-backup"
+        or (preserve_paths is not None and artifact.path in preserve_paths)
+    ]
+
+
+def _remove_deployment(
+    manifest: DeploymentManifest,
+    *,
+    restore_backup: bool = False,
+    preserve_opencode_paths: set[str] | None = None,
+) -> None:
     errors: list[tuple[str, Exception]] = []
     try:
-        _deactivate_deployment_mutations(manifest, persist_manifest=False)
+        if restore_backup:
+            _track_opencode_backup(manifest)
+        if manifest.mutations:
+            _deactivate_deployment_mutations(manifest, persist_manifest=False, restore_backup=False)
+        if restore_backup:
+            _restore_owned_opencode_backup(manifest, preserve_paths=preserve_opencode_paths)
     except Exception as exc:
         errors.append(("mutation cleanup", exc))
     try:
@@ -382,7 +457,9 @@ def _remove_deployment(manifest: DeploymentManifest) -> None:
 
 def _restore_deployment(manifest: DeploymentManifest) -> None:
     restored = deepcopy(manifest)
-    restored.artifacts = install_supervisor(restored, start=False)
+    restored.artifacts = [
+        artifact for artifact in restored.artifacts if artifact.kind == "opencode-config-backup"
+    ] + install_supervisor(restored, start=False)
     _save_apply_manifest(restored)
     _start_deployment(restored)
     _activate_deployment_mutations(restored)
@@ -583,6 +660,7 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
     recovery_saved = False
     active_persistence_failed = False
     existing = None
+    existing_opencode_paths: set[str] = set()
     try:
         try:
             existing = load_manifest(profile)
@@ -590,9 +668,21 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
             click.echo(f"Warning: {e}; overwriting.")
         if existing is not None:
             click.echo(f"Updating existing deployment profile '{profile}'...")
+            _track_opencode_backup(existing)
+            existing_opencode_paths = {
+                artifact.path
+                for artifact in getattr(existing, "artifacts", [])
+                if artifact.kind == "opencode-config-backup"
+            }
+            manifest.artifacts.extend(
+                artifact
+                for artifact in getattr(existing, "artifacts", [])
+                if artifact.kind == "opencode-config-backup" and artifact not in manifest.artifacts
+            )
             _save_recovery_snapshot(existing, profile)
             recovery_saved = True
             _remove_deployment(existing)
+
     except Exception as exc:
         recovery_detail = (
             f" Recovery snapshot: {recovery_manifest_path(profile)} is retained; "
@@ -610,7 +700,9 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
         except Exception:
             active_persistence_failed = True
             raise
-        manifest.artifacts = install_supervisor(manifest, start=False)
+        manifest.artifacts = [
+            artifact for artifact in manifest.artifacts if artifact.kind == "opencode-config-backup"
+        ] + install_supervisor(manifest, start=False)
         try:
             _save_apply_manifest(manifest)
         except Exception:
@@ -625,7 +717,11 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
     except Exception as exc:
         cleanup_errors: list[Exception] = []
         try:
-            _remove_deployment(manifest)
+            _remove_deployment(
+                manifest,
+                restore_backup=True,
+                preserve_opencode_paths=existing_opencode_paths,
+            )
         except Exception as cleanup_exc:
             cleanup_errors.append(cleanup_exc)
         if not cleanup_errors and not active_persistence_failed and existing is not None:
@@ -670,6 +766,24 @@ def _apply_manifest(manifest: DeploymentManifest) -> None:
                 f"{cleanup_detail}{persistence_detail}{_recovery_detail()}"
             ) from exc
         raise click.ClickException(f"Failed to install deployment '{profile}': {exc}") from exc
+    active_opencode_paths = {
+        mutation.path
+        for mutation in manifest.mutations
+        if mutation.target == "opencode" and mutation.path
+    }
+    if any(
+        artifact.kind == "opencode-config-backup" and artifact.path not in active_opencode_paths
+        for artifact in manifest.artifacts
+    ):
+        try:
+            _restore_owned_opencode_backup(manifest, preserve_paths=active_opencode_paths)
+            _save_apply_manifest(manifest)
+        except Exception as exc:
+            raise click.ClickException(
+                f"Deployment '{profile}' is active, but OpenCode snapshot restoration failed: "
+                f"{exc}. Backup ownership is retained in the deployment manifest; "
+                "resolve the filesystem failure and retry install apply."
+            ) from exc
     if recovery_saved:
         _delete_recovery_snapshot(profile)
 
@@ -1070,9 +1184,23 @@ def install_status(profile: str) -> None:
         # reach `.get('backend', ...)` and crash with AttributeError. Guard on
         # isinstance, mirroring wrap.py's _proxy_health_config.
         config = payload.get("config")
-        if not isinstance(config, dict):
+        anthropic_target = openai_target = "unknown"
+        if isinstance(config, dict):
+            anthropic_url = config.get("anthropic_api_url")
+            if "anthropic_api_url" in config and (
+                anthropic_url is None or isinstance(anthropic_url, str)
+            ):
+                anthropic_target = "configured" if anthropic_url else "default"
+            openai_url = config.get("openai_api_url")
+            if "openai_api_url" in config and (openai_url is None or isinstance(openai_url, str)):
+                openai_target = "configured" if openai_url else "default"
+        else:
+            # Network health probes may intentionally omit credential-bearing
+            # config. Missing information does not mean a target is unset.
             config = {}
-        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
+        click.echo(f"Default backend:  {config.get('backend', manifest.backend)}")
+        click.echo(f"Anthropic target: {anthropic_target}")
+        click.echo(f"OpenAI target:    {openai_target}")
 
 
 @install.command("start")
@@ -1126,7 +1254,7 @@ def install_remove(profile: str) -> None:
 
     manifest = _require_manifest(profile)
     try:
-        _remove_deployment(manifest)
+        _remove_deployment(manifest, restore_backup=True)
     except Exception as exc:
         raise click.ClickException(
             f"Failed to remove deployment '{profile}': cleanup failed: {exc}. "

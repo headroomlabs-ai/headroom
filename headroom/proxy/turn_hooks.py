@@ -26,6 +26,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from headroom.proxy.tool_schema_savings_policy import (
+    deferred_booking,
+    reconcile_deferred_tokens,
+    without_deferral_flags,
+)
+
 log = logging.getLogger(__name__)
 
 # Re-drive the model with a message list; returns the provider's response JSON.
@@ -198,18 +204,22 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     working on streamed OpenAI-compatible traffic. Default off ⇒ conservative:
     a hook is treated as buffered-only unless it declares itself stream-safe.
     """
+    # Deferral booked before or by a hook; reconciled once every hook has run,
+    # since a later hook may un-defer booked tools (tool search's hot tools).
+    booking = deferred_booking(ctx.tags, ctx.tools)
     for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
         fn = getattr(hook, "on_request", None)
         if fn is None:
             continue
+        booked_tag = ctx.tags.get("tool_search_deferred_tokens")
         before_messages = before_tools = None
         try:
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(ctx.tools)
+                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
             message_saved = (
                 max(0, before_messages - ctx.count_messages(ctx.messages))
@@ -217,7 +227,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(ctx.tools))
+                max(0, before_tools - ctx.count_tools(without_deferral_flags(ctx.tools)))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )
@@ -232,6 +242,10 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
+            # This hook booked (or re-booked) the deferral: it is the new baseline.
+            booking = deferred_booking(ctx.tags, ctx.tools)
+    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
 
 
 async def run_response_hooks(

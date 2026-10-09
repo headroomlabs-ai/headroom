@@ -52,6 +52,8 @@ def test_anthropic_passthrough_routes_model_endpoint_intent() -> None:
             "anthropic",
             "count_tokens",
         ),
+        ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+        ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
     )
 
 

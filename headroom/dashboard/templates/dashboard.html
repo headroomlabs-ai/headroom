@@ -102,6 +102,8 @@
         html:not(.dark) .ring-white\/5 { --tw-ring-color: rgba(0,0,0,0.08); }
         html:not(.dark) .border-red-900\/30 { border-color: rgba(239,68,68,0.25); }
         html:not(.dark) .border-emerald-900\/30 { border-color: rgba(16,185,129,0.25); }
+        /* Light mode: keep the active savings-profile badge readable */
+        html:not(.dark) .text-cyan-100 { color: #155e75; }
         /* Light mode: TTL card color adjustments */
         html:not(.dark) .text-cyan-50 { color: #164e63; }
         html:not(.dark) .text-violet-50 { color: #4c1d95; }
@@ -209,6 +211,26 @@
     </header>
 
     <main class="p-6 max-w-7xl mx-auto">
+        <!-- teams-perk:start — removed server-side when HEADROOM_LICENSE is set
+             (see headroom.dashboard.get_dashboard_html). A plain link: nothing
+             is fetched or reported, and dismissal stays in this browser. -->
+        <aside data-testid="teams-perk" x-show="!teamsPerkDismissed"
+               class="mb-6 flex flex-col gap-3 rounded-lg border border-accent/40 bg-surface p-4 md:flex-row md:items-center md:justify-between">
+            <p class="text-sm text-gray-300">
+                <span class="font-medium text-accent">Headroom for Teams</span>
+                <span x-text="(stats.summary?.cost?.total_saved_usd || 0) >= 1
+                    ? ' · You have saved $' + formatCurrency(stats.summary.cost.total_saved_usd) + ' on this machine. Get the same savings across your team, with 3 months free on a 12-month plan.'
+                    : ' · Bring these savings to your whole team, with 3 months free on a 12-month plan.'"></span>
+            </p>
+            <div class="flex items-center gap-3 shrink-0">
+                <a href="https://headroom-perks.vercel.app/?source=github&utm_source=headroom&utm_medium=dashboard&utm_content=banner"
+                   target="_blank" rel="noopener noreferrer"
+                   class="px-3 py-1.5 text-sm font-medium rounded-md bg-accent text-black hover:opacity-90">Claim 3 months free →</a>
+                <button type="button" @click="dismissTeamsPerk()" aria-label="Dismiss Headroom for Teams offer"
+                        class="text-sm text-gray-500 hover:text-gray-200">✕</button>
+            </div>
+        </aside>
+        <!-- teams-perk:end -->
         <template x-if="viewMode === 'session'">
             <div data-testid="session-view">
                 <p class="mb-4 text-xs text-gray-500">Current proxy process · runtime counters reset on restart</p>
@@ -2033,6 +2055,14 @@
         function dashboard() {
             return {
                 stats: {},
+                teamsPerkDismissed: (() => {
+                    try { return localStorage.getItem('headroom-teams-perk-dismissed') === '1'; }
+                    catch (e) { return false; }
+                })(),
+                dismissTeamsPerk() {
+                    this.teamsPerkDismissed = true;
+                    try { localStorage.setItem('headroom-teams-perk-dismissed', '1'); } catch (e) {}
+                },
                 lifetimeStats: {},
                 historyStats: {},
                 healthy: true,

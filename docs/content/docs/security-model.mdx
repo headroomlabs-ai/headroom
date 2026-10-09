@@ -279,11 +279,11 @@ accept arbitrary environment variables — writes are restricted to a hardcoded 
 |---|---|
 | `HEADROOM_OUTPUT_SHAPER` | Master switch for output-token shaping |
 | `HEADROOM_VERBOSITY_LEVEL` | Verbosity steering level |
-| `HEADROOM_EFFORT_ROUTER` | Lower effort on mechanical continuations |
-| `HEADROOM_MECHANICAL_EFFORT` | Effort value for those continuations |
 | `HEADROOM_VERBOSITY_AUTOTUNE` | AIMD verbosity controller state |
 | `HEADROOM_OUTPUT_HOLDOUT` | Output-shaping holdout fraction |
 | `HEADROOM_INTERCEPT_READ_MIN_CHARS` | ast-grep read-interception threshold |
+| `HEADROOM_VERIFY_TRUNCATION_ON_DISK` | Verify ast-grep Read truncation against disk when no client banner is found. Always returns `UNKNOWN` on Windows, where `dir_fd` / `O_NOFOLLOW` support is unavailable. |
+| `HEADROOM_VERIFY_TRUNCATION_MAX_BYTES` | Max on-disk file size (bytes) the disk-verify fallback will read |
 
 Keys outside this list are ignored, and `/admin/upstream` is read-only — there is no
 write route on the admin surface, specifically so a caller cannot redirect
