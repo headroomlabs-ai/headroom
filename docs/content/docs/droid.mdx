@@ -31,11 +31,13 @@ Factory exposes two inference shapes and Droid picks per model: Anthropic Messag
 ## Options
 
 ```bash
+# Proxy port defaults to 8787; Factory receives forwarded inference requests.
+# --no-proxy reuses a running proxy; --learn enables live traffic learning.
 headroom wrap droid \
-  --port 8787 \                              # proxy port (default 8787)
-  --factory-api-url https://api.factory.ai \ # Factory upstream to forward to
-  --no-proxy \                               # reuse an already-running proxy
-  --learn \                                  # enable live traffic learning
+  --port 8787 \
+  --factory-api-url https://api.factory.ai \
+  --no-proxy \
+  --learn \
   --verbose
 ```
 
