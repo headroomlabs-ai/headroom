@@ -1372,7 +1372,8 @@ class TrafficLearner:
             uri = f"file:{db_path}?mode=ro"
             try:
                 conn = sqlite3.connect(uri, uri=True)
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as e:
+                logger.warning("Traffic learner hydrate: failed to open %s: %s", db_path, e)
                 return []
             try:
                 rows = conn.execute(
@@ -1388,13 +1389,14 @@ class TrafficLearner:
                     "LIMIT ?",
                     (self._dedup_window,),
                 ).fetchall()
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as e:
+                logger.warning("Traffic learner hydrate: failed to read %s: %s", db_path, e)
                 return []
             finally:
                 try:
                     conn.close()
-                except Exception:
-                    pass
+                except sqlite3.Error as e:
+                    logger.debug("Traffic learner hydrate: closing %s failed: %s", db_path, e)
             return [(row[0], row[1] or "", row[2] or "{}") for row in rows]
 
         try:
@@ -1779,7 +1781,8 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
     patterns: dict[str, ExtractedPattern] = {}
     try:
         conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        logger.warning("Traffic learner: failed to open persisted patterns %s: %s", db_path, e)
         return []
     try:
         conn.row_factory = sqlite3.Row
@@ -1788,14 +1791,14 @@ def _load_persisted_patterns_from_sqlite(db_path: Path) -> list[ExtractedPattern
             "FROM memories "
             "WHERE json_extract(metadata, '$.source') = 'traffic_learner'"
         ).fetchall()
-    except sqlite3.DatabaseError:
-        conn.close()
+    except sqlite3.DatabaseError as e:
+        logger.warning("Traffic learner: failed to read persisted patterns %s: %s", db_path, e)
         return []
     finally:
         try:
             conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error as e:
+            logger.debug("Traffic learner: closing persisted patterns %s failed: %s", db_path, e)
 
     for row in rows:
         content = row["content"] or ""

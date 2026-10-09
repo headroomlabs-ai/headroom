@@ -51,6 +51,9 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 # Purge expired rows at most this often (seconds). Purging is hygiene,
 # not correctness — CompressionStore checks TTL on every get().
 _PURGE_INTERVAL = 60.0
+# items() decodes every row on each eviction pass, so an unreadable row is
+# reported once per hash rather than on every request.
+_MAX_REPORTED_UNREADABLE = 1000
 
 
 def default_db_path() -> Path:
@@ -83,6 +86,7 @@ class SQLiteBackend:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._last_purge = 0.0
+        self._reported_unreadable: set[str] = set()
         self._conn = self._open()
 
     @staticmethod
@@ -147,7 +151,9 @@ class SQLiteBackend:
         log and treat the operation as a miss; never destroy data over a
         transient error."""
         if not self._is_corruption(error):
-            logger.warning("CCR SQLite %s failed (transient, no reset): %s", op, error)
+            logger.warning(
+                "CCR SQLite %s failed on %s (transient, no reset): %s", op, self._path, error
+            )
             return
         logger.warning(
             "CCR SQLite store at %s is corrupt (%s); recreating. "
@@ -161,26 +167,44 @@ class SQLiteBackend:
         except Exception:  # noqa: BLE001 - best-effort close on corrupt handle
             pass
         self._path.unlink(missing_ok=True)
+        self._reported_unreadable.clear()
         self._conn = self._open()
 
-    def _entry_from_json(self, raw: str) -> CompressionEntry | None:
+    def _report_unreadable(self, hash_key: str, reason: object) -> None:
+        if (
+            hash_key in self._reported_unreadable
+            or len(self._reported_unreadable) >= _MAX_REPORTED_UNREADABLE
+        ):
+            return
+        self._reported_unreadable.add(hash_key)
+        logger.warning(
+            "CCR SQLite entry %s in %s is unreadable (%s); treating as a miss",
+            hash_key,
+            self._path,
+            reason,
+        )
+
+    def _entry_from_json(self, raw: str, hash_key: str) -> CompressionEntry | None:
         from ..compression_store import CompressionEntry
 
         try:
             data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as e:
+            self._report_unreadable(hash_key, e)
             return None
         if not isinstance(data, dict):
+            self._report_unreadable(hash_key, "not a JSON object")
             return None
         known = {f.name for f in fields(CompressionEntry)}
         try:
             return CompressionEntry(**{k: v for k, v in data.items() if k in known})
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as e:
             # A blob that parses as JSON but is missing a required field (schema
             # drift across an upgrade, a partially written row) must degrade to a
             # miss, not raise. Otherwise a single bad row crashes get() — and,
             # via items(), _clean_expired() runs it on every store's eviction, so
             # one poison row would break all reads, evictions, and stores.
+            self._report_unreadable(hash_key, e)
             return None
 
     def _purge_expired(self, now: float) -> int:
@@ -217,11 +241,11 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "get")
+                self._handle_db_error(e, f"get {hash_key}")
                 return None
         if row is None:
             return None
-        return self._entry_from_json(row[0])
+        return self._entry_from_json(row[0], hash_key)
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
         payload = json.dumps(asdict(entry), ensure_ascii=False)
@@ -235,7 +259,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "set")
+                self._handle_db_error(e, f"set {hash_key}")
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -247,7 +271,7 @@ class SQLiteBackend:
                 self._conn.commit()
                 return cur.rowcount > 0
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, f"delete {hash_key}")
                 return False
 
     def exists(self, hash_key: str) -> bool:
@@ -258,7 +282,7 @@ class SQLiteBackend:
                     (hash_key,),
                 ).fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, f"exists {hash_key}")
                 return False
         return row is not None
 
@@ -268,14 +292,14 @@ class SQLiteBackend:
                 self._conn.execute("DELETE FROM ccr_entries")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "clear")
 
     def count(self) -> int:
         with self._lock:
             try:
                 row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "count")
                 return 0
         return int(row[0])
 
@@ -294,7 +318,7 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "keys")
                 return []
         return [r[0] for r in rows]
 
@@ -303,11 +327,11 @@ class SQLiteBackend:
             try:
                 rows = self._conn.execute("SELECT hash, entry_json FROM ccr_entries").fetchall()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "items")
                 return []
         out: list[tuple[str, CompressionEntry]] = []
         for hash_key, raw in rows:
-            entry = self._entry_from_json(raw)
+            entry = self._entry_from_json(raw, hash_key)
             if entry is not None:
                 out.append((hash_key, entry))
         return out
@@ -317,7 +341,7 @@ class SQLiteBackend:
             try:
                 count_row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
             except sqlite3.DatabaseError as e:
-                self._handle_db_error(e, "op")
+                self._handle_db_error(e, "stats")
                 count_row = (0,)
         try:
             bytes_used = self._path.stat().st_size

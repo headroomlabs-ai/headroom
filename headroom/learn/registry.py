@@ -35,7 +35,7 @@ def _discover() -> dict[str, LearnPlugin]:
                     plugins[p.name] = p
                     logger.debug("Loaded built-in learn plugin: %s", p.name)
         except Exception:
-            logger.debug("Failed to load built-in plugin: %s", mod_name, exc_info=True)
+            logger.warning("Failed to load built-in learn plugin: %s", mod_name, exc_info=True)
 
     # 2. External: entry_points(group="headroom.learn_plugin")
     try:

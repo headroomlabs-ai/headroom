@@ -1164,7 +1164,12 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
         backend: CompressionStoreBackend = fn(**kwargs)
         return backend
     except Exception as e:
-        logger.warning("Failed to load CCR backend %s: %s", backend_type, e)
+        logger.warning(
+            "Failed to load CCR backend %s (%s); falling back to the in-process store. "
+            "Retrieval will not survive proxy restarts or cross worker processes.",
+            backend_type,
+            e,
+        )
         return None
 
 

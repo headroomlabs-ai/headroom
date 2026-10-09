@@ -921,7 +921,13 @@ class DirectMem0Adapter:
         try:
             await asyncio.to_thread(self._mem0_client.delete, memory_id=memory_id)
             return True
-        except Exception:
+        except ValueError as e:
+            # mem0 raises ValueError for an unknown id; the delete is model-driven,
+            # so a stale or invented id is expected.
+            logger.debug("DirectMem0: delete_memory(%s): not found: %s", memory_id, e)
+            return False
+        except Exception as e:
+            logger.warning("DirectMem0: delete_memory(%s) failed: %s", memory_id, e)
             return False
 
     async def get_memory(self, memory_id: str) -> Memory | None:
@@ -949,7 +955,8 @@ class DirectMem0Adapter:
                 valid_from=_utcnow(),
                 metadata=result.get("metadata") or {},
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("DirectMem0: get_memory(%s) failed: %s", memory_id, e)
             return None
 
     @property

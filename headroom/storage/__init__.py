@@ -1,5 +1,6 @@
 """Storage modules for Headroom SDK."""
 
+import logging
 import os
 
 from .base import Storage
@@ -11,6 +12,8 @@ __all__ = [
     "SQLiteStorage",
     "JSONLStorage",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def _builtin_storage_path(store_url: str, scheme: str) -> str:
@@ -64,7 +67,16 @@ def create_storage(store_url: str) -> Storage:
                     create_fn = ep.load()
                     result: Storage = create_fn(store_url)
                     return result
+                logger.warning(
+                    "No headroom.storage_backend entry point for scheme %r; "
+                    "falling back to SQLite storage",
+                    scheme,
+                )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to load storage backend for scheme %r; falling back to SQLite storage",
+                    scheme,
+                    exc_info=True,
+                )
         # Default to SQLite (legacy behavior)
         return SQLiteStorage(store_url)

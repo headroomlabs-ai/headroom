@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -166,6 +167,67 @@ def test_create_storage_builtin_entrypoint_and_fallback(
     assert isinstance(plain, FakeSQLiteStorage)
     assert created_fallback == ["custom://fallback.db", "custom://missing.db", "metrics.db"]
     plain.close()
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def storage_log() -> Iterator[_ListHandler]:
+    handler = _ListHandler()
+    logger = logging.getLogger("headroom.storage")
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    yield handler
+    logger.removeHandler(handler)
+    logger.setLevel(previous)
+
+
+def _fallback_warnings(handler: _ListHandler) -> list[str]:
+    return [
+        r.getMessage()
+        for r in handler.records
+        if r.levelno == logging.WARNING and "falling back to SQLite" in r.getMessage()
+    ]
+
+
+def test_create_storage_warns_when_a_backend_plugin_fails_to_load(
+    monkeypatch: pytest.MonkeyPatch, storage_log: _ListHandler
+) -> None:
+    monkeypatch.setattr("headroom.storage.SQLiteStorage", lambda db_path: SimpleNamespace())
+
+    created = DummyStorage()
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: [SimpleNamespace(name="custom", load=lambda: lambda url: created)],
+    )
+    assert create_storage("custom://user:secret@host/db") is created
+    assert _fallback_warnings(storage_log) == []
+
+    monkeypatch.setattr(
+        "importlib.metadata.entry_points",
+        lambda group: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    create_storage("custom://user:secret@host/db")
+    warnings = _fallback_warnings(storage_log)
+    assert len(warnings) == 1
+    assert "'custom'" in warnings[0]
+    assert "secret" not in warnings[0]
+
+    monkeypatch.setattr("importlib.metadata.entry_points", lambda group: [])
+    create_storage("other://host/db")
+    assert any("'other'" in w for w in _fallback_warnings(storage_log))
+
+    storage_log.records.clear()
+    create_storage("metrics.db")
+    assert _fallback_warnings(storage_log) == []
 
 
 def test_jsonl_storage_round_trip_query_count_and_summary(tmp_path: Path) -> None:
