@@ -212,8 +212,18 @@ def public_tags(tags: MutableMapping[str, Any] | None) -> dict[str, Any]:
     They are carried on ``tags`` because that is the one dict that reaches the
     outcome funnel from every handler; letting them through to ``RequestLog``
     would put a list and a dict into a string-keyed label store.
+
+    Credential-shaped keys are dropped here as well. :func:`helpers.extract_tags`
+    already refuses them at the source; this is the last gate before the
+    request log for tags a hook or extension added by hand.
     """
-    return {key: value for key, value in (tags or {}).items() if key not in _INTERNAL_TAGS}
+    from headroom.proxy.internal_header_policy import is_credential_tag_key
+
+    return {
+        key: value
+        for key, value in (tags or {}).items()
+        if key not in _INTERNAL_TAGS and not is_credential_tag_key(str(key))
+    }
 
 
 def encode(items: list[dict[str, Any]]) -> str:

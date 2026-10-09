@@ -248,7 +248,10 @@ class TestCLIProxyEnvVars:
             result = runner.invoke(
                 main,
                 ["proxy"],
-                env={"HEADROOM_HOST": "0.0.0.0"},
+                # 0.0.0.0 with no token is refused at startup since the bind
+                # policy landed (tests/test_proxy_bind_policy.py); this test is
+                # about env→config plumbing, so authenticate the bind.
+                env={"HEADROOM_HOST": "0.0.0.0", "HEADROOM_PROXY_TOKEN": "env-test-token"},
                 catch_exceptions=False,
             )
 
@@ -290,6 +293,31 @@ class TestCLIProxyEnvVars:
 
         assert result.exit_code == 0, result.output
         assert captured_config["config"].min_tokens_to_crush == 120
+
+    @pytest.mark.parametrize(
+        ("env", "expected"),
+        [
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": "0"}, False),
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": ""}, True),
+            ({}, True),
+        ],
+    )
+    def test_compress_user_messages_env_off_overrides_profile(self, runner, env, expected):
+        """HEADROOM_COMPRESS_USER_MESSAGES=0 must turn off the coding profile's
+        user-message compression; unset or empty keeps the profile default (on)."""
+        from headroom.agent_savings import proxy_pipeline_kwargs
+
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        kwargs = proxy_pipeline_kwargs(captured_config["config"])
+        assert kwargs["compress_user_messages"] is expected
 
     def test_headroom_min_tokens_zero_is_preserved(self, runner):
         """HEADROOM_MIN_TOKENS=0 is a legitimate value ("crush everything") and
@@ -776,6 +804,20 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["workers"] == 3
         assert captured["kwargs"]["limit_concurrency"] == 125
         assert captured["kwargs"].get("print_banner") is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("", True), (None, True)])
+def test_proxy_config_from_env_compress_user_messages(monkeypatch, value, expected):
+    """The uvicorn factory and `python -m headroom.proxy.server` read
+    HEADROOM_COMPRESS_USER_MESSAGES the same way `headroom proxy` does."""
+    from headroom.agent_savings import proxy_pipeline_kwargs
+    from headroom.proxy.server import _proxy_config_from_env
+
+    if value is not None:
+        monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", value)
+
+    kwargs = proxy_pipeline_kwargs(_proxy_config_from_env())
+    assert kwargs["compress_user_messages"] is expected
 
 
 class TestCLIProxyBackend:
@@ -1337,7 +1379,7 @@ class TestCLIProxyRpmTpm:
         assert captured_config["config"].rate_limit_requests_per_minute == 20
 
     def test_tpm_default(self, runner):
-        """Without --tpm, rate_limit_tokens_per_minute defaults to 100000."""
+        """Without --tpm, there is no token limit (the pre-0.39.0 behaviour)."""
         captured_config = {}
 
         def mock_run_server(config, **kwargs):
@@ -1347,7 +1389,7 @@ class TestCLIProxyRpmTpm:
             result = runner.invoke(main, ["proxy"], catch_exceptions=False)
 
         assert result.exit_code == 0, result.output
-        assert captured_config["config"].rate_limit_tokens_per_minute == 100000
+        assert captured_config["config"].rate_limit_tokens_per_minute is None
 
     def test_tpm_flag(self, runner):
         """--tpm 50000 should set rate_limit_tokens_per_minute to 50000."""
@@ -1404,6 +1446,7 @@ class TestSettingsFileToEnv:
                 ["proxy"],
                 env={
                     "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
                     # Ensure nothing ambient shadows the file-applied values.
                     "HEADROOM_PORT": None,
                     "HEADROOM_CODE_AWARE_ENABLED": None,
@@ -1428,6 +1471,7 @@ class TestSettingsFileToEnv:
                 ["proxy"],
                 env={
                     "HEADROOM_WORKSPACE_DIR": str(tmp_path),
+                    "HEADROOM_SETTINGS_PATH": None,
                     "HEADROOM_PORT": "7777",
                 },
                 catch_exceptions=False,

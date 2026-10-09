@@ -19,7 +19,7 @@ import type {
 import { mapProxyError, HeadroomConnectionError, HeadroomAuthError, HeadroomCompressError } from "./errors.js";
 import { deepCamelCase, deepSnakeCase } from "./utils/case.js";
 import { parseSSE } from "./utils/stream.js";
-import type { HeadroomConfig, HeadroomMode } from "./types/config.js";
+import type { CompressRequestConfig, HeadroomMode } from "./types/config.js";
 import type {
   SimulationResult,
   RequestMetrics,
@@ -73,6 +73,16 @@ export interface HeadroomParams {
   headroomOutputBufferTokens?: number;
   headroomKeepTurns?: number;
   headroomToolProfiles?: Record<string, Record<string, any>>;
+}
+
+/**
+ * Strip trailing "/" characters. A loop rather than a `+$` regex, which
+ * backtracks quadratically on inputs with long runs of slashes.
+ */
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end--;
+  return value.slice(0, end);
 }
 
 // --- Sub-clients ---
@@ -191,7 +201,7 @@ class Messages {
 export interface ExtendedClientOptions extends HeadroomClientOptions {
   providerApiKey?: string;
   defaultMode?: HeadroomMode;
-  config?: HeadroomConfig;
+  config?: CompressRequestConfig;
 }
 
 export class HeadroomClient implements HeadroomClientInterface {
@@ -200,7 +210,7 @@ export class HeadroomClient implements HeadroomClientInterface {
   private timeout: number;
   private fallback: boolean;
   private retries: number;
-  private config: HeadroomConfig | undefined;
+  private config: CompressRequestConfig | undefined;
   private stack: string | undefined;
 
   /** @internal */ providerApiKey: string | undefined;
@@ -211,11 +221,9 @@ export class HeadroomClient implements HeadroomClientInterface {
   readonly messages: Messages;
 
   constructor(options: ExtendedClientOptions = {}) {
-    this.baseUrl = (
-      options.baseUrl ??
-      getEnv("HEADROOM_BASE_URL") ??
-      DEFAULT_BASE_URL
-    ).replace(/\/+$/, "");
+    this.baseUrl = trimTrailingSlashes(
+      options.baseUrl ?? getEnv("HEADROOM_BASE_URL") ?? DEFAULT_BASE_URL,
+    );
     this.apiKey = options.apiKey ?? getEnv("HEADROOM_API_KEY");
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.fallback = options.fallback ?? true;
@@ -234,7 +242,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   async compress(
     messages: OpenAIMessage[],
-    options: { model?: string; tokenBudget?: number } = {},
+    options: { model?: string; tokenBudget?: number; config?: CompressRequestConfig } = {},
   ): Promise<CompressResult> {
     const model = options.model ?? "gpt-4o";
 
@@ -243,7 +251,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        return await this._doCompress(messages, model, options.tokenBudget);
+        return await this._doCompress(messages, model, options.tokenBudget, options.config);
       } catch (error) {
         lastError = error;
         if (error instanceof HeadroomAuthError) throw error;
@@ -498,6 +506,7 @@ export class HeadroomClient implements HeadroomClientInterface {
 
   /**
    * Raw fetch with proxy base URL, auth, and timeout.
+   * A string body is sent as-is; anything else is JSON-serialized.
    * @internal
    */
   async rawFetch(
@@ -510,6 +519,7 @@ export class HeadroomClient implements HeadroomClientInterface {
       ...options.headers,
     };
     if (this.apiKey) {
+      headers["X-Headroom-Proxy-Token"] = this.apiKey;
       // Don't override provider auth headers
       if (!headers["Authorization"] && !headers["x-api-key"]) {
         headers["Authorization"] = `Bearer ${this.apiKey}`;
@@ -524,7 +534,12 @@ export class HeadroomClient implements HeadroomClientInterface {
       response = await fetch(url, {
         method: options.method,
         headers,
-        body: options.body ? JSON.stringify(options.body) : undefined,
+        body:
+          typeof options.body === "string"
+            ? options.body
+            : options.body
+              ? JSON.stringify(options.body)
+              : undefined,
         signal: AbortSignal.timeout(this.timeout),
       });
     } catch (error) {
@@ -550,65 +565,27 @@ export class HeadroomClient implements HeadroomClientInterface {
     return response;
   }
 
-  /** @internal */
-  private async _fetch(
+  /** Proxy-only endpoints, whose bodies are already serialized. @internal */
+  private _fetch(
     path: string,
-    init: { method: string; body?: string; headers?: Record<string, string> },
+    init: { method: string; body?: string },
   ): Promise<Response> {
-    const url = `${this.baseUrl}${path}`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...init.headers,
-    };
-    if (this.apiKey) {
-      headers["Authorization"] = `Bearer ${this.apiKey}`;
-    }
-    if (this.stack && !headers["X-Headroom-Stack"]) {
-      headers["X-Headroom-Stack"] = this.stack;
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: init.method,
-        headers,
-        body: init.body,
-        signal: AbortSignal.timeout(this.timeout),
-      });
-    } catch (error) {
-      throw new HeadroomConnectionError(
-        `Failed to connect to Headroom at ${this.baseUrl}: ${error}`,
-      );
-    }
-
-    if (!response.ok) {
-      let errorBody: ProxyErrorResponse | undefined;
-      try {
-        errorBody = (await response.json()) as ProxyErrorResponse;
-      } catch {
-        // ignore
-      }
-      throw mapProxyError(
-        response.status,
-        errorBody?.error?.type ?? "unknown",
-        errorBody?.error?.message ?? `HTTP ${response.status}`,
-      );
-    }
-
-    return response;
+    return this.rawFetch(path, init);
   }
 
   private async _doCompress(
     messages: OpenAIMessage[],
     model: string,
     tokenBudget?: number,
+    config?: CompressRequestConfig,
   ): Promise<CompressResult> {
     const body: Record<string, unknown> = { messages, model };
     if (tokenBudget) {
       body.token_budget = tokenBudget;
     }
-    if (this.config) {
-      body.config = deepSnakeCase(this.config);
+    const mergedConfig = { ...this.config, ...config };
+    if (Object.keys(mergedConfig).length > 0) {
+      body.config = deepSnakeCase(mergedConfig);
     }
 
     const response = await this._fetch("/v1/compress", {

@@ -108,3 +108,176 @@ def test_compress_partial_run_keeps_processed_head_plus_verbatim_tail(
     # chunk 1 tripped the deadline -> its words kept verbatim (all present)
     for i in range(half, n_words):
         assert f"w{i}" in out
+
+
+def _two_block_messages(salt: str = "a") -> list[dict]:
+    """Two tool results, each big enough to reach the kompress stage.
+
+    ``salt`` varies the text so a second request is not served from the
+    router's content cache.
+    """
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": f"toolu_{n}",
+                    "content": " ".join(
+                        f'{{"file":"src/mod_{i}.py","line":{i},"text":"payload {salt}{n}"}}'
+                        for i in range(160)
+                    ),
+                }
+                for n in range(2)
+            ],
+        }
+    ]
+
+
+def _tokenizer():
+    from headroom.providers import OpenAIProvider
+    from headroom.tokenizer import Tokenizer
+
+    provider = OpenAIProvider()
+    return Tokenizer(provider.get_token_counter("gpt-4o"), "gpt-4o")
+
+
+class _RecordingKompress:
+    """Stands in for KompressCompressor, recording the deadline it is handed."""
+
+    shares_request_deadline = True
+
+    def __init__(self):
+        self.deadlines: list[float | None] = []
+
+    def is_ready(self) -> bool:
+        return True
+
+    def ensure_background_load(self) -> None:  # pragma: no cover - never reached
+        pass
+
+    def compress(self, content, **kwargs):
+        from types import SimpleNamespace
+
+        self.deadlines.append(kwargs.get("_deadline_started_at"))
+        compressed = " ".join(content.split()[:20])
+        return SimpleNamespace(compressed=compressed, compressed_tokens=len(compressed.split()))
+
+
+def test_every_block_of_one_request_draws_down_the_same_deadline(monkeypatch):
+    """The budget must bound the REQUEST, not each block.
+
+    ``compress()`` starts its own clock when no origin is passed, so a request
+    with N compressible blocks used to get N full deadlines. That is how a
+    single request runs past the pipeline's compression timeout; the worker
+    that overruns cannot be preempted, so it opens the timeout-debt quarantine
+    and every request queued behind it forwards with no compression at all.
+    """
+    from headroom.transforms.content_router import ContentRouter
+
+    router = ContentRouter()
+    fake = _RecordingKompress()
+    monkeypatch.setattr(router, "_get_kompress", lambda: fake)
+
+    router.apply(_two_block_messages(), _tokenizer(), force_kompress=True)
+
+    assert len(fake.deadlines) >= 2, f"expected both blocks to reach kompress: {fake.deadlines}"
+    assert all(d is not None for d in fake.deadlines), fake.deadlines
+    assert len(set(fake.deadlines)) == 1, f"each block restarted the clock: {fake.deadlines}"
+
+
+def test_a_second_request_gets_a_fresh_deadline(monkeypatch):
+    """Sharing is per-request: the next request must not inherit a spent budget."""
+    from headroom.transforms.content_router import ContentRouter
+
+    router = ContentRouter()
+    fake = _RecordingKompress()
+    monkeypatch.setattr(router, "_get_kompress", lambda: fake)
+    tokenizer = _tokenizer()
+
+    router.apply(_two_block_messages("first"), tokenizer, force_kompress=True)
+    first = set(fake.deadlines)
+    router.apply(_two_block_messages("second"), tokenizer, force_kompress=True)
+
+    assert len(set(fake.deadlines) - first) == 1, (
+        f"second request reused a deadline: {fake.deadlines}"
+    )
+
+
+def test_a_compressor_that_cannot_take_the_deadline_is_not_handed_one(monkeypatch):
+    """``RemoteKompressCompressor.compress()`` has no ``_deadline_started_at``
+    parameter, so passing it would raise TypeError and fail compression open."""
+    from headroom.transforms.content_router import ContentRouter
+
+    router = ContentRouter()
+    fake = _RecordingKompress()
+    fake.shares_request_deadline = False
+    monkeypatch.setattr(router, "_get_kompress", lambda: fake)
+
+    router.apply(_two_block_messages(), _tokenizer(), force_kompress=True)
+
+    assert fake.deadlines, "the stub should still have been called"
+    assert all(d is None for d in fake.deadlines), fake.deadlines
+
+
+def _chunked_kompress(monkeypatch, chunk_s: float):
+    """Kompress over a fake model; each chunk advances a fake monotonic clock."""
+    clock = {"now": 0.0, "chunks": 0}
+
+    class _Enc(dict):
+        def word_ids(self, batch_index=0):
+            return self["_word_ids"]
+
+    class _Tok:
+        def __call__(self, chunk_words, **kw):
+            n = len(chunk_words)
+            return _Enc(input_ids=[[0] * n], attention_mask=[[1] * n], _word_ids=list(range(n)))
+
+    class _Model:
+        def get_keep_mask(self, input_ids, attention_mask):
+            clock["now"] += chunk_s
+            clock["chunks"] += 1
+            n = len(input_ids[0])
+            return [[i < n // 2 for i in range(n)]]
+
+        def get_scores(self, input_ids, attention_mask):  # the batched path
+            return [
+                [0.9 if keep else 0.1 for keep in row]
+                for row in self.get_keep_mask(input_ids, attention_mask)
+            ]
+
+    monkeypatch.setattr(kc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(kc, "_load_kompress", lambda *a, **k: (_Model(), _Tok(), "onnx"))
+    monkeypatch.setattr(kc, "_model_device_type", lambda *a, **k: "cpu")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "0")
+    monkeypatch.delenv(kc.KOMPRESS_TIME_BUDGET_ENV, raising=False)
+
+    comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
+    comp.config.chunk_words = 100
+    monkeypatch.setattr(comp, "_should_batch_single_content", lambda *a, **k: False)
+    monkeypatch.setattr(comp, "_should_use_sequential_fallback", lambda: False)
+    return comp, clock
+
+
+def test_time_budget_cap_stops_a_call_and_returns_it_unchanged(monkeypatch):
+    """The router hands Kompress what is left of its ML budget, so the first
+    call of a request -- which has no measured cost to be refused on -- stops
+    at a chunk boundary instead of running to the 20s per-call budget. The
+    block comes back byte-identical, so it is stable on later turns."""
+    comp, clock = _chunked_kompress(monkeypatch, chunk_s=0.6)
+    content = " ".join(f"w{i}" for i in range(500))  # five chunks, 3.0s uncapped
+
+    result = comp.compress(content, _time_budget_cap_seconds=1.0)
+
+    assert clock["chunks"] == 2, "must stop at the first chunk boundary past the cap"
+    assert result.compressed == content
+
+
+def test_time_budget_cap_bounds_the_batched_path_too(monkeypatch):
+    comp, clock = _chunked_kompress(monkeypatch, chunk_s=0.6)
+    content = " ".join(f"w{i}" for i in range(500))
+
+    [result] = comp.compress_batch([content], batch_size=1, _time_budget_cap_seconds=1.0)
+
+    assert clock["chunks"] == 2
+    assert result.compressed == content

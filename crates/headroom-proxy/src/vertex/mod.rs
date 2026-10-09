@@ -90,6 +90,7 @@ use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::Response;
 use std::net::SocketAddr;
 
+use crate::observability::{capture, ledger};
 use crate::proxy::AppState;
 
 /// Single axum handler mounted at the
@@ -120,6 +121,33 @@ pub async fn handle_vertex_predict_dispatch(
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // The upstream URL is built from the raw request path (which
+    // `crate::upstream_path` already refuses to normalise), but the
+    // decoded parameters are logged, labelled and handed to the
+    // envelope logic. Reject the shapes that could only mean a
+    // traversal attempt (`..`, empty, control characters) before any of
+    // that happens, so a later refactor that interpolates these values
+    // cannot reopen the hole.
+    for (name, value) in [
+        ("project", project.as_str()),
+        ("location", location.as_str()),
+        ("model_action", model_action.as_str()),
+    ] {
+        if let Err(e) = crate::upstream_path::validate_segment(value) {
+            tracing::warn!(
+                event = "vertex_path_rejected",
+                request_id = %request_id,
+                segment = name,
+                error = %e,
+                "vertex path parameter would rewrite the upstream path; refusing"
+            );
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("vertex path: {name} rejected: {e}")))
+                .expect("static");
+        }
+    }
+
     let (model_id, verb_str) = match split_model_action(&model_action) {
         Some(parts) => parts,
         None => {
@@ -130,6 +158,15 @@ pub async fn handle_vertex_predict_dispatch(
                 segment = %model_action,
                 "vertex path final segment missing `:verb` separator"
             );
+            // A proxy-side rejection is still an outcome for this
+            // request. The model id is whatever the caller sent (it
+            // is what failed to parse); the ledger clamps it.
+            capture::finalize_rejected(capture::start_pending(
+                &state,
+                ledger::provider::VERTEX,
+                &model_action,
+                &request_id,
+            ));
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex path: bad model_action"))
@@ -146,6 +183,12 @@ pub async fn handle_vertex_predict_dispatch(
                 verb = %verb_str,
                 "vertex path verb not recognized; only rawPredict / streamRawPredict are supported"
             );
+            capture::finalize_rejected(capture::start_pending(
+                &state,
+                ledger::provider::VERTEX,
+                model_id,
+                &request_id,
+            ));
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::from("vertex: unknown verb"))

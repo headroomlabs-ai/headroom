@@ -6,6 +6,7 @@ import os
 import sys
 import types
 from contextlib import contextmanager
+from hashlib import sha1
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,13 @@ except ModuleNotFoundError:  # Python < 3.11
 import click
 import pytest
 from click.testing import CliRunner
+
+from headroom.install.paths import _PROFILE_RE as PROFILE_RE
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_home(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user-home")
 
 
 def _load_init_module(monkeypatch):
@@ -228,6 +236,7 @@ def test_init_codex_creates_hooks_feature_flag_on_first_init(
     parsed = tomllib.loads(content)
     assert parsed["model_provider"] == "headroom"
     assert parsed["features"]["hooks"] is True
+    assert parsed["model_providers"]["headroom"]["name"] == "OpenAI"
     assert "codex_hooks" not in content
 
 
@@ -460,6 +469,46 @@ def test_ensure_claude_hooks_rewrites_existing_entries(monkeypatch, tmp_path: Pa
     assert session_entries[-1]["hooks"][0]["command"].endswith("--marker headroom-init-claude")
 
 
+def test_ensure_claude_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    """The external hook timeout must stay above the internal wait_ready(45s)
+    call _ensure_profile_running makes after a cold start (#3417), or the host
+    kills the hook before a first-ever proxy start can ever report ready."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_claude_hooks(settings_path, "init-local-demo", 9001)
+
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        timeout = payload["hooks"][event][-1]["hooks"][0]["timeout"]
+        assert timeout > 45
+
+
+def test_ensure_copilot_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    config_path = tmp_path / "copilot.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_copilot_hooks(config_path, "init-user")
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["timeout"] > 45
+
+
+def test_ensure_codex_hooks_timeout_exceeds_cold_start_wait(monkeypatch, tmp_path: Path) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "hooks.json"
+    monkeypatch.setattr(init_cli, "_hook_command", lambda *parts: "headroom init hook ensure")
+
+    init_cli._ensure_codex_hooks(path, "init-user")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for event in ("SessionStart", "PreToolUse"):
+        assert payload["hooks"][event][-1]["hooks"][0]["timeout"] > 45
+
+
 def test_ensure_copilot_hooks_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
     config_path = tmp_path / "copilot.json"
@@ -537,7 +586,7 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
     init_cli, _ = _load_init_module(monkeypatch)
     path = tmp_path / "config.toml"
     path.write_text(
-        f"prefix\n{init_cli._CODEX_PROVIDER_MARKER_START}\nold = true\n{init_cli._CODEX_PROVIDER_MARKER_END}\n",
+        f"# prefix\n{init_cli._CODEX_PROVIDER_MARKER_START}\nold = true\n{init_cli._CODEX_PROVIDER_MARKER_END}\n",
         encoding="utf-8",
     )
 
@@ -624,6 +673,7 @@ def test_ensure_codex_provider_emits_requires_openai_auth_for_chatgpt(
     monkeypatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     path = tmp_path / "config.toml"
     (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
 
@@ -636,12 +686,17 @@ def test_ensure_codex_provider_omits_requires_openai_auth_for_api_key(
     monkeypatch, tmp_path: Path
 ) -> None:
     init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     path = tmp_path / "config.toml"
-    (tmp_path / "auth.json").write_text('{"auth_mode": "apikey"}', encoding="utf-8")
+    (tmp_path / "auth.json").write_text(
+        '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+    )
 
     init_cli._ensure_codex_provider(path, 8787)
 
     assert "requires_openai_auth" not in path.read_text(encoding="utf-8")
+    assert "auth = { command =" in path.read_text(encoding="utf-8")
+    assert "sk-test-only" not in path.read_text(encoding="utf-8")
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
@@ -658,6 +713,59 @@ def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_pat
     assert content.count(init_cli._CODEX_FEATURE_MARKER_START) == 1
     assert "hooks = true" in content
     assert "codex_hooks" not in content
+
+
+@pytest.mark.parametrize("custom_home", [False, True])
+@pytest.mark.parametrize("auth_mode", ["apikey", "chatgpt"])
+def test_local_codex_provider_reads_credentials_from_user_home(
+    monkeypatch, tmp_path: Path, custom_home: bool, auth_mode: str
+) -> None:
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    codex_home = tmp_path / "custom" if custom_home else tmp_path / "home" / ".codex"
+    if custom_home:
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    codex_home.mkdir(parents=True)
+    (codex_home / "auth.json").write_text(
+        json.dumps({"auth_mode": auth_mode, "OPENAI_API_KEY": "sk-test-only"}),
+        encoding="utf-8",
+    )
+    project_config = tmp_path / "project" / ".codex" / "config.toml"
+
+    init_cli._ensure_codex_provider(project_config, 8787)
+
+    provider = tomllib.loads(project_config.read_text(encoding="utf-8"))["model_providers"][
+        "headroom"
+    ]
+    if auth_mode == "chatgpt":
+        assert provider["requires_openai_auth"] is True
+        assert "auth" not in provider
+    else:
+        assert "requires_openai_auth" not in provider
+        assert Path(provider["auth"]["args"][0]).parent == codex_home.resolve()
+    assert "sk-test-only" not in project_config.read_text(encoding="utf-8")
+
+
+def test_init_codex_helper_collision_leaves_provider_config_unchanged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from headroom.providers.codex.install import codex_auth_helper_path
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+    config = tmp_path / "config.toml"
+    original = 'model_provider = "openai"\n'
+    config.write_text(original, encoding="utf-8")
+    helper = codex_auth_helper_path(auth, config_path=config)
+    helper.write_text("user content", encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="Codex provider configuration was not updated"):
+        init_cli._ensure_codex_provider(config, 8787)
+
+    assert config.read_text(encoding="utf-8") == original
+    assert helper.read_text(encoding="utf-8") == "user content"
 
 
 def test_ensure_codex_feature_flag_replaces_marker_inside_features_scope(
@@ -1332,6 +1440,8 @@ def test_init_codex_windows_warns_about_upstream_hook_limitation(monkeypatch) ->
     init_cli._init_codex(global_scope=True, profile="init-user", port=9000)
 
     assert any("disabled upstream on Windows" in message for message in messages)
+    # Routing to a proxy nothing restarts must come with a way out (#3749).
+    assert any("headroom unwrap codex" in message for message in messages)
 
 
 def test_init_openclaw_propagates_nonzero_exit(monkeypatch) -> None:
@@ -1615,3 +1725,50 @@ def test_init_codebuddy_hooks_adds_session_start_hook(monkeypatch, tmp_path: Pat
         )
         for entry in session_hooks
     )
+
+
+@pytest.mark.parametrize(
+    "dir_name",
+    [
+        "Мастеринг в HW",
+        "项目",
+        "café-app",
+        "Ünicode Projekt",
+    ],
+)
+def test_local_profile_accepts_non_ascii_directory_names(monkeypatch, tmp_path, dir_name) -> None:
+    """A non-ASCII working directory must still yield a valid profile name.
+
+    ``str.isalnum`` is Unicode-aware, so Cyrillic/CJK/accented letters survived
+    into the slug and ``validate_profile_name`` then rejected it, making
+    ``headroom init`` unusable from such a directory.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / dir_name
+    root.mkdir()
+
+    profile = init_cli._local_profile(root)
+
+    assert PROFILE_RE.fullmatch(profile), profile
+    assert profile.startswith("init-")
+
+
+def test_local_profile_is_unchanged_for_ascii_directory_names(monkeypatch, tmp_path) -> None:
+    """The ASCII slug path keeps its existing output."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    root = tmp_path / "my-repo"
+    root.mkdir()
+
+    digest = sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:8]
+    assert init_cli._local_profile(root) == f"init-my-repo-{digest}"
+
+
+def test_local_profile_distinguishes_identical_non_ascii_names(monkeypatch, tmp_path) -> None:
+    """Two folders sharing a fully non-ASCII name must not collide."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    first = tmp_path / "a" / "项目"
+    second = tmp_path / "b" / "项目"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+
+    assert init_cli._local_profile(first) != init_cli._local_profile(second)

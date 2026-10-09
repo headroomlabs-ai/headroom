@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -29,6 +30,25 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
 
 logger = logging.getLogger(__name__)
+
+
+def _log_transform_failure(transform_name: str, log_prefix: str, exc: Exception) -> None:
+    """Keep stack diagnostics without logging payload-bearing exception text."""
+    # Log frame locations only: source lines can embed literal payloads too.
+    # Exception messages, notes, cause/context chains, and locals stay out.
+    frames = "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(exc.__traceback__)
+    )
+    logger.error(
+        "%sTransform %s failed; aborting compression pipeline\n"
+        "Traceback (most recent call last):\n%s%s: exception message redacted",
+        log_prefix,
+        transform_name,
+        frames,
+        type(exc).__name__,
+    )
+
 
 # Waste-signal detection re-parses the *original* messages for telemetry only
 # (it never changes the compression result). On very large transcripts that
@@ -317,6 +337,7 @@ class TransformPipeline:
             all_markers: list[str] = []
             all_warnings: list[str] = []
             all_timing: dict[str, float] = {}  # transform_name → ms
+            all_message_decisions: list[Any] = []
 
             # Track transform diffs if enabled
             transform_diffs: list[TransformDiff] = []
@@ -345,7 +366,13 @@ class TransformPipeline:
 
             for transform in self.transforms:
                 # Check if transform should run
-                if not transform.should_apply(current_messages, tokenizer, **kwargs):
+                try:
+                    eligible = transform.should_apply(current_messages, tokenizer, **kwargs)
+                except Exception as exc:
+                    _log_transform_failure(transform.name, log_prefix, exc)
+                    self._breaker_record_failure()
+                    raise
+                if not eligible:
                     continue
 
                 transform_span_context = (
@@ -366,7 +393,8 @@ class TransformPipeline:
                     t0 = time.perf_counter()
                     try:
                         result = transform.apply(current_messages, tokenizer, **kwargs)
-                    except Exception:
+                    except Exception as exc:
+                        _log_transform_failure(transform.name, log_prefix, exc)
                         self._breaker_record_failure()
                         raise
                     duration_ms = (time.perf_counter() - t0) * 1000
@@ -401,6 +429,8 @@ class TransformPipeline:
                     all_markers.extend(result.markers_inserted)
                     all_warnings.extend(result.warnings)
                     all_timing[transform.name] = duration_ms
+                    if result.message_decisions:
+                        all_message_decisions.extend(result.message_decisions)
 
                     # Merge sub-transform timing (e.g. ContentRouter's per-compressor breakdown)
                     if result.timing:
@@ -543,6 +573,7 @@ class TransformPipeline:
             diff_artifact=diff_artifact,
             timing=all_timing,
             waste_signals=waste_signals,
+            message_decisions=all_message_decisions,
         )
 
     def simulate(

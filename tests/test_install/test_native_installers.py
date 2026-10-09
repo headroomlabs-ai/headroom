@@ -210,6 +210,19 @@ def _write_fake_docker_shims(tmp_path: Path) -> Path:
     openclaw_sh.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     openclaw_sh.chmod(0o755)
 
+    opencode_sh = shim_dir / "opencode"
+    opencode_sh.write_text(
+        "#!/usr/bin/env bash\n"
+        "{\n"
+        "  printf 'CONFIG=%s\\n' \"${OPENCODE_CONFIG_CONTENT-}\"\n"
+        "  printf 'ARGS='\n"
+        "  printf '%q ' \"$@\"\n"
+        "  printf '\\n'\n"
+        '} > "${FAKE_OPENCODE_LOG}"\n',
+        encoding="utf-8",
+    )
+    opencode_sh.chmod(0o755)
+
     openclaw_cmd = shim_dir / "openclaw.cmd"
     openclaw_cmd.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
 
@@ -371,6 +384,76 @@ def _bash_supports_4_3() -> bool:
     return (major, minor) >= (4, 3)
 
 
+def _assert_loopback_publication(call: list[str]) -> None:
+    publication = call[call.index("-p") + 1].split(":")
+    assert len(publication) == 3
+    assert publication[0] == "127.0.0.1"
+    assert publication[1] == publication[2]
+
+
+def _assert_generated_proxy_argv(
+    call: list[str], expected_port: int, forwarded_tail: list[str] | None = None
+) -> None:
+    _assert_loopback_publication(call)
+    entrypoint = call.index("--entrypoint")
+    image = entrypoint + 2
+    assert call[entrypoint + 1] == "headroom"
+    assert call[image + 1 : image + 6] == [
+        "proxy",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(expected_port),
+    ]
+    if forwarded_tail is not None:
+        assert call[image + 6 :] == forwarded_tail
+
+
+def test_generated_wrappers_explicitly_override_image_host_for_container_access() -> None:
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert 'args+=("${HEADROOM_IMAGE}" --host 0.0.0.0 --port "${port}" "$@")' in bash_source
+    assert "dockerArgs.Add('0.0.0.0')" in powershell_source
+
+
+def test_wrappers_acknowledge_open_bind_only_with_loopback_publication() -> None:
+    """Every container launch that binds 0.0.0.0 inside the container must
+    publish on host loopback *and* acknowledge the token-less open bind, and
+    the acknowledgement must never appear without that publication.
+
+    The proxy refuses a token-less non-loopback bind unless
+    HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 is set; the wrappers make that
+    statement only through one helper that also adds ``-p 127.0.0.1:...``.
+    """
+    ack = "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1"
+    bash_source = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    powershell_source = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    # Bash: the publish flag and the acknowledgement live only in the helper.
+    helper = bash_source.split("append_loopback_publish_args() {", 1)[1].split("\n}\n", 1)[0]
+    assert '-p "127.0.0.1:${port}:${port}"' in helper and ack in helper
+    outside = bash_source.replace(helper, "")
+    assert '-p "127.0.0.1:' not in outside
+    assert outside.count(ack) == 0
+    # Three launch sites, three helper calls.
+    assert bash_source.count("--host 0.0.0.0") == 3
+    assert bash_source.count("append_loopback_publish_args ") == 3
+
+    # PowerShell: same shape.
+    ps_helper = powershell_source.split("function Get-LoopbackPublishArgs {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "127.0.0.1`:$Port`:$Port" in ps_helper and ack in ps_helper
+    # Without the unary comma PowerShell unrolls the array to object[], and
+    # List[string].AddRange rejects it at runtime.
+    assert "return ,[string[]]@(" in ps_helper
+    ps_outside = powershell_source.replace(ps_helper, "")
+    assert "'-p'," not in ps_outside.replace("Get-LoopbackPublishArgs", "")
+    assert ps_outside.count(ack) == 0
+    assert powershell_source.count("Get-LoopbackPublishArgs -Port") == 3
+
+
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
     reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
@@ -394,6 +477,7 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         wrap_help = _run([str(wrapper), "wrap", "--help"], env=env)
         assert "Supported commands:" in wrap_help.stdout
         assert "copilot" not in wrap_help.stdout
+        _run([str(wrapper), "proxy", "--help"], env=env)
         unsupported_wrap = _run(
             [str(wrapper), "wrap", "copilot", "--help"],
             env=env,
@@ -504,8 +588,33 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
             if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "--help" in call
         )
         assert "-it" not in help_call
+        proxy_help_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
+        )
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [str(wrapper), "proxy", "--port", str(explicit_port), "--host", "192.0.2.1"],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call
@@ -552,6 +661,53 @@ def test_bash_native_installer_supports_persistent_docker_lifecycle(tmp_path: Pa
         _run([str(wrapper), "install", "restart", "--profile", "smoke"], env=env)
         _run([str(wrapper), "install", "remove", "--profile", "smoke"], env=env)
         assert not manifest_path.parent.exists()
+    finally:
+        _cleanup_fake_docker(env)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None or not _bash_supports_4_3(),
+    reason="installer requires bash >= 4.3 (macOS system bash is 3.2)",
+)
+def test_bash_native_wrapper_supports_opencode(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+    env["FAKE_OPENCODE_LOG"] = str(tmp_path / "opencode.log")
+
+    try:
+        _run(["bash", str(REPO_ROOT / "scripts" / "install.sh")], env=env, cwd=REPO_ROOT)
+        wrapper = home / ".local" / "bin" / "headroom"
+
+        config_file = home / ".config" / "opencode" / "opencode.json"
+        config_file.parent.mkdir(parents=True)
+        config_content = (
+            '{"provider":{"headroom":{"options":{"baseURL":"http://127.0.0.1:8787/v1"}}}}'
+        )
+        config_file.write_text(config_content, encoding="utf-8")
+
+        port = _free_port()
+        result = _run(
+            [str(wrapper), "wrap", "opencode", "--port", str(port), "--", "--help"],
+            env=env,
+        )
+        assert result.stderr == ""
+
+        docker_calls = _read_fake_docker_log(env)
+        prepare_call = next(
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "--rm"] and "--prepare-only" in call and "opencode" in call
+        )
+        assert f"{home}/.config/opencode:/tmp/headroom-home/.config/opencode" in prepare_call
+        assert f"{home}/.config:/tmp/headroom-home/.config" not in prepare_call
+
+        opencode_output = Path(env["FAKE_OPENCODE_LOG"]).read_text(encoding="utf-8")
+        assert f"CONFIG={config_content}" in opencode_output
+        assert "ARGS=--help" in opencode_output
+        docker_state = json.loads(Path(env["FAKE_DOCKER_STATE"]).read_text(encoding="utf-8"))
+        assert docker_state["containers"] == {}
     finally:
         _cleanup_fake_docker(env)
 
@@ -647,6 +803,61 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
             _restore_user_path_entry(before)
 
 
+@pytest.mark.skipif(
+    os.name != "nt" or _powershell_executable() is None,
+    reason="Windows PowerShell coverage runs on Windows hosts only",
+)
+def test_powershell_mcp_wrapper_keeps_stdin_attached_for_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    """Piped MCP stdio must still pass -i to Docker even when input is redirected."""
+    powershell = _powershell_executable()
+    assert powershell is not None
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    env = _build_env(home, tmp_path)
+    env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
+
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+        wrapper = home / ".local" / "bin" / "headroom.ps1"
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "mcp",
+                "serve",
+            ],
+            env=env,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.returncode == 0
+        mcp_call = next(call for call in _read_fake_docker_log(env) if call[:2] == ["run", "--rm"])
+        assert "-i" in mcp_call
+        assert "-t" not in mcp_call
+    finally:
+        _cleanup_fake_docker(env)
+
+
 # AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
 # a given HEADROOM_INSTALL_PATH_SCOPE, so the scope allow-list is exercised
 # without running the whole installer. Parsing via the PowerShell AST (not a
@@ -719,6 +930,104 @@ def test_path_scope_rejects_machine_and_invalid_values(tmp_path: Path) -> None:
         out = _invoke_scope_harness(bad, tmp_path)
         assert out.startswith("ERR:"), f"scope {bad!r} was not rejected: {out!r}"
         assert "User" in out and "Process" in out, out
+
+
+# AST-extract the two functions Start-PersistentDockerInstall uses to build the
+# dashboard allowlist env and run them in the same order: the passthrough
+# enumerates Env: before Add-DashboardGatewayEnv checks for an explicit value.
+# Both live in the generated wrapper, i.e. inside install.ps1's single-quoted
+# here-string template, so that template is parsed in turn. `docker` is stubbed
+# so no real daemon is queried. Prints one docker arg per line.
+_DASHBOARD_GATEWAY_HARNESS = r"""
+param([string]$InstallScript)
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $InstallScript, [ref]$null, [ref]$null)
+$template = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+    $n.StringConstantType -eq 'SingleQuotedHereString' -and
+    $n.Value.Contains('function Add-DashboardGatewayEnv')
+}, $true) | Select-Object -First 1
+if (-not $template) { Write-Output 'NOTEMPLATE'; exit 3 }
+$ast = [System.Management.Automation.Language.Parser]::ParseInput(
+    $template.Value, [ref]$null, [ref]$null)
+$functions = $ast.FindAll({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true)
+foreach ($name in 'Get-PassthroughEnvArgs', 'Add-DashboardGatewayEnv') {
+    $fn = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $fn) { Write-Output "NOFUNC:$name"; exit 3 }
+    Invoke-Expression $fn.Extent.Text
+}
+function docker { $global:LASTEXITCODE = 0; '172.17.0.1' }
+$dockerArgs = New-Object System.Collections.Generic.List[string]
+$dockerArgs.AddRange([string[]](Get-PassthroughEnvArgs))
+Add-DashboardGatewayEnv -ArgsList $dockerArgs
+$dockerArgs | ForEach-Object { Write-Output $_ }
+"""
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="Windows PowerShell coverage runs on Windows hosts only"
+)
+@pytest.mark.parametrize(
+    "shell",
+    [
+        # Windows PowerShell 5.1 ships with every Windows install and is what a
+        # plain `powershell` resolves to; pwsh is PowerShell 7+.
+        pytest.param("powershell", id="windows-powershell"),
+        pytest.param("pwsh", id="pwsh"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("configured", "expect_gateway_default"),
+    [
+        pytest.param(None, True, id="unset"),
+        pytest.param("10.20.0.0/16", False, id="configured"),
+        pytest.param("", False, id="explicitly-empty"),
+    ],
+)
+def test_powershell_dashboard_gateway_default_respects_explicit_allowlist(
+    tmp_path: Path, shell: str, configured: str | None, expect_gateway_default: bool
+) -> None:
+    """An explicit allowlist, even an empty one, must suppress the gateway default.
+
+    Windows PowerShell 5.1 stops reporting an empty variable through
+    ``Test-Path Env:`` once ``Env:`` has been enumerated, so the explicit opt-out
+    was forwarded by name *and* overridden by the trusted bridge gateway.
+    """
+    executable = shutil.which(shell)
+    if executable is None:
+        pytest.skip(f"{shell} is not installed")
+
+    trusted_cidrs = "HEADROOM_PROXY_TRUSTED_DASHBOARD_CLIENT_CIDRS"
+    env = {key: value for key, value in os.environ.items() if key.upper() != trusted_cidrs}
+    if configured is not None:
+        env[trusted_cidrs] = configured
+
+    harness = tmp_path / "dashboard_gateway_harness.ps1"
+    harness.write_text(_DASHBOARD_GATEWAY_HARNESS, encoding="utf-8")
+    result = _run(
+        [
+            executable,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            "-InstallScript",
+            str(REPO_ROOT / "scripts" / "install.ps1"),
+        ],
+        env=env,
+    )
+    docker_args = result.stdout.splitlines()
+
+    gateway_default = f"{trusted_cidrs}=172.17.0.1/32"
+    assert (gateway_default in docker_args) is expect_gateway_default, docker_args
+    # Docker's name-only --env form forwards the caller's value unchanged.
+    assert (trusted_cidrs in docker_args) is (configured is not None), docker_args
 
 
 @pytest.mark.skipif(
@@ -925,8 +1234,40 @@ def test_powershell_native_installer_supports_persistent_docker_lifecycle(tmp_pa
             if call[:2] == ["run", "--rm"] and "-p" in call and "proxy" in call and "--help" in call
         )
         assert "-it" not in proxy_help_call
+        _assert_generated_proxy_argv(proxy_help_call, 8787)
+        explicit_port = _free_port()
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(wrapper),
+                "proxy",
+                "--port",
+                str(explicit_port),
+                "--host",
+                "192.0.2.1",
+            ],
+            env=env,
+        )
+        explicit_call = next(
+            call
+            for call in reversed(_read_fake_docker_log(env))
+            if call[:2] == ["run", "--rm"] and "--entrypoint" in call and "192.0.2.1" in call
+        )
+        _assert_generated_proxy_argv(
+            explicit_call,
+            explicit_port,
+            ["--port", str(explicit_port), "--host", "192.0.2.1"],
+        )
         install_call = next(
-            call for call in docker_calls if call[:2] == ["run", "-d"] and "--name" in call
+            call
+            for call in docker_calls
+            if call[:2] == ["run", "-d"]
+            and "--name" in call
+            and call[call.index("--name") + 1] == "headroom-smoke"
         )
         assert install_call[install_call.index("-p") + 1] == f"127.0.0.1:{port}:{port}"
         assert "/tmp/headroom-home/.headroom/memory.db" in install_call

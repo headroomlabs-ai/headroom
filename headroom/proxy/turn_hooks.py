@@ -26,6 +26,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from headroom.proxy.tool_schema_savings_policy import (
+    deferred_booking,
+    reconcile_deferred_tokens,
+    without_deferral_flags,
+)
+
 log = logging.getLogger(__name__)
 
 # Re-drive the model with a message list; returns the provider's response JSON.
@@ -53,6 +59,12 @@ class TurnContext:
     tags: dict[str, Any] = field(default_factory=dict)
     count_messages: Callable[[list[dict[str, Any]]], int] | None = None
     count_tools: Callable[[Any], int] | None = None
+    # Outbound headers a request hook wants on the provider request, name ->
+    # value. The handler merges them through :func:`merge_provider_headers`:
+    # only allow-listed names are honoured, and ``anthropic-beta`` is merged as
+    # a token set behind the client's own value rather than overwritten. On the
+    # gateway contract the merged map is the response's ``headers`` object.
+    provider_headers: dict[str, str] = field(default_factory=dict)
 
     def record_savings(
         self,
@@ -91,6 +103,14 @@ class TurnHook(Protocol):
     # False (conservative). See :func:`run_request_hooks`.
     stream_safe: bool
 
+    # Optional: run order among registered hooks, lowest first (stable for
+    # ties; absent ⇒ DEFAULT_HOOK_PRIORITY). Convention: routers that change
+    # ``ctx.model`` 10-49, message folds 50-99, tool-catalog shaping that is
+    # gated on the final model (deferral) 200+. Registration order is
+    # entry-point discovery order, which an operator does not control, so a
+    # hook whose correctness depends on running after another must say so.
+    priority: int
+
     def on_request(self, ctx: TurnContext) -> None:
         """Inspect / mutate ``ctx`` (e.g. ``ctx.tools``) before it goes upstream."""
 
@@ -105,15 +125,65 @@ class TurnHook(Protocol):
 
 _hooks: list[TurnHook] = []
 
+DEFAULT_HOOK_PRIORITY = 100
+
+#: Provider header names a hook may request through ``TurnContext.provider_headers``.
+PROVIDER_HEADER_ALLOWLIST: frozenset[str] = frozenset({"anthropic-beta"})
+
+
+def _priority(hook: Any) -> int:
+    try:
+        return int(getattr(hook, "priority", DEFAULT_HOOK_PRIORITY))
+    except (TypeError, ValueError):
+        return DEFAULT_HOOK_PRIORITY
+
 
 def register_turn_hook(hook: TurnHook) -> None:
     """Register a hook. Called by an extension's ``install(app, config)``."""
     _hooks.append(hook)
-    log.info("registered turn hook: %s", getattr(hook, "name", type(hook).__name__))
+    log.info(
+        "registered turn hook: %s (priority %d)",
+        getattr(hook, "name", type(hook).__name__),
+        _priority(hook),
+    )
 
 
 def registered_turn_hooks() -> list[TurnHook]:
-    return list(_hooks)
+    """Registered hooks in run order: ``priority`` ascending, registration
+    order for ties."""
+    return sorted(_hooks, key=_priority)
+
+
+def merge_provider_headers(
+    client_headers: dict[str, str] | None, requested: dict[str, str] | None
+) -> dict[str, str]:
+    """Reduce hook-requested provider headers to what the handler may set.
+
+    Names outside :data:`PROVIDER_HEADER_ALLOWLIST` are dropped (debug log).
+    ``anthropic-beta`` merges as a token set: the client's tokens first, the
+    hook's appended, deduplicated — a hook may add a beta the feature needs
+    but never strip one the client asked for. Other allow-listed names are set
+    verbatim. Returns only the headers to set; an empty map means "nothing".
+    """
+    out: dict[str, str] = {}
+    if not isinstance(requested, dict) or not requested:
+        return out
+    client = {str(k).strip().lower(): v for k, v in (client_headers or {}).items()}
+    for name, value in requested.items():
+        key = str(name).strip().lower()
+        if key not in PROVIDER_HEADER_ALLOWLIST:
+            log.debug("turn hook requested header %r outside the allowlist; dropped", name)
+            continue
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if key == "anthropic-beta":
+            from headroom.proxy.beta_header_merge import merge_anthropic_beta
+
+            tokens = [t.strip() for t in value.split(",") if t.strip()]
+            out[key] = merge_anthropic_beta(client.get(key) or None, tokens)
+        else:
+            out[key] = value
+    return out
 
 
 def clear_turn_hooks() -> None:
@@ -134,18 +204,22 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
     working on streamed OpenAI-compatible traffic. Default off ⇒ conservative:
     a hook is treated as buffered-only unless it declares itself stream-safe.
     """
-    for hook in _hooks:
+    # Deferral booked before or by a hook; reconciled once every hook has run,
+    # since a later hook may un-defer booked tools (tool search's hot tools).
+    booking = deferred_booking(ctx.tags, ctx.tools)
+    for hook in registered_turn_hooks():
         if stream_safe_only and not getattr(hook, "stream_safe", False):
             continue
         fn = getattr(hook, "on_request", None)
         if fn is None:
             continue
+        booked_tag = ctx.tags.get("tool_search_deferred_tokens")
         before_messages = before_tools = None
         try:
             if ctx.count_messages is not None:
                 before_messages = ctx.count_messages(ctx.messages)
             if ctx.count_tools is not None:
-                before_tools = ctx.count_tools(ctx.tools)
+                before_tools = ctx.count_tools(without_deferral_flags(ctx.tools))
             fn(ctx)
             message_saved = (
                 max(0, before_messages - ctx.count_messages(ctx.messages))
@@ -153,7 +227,7 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 else 0
             )
             tool_saved = (
-                max(0, before_tools - ctx.count_tools(ctx.tools))
+                max(0, before_tools - ctx.count_tools(without_deferral_flags(ctx.tools)))
                 if before_tools is not None and ctx.count_tools is not None
                 else 0
             )
@@ -168,6 +242,10 @@ def run_request_hooks(ctx: TurnContext, *, stream_safe_only: bool = False) -> No
                 )
         except Exception:  # a hook must never break the proxy
             log.exception("turn hook %r on_request failed", getattr(hook, "name", hook))
+        if ctx.tags.get("tool_search_deferred_tokens") != booked_tag:
+            # This hook booked (or re-booked) the deferral: it is the new baseline.
+            booking = deferred_booking(ctx.tags, ctx.tools)
+    reconcile_deferred_tokens(ctx.tags, booking, ctx.tools, ctx.count_tools)
 
 
 async def run_response_hooks(
@@ -179,7 +257,7 @@ async def run_response_hooks(
     (returns ``response`` unchanged); a failing hook is logged and skipped.
     """
     current = response
-    for hook in _hooks:
+    for hook in registered_turn_hooks():
         fn = getattr(hook, "on_response", None)
         if fn is None:
             continue
