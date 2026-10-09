@@ -20,7 +20,10 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    net_hook_tool_saving,
+    without_deferral_flags,
+)
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -3349,6 +3352,7 @@ class AnthropicHandlerMixin:
             # into the forwarded count below so the headline nets them; shrinkage
             # stays on the turn_hook_tools_saved_tokens tag.
             _th_tool_growth = 0
+            _th_saved = 0
             _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
@@ -3539,7 +3543,11 @@ class AnthropicHandlerMixin:
                         # Advisory, like the maturation pass itself: a failure
                         # here must not skip the recount around it.
                         logger.debug("maturation replay debt skipped", exc_info=True)
-                tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
+                # Signed, then clamped once: message text a hook added offsets
+                # the tool definitions it removed (booked on the tag above).
+                tokens_saved = net_hook_tool_saving(
+                    original_tokens - optimized_tokens - _replay_debt, tags, _th_saved
+                )
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.

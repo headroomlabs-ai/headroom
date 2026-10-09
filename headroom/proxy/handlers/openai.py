@@ -39,7 +39,10 @@ from headroom.proxy.modes import is_cache_mode
 from headroom.proxy.rate_limit_identity import rate_limit_identity
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    net_hook_tool_saving,
+    without_deferral_flags,
+)
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -4831,6 +4834,7 @@ class OpenAIHandlerMixin:
         )
 
         _th_ctx: TurnContext | None = None
+        _th_raw_saved = None
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
@@ -4887,7 +4891,8 @@ class OpenAIHandlerMixin:
                     else 0
                 )
                 optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                _th_raw_saved: int | None = original_tokens - optimized_tokens
+                tokens_saved = max(0, _th_raw_saved)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
                 if _th_msg_before is not None and _th_msg_after < _th_msg_before:
                     transforms_applied.append("turn_hook")
@@ -4904,6 +4909,10 @@ class OpenAIHandlerMixin:
                     int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                 )
                 transforms_applied.append(f"turn_hook:tools:{_th_saved}tok")
+            # Signed, then clamped once: message text a hook added offsets the
+            # tool definitions it removed.
+            if _th_raw_saved is not None:
+                tokens_saved = net_hook_tool_saving(_th_raw_saved, tags, _th_saved)
 
         # Compatibility shim: GPT-5 / o-series chat models REJECT the legacy
         # `max_tokens` ("Unsupported parameter … Use 'max_completion_tokens'
@@ -11110,10 +11119,17 @@ class OpenAIHandlerMixin:
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
 
-            # Tools a turn hook added are sent too: they reduce the saving.
+            # Tools and message text a turn hook added are sent too: they reduce
+            # the saving, and offset tools the hook removed (signed, clamped once).
+            _hook_tool_saved = 0
             if _turn is not None:
                 tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
-            tokens_saved = max(0, tokens_before - tokens_after)
+                if not _turn.folded_messages:  # a recount already includes it
+                    tokens_after += max(0, int(getattr(_turn, "message_growth_tokens", 0) or 0))
+                _hook_tool_saved = int(getattr(_turn, "hook_tool_saved_tokens", 0) or 0)
+            tokens_saved = net_hook_tool_saving(
+                tokens_before - tokens_after, tags, _hook_tool_saved
+            )
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())
             # The claimed turn adds its labels and response fields BEFORE the

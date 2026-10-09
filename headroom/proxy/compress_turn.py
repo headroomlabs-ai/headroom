@@ -93,6 +93,9 @@ class CompressTurn(Protocol):
     # ``tool_growth_tokens``, the tool-definition tokens ``transform`` ADDED to
     # the request (a hook's search tool, say). The handler adds it to
     # ``tokens_after``, since those tokens are sent too; absent reads as 0.
+    # Likewise optional: ``message_growth_tokens`` (message tokens it added)
+    # and ``hook_tool_saved_tokens`` (tool tokens it removed and booked), so
+    # the handler can net the two before clamping the saving.
 
     def finish(
         self,

@@ -158,6 +158,26 @@ def tool_schema_saved_from_tags(tags: object) -> int:
     return total
 
 
+def net_hook_tool_saving(raw_saved: int, tags: object, hook_tool_saved: int) -> int:
+    """Net a request's message-side saving against the tool saving its turn
+    hooks booked on ``turn_hook_tools_saved_tokens``; return it clamped at 0.
+
+    The headline is ``tokens_saved`` (clamped) plus that tag. A hook that adds
+    message text while removing tools leaves ``raw_saved`` negative, and the
+    clamp alone would drop the growth while the tag kept the full removal. The
+    deficit is debited from the tag first (at most what the hooks booked on
+    this request), so headline == messages + tools, signed, clamped once.
+    """
+    raw = int(raw_saved)
+    booked = max(0, int(hook_tool_saved or 0))
+    if raw < 0 and booked > 0 and isinstance(tags, dict):
+        offset = min(-raw, booked)
+        current = int(tags.get("turn_hook_tools_saved_tokens", 0) or 0)
+        tags["turn_hook_tools_saved_tokens"] = max(0, current - offset)
+        raw += offset
+    return max(0, raw)
+
+
 def headline_tokens_saved(tokens_saved: object, tags: object) -> int:
     """Return the single "Tokens saved" figure for one request.
 

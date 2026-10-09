@@ -259,3 +259,130 @@ def test_a_later_partial_loss_caps_the_earlier_credit_at_the_net() -> None:
     assert details["message_tokens_saved"] + details["tool_tokens_saved"] == net
     assert details["uncapped_message_tokens_saved"] > net
     assert details["uncapped_tool_tokens_saved"] == 0
+
+
+# ── message growth offsets tool removal in the handler headline ──────────────
+
+BIG_TOOL = {
+    "name": "big_tool",
+    "description": "Does many things in many ways. " * 40,
+    "input_schema": {"type": "object"},
+}
+
+
+class _AddTextRemoveTools:
+    """The opposite signed case: append message text, drop every tool."""
+
+    name = savings_source = "rewriter"
+    stream_safe = True
+
+    def __init__(self, added_text: str) -> None:
+        self.added_text = added_text
+
+    def on_request(self, ctx: TurnContext) -> None:
+        ctx.messages = [*ctx.messages, {"role": "user", "content": self.added_text}]
+        ctx.tools = []
+
+
+def _app_with_spy(monkeypatch) -> tuple[Any, list[Any]]:
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+    outcomes: list[Any] = []
+
+    async def _spy(_self, outcome, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ANN202
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(type(app.state.proxy), "_record_request_outcome", _spy, raising=True)
+    return app, outcomes
+
+
+def _expected(model: str, before: list, added_text: str, tools: list) -> int:
+    tok = get_tokenizer(model)
+    grown = tok.count_messages([*before, {"role": "user", "content": added_text}])
+    message_growth = grown - tok.count_messages(before)
+    removed = tok.count_text(json.dumps(tools, default=str))
+    return removed - message_growth
+
+
+@pytest.mark.parametrize("repeat", [5, 400], ids=["net-positive", "net-negative"])
+@respx.mock
+def test_anthropic_headline_nets_added_text_against_removed_tools(monkeypatch, repeat) -> None:
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    added = "extra steering text. " * repeat
+    register_turn_hook(_AddTextRemoveTools(added))
+    app, outcomes = _app_with_spy(monkeypatch)
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 100, "output_tokens": 1},
+            },
+        )
+    )
+    before = [{"role": "user", "content": "hi"}]
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 16,
+                "messages": before,
+                "tools": [BIG_TOOL],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+    assert result.status_code == 200
+    net = _expected("claude-sonnet-4-5", before, added, [BIG_TOOL])
+    assert (net > 0) == (repeat == 5)
+    outcome = outcomes[-1]
+    assert headline_tokens_saved(outcome.tokens_saved, outcome.tags) == max(0, net)
+
+
+@pytest.mark.parametrize("repeat", [5, 400], ids=["net-positive", "net-negative"])
+@respx.mock
+def test_openai_chat_headline_nets_added_text_against_removed_tools(monkeypatch, repeat) -> None:
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    added = "extra steering text. " * repeat
+    register_turn_hook(_AddTextRemoveTools(added))
+    app, outcomes = _app_with_spy(monkeypatch)
+    respx.post("https://api.openai.com/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "choices": [
+                    {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 1},
+            },
+        )
+    )
+    tools = [{"type": "function", "function": BIG_TOOL}]
+    before = [{"role": "user", "content": "hi"}]
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": before, "tools": tools},
+            headers={"authorization": "Bearer sk-test"},
+        )
+    assert result.status_code == 200
+    net = _expected("gpt-4o", before, added, tools)
+    assert (net > 0) == (repeat == 5)
+    outcome = outcomes[-1]
+    assert headline_tokens_saved(outcome.tokens_saved, outcome.tags) == max(0, net)

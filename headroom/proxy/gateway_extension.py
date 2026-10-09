@@ -145,6 +145,14 @@ class GatewayTurn:
     def tool_growth_tokens(self) -> int:
         return self._transformer.tool_growth_tokens if self._transformer is not None else 0
 
+    @property
+    def message_growth_tokens(self) -> int:
+        return self._transformer.message_growth_tokens if self._transformer is not None else 0
+
+    @property
+    def hook_tool_saved_tokens(self) -> int:
+        return self._transformer.hook_tool_saved_tokens if self._transformer is not None else 0
+
     # -- event-loop side ---------------------------------------------------
     def finish(
         self,
