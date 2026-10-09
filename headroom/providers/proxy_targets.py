@@ -79,6 +79,21 @@ def openai_compatible_base_url(proxy: Any, headers: Mapping[str, str]) -> str:
     return target
 
 
+def is_anthropic_hello_path(path: str | None) -> bool:
+    """Return True for Anthropic's connectivity canary endpoint (/api/hello).
+
+    Claude Code (and other Anthropic SDK clients) sends unauthenticated
+    ``HEAD /api/hello`` or ``GET /api/hello`` requests to test upstream
+    connectivity. Because the probe carries no authorization headers,
+    unrouted passthrough would otherwise fall through to the default OpenAI
+    target and fail with 404 (#3336).
+    """
+    if not path:
+        return False
+    normalized = (path if path.startswith("/") else f"/{path}").rstrip("/")
+    return normalized == "/api/hello"
+
+
 def select_passthrough_base_url(
     proxy: Any, headers: Mapping[str, str], path: str | None = None
 ) -> str:
@@ -105,6 +120,8 @@ def select_passthrough_base_url(
             if is_safe_upstream_url(azure_base):
                 return azure_base.rstrip("/")
             logger.warning("ignoring unsafe x-headroom-base-url override: %r", azure_base)
+    if is_anthropic_hello_path(path):
+        return api_target(proxy, "anthropic")
     provider_name = proxy.provider_runtime.model_metadata_provider(headers)
     target = api_target(proxy, provider_name)
     if (

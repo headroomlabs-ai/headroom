@@ -28,6 +28,8 @@ class ProviderHandlerRoute:
 
 ANTHROPIC_PASSTHROUGH_ROUTES: tuple[ProviderPassthroughRoute, ...] = (
     ProviderPassthroughRoute("POST", "/v1/messages/count_tokens", "anthropic", "count_tokens"),
+    ProviderPassthroughRoute("GET", "/api/hello", "anthropic", "api/hello"),
+    ProviderPassthroughRoute("HEAD", "/api/hello", "anthropic", "api/hello"),
 )
 
 

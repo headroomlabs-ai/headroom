@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from headroom.providers.proxy_targets import (
     api_target,
+    is_anthropic_hello_path,
     openai_compatible_base_url,
     select_passthrough_base_url,
     vertex_target_for_location,
@@ -79,6 +80,10 @@ def test_select_passthrough_base_url_handles_special_auth_modes() -> None:
         "https://legacy.anthropic.test"
     )
     assert select_passthrough_base_url(proxy, {}) == "https://legacy.openai.test"
+    assert select_passthrough_base_url(proxy, {}, "/api/hello") == "https://legacy.anthropic.test"
+    assert select_passthrough_base_url(proxy, {}, "/api/hello/") == "https://legacy.anthropic.test"
+    # Non-probe unauthenticated paths still fall through to OpenAI.
+    assert select_passthrough_base_url(proxy, {}, "/other/endpoint") == "https://legacy.openai.test"
     # A configured OpenAI target outranks Grok wire signals (see
     # ``test_openai_compatible_base_url_respects_configured_openai_target``).
     assert (
@@ -154,3 +159,15 @@ def test_select_passthrough_base_url_factory_mode_wins_over_auth_modes() -> None
     assert (
         select_passthrough_base_url(proxy, {"chatgpt-account-id": "a"}) == "https://api.factory.ai"
     )
+
+
+def test_is_anthropic_hello_path() -> None:
+    assert is_anthropic_hello_path("/api/hello")
+    assert is_anthropic_hello_path("api/hello")
+    assert is_anthropic_hello_path("/api/hello/")
+    assert is_anthropic_hello_path("api/hello/")
+    assert not is_anthropic_hello_path(None)
+    assert not is_anthropic_hello_path("")
+    assert not is_anthropic_hello_path("/api/hello/extra")
+    assert not is_anthropic_hello_path("/v1/messages")
+    assert not is_anthropic_hello_path("/hello")

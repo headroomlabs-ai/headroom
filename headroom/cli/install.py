@@ -1178,9 +1178,23 @@ def install_status(profile: str) -> None:
         # reach `.get('backend', ...)` and crash with AttributeError. Guard on
         # isinstance, mirroring wrap.py's _proxy_health_config.
         config = payload.get("config")
-        if not isinstance(config, dict):
+        anthropic_target = openai_target = "unknown"
+        if isinstance(config, dict):
+            anthropic_url = config.get("anthropic_api_url")
+            if "anthropic_api_url" in config and (
+                anthropic_url is None or isinstance(anthropic_url, str)
+            ):
+                anthropic_target = "configured" if anthropic_url else "default"
+            openai_url = config.get("openai_api_url")
+            if "openai_api_url" in config and (openai_url is None or isinstance(openai_url, str)):
+                openai_target = "configured" if openai_url else "default"
+        else:
+            # Network health probes may intentionally omit credential-bearing
+            # config. Missing information does not mean a target is unset.
             config = {}
-        click.echo(f"Backend:    {config.get('backend', manifest.backend)}")
+        click.echo(f"Default backend:  {config.get('backend', manifest.backend)}")
+        click.echo(f"Anthropic target: {anthropic_target}")
+        click.echo(f"OpenAI target:    {openai_target}")
 
 
 @install.command("start")
