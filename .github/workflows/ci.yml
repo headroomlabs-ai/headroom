@@ -574,9 +574,19 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
-        with:
-          configFile: .commitlintrc.cjs
+      - name: Install commitlint
+        run: >-
+          npm install --prefix "$RUNNER_TEMP/headroom-commitlint"
+          --no-package-lock --ignore-scripts --no-audit --no-fund
+          @commitlint/cli@19 @commitlint/config-conventional@19
+      - name: Lint non-merge commits by ID
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          NODE_PATH: ${{ runner.temp }}/headroom-commitlint/node_modules
+        run: >-
+          python scripts/lint_commits.py --from "$BASE_SHA" --to "$HEAD_SHA"
+          --commitlint "$RUNNER_TEMP/headroom-commitlint/node_modules/.bin/commitlint"
 
   build:
     needs: changes
