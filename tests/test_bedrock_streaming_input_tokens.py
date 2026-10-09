@@ -52,7 +52,7 @@ def _make_bedrock_backend(events: list[StreamEvent]) -> MagicMock:
     return mock
 
 
-def _bedrock_events(input_tokens: int) -> list[StreamEvent]:
+def _bedrock_events(input_tokens: int, **cache: int) -> list[StreamEvent]:
     """Build a minimal Anthropic streaming sequence as LiteLLM emits it."""
     message_start = {
         "type": "message_start",
@@ -63,7 +63,7 @@ def _bedrock_events(input_tokens: int) -> list[StreamEvent]:
             "type": "message",
             "content": [],
             # LiteLLM hardcodes this to 0 — the bug under test.
-            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0, **cache},
         },
     }
     block_start = {
@@ -189,4 +189,25 @@ def test_bedrock_backfilled_input_is_reported_as_estimated() -> None:
 def test_bedrock_reported_input_is_provider_reported() -> None:
     tokens = _post_stream_stats(_make_bedrock_backend(_bedrock_events(input_tokens=777)))
     assert tokens["input_provider_reported"] == 777
+    assert tokens["input_estimated"] == 0
+
+
+def test_bedrock_fully_cached_zero_is_billed_input_not_a_placeholder() -> None:
+    """input_tokens=0 beside a cache bucket is a real count (a fully cached
+    prompt), not LiteLLM's placeholder: it is not backfilled, and the cache
+    buckets count as provider-reported billed input."""
+    events = _bedrock_events(input_tokens=0, cache_read_input_tokens=8857)
+    assert _message_start_input_tokens(_post_stream(_make_bedrock_backend(events))) == 0
+    tokens = _post_stream_stats(
+        _make_bedrock_backend(_bedrock_events(input_tokens=0, cache_read_input_tokens=8857))
+    )
+    assert tokens["input_provider_reported"] == 8857
+    assert tokens["input_estimated"] == 0
+
+
+def test_bedrock_cache_write_alone_also_counts_as_reported() -> None:
+    tokens = _post_stream_stats(
+        _make_bedrock_backend(_bedrock_events(input_tokens=0, cache_creation_input_tokens=1200))
+    )
+    assert tokens["input_provider_reported"] == 1200
     assert tokens["input_estimated"] == 0
