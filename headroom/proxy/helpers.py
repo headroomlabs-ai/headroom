@@ -1048,6 +1048,22 @@ _ROLE_SYSTEM = "system"
 _TEXT_BLOCK_TYPE = "text"
 
 
+def _coerce_system_block(block: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a block representable by Anthropic's top-level ``system`` field."""
+    text = block.get("text")
+    if isinstance(text, str) and text:
+        # Anthropic TextBlockParam accepts these fields only. Image sources
+        # and tool IDs/inputs remain invalid even after changing ``type``.
+        coerced = {
+            key: value
+            for key, value in block.items()
+            if key in {"type", "text", "cache_control", "citations"}
+        }
+        coerced["type"] = _TEXT_BLOCK_TYPE
+        return coerced
+    return None
+
+
 def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     """Convert a ``role="system"`` message into Anthropic system content blocks."""
     content = message.get("content")
@@ -1078,10 +1094,12 @@ def relocate_system_messages_to_top_level(
     field as the issue-765 last-line wire-contract guard.
 
     The relocated content is appended after any existing top-level ``system``
-    so wire order (system prompt, then conversation) is preserved and no content
-    is dropped. Only text-shaped content moves: non-text blocks (images,
-    documents) stay in a mid-conversation system section at their original
-    position, because top-level `system` accepts text blocks only (issue #3552).
+    so wire order (system prompt, then conversation) is preserved. Only
+    text-shaped content moves: non-text blocks (images, documents) stay in a
+    mid-conversation system section at their original position, because
+    top-level `system` accepts text blocks only (issue #3552). A leading system
+    section cannot stay in ``messages[0]``; non-text blocks there are dropped
+    with a warning because they cannot be represented in either valid location.
 
     Returns ``(clean_messages, new_system, changed)``. When no system-role
     message is present the inputs pass through unchanged (``changed=False``) so
@@ -1144,26 +1162,52 @@ def relocate_system_messages_to_top_level(
 
     relocated_blocks: list[Any] = []
     retained: dict[int, dict[str, Any]] = {}
+    leading_system_indices: set[int] = set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != _ROLE_SYSTEM:
+            break
+        leading_system_indices.add(index)
     for i in sorted(system_indices):
         message = messages[i]
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
             # Only text-shaped content may move into the top-level ``system``
             # parameter (text blocks and bare strings). Non-text blocks such as
-            # images or documents stay in place so nothing is dropped and
-            # upstreams that reject non-text system blocks keep working
-            # (issue #3552).
+            # images or documents stay in mid-conversation sections so nothing
+            # is dropped and upstreams that reject non-text system blocks keep
+            # working (issue #3552). A leading section cannot remain there
+            # without violating Anthropic's message contract.
             hoisted_from_list: list[Any] = []
             leftovers: list[Any] = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == _TEXT_BLOCK_TYPE:
-                    hoisted_from_list.append(block)
+                if isinstance(block, dict):
+                    if i in leading_system_indices:
+                        coerced = _coerce_system_block(block)
+                        if coerced is not None:
+                            hoisted_from_list.append(coerced)
+                        else:
+                            logger.warning(
+                                "event=system_relocation_block_dropped block_type=%s "
+                                "reason=not_representable_as_text",
+                                block.get("type", "missing"),
+                            )
+                    elif block.get("type") == _TEXT_BLOCK_TYPE:
+                        hoisted_from_list.append(block)
+                    else:
+                        leftovers.append(block)
                 elif isinstance(block, str) and block:
                     hoisted_from_list.append({"type": _TEXT_BLOCK_TYPE, "text": block})
                 else:
-                    leftovers.append(block)
+                    if i in leading_system_indices:
+                        logger.warning(
+                            "event=system_relocation_block_dropped block_type=%s "
+                            "reason=not_representable_as_text",
+                            "string" if isinstance(block, str) else type(block).__name__,
+                        )
+                    else:
+                        leftovers.append(block)
             relocated_blocks.extend(hoisted_from_list)
-            if leftovers:
+            if leftovers and i not in leading_system_indices:
                 retained[i] = {**message, "content": leftovers}
         else:
             # String (and other) content converts losslessly to text blocks.
@@ -2971,6 +3015,30 @@ class RequestBodyTooLarge(ValueError):
     """
 
 
+class RequestBodyNotObject(ValueError):
+    """The request body parsed as JSON but is not an object (e.g. a list)."""
+
+
+def invalid_request_body_message(exc: Exception) -> str:
+    """Client-facing text for a request body that failed to read or parse.
+
+    Fixed strings only, chosen by exception type. The exception's own text can
+    carry decoder internals and request metadata, and echoing it back is what
+    CodeQL's ``py/stack-trace-exposure`` flags. The type is logged so a 400 can
+    still be diagnosed from the proxy side.
+    """
+    logger.info("rejected request body (%s)", type(exc).__name__)
+    if isinstance(exc, RequestBodyTooLarge):
+        return "Invalid request body: too large"
+    if isinstance(exc, RequestBodyNotObject):
+        return "Invalid request body: must be a JSON object"
+    if isinstance(exc, json.JSONDecodeError):
+        return "Invalid request body: malformed JSON"
+    if isinstance(exc.__cause__, UnicodeDecodeError):
+        return "Invalid request body: not valid UTF-8 (possibly compressed?)"
+    return "Invalid request body"
+
+
 def _inflate_bounded(raw: bytes, *, wbits: int, label: str, multi_member: bool = False) -> bytes:
     """Incrementally inflate ``raw``, stopping the instant output passes the cap.
 
@@ -3303,7 +3371,9 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
 
     result = json.loads(text)
     if not isinstance(result, dict):
-        raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+        raise RequestBodyNotObject(
+            "Request body must be a JSON object, not " + type(result).__name__
+        )
 
     # Drop output-only blocks the request schema rejects (see
     # ``strip_output_only_request_blocks``). Callers of this bytes-less reader
@@ -3343,7 +3413,9 @@ async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any]
 
     result = json.loads(text)
     if not isinstance(result, dict):
-        raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+        raise RequestBodyNotObject(
+            "Request body must be a JSON object, not " + type(result).__name__
+        )
 
     # Drop output-only blocks (see ``strip_output_only_request_blocks``) before
     # any downstream deepcopy / compression / 400-retry path. This is the shared

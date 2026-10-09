@@ -70,6 +70,36 @@ def extract_tool_calls(response: dict[str, Any], provider: str) -> list[dict[str
     return []
 
 
+def drop_tool_calls(
+    response: dict[str, Any],
+    provider: str,
+    calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Return a shallow copy of ``response`` without ``calls``.
+
+    ``calls`` are objects ``extract_tool_calls`` returned for this response and
+    are matched by identity. Anthropic and OpenAI chat only: a Responses
+    ``function_call`` can be the item a ``reasoning`` item requires next, and a
+    Gemini ``functionCall`` part can carry the turn's thought signature, so
+    removing one there can make the continuation invalid. Other providers get
+    ``response`` back unchanged.
+    """
+    drop = {id(call) for call in calls}
+    if provider == "anthropic":
+        content = response.get("content")
+        if isinstance(content, list):
+            return {**response, "content": [b for b in content if id(b) not in drop]}
+    elif provider == "openai":
+        choices = response.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict) and isinstance(message.get("tool_calls"), list):
+                tool_calls = [c for c in message["tool_calls"] if id(c) not in drop]
+                first = {**choices[0], "message": {**message, "tool_calls": tool_calls}}
+                return {**response, "choices": [first, *choices[1:]]}
+    return response
+
+
 def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:
     """Return true when a provider-native tool call names the CCR retrieval tool."""
     return (

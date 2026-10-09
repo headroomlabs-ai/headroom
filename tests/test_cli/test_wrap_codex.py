@@ -453,6 +453,47 @@ class TestInjectAndRestoreRoundTrip:
         assert not config_file.exists()
         assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
 
+    def test_wrap_unwrap_removes_generated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        helper = wrap_mod.codex_auth_helper_path(config_dir / "auth.json")
+        assert helper.exists()
+        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+        assert config["model_providers"]["headroom"]["auth"]["args"] == [str(helper.resolve())]
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "removed"
+        assert not helper.exists()
+
+    def test_wrap_unwrap_preserves_preexisting_unrelated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text('model = "gpt-5"\n', encoding="utf-8")
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+        helper = config_dir / ".headroom-codex-auth.py"
+        helper.write_text("user content", encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert helper.read_text(encoding="utf-8") == "user content"
+
     def test_wrap_unwrap_respects_codex_home(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -468,7 +509,48 @@ class TestInjectAndRestoreRoundTrip:
 
         status, _ = wrap_mod._restore_codex_provider_config()
         assert status == "removed"
+
         assert not config_file.exists()
+
+    def test_wrap_helper_collision_aborts_before_backup(self, monkeypatch, tmp_path: Path) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        auth = config_dir / "auth.json"
+        auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+        config_file = config_dir / "config.toml"
+        original = 'model_provider = "openai"\n'
+        config_file.write_text(original, encoding="utf-8")
+        helper = wrap_mod.codex_auth_helper_path(auth, config_path=config_file)
+        helper.write_text("user content", encoding="utf-8")
+
+        with pytest.raises(
+            wrap_mod.click.ClickException, match="Codex provider configuration was not updated"
+        ):
+            wrap_mod._inject_codex_provider_config(8787)
+
+        assert config_file.read_text(encoding="utf-8") == original
+        assert not (config_dir / "config.toml.headroom-backup").exists()
+        assert helper.read_text(encoding="utf-8") == "user content"
+
+    def test_unwrap_keeps_helper_used_by_restored_custom_provider(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        auth = config_dir / "auth.json"
+        auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+        original = "[model_providers.custom]\n" + wrap_mod.build_codex_auth_config(auth)
+        config_file = config_dir / "config.toml"
+        config_file.write_text(original, encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert config_file.read_text(encoding="utf-8") == original
+        assert wrap_mod.codex_auth_helper_path(auth).exists()
 
     def test_wrap_unwrap_restores_prior_model_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2436,3 +2518,46 @@ class TestCodexLaunchExportsCustomUpstream:
     ) -> None:
         env = self._launch_env(monkeypatch, tmp_path, custom_upstream=None)
         assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+
+
+@pytest.mark.parametrize("original", ["", 'model = "gpt-5"\n'])
+def test_unwrap_init_snapshot_removes_unreferenced_auth_helper(monkeypatch, tmp_path, original):
+    from headroom.cli import init as init_cli
+    from headroom.providers.codex.install import codex_auth_helper_path
+
+    _set_test_home(monkeypatch, tmp_path)
+    config = tmp_path / ".codex/config.toml"
+    config.parent.mkdir()
+    config.write_text(original, encoding="utf-8")
+    auth = config.with_name("auth.json")
+    auth.write_text('{"OPENAI_API_KEY":"test-key"}', encoding="utf-8")
+    init_cli._ensure_codex_provider(config, 8787)
+    helper = codex_auth_helper_path(auth, config_path=config)
+    assert helper.exists()
+    backup = wrap_mod._codex_config_paths()[1]
+    backup.write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
+    wrap_mod._restore_codex_provider_config()
+    assert not helper.exists()
+    assert not backup.exists()
+    if original:
+        assert tomllib.loads(config.read_text(encoding="utf-8")) == tomllib.loads(original)
+    else:
+        assert not config.exists()
+
+
+@pytest.mark.parametrize("with_backup", [False, True])
+def test_unwrap_preserves_adopted_provider_options(monkeypatch, tmp_path, with_backup):
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config = tmp_path / ".codex/config.toml"
+    config.parent.mkdir()
+    original = '[model_providers.headroom]\nbase_url = "http://127.0.0.1:9200/v1"\nrequest_max_retries = 7\n'
+    config.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config, 8787)
+    init_cli._ensure_codex_provider(config, 9500)
+    if with_backup:
+        backup = wrap_mod._codex_config_paths()[1]
+        backup.write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
+    wrap_mod._restore_codex_provider_config()
+    assert tomllib.loads(config.read_text(encoding="utf-8")) == tomllib.loads(original)

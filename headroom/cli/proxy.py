@@ -2,9 +2,10 @@
 
 import logging
 import os
+import platform
 import sys
 import warnings
-from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -21,6 +22,15 @@ from headroom.proxy.modes import PROXY_MODE_CACHE, normalize_proxy_mode
 from .main import main
 
 
+def _proxy_requires_onnx_backends() -> bool:
+    """Match extras that omit unavailable Intel macOS Python 3.14+ wheels."""
+    return not (
+        sys.platform == "darwin"
+        and platform.machine() == "x86_64"
+        and sys.version_info[:2] >= (3, 14)
+    )
+
+
 def ensure_proxy_dependencies() -> None:
     """Verify optional proxy extras are installed before starting or wrapping."""
     required_modules: list[str] = [
@@ -29,18 +39,19 @@ def ensure_proxy_dependencies() -> None:
         "httpx",
         "openai",
         "mcp",
-        "magika",
         "zstandard",
         "websockets",
-        "onnxruntime",
         "transformers",
     ]
+    if _proxy_requires_onnx_backends():
+        required_modules.extend(["magika", "onnxruntime"])
     if sys.implementation.name != "pypy":
         required_modules.append("orjson")
 
     try:
-        for module in required_modules:
-            import_module(module)
+        missing = next((module for module in required_modules if find_spec(module) is None), None)
+        if missing is not None:
+            raise ImportError(f"No module named '{missing}'")
     except ImportError as e:
         click.secho(
             "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]",
