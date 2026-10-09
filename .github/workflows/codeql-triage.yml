@@ -14,6 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read  # checkout, for scripts/codeql_triage.sh
   issues: write
   security-events: read
 
@@ -40,31 +41,12 @@ jobs:
             --description "Security-relevant; exempt from stale triage" \
             --force
 
-      - name: Open weekly triage issue
+      - uses: actions/checkout@v7
+
+      # One issue per ISO week: re-runs and later dispatches reuse it (see the
+      # script header). Tested by tests/test_codeql_triage_script.py.
+      - name: Open or update this week's triage issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          week="$(date -u +%Y-%m-%d)"
-          alerts="$(gh api --paginate -X GET "repos/$REPO/code-scanning/alerts" -f state=open \
-            --jq '.[] | select(.rule.security_severity_level == "critical" or .rule.security_severity_level == "high")
-                  | "- [ ] [#\(.number)](\(.html_url)) **\(.rule.security_severity_level)** `\(.rule.id)` in `\(.most_recent_instance.location.path):\(.most_recent_instance.location.start_line)` (open since \(.created_at[:10]))"')"
-          count="$(printf '%s' "$alerts" | grep -c '^- ' || true)"
-          {
-            echo "Weekly code scanning triage for the week of **$week**. Owner: @$TRIAGE_ASSIGNEE (tejas@headroomlabs.ai)."
-            echo
-            echo "For each alert: fix it (link the PR) or dismiss it in code scanning with a reason. Close this issue when every box is ticked."
-            echo "Target: critical and high fixed or dismissed within the vulnerability management SLA."
-            echo
-            echo "### Open critical/high alerts: $count"
-            echo
-            if [ "$count" -eq 0 ]; then echo "None. Close this issue to record the review."; else printf '%s\n' "$alerts"; fi
-            echo
-            echo "All open alerts: https://github.com/$REPO/security/code-scanning"
-          } > body.md
-          gh issue create --repo "$REPO" \
-            --title "CodeQL triage: week of $week ($count critical/high open)" \
-            --body-file body.md \
-            --assignee "$TRIAGE_ASSIGNEE" \
-            --label security
+        run: scripts/codeql_triage.sh

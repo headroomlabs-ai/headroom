@@ -416,11 +416,19 @@ export default {
     // 429 is safe for old clients: only 400/415 make them drop gzip
     // (_GZIP_REFUSED_STATUSES in headroom/telemetry/session.py).
     //
-    // Optional so a deploy without the binding (local tests, an old
-    // wrangler.toml) fails open instead of 500ing every upload.
+    // Fails open: with no binding (local tests, an old wrangler.toml) or when
+    // the rate-limit service itself errors, the upload proceeds. A limiter
+    // outage must not drop every legitimate beacon; the cost is that a flood
+    // during that outage is unbounded until the service recovers.
     if (env.RATE_LIMIT) {
-      const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
-      if (!success) return new Response('rate limited', { status: 429 });
+      let limited = false;
+      try {
+        const { success } = await env.RATE_LIMIT.limit({ key: 'all' });
+        limited = !success;
+      } catch (err) {
+        console.error('beacon: rate limiter unavailable, failing open:', String(err));
+      }
+      if (limited) return new Response('rate limited', { status: 429 });
     }
 
     const raw = await request.arrayBuffer();
