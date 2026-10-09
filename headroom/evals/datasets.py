@@ -1177,47 +1177,6 @@ def load_custom_dataset(path: Path | str) -> EvalSuite:
     return EvalSuite.from_jsonl(path)
 
 
-def generate_retrieval_probes(
-    context: str,
-    n_probes: int = 5,
-) -> list[str]:
-    """Generate retrieval probes from a context.
-
-    Extracts key facts/entities that should be retrievable
-    after compression.
-
-    Args:
-        context: The context to analyze
-        n_probes: Number of probes to generate
-
-    Returns:
-        List of fact strings to probe for
-    """
-    import re
-
-    probes = []
-
-    # Look for specific patterns
-    patterns = [
-        r"\b[A-Z][a-z]+ [A-Z][a-z]+\b",  # Names (e.g., "John Smith")
-        r"\b\d{4}-\d{2}-\d{2}\b",  # Dates (e.g., "2024-01-15")
-        r"\b[A-Z]{2,}\b",  # Acronyms (e.g., "API", "HTTP")
-        r"\b\d+\.\d+%?\b",  # Numbers (e.g., "99.9%", "123.45")
-        r'"[^"]{5,50}"',  # Quoted strings
-        r"\b[a-z_]+_[a-z_]+\b",  # Snake case identifiers
-    ]
-
-    for pattern in patterns:
-        matches = re.findall(pattern, context)
-        for match in matches[:2]:  # Take up to 2 per pattern
-            if match not in probes:
-                probes.append(match.strip('"'))
-            if len(probes) >= n_probes:
-                return probes
-
-    return probes
-
-
 # =============================================================================
 # DATASET REGISTRY & UTILITIES
 # =============================================================================
