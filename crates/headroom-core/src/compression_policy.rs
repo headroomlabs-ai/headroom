@@ -135,10 +135,23 @@ pub(crate) const MAX_LOSSY_RATIO_SUBSCRIPTION: f32 = 0.25;
 /// net-cost mutation formula (#856).
 pub const CACHE_WRITE_MULTIPLIER: f32 = 1.25;
 
+/// Anthropic prompt-cache write multiplier for the 1-hour TTL tier.
+pub const CACHE_WRITE_MULTIPLIER_1H: f32 = 2.0;
+
 /// Anthropic prompt-cache read multiplier: a `cache_read` token costs
 /// 0.1× a plain input token. Input to the net-cost mutation formula
 /// (#856).
 pub const CACHE_READ_MULTIPLIER: f32 = 0.1;
+
+/// Return the cache-write multiplier for a prompt-cache TTL tier.
+///
+/// Invalid, missing, and non-positive values retain the 5-minute default.
+pub fn cache_write_multiplier_for_ttl(ttl_seconds: Option<f32>) -> f32 {
+    match ttl_seconds {
+        Some(ttl) if ttl.is_finite() && ttl >= 3_600.0 => CACHE_WRITE_MULTIPLIER_1H,
+        _ => CACHE_WRITE_MULTIPLIER,
+    }
+}
 
 /// Per-auth-mode policy that downstream compression stages consult.
 ///
@@ -269,7 +282,26 @@ impl CompressionPolicy {
         expected_reads: f32,
         p_alive: f32,
     ) -> f32 {
-        let w = CACHE_WRITE_MULTIPLIER;
+        self.net_mutation_gain_with_write_multiplier(
+            delta_t,
+            suffix_tokens,
+            expected_reads,
+            p_alive,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::net_mutation_gain`] with an explicit cache-write
+    /// multiplier. `None` uses the 5-minute default.
+    pub fn net_mutation_gain_with_write_multiplier(
+        &self,
+        delta_t: u32,
+        suffix_tokens: u32,
+        expected_reads: f32,
+        p_alive: f32,
+        write_multiplier: Option<f32>,
+    ) -> f32 {
+        let w = write_multiplier.unwrap_or(CACHE_WRITE_MULTIPLIER);
         let r = CACHE_READ_MULTIPLIER;
         // f32::max ignores NaN (returns the other operand), so NaN reads
         // land on 0.0; clamp would propagate NaN, so guard alive explicitly.
@@ -299,7 +331,32 @@ impl CompressionPolicy {
         expected_reads: f32,
         p_alive: f32,
     ) -> bool {
-        self.net_mutation_gain(delta_t, suffix_tokens, expected_reads, p_alive) > 0.0
+        self.should_mutate_deep_with_write_multiplier(
+            delta_t,
+            suffix_tokens,
+            expected_reads,
+            p_alive,
+            None,
+        )
+    }
+
+    /// Variant of [`Self::should_mutate_deep`] with an explicit cache-write
+    /// multiplier. `None` uses the 5-minute default.
+    pub fn should_mutate_deep_with_write_multiplier(
+        &self,
+        delta_t: u32,
+        suffix_tokens: u32,
+        expected_reads: f32,
+        p_alive: f32,
+        write_multiplier: Option<f32>,
+    ) -> bool {
+        self.net_mutation_gain_with_write_multiplier(
+            delta_t,
+            suffix_tokens,
+            expected_reads,
+            p_alive,
+            write_multiplier,
+        ) > 0.0
     }
 
     /// Remaining-read count at which a warm-cache (P_alive = 1)
@@ -315,10 +372,21 @@ impl CompressionPolicy {
     /// session lasts N more turns"). Returns 0 when `delta_t` is 0
     /// (no savings — callers gate on `delta_t > 0`).
     pub fn break_even_reads(&self, delta_t: u32, suffix_tokens: u32) -> f32 {
+        self.break_even_reads_with_write_multiplier(delta_t, suffix_tokens, None)
+    }
+
+    /// Variant of [`Self::break_even_reads`] with an explicit cache-write
+    /// multiplier. `None` uses the 5-minute default.
+    pub fn break_even_reads_with_write_multiplier(
+        &self,
+        delta_t: u32,
+        suffix_tokens: u32,
+        write_multiplier: Option<f32>,
+    ) -> f32 {
         if delta_t == 0 {
             return 0.0;
         }
-        let w = CACHE_WRITE_MULTIPLIER;
+        let w = write_multiplier.unwrap_or(CACHE_WRITE_MULTIPLIER);
         let r = CACHE_READ_MULTIPLIER;
         ((w - r) / r) * ((suffix_tokens as f32) / (delta_t as f32))
     }
@@ -445,6 +513,29 @@ mod tests {
         let gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0);
         assert!((gain - 3_500.0).abs() < 1.0, "gain = {gain}");
         assert!(p.should_mutate_deep(50_000, 10_000, 3.0, 1.0));
+    }
+
+    #[test]
+    fn net_gain_big_shave_shallow_suffix_is_loss_at_1h_tier() {
+        let p = CompressionPolicy::for_mode(AuthMode::Payg);
+        let default_gain = p.net_mutation_gain(50_000, 10_000, 3.0, 1.0);
+        assert!(default_gain > 0.0, "default gain = {default_gain}");
+
+        let gain = p.net_mutation_gain_with_write_multiplier(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            Some(CACHE_WRITE_MULTIPLIER_1H),
+        );
+        assert!((gain - (-4_000.0)).abs() < 1.0, "gain = {gain}");
+        assert!(!p.should_mutate_deep_with_write_multiplier(
+            50_000,
+            10_000,
+            3.0,
+            1.0,
+            Some(CACHE_WRITE_MULTIPLIER_1H),
+        ));
     }
 
     #[test]

@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree
+from xml.sax.saxutils import escape as _xml_escape
 
 import click
 
@@ -242,7 +247,205 @@ def _linux_task_spec(manifest: DeploymentManifest, ensure_script: Path) -> tuple
     return None, content
 
 
-def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
+def _windows_current_user() -> str:
+    """Best-effort ``DOMAIN\\USER`` for the S4U task principal."""
+
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN")
+    return f"{domain}\\{user}" if domain else user
+
+
+class _WindowsTaskRegistrationError(RuntimeError):
+    """Task registration or read-back verification failed."""
+
+    def __init__(self, message: str, *, task_created: bool = False) -> None:
+        super().__init__(message)
+        self.task_created = task_created
+
+
+def _windows_task_xml(
+    command: str, *, trigger_xml: str, scope: str, logon_type: str | None = None
+) -> str:
+    """Render Task Scheduler XML for ``command`` and its requested principal.
+
+    User-scope tasks use an S4U principal ("run whether user is logged on or
+    not", no stored password) so each run happens in a non-interactive session
+    and never draws a console window (issue #2453). Callers can explicitly use
+    InteractiveToken as a session-scoped compatibility mode for locked-down
+    user accounts.
+    System-scope tasks keep the LocalSystem service account, which already has
+    no desktop.
+    """
+
+    if scope == "system":
+        if logon_type not in (None, "ServiceAccount"):
+            raise ValueError("System-scope Windows tasks must use ServiceAccount")
+        principal = (
+            "    <UserId>S-1-5-18</UserId>\n"
+            "    <LogonType>ServiceAccount</LogonType>\n"
+            "    <RunLevel>HighestAvailable</RunLevel>"
+        )
+    else:
+        logon_type = logon_type or "S4U"
+        if logon_type not in ("S4U", "InteractiveToken"):
+            raise ValueError(f"Unsupported user-scope Windows task logon type: {logon_type}")
+        principal = (
+            f"    <UserId>{_xml_escape(_windows_current_user())}</UserId>\n"
+            f"    <LogonType>{logon_type}</LogonType>\n"
+            "    <RunLevel>LeastPrivilege</RunLevel>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <Triggers>\n"
+        f"{trigger_xml}\n"
+        "  </Triggers>\n"
+        '  <Principals>\n    <Principal id="Author">\n'
+        f"{principal}\n"
+        "    </Principal>\n  </Principals>\n"
+        "  <Settings>\n"
+        "    <Hidden>true</Hidden>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
+
+
+def _windows_boot_trigger() -> str:
+    return "    <BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>"
+
+
+def _windows_health_trigger() -> str:
+    start = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return (
+        "    <TimeTrigger>\n"
+        f"      <StartBoundary>{start}</StartBoundary>\n"
+        "      <Enabled>true</Enabled>\n"
+        "      <Repetition>\n"
+        "        <Interval>PT5M</Interval>\n"
+        "        <StopAtDurationEnd>false</StopAtDurationEnd>\n"
+        "      </Repetition>\n"
+        "    </TimeTrigger>"
+    )
+
+
+def _parse_windows_task_xml(raw: bytes | str) -> ElementTree.Element:
+    """Parse schtasks XML when its declaration does not match stdout bytes."""
+    if isinstance(raw, bytes):
+        try:
+            return ElementTree.fromstring(raw)
+        except ElementTree.ParseError:
+            raw = raw.decode(errors="replace")
+    normalized = re.sub(
+        r'<\?xml\s+version="1\.0"\s+encoding="[^"]+"\?>',
+        '<?xml version="1.0"?>',
+        raw,
+        count=1,
+    )
+    return ElementTree.fromstring(normalized)
+
+
+def _register_windows_task(name: str, xml: str, *, expected_logon_type: str) -> None:
+    """Register a task and verify its principal from Task Scheduler's XML."""
+
+    # schtasks reads the XML from a file; UTF-16 matches the declared encoding.
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".xml", encoding="utf-16", delete=False)
+    try:
+        tmp.write(xml)
+        tmp.close()
+        task_created = False
+        try:
+            subprocess.run(
+                ["schtasks", "/Create", "/TN", name, "/XML", tmp.name, "/F"],
+                check=True,
+            )
+            task_created = True
+            query = subprocess.run(
+                ["schtasks", "/Query", "/TN", name, "/XML"],
+                check=True,
+                capture_output=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _WindowsTaskRegistrationError(
+                f"Could not register or verify Windows task {name!r}: {exc}",
+                task_created=task_created,
+            ) from exc
+
+        try:
+            task = _parse_windows_task_xml(query.stdout or b"")
+        except ElementTree.ParseError as exc:
+            raise _WindowsTaskRegistrationError(
+                f"Could not parse registered Windows task {name!r}", task_created=True
+            ) from exc
+
+        logon_element = task.find(".//{*}LogonType")
+        actual_logon_type = (
+            logon_element.text.strip()
+            if logon_element is not None and logon_element.text is not None
+            else None
+        )
+        if actual_logon_type != expected_logon_type:
+            raise _WindowsTaskRegistrationError(
+                f"Windows task {name!r} requested {expected_logon_type} logon type, "
+                f"but Task Scheduler registered {actual_logon_type or 'no logon type'}",
+                task_created=True,
+            )
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _delete_windows_task(name: str) -> subprocess.CompletedProcess[str] | None:
+    """Best-effort removal of a scheduled task."""
+
+    try:
+        return run(
+            ["schtasks", "/Delete", "/TN", name, "/F"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+
+
+def _cleanup_windows_tasks_for_fallback(names: list[str], *, must_delete: set[str]) -> None:
+    """Remove preferred tasks and fail if Task Scheduler still reports one."""
+
+    for name in names:
+        deletion = _delete_windows_task(name)
+        if name in must_delete and (deletion is None or deletion.returncode != 0):
+            raise _WindowsTaskRegistrationError(
+                f"Could not clean up Windows task {name!r} before compatibility fallback"
+            )
+
+        try:
+            query = run(
+                ["schtasks", "/Query", "/TN", name, "/XML"],
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise _WindowsTaskRegistrationError(
+                f"Could not verify cleanup of Windows task {name!r}: {exc}"
+            ) from exc
+
+        if query.returncode == 0:
+            raise _WindowsTaskRegistrationError(
+                f"Could not clean up Windows task {name!r}; it remains registered"
+            )
+
+
+def install_supervisor(manifest: DeploymentManifest, *, start: bool = True) -> list[ArtifactRecord]:
     """Install service/task artifacts for the deployment."""
 
     records = render_runner_scripts(manifest)
@@ -319,61 +522,74 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        _bootstrap_with_retry(bootstrap_domain, plist_path)
+        if start:
+            _bootstrap_with_retry(bootstrap_domain, plist_path)
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        # sc.exe's binPath= value embeds its own quotes (cmd.exe /c "<path>").
-        # Passing this as an argv list lets subprocess.list2cmdline re-quote the
-        # token and sc.exe mis-tokenizes it (issue #1654), so build the exact
-        # command line ourselves and hand subprocess a string.
-        run_cmd = windows_run_cmd_path(manifest.profile)
-        create_cmd = (
-            f"sc.exe create {manifest.service_name} "
-            f'binPath= "cmd.exe /c \\"{run_cmd}\\"" start= auto'
-        )
-        subprocess.run(create_cmd, check=True)
-        subprocess.run(
-            ["sc.exe", "failure", manifest.service_name, "reset= 0", "actions= restart/5000"],
-            check=True,
-        )
-        records.append(ArtifactRecord(kind="windows-service", path=manifest.service_name))
-        return records
-
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.TASK.value:
+    if _is_windows() and manifest.supervisor_kind in (
+        SupervisorKind.SERVICE.value,
+        SupervisorKind.TASK.value,
+    ):
         startup_name = f"{manifest.service_name}-startup"
         health_name = f"{manifest.service_name}-health"
-        startup_cmd = str(windows_ensure_cmd_path(manifest.profile))
-        user_args = ["/RU", "SYSTEM"] if manifest.scope == "system" else []
-        start_schedule = [
-            "schtasks",
-            "/Create",
-            "/TN",
-            startup_name,
-            "/TR",
-            startup_cmd,
-            "/SC",
-            "ONSTART",
-            "/F",
-            *user_args,
+        startup_cmd = str(
+            windows_run_cmd_path(manifest.profile)
+            if manifest.supervisor_kind == SupervisorKind.SERVICE.value
+            else windows_ensure_cmd_path(manifest.profile)
+        )
+        health_cmd = str(windows_ensure_cmd_path(manifest.profile))
+        # Register from task XML (not schtasks flags) so the principal is S4U /
+        # hidden — flag-created tasks use an interactive token and flash a
+        # focus-stealing console on every run (issue #2453).
+        preferred_logon_type = "ServiceAccount" if manifest.scope == "system" else "S4U"
+        preferred_tasks = [
+            (startup_name, startup_cmd, _windows_boot_trigger()),
+            (health_name, health_cmd, _windows_health_trigger()),
         ]
-        health_schedule = [
-            "schtasks",
-            "/Create",
-            "/TN",
-            health_name,
-            "/TR",
-            startup_cmd,
-            "/SC",
-            "MINUTE",
-            "/MO",
-            "5",
-            "/F",
-            *user_args,
-        ]
-        subprocess.run(start_schedule, check=True)
-        subprocess.run(health_schedule, check=True)
+        registered_preferred_tasks: list[str] = []
+
+        try:
+            for name, task_cmd, trigger_xml in preferred_tasks:
+                _register_windows_task(
+                    name,
+                    _windows_task_xml(
+                        task_cmd,
+                        trigger_xml=trigger_xml,
+                        scope=manifest.scope,
+                        logon_type=preferred_logon_type,
+                    ),
+                    expected_logon_type=preferred_logon_type,
+                )
+                registered_preferred_tasks.append(name)
+        except _WindowsTaskRegistrationError as exc:
+            if manifest.scope == "system":
+                raise
+            must_delete = set(registered_preferred_tasks)
+            if exc.task_created:
+                must_delete.add(name)
+            _cleanup_windows_tasks_for_fallback(
+                [name for name, _task_cmd, _trigger_xml in preferred_tasks],
+                must_delete=must_delete,
+            )
+            _register_windows_task(
+                health_name,
+                _windows_task_xml(
+                    health_cmd,
+                    trigger_xml=_windows_health_trigger(),
+                    scope=manifest.scope,
+                    logon_type="InteractiveToken",
+                ),
+                expected_logon_type="InteractiveToken",
+            )
+            click.echo(
+                "Warning: Windows Task Scheduler rejected logged-off recovery; "
+                "using session-scoped health recovery. The health task runs every "
+                "five minutes while you are logged on and will not run while you are logged off."
+            )
+            records.append(ArtifactRecord(kind="windows-task", path=health_name))
+            return records
+
         records.extend(
             [
                 ArtifactRecord(kind="windows-task", path=startup_name),
@@ -427,8 +643,12 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         plist_path = plist_dir / f"{label}.plist"
         _bootstrap_with_retry(domain, plist_path, action="start")
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
+    if _is_windows():
+        subprocess.run(
+            ["schtasks", "/Change", "/TN", f"{manifest.service_name}-health", "/ENABLE"],
+            check=True,
+        )
+        subprocess.run(["schtasks", "/Run", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def stop_supervisor(manifest: DeploymentManifest) -> None:
@@ -437,6 +657,8 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.NONE.value:
         return
     if sys.platform.startswith("linux"):
+        if manifest.supervisor_kind == SupervisorKind.TASK.value:
+            return
         flags = [] if manifest.scope == "system" else ["--user"]
         subprocess.run(["systemctl", *flags, "stop", manifest.service_name], check=True)
         return
@@ -464,8 +686,11 @@ def stop_supervisor(manifest: DeploymentManifest) -> None:
                 f"launchctl bootout failed for {domain}/{label}: {detail or 'unknown error'}"
             )
         return
-    if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        subprocess.run(["sc.exe", "stop", manifest.service_name], check=True)
+    if _is_windows():
+        health = f"{manifest.service_name}-health"
+        subprocess.run(["schtasks", "/Change", "/TN", health, "/DISABLE"], check=True)
+        subprocess.run(["schtasks", "/End", "/TN", health], check=False)
+        subprocess.run(["schtasks", "/End", "/TN", f"{manifest.service_name}-startup"], check=True)
 
 
 def remove_supervisor(manifest: DeploymentManifest) -> None:
@@ -477,19 +702,21 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
     if sys.platform.startswith("linux"):
         if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
             flags = [] if manifest.scope == "system" else ["--user"]
-            run(
+            result = run(
                 ["systemctl", *flags, "disable", "--now", manifest.service_name],
                 capture_output=True,
                 text=True,
             )
+            _require_removal_success(result, "systemctl disable --now", absent_text="not loaded")
             unit_path, _ = _linux_service_unit(manifest, unix_run_script_path(manifest.profile))
             if unit_path.exists():
                 unit_path.unlink()
-            run(
+            result = run(
                 ["systemctl", *flags, "daemon-reload"],
                 capture_output=True,
                 text=True,
             )
+            _require_removal_success(result, "systemctl daemon-reload")
             return
         cron_path, _ = _linux_task_spec(manifest, unix_ensure_script_path(manifest.profile))
         if cron_path and cron_path.exists():
@@ -501,17 +728,20 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             text=True,
         )
         if current.returncode != 0:
+            if "no crontab for" not in _result_text(current).lower():
+                raise click.ClickException(f"crontab -l failed: {_result_text(current)}")
             return
         marker_start = f"# >>> headroom {manifest.profile} >>>"
         marker_end = f"# <<< headroom {manifest.profile} <<<"
         pattern = re.compile(re.escape(marker_start) + r".*?" + re.escape(marker_end), re.DOTALL)
         content = pattern.sub("", current.stdout).strip()
-        run(
+        result = run(
             ["crontab", "-"],
             input=(content + "\n") if content else "",
             text=True,
             check=True,
         )
+        _require_removal_success(result, "crontab update")
         return
 
     if sys.platform == "darwin":
@@ -529,35 +759,55 @@ def remove_supervisor(manifest: DeploymentManifest) -> None:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        run(
+        result = run(
             ["launchctl", "bootout", f"{domain}/{label}"],
             capture_output=True,
             text=True,
         )
+        _require_removal_success(result, "launchctl bootout", absent_codes={_LAUNCHCTL_ESRCH})
         if plist_path.exists():
             plist_path.unlink()
         return
 
     if _is_windows():
-        if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-            run(
-                ["sc.exe", "stop", manifest.service_name],
+        # Both presets are task-backed. Remove any legacy SCM service too,
+        # but do not hide a permission failure behind best-effort cleanup.
+        result = run(["sc.exe", "stop", manifest.service_name], capture_output=True, text=True)
+        _require_removal_success(result, "sc.exe stop", absent_codes={1060, 1062})
+        result = run(["sc.exe", "delete", manifest.service_name], capture_output=True, text=True)
+        _require_removal_success(result, "sc.exe delete", absent_codes={1060})
+        for suffix in ("startup", "health"):
+            result = run(
+                ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-{suffix}", "/F"],
                 capture_output=True,
                 text=True,
             )
-            run(
-                ["sc.exe", "delete", manifest.service_name],
-                capture_output=True,
-                text=True,
+            _require_removal_success(
+                result,
+                f"schtasks {suffix} delete",
+                absent_text="cannot find the file specified",
             )
-            return
-        run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-startup", "/F"],
-            capture_output=True,
-            text=True,
-        )
-        run(
-            ["schtasks", "/Delete", "/TN", f"{manifest.service_name}-health", "/F"],
-            capture_output=True,
-            text=True,
-        )
+
+
+def _result_text(result: object) -> str:
+    return str(
+        getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error"
+    ).strip()
+
+
+def _require_removal_success(
+    result: object,
+    operation: str,
+    *,
+    absent_codes: set[int] | None = None,
+    absent_text: str | None = None,
+) -> None:
+    returncode = int(getattr(result, "returncode", 0))
+    detail = _result_text(result)
+    if returncode == 0:
+        return
+    if absent_codes and returncode in absent_codes:
+        return
+    if absent_text and absent_text in detail.lower():
+        return
+    raise click.ClickException(f"{operation} failed: {detail}")

@@ -16,7 +16,12 @@ from functools import lru_cache
 from typing import Any, cast
 
 from headroom import paths as _paths
-from headroom.tokenizers.base import coerce_countable_text, count_content_blocks
+from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
+from headroom.tokenizers.base import (
+    TokenCountCache,
+    coerce_countable_text,
+    count_content_blocks,
+)
 
 from .base import Provider, TokenCounter
 
@@ -32,12 +37,7 @@ _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 # Models whose price came from the built-in table rather than LiteLLM.
 _PRICING_FALLBACK_WARNINGS: set[str] = set()
 
-try:
-    import tiktoken
-
-    TIKTOKEN_AVAILABLE = True
-except ImportError:
-    TIKTOKEN_AVAILABLE = False
+TIKTOKEN_AVAILABLE = importlib.util.find_spec("tiktoken") is not None
 
 LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
@@ -85,8 +85,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
     # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
-    # get_context_limit; these are the manual fallback for installs without it
-    # (the litellm dep is gated python_version < '3.14').
+    # get_context_limit; these are the manual fallback for installs without it.
     "gpt-4.1": 1_047_576,
     "gpt-4.1-mini": 1_047_576,
     "gpt-4.1-nano": 1_047_576,
@@ -114,9 +113,11 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o3-mini": 200000,
     "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
-    # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
-    # aliases). LiteLLM lookup is still attempted first in get_context_limit;
-    # these are the manual fallback when LiteLLM doesn't know the model.
+    # against api-docs.deepseek.com (V4.1-Flash / V4-Pro-0813) and LiteLLM
+    # model_cost (deprecated aliases). LiteLLM lookup is still attempted first in
+    # get_context_limit; these are the manual fallback when LiteLLM doesn't know
+    # the model.
+    "deepseek-flash": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v3.2": 128_000,
@@ -204,6 +205,11 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             openai_config = loaded.get("openai", loaded)
             if "context_limits" in openai_config:
                 config["context_limits"].update(openai_config["context_limits"])
@@ -213,7 +219,10 @@ def _load_custom_model_config() -> dict[str, Any]:
                 config["encodings"].update(openai_config["encodings"])
 
             logger.debug("Loaded custom OpenAI model config from HEADROOM_MODEL_LIMITS")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -227,6 +236,9 @@ def _load_custom_model_config() -> dict[str, Any]:
         try:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
+
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
 
             openai_config = loaded.get("openai", {})
             if "context_limits" in openai_config:
@@ -243,7 +255,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["encodings"][model] = encoding
 
             logger.debug(f"Loaded custom OpenAI model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config
@@ -285,12 +297,21 @@ def _check_pricing_staleness() -> str | None:
 
 @lru_cache(maxsize=8)
 def _get_encoding(encoding_name: str) -> Any:
-    """Get tiktoken encoding, cached."""
+    """Get tiktoken encoding, cached.
+
+    Routes through the bounded loader so a stalled vocab download raises
+    :class:`~headroom.tokenizers.tiktoken_counter.TiktokenLoadError` after a
+    timeout instead of hanging the caller indefinitely — ``tiktoken`` fetches
+    vocabularies with no network timeout, and this runs on whatever thread
+    first counts tokens for a model, including proxy startup (GH #956).
+    """
     if not TIKTOKEN_AVAILABLE:
         raise RuntimeError(
             "tiktoken is required for OpenAI provider. Install with: pip install tiktoken"
         )
-    return tiktoken.get_encoding(encoding_name)
+    from ..tokenizers.tiktoken_counter import load_encoding
+
+    return load_encoding(encoding_name)
 
 
 def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = None) -> str | None:
@@ -343,15 +364,32 @@ class OpenAITokenCounter:
 
         Raises:
             RuntimeError: If tiktoken is not installed.
+            TiktokenLoadError: If the encoding's vocabulary can't be loaded
+                within the bounded timeout (e.g. stalled download).
         """
         self.model = model
         encoding_name = _get_encoding_name_for_model(model, custom_encodings)
         self._encoding = _get_encoding(encoding_name)
+        # count_text is a pure function of its text, and this counter is a
+        # per-model singleton reused across requests (OpenAIProvider caches it),
+        # so a stable prefix/system prompt or a repeated tool result is otherwise
+        # re-encoded on every turn. Cache the count like AnthropicTokenCounter
+        # already does (the cache only admits large strings, so tiny/rare ones
+        # pay nothing).
+        self._count_cache = TokenCountCache()
 
     def count_text(self, text: str) -> int:
         """Count tokens in text."""
         if not text:
             return 0
+        cached = self._count_cache.get(text)
+        if cached is not None:
+            return cached
+        count = self._count_text_uncached(text)
+        self._count_cache.put(text, count)
+        return count
+
+    def _count_text_uncached(self, text: str) -> int:
         try:
             return len(self._encoding.encode(text))
         except ValueError:
@@ -507,7 +545,9 @@ class OpenAIProvider(Provider):
         the proxy pipeline resolves its tokenizer through this provider while
         handlers resolve through the tokenizer registry, the two disagree about
         the same request — savings become a difference of two rulers. Defer to
-        the registry so each model has exactly one tokenizer.
+        the registry so each model has exactly one tokenizer. For OpenAI models,
+        fall back to estimation when a vocabulary cannot load within the bounded
+        timeout; the cached fallback prevents subsequent requests from blocking.
         """
         if model not in self._token_counters:
             if _lookup_encoding_name(model, self._encodings) is None:
@@ -515,9 +555,19 @@ class OpenAIProvider(Provider):
 
                 self._token_counters[model] = cast(Any, get_tokenizer(model))
             else:
-                self._token_counters[model] = OpenAITokenCounter(
-                    model=model, custom_encodings=self._encodings
-                )
+                from ..tokenizers.tiktoken_counter import TiktokenLoadError
+
+                try:
+                    self._token_counters[model] = OpenAITokenCounter(
+                        model=model, custom_encodings=self._encodings
+                    )
+                except TiktokenLoadError as exc:
+                    logger.warning(
+                        "tiktoken unavailable for %s (%s); using estimation.", model, exc
+                    )
+                    from ..tokenizers.estimator import EstimatingTokenCounter
+
+                    self._token_counters[model] = EstimatingTokenCounter()
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
@@ -619,20 +669,16 @@ class OpenAIProvider(Provider):
         Returns:
             Estimated cost in USD, or None if pricing unknown.
         """
-        # Try LiteLLM first (most up-to-date pricing)
-        litellm = _get_litellm_module()
-        if litellm is not None:
-            try:
-                # LiteLLM uses per-token pricing, returns total cost
-                cost = litellm.completion_cost(
-                    model=model,
-                    prompt_tokens=input_tokens,
-                    completion_tokens=output_tokens,
-                )
-                if cost is not None and cost > 0:
-                    return float(cost)
-            except Exception:
-                pass  # Fall through to manual pricing
+        # Try LiteLLM first (most up-to-date pricing, and it knows each model's
+        # real cached-input rate rather than the manual path's flat estimate)
+        cost = estimate_cost_from_tokens(
+            model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        if cost is not None and cost > 0:
+            return float(cost)
 
         # Fall back to hardcoded pricing
         return self._estimate_cost_manual(input_tokens, output_tokens, model, cached_tokens)
@@ -679,8 +725,7 @@ class OpenAIProvider(Provider):
 
         The table used to be authoritative, which is how it went ~18 months stale
         and priced gpt-4.1-nano 300x over (see the entries below). Demoting it to
-        a fallback means that drift only reaches installs with no LiteLLM — the
-        dependency is gated ``python_version < '3.14'``.
+        a fallback means that drift only reaches installs with no LiteLLM.
         """
         # 1. Explicit configuration wins.
         override = self._pricing_overrides.get(model)

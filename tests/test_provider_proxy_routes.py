@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from headroom.providers.codex.runtime import CodexRoutingDecision
+from headroom.proxy import upstream_guard
 from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
@@ -30,6 +31,9 @@ def _app() -> Any:
 
 
 def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> None:
+    # This routing test uses reserved, intentionally unresolvable hostnames.
+    # Explicitly allow them so the SSRF guard can remain fail-closed on DNS errors.
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "azure.example,custom.example,opencode.ai")
     calls: list[tuple[str, str, str, str]] = []
     gemini_calls: list[tuple[str, str, str, str]] = []
     gemini_count_calls: list[tuple[str, str, str, str]] = []
@@ -114,6 +118,9 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
         assert client.post("/v1/messages/count_tokens").json()["base_url"] == (
             "https://api.anthropic.test"
         )
+        assert client.get("/api/hello").json()["base_url"] == ("https://api.anthropic.test")
+        assert client.head("/api/hello").status_code == 200
+        assert calls[-1] == ("HEAD", "/api/hello", "https://api.anthropic.test", "anthropic")
         assert client.get("/v1/models", headers={"x-goog-api-key": "test"}).json()["base_url"] == (
             "https://api.openai.test"
         )
@@ -274,6 +281,133 @@ def test_provider_passthrough_routes_forward_expected_targets(monkeypatch) -> No
     assert len(anthropic_calls) >= 2
 
 
+def test_codex_alpha_search_route_from_headroom_issue_2525() -> None:
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, dict[str, str], bytes]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(
+                (
+                    method,
+                    url,
+                    dict(kwargs.get("headers", {})),
+                    kwargs.get("content", b""),
+                )
+            )
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        response = client.post(
+            "/v1/alpha/search?query=weather",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(fake_http_client.calls) == 1
+    method, url, headers, body = fake_http_client.calls[0]
+    assert method == "POST"
+    assert url == "https://chatgpt.com/backend-api/codex/alpha/search?query=weather"
+    assert headers["authorization"] == "Bearer oauth-token"
+    assert headers["chatgpt-account-id"] == "acct_123"
+    assert headers["content-length"] == "19"
+    assert headers["content-type"] == "application/json"
+    assert body == b'{"query":"weather"}'
+
+
+def test_non_chatgpt_alpha_search_falls_through_to_openai_upstream(monkeypatch) -> None:
+    calls: list[tuple[str, str, str, str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        calls.append((request.method, request.url.path, base_url, sub_path, provider_name))
+        return JSONResponse(
+            {
+                "base_url": base_url,
+                "sub_path": sub_path,
+                "provider": provider_name,
+            }
+        )
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    with TestClient(_app()) as client:
+        response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "base_url": "https://api.openai.test",
+        "sub_path": "",
+        "provider": "",
+    }
+    assert calls == [
+        (
+            "POST",
+            "/v1/alpha/search",
+            "https://api.openai.test",
+            "",
+            "",
+        )
+    ]
+
+
+def test_codex_alpha_search_route_matrix(monkeypatch) -> None:
+    fallback_calls: list[tuple[str, str]] = []
+
+    async def fake_passthrough(self, request, base_url, sub_path="", provider_name=""):  # type: ignore[no-untyped-def]
+        fallback_calls.append((request.url.path, base_url))
+        return JSONResponse({"base_url": base_url, "provider": provider_name})
+
+    monkeypatch.setattr(HeadroomProxy, "handle_passthrough", fake_passthrough)
+
+    class FakeAsyncClient:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.urls.append(url)
+            return httpx.Response(200, json={"ok": True})
+
+        async def aclose(self) -> None:
+            return None
+
+    with TestClient(_app()) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+
+        oauth_response = client.post(
+            "/v1/alpha/search",
+            headers={
+                "Authorization": "Bearer oauth-token",
+                "ChatGPT-Account-ID": "acct_123",
+            },
+            json={"query": "weather"},
+        )
+        api_key_response = client.post(
+            "/v1/alpha/search",
+            headers={"Authorization": "Bearer sk-proj-openai-test"},
+            json={"query": "weather"},
+        )
+
+    assert oauth_response.status_code == 200
+    assert api_key_response.status_code == 200
+    assert fake_http_client.urls == ["https://chatgpt.com/backend-api/codex/alpha/search"]
+    assert fallback_calls == [("/v1/alpha/search", "https://api.openai.test")]
+
+
 def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> None:
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     proxy = type(
@@ -300,12 +434,21 @@ def test_proxy_route_helpers_prefer_legacy_targets_and_gemini_passthrough() -> N
     assert proxy_routes._select_passthrough_base_url(proxy, {"x-goog-api-key": "test"}) == (
         "https://legacy.gemini.test"
     )
-    assert (
-        proxy_routes._select_passthrough_base_url(
-            proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+    # The azure branch honours the override, but only after the SSRF guard
+    # clears the destination (CVE-2026-77775). `azure.example` does not
+    # resolve, and the guard fails closed on resolution failure, so pin a
+    # public answer to keep this assertion about target *precedence*.
+    with patch.object(
+        upstream_guard.socket,
+        "getaddrinfo",
+        return_value=[(None, None, None, None, ("20.10.10.10", 443))],
+    ):
+        assert (
+            proxy_routes._select_passthrough_base_url(
+                proxy, {"api-key": "azure", "x-headroom-base-url": "https://azure.example/base/"}
+            )
+            == "https://azure.example/base"
         )
-        == "https://azure.example/base"
-    )
     assert proxy_routes._select_passthrough_base_url(proxy, {"api-key": "azure"}) == (
         "https://legacy.anthropic.test"
     )
@@ -369,7 +512,9 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
             "handle_anthropic_batch_passthrough"
         )
         assert client.post("/v1/chat/completions").json()["handler"] == "handle_openai_chat"
+        assert client.post("/chat/completions").json()["handler"] == "handle_openai_chat"
         assert client.post("/v1/responses").json()["handler"] == "handle_openai_responses"
+        assert client.post("/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/v1/codex/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/responses").json()["handler"] == "handle_openai_responses"
         assert client.post("/backend-api/codex/responses").json()["handler"] == (
@@ -1119,6 +1264,11 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
                         {"id": "claude-sonnet-4-5[1m]", "object": "model"},
                     ],
                 },
+                headers={
+                    "etag": '"stale"',
+                    "last-modified": "Thu, 01 Jan 1970 00:00:00 GMT",
+                    "cache-control": "max-age=60",
+                },
             )
 
         async def aclose(self) -> None:
@@ -1130,6 +1280,9 @@ def test_anthropic_model_metadata_strips_ansi_model_ids() -> None:
         response = client.get("/v1/models", headers={"x-api-key": "sk-ant-test"})
 
     assert response.status_code == 200
+    assert response.headers.get("etag") is None
+    assert response.headers.get("last-modified") is None
+    assert response.headers.get("cache-control") is None
     assert response.json()["data"] == [
         {"id": "claude-opus-4-8", "object": "model"},
         {"id": "claude-sonnet-4-5", "object": "model"},
@@ -1165,6 +1318,57 @@ def test_anthropic_model_detail_path_strips_ansi_model_id() -> None:
     assert fake_http_client.calls == [
         ("GET", "https://api.anthropic.test/v1/models/claude-opus-4-8")
     ]
+
+
+def test_issue_3312_grok_model_metadata() -> None:
+    fixture = {
+        "model": "grok-4.6",
+        "context_length": 500000,
+    }
+
+    class FakeAsyncClient:
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": fixture["model"],
+                            "object": "model",
+                            "context_length": fixture["context_length"],
+                        }
+                    ],
+                },
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            anthropic_api_url="https://api.anthropic.test",
+            openai_api_url="https://api.x.ai",
+            gemini_api_url="https://api.gemini.test",
+            cloudcode_api_url="https://cloudcode.test",
+            vertex_api_url="https://vertex.test",
+        )
+    )
+    with TestClient(app) as client:
+        client.app.state.proxy.http_client = FakeAsyncClient()
+        response = client.get("/v1/models", headers={"authorization": "Bearer sk-xai-test"})
+
+    entry = response.json()["data"][0]
+    assert response.status_code == 200
+    assert entry == {
+        "id": "grok-4.6",
+        "object": "model",
+        "context_length": 500000,
+        "context_window": 500000,
+    }
 
 
 def test_anthropic_messages_strips_ansi_model_id_before_upstream() -> None:

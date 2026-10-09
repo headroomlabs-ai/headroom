@@ -52,7 +52,12 @@ def _exec_tool(tool: str, argv: Sequence[str]) -> None:
             err=True,
         )
         sys.exit(2)
-    except (binaries.Sha256Mismatch, binaries.BinaryFetchError) as e:
+    # BinaryError, not a list of subclasses: every failure here is a refusal to
+    # run an unverified tool, and enumerating them meant UnpinnedDownload -- added
+    # later -- escaped as a traceback instead of the `error: ...` + exit 2 every
+    # sibling produces. PlatformNotSupported and OfflineError are caught above for
+    # their specific hints; this is the catch-all for the rest.
+    except binaries.BinaryError as e:
         click.secho(f"error: {e}", fg="red", err=True)
         sys.exit(2)
 
@@ -232,7 +237,10 @@ def tools_install_cmd(tools: tuple[str, ...], force: bool) -> None:
         except binaries.PlatformNotSupported as e:
             click.secho(f"{name}: {e}", fg="red")
             exit_code = 1
-        except (binaries.BinaryFetchError, binaries.Sha256Mismatch, binaries.OfflineError) as e:
+        # Base class for the same reason as _exec_tool: an escaping subclass here
+        # also aborted the loop over the remaining tools and skipped the final
+        # sys.exit(exit_code), so one unpinned asset silently stopped the install.
+        except binaries.BinaryError as e:
             click.secho(f"{name}: {e}", fg="red")
             exit_code = 1
     sys.exit(exit_code)

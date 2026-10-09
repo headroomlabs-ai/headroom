@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,6 +15,15 @@ from fastapi.testclient import TestClient
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.server import ProxyConfig, create_app
+
+
+def _force_compression(monkeypatch) -> None:  # noqa: ANN001
+    decision = SimpleNamespace(should_compress=True, passthrough_reason=None)
+    decision.apply_to_tags = lambda tags: None
+    monkeypatch.setattr(
+        "headroom.proxy.handlers.anthropic.CompressionDecision.decide",
+        lambda **kwargs: decision,
+    )
 
 
 class _FakePrefixTracker:
@@ -345,7 +355,9 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         class _FakeCompressionCache:
             def apply_cached(self, messages):  # noqa: ANN001
@@ -420,7 +432,9 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         proxy.memory_handler = SimpleNamespace(
             config=SimpleNamespace(inject_context=True, inject_tools=False),
@@ -486,7 +500,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         class _FakeInjector:
             def __init__(
@@ -504,6 +520,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
 
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
+
+            def verify_ownership(self, store=None):  # noqa: ANN001
+                return self.detected_hashes
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
@@ -553,7 +572,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         class _FakeInjector:
             def __init__(
@@ -571,6 +592,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
 
             def scan_for_markers(self, messages):  # noqa: ANN001
                 return []
+
+            def verify_ownership(self, store=None):  # noqa: ANN001
+                return self.detected_hashes
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
@@ -620,10 +644,22 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
     value: unit-testing the old policy in isolation is exactly what let a
     wrong-but-self-consistent decision pass.
     """
+    from headroom.cache.compression_store import get_compression_store, reset_compression_store
     from headroom.ccr.tool_injection import CCR_TOOL_NAME
     from headroom.proxy.helpers import (
         _reset_session_ccr_tracker_for_test,
         serialize_tool_definition_canonical,
+    )
+
+    # verify_ownership() (issue #2836) requires the marker's hash to be a
+    # real store entry — seed one with the exact hash the marker text below
+    # references, via explicit_hash (the store's own hash generation from
+    # `original` content wouldn't match this hand-typed literal).
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[50 items compressed to 5]",
+        explicit_hash="abc123def456abc123def456",
     )
 
     marker_message = {
@@ -653,7 +689,9 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
             proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
                 "frozen-transition-session"
             )
-            proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+            proxy.session_tracker_store.get_or_create = (
+                lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+            )
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
                 forwarded.append(body)
@@ -701,6 +739,7 @@ def test_ccr_tool_stays_in_forwarded_tools_across_frozen_transition() -> None:
             assert _post().status_code == 200
     finally:
         _reset_session_ccr_tracker_for_test()
+        reset_compression_store()
 
     assert len(forwarded) == 2, "expected exactly two forwarded requests"
 
@@ -735,7 +774,9 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         proxy.anthropic_pipeline.apply = lambda **kwargs: (_ for _ in ()).throw(
             AssertionError("cache mode should not invoke anthropic pipeline")
@@ -921,7 +962,9 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         class _FakeCompressionCache:
             def apply_cached(self, messages):  # noqa: ANN001
@@ -993,7 +1036,8 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         assert captured["frozen_message_count"] >= 0
 
 
-def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> None:
+def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history(monkeypatch) -> None:
+    _force_compression(monkeypatch)
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
@@ -1005,13 +1049,20 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         original_messages = [
             {"role": "user", "content": "turn1"},
             {"role": "assistant", "content": "turn1-assistant"},
             {"role": "user", "content": "current turn"},
         ]
+        # Mid-session: the first two messages were already forwarded last turn,
+        # so they form the byte-stable cached prefix the handler must replay
+        # even if a transform tries to mutate them.
+        fake_tracker._last_original_messages = original_messages[:2]
+        fake_tracker._last_forwarded_messages = original_messages[:2]
 
         def _fake_apply(**kwargs):
             mutated = list(kwargs["messages"])
@@ -1063,7 +1114,11 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         assert sent_messages[1] == original_messages[1]
 
 
-def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
+def test_cache_mode_cold_start_forwards_pipeline_rewrites(monkeypatch) -> None:
+    _force_compression(monkeypatch)
+    # Issue #2357: on a true session cold start (no prior forwarded messages,
+    # no frozen prefix) there is no provider cache to protect, so the full
+    # pipeline output is forwarded and recorded for byte-identical replay.
     captured = {}
     with _make_proxy_client() as client:
         proxy = client.app.state.proxy
@@ -1075,7 +1130,9 @@ def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
 
         original_messages = [
             {"role": "user", "content": "turn1"},
@@ -1128,7 +1185,12 @@ def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
         )
 
         assert response.status_code == 200
-        assert captured["body"]["messages"] == original_messages
+        sent_messages = captured["body"]["messages"]
+        assert sent_messages[:2] == original_messages[:2]
+        assert sent_messages[2]["content"] == "REWRITTEN_CURRENT_TURN"
+        # Recorded as forwarded so later turns replay this prefix verbatim
+        # (the tracker may append the assistant reply after the forwarded turns).
+        assert fake_tracker._last_forwarded_messages[: len(sent_messages)] == sent_messages
 
 
 def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix() -> None:
@@ -1158,7 +1220,9 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: tracker
+        )
 
         def _fake_apply(**kwargs):
             captured["calls"].append(kwargs["messages"])
@@ -1243,6 +1307,159 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
         ]
 
 
+def test_cache_mode_delta_keeps_newest_user_prompt_verbatim() -> None:
+    """The cache-mode delta call must tell the router the prefix is replayed.
+
+    Without ``prefix_replay_guaranteed`` the router treats the newest user
+    message as compressible text, so under the coding profile (which turns on
+    user-message compression) a follow-up prompt -- e.g. a Claude Code
+    teammate's ``<teammate-message>`` -- reached the model lossily rewritten
+    on every turn after the first (#1174). Every other Anthropic
+    ``pipeline.apply`` call already passes the flag.
+    """
+    captured: dict = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.config.image_optimize = False
+
+        tracker = _FakePrefixTracker(frozen_count=0)
+        tracker._last_original_messages = [
+            {"role": "user", "content": "turn1"},
+            {"role": "assistant", "content": "turn1-assistant"},
+        ]
+        tracker._last_forwarded_messages = list(tracker._last_original_messages)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: tracker
+        )
+
+        def _fake_apply(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                messages=list(kwargs["messages"]),
+                transforms_applied=[],
+                timing={},
+                tokens_before=10,
+                tokens_after=10,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_delta_prompt",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": "turn1"},
+                    {"role": "assistant", "content": "turn1-assistant"},
+                    {"role": "user", "content": "<teammate-message>next task</teammate-message>"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["frozen_message_count"] == 2  # the delta path ran
+        assert captured.get("prefix_replay_guaranteed") is True
+
+
+def test_anthropic_handler_anchors_a_proven_rewritten_tail_to_stable_blocks() -> None:
+    """The real handler must feed last turn's bytes into normalization."""
+    bodies = []
+
+    def _history(turn: int, churn: int) -> list[dict]:
+        content = [{"type": "text", "text": f"stable-{index}"} for index in range(30)]
+        content.extend(
+            {"type": "text", "text": f"turn-{turn}-changing-{index}"} for index in range(churn)
+        )
+        content.extend(
+            [
+                {"type": "text", "text": "instruction: summarize"},
+                {"type": "text", "text": "fixed end-of-transcript reminder"},
+            ]
+        )
+        return [{"role": "user", "content": content}]
+
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        # Breakpoint ownership and lineage tracking apply even in passthrough
+        # mode. Keeping optimization off isolates that real handler wiring from
+        # the compression pipeline.
+        proxy.config.optimize = False
+        proxy.config.image_optimize = False
+        # This regression models a client whose next request replaces the same
+        # aggregate message. Do not synthesize an assistant history entry in
+        # the tracker, because that is a separate response-reconstruction path.
+        proxy._assistant_message_from_response_json = lambda _body: None
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            bodies.append(copy.deepcopy(body))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_rewrite",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 10_000,
+                        "output_tokens": 1,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 10_000,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+        headers = {"x-api-key": "test-key", "anthropic-version": "2023-06-01"}
+        for turn, churn in enumerate((3, 5, 8), start=1):
+            response = client.post(
+                "/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 32,
+                    "messages": _history(turn, churn),
+                },
+            )
+            assert response.status_code == 200
+
+    breakpoint_indices = []
+    for body in bodies:
+        marked = [
+            index
+            for index, block in enumerate(body["messages"][0]["content"])
+            if "cache_control" in block
+        ]
+        assert len(marked) == 1
+        breakpoint_indices.append(marked[0])
+
+    # Cold request caches through its newest block. Once rewrite is proven,
+    # all subsequent calls pin the same 30-block boundary instead of creating
+    # an ever-growing full write on each turn.
+    assert breakpoint_indices == [34, 29, 29]
+
+
 def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() -> None:
     captured = {"calls": []}
     with _make_proxy_client() as client:
@@ -1264,7 +1481,9 @@ def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() ->
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stable-session"
         )
-        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: tracker
+        )
 
         def _fake_apply(**kwargs):
             captured["calls"].append(kwargs["messages"])
@@ -1412,7 +1631,9 @@ def _drive_request(
     proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
         "issue-327-session"
     )
-    proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+    proxy.session_tracker_store.get_or_create = (
+        lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+    )
     proxy._get_compression_cache = lambda session_id: fake_comp_cache
 
     def _fake_apply(**kwargs):  # noqa: ANN003
@@ -1701,7 +1922,9 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stream-parity-A"
         )
-        proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda s: fake_cache_a
 
         def _fake_apply_a(**kwargs):  # noqa: ANN003
@@ -1758,7 +1981,9 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
             "stream-parity-B"
         )
-        proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
+        proxy.session_tracker_store.get_or_create = (
+            lambda session_id, provider, cache_ttl_seconds=None: fake_tracker
+        )
         proxy._get_compression_cache = lambda s: fake_cache_b
 
         def _fake_apply_b(**kwargs):  # noqa: ANN003

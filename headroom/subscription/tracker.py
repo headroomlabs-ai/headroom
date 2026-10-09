@@ -179,11 +179,15 @@ class SubscriptionTracker(QuotaTracker):
     # Proxy integration hooks
     # ------------------------------------------------------------------
 
-    def notify_active(self, token: str) -> None:
+    def notify_active(self, token: str, *, from_local_operator: bool = False) -> None:
         """Called by the proxy handler when an OAuth request comes through.
 
-        Stores the token for polling and marks the tracker as recently active.
-        Only processes Bearer tokens that look like OAuth (not API keys).
+        Marks the tracker as recently active. The caller's bearer is remembered
+        for polling **only** when ``from_local_operator`` is true — the handler
+        passes :func:`headroom.subscription.credential_policy.is_local_operator_connection`.
+        A network caller on a shared proxy never becomes the polled account
+        (VAPT 01-F16). Only Bearer tokens that look like OAuth (not API keys)
+        are considered.
         """
         if not token or not token.startswith("Bearer "):
             return
@@ -192,8 +196,10 @@ class SubscriptionTracker(QuotaTracker):
         if raw.startswith("sk-ant-api"):
             return
         with self._lock:
-            self._current_token = raw
             self._state.last_active_at = _utc_now()
+            if not from_local_operator:
+                return
+            self._current_token = raw
             prefix = raw[:8]
             self._full_tokens[prefix] = self._full_tokens.get(prefix, 0) + 1
 
@@ -393,16 +399,31 @@ class SubscriptionTracker(QuotaTracker):
             is_active = self._state.is_active(active_window_s=self._active_window_s)
             token = self._current_token
 
-        if not is_active:
-            # Try background poll using credentials file token
-            from headroom.subscription.client import read_cached_oauth_token
+        # Always consult the credentials file: it is the source Claude Code
+        # refreshes in place, so it holds the *current* token. `self._current_token`
+        # is a snapshot of the last proxied Authorization header and goes stale
+        # as soon as Claude Code rotates its OAuth token — it is only replaced
+        # when a request flows through the proxy, which an idle client never
+        # does. Preferring it (`token or bg_token`) therefore pinned polling to
+        # an expired token and surfaced as permanent `poll_errors` /
+        # "fetch returned None" with a stale `polled_at` (issue #3913).
+        from headroom.subscription.client import read_cached_oauth_token
 
-            bg_token = read_cached_oauth_token()
-            if not bg_token:
-                return
-            token = token or bg_token
+        bg_token = read_cached_oauth_token()
+        if not is_active and not bg_token:
+            return
 
-        snapshot = await self._client.fetch(token)
+        snapshot = None
+        # Fresh credentials-file token first, so a normal poll costs one request.
+        if bg_token:
+            snapshot = await self._client.fetch(bg_token)
+        # Only spend a second request on the remembered header token when it is
+        # a *different* token that could still be the live one (no credentials
+        # file, e.g. CLAUDE_CODE_OAUTH_TOKEN absent and polling off a proxied
+        # header).
+        if snapshot is None and token and token != bg_token:
+            snapshot = await self._client.fetch(token)
+
         if snapshot is None:
             with self._lock:
                 self._state.mark_error("fetch returned None")
@@ -459,6 +480,8 @@ class SubscriptionTracker(QuotaTracker):
     # ------------------------------------------------------------------
 
     def _persist_state(self) -> None:
+        if not _paths.persistence_allowed("subscription quota state"):
+            return
         try:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:

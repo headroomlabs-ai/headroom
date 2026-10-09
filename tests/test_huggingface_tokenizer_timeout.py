@@ -4,6 +4,11 @@ path it blocked the event loop for ~10 minutes and zombified the server. The fix
 tries the local HF cache first (local_files_only=True), bounds the network attempt
 with HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS on a daemon thread, and fails open to
 estimation — caching the failure so the hub is probed at most once per process.
+
+The repo ids below are real shipped ones because _load_tokenizer now refuses
+anything off the tokenizer allowlist before it reaches the loading path at all
+(see test_huggingface_tokenizer_allowlist.py); a placeholder name would short
+out these tests by being rejected rather than exercising the timeout.
 """
 
 from __future__ import annotations
@@ -24,7 +29,10 @@ from headroom.tokenizers.huggingface import (
 
 
 @pytest.fixture(autouse=True)
-def _fresh_cache():
+def _fresh_cache(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("HEADROOM_OFFLINE", raising=False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
     _load_tokenizer.cache_clear()
     yield
     _load_tokenizer.cache_clear()
@@ -50,7 +58,7 @@ def test_local_cache_tried_before_network(monkeypatch: pytest.MonkeyPatch) -> No
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "5")
 
-    assert _load_tokenizer("some/model") == "network-tokenizer"
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "network-tokenizer"
     assert calls[0].get("local_files_only") is True, "first attempt must be cache-only"
     assert not calls[1].get("local_files_only")
 
@@ -64,7 +72,7 @@ def test_cache_hit_never_touches_network(monkeypatch: pytest.MonkeyPatch) -> Non
 
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
 
-    assert _load_tokenizer("some/model") == "cached-tokenizer"
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "cached-tokenizer"
     assert len(calls) == 1
     assert calls[0].get("local_files_only") is True
 
@@ -80,12 +88,12 @@ def test_slow_network_load_times_out_and_fails_open(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "0.2")
 
     start = time.monotonic()
-    assert _load_tokenizer("slow/model") is None
+    assert _load_tokenizer("Qwen/Qwen2-7B") is None
     assert time.monotonic() - start < 5, "load must unblock at the timeout, not the download"
 
     # Failure is cached (lru_cache) — the second call must not re-probe the hub.
     start = time.monotonic()
-    assert _load_tokenizer("slow/model") is None
+    assert _load_tokenizer("Qwen/Qwen2-7B") is None
     assert time.monotonic() - start < 0.05
 
 
@@ -98,7 +106,42 @@ def test_timeout_zero_disables_network_loading(monkeypatch: pytest.MonkeyPatch) 
     _install_fake_transformers(monkeypatch, fake_from_pretrained)
     monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "0")
 
-    assert _load_tokenizer("offline/model") is None
+    assert _load_tokenizer("google/gemma-7b") is None
+
+
+def test_offline_mode_prevents_network_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_from_pretrained(name: str, **kwargs: Any):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            raise OSError("not in cache")
+        raise AssertionError("network load attempted in offline mode")
+
+    _install_fake_transformers(monkeypatch, fake_from_pretrained)
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+    monkeypatch.setenv("HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS", "5")
+
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") is None
+    assert len(calls) == 1
+    assert calls[0].get("local_files_only") is True
+
+
+def test_offline_mode_allows_cached_tokenizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_from_pretrained(name: str, **kwargs: Any):
+        calls.append(kwargs)
+        return "cached-tokenizer"
+
+    _install_fake_transformers(monkeypatch, fake_from_pretrained)
+    monkeypatch.setenv("HEADROOM_OFFLINE", "1")
+
+    assert _load_tokenizer("Qwen/Qwen2.5-7B") == "cached-tokenizer"
+    assert len(calls) == 1
+    assert calls[0].get("local_files_only") is True
 
 
 def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,7 +159,9 @@ def test_count_messages_fails_open_to_estimation(monkeypatch: pytest.MonkeyPatch
 def test_deepseek_model_aliases_resolve_to_expected_tokenizers() -> None:
     assert get_tokenizer_name("deepseek-v3.2") == "deepseek-ai/DeepSeek-V3.2"
     assert get_tokenizer_name("deepseek-v4-pro") == "deepseek-ai/DeepSeek-V4-Pro"
-    assert get_tokenizer_name("deepseek-v4-flash") == "deepseek-ai/DeepSeek-V4-Flash"
+    assert get_tokenizer_name("deepseek-v4-flash") == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert get_tokenizer_name("deepseek-flash") == "deepseek-ai/DeepSeek-V4.1-Flash"
+    assert get_tokenizer_name("deepseek-v4-flash-vision-exp") == "deepseek-ai/DeepSeek-V4.1-Flash"
     assert get_tokenizer_name("deepseek-r1") == "deepseek-ai/DeepSeek-R1"
     assert get_tokenizer_name("deepseek-r1-0528") == "deepseek-ai/DeepSeek-R1-0528"
 

@@ -10,19 +10,23 @@ from click.testing import CliRunner
 
 import headroom.cli.doctor as doctor_mod
 from headroom.cli.doctor import (
+    DEFAULT_PROXY_PORT,
     FAIL,
     PASS,
     SKIP,
     WARN,
     check_budget,
+    check_claude_desktop,
     check_claude_remote_control_gate,
     check_claude_routing,
     check_codex_routing,
     check_deployments,
+    check_kompress_health,
     check_proxy_liveness,
     check_savings,
     check_shell_env,
     check_version_drift,
+    resolve_probe_port,
 )
 from headroom.cli.main import main
 from headroom.providers.claude.runtime import remote_control_gate_message
@@ -42,6 +46,38 @@ STATS_OK = {
     },
     "cost": {"budget_limit_usd": 10.0, "budget_period": "daily"},
 }
+
+
+class TestKompressHealth:
+    def test_missing_health_endpoint_skips(self):
+        result = check_kompress_health(None)
+        assert result.status == SKIP
+        assert "health endpoint" in result.summary
+
+    def test_older_proxy_without_component_warns(self):
+        result = check_kompress_health({"checks": {}})
+        assert result.status == WARN
+        assert "readiness" in result.summary
+
+    def test_disabled_passes(self):
+        result = check_kompress_health({"checks": {"kompress": {"enabled": False}}})
+        assert result.status == PASS
+        assert result.summary == "disabled"
+
+    def test_ready_reports_backend(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": True, "backend": "onnx"}}}
+        )
+        assert result.status == PASS
+        assert result.summary == "ready (onnx)"
+
+    def test_cold_model_warns_with_action(self):
+        result = check_kompress_health(
+            {"checks": {"kompress": {"enabled": True, "ready": False, "status": "degraded"}}}
+        )
+        assert result.status == WARN
+        assert "passing through" in result.summary
+        assert "/debug/warmup" in (result.hint or "")
 
 
 class TestProxyLiveness:
@@ -150,6 +186,79 @@ class TestClaudeRouting:
         result = check_claude_routing(path, 8787)
         assert result.status == WARN
         assert "gateway.corp.example" in result.summary
+
+    def test_foundry_url_passes(self, tmp_path):
+        # In Foundry mode ANTHROPIC_BASE_URL is absent by design; routing lives
+        # in ANTHROPIC_FOUNDRY_BASE_URL. doctor must recognize it as routed.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "CLAUDE_CODE_USE_FOUNDRY": "1",
+                        "ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == PASS
+
+    def test_foundry_without_base_url_warns(self, tmp_path):
+        # Foundry mode on but no upstream URL configured: still unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
+    def test_foundry_url_ignored_without_flag(self, tmp_path):
+        # Without CLAUDE_CODE_USE_FOUNDRY the foundry URL is not consulted, so a
+        # settings file carrying only the foundry key reads as unrouted.
+        path = tmp_path / "settings.json"
+        path.write_text(
+            json.dumps({"env": {"ANTHROPIC_FOUNDRY_BASE_URL": "http://127.0.0.1:8787"}}),
+            encoding="utf-8",
+        )
+        assert check_claude_routing(path, 8787).status == WARN
+
+
+class TestClaudeDesktop:
+    def test_no_desktop_dir_produces_no_row(self, tmp_path):
+        # #2925: absent Desktop -> no row, so it never contradicts a routed CLI.
+        assert check_claude_desktop(tmp_path / "Claude") is None
+
+    def test_desktop_present_warns_about_bypass(self, tmp_path):
+        desktop = tmp_path / "Claude"
+        desktop.mkdir()
+        result = check_claude_desktop(desktop)
+        assert result is not None
+        assert result.name == "claude desktop"
+        assert result.status == WARN
+        assert "bypass" in result.summary
+        assert "#869" in (result.hint or "")
+
+    def test_doctor_appends_desktop_row_when_present(self, tmp_path, monkeypatch):
+        # Integration: the entrypoint surfaces the Desktop row when detected.
+        desktop = tmp_path / "Claude"
+        desktop.mkdir()
+        monkeypatch.setattr(doctor_mod, "claude_desktop_config_dir", lambda: desktop)
+        monkeypatch.setattr(doctor_mod, "probe_json", lambda *a, **k: None)
+        monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
+        result = CliRunner().invoke(main, ["doctor", "--json"])
+        payload = json.loads(result.output)
+        rows = {c["name"]: c for c in payload["checks"]}
+        assert "claude desktop" in rows
+        assert rows["claude desktop"]["status"] == WARN
+
+    def test_doctor_omits_desktop_row_when_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(doctor_mod, "claude_desktop_config_dir", lambda: tmp_path / "Claude")
+        monkeypatch.setattr(doctor_mod, "probe_json", lambda *a, **k: None)
+        monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
+        result = CliRunner().invoke(main, ["doctor", "--json"])
+        payload = json.loads(result.output)
+        assert "claude desktop" not in {c["name"] for c in payload["checks"]}
 
 
 class TestClaudeRemoteControlGate:
@@ -337,6 +446,85 @@ class TestClaudeRemoteControlGate:
         assert result.status == PASS
 
 
+class TestClaudeRoutingScope:
+    """Project-scoped routing must not read as "not routed" (#3205).
+
+    `headroom init claude` without --global writes
+    `.claude/settings.local.json`. Reading only `~/.claude/settings.json`
+    reported not-routed for sessions that were genuinely routed and actively
+    compressing, which sent one team hand-checking `ps eww` on every session.
+    """
+
+    @staticmethod
+    def _settings(path, base_url):  # noqa: ANN001, ANN205
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = {"env": {"ANTHROPIC_BASE_URL": base_url}} if base_url else {"env": {}}
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def test_project_local_settings_count_as_routed(self, tmp_path):
+        user = tmp_path / "user" / "settings.json"
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.local.json", "http://127.0.0.1:8787"
+        )
+
+        result = check_claude_routing(user, 8787, [project])
+
+        assert result.status == PASS
+        assert "settings.local.json" in result.summary or "settings.local.json" in str(result)
+
+    def test_project_settings_json_counts_as_routed(self, tmp_path):
+        user = tmp_path / "user" / "settings.json"
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.json", "http://127.0.0.1:8787"
+        )
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_project_scope_takes_precedence_over_user_scope(self, tmp_path):
+        """Claude layers project over user, so the reported port follows suit."""
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:9999")
+        project = self._settings(
+            tmp_path / "proj" / ".claude" / "settings.local.json", "http://127.0.0.1:8787"
+        )
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_falls_back_to_user_scope_when_project_has_no_base_url(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+        project = self._settings(tmp_path / "proj" / ".claude" / "settings.local.json", "")
+
+        assert check_claude_routing(user, 8787, [project]).status == PASS
+
+    def test_still_warns_when_nothing_routes(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "")
+        project = self._settings(tmp_path / "proj" / ".claude" / "settings.local.json", "")
+
+        assert check_claude_routing(user, 8787, [project]).status == WARN
+
+    def test_missing_project_file_is_skipped_not_fatal(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+        absent = tmp_path / "proj" / ".claude" / "settings.local.json"
+
+        assert check_claude_routing(user, 8787, [absent]).status == PASS
+
+    def test_unparseable_project_file_surfaces_rather_than_reporting_not_routed(self, tmp_path):
+        project = tmp_path / "proj" / ".claude" / "settings.local.json"
+        project.parent.mkdir(parents=True, exist_ok=True)
+        project.write_text("{not json", encoding="utf-8")
+        user = tmp_path / "user" / "settings.json"
+
+        result = check_claude_routing(user, 8787, [project])
+
+        assert result.status == WARN
+        assert "could not parse" in result.summary
+
+    def test_no_project_paths_preserves_original_behaviour(self, tmp_path):
+        user = self._settings(tmp_path / "user" / "settings.json", "http://127.0.0.1:8787")
+
+        assert check_claude_routing(user, 8787).status == PASS
+
+
 class TestCodexRouting:
     def test_missing_file_warns(self, tmp_path):
         assert check_codex_routing(tmp_path / "config.toml", 8787).status == WARN
@@ -350,6 +538,44 @@ class TestCodexRouting:
             encoding="utf-8",
         )
         assert check_codex_routing(path, 8787).status == PASS
+
+    def test_preserved_provider_id_right_port_passes(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == PASS
+        assert result.hint is None
+
+    def test_preserved_provider_id_port_mismatch_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://localhost:9999/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "9999" in result.summary
+
+    def test_active_provider_takes_precedence_over_headroom_block(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "corp"\n'
+            "[model_providers.corp]\n"
+            'base_url = "https://gateway.corp.example/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "gateway.corp.example" in result.summary
 
     def test_port_mismatch_warns(self, tmp_path):
         path = tmp_path / "config.toml"
@@ -371,6 +597,70 @@ class TestCodexRouting:
         path.write_bytes(b"\xff\xfe garbage \x00")
         assert check_codex_routing(path, 8787).status == WARN
 
+    # -- requires_openai_auth (#3206) ------------------------------------
+    # Codex attaches no Authorization header to a custom provider unless the
+    # block carries requires_openai_auth. A ChatGPT-OAuth user then 401s on
+    # every request with "Missing bearer" while doctor reported green -- the
+    # reason one report went 15h before anyone could see the cause.
+
+    @staticmethod
+    def _routed(tmp_path, *, requires_auth: bool):
+        path = tmp_path / "config.toml"
+        block = (
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n'
+            "supports_websockets = true\n"
+        )
+        if requires_auth:
+            block += "requires_openai_auth = true\n"
+        path.write_text(block, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _chatgpt_auth(tmp_path):
+        (tmp_path / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+
+    def test_chatgpt_auth_without_requires_openai_auth_warns(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=False)
+        self._chatgpt_auth(tmp_path)
+
+        result = check_codex_routing(path, 8787)
+
+        assert result.status == WARN
+        assert "Authorization" in result.summary
+
+    def test_chatgpt_auth_with_requires_openai_auth_passes(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=True)
+        self._chatgpt_auth(tmp_path)
+
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_preserved_provider_id_without_requires_openai_auth_warns(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'model_provider = "codex-lb"\n'
+            "[model_providers.codex-lb]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        self._chatgpt_auth(tmp_path)
+
+        result = check_codex_routing(path, 8787)
+        assert result.status == WARN
+        assert "Authorization" in result.summary
+
+    def test_api_key_user_without_requires_openai_auth_still_passes(self, tmp_path):
+        """API-key users must not be nagged -- the flag would break them (#406)."""
+        path = self._routed(tmp_path, requires_auth=False)
+        (tmp_path / "auth.json").write_text('{"OPENAI_API_KEY": "sk-test"}', encoding="utf-8")
+
+        assert check_codex_routing(path, 8787).status == PASS
+
+    def test_no_auth_json_does_not_warn(self, tmp_path):
+        path = self._routed(tmp_path, requires_auth=False)
+
+        assert check_codex_routing(path, 8787).status == PASS
+
 
 class TestShellEnv:
     def test_unset_warns(self):
@@ -389,6 +679,17 @@ class TestShellEnv:
     def test_other_url_warns(self):
         env = {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
         assert check_shell_env(env, 8787).status == WARN
+
+    def test_ollama_launch_url_names_the_collision(self):
+        # `ollama launch claude` points Claude Code at Ollama's :11434, which
+        # outranks the persistent Headroom route (issue #2199). The diagnostic
+        # must name Ollama, not tell the user to re-probe port 11434.
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11434"}
+        result = check_shell_env(env, 8787)
+        assert result.status == WARN
+        assert "Ollama" in result.summary
+        assert "#2199" in (result.hint or "")
+        assert "--port 11434" not in (result.hint or "")
 
 
 class TestSavings:
@@ -505,6 +806,7 @@ class TestBudget:
 class _FakeManifest:
     profile: str
     health_url: str
+    port: int = 8787
 
 
 class TestDeployments:
@@ -523,6 +825,33 @@ class TestDeployments:
         assert "prod" in result.summary
 
 
+class TestResolveProbePort:
+    def test_explicit_port_wins_over_deployment(self):
+        manifests = [_FakeManifest("default", "", port=8789)]
+        assert resolve_probe_port(9000, manifests) == 9000
+
+    def test_default_profile_deployment_port_is_preferred(self):
+        manifests = [
+            _FakeManifest("prod", "", port=9999),
+            _FakeManifest("default", "", port=8789),
+        ]
+        assert resolve_probe_port(None, manifests) == 8789
+
+    def test_single_non_default_deployment_is_used(self):
+        assert resolve_probe_port(None, [_FakeManifest("prod", "", port=9999)]) == 9999
+
+    def test_builtin_default_without_deployments(self):
+        assert resolve_probe_port(None, []) == DEFAULT_PROXY_PORT
+
+    def test_ambiguous_named_deployments_fall_back_to_the_default(self):
+        """Several named profiles and no request: any pick would be arbitrary."""
+        manifests = [
+            _FakeManifest("prod", "", port=9998),
+            _FakeManifest("staging", "", port=9999),
+        ]
+        assert resolve_probe_port(None, manifests) == DEFAULT_PROXY_PORT
+
+
 class TestDoctorCommand:
     @pytest.fixture
     def runner(self):
@@ -533,9 +862,21 @@ class TestDoctorCommand:
         """Point all filesystem/network surfaces at controlled fakes."""
         monkeypatch.setattr(doctor_mod, "claude_settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(doctor_mod, "codex_config_path", lambda: tmp_path / "config.toml")
+        monkeypatch.setattr(
+            doctor_mod, "codex_project_config_path", lambda: tmp_path / "project-codex.toml"
+        )
         monkeypatch.setattr(doctor_mod, "savings_path", lambda: tmp_path / "savings.json")
         monkeypatch.setattr(doctor_mod, "list_manifests", lambda: [])
-        for var in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "HEADROOM_PORT"):
+        for var in (
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_VERTEX",
+            "OPENAI_BASE_URL",
+            "HEADROOM_PORT",
+        ):
             monkeypatch.delenv(var, raising=False)
         return tmp_path
 
@@ -555,6 +896,23 @@ class TestDoctorCommand:
         assert result.exit_code == 2
         assert "not reachable" in result.output
 
+    def test_conflicting_claude_auth_is_a_redacted_failure(self, runner, isolated, monkeypatch):
+        settings = isolated / "settings.json"
+        settings.write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"token-value"}}', encoding="utf-8")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "api-value")
+        monkeypatch.setattr(doctor_mod, "probe_json", self._probe(None, None))
+
+        result = runner.invoke(main, ["doctor", "--json"])
+
+        assert result.exit_code == 2
+        payload = json.loads(result.output)
+        auth = next(check for check in payload["checks"] if check["name"] == "claude auth")
+        assert auth["status"] == "fail"
+        assert "shell environment" in auth["summary"]
+        assert str(settings) in auth["summary"]
+        assert "api-value" not in result.output
+        assert "token-value" not in result.output
+
     def test_warnings_only_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
@@ -565,6 +923,7 @@ class TestDoctorCommand:
     def test_remote_control_warning_exits_1(self, runner, isolated, monkeypatch):
         monkeypatch.setattr(doctor_mod, "probe_json", self._probe(LIVEZ_OK, STATS_OK))
         monkeypatch.setattr(doctor_mod, "get_version", lambda: "0.26.0")
+        monkeypatch.setattr(doctor_mod, "detect_claude_code_version", lambda: None)
         (isolated / "settings.json").write_text(
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}),
             encoding="utf-8",
@@ -608,6 +967,24 @@ class TestDoctorCommand:
         monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
         runner.invoke(main, ["doctor"], env={"HEADROOM_PORT": "9999"})
         assert "http://127.0.0.1:9999/livez" in seen
+
+    def test_deployment_port_probed_when_shell_has_no_override(self, runner, isolated, monkeypatch):
+        """`headroom deploy --port N` only sets HEADROOM_PORT inside the deployment."""
+        seen: list[str] = []
+
+        def recording_probe(url, timeout=2.0):
+            seen.append(url)
+            return None
+
+        monkeypatch.setattr(
+            doctor_mod,
+            "list_manifests",
+            lambda: [_FakeManifest("default", "http://127.0.0.1:8789/readyz", port=8789)],
+        )
+        monkeypatch.setattr(doctor_mod, "probe_json", recording_probe)
+        runner.invoke(main, ["doctor"])
+        assert "http://127.0.0.1:8789/livez" in seen
+        assert not any("127.0.0.1:8787" in url for url in seen)
 
 
 class TestCostTrackerBudgetKeys:

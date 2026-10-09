@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import gc
 import io
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +25,11 @@ except ImportError:
     _IMAGE_ML_AVAILABLE = False
 
 from headroom.models.config import ML_MODEL_DEFAULTS
+
+# Re-exported from the dependency-free module so existing
+# ``from .trained_router import Technique`` imports keep working without this
+# module (which imports torch/transformers) being needed just for the types.
+from .image_types import ImageSignals, RouteDecision, Technique
 
 
 def _extract_tensor(output: torch.Tensor | BaseModelOutputWithPooling) -> torch.Tensor:
@@ -53,37 +56,6 @@ def _extract_tensor(output: torch.Tensor | BaseModelOutputWithPooling) -> torch.
             "BaseModelOutputWithPooling has neither pooler_output nor last_hidden_state"
         )
     return output
-
-
-class Technique(Enum):
-    """Image optimization techniques."""
-
-    TRANSCODE = "transcode"  # Convert to text description (99% savings)
-    CROP = "crop"  # Extract relevant region (50-90% savings)
-    PRESERVE = "preserve"  # Keep full quality (0% savings)
-    FULL_LOW = "full_low"  # Full image, lower quality (87% savings)
-
-
-@dataclass
-class ImageSignals:
-    """Signals extracted from image analysis."""
-
-    has_text: float
-    is_document: float
-    is_complex: float
-    has_small_details: float
-
-
-@dataclass
-class RouteDecision:
-    """Result of routing decision."""
-
-    technique: Technique
-    confidence: float
-    reason: str
-    image_signals: ImageSignals | None = None
-    query_prediction: str | None = None
-    query_confidence: float | None = None
 
 
 class TrainedRouter:
