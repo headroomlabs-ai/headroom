@@ -565,23 +565,13 @@ class TestMemoryIntegration:
 
 
 class TestExtractionPrompts:
-    """Tests for extraction prompt templates."""
+    """Tests for the extraction prompt template."""
 
     def test_extraction_prompts_exist_and_valid(self):
-        """Verify extraction prompts are defined and non-empty."""
-        from headroom.memory.extraction import (
-            ENTITY_EXTRACTION_PROMPT,
-            EXTRACTION_SYSTEM_PROMPT,
-            FACT_EXTRACTION_PROMPT,
-            RELATIONSHIP_EXTRACTION_PROMPT,
-        )
+        """Verify the extraction system prompt is defined and non-empty."""
+        from headroom.memory.extraction import EXTRACTION_SYSTEM_PROMPT
 
         assert len(EXTRACTION_SYSTEM_PROMPT) > 100, "System prompt should be substantial"
-        assert len(FACT_EXTRACTION_PROMPT) > 100, "Fact prompt should be substantial"
-        assert len(ENTITY_EXTRACTION_PROMPT) > 100, "Entity prompt should be substantial"
-        assert len(RELATIONSHIP_EXTRACTION_PROMPT) > 100, (
-            "Relationship prompt should be substantial"
-        )
 
         # Verify they mention key concepts
         assert "facts" in EXTRACTION_SYSTEM_PROMPT.lower()
