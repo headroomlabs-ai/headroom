@@ -107,6 +107,9 @@ def update_plugin_versions(root: Path, version: str) -> None:
         root / "plugins" / "headroom-agent-hooks" / ".github" / "plugin" / "plugin.json",
         version,
     )
+    update_plugin_manifest(
+        root / "plugins" / "headroom-snip" / ".claude-plugin" / "plugin.json", version
+    )
 
 
 def update_openclaw_package_json(file_path: Path, version: str) -> None:
