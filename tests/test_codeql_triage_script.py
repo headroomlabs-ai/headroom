@@ -156,8 +156,8 @@ def test_later_dispatch_reuses_a_closed_issue_and_keeps_its_ticks(harness):
     run("2026-10-05")  # Monday's scheduled run
 
     ticked = state()["issues"][0]["body"].replace("- [ ]", "- [x]")
-    edit_issue(1, body=ticked, state="closed")
-    set_alerts(_alert(1), _alert(7))  # a new high alert midweek
+    edit_issue(1, body=ticked, state="closed")  # #1 fixed, box ticked
+    set_alerts(_alert(7))  # a new high alert midweek
 
     run("2026-10-09")  # Friday's manual dispatch
 
@@ -202,3 +202,21 @@ def test_no_alerts_still_records_the_review(harness):
     (issue,) = state()["issues"]
     assert "(0 critical/high open)" in issue["title"]
     assert "None. Close this issue to record the review." in issue["body"]
+
+
+def test_an_alert_reopened_after_its_box_was_ticked_is_reported_again(harness):
+    set_alerts, state, edit_issue, run = harness
+    set_alerts(_alert(1))
+    run("2026-10-05")
+    ticked = state()["issues"][0]["body"].replace("- [ ]", "- [x]")
+    edit_issue(1, body=ticked, state="closed")  # dismissed and ticked
+
+    # Reopened later the same week: open again, and its only mention is ticked.
+    run("2026-10-08")
+    (issue,) = state()["issues"]
+    (comment,) = issue["comments"]
+    assert "[#1]" in comment
+    assert issue["body"] == ticked and issue["state"] == "closed"
+
+    run("2026-10-09")  # listed unticked in that comment now: not repeated
+    assert len(state()["issues"][0]["comments"]) == 1

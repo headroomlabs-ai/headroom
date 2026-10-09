@@ -5,9 +5,9 @@
 # re-run of Monday's job and a manual dispatch later the same week both find
 # the issue already opened for that week, including a closed one, and reuse it
 # instead of opening another. A reused issue is never edited, reopened or
-# retitled, so ticked checkboxes and its closure stand. If critical/high alerts
-# opened since it was filed, they are added as a comment; otherwise the run
-# does nothing.
+# retitled, so ticked checkboxes and its closure stand. Open critical/high
+# alerts it does not list unticked (new ones, or ones reopened after being
+# ticked) are added as a comment; otherwise the run does nothing.
 #
 # Env: REPO (owner/name), TRIAGE_ASSIGNEE (login). TRIAGE_TODAY (YYYY-MM-DD)
 # overrides the date for tests. Needs gh, jq and python3.
@@ -49,14 +49,16 @@ existing="$(gh api --paginate "repos/$REPO/issues?state=all&labels=security&per_
   | jq -r --arg marker "$marker" "$week_issue_jq" | head -n 1)"
 
 if [ -n "$existing" ]; then
-  # Alerts already listed in the issue or in an earlier re-run comment.
+  # Alerts already listed, unticked, in the issue or an earlier re-run
+  # comment. A ticked alert that is open again (dismissed, then reopened) is
+  # reported again rather than hidden behind its old tick.
   known="$(gh api "repos/$REPO/issues/$existing" | jq -r '.body // ""')"
   known="$known"$'\n'"$(gh api --paginate "repos/$REPO/issues/$existing/comments" | jq -r '.[].body // ""')"
   new=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     ref="${line#*\[#}"             # after "- [ ] [#"
-    ref="[#${ref%%\]*}]"           # "[#123]"
+    ref="- [ ] [#${ref%%\]*}]("    # "- [ ] [#123]("
     case "$known" in *"$ref"*) ;; *) new="${new}${line}"$'\n' ;; esac
   done <<< "$alerts"
   if [ -z "$new" ]; then
@@ -64,7 +66,7 @@ if [ -n "$existing" ]; then
     exit 0
   fi
   {
-    echo "Re-run on $today: critical/high alerts opened since this issue was filed:"
+    echo "Re-run on $today: critical/high alerts that are open and not yet listed here (new, or reopened after being ticked):"
     echo
     printf '%s' "$new"
   } > comment.md
