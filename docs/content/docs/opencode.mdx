@@ -42,6 +42,7 @@ headroom wrap opencode \
   --code-graph \
   --no-proxy \
   --openai-api-url https://api.deepseek.com/v1 \
+  --extra-model "deepseek-chat=DeepSeek Chat=65536" \
   --learn \
   --memory \
   --backend anthropic \
@@ -90,6 +91,34 @@ The generated `headroom` provider exposes these models through the proxy:
 
 The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` or in the generated `OPENCODE_CONFIG_CONTENT` payload.
 
+### Adding models
+
+OpenCode only resolves `headroom/<id>` for ids listed under the `headroom`
+provider. Add your own with the repeatable `--extra-model` flag, in the format
+`id[=name[=context_window[=output_limit]]]`:
+
+```bash
+headroom wrap opencode \
+  --openai-api-url https://openrouter.ai/api/v1 \
+  --extra-model "deepseek/deepseek-chat:free=DeepSeek Free=65536" \
+  --extra-model "qwen2.5-coder:7b"
+```
+
+Fields are separated by `=` because model ids often contain `:` (Ollama
+`name:tag`, OpenRouter `:free`). `name` defaults to the id, `context_window` to
+200000, and `output_limit` to 16384 or the context window, whichever is
+smaller. An id that matches a built-in model replaces its entry.
+
+To keep the same models on every wrap, set `HEADROOM_OPENCODE_EXTRA_MODELS` to
+a comma-separated list of specs. Names in the variable can't contain a comma.
+When both are set, `--extra-model` wins for the same id.
+
+With `--openai-api-url`, wrap also keeps the model ids already listed under the
+`headroom` provider in `opencode.json`, and it can't tell yours apart from ones
+an earlier `--extra-model` added. To drop an extra model there, delete its
+entry from `opencode.json`, or run `headroom unwrap opencode` before wrapping
+again.
+
 ## Environment Variables
 
 | Variable | Description |
@@ -97,6 +126,7 @@ The default model is `headroom/claude-sonnet-4-6`. Change it in `opencode.json` 
 | `OPENCODE_CONFIG_CONTENT` | JSON payload with provider, plugin, and optional local MCP config injected by `wrap` |
 | `HEADROOM_PROXY_URL` | Proxy URL passed to Headroom MCP when a non-default port is used, and to the native plugin when configured |
 | `OPENAI_TARGET_API_URL` | Upstream for OpenAI-compatible traffic when `--openai-api-url` is not passed; defaults to `https://api.openai.com/v1` |
+| `HEADROOM_OPENCODE_EXTRA_MODELS` | Comma-separated `--extra-model` specs added to the `headroom` provider on every wrap |
 | `HEADROOM_OPENCODE_EXCLUDE_HOSTS` | Comma-separated hosts (and their subdomains) the native plugin sends straight upstream instead of through the proxy, for example `opencode.ai,.corp.internal` |
 
 ## Failure Learning

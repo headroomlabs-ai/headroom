@@ -8,6 +8,7 @@ import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from headroom._subprocess import run
 from headroom.mcp_registry.install import DEFAULT_PROXY_URL
@@ -157,6 +158,7 @@ def build_opencode_config_content(
     port: int,
     include_mcp: bool = True,
     include_plugin: bool = True,
+    extra_models: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     """Build JSON payload for ``OPENCODE_CONFIG_CONTENT``.
 
@@ -186,7 +188,7 @@ def build_opencode_config_content(
         "provider": {
             "anthropic": {"options": {"baseURL": base_url}},
             "openai": {"options": {"baseURL": base_url}},
-            "headroom": headroom_provider_entry(port),
+            "headroom": headroom_provider_entry(port, extra_models),
         }
     }
     if include_mcp:
@@ -217,6 +219,7 @@ def build_launch_env(
     *,
     include_mcp: bool = True,
     include_plugin: bool = True,
+    extra_models: dict[str, Any] | None = None,
     session_token: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """Build environment variables for launching OpenCode through Headroom.
@@ -237,6 +240,7 @@ def build_launch_env(
         port=port,
         include_mcp=include_mcp,
         include_plugin=include_plugin,
+        extra_models=extra_models,
     )
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_content, separators=(",", ":"))
 
