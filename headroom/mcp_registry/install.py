@@ -10,6 +10,7 @@ from .antigravity import AntigravityRegistrar
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeRegistrar
 from .codex import CodexRegistrar
+from .dsh import DshRegistrar
 from .grok import GrokRegistrar
 from .opencode import OpencodeRegistrar
 
@@ -29,6 +30,7 @@ def get_all_registrars() -> list[MCPRegistrar]:
         CodexRegistrar(),
         GrokRegistrar(),
         OpencodeRegistrar(),
+        DshRegistrar(),
     ]
 
 

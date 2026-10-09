@@ -18,6 +18,7 @@ from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
 from .claude import ClaudeConfigMutationError, ClaudeRegistrar
 from .codex import CodexRegistrar
 from .display import any_succeeded, format_result, format_results
+from .dsh import DshRegistrar
 from .grok import GrokRegistrar
 from .install import (
     CLAUDE_SERENA_CONTEXT,
@@ -37,6 +38,7 @@ __all__ = [
     "ClaudeConfigMutationError",
     "ClaudeRegistrar",
     "CodexRegistrar",
+    "DshRegistrar",
     "GrokRegistrar",
     "MCPRegistrar",
     "OpencodeRegistrar",

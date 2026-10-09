@@ -51,7 +51,7 @@ file content is sent anywhere to be compressed.
 
 - **Library** — `compress(messages)` in Python or TypeScript, inline in any app.
 - **Proxy** — `headroom proxy --port 8787`, zero code changes, any language.
-- **Agent wrap** — `headroom wrap claude|codex|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`.
+- **Agent wrap** — `headroom wrap claude|codex|dsh|grok|copilot|cursor|aider|opencode|cline|continue|goose|openhands|openclaw|vibe|omp|zcode` in one command; undo with `headroom unwrap <tool>`.
 - **MCP server** — `headroom_compress`, `headroom_retrieve`, `headroom_stats` for any MCP client.
 - **Cross-agent memory** — one shared store across Claude, Codex, Gemini and Grok, with automatic dedup.
 - **`headroom learn`** — mines failed sessions and writes corrections to `CLAUDE.local.md` (default, gitignored), `CLAUDE.md`, `AGENTS.md`, `GEMINI.md` or `GROK.md`.
@@ -256,12 +256,13 @@ Saved** card then reads `measured` rather than `estimated`, with the band.
 | Cortex Code | Library only | 60–65% savings in library mode; no `wrap` |
 | Kimi CLI | ✅ | OAuth bearer forwarded — log in once |
 | ZCode | ✅ | starts the proxy and prints base URLs for ZCode settings |
+| DeepSeek Harness (dsh) | ✅ | `web` + `headless`; routes via `DEEPSEEK_BASE_URL` |
 
 [^third-party-upstream]: `headroom wrap` routes OpenAI-compatible traffic to the default upstream (`https://api.openai.com/v1`). For a third-party OpenAI-compatible provider (DeepSeek, Together, OpenRouter, a self-hosted gateway), pass `--openai-api-url https://api.deepseek.com/v1` — or set `OPENAI_TARGET_API_URL` before wrapping — otherwise your provider key is sent to OpenAI and rejected with `401 Incorrect API key provided`. See [OpenCode + DeepSeek](docs/content/docs/opencode-deepseek.mdx).
 
 Any OpenAI-compatible client works through `headroom proxy`. MCP-native clients:
 `headroom mcp install`. Undo durable wrapping with `headroom unwrap <tool>`
-(`claude`, `copilot`, `codex`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
+(`claude`, `copilot`, `codex`, `dsh`, `grok`, `kimi`, `omp`, `opencode`, `openclaw`,
 `zcode`). Registry authors should use the canonical [`server.json`](server.json)
 rather than reconstructing the `headroom mcp serve` contract from prose.
 

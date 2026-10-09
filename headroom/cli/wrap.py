@@ -164,6 +164,7 @@ from headroom.providers.copilot import (
     validate_configuration as _validate_copilot_configuration,
 )
 from headroom.providers.cursor import render_setup_lines as _render_cursor_setup_lines
+from headroom.providers.dsh.runtime import build_launch_env, resolve_dsh_command
 from headroom.providers.grok import (
     DEFAULT_API_URL as _GROK_DEFAULT_API_URL,
 )
@@ -720,6 +721,7 @@ def _start_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    deepseek_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
@@ -780,6 +782,8 @@ def _start_proxy(
 
     if openai_api_url:
         cmd.extend(["--openai-api-url", openai_api_url])
+    if deepseek_api_url:
+        cmd.extend(["--deepseek-api-url", deepseek_api_url])
 
     if anthropic_api_url:
         cmd.extend(["--anthropic-api-url", anthropic_api_url])
@@ -828,6 +832,8 @@ def _start_proxy(
         apply_agent_savings_env_defaults(proxy_env, savings_profile)
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
+    if deepseek_api_url:
+        proxy_env["DEEPSEEK_TARGET_API_URL"] = deepseek_api_url
     if anthropic_api_url:
         proxy_env["ANTHROPIC_TARGET_API_URL"] = anthropic_api_url
     if clear_vertex_api_url:
@@ -4255,6 +4261,7 @@ _PROXY_ROUTING_URL_KEYS = (
     "gemini_api_url",
     "augment_api_url",
     "factory_api_url",
+    "deepseek_api_url",
 )
 
 
@@ -4302,6 +4309,7 @@ def _effective_requested_proxy_routing(
     anthropic_api_url: str | None,
     vertex_api_url: str | None,
     clear_vertex_api_url: bool,
+    deepseek_api_url: str | None = None,
 ) -> tuple[str, dict[str, str | None]]:
     """Resolve the routing a newly started proxy would inherit."""
     from headroom.providers.registry import resolve_api_overrides
@@ -4312,6 +4320,7 @@ def _effective_requested_proxy_routing(
         gemini_api_url=None,
         cloudcode_api_url=None,
         vertex_api_url=vertex_api_url,
+        deepseek_api_url=deepseek_api_url,
     )
     return (
         backend or os.environ.get("HEADROOM_BACKEND") or "anthropic",
@@ -4323,6 +4332,7 @@ def _effective_requested_proxy_routing(
             "vertex_api_url": None if clear_vertex_api_url else overrides.vertex,
             "augment_api_url": os.environ.get("AUGMENT_TARGET_API_URL"),
             "factory_api_url": os.environ.get("FACTORY_TARGET_API_URL"),
+            "deepseek_api_url": overrides.deepseek,
         },
     )
 
@@ -4786,6 +4796,7 @@ def _ensure_proxy_unlocked(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    deepseek_api_url: str | None = None,
     require_openai_api_url: bool = False,
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
@@ -4813,6 +4824,7 @@ def _ensure_proxy_unlocked(
         anthropic_api_url=anthropic_api_url,
         vertex_api_url=vertex_api_url,
         clear_vertex_api_url=clear_vertex_api_url,
+        deepseek_api_url=deepseek_api_url,
     )
     # Set True when the proxy on the requested port belongs to a persistent
     # deployment whose routing config does not match this wrap: the deployment
@@ -5237,6 +5249,7 @@ def _ensure_proxy_unlocked(
                     anyllm_provider=anyllm_provider,
                     region=region,
                     openai_api_url=openai_api_url,
+                    deepseek_api_url=deepseek_api_url,
                     anthropic_api_url=anthropic_api_url,
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
@@ -5509,6 +5522,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    deepseek_api_url: str | None = None,
     anthropic_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
@@ -5552,6 +5566,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            deepseek_api_url=deepseek_api_url,
             anthropic_api_url=anthropic_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
@@ -8738,6 +8753,101 @@ def opencode(
                     _opencode_proxy.kill()
 
 
+# =============================================================================
+# DeepSeek Harness (dsh)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@_retired_context_tool_option
+@proxy_port_option()
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--profile",
+    "profile",
+    default="web",
+    type=click.Choice(["web", "headless"]),
+    help="dsh launch profile (default: web)",
+)
+@click.option("--command", "command", default=None, help="Explicit dsh command/launcher override")
+@click.option(
+    "--deepseek-api-url",
+    default=None,
+    help="DeepSeek upstream API URL (default: https://api.deepseek.com)",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@_serena_instructions_option
+@_code_memory_option
+@click.argument("dsh_args", nargs=-1, type=click.UNPROCESSED)
+def dsh(
+    port: int,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    profile: str,
+    command: str,
+    deepseek_api_url: str,
+    verbose: bool,
+    prepare_only: bool,
+    dsh_args: tuple,
+) -> None:
+    """Launch DeepSeek Harness (dsh) through Headroom proxy.
+
+    \b
+    Sets DEEPSEEK_BASE_URL to route dsh's OpenAI-compatible /chat/completions
+    traffic through Headroom. The DeepSeek bearer (DEEPSEEK_API_KEY) is
+    forwarded upstream, so no extra login is required.
+
+    \b
+    Examples:
+        headroom wrap dsh                              # Start proxy + dsh web
+        headroom wrap dsh --profile headless "task"    # One-shot task
+        headroom wrap dsh --command "pnpm dsh"         # Custom launcher
+        headroom wrap dsh --deepseek-api-url https://api.deepseek.com
+    """
+    if prepare_only:
+        return
+    if deepseek_api_url is None:
+        deepseek_api_url = os.environ.get("DEEPSEEK_BASE_URL")
+
+    try:
+        argv = resolve_dsh_command(profile=profile, command=command, task_args=dsh_args)
+    except RuntimeError as exc:
+        click.echo(f"Error: {exc}")
+        raise SystemExit(1) from exc
+
+    env, env_vars_display = build_launch_env(port, os.environ)
+
+    from headroom.mcp_registry import DshRegistrar
+
+    registrar = DshRegistrar()
+    registrar.ensure_home()
+    # The proxy compresses tool results and emits `[Retrieve more: hash=…]`
+    # markers, so dsh needs the headroom MCP entry to resolve them — every other
+    # wrapped agent registers it here. force=True for the same reason codex uses
+    # it: dsh starts a long-lived MCP subprocess, so a previous wrap on another
+    # port would otherwise leave retrieval pointed at the wrong proxy.
+    _setup_headroom_mcp(registrar, port, verbose=verbose, force=True)
+    _setup_coding_compressor(registrar, serena_context="agent", verbose=verbose)
+
+    _launch_tool(
+        binary=argv[0],
+        args=tuple(argv[1:]),
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="DSH",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="dsh",
+        deepseek_api_url=deepseek_api_url,
+    )
+
+
 def _opencode_home_dir() -> Path:
     """Return the OpenCode home/config directory."""
     env_path = os.environ.get("OPENCODE_HOME", "").strip()
@@ -9143,6 +9253,37 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
     if not no_stop_proxy and status != "noop":
         _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()
+
+
+@unwrap.command("dsh")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_dsh(port: int, no_stop_proxy: bool) -> None:
+    """Undo ``headroom wrap dsh`` (remove MCP entries and stop the proxy)."""
+    from headroom.mcp_registry import DshRegistrar
+
+    registrar = DshRegistrar()
+    removed_any = False
+    if registrar.detect():
+        serena_status = _remove_headroom_installed_serena_mcp(registrar)
+        if serena_status == "removed":
+            click.echo("  Removed Headroom-installed Serena MCP server from dsh.")
+            removed_any = True
+        elif serena_status == "failed":
+            click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
+
+        headroom_present = registrar.get_server("headroom") is not None
+        if registrar.unregister_server("headroom") and headroom_present:
+            click.echo("  Removed Headroom MCP server from dsh config.")
+            removed_any = True
+
+    if not removed_any:
+        click.echo("  Nothing to undo: no Headroom MCP markers found.")
+
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
 
 
 # =============================================================================
