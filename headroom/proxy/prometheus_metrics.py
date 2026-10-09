@@ -173,6 +173,22 @@ class PrometheusMetrics:
         self.tokens_input_estimated_total = 0
         self.requests_input_provider_reported = 0
         self.requests_input_estimated = 0
+        # Per-request savings converted to the provider's units
+        # (savings_calibration), split novel/carried, plus how each request's
+        # conversion was obtained. tokens_saved_total stays on Headroom's local
+        # tokenizer, counted once per conversation.
+        self.tokens_saved_provider_total = 0
+        self.tokens_saved_provider_novel_total = 0
+        self.tokens_saved_provider_carried_total = 0
+        # Provider tokens on requests where Headroom added more than it
+        # removed (already netted into tokens_saved_provider_total).
+        self.tokens_added_provider_total = 0
+        # Of tokens_saved_provider_total: the requests whose input is the
+        # provider's own count. Pairs with tokens_input_provider_reported_total
+        # so a ratio of the two covers one population of requests.
+        self.tokens_saved_provider_reported_total = 0
+        self.savings_usd_provider_total = 0.0
+        self.calibration_requests_by_source: dict[str, int] = defaultdict(int)
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
         # Tool-schema savings (deferral + turn-hook tool shrink), aggregated from
@@ -439,6 +455,13 @@ class PrometheusMetrics:
             self.tokens_input_estimated_total = 0
             self.requests_input_provider_reported = 0
             self.requests_input_estimated = 0
+            self.tokens_saved_provider_total = 0
+            self.tokens_saved_provider_novel_total = 0
+            self.tokens_saved_provider_carried_total = 0
+            self.tokens_added_provider_total = 0
+            self.tokens_saved_provider_reported_total = 0
+            self.savings_usd_provider_total = 0.0
+            self.calibration_requests_by_source.clear()
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
@@ -870,6 +893,10 @@ class PrometheusMetrics:
         # when it is Headroom's local estimate. None (callers predating the
         # split) records nothing in either bucket.
         input_provider_reported: bool | None = None,
+        # This request's saving in provider units (CalibratedSavings) and its
+        # dollar value. None for callers predating calibration.
+        calibrated: Any = None,
+        calibrated_usd: float = 0.0,
     ):
         """Record metrics for a request.
 
@@ -953,6 +980,15 @@ class PrometheusMetrics:
             elif input_provider_reported is False and input_tokens > 0:
                 self.tokens_input_estimated_total += input_tokens
                 self.requests_input_estimated += 1
+            if calibrated is not None:
+                self.tokens_saved_provider_total += calibrated.tokens_saved
+                self.tokens_saved_provider_novel_total += calibrated.novel_tokens_saved
+                self.tokens_saved_provider_carried_total += calibrated.carried_tokens_saved
+                self.tokens_added_provider_total += max(-calibrated.tokens_saved, 0)
+                if input_provider_reported is True:
+                    self.tokens_saved_provider_reported_total += calibrated.tokens_saved
+                self.savings_usd_provider_total += float(calibrated_usd or 0.0)
+                self.calibration_requests_by_source[calibrated.source] += 1
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
             self.tool_search_saved_total += max(0, int(tool_search_saved))

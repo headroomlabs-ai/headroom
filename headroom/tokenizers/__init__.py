@@ -27,6 +27,7 @@ from .estimator import CharacterCounter, EstimatingTokenCounter
 from .registry import (
     TokenizerRegistry,
     get_tokenizer,
+    is_native_tokenizer,
     list_supported_models,
     register_tokenizer,
 )
@@ -59,6 +60,7 @@ __all__ = [
     # Registry
     "TokenizerRegistry",
     "get_tokenizer",
+    "is_native_tokenizer",
     "register_tokenizer",
     "list_supported_models",
     # Base classes

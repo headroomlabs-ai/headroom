@@ -1,0 +1,67 @@
+---
+title: Savings in Provider Tokens
+description: Per-request savings in the provider's own token units, and how to reconcile Headroom's numbers with the Claude Console or OpenAI usage dashboard.
+---
+
+Headroom measures compression with a local tokenizer. For OpenAI models that is OpenAI's own tokenizer, so the counts already match the bill. Claude's tokenizer is not public. Headroom's stand-in counts **15–25% low on Claude 4.x and 35–38% low on Claude 5.x**, so local counts never line up with the Claude Console.
+
+To fix that, every request also reports its saving **in the provider's units**. The conversion uses that request's own billed input, so it needs no extra API calls and works with your own keys or subscription.
+
+## What each request reports
+
+| Field | Meaning |
+|---|---|
+| `billed_input_tokens` | Input the provider says it received: uncached + cache reads + cache writes. |
+| `input_tokens_source` | `provider` if read from the response's usage, `estimated` if the provider reported none. |
+| `tokens_saved_provider` | Net saving in provider tokens: everything removed minus anything Headroom added. Can be negative. |
+| `novel_tokens_saved_provider` | Part removed **this request**, priced as new input. |
+| `carried_tokens_saved_provider` | Part removed on an **earlier** request and still removed (compressed history, tools deferred earlier). Priced at cache-read rates. |
+| `tool_tokens_saved_provider` | Part that is tool definitions (tool-search deferral, schema compaction). |
+| `baseline_input_tokens` | The request without Headroom: billed + saved. |
+| `baseline_estimated` | `true` when the provider reported no usage, so the baseline is built from Headroom's estimate. |
+| `savings_percent_provider` | Saved ÷ baseline. |
+| `calibration_ratio` / `calibration_factor` / `calibration_source` | How the conversion was made (see below). |
+| `savings_usd` | Dollar value at the model's catalog rates. |
+
+These fields appear on `/stats` → `recent_requests`, on the dashboard's expanded request row, in the request log, and on the `PERF` log line (`billed_in=`, `saved_provider=`, `saved_novel=`, `saved_carried=`, `saved_tools=`, `cal=`, `saved_usd=`). Totals are under `/stats` → `tokens.saved_provider*` and in the usage report.
+
+`tokens.saved_provider_percent` is `saved_provider_reported / (input_provider_reported + saved_provider_reported)`: savings and billed input of the **same** requests, the ones whose input the provider reported. Requests with estimated input count in `saved_provider` but not in the percentage. It is 0 when that baseline is not positive.
+
+## How the conversion works
+
+1. **Exchange rate.** The provider's billed input for this request ÷ Headroom's local count of the same forwarded request (system prompt, billed tools and messages).
+2. **Net saving.** Headroom's local count of the request as the client sent it, minus the same count of what it forwarded. Message compression, tool compaction and deferral, and tools Headroom added are each counted once.
+3. **Message content** converts at the exchange rate × a measured correction: **0.91** for Claude 4.x, **0.89** for Claude 5.x. What Headroom removes (JSON punctuation, whitespace, repeated lines) tokenizes more cheaply than the request average.
+4. **Tool definitions** convert at a measured rate per family: **1.20** for Claude 4.x, **1.62** for Claude 5.x.
+
+Every tier in a Claude generation tokenizes text identically: Opus, Sonnet and Haiku, plus Fable on 5.x. One correction per generation covers them all.
+
+`calibration_source` tells you which path a request took:
+
+- `native` — the local tokenizer is the provider's own (OpenAI). Nothing is converted.
+- `request` — this request's own exchange rate.
+- `model_average` — the request couldn't be measured (no usage, or images/documents), so the model's recent average rate is used.
+- `uncalibrated` — nothing to measure yet. The numbers are in local units.
+
+Accuracy on real Claude Code transcripts, against Anthropic `count_tokens`:
+
+| Model | Typical request error | Total bias |
+|---|---|---|
+| Sonnet 4.6 | 4.5% | +0.2% |
+| Sonnet 5.5 | 4.4% | +0.5% |
+
+Reproduce with `benchmarks/savings_calibration_accuracy.py`.
+
+## Reconciling with the Claude Console
+
+- The Console's **input**, **cache read** and **cache write** columns add up to Headroom's `billed_input_tokens` for the same requests. Compare like with like: same API key, same time window, requests that went through Headroom.
+- *Without Headroom* = Console total input + `tokens_saved_provider` summed over the same requests.
+- Savings show up on **every** turn because compressed history stays compressed when it is re-sent. That is `carried_tokens_saved_provider`. To count each removal once, use the novel figure.
+- A request with `input_tokens_source=estimated` had no provider usage. Leave it out of a billing reconciliation.
+
+## Failure modes
+
+- **No usage in the response** (some gateways): the request is labelled `estimated` and uses the model's average rate. The baseline is marked `baseline_estimated`.
+- **Images or documents**: local counts of media are rough, so the request uses `model_average` instead of its own rate.
+- **New provider tokenizer**: the exchange rate adapts immediately. The family correction is a measured constant, so re-run the benchmark when a new generation ships. An unknown family uses the exchange rate alone.
+- Calibration never fails a request. On any error, savings fall back to local units.

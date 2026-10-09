@@ -465,6 +465,30 @@ def get_tokenizer(
     return TokenizerRegistry.get(model, backend, fallback)
 
 
+# Backends that load the provider's own vocabulary, so counts match the bill.
+_NATIVE_BACKENDS = frozenset({"tiktoken", "mistral", "huggingface"})
+
+
+def is_native_tokenizer(model: str) -> bool:
+    """True when Headroom counts ``model`` with the provider's own tokenizer.
+
+    OpenAI (tiktoken), Mistral (mistral-common) and Hugging Face models load
+    the real vocabulary; measured against OpenAI's billed ``prompt_tokens`` the
+    local count matches to within a token. Claude (private tokenizer, counted
+    with an ``o200k_base`` stand-in), Gemini, Cohere, Kimi and unknown models
+    are counted with a stand-in or an estimator, so their counts are
+    approximations of the provider's units. A native backend that fell back to
+    the character estimator (vocabulary unavailable) is not native either.
+    """
+    try:
+        registry = TokenizerRegistry()
+        if registry._detect_backend(model) not in _NATIVE_BACKENDS:
+            return False
+        return not isinstance(get_tokenizer(model), EstimatingTokenCounter)
+    except Exception:  # pragma: no cover - accounting must never raise
+        return False
+
+
 def register_tokenizer(
     model: str,
     tokenizer: TokenCounter | None = None,

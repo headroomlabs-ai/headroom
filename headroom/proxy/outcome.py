@@ -26,12 +26,19 @@ actually reports.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from headroom.proxy.conversation_savings import get_conversation_savings
+from headroom.proxy.savings_calibration import (
+    CLIENT_REQUEST_TOKENS_TAG,
+    CLIENT_TOOL_TOKENS_TAG,
+    CalibratedSavings,
+    get_savings_calibrator,
+)
 from headroom.proxy.tool_schema_savings_policy import (
     headline_tokens_saved,
     tool_schema_saved_from_tags,
@@ -99,6 +106,19 @@ class RequestOutcome:
     # no provider count (or whose optimized_tokens is already provider-scaled)
     # leaves it 0 and billing falls back to optimized_tokens, exactly as before.
     provider_input_tokens: int = 0
+    # ── Savings calibration inputs (see headroom.proxy.savings_calibration) ──
+    # calibration_key: stable id of this conversation (Anthropic: the prefix
+    #     tracker lineage), so consecutive turns can be compared.
+    # local_forwarded_tokens: Headroom's local count of the WHOLE forwarded
+    #     request (system + billed tools + messages), counted exactly as the
+    #     client request is at entry, so the two differ by the net saving.
+    # local_counts_full_request: True when that count is like for like with
+    #     what the provider bills (no images/documents).
+    calibration_key: str | None = None
+    local_forwarded_tokens: int = 0
+    # The billed tool definitions alone, same method (savings_calibration).
+    local_forwarded_tool_tokens: int = 0
+    local_counts_full_request: bool = False
 
     # ── Cache (provider-agnostic; unused fields stay 0) ───────────────
     # Anthropic populates all five (read + write + 5m + 1h + uncached).
@@ -338,6 +358,10 @@ class RequestOutcome:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         provider_input_tokens: int = 0,
+        calibration_key: str | None = None,
+        local_forwarded_tokens: int = 0,
+        local_forwarded_tool_tokens: int = 0,
+        local_counts_full_request: bool = False,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -409,6 +433,10 @@ class RequestOutcome:
             original_tokens=original_tokens,
             optimized_tokens=optimized_tokens,
             provider_input_tokens=max(int(provider_input_tokens or 0), 0),
+            calibration_key=calibration_key,
+            local_forwarded_tokens=max(int(local_forwarded_tokens or 0), 0),
+            local_forwarded_tool_tokens=max(int(local_forwarded_tool_tokens or 0), 0),
+            local_counts_full_request=local_counts_full_request,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
             conversation_key=conversation_key,
@@ -441,6 +469,60 @@ class RequestOutcome:
 
 
 # ── The funnel ───────────────────────────────────────────────────────
+
+
+def _int_tag(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=512)
+def _native_tokenizer(model: str) -> bool:
+    from headroom.tokenizers import is_native_tokenizer
+
+    return is_native_tokenizer(model)
+
+
+def _price_calibrated(outcome: RequestOutcome, calibrated: CalibratedSavings) -> float:
+    """Dollar value of one request's calibrated saving.
+
+    Novel savings would have entered as new input (uncached or cache write);
+    carried savings sit in history the provider re-reads, so they are priced
+    against the cached prefix. Never raises.
+    """
+    if calibrated.novel_tokens_saved == 0 and calibrated.carried_tokens_saved == 0:
+        return 0.0
+    try:
+        from headroom.pricing.counterfactual import CacheMix, Region, price_savings
+
+        mix = CacheMix.from_usage(
+            cache_read_tokens=outcome.cache_read_tokens,
+            cache_write_tokens=outcome.cache_write_tokens,
+            cache_write_5m_tokens=outcome.cache_write_5m_tokens,
+            cache_write_1h_tokens=outcome.cache_write_1h_tokens,
+            uncached_input_tokens=outcome.uncached_input_tokens,
+            cache_inferred=outcome.cache_inferred,
+        )
+        total = 0.0
+        for tokens, region in (
+            (calibrated.novel_tokens_saved, Region.LIVE_ZONE),
+            (calibrated.carried_tokens_saved, Region.PREFIX),
+        ):
+            # Negative = tokens Headroom added; priced the same way, as a cost.
+            if tokens:
+                total += (1 if tokens > 0 else -1) * price_savings(
+                    abs(tokens),
+                    model=outcome.model,
+                    mix=mix,
+                    region=region,
+                    local_tokens=outcome.provider_input_tokens or outcome.optimized_tokens,
+                    provider=outcome.provider,
+                ).usd
+        return round(total, 6)
+    except Exception:  # pragma: no cover - a savings figure must never fail a request
+        return 0.0
 
 
 _estimated_input_warned: set[tuple[str, str]] = set()
@@ -681,6 +763,36 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if not input_provider_reported and billed_input_tokens > 0:
         _warn_estimated_input(outcome.provider, outcome.model)
 
+    # This request's saving in the provider's units (savings_calibration).
+    # Net saving = Headroom's local count of the client's request minus the
+    # same count of the forwarded one; its tool part = the same difference
+    # over billed tool definitions alone (deferral and compaction, minus tools
+    # Headroom added). Paths that did not measure the client request fall back
+    # to the pipeline's saving and the tool-savings tags.
+    tags_in = outcome.tags or {}
+    client_tokens = _int_tag(tags_in.get(CLIENT_REQUEST_TOKENS_TAG))
+    client_tools = _int_tag(tags_in.get(CLIENT_TOOL_TOKENS_TAG))
+    forwarded_tokens = outcome.local_forwarded_tokens
+    if client_tokens is not None and forwarded_tokens > 0:
+        net_saved_local = client_tokens - forwarded_tokens
+        tool_saved_local = (client_tools or 0) - outcome.local_forwarded_tool_tokens
+    else:
+        net_saved_local = headline_tokens_saved(outcome.tokens_saved, tags_in)
+        tool_saved_local = tool_schema_saved_from_tags(tags_in)
+        forwarded_tokens = forwarded_tokens or outcome.optimized_tokens
+    calibrated = get_savings_calibrator().calibrate(
+        model=outcome.model,
+        conversation_key=outcome.calibration_key or outcome.conversation_key,
+        billed_input_tokens=outcome.provider_input_tokens,
+        local_forwarded_tokens=forwarded_tokens,
+        local_covers_request=outcome.local_counts_full_request,
+        tokens_saved=net_saved_local,
+        native_tokenizer=_native_tokenizer(outcome.model),
+        tool_definition_tokens_saved=tool_saved_local,
+        local_forwarded_tool_tokens=outcome.local_forwarded_tool_tokens,
+    )
+    calibrated_usd = _price_calibrated(outcome, calibrated)
+
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
         provider=outcome.provider,
@@ -713,6 +825,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         # OpenAI never charges.
         cache_inferred=outcome.cache_inferred,
         input_provider_reported=input_provider_reported,
+        calibrated=calibrated,
+        calibrated_usd=calibrated_usd,
     )
 
     # 2. Cost tracker (optional).
@@ -734,6 +848,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             # compression only while its own headline counted both layers.
             tool_schema_saved=tool_search_saved,
             provider_reported=input_provider_reported,
+            provider_tokens_saved=calibrated.tokens_saved,
+            provider_novel_tokens_saved=calibrated.novel_tokens_saved,
         )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
@@ -775,6 +891,19 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 request_messages=outcome.request_messages,
                 compressed_messages=outcome.compressed_messages,
                 turn_id=outcome.turn_id,
+                billed_input_tokens=outcome.provider_input_tokens,
+                input_tokens_source="provider" if input_provider_reported else "estimated",
+                tokens_saved_provider=calibrated.tokens_saved,
+                novel_tokens_saved_provider=calibrated.novel_tokens_saved,
+                carried_tokens_saved_provider=calibrated.carried_tokens_saved,
+                tool_tokens_saved_provider=calibrated.tool_tokens_saved,
+                baseline_input_tokens=calibrated.baseline_input_tokens,
+                baseline_estimated=calibrated.baseline_estimated,
+                savings_percent_provider=calibrated.reduction_percent,
+                calibration_factor=calibrated.factor,
+                calibration_ratio=calibrated.request_ratio,
+                calibration_source=calibrated.source,
+                savings_usd=calibrated_usd,
             )
         )
 
@@ -824,4 +953,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
         f"{client_part}"
         f"{cached_part}"
+        f" billed_in={outcome.provider_input_tokens}"
+        f" saved_provider={calibrated.tokens_saved}"
+        f" saved_novel={calibrated.novel_tokens_saved}"
+        f" saved_carried={calibrated.carried_tokens_saved}"
+        f" saved_tools={calibrated.tool_tokens_saved}"
+        f" cal={calibrated.factor:.4f}/{calibrated.source}"
+        f" saved_usd={calibrated_usd:.6f}"
     )

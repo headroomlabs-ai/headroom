@@ -96,6 +96,36 @@ class RequestLog:
     cache_write_tokens: int = 0
     uncached_input_tokens: int = 0
 
+    # Per-request accounting in the PROVIDER's units (see
+    # headroom.proxy.savings_calibration). ``input_tokens_original`` /
+    # ``_optimized`` / ``tokens_saved`` above stay on Headroom's local
+    # tokenizer; these are the numbers that reconcile with the provider:
+    #   billed_input_tokens   what the provider says it received (its usage)
+    #   input_tokens_source   "provider" or "estimated" (no provider usage)
+    #   tokens_saved_provider the NET saving (removed minus anything Headroom
+    #                         added) in provider tokens, split
+    #                         into novel (this turn) + carried (earlier turns)
+    #   baseline_input_tokens billed + saved: the request without Headroom
+    #   calibration_*         how the saving was converted, so the arithmetic
+    #                         can be followed for any single request
+    #   savings_usd           novel priced as new input, carried as cache reads
+    billed_input_tokens: int = 0
+    input_tokens_source: str = "estimated"
+    tokens_saved_provider: int = 0
+    novel_tokens_saved_provider: int = 0
+    carried_tokens_saved_provider: int = 0
+    # Of which tool definitions removed (deferral/compaction).
+    tool_tokens_saved_provider: int = 0
+    baseline_input_tokens: int = 0
+    # True when the provider reported no usage: the baseline is built from
+    # Headroom's estimate of the forwarded request.
+    baseline_estimated: bool = False
+    savings_percent_provider: float = 0.0
+    calibration_factor: float = 1.0
+    calibration_ratio: float = 0.0
+    calibration_source: str = "uncalibrated"
+    savings_usd: float = 0.0
+
     # Waste signals detected in original messages
     waste_signals: dict[str, int] | None = None
 

@@ -1087,6 +1087,9 @@ def _mirror_marker(holder: Any, client_holder: Any) -> tuple[Any, bool]:
     return holder, False
 
 
+_LINEAGE_IDS = itertools.count(1)
+
+
 class PrefixCacheTracker:
     """Tracks provider prefix cache state across turns in a session.
 
@@ -1109,6 +1112,10 @@ class PrefixCacheTracker:
     def __init__(self, provider: str, config: PrefixFreezeConfig | None = None):
         self.provider = provider
         self.config = config or PrefixFreezeConfig()
+        # Stable identity of this conversation lineage, for per-conversation
+        # bookkeeping outside the tracker (savings calibration compares a
+        # conversation's consecutive turns). Unique per tracker, never reused.
+        self.lineage_id: str = f"{provider}:{next(_LINEAGE_IDS)}"
         self._cache_ttl_seconds: int | None = None
         self._cached_token_count: int = 0
         self._cached_message_count: int = 0

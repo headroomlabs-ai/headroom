@@ -236,6 +236,35 @@ def _app_and_outcomes(monkeypatch):
     return app, outcomes
 
 
+def _calibration_source(outcome: Any) -> str:
+    """Run a captured outcome through the real funnel and return how its saving
+    was converted (savings_calibration): ``request`` only when the turn's own
+    billed/local exchange rate was used."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from headroom.proxy.cost import CostTracker
+    from headroom.proxy.outcome import emit_request_outcome
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_calibration import reset_savings_calibrator
+
+    reset_savings_calibrator()
+    cost = CostTracker()
+    logged: list[Any] = []
+    sink = SimpleNamespace(
+        metrics=PrometheusMetrics(cost_tracker=cost, stateless=True),
+        cost_tracker=cost,
+        logger=SimpleNamespace(log=logged.append),
+    )
+    asyncio.run(emit_request_outcome(sink, outcome))
+    reset_savings_calibrator()
+    return logged[-1].calibration_source
+
+
+# A request big enough for the calibrator to measure (MIN_REQUEST_TOKENS).
+_BIG = "the quick brown fox jumps over the lazy dog " * 300
+
+
 @respx.mock
 def test_chat_bills_the_original_plus_the_redrive(monkeypatch, _no_hooks) -> None:
     """A=100/10, B=150/20 -> 250 in / 30 out.
@@ -388,7 +417,7 @@ def test_anthropic_bills_original_plus_hook_redrive(monkeypatch, _no_hooks) -> N
             json={
                 "model": "claude-sonnet-4-5",
                 "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [{"role": "user", "content": _BIG}],
             },
             headers={
                 "x-api-key": "sk-ant-test",
@@ -403,3 +432,80 @@ def test_anthropic_bills_original_plus_hook_redrive(monkeypatch, _no_hooks) -> N
     assert outcome.cache_read_tokens == 120
     assert outcome.cache_write_tokens == 55
     assert outcome.uncached_input_tokens == 250
+    # Billed input covers two calls but the local count covers one body, so
+    # the turn's billed/local is not an exchange rate: savings calibration
+    # must not measure from it (it falls back to the model's recent rate).
+    assert outcome.local_counts_full_request is False
+
+
+@respx.mock
+def test_anthropic_without_redrive_stays_measurable(monkeypatch, _no_hooks) -> None:
+    """Control for the re-drive case: one call, one body, so the turn's own
+    billed/local exchange rate is valid for savings calibration."""
+    app, outcomes = _app_and_outcomes(monkeypatch)
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "a",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "a"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3_000, "output_tokens": 10},
+            },
+        )
+    )
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": _BIG}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+    assert result.status_code == 200
+    assert outcomes[-1].local_counts_full_request is True
+    # The turn's own billed/local rate is what converts its saving.
+    assert _calibration_source(outcomes[-1]) == "request"
+
+
+@respx.mock
+def test_anthropic_redrive_turn_never_converts_at_its_own_rate(monkeypatch, _no_hooks) -> None:
+    """Two calls billed (~1,500 each) against one ~2,700-token local body: the
+    ratio would land in the accepted band and silently double the saving, so
+    the turn must fall back instead of using it."""
+    register_turn_hook(_RedriveOnce())
+    app, outcomes = _app_and_outcomes(monkeypatch)
+
+    def response(ident: str) -> dict[str, Any]:
+        return {
+            "id": ident,
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": ident}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1_500, "output_tokens": 5},
+        }
+
+    sent = iter([response("a"), response("b")])
+    respx.post("https://api.anthropic.com/v1/messages").mock(
+        side_effect=lambda request: httpx.Response(200, json=next(sent))
+    )
+    with TestClient(app) as client:
+        result = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": _BIG}],
+            },
+            headers={"x-api-key": "sk-ant-test", "anthropic-version": "2023-06-01"},
+        )
+    assert result.status_code == 200
+    assert outcomes[-1].provider_input_tokens == 3_000
+    assert _calibration_source(outcomes[-1]) != "request"

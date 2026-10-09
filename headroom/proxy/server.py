@@ -3165,6 +3165,17 @@ class ActivityMiddleware:
             self.proxy._activity_generation += 1
 
 
+def _provider_saved_percent(saved: int, billed_input: int) -> float:
+    """Savings as a share of what the requests would have billed without
+    Headroom (billed input + net saving). 0 when that baseline is not
+    positive: net-negative savings can cancel it, and a percentage of
+    nothing is not meaningful."""
+    baseline = billed_input + saved
+    if billed_input <= 0 or baseline <= 0:
+        return 0.0
+    return round(saved / baseline * 100, 2)
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -4811,6 +4822,25 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "savings_breakdown": log.get("savings_breakdown", []),
                     "waste_signals": log.get("waste_signals"),
                     "tool_schema_saved_tokens": _tool_schema_saved_from_tags(log.get("tags")),
+                    # Provider-unit accounting for this request (RequestLog docs).
+                    **{
+                        name: _recent_request_optional_number(log, name)
+                        for name in (
+                            "billed_input_tokens",
+                            "tokens_saved_provider",
+                            "novel_tokens_saved_provider",
+                            "carried_tokens_saved_provider",
+                            "tool_tokens_saved_provider",
+                            "baseline_input_tokens",
+                            "savings_percent_provider",
+                            "calibration_factor",
+                            "calibration_ratio",
+                            "savings_usd",
+                        )
+                    },
+                    "input_tokens_source": log.get("input_tokens_source"),
+                    "calibration_source": log.get("calibration_source"),
+                    "baseline_estimated": bool(log.get("baseline_estimated")),
                 }
             )
         dashboard_recent_requests = dashboard_recent_requests[:25]
@@ -5163,6 +5193,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
                 "requests_input_provider_reported": m.requests_input_provider_reported,
                 "requests_input_estimated": m.requests_input_estimated,
+                # Savings in the provider's units, summed per request
+                # (savings_calibration). novel = removed on the turn it happened;
+                # carried = history compressed earlier, still smaller as it is
+                # re-sent. by_source says how each request was converted.
+                "saved_provider": m.tokens_saved_provider_total,
+                "saved_provider_novel": m.tokens_saved_provider_novel_total,
+                "saved_provider_carried": m.tokens_saved_provider_carried_total,
+                "added_provider": m.tokens_added_provider_total,
+                "saved_provider_usd": round(m.savings_usd_provider_total, 4),
+                # Same population on both sides: savings and billed input of
+                # the requests whose input the provider reported. Estimated-
+                # input requests are in saved_provider but not in this ratio.
+                "saved_provider_reported": m.tokens_saved_provider_reported_total,
+                "saved_provider_percent": _provider_saved_percent(
+                    m.tokens_saved_provider_reported_total,
+                    m.tokens_input_provider_reported_total,
+                ),
+                "calibration_by_source": dict(m.calibration_requests_by_source),
                 "output": m.tokens_output_total,
                 "output_saved": output_reduction.get("tokens_saved", 0),
                 "output_reduction_percent": output_reduction.get("reduction_percent", 0),

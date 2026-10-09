@@ -906,6 +906,16 @@ class CostTracker:
         # cloud side can tell a billed figure from an estimate.
         self._provider_tokens_sent_by_model: dict[str, int] = {}
         self._provider_requests_by_model: dict[str, int] = {}
+        # Per-request savings in provider units (savings_calibration): the sum
+        # of every request's saving, and the novel part (each removal counted
+        # once, on the turn it happened). A request where Headroom added more
+        # than it removed has a negative saving; it goes to the *_added
+        # counters so every counter only grows (the licence reporter takes
+        # clamped deltas) and net = saved - added.
+        self._provider_tokens_saved_by_model: dict[str, int] = {}
+        self._provider_tokens_added_by_model: dict[str, int] = {}
+        self._provider_novel_tokens_saved_by_model: dict[str, int] = {}
+        self._provider_novel_tokens_added_by_model: dict[str, int] = {}
         # Completion tokens keyed by ``(model, long_context)`` — same reason as
         # the savings buckets: the >200k completion rate is a different number.
         self._output_tokens_by_tier: dict[tuple[str, bool], int] = {}
@@ -938,6 +948,10 @@ class CostTracker:
         self._tokens_sent_by_model.clear()
         self._provider_tokens_sent_by_model.clear()
         self._provider_requests_by_model.clear()
+        self._provider_tokens_saved_by_model.clear()
+        self._provider_tokens_added_by_model.clear()
+        self._provider_novel_tokens_saved_by_model.clear()
+        self._provider_novel_tokens_added_by_model.clear()
         self._output_tokens_by_tier.clear()
         self._requests_by_model.clear()
         self._api_cache_read_by_model.clear()
@@ -1032,6 +1046,8 @@ class CostTracker:
         cache_inferred: bool = False,
         tool_schema_saved: int = 0,
         provider_reported: bool = False,
+        provider_tokens_saved: int = 0,
+        provider_novel_tokens_saved: int = 0,
     ):
         """Record token counts per model and accumulate request cost for budget enforcement.
 
@@ -1146,6 +1162,21 @@ class CostTracker:
                 self._tool_saved_list_by_model.get(model, 0.0) + list_part
             )
         self._tokens_sent_by_model[model] = self._tokens_sent_by_model.get(model, 0) + tokens_sent
+        for value, saved_counter, added_counter in (
+            (
+                provider_tokens_saved,
+                self._provider_tokens_saved_by_model,
+                self._provider_tokens_added_by_model,
+            ),
+            (
+                provider_novel_tokens_saved,
+                self._provider_novel_tokens_saved_by_model,
+                self._provider_novel_tokens_added_by_model,
+            ),
+        ):
+            if value:
+                counter = saved_counter if value > 0 else added_counter
+                counter[model] = counter.get(model, 0) + abs(value)
         if provider_reported:
             self._provider_tokens_sent_by_model[model] = (
                 self._provider_tokens_sent_by_model.get(model, 0) + tokens_sent

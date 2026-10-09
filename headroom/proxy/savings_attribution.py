@@ -203,7 +203,14 @@ def from_tags(tags: MutableMapping[str, Any] | None) -> list[dict[str, Any]]:
     return [dict(item) for item in raw[:MAX_SOURCES] if isinstance(item, dict)]
 
 
-_INTERNAL_TAGS = frozenset({SAVINGS_ATTRIBUTION_TAG, STAGE_TIMING_TAG})
+from headroom.proxy.savings_calibration import (  # noqa: E402
+    CLIENT_REQUEST_TOKENS_TAG,
+    CLIENT_TOOL_TOKENS_TAG,
+)
+
+_INTERNAL_TAGS = frozenset(
+    {SAVINGS_ATTRIBUTION_TAG, STAGE_TIMING_TAG, CLIENT_REQUEST_TOKENS_TAG, CLIENT_TOOL_TOKENS_TAG}
+)
 
 
 def public_tags(tags: MutableMapping[str, Any] | None) -> dict[str, Any]:

@@ -326,6 +326,20 @@ class UsageReporter:
             "cache_read_tokens": provider_deltas["cache_read_tokens"],
             "cache_write_tokens": provider_deltas["cache_write_tokens"],
             "uncached_input_tokens": provider_deltas["uncached_input_tokens"],
+            # Savings in the provider's units (savings_calibration), NET: what
+            # Headroom saved minus what it added, the same meaning as /stats
+            # ``saved_provider``. ``*_novel_*`` counts each removal once, on the
+            # request it happened. ``*_gross`` / ``tokens_added_*`` are the two
+            # sides of the net, for auditing requests where Headroom added more
+            # than it removed.
+            "tokens_saved_provider": provider_deltas["tokens_saved_provider"]
+            - provider_deltas["tokens_added_provider"],
+            "tokens_saved_provider_gross": provider_deltas["tokens_saved_provider"],
+            "tokens_added_provider": provider_deltas["tokens_added_provider"],
+            "tokens_saved_novel_provider": provider_deltas["tokens_saved_novel_provider"]
+            - provider_deltas["tokens_added_novel_provider"],
+            "tokens_saved_novel_provider_gross": provider_deltas["tokens_saved_novel_provider"],
+            "tokens_added_novel_provider": provider_deltas["tokens_added_novel_provider"],
             # Units, stated so no consumer has to guess: tokens_after is billed
             # input where provider-reported; tokens_saved is Headroom's local
             # tokenizer count of what compression removed.
@@ -374,6 +388,10 @@ class UsageReporter:
         "cache_read_tokens": "_api_cache_read_by_model",
         "cache_write_tokens": "_api_cache_write_by_model",
         "uncached_input_tokens": "_api_uncached_by_model",
+        "tokens_saved_provider": "_provider_tokens_saved_by_model",
+        "tokens_added_provider": "_provider_tokens_added_by_model",
+        "tokens_saved_novel_provider": "_provider_novel_tokens_saved_by_model",
+        "tokens_added_novel_provider": "_provider_novel_tokens_added_by_model",
     }
 
     def _current_provider_counters(self, cost_tracker: Any) -> dict[str, dict[str, int]]:

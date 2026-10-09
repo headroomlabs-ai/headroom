@@ -23,6 +23,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.provider_usage import billed_input_for_provider
+from headroom.proxy.savings_calibration import local_request_counts
 from headroom.proxy.token_counting import gemini_output_tokens
 
 if TYPE_CHECKING:
@@ -1109,7 +1110,17 @@ class StreamingMixin:
         _stream_stop_reason = (
             parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
         )
+        # Calibration inputs: the conversation's identity and Headroom's local
+        # count of the non-message parts, so savings can be converted into the
+        # provider's units against its own billed count (savings_calibration).
+        _forwarded_tokens, _forwarded_tools, _counts_full = await asyncio.to_thread(
+            local_request_counts, model, body
+        )
         outcome = RequestOutcome.from_stream(
+            calibration_key=getattr(prefix_tracker, "lineage_id", None) or conversation_key,
+            local_forwarded_tokens=_forwarded_tokens,
+            local_forwarded_tool_tokens=_forwarded_tools,
+            local_counts_full_request=_counts_full,
             thinking_tokens=_stream_thinking.tokens,
             thinking_inferred=_stream_thinking.inferred,
             stop_reason=_stream_stop_reason,

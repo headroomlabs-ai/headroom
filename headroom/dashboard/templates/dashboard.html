@@ -1152,6 +1152,30 @@
                                                         <div class="font-mono" x-text="(req.optimization_latency_ms || 0).toFixed(0) + 'ms'"></div>
                                                     </div>
                                                 </div>
+                                                <!-- Provider-unit accounting: what the provider billed, the
+                                                     saving converted into its tokens, and how it was converted. -->
+                                                <div class="mt-3 grid grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
+                                                    <div>
+                                                        <div class="text-gray-500 uppercase tracking-wide mb-1">Sent to Provider</div>
+                                                        <div class="font-mono" x-text="formatNumber(req.billed_input_tokens || req.input_tokens_optimized)"></div>
+                                                        <div class="text-gray-500" x-text="req.input_tokens_source === 'provider' ? 'provider-reported' : 'estimated'"></div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="text-gray-500 uppercase tracking-wide mb-1">Without Headroom</div>
+                                                        <div class="font-mono" x-text="formatNumber(req.baseline_input_tokens)"></div>
+                                                        <div class="text-gray-500" x-show="req.baseline_estimated">estimated</div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="text-gray-500 uppercase tracking-wide mb-1">Saved (provider tokens)</div>
+                                                        <div class="font-mono text-accent" x-text="formatNumber(req.tokens_saved_provider) + ' (' + (req.savings_percent_provider || 0).toFixed(1) + '%)'"></div>
+                                                        <div class="text-gray-500" x-text="formatNumber(req.novel_tokens_saved_provider) + ' this turn · ' + formatNumber(req.carried_tokens_saved_provider) + ' carried' + (req.tool_tokens_saved_provider ? ' · ' + formatNumber(req.tool_tokens_saved_provider) + ' tool defs' : '')"></div>
+                                                    </div>
+                                                    <div>
+                                                        <div class="text-gray-500 uppercase tracking-wide mb-1">Conversion</div>
+                                                        <div class="font-mono" x-text="'×' + (req.calibration_factor || 1).toFixed(3) + ' · $' + (req.savings_usd || 0).toFixed(4)"></div>
+                                                        <div class="text-gray-500" x-text="req.calibration_source || 'uncalibrated'"></div>
+                                                    </div>
+                                                </div>
                                                 <!-- Transforms Applied -->
                                                 <template x-if="(req.transforms_applied || []).length > 0">
                                                     <div class="mt-3">

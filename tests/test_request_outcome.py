@@ -310,6 +310,10 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         # Whether the positional tokens_sent is the provider's billed count.
         # This outcome carries no provider_input_tokens, so it is an estimate.
         "provider_reported": False,
+        # The request's saving converted to provider units (savings_calibration).
+        # No provider usage on this outcome, so it stays uncalibrated: local units.
+        "provider_tokens_saved": 700,
+        "provider_novel_tokens_saved": 700,
     }
 
 
