@@ -23,6 +23,70 @@ def _observe(backend, conversation, hashes):
     return observe(conversation, hashes)
 
 
+@pytest.mark.parametrize("raw", ["{broken", '["not a clock"]'])
+def test_sqlite_unrelated_corrupt_namespace_does_not_block_fallback(tmp_path, raw):
+    path = tmp_path / "namespaces.sqlite"
+    backend = SQLiteBackend(db_path=path)
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    other = store.store("other original", "other sample")
+    assert backend.observe_context_turn("A", [other], namespace_key="workspace-X")
+    assert backend.observe_context_turn("B", [key], namespace_key="workspace-Y")
+    backend._conn.execute(
+        "UPDATE ccr_context_states SET state_json=? WHERE conversation_key='A'", (raw,)
+    )
+    backend._conn.commit()
+
+    reopened = SQLiteBackend(db_path=path)
+    snapshot = reopened.observe_context_turn("B-trimmed", [key], namespace_key="workspace-Y")
+    assert snapshot is not None
+    assert snapshot.current_turn == 2
+    assert snapshot.compression_turns[key][1] == 1
+    assert CompressionStore(backend=reopened).retrieve(key).original_content == "original"
+
+
+@pytest.mark.parametrize("raw", ["{broken", '["not a clock"]', '{"namespace":"workspace-Y"}'])
+def test_sqlite_corrupt_candidate_in_same_namespace_fails_closed(tmp_path, raw):
+    backend = SQLiteBackend(db_path=tmp_path / "same-namespace.sqlite")
+    store = CompressionStore(backend=backend)
+    key = store.store("original", "sample")
+    assert backend.observe_context_turn("A", [key], namespace_key="workspace-X")
+    backend._conn.execute(
+        "UPDATE ccr_context_states SET state_json=? WHERE conversation_key='A'", (raw,)
+    )
+    backend._conn.commit()
+    assert backend.observe_context_turn("A-trimmed", [key], namespace_key="workspace-X") is None
+    assert store.retrieve(key).original_content == "original"
+
+
+def test_sqlite_concurrent_namespace_migration_preserves_trimmed_history_age(tmp_path):
+    path = tmp_path / "legacy-namespaces.sqlite"
+    backend = SQLiteBackend(db_path=path)
+    key = CompressionStore(backend=backend).store("original", "sample")
+    for _ in range(5):
+        assert backend.observe_context_turn("origin", [key], namespace_key="workspace-X")
+    row = backend._conn.execute(
+        "SELECT conversation_key, state_json, expires_at FROM ccr_context_states"
+    ).fetchone()
+    backend._conn.execute("DROP TABLE ccr_context_states")
+    backend._conn.execute(
+        "CREATE TABLE ccr_context_states "
+        "(conversation_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, expires_at REAL NOT NULL)"
+    )
+    backend._conn.execute("INSERT INTO ccr_context_states VALUES (?, ?, ?)", row)
+    backend._conn.commit()
+    backend._conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        migrated = list(executor.map(lambda _: SQLiteBackend(db_path=path), range(2)))
+    for index, handle in enumerate(migrated):
+        snapshot = handle.observe_context_turn("trimmed", [key], namespace_key="workspace-X")
+        assert snapshot is not None
+        assert snapshot.current_turn == 6 + index
+        assert snapshot.compression_turns[key][1] == 1
+    assert CompressionStore(backend=migrated[0]).retrieve(key).original_content == "original"
+
+
 def test_shared_hash_has_independent_first_turn_in_each_conversation(backend):
     store = CompressionStore(backend=backend)
     key = store.store("shared original", "shared sample")

@@ -52,7 +52,8 @@ DROP INDEX IF EXISTS idx_ccr_expiry;
 CREATE TABLE IF NOT EXISTS ccr_context_states (
     conversation_key TEXT PRIMARY KEY,
     state_json TEXT NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    namespace_key TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ccr_context_expiry ON ccr_context_states(expires_at);
 """
@@ -118,6 +119,7 @@ class SQLiteBackend:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
+        self._migrate_context_namespaces(conn)
         # Startup hygiene: expired rows are only purged opportunistically
         # on writes, so a quiet store could otherwise hold expired
         # originals (which may contain sensitive tool output) on disk
@@ -138,6 +140,35 @@ class SQLiteBackend:
                 except OSError:
                     pass
         return conn
+
+    @staticmethod
+    def _migrate_context_namespaces(conn: sqlite3.Connection) -> None:
+        """Index clock ownership independently of JSON, preserving legacy anchors."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(ccr_context_states)")}
+            if "namespace_key" not in columns:
+                conn.execute("ALTER TABLE ccr_context_states ADD COLUMN namespace_key TEXT")
+                for key, raw in conn.execute(
+                    "SELECT conversation_key, state_json FROM ccr_context_states"
+                ).fetchall():
+                    try:
+                        state = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    namespace = state.get("namespace") if isinstance(state, dict) else None
+                    if isinstance(namespace, str) and namespace:
+                        conn.execute(
+                            "UPDATE ccr_context_states SET namespace_key=? WHERE conversation_key=?",
+                            (namespace, key),
+                        )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ccr_context_namespace ON ccr_context_states(namespace_key)"
+            )
+            conn.commit()
+        except sqlite3.DatabaseError:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _is_corruption(error: Exception) -> bool:
@@ -246,12 +277,21 @@ class SQLiteBackend:
                     return None
                 self._conn.execute("DELETE FROM ccr_context_states WHERE expires_at < ?", (now,))
                 if namespace_key is not None:
-                    states = {
-                        key: json.loads(raw)
-                        for key, raw in self._conn.execute(
-                            "SELECT conversation_key, state_json FROM ccr_context_states"
-                        )
-                    }
+                    states = {}
+                    for key, raw, indexed_namespace in self._conn.execute(
+                        "SELECT conversation_key, state_json, namespace_key FROM ccr_context_states "
+                        "WHERE namespace_key=? OR namespace_key IS NULL OR conversation_key=?",
+                        (namespace_key, conversation_key),
+                    ):
+                        candidate = json.loads(raw)
+                        if indexed_namespace is not None and (
+                            not isinstance(candidate, dict)
+                            or candidate.get("namespace") != indexed_namespace
+                        ):
+                            raise ValueError(
+                                "CCR clock namespace does not match its retained ownership"
+                            )
+                        states[key] = candidate
                     conversation_key = resolve_context_conversation(
                         conversation_key, namespace_key, states, events
                     )
@@ -270,10 +310,11 @@ class SQLiteBackend:
                 )
                 state["namespace"] = namespace_key if namespace_key is not None else "explicit"
                 self._conn.execute(
-                    "INSERT INTO ccr_context_states(conversation_key, state_json, expires_at) "
-                    "VALUES (?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
-                    "state_json = excluded.state_json, expires_at = excluded.expires_at",
-                    (conversation_key, json.dumps(state), expires_at),
+                    "INSERT INTO ccr_context_states(conversation_key, state_json, expires_at, namespace_key) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_key) DO UPDATE SET "
+                    "state_json = excluded.state_json, expires_at = excluded.expires_at, "
+                    "namespace_key = excluded.namespace_key",
+                    (conversation_key, json.dumps(state), expires_at, state["namespace"]),
                 )
                 self._conn.commit()
                 return snapshot
