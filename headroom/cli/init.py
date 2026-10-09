@@ -36,6 +36,7 @@ from headroom.install.models import ConfigScope, InstallPreset, RuntimeKind, Sup
 from headroom.install.paths import (
     claude_settings_path,
     codex_config_path,
+    codex_home_dir,
     codex_hooks_path,
     codex_project_config_path,
     validate_profile_name,
@@ -56,7 +57,11 @@ from headroom.install.state import ManifestError, load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
 from headroom.providers.claude import TOOL_SEARCH_DEFAULT, TOOL_SEARCH_ENV
 from headroom.providers.claude.runtime import TOOL_SEARCH_FOUNDRY_DEFAULT
-from headroom.providers.codex.install import codex_uses_chatgpt_auth
+from headroom.providers.codex.install import (
+    CodexAuthConfigError,
+    build_codex_auth_config,
+    codex_uses_chatgpt_auth,
+)
 from headroom.providers.codex.threads import retag_to_headroom
 
 from .main import main
@@ -340,9 +345,25 @@ def _strip_codex_root_routing_orphans(content: str) -> str:
     return root + rest
 
 
-def _strip_codex_init_block(content: str) -> str:
+_CODEX_PROVIDER_SNAPSHOT_PREFIX = "# Headroom init previous provider: "
+
+
+def _codex_init_provider_snapshot(content: str) -> str | None:
+    match = re.search(r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"([^\n]*)", content)
+    if match is None:
+        return None
+    snapshot = json.loads(match.group(1))
+    if not isinstance(snapshot, str):
+        raise ValueError("Invalid Headroom init provider snapshot")
+    tomllib.loads(snapshot)
+    return snapshot
+
+
+def _strip_codex_init_block(content: str, *, restore_provider: bool = True) -> str:
     """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
     import re
+
+    provider_snapshot = _codex_init_provider_snapshot(content)
 
     # Remove any provider marker → end marker span, possibly repeated.
     while _CODEX_PROVIDER_MARKER_START in content and _CODEX_PROVIDER_MARKER_END in content:
@@ -368,6 +389,8 @@ def _strip_codex_init_block(content: str) -> str:
         r"(?=^\[|\Z)"
     )
     content = orphan_headroom_table.sub("", content)
+    if restore_provider and provider_snapshot is not None:
+        content = content.rstrip() + "\n\n" + provider_snapshot
 
     return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
 
@@ -377,14 +400,17 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
 
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
     warn_codex_provider_port_change(path, port)
+    auth_path = codex_home_dir() / "auth.json"
     # Emit requires_openai_auth only for ChatGPT-OAuth users (restores the
     # account menu); omitting it for API-key users avoids forcing an OAuth
     # login (#406).
     requires_openai_auth = (
-        "requires_openai_auth = true\n"
-        if codex_uses_chatgpt_auth(path.parent / "auth.json")
-        else ""
+        "requires_openai_auth = true\n" if codex_uses_chatgpt_auth(auth_path) else ""
     )
+    try:
+        auth_config = build_codex_auth_config(auth_path, config_path=path)
+    except CodexAuthConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n'
@@ -396,10 +422,56 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         'name = "OpenAI"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         "supports_websockets = true\n"
+        f"{auth_config}"
         f"{requires_openai_auth}"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # Adopt an existing unmarked provider table instead of declaring it twice.
+    # Keep user options that are not owned by the generated provider block.
+    provider_snapshot = _codex_init_provider_snapshot(content)
+    provider_table = re.search(
+        r"(?m)^[ \t]*\[model_providers\.headroom\][ \t]*(?:#[^\n]*)?\r?\n", content
+    )
+    if provider_table:
+        next_table = re.search(r"(?m)^[ \t]*\[", content[provider_table.end() :])
+        table_end = provider_table.end() + next_table.start() if next_table else len(content)
+        if provider_snapshot is None and _CODEX_PROVIDER_MARKER_START not in content:
+            provider_snapshot = content[provider_table.start() : table_end]
+        existing_options = content[provider_table.end() : table_end]
+        existing_options = re.sub(
+            r"(?m)^" + re.escape(_CODEX_PROVIDER_SNAPSHOT_PREFIX) + r"[^\n]*(?:\n|$)",
+            "",
+            existing_options,
+        )
+        existing_options = existing_options.replace(_CODEX_PROVIDER_MARKER_END, "")
+        generated_keys = set(re.findall(r"(?m)^([A-Za-z_][A-Za-z_0-9]*)[ \t]*=", block))
+        generated_keys.update(
+            {"auth", "env_key", "requires_openai_auth", "experimental_bearer_token"}
+        )
+        for key in generated_keys:
+            existing_options = re.sub(
+                rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=[^\n]*(?:\n|$)",
+                "",
+                existing_options,
+            )
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            existing_options + _CODEX_PROVIDER_MARKER_END,
+        )
+        if _CODEX_PROVIDER_MARKER_START not in content:
+            content = content[: provider_table.start()] + content[table_end:]
+    content = _replace_marker_block(
+        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, "", at_root=True
+    )
+    if provider_snapshot is not None:
+        block = block.replace(
+            _CODEX_PROVIDER_MARKER_END,
+            _CODEX_PROVIDER_SNAPSHOT_PREFIX
+            + json.dumps(provider_snapshot)
+            + "\n"
+            + _CODEX_PROVIDER_MARKER_END,
+        )
     # init owns the ROOT-level model_provider/openai_base_url: drop any prior
     # root assignment so we replace it instead of emitting a duplicate top-level
     # key (#260). Scope the strip to the document root (everything before the
@@ -418,6 +490,7 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    tomllib.loads(content)
     path.write_text(content, encoding="utf-8")
     # Codex filters its history menu by the active model_provider, so existing
     # native threads vanish once we switch to "headroom". Retag them to match the

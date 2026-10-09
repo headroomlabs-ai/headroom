@@ -8,6 +8,7 @@ import pytest
 
 from headroom.proxy.output_savings import (
     MEASURED_MIN_CLUSTERS,
+    MEASURED_SUPERSEDE_MIN_CLUSTERS,
     BaselineModel,
     SavingsLedger,
     SavingsRecorder,
@@ -365,7 +366,7 @@ class TestEstimateFromHoldout:
 
     def test_best_estimate_prefers_measured(self):
         ledger = SavingsLedger()
-        for i in range(10):
+        for i in range(MEASURED_SUPERSEDE_MIN_CLUSTERS):
             ledger.baseline.observe("opus|a|s|tools", 1000)
             ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
             ledger.record("treatment", "opus|a|s|tools", 900, f"t{i}")
@@ -377,6 +378,91 @@ class TestEstimateFromHoldout:
             ledger.baseline.observe("opus|a|s|tools", 1000)
             ledger.record("treatment", "opus|a|s|tools", 900)
         assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_wide_band_does_not_take_over_even_at_full_size(self):
+        """The width gate still bites once the cluster gate is cleared."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        for i in range(30):
+            ledger.record("control", "opus|a|s|tools", (200, 1000, 5000)[i % 3], f"c{i}")
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "the arm is spread over enough conversations"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 > 10, "and too noisy to believe"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_holdout_covering_a_corner_of_traffic_does_not_take_over(self):
+        ledger = SavingsLedger()
+        # One stratum measured cleanly, but it is a fraction of the traffic.
+        for i in range(30):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 900, f"t{i}")
+        for i in range(200):
+            ledger.baseline.observe("opus|b|xl|tools", 4000)
+            ledger.record("treatment", "opus|b|xl|tools", 3000, f"b{i}")
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_a_few_long_conversations_do_not_take_the_headline(self):
+        """Five control conversations clear the cluster gate, and their
+        per-request band looks tight, but they are five draws, not 1,000."""
+        ledger = SavingsLedger()
+        for i in range(200):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        for conv in range(5):
+            for j in range(200):
+                ledger.record("control", "opus|a|s|tools", 900 + 100 * conv + j % 3, f"c{conv}")
+
+        measured = ledger.estimate_from_holdout()
+        assert measured is not None, "a real arm by the cluster gate"
+        assert (measured.ci_high_pct - measured.ci_low_pct) / 2 < 10, "and a tight-looking band"
+        assert ledger.best_estimate().kind == "estimated"
+
+    def test_unlabelled_legacy_traffic_does_not_block_the_measurement(self):
+        """Requests recorded before conversations were tracked can never be
+        measured, so they must not count against the measurement's coverage."""
+        ledger = SavingsLedger()
+        for _ in range(2000):
+            ledger.baseline.observe("opus|a|s|tools", 1000)
+            ledger.record("treatment", "opus|a|s|tools", 800)
+        for i in range(MEASURED_SUPERSEDE_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000 + i % 3, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 900 + i % 3, f"t{i}")
+
+        assert ledger.estimate_from_baseline().n_requests == 2030
+        assert ledger.best_estimate().kind == "measured"
+
+    def test_a_young_holdout_still_reports_without_a_baseline(self):
+        """Below the supersede floor there is nothing to displace, so the
+        cluster-gated measurement is reported rather than nothing."""
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        assert ledger.best_estimate().kind == "measured"
+
+    def test_a_corner_holdout_does_not_set_the_headline_without_a_baseline(self):
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 100, f"t{i}")
+        # The rest of the traffic has no control to compare against.
+        for i in range(200):
+            ledger.record("treatment", "opus|b|xl|tools", 3000, f"b{i}")
+        assert ledger.estimate_from_holdout() is not None
+        assert ledger.best_estimate().kind != "measured"
+
+    def test_measured_wins_without_a_baseline_to_fall_back_on(self):
+        """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
+        ledger = SavingsLedger()
+        for i in range(50):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        assert ledger.estimate_from_baseline().n_requests == 0
+        assert ledger.best_estimate().kind == "measured"
 
 
 class TestHoldoutClusterGate:

@@ -1716,3 +1716,40 @@ def test_wrap_source_has_no_raw_control_bytes() -> None:
     # tell the escape from a raw 0x08 byte typed into the file. Check the bytes.
     source = Path(wrap_mod.__file__).read_bytes().decode("utf-8")
     assert _has_control_chars(source.replace("\r", "")) == []
+
+
+def test_wrap_opencode_session_token_matches_registration(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same token must reach both proxy registration and the child env --
+    two independent presence checks could each pass with mismatched values."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    _set_test_home(monkeypatch, tmp_path)
+
+    captured: dict[str, object] = {}
+    register_calls: list[dict[str, object]] = []
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    def spying_register(port, **kwargs):  # noqa: ANN001, ANN003
+        register_calls.append(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="opencode"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_register_proxy_client", side_effect=spying_register):
+                result = runner.invoke(main, ["wrap", "opencode", "--port", "9000", "--no-mcp"])
+
+    assert result.exit_code == 0, result.output
+    assert register_calls, "expected _register_proxy_client to be called"
+    registered_token = register_calls[0].get("session_token")
+    assert registered_token, "expected a non-empty session_token to be registered"
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    # Assumes the plugin resolves (packaged bundle ships in this checkout);
+    # see test_build_launch_env_omits_session_token_when_plugin_absent.
+    assert env.get("HEADROOM_OPENCODE_SESSION_TOKEN") == registered_token
