@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -90,7 +93,7 @@ def test_recovery_manifest_preserves_mutations_and_artifacts(monkeypatch, tmp_pa
     assert not recovery.exists()
 
 
-def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) -> None:
+def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path, caplog) -> None:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     valid = _manifest()
     save_manifest(valid)
@@ -99,9 +102,26 @@ def test_list_manifests_ignores_invalid_payloads(monkeypatch, tmp_path: Path) ->
     broken_dir.mkdir(parents=True)
     (broken_dir / "manifest.json").write_text("{not json", encoding="utf-8")
 
-    manifests = list_manifests()
+    with caplog.at_level(logging.WARNING, logger="headroom.install.state"):
+        manifests = list_manifests()
 
     assert [manifest.profile for manifest in manifests] == ["default"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(str(broken_dir / "manifest.json") in message for message in warnings)
+    assert not any(str(tmp_path / ".headroom" / "deploy" / "default") in m for m in warnings)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mode bits decide access only on POSIX")
+def test_save_manifest_keeps_manifest_owner_only(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    save_manifest(_manifest())
+    path = tmp_path / ".headroom" / "deploy" / "default" / "manifest.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    # A manifest left group/world-readable is tightened on the next save.
+    path.chmod(0o644)
+    save_manifest(_manifest())
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def _write_manifest_with_image(profile_dir: Path, image: str) -> None:
